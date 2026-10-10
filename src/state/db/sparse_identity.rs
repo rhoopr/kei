@@ -528,6 +528,7 @@ mod tests {
             .await
             .unwrap();
         let transition = |proofs| CheckpointTransition {
+            expected_metadata: Vec::new(),
             legacy_preservation_proofs: Vec::new(),
             legacy_config_hash: None,
             sparse_identity_proofs: proofs,

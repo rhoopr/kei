@@ -113,6 +113,19 @@ impl SqliteStateDb {
             let tx = conn
                 .transaction()
                 .map_err(|e| StateError::query("commit_checkpoint_transition::begin", e))?;
+            for (key, expected) in &transition.expected_metadata {
+                let actual: Option<String> = tx
+                    .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                if &actual != expected {
+                    return Err(StateError::Invariant {
+                        operation: "commit_checkpoint_transition",
+                        detail: "checkpoint planning facts changed".to_owned(),
+                    });
+                }
+            }
             for proof in &transition.legacy_preservation_proofs {
                 let binds_cursor = transition.metadata_updates.iter().any(|(key, value)| {
                     super::legacy_preservation::checkpoint_library(key)

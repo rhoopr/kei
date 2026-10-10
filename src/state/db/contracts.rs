@@ -388,6 +388,8 @@ pub(crate) struct ScopedDbSyncToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckpointTransition {
+    /// Rechecked in the same transaction before proof activation or any write.
+    pub(crate) expected_metadata: Vec<(String, Option<String>)>,
     pub(crate) legacy_preservation_proofs: Vec<super::LegacyActivationProof>,
     pub(crate) legacy_config_hash: Option<String>,
     pub(crate) sparse_identity_proofs: Vec<SparseIdentityProof>,

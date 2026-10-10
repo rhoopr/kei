@@ -245,6 +245,7 @@ async fn download_photos_incremental_streaming(
         .await
         .context("incremental changes producer task panicked")??;
 
+    let completed_delta_replay = delta_summary.sync_token.is_some();
     delta_summary.log_debug();
     // The pipeline already counted the representative error sent by the
     // producer. Preserve the full lookup failure count without counting twice.
@@ -294,6 +295,7 @@ async fn download_photos_incremental_streaming(
         sync_token,
         stats,
         delta_summary.sparse_identity_proofs,
+        completed_delta_replay,
     ))
 }
 
@@ -684,6 +686,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     );
 
     let delta_summary = delta.summary;
+    let completed_delta_replay = delta_summary.sync_token.is_some();
     delta_summary.log_debug();
 
     if delta_summary.auth_errors > 0 {
@@ -703,6 +706,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             None,
             stats,
             delta_summary.sparse_identity_proofs,
+            completed_delta_replay,
         ));
     }
 
@@ -759,6 +763,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 None,
                 stats,
                 delta_summary.sparse_identity_proofs,
+                completed_delta_replay,
             ));
         }
         // Delta arrival is not an ordered library/pass inventory. Reuse the
@@ -801,6 +806,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             None,
             delta_stats,
             delta_summary.sparse_identity_proofs,
+            completed_delta_replay,
         );
         selected.outcome = merge_download_outcomes(&selected.outcome, &delta_result.outcome);
         selected.accumulate(&delta_result);
@@ -810,7 +816,6 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         // The validated source stream completed even when unresolved identity
         // still holds its successor. Keep the cycle owner from replaying an
         // already completed delta as though this were a pure rank inventory.
-        selected.checkpoint.completed_delta_replay = true;
         // The rank query's token is only an EOF proof for selection. It never
         // replaces the actual completed changes/zone successor. Preserve every
         // full-selection and delta veto, including a bounded recent inventory.
@@ -887,6 +892,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             sync_token,
             stats,
             delta_summary.sparse_identity_proofs,
+            completed_delta_replay,
         ));
     }
 
@@ -1179,6 +1185,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             sync_token,
             stats,
             delta_summary.sparse_identity_proofs,
+            completed_delta_replay,
         ));
     }
 
@@ -1216,6 +1223,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             None,
             stats,
             delta_summary.sparse_identity_proofs,
+            completed_delta_replay,
         ));
     }
 
@@ -1403,6 +1411,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 .flatten(),
             stats,
             delta_summary.sparse_identity_proofs,
+            completed_delta_replay,
         ));
     }
 
@@ -1432,6 +1441,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             .flatten(),
         stats,
         delta_summary.sparse_identity_proofs,
+        completed_delta_replay,
     ))
 }
 

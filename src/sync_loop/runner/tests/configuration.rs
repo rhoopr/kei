@@ -2121,3 +2121,82 @@ async fn recent_exact_eof_bridge_receipt_survives_failed_cursor_commit_and_quiet
         }
     }
 }
+
+#[tokio::test]
+async fn retained_checkpoint_candidate_changed_at_promotion_preserves_concurrent_state() {
+    let config = make_run_cycle_config();
+    let inner = make_state_db();
+    inner
+        .set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
+        .await
+        .unwrap();
+    inner
+        .set_metadata("sync_token:PrimarySync", "prior-token")
+        .await
+        .unwrap();
+    let candidate_key =
+        pending_zone_token_key(&download::compute_config_hash(&config), "PrimarySync");
+    let wrapper =
+        FailingMetadataSetDb::without_set_failure(inner.clone(), "candidate promotion mutation")
+            .with_completed_candidate_mutation(
+                candidate_key.clone(),
+                "independent-candidate".into(),
+            );
+    let db: Arc<dyn download::DownloadStore> = Arc::new(wrapper);
+    let dir = tempfile::tempdir().unwrap();
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let library = make_run_cycle_library_state_with_album(
+        "PrimarySync",
+        "sync_token:PrimarySync",
+        make_full_album_with_boxed_session(
+            "PrimarySync",
+            Box::new(ConfigBridgeSession::new(
+                "PrimarySync",
+                "inventory-token",
+                "bridge-token",
+            )),
+        ),
+    );
+    let builder = make_run_cycle_download_config_builder(dir.path(), db.clone());
+    let result = run_cycle(
+        &[&library],
+        &config,
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        &shared,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(!result.db_sync_token_advance_safe);
+    assert_eq!(
+        inner
+            .get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("prior-token")
+    );
+    assert_eq!(
+        inner
+            .get_metadata(ENUM_CONFIG_HASH_KEY)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("old-enum-hash")
+    );
+    assert_eq!(
+        inner.get_metadata(&candidate_key).await.unwrap().as_deref(),
+        Some("independent-candidate")
+    );
+    assert_eq!(
+        inner
+            .get_metadata(PENDING_ENUM_CONFIG_HASH_KEY)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(download::compute_config_hash(&config).as_str())
+    );
+}

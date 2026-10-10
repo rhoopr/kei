@@ -543,6 +543,7 @@ async fn sparse_receipts_survive_report_changes_and_inventory_bridge_composition
         Some("after".into()),
         SyncStats::default(),
         vec![proof.clone()],
+        true,
     );
     // Reporting snapshots cannot erase or create durable checkpoint receipts.
     delta.stats = SyncStats::default();
@@ -557,6 +558,7 @@ async fn sparse_receipts_survive_report_changes_and_inventory_bridge_composition
             .is_none()
     );
     db.commit_checkpoint_transition(CheckpointTransition {
+        expected_metadata: Vec::new(),
         legacy_preservation_proofs: Vec::new(),
         legacy_config_hash: None,
         sparse_identity_proofs: inventory.checkpoint.sparse_identity_proofs,
@@ -586,4 +588,54 @@ async fn sparse_receipts_survive_report_changes_and_inventory_bridge_composition
                 .is_none()
         );
     }
+}
+
+#[test]
+fn mixed_delta_completion_provenance_preserves_vetoes_and_does_not_invent_successor() {
+    for complete in [false, true] {
+        let mut delta = SyncResult::from_incremental_execution(
+            DownloadOutcome::Success,
+            None,
+            SyncStats {
+                sync_token_blocked: true,
+                identity_incomplete: true,
+                state_write_failures: 1,
+                interrupted: true,
+                ..SyncStats::default()
+            },
+            Vec::new(),
+            complete,
+        );
+        let mut query = SyncResult::from_execution(
+            DownloadOutcome::Success,
+            Some("rank-query-eof".into()),
+            SyncStats::default(),
+        );
+        query.full_enumeration_ran = true;
+        delta.accumulate(&query);
+        assert_eq!(delta.checkpoint.completed_delta_replay, complete);
+        assert!(delta.full_enumeration_ran);
+        assert!(delta.checkpoint.sync_token_blocked);
+        assert!(delta.checkpoint.identity_incomplete);
+        assert!(delta.checkpoint.interrupted);
+        assert_eq!(delta.checkpoint.state_write_failures, 1);
+        assert!(delta.sync_token.is_none());
+        assert!(!delta.checkpoint.retained_token_rejected);
+    }
+}
+
+#[test]
+fn retained_token_rejection_composes_as_execution_evidence() {
+    let mut result = SyncResult::from_execution(
+        DownloadOutcome::Success,
+        Some("query-eof".into()),
+        SyncStats::default(),
+    );
+    let mut fallback =
+        SyncResult::from_execution(DownloadOutcome::Success, None, SyncStats::default());
+    fallback.checkpoint.retained_token_rejected = true;
+    result.accumulate(&fallback);
+    result.stats = SyncStats::default();
+    assert!(result.checkpoint.retained_token_rejected);
+    assert!(!result.checkpoint.completed_delta_replay);
 }

@@ -123,7 +123,25 @@ pub(super) async fn include_pending_local_work(
             .primary_layout_operations(zone.to_owned())
             .await
             .map_or(true, |rows| !rows.is_empty());
-        if capture_pending || rewrite_pending || identity_pending || layout_pending {
+        let retained_checkpoint_pending = match db
+            .get_metadata(&format!(
+                "{}{zone}",
+                crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
+            ))
+            .await
+        {
+            Ok(marker) => marker.is_some(),
+            Err(_error) => {
+                tracing::warn!("Could not inspect retained checkpoint hold before watch pre-check");
+                true
+            }
+        };
+        if capture_pending
+            || rewrite_pending
+            || identity_pending
+            || layout_pending
+            || retained_checkpoint_pending
+        {
             local_work_zones.insert(library.zone_name.clone());
         }
     }

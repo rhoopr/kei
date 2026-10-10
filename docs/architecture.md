@@ -729,6 +729,38 @@ A linked record name, missing/deleted shared zone, or history of removing a
 Shared Photo Library is not a source deletion or master identity. No automatic
 cross-zone recovery or checkpoint relaxation is added.
 
+A complete inventory followed by an explicitly rejected retained cursor creates
+`retained_checkpoint_hold:<zone>`. The versioned receipt contains a cursor
+fingerprint, requested enumeration/preservation policy hashes, an attempt count,
+and the next attempt deadline; it contains no provider identity or cursor value. Unchanged
+held zones defer provider, inventory and legacy preparation work for one hour.
+The initial rejection and two automatic retries form a finite budget of three
+attempts per boundary and policy. Exhausted holds perform no further provider
+work. Due attempts reserve their count and next deadline durably before requests,
+so interrupted or incomplete attempts consume a reservation. A failed reservation
+performs no provider work. Version-one receipts without a count retain one spent
+attempt. Malformed or unsupported receipts remain an actionable hold with no
+provider work. Genuine policy or active cursor changes permit bounded re-evaluation. Original assets, owner/date facts, legacy
+generations, transfer retries and sparse/deletion evidence remain intact.
+
+A fresh inventory and its counts cannot establish lost historical deletion
+facts or resolve this hold. Permanently rejected boundaries remain actionable
+holds; this protocol does not rebootstrap them. A successful validated replay
+of the retained boundary removes the hold in the same transaction that stages
+or activates its successor. Transaction-time metadata comparisons fence both
+hold staging and checkpoint promotion against changes to the planned cursor
+and enumeration configuration, including the exact staged candidate read during
+aggregate promotion. Existing legacy/sparse generation validation
+still applies. Global configuration activation remains atomic across selected
+zones. Zone-local hold aggregation keeps status and backup safety truthful even
+when another zone succeeds.
+
+Ordinary incremental producers carry validated changes/zone completion separately
+from query enumeration. Mixed unfiled and smart-folder refreshes retain the actual
+delta successor and every identity, partial-scan, cancellation and durable-write
+veto. A successful smart query does not certify retained-boundary replay. Typed
+provider cursor rejection is distinct from malformed or missing successor data.
+
 The per-zone provider checkpoint and the scoped database pre-check token have
 different gates:
 
