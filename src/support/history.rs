@@ -219,12 +219,13 @@ pub(crate) fn complete(stats: &crate::download::SyncStats, outcome: &'static str
 }
 
 pub(crate) fn observe(kind: &'static str, fields: Value) {
-    if let Some(recorder) = ACTIVE.get()
-        && let Some(fields) = fields
-            .as_object()
-            .and_then(|v| privacy::diagnostic(kind, v))
+    if let Some(fields) = fields
+        .as_object()
+        .and_then(|v| privacy::diagnostic(kind, v))
     {
-        recorder.send(Message::Observe(kind, fields));
+        // One production bridge lets typed owners and provider tracing share the
+        // same allowlist and enables disposable production-path fixture capture.
+        tracing::debug!(diagnostic = kind, support_fields = %Value::Object(fields));
     }
 }
 
@@ -238,6 +239,10 @@ pub(crate) fn observe_scoped(
     mut fields: Value,
 ) {
     let Some(recorder) = ACTIVE.get() else {
+        if let Some(map) = fields.as_object_mut() {
+            map.insert("correlation_unavailable".into(), Value::Bool(true));
+        }
+        observe(kind, fields);
         return;
     };
     let key = if let Some((id, version)) = item {
@@ -517,7 +522,10 @@ fn save(path: &Path, history: &mut History) -> std::io::Result<()> {
         file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
-        crate::fs_util::atomic_install(&temporary, path)
+        // Staging is already in the same directory. A failed rename must never
+        // invoke a copying fallback or follow an unowned predictable sibling.
+        std::fs::rename(&temporary, path)?;
+        crate::fs_util::fsync_parent_dir(path)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -557,6 +565,16 @@ impl Visit for Visitor {
         }
     }
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "support_fields" {
+            let rendered = format!("{value:?}");
+            if rendered.len() <= 64 * 1024
+                && let Ok(Value::Object(fields)) = serde_json::from_str(&rendered)
+            {
+                // The selected diagnostic contract is applied again on_event.
+                self.fields.extend(fields);
+            }
+            return;
+        }
         // Formatting is allowed only for explicitly typed enum/optional scalar
         // fields. Other debug values can carry arbitrary private data.
         if matches!(field.name(), "oldest_refreshed_url_observed_age_secs") {

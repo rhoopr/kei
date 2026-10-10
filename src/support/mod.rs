@@ -42,6 +42,31 @@ pub(crate) fn runtime_configuration(config: &crate::config::Config) -> Value {
         serde_json::to_value(crate::report::RunOptions::from_config(config)).unwrap_or(Value::Null);
     if let Some(map) = value.as_object_mut() {
         map.insert(
+            "file_match_policy".into(),
+            json!(match config.photos.file_match_policy {
+                crate::types::FileMatchPolicy::NameSizeDedupWithSuffix =>
+                    "name-size-dedup-with-suffix",
+                crate::types::FileMatchPolicy::NameId7 => "name-id7",
+            }),
+        );
+        map.insert(
+            "raw_policy".into(),
+            json!(match config.photos.raw_policy {
+                crate::types::RawPolicy::AsIs => "as-is",
+                crate::types::RawPolicy::PreferRaw => "prefer-raw",
+                crate::types::RawPolicy::PreferJpeg => "prefer-jpeg",
+            }),
+        );
+        map.insert(
+            "live_photo_mode".into(),
+            json!(match config.photos.live_photo_mode {
+                crate::types::LivePhotoMode::Both => "both",
+                crate::types::LivePhotoMode::ImageOnly => "image-only",
+                crate::types::LivePhotoMode::VideoOnly => "video-only",
+                crate::types::LivePhotoMode::Skip => "skip",
+            }),
+        );
+        map.insert(
             "filename_exclusions".into(),
             json!(config.download.filename_exclude.len()),
         );
@@ -290,4 +315,27 @@ pub(crate) fn download_error_fields(
         }
         DownloadError::Other(error) => error_fields(operation, error),
     }
+}
+
+pub(crate) fn observe_metadata(path: &Path, kind: &'static str, fields: Value) {
+    observe_scoped(
+        "metadata",
+        Some((&path.to_string_lossy(), "metadata")),
+        kind,
+        fields,
+    );
+}
+
+pub(crate) fn metadata_error(
+    path: &Path,
+    stage: &'static str,
+    error: &anyhow::Error,
+    committed: Option<bool>,
+) {
+    let mut fields = error_fields("metadata_capture", error);
+    if let Some(map) = fields.as_object_mut() {
+        map.insert("stage".into(), json!(stage));
+        map.insert("publication_committed".into(), json!(committed));
+    }
+    observe_metadata(path, "support_task_error_v1", fields);
 }

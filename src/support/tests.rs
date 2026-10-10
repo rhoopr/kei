@@ -207,7 +207,7 @@ fn owning_checkpoint_decisions_survive_support_allowlist_without_tokens() {
 
 #[test]
 fn existing_refresh_hold_and_hardlink_fixed_fields_survive_production_layer() {
-    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::layer::SubscriberExt;
     let (layer, drain) = super::history::test_layer();
     tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
         tracing::warn!(
@@ -243,6 +243,73 @@ fn existing_refresh_hold_and_hardlink_fixed_fields_survive_production_layer() {
     assert!(
         !serde_json::to_string(&evidence)
             .unwrap()
+            .contains("PRIVATE")
+    );
+}
+
+#[test]
+fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
+    use crate::types::{FileMatchPolicy, LivePhotoMode, RawPolicy};
+    let dir = tempfile::tempdir().unwrap();
+    let globals = crate::config::GlobalArgs {
+        username: Some("PRIVATE_USER".into()),
+        domain: None,
+        data_dir: Some(dir.path().to_string_lossy().into_owned()),
+    };
+    let toml: crate::config::TomlConfig = toml::from_str(&format!(
+        "[download]\ndirectory={:?}",
+        dir.path().to_string_lossy()
+    ))
+    .unwrap();
+    let mut config = crate::config::Config::build(
+        &globals,
+        &crate::cli::PasswordArgs::default(),
+        crate::cli::SyncArgs::default(),
+        Some(&toml),
+    )
+    .unwrap();
+    for (variant, label) in [
+        (
+            FileMatchPolicy::NameSizeDedupWithSuffix,
+            "name-size-dedup-with-suffix",
+        ),
+        (FileMatchPolicy::NameId7, "name-id7"),
+    ] {
+        config.photos.file_match_policy = variant;
+        assert_eq!(
+            super::runtime_configuration(&config)["file_match_policy"],
+            label
+        );
+    }
+    for (variant, label) in [
+        (RawPolicy::AsIs, "as-is"),
+        (RawPolicy::PreferRaw, "prefer-raw"),
+        (RawPolicy::PreferJpeg, "prefer-jpeg"),
+    ] {
+        config.photos.raw_policy = variant;
+        assert_eq!(super::runtime_configuration(&config)["raw_policy"], label);
+    }
+    for (variant, label) in [
+        (LivePhotoMode::Both, "both"),
+        (LivePhotoMode::ImageOnly, "image-only"),
+        (LivePhotoMode::VideoOnly, "video-only"),
+        (LivePhotoMode::Skip, "skip"),
+    ] {
+        config.photos.live_photo_mode = variant;
+        assert_eq!(
+            super::runtime_configuration(&config)["live_photo_mode"],
+            label
+        );
+        let input: crate::config::TomlConfig =
+            toml::from_str(&format!("[photos]\nlive_photo_mode={label:?}")).unwrap();
+        assert_eq!(
+            super::configuration(Some(&input), true)["live_photo_mode"],
+            label
+        );
+    }
+    assert!(
+        !super::runtime_configuration(&config)
+            .to_string()
             .contains("PRIVATE")
     );
 }

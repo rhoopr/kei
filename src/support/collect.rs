@@ -202,9 +202,11 @@ fn filesystem(raw_directory: Option<&str>) -> Value {
     };
     let directory = crate::config::expand_tilde(raw);
     let entry = std::fs::symlink_metadata(&directory).ok();
-    let mut result = json!({"status": "observational_only", "directory_present": entry.is_some(),
+    let result = json!({"status": "observational_only", "directory_present": entry.is_some(),
         "directory_is_symlink": entry.is_some_and(|m| m.file_type().is_symlink()),
         "family": "unavailable", "write_semantics": "not_probed"});
+    #[cfg(target_os = "linux")]
+    let mut result = result;
     #[cfg(target_os = "linux")]
     if let Some(bytes) = read_bytes(Path::new("/proc/self/mountinfo"), 256 * 1024)
         && let Ok(text) = std::str::from_utf8(&bytes)

@@ -364,3 +364,29 @@ fn dropped_cycle_handoff_cannot_overwrite_prior_completed_evidence() {
     assert_eq!(history.cycles.len(), 2);
     assert_eq!(history.cycles[1].stats["downloaded"], 2);
 }
+
+#[cfg(unix)]
+#[test]
+fn failed_history_rename_never_uses_an_unowned_copy_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("support.json");
+    std::fs::create_dir(&path).unwrap();
+    let media = dir.path().join("media.jpg");
+    std::fs::write(&media, b"private media").unwrap();
+    let sibling = path.with_extension(format!("json.kei-xdev-tmp-{}", std::process::id()));
+    std::os::unix::fs::symlink(&media, &sibling).unwrap();
+    let mut history = History {
+        schema_version: 1,
+        ..History::default()
+    };
+    apply(&mut history, Message::Start(json!({})));
+    assert!(save(&path, &mut history).is_err());
+    assert_eq!(std::fs::read(media).unwrap(), b"private media");
+    assert!(
+        std::fs::symlink_metadata(sibling)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(path.is_dir());
+}

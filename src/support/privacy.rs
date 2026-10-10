@@ -300,6 +300,8 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
         | "sparse_share_reference_unresolved"
         | "sparse_share_reference_malformed" => Some(&["reference_zone", "lookup_zone", "count"]),
         "support_task_error_v1" => Some(&[
+            "stage",
+            "publication_committed",
             "operation",
             "class",
             "errno",
@@ -359,6 +361,7 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "path_shape_equal",
         ]),
         "support_metadata_v1" => Some(&[
+            "timestamp_planned",
             "operation",
             "backend",
             "source_fractional",
@@ -451,6 +454,19 @@ pub(crate) fn fixed_label(value: &str) -> bool {
 }
 
 const LABELS: &[&str] = &[
+    "name-size-dedup-with-suffix",
+    "name-id7",
+    "prefer-raw",
+    "prefer-jpeg",
+    "image-only",
+    "video-only",
+    "skip",
+    "metadata_probe",
+    "metadata_prepare",
+    "metadata_publish",
+    "sidecar_plan",
+    "sidecar_write",
+    "source_gps",
     "enumeration_incomplete",
     "dry_run",
     "stale_pass_plan",
