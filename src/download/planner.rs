@@ -211,6 +211,7 @@ impl TaskPlanner {
         self.add_downloaded_paths(vec![crate::state::DownloadedFileRecord {
             added_at: None,
             is_current_path: true,
+            is_preserved_history: false,
             library: proof.library.clone(),
             id: proof.id.clone(),
             version_size: proof.version_size,
