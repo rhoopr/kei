@@ -953,3 +953,128 @@ fn status_failed_truncates_past_print_cap() {
         "truncation tail missing; stdout: {stdout}"
     );
 }
+
+#[test]
+fn status_retained_checkpoint_holds_show_actionable_redacted_guidance_after_other_zone_success() {
+    use sha2::{Digest, Sha256};
+
+    let private_cursor = "private-retained-cursor";
+    let cursor_hash = format!("{:x}", Sha256::digest(private_cursor.as_bytes()));
+    let hold = |attempt_count| {
+        serde_json::json!({
+            "version": 1,
+            "prior_cursor_sha256": cursor_hash,
+            "enum_config_hash": "private-requested-policy",
+            "preservation_config_hash": null,
+            "next_attempt_at": chrono::Utc::now().timestamp() + 3600,
+            "attempt_count": attempt_count
+        })
+        .to_string()
+    };
+    for (encoded, action, guidance) in [
+        (
+            hold(1),
+            "await_retained_checkpoint_evidence",
+            "Retained cursor rejected. Recovery makes at most three automatic attempts, at least one hour apart; exhausted holds require authoritative retained-history evidence. Preserve the state database and media. Fresh inventory alone cannot resolve this hold.",
+        ),
+        (
+            hold(3),
+            "retained_checkpoint_retry_exhausted",
+            "Automatic retained-checkpoint recovery exhausted. Active source/configuration and historical work remain retained. Preserve the state database and media while obtaining authoritative retained-history evidence.",
+        ),
+        (
+            format!("malformed-private-held-evidence:{private_cursor}"),
+            "repair_retained_checkpoint_evidence",
+            "Retained recovery evidence is malformed or unsupported. Provider work is paused. Preserve the state database and media and restore validated recovery evidence before resuming.",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let username = "test@example.com";
+        let kept = dir.path().join("preserved.jpg");
+        let bytes = include_bytes!("../data/media/pattern.jpg");
+        std::fs::write(&kept, bytes).unwrap();
+        let conn = create_state_db(dir.path(), username);
+        insert_asset(
+            &conn,
+            "kept",
+            "downloaded",
+            "preserved.jpg",
+            Some(kept.to_str().unwrap()),
+            None,
+            None,
+        );
+        conn.execute(
+            "INSERT INTO asset_metadata_capture_revisions (library,asset_id,revision,updated_at) VALUES ('PrimarySync','kept',1,1700000000)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO sync_runs(started_at,completed_at,status) VALUES (1700000000,1700000010,'complete')",
+            [],
+        ).unwrap();
+        for (key, value) in [
+            ("sync_token:PrimarySync", private_cursor),
+            ("retained_checkpoint_hold:PrimarySync", encoded.as_str()),
+            // A separately successful zone has overwritten the global summary.
+            // The durable per-zone hold must still control operator status.
+            (
+                "sync_token:SharedSync-private",
+                "private-healthy-zone-cursor",
+            ),
+            ("last_checkpoint_status", "current"),
+            ("last_recovery_action", "none"),
+        ] {
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key,value) VALUES (?1,?2)",
+                [key, value],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let output = clean_cmd()
+            .env("ICLOUD_USERNAME", username)
+            .env("KEI_DATA_DIR", dir.path())
+            .arg("status")
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == "Provider checkpoint: preserved"),
+            "{action}: {stdout}"
+        );
+        assert!(
+            !stdout.contains("Provider checkpoint: current"),
+            "{action}: {stdout}"
+        );
+        assert!(stdout.contains("Backup status: unsafe - retained provider history is unavailable; recovery evidence is required"), "{action}: {stdout}");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == format!("Last recovery action: {action}")),
+            "{stdout}"
+        );
+        assert!(
+            stdout.lines().any(|line| line.trim() == guidance),
+            "{action}: {stdout}"
+        );
+        let diagnostics = format!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        for private in [
+            private_cursor,
+            cursor_hash.as_str(),
+            "private-requested-policy",
+            "private-healthy-zone-cursor",
+            "SharedSync-private",
+            "malformed-private-held-evidence",
+        ] {
+            assert!(
+                !diagnostics.contains(private),
+                "{action} exposed private evidence: {diagnostics}"
+            );
+        }
+        assert_eq!(std::fs::read(&kept).unwrap(), bytes);
+    }
+}

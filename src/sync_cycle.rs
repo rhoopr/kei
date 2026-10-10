@@ -982,63 +982,62 @@ pub(crate) async fn run_cycle(
         // legacy work, including attempts later cancelled or found incomplete.
         if !config.runtime.dry_run
             && let Some(db) = state_db
+            && let Some(encoded) = retained_hold_at_start
+            && let Ok(hold) = serde_json::from_str::<RetainedCheckpointHold>(&encoded)
+            && let Some(prior) = retained_cursor_at_start.as_deref()
         {
-            if let Some(encoded) = retained_hold_at_start
-                && let Ok(hold) = serde_json::from_str::<RetainedCheckpointHold>(&encoded)
-                && let Some(prior) = retained_cursor_at_start.as_deref()
-            {
-                let mut current = RetainedCheckpointHold::new(
-                    &prior,
-                    &enum_config_hash,
-                    preservation_config_hash.as_deref(),
-                );
-                if hold.matches(&current) {
-                    let exhausted = hold.attempt_count >= RETAINED_CHECKPOINT_MAX_ATTEMPTS;
-                    current.attempt_count = hold.attempt_count.saturating_add(1);
-                    retained_checkpoint_attempt = current.attempt_count;
-                    let deferred = exhausted || hold.deferred(chrono::Utc::now().timestamp());
-                    let reservation_failed = if deferred {
-                        false
+            let mut current = RetainedCheckpointHold::new(
+                prior,
+                &enum_config_hash,
+                preservation_config_hash.as_deref(),
+            );
+            if hold.matches(&current) {
+                let exhausted = hold.attempt_count >= RETAINED_CHECKPOINT_MAX_ATTEMPTS;
+                current.attempt_count = hold.attempt_count.saturating_add(1);
+                retained_checkpoint_attempt = current.attempt_count;
+                let deferred = exhausted || hold.deferred(chrono::Utc::now().timestamp());
+                let reservation_failed = if deferred {
+                    false
+                } else {
+                    persist_retained_checkpoint_hold(
+                        db,
+                        hold_key.clone(),
+                        &current,
+                        zone_metadata_fence.clone(),
+                    )
+                    .await
+                    .is_err()
+                };
+                if !deferred
+                    && !reservation_failed
+                    && let Some((_, expected)) = zone_metadata_fence.last_mut()
+                {
+                    *expected = Some(serde_json::to_string(&current)?);
+                }
+                if deferred || reservation_failed {
+                    block_for_retained_checkpoint(&mut cycle_stats);
+                    cycle_stats
+                        .sync_token_blocked_zone
+                        .get_or_insert_with(|| lib_state.zone_name.clone());
+                    if reservation_failed {
+                        cycle_stats.state_write_failures =
+                            cycle_stats.state_write_failures.saturating_add(1);
+                    }
+                    cycle_failed_count = cycle_failed_count.saturating_add(1);
+                    db_sync_token_advance_safe = false;
+                    checkpoint_hold_action = Some(if exhausted {
+                        RecoveryAction::RetainedCheckpointRetryExhausted.as_str()
                     } else {
-                        persist_retained_checkpoint_hold(
-                            db,
-                            hold_key.clone(),
-                            &current,
-                            zone_metadata_fence.clone(),
-                        )
-                        .await
-                        .is_err()
-                    };
-                    if !deferred && !reservation_failed {
-                        if let Some((_, expected)) = zone_metadata_fence.last_mut() {
-                            *expected = Some(serde_json::to_string(&current)?);
-                        }
-                    }
-                    if deferred || reservation_failed {
-                        block_for_retained_checkpoint(&mut cycle_stats);
-                        cycle_stats
-                            .sync_token_blocked_zone
-                            .get_or_insert_with(|| lib_state.zone_name.clone());
-                        if reservation_failed {
-                            cycle_stats.state_write_failures =
-                                cycle_stats.state_write_failures.saturating_add(1);
-                        }
-                        cycle_failed_count = cycle_failed_count.saturating_add(1);
-                        db_sync_token_advance_safe = false;
-                        checkpoint_hold_action = Some(if exhausted {
-                            RecoveryAction::RetainedCheckpointRetryExhausted.as_str()
-                        } else {
-                            RecoveryAction::AwaitRetainedCheckpointEvidence.as_str()
-                        });
-                        tracing::warn!(
-                            diagnostic = "retained_checkpoint_expired",
-                            retry_deferred = deferred,
-                            state_write_failed = reservation_failed,
-                            retry_exhausted = exhausted,
-                            "Retained checkpoint evidence is unavailable; preserving history and deferring recovery"
-                        );
-                        continue;
-                    }
+                        RecoveryAction::AwaitRetainedCheckpointEvidence.as_str()
+                    });
+                    tracing::warn!(
+                        diagnostic = "retained_checkpoint_expired",
+                        retry_deferred = deferred,
+                        state_write_failed = reservation_failed,
+                        retry_exhausted = exhausted,
+                        "Retained checkpoint evidence is unavailable; preserving history and deferring recovery"
+                    );
+                    continue;
                 }
             }
         }
