@@ -3,7 +3,6 @@
 use super::prepared::{
     PreparedMetadataFile, TmpGuard, create_unique_embed_temp, fingerprint_bytes,
 };
-use super::probe::probe_from_native_metadata;
 use super::values::MetadataWrite;
 use super::xmp_fields::{apply_to_xmp, ensure_initialized};
 use crate::download::heif;
@@ -72,7 +71,13 @@ pub(super) fn prepare_metadata_heif(
                 path.display()
             );
         };
-        heif::rewrite_exif_capture_time(&input, datetime, offset).with_context(|| {
+        heif::rewrite_exif_capture_time(
+            &input,
+            datetime,
+            offset,
+            write.datetime_subseconds.as_deref(),
+        )
+        .with_context(|| {
             format!(
                 "Could not update native HEIC Exif capture time in {}",
                 path.display()
@@ -130,16 +135,17 @@ pub(super) fn prepare_metadata_heif(
                     tmp_path.display()
                 )
             })?;
-        let native_metadata = Metadata::new_from_vec(&native_tiff, FileExtension::TIFF)
-            .with_context(|| {
-                format!(
-                    "Could not parse rewritten native HEIC Exif in {}",
-                    tmp_path.display()
-                )
-            })?;
-        let native_probe = probe_from_native_metadata(&native_metadata);
+        Metadata::new_from_vec(&native_tiff, FileExtension::TIFF).with_context(|| {
+            format!(
+                "Could not parse rewritten native HEIC Exif in {}",
+                tmp_path.display()
+            )
+        })?;
+        let native_probe = heif::extract_exif_capture_time(&rewritten)?
+            .ok_or_else(|| anyhow::anyhow!("Rewritten HEIC lost its native capture time"))?;
         if native_probe.datetime_original.as_deref() != write.datetime.as_deref()
             || native_probe.offset_time_original.as_deref() != write.offset_time_original.as_deref()
+            || native_probe.subseconds_original.as_deref() != write.datetime_subseconds.as_deref()
         {
             anyhow::bail!(
                 "Rewritten HEIC native Exif does not contain the requested capture timestamp and offset: {}",

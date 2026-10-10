@@ -130,6 +130,7 @@ impl From<std::io::Error> for HeifExifError {
 #[derive(Debug)]
 pub(crate) struct ExifCaptureTime {
     pub(crate) datetime_original: Option<String>,
+    pub(crate) subseconds_original: Option<String>,
     pub(crate) offset_time_original: Option<String>,
 }
 

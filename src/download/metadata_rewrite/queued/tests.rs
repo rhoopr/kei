@@ -829,78 +829,99 @@ async fn refresh_drain_repairs_native_heif_capture_time_before_retiring_marker()
     use little_exif::filetype::FileExtension;
     use little_exif::metadata::Metadata;
 
-    let dir = tempfile::tempdir().unwrap();
-    let photo_path = dir.path().join("native-capture-repair.heic");
-    std::fs::write(
-        &photo_path,
-        with_capture_xmp(include_bytes!("../../../../tests/data/sample.heic")),
-    )
-    .unwrap();
-    let checksum = crate::download::file::compute_sha256(&photo_path)
+    for millis in [629, 7, 0] {
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("native-capture-repair.heic");
+        std::fs::write(
+            &photo_path,
+            with_capture_xmp(include_bytes!("../../../../tests/data/sample.heic")),
+        )
+        .unwrap();
+        let checksum = crate::download::file::compute_sha256(&photo_path)
+            .await
+            .unwrap();
+
+        let created_local = now_local() + chrono::Duration::milliseconds(millis);
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("HEIF_CAPTURE_REPAIR")
+            .filename("native-capture-repair.heic")
+            .checksum("provider-checksum")
+            .created_at(created_local.with_timezone(&chrono::Utc))
+            .metadata(AssetMetadata {
+                timezone_offset: Some(39_600),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "HEIF_CAPTURE_REPAIR",
+            "original",
+            &photo_path,
+            &checksum,
+            None,
+        )
         .await
         .unwrap();
+        queue_capture_repair(&db, &record).await;
 
-    let created_local = now_local();
-    let db = SqliteStateDb::open_in_memory().unwrap();
-    let record = crate::test_helpers::TestAssetRecord::new("HEIF_CAPTURE_REPAIR")
-        .filename("native-capture-repair.heic")
-        .checksum("provider-checksum")
-        .created_at(created_local.with_timezone(&chrono::Utc))
-        .metadata(AssetMetadata {
-            timezone_offset: Some(39_600),
-            ..AssetMetadata::default()
-        })
-        .build();
-    db.upsert_seen(&record).await.unwrap();
-    db.mark_downloaded(
-        "PrimarySync",
-        "HEIF_CAPTURE_REPAIR",
-        "original",
-        &photo_path,
-        &checksum,
-        None,
-    )
-    .await
-    .unwrap();
-    queue_capture_repair(&db, &record).await;
+        let residual = crate::download::drain_pending_metadata_rewrites(
+            &db as &dyn DownloadStore,
+            &MetadataConfig {
+                set_exif_datetime: true,
+                ..MetadataConfig::default()
+            },
+            CaptureTimestampRepair::ReplaceWithCaptureLocal,
+            &["PrimarySync"],
+            Arc::from(".metadata-test"),
+            &CancellationToken::new(),
+        )
+        .await;
 
-    let residual = crate::download::drain_pending_metadata_rewrites(
-        &db as &dyn DownloadStore,
-        &MetadataConfig {
-            set_exif_datetime: true,
-            ..MetadataConfig::default()
-        },
-        CaptureTimestampRepair::ReplaceWithCaptureLocal,
-        &["PrimarySync"],
-        Arc::from(".metadata-test"),
-        &CancellationToken::new(),
-    )
-    .await;
-
-    assert_eq!(residual, 0);
-    assert!(
-        db.get_pending_metadata_rewrites(1)
-            .await
+        assert_eq!(residual, 0);
+        assert!(
+            db.get_pending_metadata_rewrites(1)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the marker may retire only after native Exif is repaired"
+        );
+        let bytes = std::fs::read(&photo_path).unwrap();
+        let tiff = crate::download::heif::extract_exif_tiff_bytes(&bytes)
             .unwrap()
-            .is_empty(),
-        "the marker may retire only after native Exif is repaired"
-    );
-    let bytes = std::fs::read(&photo_path).unwrap();
-    let tiff = crate::download::heif::extract_exif_tiff_bytes(&bytes)
-        .unwrap()
-        .expect("native Exif item");
-    let metadata = Metadata::new_from_vec(&tiff, FileExtension::TIFF).unwrap();
-    assert!(metadata
+            .expect("native Exif item");
+        let metadata = Metadata::new_from_vec(&tiff, FileExtension::TIFF).unwrap();
+        assert!(metadata
         .get_tag(&ExifTag::DateTimeOriginal(String::new()))
         .any(|tag| matches!(tag, ExifTag::DateTimeOriginal(value) if value == "2024:06:15 10:00:00")));
-    assert!(
-        metadata
-            .get_tag(&ExifTag::OffsetTimeOriginal(String::new()))
-            .any(|tag| matches!(tag, ExifTag::OffsetTimeOriginal(value) if value == "+11:00"))
-    );
-    let probe = crate::download::metadata::probe_exif(&photo_path).unwrap();
-    assert!(probe.denotes_capture_time(&created_local));
-    assert_eq!(probe.offset_time_original.as_deref(), Some("+11:00"));
+        assert!(
+            metadata
+                .get_tag(&ExifTag::OffsetTimeOriginal(String::new()))
+                .any(|tag| matches!(tag, ExifTag::OffsetTimeOriginal(value) if value == "+11:00"))
+        );
+        let probe = crate::download::metadata::probe_exif(&photo_path).unwrap();
+        assert!(probe.denotes_capture_time(&created_local));
+        assert_eq!(probe.offset_time_original.as_deref(), Some("+11:00"));
+        let expected_fraction = (millis != 0).then(|| format!("{millis:03}"));
+        let capture = crate::download::heif::extract_exif_capture_time(&bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(capture.subseconds_original, expected_fraction);
+        let packet = crate::download::heif::extract_xmp_strict(&bytes)
+            .unwrap()
+            .unwrap();
+        let xmp: XmpMeta = std::str::from_utf8(&packet).unwrap().parse().unwrap();
+        assert_eq!(
+            xmp.property(xmp_ns::EXIF, "DateTimeOriginal")
+                .unwrap()
+                .value,
+            created_local.format("%Y-%m-%dT%H:%M:%S%.f%:z").to_string()
+        );
+        assert_eq!(
+            probe.native_heif_capture_time_repair_required(&created_local, "+11:00"),
+            Ok(Some(false))
+        );
+    }
 }
 
 #[cfg(feature = "xmp")]
@@ -992,67 +1013,77 @@ async fn heif_capture_repair_without_native_exif_keeps_marker_pending() {
     use crate::state::SqliteStateDb;
     use crate::state::types::AssetMetadata;
 
-    let dir = tempfile::tempdir().unwrap();
-    let photo_path = dir.path().join("xmp-only-capture-repair.avif");
-    let source = with_capture_xmp(include_bytes!("../../../../tests/data/white_1x1.avif"));
-    assert!(
-        crate::download::heif::extract_exif_tiff_bytes(&source)
-            .unwrap()
-            .is_none(),
-        "the fixture must have no native Exif item"
-    );
-    std::fs::write(&photo_path, &source).unwrap();
-    let checksum = crate::download::file::compute_sha256(&photo_path)
+    let sample = include_bytes!("../../../../tests/data/sample.heic");
+    let tag = sample
+        .windows(8)
+        .position(|value| value == [0x92, 0x91, 0, 2, 0, 0, 0, 4])
+        .unwrap();
+    let mut missing_subseconds = sample.to_vec();
+    missing_subseconds[tag + 1] = 0x94;
+    let mut short_subseconds = sample.to_vec();
+    short_subseconds[tag + 7] = 1;
+    for source in [
+        with_capture_xmp(include_bytes!("../../../../tests/data/white_1x1.avif")),
+        with_capture_xmp(&missing_subseconds),
+        with_capture_xmp(&short_subseconds),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let photo_path = dir.path().join("xmp-only-capture-repair.avif");
+        std::fs::write(&photo_path, &source).unwrap();
+        let checksum = crate::download::file::compute_sha256(&photo_path)
+            .await
+            .unwrap();
+
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("XMP_ONLY_CAPTURE_REPAIR")
+            .filename("xmp-only-capture-repair.avif")
+            .checksum("provider-checksum")
+            .created_at(
+                (now_local() + chrono::Duration::milliseconds(629)).with_timezone(&chrono::Utc),
+            )
+            .metadata(AssetMetadata {
+                timezone_offset: Some(39_600),
+                ..AssetMetadata::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "XMP_ONLY_CAPTURE_REPAIR",
+            "original",
+            &photo_path,
+            &checksum,
+            None,
+        )
         .await
         .unwrap();
+        queue_capture_repair(&db, &record).await;
 
-    let db = SqliteStateDb::open_in_memory().unwrap();
-    let record = crate::test_helpers::TestAssetRecord::new("XMP_ONLY_CAPTURE_REPAIR")
-        .filename("xmp-only-capture-repair.avif")
-        .checksum("provider-checksum")
-        .created_at(now_local().with_timezone(&chrono::Utc))
-        .metadata(AssetMetadata {
-            timezone_offset: Some(39_600),
-            ..AssetMetadata::default()
-        })
-        .build();
-    db.upsert_seen(&record).await.unwrap();
-    db.mark_downloaded(
-        "PrimarySync",
-        "XMP_ONLY_CAPTURE_REPAIR",
-        "original",
-        &photo_path,
-        &checksum,
-        None,
-    )
-    .await
-    .unwrap();
-    queue_capture_repair(&db, &record).await;
+        let residual = crate::download::drain_pending_metadata_rewrites(
+            &db as &dyn DownloadStore,
+            &MetadataConfig {
+                set_exif_datetime: true,
+                ..MetadataConfig::default()
+            },
+            CaptureTimestampRepair::ReplaceWithCaptureLocal,
+            &["PrimarySync"],
+            Arc::from(".metadata-test"),
+            &CancellationToken::new(),
+        )
+        .await;
 
-    let residual = crate::download::drain_pending_metadata_rewrites(
-        &db as &dyn DownloadStore,
-        &MetadataConfig {
-            set_exif_datetime: true,
-            ..MetadataConfig::default()
-        },
-        CaptureTimestampRepair::ReplaceWithCaptureLocal,
-        &["PrimarySync"],
-        Arc::from(".metadata-test"),
-        &CancellationToken::new(),
-    )
-    .await;
-
-    assert_eq!(residual, 1);
-    assert_eq!(
-        db.get_pending_metadata_rewrites(1).await.unwrap().len(),
-        1,
-        "a HEIF without native Exif must retain its repair marker"
-    );
-    assert_eq!(
-        std::fs::read(&photo_path).unwrap(),
-        source,
-        "a refused repair must not change the file"
-    );
+        assert_eq!(residual, 1);
+        assert_eq!(
+            db.get_pending_metadata_rewrites(1).await.unwrap().len(),
+            1,
+            "a HEIF without writable paired capture storage must retain its repair marker"
+        );
+        assert_eq!(
+            std::fs::read(&photo_path).unwrap(),
+            source,
+            "a refused repair must not change the file"
+        );
+    }
 }
 
 #[cfg(feature = "xmp")]

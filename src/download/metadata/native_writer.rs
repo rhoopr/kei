@@ -55,8 +55,12 @@ pub(super) fn prepare_metadata_native(
         metadata.set_tag(ExifTag::CreateDate(dt.clone()));
         metadata.set_tag(ExifTag::ModifyDate(dt.clone()));
         metadata.remove_tag(ExifTag::SubSecTimeOriginal(String::new()));
+        metadata.remove_tag(ExifTag::SubSecTimeDigitized(String::new()));
+        metadata.remove_tag(ExifTag::SubSecTime(String::new()));
         if let Some(subseconds) = &write.datetime_subseconds {
             metadata.set_tag(ExifTag::SubSecTimeOriginal(subseconds.clone()));
+            metadata.set_tag(ExifTag::SubSecTimeDigitized(subseconds.clone()));
+            metadata.set_tag(ExifTag::SubSecTime(subseconds.clone()));
         }
     }
     if write.clear_datetime_offsets {
@@ -275,37 +279,40 @@ mod native_tests {
     fn native_apply_metadata_preserves_datetime_subseconds_without_xmp() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_jpeg(dir.path(), "native-subseconds.jpg");
-        apply_metadata(
-            &path,
-            &MetadataWrite {
-                datetime: Some("2024:06:15 10:00:00".into()),
-                datetime_subseconds: Some("629".into()),
-                ..MetadataWrite::default()
-            },
-            ".kei-tmp",
-        )
-        .unwrap();
-        let metadata = Metadata::new_from_path(&path).unwrap();
-        assert!(matches!(
-            metadata.get_tag(&ExifTag::SubSecTimeOriginal(String::new())).next(),
-            Some(ExifTag::SubSecTimeOriginal(value)) if value == "629"
-        ));
-        apply_metadata(
-            &path,
-            &MetadataWrite {
-                datetime: Some("2024:06:15 10:00:01".into()),
-                ..MetadataWrite::default()
-            },
-            ".kei-tmp",
-        )
-        .unwrap();
-        let metadata = Metadata::new_from_path(&path).unwrap();
-        assert!(
-            metadata
-                .get_tag(&ExifTag::SubSecTimeOriginal(String::new()))
-                .next()
-                .is_none()
-        );
+        let mut stale = Metadata::new();
+        stale.set_tag(ExifTag::SubSecTimeOriginal("111".into()));
+        stale.set_tag(ExifTag::SubSecTimeDigitized("222".into()));
+        stale.set_tag(ExifTag::SubSecTime("333".into()));
+        stale.write_to_file(&path).unwrap();
+        for fraction in [Some("629"), Some("007"), None] {
+            apply_metadata(
+                &path,
+                &MetadataWrite {
+                    datetime: Some("2024:06:15 10:00:00".into()),
+                    datetime_subseconds: fraction.map(str::to_owned),
+                    ..MetadataWrite::default()
+                },
+                ".kei-tmp",
+            )
+            .unwrap();
+            let metadata = Metadata::new_from_path(&path).unwrap();
+            for template in [
+                ExifTag::SubSecTimeOriginal(String::new()),
+                ExifTag::SubSecTimeDigitized(String::new()),
+                ExifTag::SubSecTime(String::new()),
+            ] {
+                let value = metadata
+                    .get_tag(&template)
+                    .next()
+                    .and_then(|tag| match tag {
+                        ExifTag::SubSecTimeOriginal(value)
+                        | ExifTag::SubSecTimeDigitized(value)
+                        | ExifTag::SubSecTime(value) => Some(value.as_str()),
+                        _ => None,
+                    });
+                assert_eq!(value, fraction, "paired tag 0x{:04x}", template.as_u16());
+            }
+        }
     }
 
     #[test]

@@ -158,6 +158,7 @@ fn plan_metadata_write_withholds_offset_from_an_unverified_timestamp() {
             #[cfg(feature = "xmp")]
             native_heif_capture_time: crate::download::metadata::HeifNativeCaptureTime::Present {
                 datetime_original: Some(existing.clone()),
+                subseconds_original: Some("629".into()),
                 offset_time_original: Some("+11:00".into()),
             },
             ..crate::download::metadata::ExifProbe::default()
@@ -258,6 +259,7 @@ fn plan_metadata_write_accepts_iso_timestamps_from_the_xmp_probe() {
             #[cfg(feature = "xmp")]
             native_heif_capture_time: crate::download::metadata::HeifNativeCaptureTime::Present {
                 datetime_original: Some(existing.clone()),
+                subseconds_original: Some("629".into()),
                 offset_time_original: Some("+11:00".into()),
             },
             ..crate::download::metadata::ExifProbe::default()

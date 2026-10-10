@@ -85,6 +85,8 @@ pub(super) async fn prepare_embed_metadata(
                 Ok(Some(_)) => {
                     write.datetime =
                         Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string());
+                    let millis = created_local.timestamp_subsec_millis();
+                    write.datetime_subseconds = (millis != 0).then(|| format!("{millis:03}"));
                     write.offset_time_original = Some(expected_offset);
                     write.clear_datetime_offsets = probe.has_any_datetime_offset();
                 }

@@ -32,6 +32,7 @@ pub(in crate::download) enum HeifNativeCaptureTime {
     #[cfg(feature = "xmp")]
     Present {
         datetime_original: Option<String>,
+        subseconds_original: Option<String>,
         offset_time_original: Option<String>,
     },
     #[cfg(feature = "xmp")]
@@ -92,10 +93,17 @@ impl ExifProbe {
             #[cfg(feature = "xmp")]
             HeifNativeCaptureTime::Present {
                 datetime_original: Some(datetime),
+                subseconds_original,
                 offset_time_original: Some(offset),
             } => {
                 let denotes_capture_time = capture_timestamp_matches(datetime, created_local);
-                Ok(Some(!denotes_capture_time || offset != expected_offset))
+                let expected_subseconds = (created_local.timestamp_subsec_millis() != 0)
+                    .then(|| format!("{:03}", created_local.timestamp_subsec_millis()));
+                Ok(Some(
+                    !denotes_capture_time
+                        || offset != expected_offset
+                        || subseconds_original != &expected_subseconds,
+                ))
             }
         }
     }
@@ -212,6 +220,7 @@ fn probe_exif_heif(path: &Path) -> ExifProbe {
         Ok(Some(capture_time)) => {
             probe.native_heif_capture_time = HeifNativeCaptureTime::Present {
                 datetime_original: capture_time.datetime_original,
+                subseconds_original: capture_time.subseconds_original,
                 offset_time_original: capture_time.offset_time_original,
             };
         }
@@ -286,13 +295,22 @@ fn mark_heif_exif_unreadable(probe: &mut ExifProbe) {
 }
 
 pub(super) fn probe_from_native_metadata(meta: &Metadata) -> ExifProbe {
-    let datetime_original = meta
+    let mut datetime_original = meta
         .get_tag(&ExifTag::DateTimeOriginal(String::new()))
         .next()
         .and_then(|tag| match tag {
             ExifTag::DateTimeOriginal(value) => Some(value.clone()),
             _ => None,
         });
+    if let Some(datetime) = &mut datetime_original
+        && let Some(ExifTag::SubSecTimeOriginal(subseconds)) = meta
+            .get_tag(&ExifTag::SubSecTimeOriginal(String::new()))
+            .next()
+        && !subseconds.is_empty()
+    {
+        datetime.push('.');
+        datetime.push_str(subseconds);
+    }
     let offset_time_original = meta
         .get_tag(&ExifTag::OffsetTimeOriginal(String::new()))
         .next()
@@ -408,7 +426,7 @@ mod tests {
         );
         assert_eq!(
             probe.datetime_original.as_deref(),
-            Some("2023:09:03 09:28:14"),
+            Some("2023:09:03 09:28:14.307"),
             "probe must retain the native HEIF Exif datetime when XMP does not replace it",
         );
         assert_eq!(probe.offset_time_original.as_deref(), Some("+03:00"));
@@ -422,7 +440,7 @@ mod tests {
         let probe = probe_exif(&path).expect("probe_exif must succeed on HEIC");
         assert_eq!(
             probe.datetime_original.as_deref(),
-            Some("2023:09:03 09:28:14"),
+            Some("2023:09:03 09:28:14.307"),
             "HEIF probe must retain DateTimeOriginal from the Exif item"
         );
         assert_eq!(probe.offset_time_original.as_deref(), Some("+03:00"));

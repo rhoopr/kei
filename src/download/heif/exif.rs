@@ -324,7 +324,19 @@ fn validate_tiff_patch_ranges(
             return Err(invalid_layout("TIFF contains too many linked IFDs"));
         }
         let (structure, entries, next_ifd) = read_tiff_ifd(tiff, ifd_offset, endian)?;
-        protected.push(structure);
+        // Only a target entry's own inline value may change within its IFD.
+        let mut start = structure.start;
+        for entry in &entries {
+            if entry.count <= 4
+                && let Some((_, range)) = targets
+                    .iter()
+                    .find(|(target, _)| target.start == entry.start)
+            {
+                protected.push(start..range.start);
+                start = range.end;
+            }
+        }
+        protected.push(start..structure.end);
         for (offset_tag, length_tag) in [(0x0111, 0x0117), (0x0144, 0x0145), (0x0201, 0x0202)] {
             protected.extend(tiff_referenced_data_ranges(
                 tiff, &entries, endian, offset_tag, length_tag,
@@ -447,6 +459,7 @@ pub(crate) fn extract_exif_capture_time(
     let Some(exif_ifd_offset) = exif_ifd_offset else {
         return Ok(Some(ExifCaptureTime {
             datetime_original: None,
+            subseconds_original: None,
             offset_time_original: None,
         }));
     };
@@ -456,8 +469,13 @@ pub(crate) fn extract_exif_capture_time(
     let offset_time_original = find_tiff_entry(&tiff, exif_ifd_offset, 0x9011, endian)?
         .map(|entry| tiff_ascii_value(&tiff, entry))
         .transpose()?;
+    let subseconds_original = find_tiff_entry(&tiff, exif_ifd_offset, 0x9291, endian)?
+        .map(|entry| tiff_ascii_value(&tiff, entry))
+        .transpose()?
+        .filter(|value| !value.is_empty());
     Ok(Some(ExifCaptureTime {
         datetime_original,
+        subseconds_original,
         offset_time_original,
     }))
 }
@@ -482,12 +500,21 @@ fn replace_tiff_ascii(tiff: &mut [u8], range: Range<usize>, value: &str) -> Resu
 /// Replace an existing native HEIF capture timestamp and offset without
 /// resizing or re-encoding the Exif item. Files without a native
 /// `DateTimeOriginal` need no native repair. A native timestamp without a
-/// safely writable paired offset is rejected so its durable marker remains.
+/// safely writable paired offset or requested subsecond storage is rejected
+/// so its durable marker remains. Existing subseconds are cleared for whole seconds.
 pub(crate) fn rewrite_exif_capture_time(
     bytes: &[u8],
     datetime: &str,
     offset: &str,
+    subseconds: Option<&str>,
 ) -> Result<Option<Vec<u8>>, HeifError> {
+    if subseconds.is_some_and(|value| {
+        value.is_empty() || value.len() > 9 || !value.bytes().all(|b| b.is_ascii_digit())
+    }) {
+        return Err(invalid_layout(
+            "replacement HEIF Exif subseconds are invalid",
+        ));
+    }
     if datetime.len() != 19 || offset.len() != 6 {
         return Err(invalid_layout(
             "replacement HEIF Exif capture time has an invalid length",
@@ -583,14 +610,28 @@ pub(crate) fn rewrite_exif_capture_time(
     let datetime_original_range = tiff_ascii_range(&tiff, datetime_original)?;
     let offset_time_original_range = tiff_ascii_range(&tiff, offset_time_original)?;
 
-    let targets = [
+    let mut targets = vec![
         (datetime_original, datetime_original_range.clone()),
         (offset_time_original, offset_time_original_range.clone()),
     ];
+    let subsecond_entry = find_tiff_entry(&tiff, exif_ifd_offset, 0x9291, endian)?;
+    let subsecond_range = subsecond_entry
+        .map(|entry| tiff_ascii_range(&tiff, entry))
+        .transpose()?;
+    if let (Some(entry), Some(range)) = (subsecond_entry, &subsecond_range) {
+        targets.push((entry, range.clone()));
+    } else if subseconds.is_some() {
+        return Err(invalid_layout(
+            "HEIF Exif timestamp has no writable paired subseconds",
+        ));
+    }
     validate_tiff_patch_ranges(&tiff, endian, ifd0_offset, &targets)?;
 
     replace_tiff_ascii(&mut tiff, datetime_original_range, datetime)?;
     replace_tiff_ascii(&mut tiff, offset_time_original_range, offset)?;
+    if let Some(range) = subsecond_range {
+        replace_tiff_ascii(&mut tiff, range, subseconds.unwrap_or(""))?;
+    }
 
     let mut output = bytes.to_vec();
     output
@@ -642,7 +683,7 @@ mod tests {
 
         assert!(
             matches!(
-                rewrite_exif_capture_time(&input, "2024:06:15 10:00:00", "+11:00"),
+                rewrite_exif_capture_time(&input, "2024:06:15 10:00:00", "+11:00", None),
                 Err(HeifError::InvalidLayout { reason })
                     if reason.contains("overlaps other TIFF data")
             ),
@@ -673,6 +714,7 @@ mod tests {
             input,
             std::str::from_utf8(NEW_DATETIME).unwrap(),
             std::str::from_utf8(NEW_OFFSET).unwrap(),
+            Some("307"),
         )
         .expect("native Exif capture time rewrite")
         .expect("sample HEIC has a native capture timestamp");
@@ -712,6 +754,110 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_exif_capture_time_updates_and_clears_inline_subseconds() {
+        let input = include_bytes!("../../../tests/data/sample.heic");
+        for fraction in [Some("629"), Some("007"), None] {
+            let output =
+                rewrite_exif_capture_time(input, "2024:06:15 10:00:00", "+11:00", fraction)
+                    .unwrap()
+                    .unwrap();
+            let capture = extract_exif_capture_time(&output).unwrap().unwrap();
+            assert_eq!(
+                capture.datetime_original.as_deref(),
+                Some("2024:06:15 10:00:00")
+            );
+            assert_eq!(capture.offset_time_original.as_deref(), Some("+11:00"));
+            assert_eq!(capture.subseconds_original.as_deref(), fraction);
+            assert_eq!(output.len(), input.len());
+            let tiff = extract_exif_tiff_bytes(input).unwrap().unwrap();
+            let (endian, _, ifd) = super::tiff_capture_ifd_offsets(&tiff).unwrap();
+            let entry = super::find_tiff_entry(&tiff, ifd.unwrap(), 0x9291, endian)
+                .unwrap()
+                .unwrap();
+            let range = super::tiff_ascii_range(&tiff, entry).unwrap();
+            assert!(range.len() <= 4, "fixture exercises inline ASCII storage");
+            let mut expected = tiff.clone();
+            for (tag, value) in [
+                (0x9003, "2024:06:15 10:00:00"),
+                (0x9011, "+11:00"),
+                (0x9291, fraction.unwrap_or("")),
+            ] {
+                let entry = super::find_tiff_entry(&tiff, ifd.unwrap(), tag, endian)
+                    .unwrap()
+                    .unwrap();
+                super::replace_tiff_ascii(
+                    &mut expected,
+                    super::tiff_ascii_range(&tiff, entry).unwrap(),
+                    value,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                extract_exif_tiff_bytes(&output).unwrap().unwrap(),
+                expected,
+                "no unrelated TIFF bytes may change"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_exif_capture_time_refuses_missing_or_short_subsecond_storage() {
+        use little_exif::{exif_tag::ExifTag, filetype::FileExtension, metadata::Metadata};
+        for fraction in [None, Some("")] {
+            let mut metadata = Metadata::new();
+            metadata.set_tag(ExifTag::DateTimeOriginal("2023:09:03 09:28:14".into()));
+            metadata.set_tag(ExifTag::OffsetTimeOriginal("+03:00".into()));
+            if let Some(value) = fraction {
+                metadata.set_tag(ExifTag::SubSecTimeOriginal(value.into()));
+            }
+            let exif = metadata.as_u8_vec(FileExtension::HEIF).unwrap();
+            let input = heic_with_exif_items(&[(2, &exif)], vec![ref_box(b"cdsc", 2, &[1])]);
+            let before = input.clone();
+            assert!(
+                rewrite_exif_capture_time(&input, "2024:06:15 10:00:00", "+11:00", Some("629"))
+                    .is_err()
+            );
+            assert_eq!(input, before);
+        }
+    }
+
+    #[test]
+    fn rewrite_exif_capture_time_rejects_aliased_inline_subseconds() {
+        use little_exif::{exif_tag::ExifTag, filetype::FileExtension, metadata::Metadata};
+
+        let mut metadata = Metadata::new();
+        metadata.set_tag(ExifTag::DateTimeOriginal("2023:09:03 09:28:14".into()));
+        metadata.set_tag(ExifTag::OffsetTimeOriginal("+03:00".into()));
+        metadata.set_tag(ExifTag::SubSecTimeOriginal("307".into()));
+        metadata.set_tag(ExifTag::ImageDescription("other metadata".into()));
+        let exif = metadata.as_u8_vec(FileExtension::HEIF).unwrap();
+        let input = heic_with_exif_items(&[(2, &exif)], vec![ref_box(b"cdsc", 2, &[1])]);
+        let mut tiff = extract_exif_tiff_bytes(&input).unwrap().unwrap();
+        let (endian, ifd0, exif_ifd) = super::tiff_capture_ifd_offsets(&tiff).unwrap();
+        let fraction = super::find_tiff_entry(&tiff, exif_ifd.unwrap(), 0x9291, endian)
+            .unwrap()
+            .unwrap();
+        let range = super::tiff_ascii_range(&tiff, fraction).unwrap();
+        assert_eq!(range.len(), 4);
+        let description = super::find_tiff_entry(&tiff, ifd0, 0x010E, endian)
+            .unwrap()
+            .unwrap();
+        let offset = u32::try_from(range.start).unwrap();
+        let encoded = match endian {
+            super::TiffEndian::Little => offset.to_le_bytes(),
+            super::TiffEndian::Big => offset.to_be_bytes(),
+        };
+        tiff[description.start + 8..description.start + 12].copy_from_slice(&encoded);
+        let mut exif = vec![0; 4];
+        exif.extend_from_slice(&tiff);
+        let input = heic_with_exif_items(&[(2, &exif)], vec![ref_box(b"cdsc", 2, &[1])]);
+        assert!(matches!(
+            rewrite_exif_capture_time(&input, "2024:06:15 10:00:00", "+11:00", Some("629")),
+            Err(HeifError::InvalidLayout { reason }) if reason.contains("overlaps other TIFF data")
+        ));
+    }
+
+    #[test]
     fn rewrite_exif_capture_time_refuses_an_unpaired_native_timestamp() {
         use little_exif::exif_tag::ExifTag;
         use little_exif::filetype::FileExtension;
@@ -722,7 +868,7 @@ mod tests {
         let exif = metadata.as_u8_vec(FileExtension::HEIF).unwrap();
         let input = heic_with_exif_items(&[(2, &exif)], vec![ref_box(b"cdsc", 2, &[1])]);
 
-        let result = rewrite_exif_capture_time(&input, "2024:06:15 10:00:00", "+11:00");
+        let result = rewrite_exif_capture_time(&input, "2024:06:15 10:00:00", "+11:00", None);
         assert!(
             matches!(result, Err(HeifError::InvalidLayout { reason }) if reason.contains("paired offset")),
             "a timestamp without a writable native offset must remain pending"
@@ -779,7 +925,7 @@ mod tests {
             iref_children: vec![ref_box(b"cdsc", 2, &[1]), ref_box(b"dimg", 1, &[3])],
         });
 
-        let result = rewrite_exif_capture_time(&input, "2024:06:15 10:00:00", "+11:00");
+        let result = rewrite_exif_capture_time(&input, "2024:06:15 10:00:00", "+11:00", None);
         assert!(
             matches!(result, Err(HeifError::InvalidLayout { reason }) if reason.contains("item-offset")),
             "item-offset dependants make in-place Exif repair unsafe"

@@ -90,7 +90,7 @@ changing behavior.
 | HEIF facade and file-backed reads | `src/download/heif.rs`, `src/download/heif/file.rs` | Preserves HEIF entry points and typed errors; locates native Exif with bounded file reads without loading media payloads. |
 | HEIF layout | `src/download/heif/boxes.rs`, `src/download/heif/items.rs` | Owns box boundaries, item tables, extent resolution, and item-location encoding. |
 | HEIF metadata relationships | `src/download/heif/relationships.rs` | Resolves primary-image metadata ownership and encodes item references. Ambiguous ownership fails closed. |
-| HEIF native Exif | `src/download/heif/exif.rs` | Extracts native Exif and repairs capture timestamps within the TIFF payload. |
+| HEIF native Exif | `src/download/heif/exif.rs` | Extracts native Exif and repairs capture timestamps, offsets, and paired subseconds within existing TIFF storage. Unsafe or insufficient storage leaves repair pending; native values are verified before publication. |
 | HEIF XMP | `src/download/heif/xmp_read.rs`, `src/download/heif/xmp_write.rs` | Reads, inserts, and replaces the selected XMP packet without re-encoding image payloads. |
 | HEIF preservation checks | `src/download/heif/preservation.rs` | Validates non-XMP item payloads and opaque metadata after a rewrite. |
 | Metadata rewrite facade and immediate execution | `src/download/metadata_rewrite.rs`, `src/download/metadata_rewrite/immediate.rs` | Preserves rewrite entry points and coordinates download-time metadata writes. The pipeline retains media publication and state finalization. |
