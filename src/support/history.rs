@@ -171,6 +171,7 @@ enum Message {
     Start(Value),
     Begin(Value),
     Complete(Value, &'static str),
+    #[cfg(test)]
     Observe(&'static str, Map<String, Value>),
     Event(String, Map<String, Value>),
     Stop,
@@ -407,6 +408,7 @@ fn apply(history: &mut History, message: Message) -> bool {
                 cycle.stats = stats;
             }
         }
+        #[cfg(test)]
         Message::Observe(kind, fields) => add(history, kind, fields),
         Message::Event(kind, fields) => add(history, &kind, fields),
         Message::Stop => {

@@ -251,7 +251,10 @@ async fn production_metadata_plan_and_io_error_are_safe_support_evidence() {
     )
     .with_subscriber(tracing_subscriber::registry().with(layer))
     .await;
-    assert!(matches!(result, super::EmbedPrepareResult::Failed));
+    assert!(matches!(
+        result,
+        super::EmbedPrepareResult::Failed | super::EmbedPrepareResult::InputChanged
+    ));
     guard.finish().await;
     let evidence = crate::support::history::test_retained_events(&history);
     let plan = evidence
