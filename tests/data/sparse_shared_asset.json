@@ -8,7 +8,7 @@
       "value": 1700000000000
     },
     "isSparsePrivateRecord": {
-      "type": "INT64",
+      "type": "NUMBER_INT64",
       "value": 1
     },
     "linkedShareRecordName": {

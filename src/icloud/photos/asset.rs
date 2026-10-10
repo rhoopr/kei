@@ -82,13 +82,15 @@ impl SparseShareEvidence {
         .iter()
         .any(|key| fields.get(key).is_some());
         let marker = fields.get("isSparsePrivateRecord");
-        if !has_link
-            && (marker.is_none()
-                || (marker.and_then(|v| v.get("value")).and_then(Value::as_i64) == Some(0)
-                    && marker
-                        .and_then(|v| v.get("type"))
-                        .is_none_or(|kind| kind.as_str() == Some("INT64"))))
-        {
+        let marker_value = marker
+            .filter(|field| {
+                field
+                    .get("type")
+                    .is_none_or(|kind| matches!(kind.as_str(), Some("INT64" | "NUMBER_INT64")))
+            })
+            .and_then(|field| field.get("value"))
+            .and_then(Value::as_i64);
+        if !has_link && (marker.is_none() || marker_value == Some(0)) {
             return None;
         }
         fn field<'a>(fields: &'a Value, key: &str, kind: &str) -> Option<&'a Value> {
@@ -108,7 +110,7 @@ impl SparseShareEvidence {
                 .map(|s| SparseShareId(s.into()))
         }
         let link = (|| {
-            if field(fields, "isSparsePrivateRecord", "INT64").and_then(Value::as_i64) != Some(1) {
+            if marker_value != Some(1) {
                 return None;
             }
             let record_name = identifier(field(fields, "linkedShareRecordName", "STRING"))?;
@@ -1224,6 +1226,46 @@ mod tests {
     }
 
     #[test]
+    fn sparse_share_marker_accepts_only_exact_integer_type_aliases() {
+        let original = crate::test_helpers::sparse_shared_asset_record();
+        let expected = SparseShareEvidence::from_fields(&{
+            let mut fields = original["fields"].clone();
+            fields["isSparsePrivateRecord"]["type"] = json!("INT64");
+            fields
+        });
+        assert!(matches!(expected, Some(SparseShareEvidence::Linked(_))));
+        for kind in [Some("INT64"), Some("NUMBER_INT64"), None] {
+            let mut fields = original["fields"].clone();
+            let marker = fields["isSparsePrivateRecord"].as_object_mut().unwrap();
+            match kind {
+                Some(kind) => {
+                    marker.insert("type".into(), json!(kind));
+                }
+                None => {
+                    marker.remove("type");
+                }
+            }
+            let mut marker_only = json!({"isSparsePrivateRecord": marker});
+            assert_eq!(
+                SparseShareEvidence::from_fields(&fields),
+                expected,
+                "{kind:?}"
+            );
+            assert_eq!(
+                SparseShareEvidence::from_fields(&marker_only),
+                Some(SparseShareEvidence::Malformed),
+                "marker alone is not a link: {kind:?}"
+            );
+            marker_only["isSparsePrivateRecord"]["value"] = json!(0);
+            assert_eq!(
+                SparseShareEvidence::from_fields(&marker_only),
+                None,
+                "zero without a link: {kind:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sparse_share_durable_key_roundtrip_and_validation() {
         let raw = crate::test_helpers::sparse_shared_asset_record();
         let mut buffer = DeltaRecordBuffer::new();
@@ -1264,11 +1306,23 @@ mod tests {
         for (pointer, value) in [
             ("/isSparsePrivateRecord/value", json!("1")),
             ("/isSparsePrivateRecord/value", json!(0)),
+            ("/isSparsePrivateRecord/value", json!(-1)),
+            ("/isSparsePrivateRecord/value", json!(2)),
+            ("/isSparsePrivateRecord/value", json!(1.0)),
+            ("/isSparsePrivateRecord/value", json!(true)),
+            ("/isSparsePrivateRecord/value", json!(null)),
+            ("/isSparsePrivateRecord/value", json!(u64::MAX)),
+            ("/isSparsePrivateRecord/type", json!("number_int64")),
+            ("/isSparsePrivateRecord/type", json!("NUMBER_INT64 ")),
+            ("/isSparsePrivateRecord/type", json!("NUMBER_INT32")),
+            ("/isSparsePrivateRecord/type", json!(null)),
+            ("/isSparsePrivateRecord/type", json!(64)),
             ("/isSparsePrivateRecord/type", json!("STRING")),
             ("/linkedShareRecordName/value", json!(" ")),
             ("/linkedShareRecordName/type", json!("REFERENCE")),
             ("/linkedShareZoneName/value", json!("SharedSync-")),
             ("/linkedShareZoneName/value", json!("PrimarySync")),
+            ("/linkedShareZoneOwner/type", json!("STRING")),
             ("/linkedShareZoneOwner/value", json!("private-owner")),
             ("/linkedShareZoneOwner/value/recordName", json!(null)),
         ] {
