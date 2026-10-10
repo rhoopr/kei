@@ -386,6 +386,29 @@ pub(crate) fn filename_matches_identity_collision(
 
 /// Add a literal suffix before the file extension.
 ///
+/// Render a terminal role after identity/collision qualifiers, reserving its
+/// byte budget before truncation. Provider text is never stripped as a role.
+pub(crate) fn role_filename(filename: &str, qualifier: &str, role: &str) -> String {
+    let cleaned = clean_filename(filename);
+    let (stem, extension) = cleaned
+        .rsplit_once('.')
+        .map_or((cleaned.as_ref(), ""), |(s, e)| (s, e));
+    let tail = if extension.is_empty() {
+        format!("{qualifier}{role}")
+    } else {
+        format!("{qualifier}{role}.{extension}")
+    };
+    let budget = 255_usize.saturating_sub(tail.len());
+    let stem: String = stem
+        .chars()
+        .scan(0_usize, |used, c| {
+            *used += c.len_utf8();
+            (*used <= budget).then_some(c)
+        })
+        .collect();
+    format!("{stem}{tail}")
+}
+
 /// Unlike [`insert_suffix`], this does not add a hyphen. Use it for suffixes
 /// that already include their separator, such as `_edited`.
 pub(crate) fn insert_literal_suffix(path: &str, suffix: &str) -> String {

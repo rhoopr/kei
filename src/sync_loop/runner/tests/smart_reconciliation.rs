@@ -95,28 +95,34 @@ impl PhotosSession for SmartReconciliationSession {
 
 #[tokio::test]
 async fn run_cycle_smart_reconciliation_promotes_after_fresh_query_and_stays_quiet() {
-    smart_reconciliation_lifecycle("Hidden", false, false, None).await;
+    Box::pin(smart_reconciliation_lifecycle("Hidden", false, false, None)).await;
 }
 
 #[tokio::test]
 async fn run_cycle_smart_reconciliation_favorites_mixed_selection_stays_quiet() {
-    smart_reconciliation_lifecycle("Favorites", true, false, None).await;
+    Box::pin(smart_reconciliation_lifecycle(
+        "Favorites",
+        true,
+        false,
+        None,
+    ))
+    .await;
 }
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn run_cycle_smart_reconciliation_sidecars_survive_transition_and_restart() {
-    smart_reconciliation_lifecycle("Hidden", false, true, None).await;
+    Box::pin(smart_reconciliation_lifecycle("Hidden", false, true, None)).await;
 }
 
 #[tokio::test]
 async fn run_cycle_smart_reconciliation_other_empty_library_failure_holds_promotion() {
-    smart_reconciliation_lifecycle(
+    Box::pin(smart_reconciliation_lifecycle(
         "Hidden",
         false,
         false,
         Some(SmartReconciliationFault::OtherLibraryFailure),
-    )
+    ))
     .await;
 }
 
@@ -134,7 +140,13 @@ async fn run_cycle_smart_reconciliation_retains_incomplete_work_then_recovers() 
         SmartReconciliationFault::DownloadWrite,
         SmartReconciliationFault::IncompleteAlbumSnapshot,
     ] {
-        smart_reconciliation_lifecycle("Hidden", false, false, Some(fault)).await;
+        Box::pin(smart_reconciliation_lifecycle(
+            "Hidden",
+            false,
+            false,
+            Some(fault),
+        ))
+        .await;
     }
 }
 

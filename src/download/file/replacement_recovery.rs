@@ -529,6 +529,66 @@ pub(super) fn publish(
         .map_err(|error| retain_recovery_error(error, &journal, part))
 }
 
+/// The managed layout owner supplies retained no-follow parent capabilities;
+/// use the same conditional replacement journal and recovery as truncated repair.
+pub(super) fn publish_confined(
+    part: &ConfinedPath,
+    target: &ConfinedPath,
+    expected: ExistingFileFingerprint,
+    replacement: ExistingFileFingerprint,
+) -> Result<()> {
+    let target = target.sibling(target.path())?;
+    let mut journal = Journal::create(part, target, expected, replacement)?;
+    if let Err(error) = publish_journal(&journal, |_| Ok(())) {
+        if let Err(recovery_error) = journal.recover() {
+            return Err(retain_recovery_error(
+                error.context(format!(
+                    "Replacement recovery incomplete: {recovery_error:#}"
+                )),
+                &journal,
+                part.path(),
+            ));
+        }
+        return Err(error);
+    }
+    finish_publication(&mut journal, part.path())
+        .map_err(|error| retain_recovery_error(error, &journal, part.path()))
+}
+
+/// Resume only the exact temporary two-name link left by no-replace or the
+/// committed fallback journal. The layout's durable prepared receipt supplies
+/// custody, identity and bytes; unknown links never receive this authorization.
+pub(super) fn finish_owned_prepared_link(
+    part: &ConfinedPath,
+    target: &ConfinedPath,
+    expected: ExistingFileFingerprint,
+    expected_identity: FileIdentity,
+) -> Result<()> {
+    let Some(file) = part.open_optional_regular()? else {
+        return Ok(());
+    };
+    let links = crate::fs_util::file_link_count(&file)?;
+    if links == 1 {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        links == 2
+            && file_identity(&file)? == expected_identity
+            && same_entry(part, target)?
+            && read_fingerprint(part)? == Some(expected.into())
+            && read_fingerprint(target)? == Some(expected.into()),
+        "Unexpected prepared hardlink; retaining all bytes"
+    );
+    // CONTRACT: TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP
+    // This is the existing publication cleanup, with the additional persisted
+    // prepared identity and exact two-entry boundary required by layout recovery.
+    part.validate_identity(expected_identity)?;
+    unlink(part, 0)?;
+    part.sync_parent()?;
+    target.sync_parent()?;
+    Ok(())
+}
+
 fn retain_recovery_error(error: anyhow::Error, journal: &Journal, part: &Path) -> anyhow::Error {
     error
         .context(ConditionalPublishMustRetainPaths {

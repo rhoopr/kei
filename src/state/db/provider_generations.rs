@@ -1793,6 +1793,39 @@ pub(super) fn guard_metadata(
 
 /// Called inside the existing verified-download transaction using the actual
 /// native path and SHA-verified source checksum, never a lossy legacy path row.
+/// A preservation-backed layout commit proves the selected destination using
+/// pinned provider identity, independent local bytes, and prepared metadata.
+pub(super) fn record_layout_destination(
+    conn: &Connection,
+    record: &AssetRecord,
+    file: &super::primary_layout::LayoutFile,
+    flags: u8,
+) -> Result<(), StateError> {
+    validate_identity_decisions(conn, &record.library, &record.id)?;
+    let path = file.path.key()?;
+    let rows:Vec<(String,String,String)>=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND checksum=?5 AND size_bytes=?6 AND metadata_hash IS ?7 AND admitted=1")?.query_map(params![record.library,record.id,record.version_size.as_str(),path,record.checksum.as_ref(),i64::try_from(record.size_bytes).map_err(|_error|StateError::ProviderSelectionInvalid)?,record.metadata.metadata_hash],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
+    for (generation, key, child) in rows {
+        let root = load_generation(conn, &generation)?;
+        if root.spec.metadata_flags & flags != root.spec.metadata_flags {
+            return Err(StateError::ProviderWorkConflict);
+        }
+        let manifest = load_decision(conn, &root, &key, &child)?;
+        let destination = manifest
+            .decision
+            .destinations
+            .iter()
+            .find(|d| {
+                d.version_size == record.version_size.as_str()
+                    && d.path.key().ok().as_deref() == Some(path.as_str())
+            })
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        let local = data_encoding::HEXLOWER.encode(&file.fingerprint.sha256);
+        conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,verified_media=1,verified_metadata=1,local_checksum=?6,source_checksum=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,record.version_size.as_str(),path,local,file.source_checksum])?;
+        refresh_progress_hash(conn, &root, &manifest, destination)?;
+    }
+    Ok(())
+}
+
 pub(super) fn record_verified_destination(
     conn: &Connection,
     library: &str,

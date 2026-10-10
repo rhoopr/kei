@@ -158,6 +158,30 @@ impl PhotoAlbum {
         .await
     }
 
+    /// Use only source zones already validated by album hydration. A name from
+    /// another library does not authorize guessing a CloudKit zone.
+    pub(crate) async fn confirm_layout_asset(
+        &self,
+        child: &str,
+        zone: &str,
+    ) -> Result<CurrentCatalogAsset> {
+        if self.zone_name() == zone {
+            return self.confirm_catalog_asset(child).await;
+        }
+        let mut sources = self
+            .cross_zone_sources
+            .iter()
+            .filter(|source| source.zone_name() == zone);
+        let source = sources
+            .next()
+            .context("Primary layout has no validated provider source zone")?;
+        anyhow::ensure!(
+            sources.next().is_none(),
+            "Primary layout has ambiguous provider source zones"
+        );
+        source.confirm_catalog_asset(child).await
+    }
+
     pub(crate) async fn confirm_catalog_asset(&self, child: &str) -> Result<CurrentCatalogAsset> {
         let body = self.current_lookup_body(&[child]).await?;
         let zone = self.zone_id.as_ref().clone();

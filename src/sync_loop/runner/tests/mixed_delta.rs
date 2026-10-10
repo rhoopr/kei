@@ -113,12 +113,12 @@ fn hidden_album(session: MixedSession) -> PhotoAlbum {
 
 #[tokio::test]
 async fn mixed_valid_delta_hidden_refresh_promotes_inventory_bridge_then_quiet_reopen() {
-    mixed_lifecycle(true, None).await;
+    Box::pin(mixed_lifecycle(true, None)).await;
 }
 
 #[tokio::test]
 async fn mixed_valid_delta_hidden_refresh_clears_retained_identity_marker_without_extra_replay() {
-    mixed_lifecycle(false, None).await;
+    Box::pin(mixed_lifecycle(false, None)).await;
 }
 
 #[tokio::test]
@@ -130,7 +130,7 @@ async fn mixed_delta_hidden_refresh_preserves_vetoes_then_recovers_after_reopen(
         MixedFault::CheckpointWrite,
         MixedFault::StalePlan,
     ] {
-        mixed_lifecycle(true, Some(fault)).await;
+        Box::pin(mixed_lifecycle(true, Some(fault))).await;
     }
 }
 

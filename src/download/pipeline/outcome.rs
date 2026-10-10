@@ -95,6 +95,24 @@ pub(super) async fn finalize_streaming_download(
         }
     };
 
+    consumer.photos_downloaded += metrics
+        .layout_photos
+        .load(std::sync::atomic::Ordering::Relaxed);
+    consumer.videos_downloaded += metrics
+        .layout_videos
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if let Ok(recap) = metrics.layout_recap.lock() {
+        consumer.recap.merge(recap.clone());
+    }
+    consumer.downloaded += metrics
+        .layout_downloaded
+        .load(std::sync::atomic::Ordering::Relaxed);
+    consumer.bytes_downloaded_total += metrics
+        .layout_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    consumer.disk_bytes_total += metrics
+        .layout_disk_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
     let assets_seen_count = metrics
         .assets_seen
         .load(std::sync::atomic::Ordering::Relaxed);

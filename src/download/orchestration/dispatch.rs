@@ -305,6 +305,18 @@ async fn download_photos_with_sync_inner(
     controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
+    let primary_layout_requested = config.edited_naming == crate::types::EditedNaming::Primary
+        || match &config.state_db {
+            Some(db) => db.has_primary_layouts(&config.library).await?,
+            None => false,
+        };
+    let primary_layout_active = controls.run_mode.downloads_files() && primary_layout_requested;
+    let primary_layout_preview = !controls.run_mode.downloads_files() && primary_layout_requested;
+    let config = Arc::new(DownloadConfig {
+        primary_layout_active,
+        primary_layout_preview,
+        ..config.as_ref().clone()
+    });
     let sync_started_at = chrono::Utc::now().timestamp();
     super::generation::freeze_before_sync(passes, &config, controls).await?;
     if matches!(controls.run_mode, super::models::DownloadRunMode::Download) {
@@ -315,7 +327,12 @@ async fn download_photos_with_sync_inner(
         crate::download::file::recover_conditional_replacements(&config.directory, &protected)
             .await?;
     }
-    cleanup_orphan_part_files(&config).await;
+    if primary_layout_active {
+        super::primary_layout::recover(download_client, passes, &config, &shutdown_token).await?;
+    }
+    if controls.run_mode.downloads_files() {
+        cleanup_orphan_part_files(&config).await;
+    }
     if matches!(config.sync_mode, SyncMode::Incremental { .. })
         && let Some(db) = &config.state_db
     {
@@ -389,8 +406,10 @@ async fn download_photos_with_sync_inner(
             config
         };
 
-    super::queue_projection::admit_retained_work(passes, &config, controls, &shutdown_token)
-        .await?;
+    if !primary_layout_active {
+        super::queue_projection::admit_retained_work(passes, &config, controls, &shutdown_token)
+            .await?;
+    }
 
     let result = match &config.sync_mode {
         SyncMode::Full if config.selection_context.is_some() => {
@@ -625,6 +644,16 @@ async fn download_photos_with_sync_inner(
         result.sync_token = None;
     }
 
+    // Managed publication can complete the newly captured source in this cycle.
+    // Keep the existing bounded admission owner, but run it after capture so an
+    // otherwise quiet reopen does not need to hydrate yesterday's completed work.
+    if primary_layout_active
+        && matches!(result.outcome, DownloadOutcome::Success)
+        && !shutdown_token.is_cancelled()
+    {
+        super::queue_projection::admit_retained_work(passes, &config, controls, &shutdown_token)
+            .await?;
+    }
     super::generation::hold_retained_debt(passes, &config, controls, &mut result).await?;
 
     // Pending is transient — anything still pending after a complete sync either

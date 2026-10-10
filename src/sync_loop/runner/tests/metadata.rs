@@ -3647,7 +3647,12 @@ enum LegacyHardlinkFault {
 }
 
 async fn exercise_legacy_child_cycles(fault: AmbiguousChildFault, child_counts: &[usize]) {
-    exercise_legacy_child_cycles_with_hardlinks(fault, child_counts, None).await;
+    Box::pin(exercise_legacy_child_cycles_with_hardlinks(
+        fault,
+        child_counts,
+        None,
+    ))
+    .await;
 }
 
 async fn exercise_legacy_child_cycles_with_hardlinks(

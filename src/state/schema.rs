@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 34;
+pub(crate) const SCHEMA_VERSION: i32 = 35;
 
 fn migrate_active_selection(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(r"CREATE TABLE IF NOT EXISTS provider_active_generations (
@@ -1338,6 +1338,7 @@ fn migrate_to_version(
         32 => migrate_provider_work_retries(conn)?,
         33 => migrate_provider_selection(conn)?,
         34 => migrate_active_selection(conn)?,
+        35 => conn.execute_batch(super::db::primary_layout::DDL)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1883,6 +1884,52 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn primary_layout_schema_34_upgrade_preserves_existing_durable_evidence() {
+        let conn = Connection::open_in_memory().unwrap();
+        for version in 1..=34 {
+            migrate_to_version(&conn, 0, version).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO metadata(key,value) VALUES('sync_token:PrimarySync','old-token')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TABLE independent_native_evidence(path BLOB NOT NULL,body BLOB NOT NULL);INSERT INTO independent_native_evidence VALUES(X'00FF01',X'010203FF');").unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 34);
+        for _ in 0..2 {
+            migrate(&conn).unwrap();
+            assert_eq!(get_schema_version(&conn).unwrap(), 35);
+            assert_eq!(
+                conn.query_row::<String, _, _>(
+                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                "old-token"
+            );
+            assert_eq!(
+                conn.query_row::<Vec<u8>, _, _>(
+                    "SELECT body FROM independent_native_evidence WHERE path=X'00FF01'",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                [1, 2, 3, 255]
+            );
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM primary_layout_operations",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+                0
+            );
+        }
     }
 
     #[test]

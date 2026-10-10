@@ -277,6 +277,19 @@ where
             continue;
         };
         let path = PathBuf::from(local_path);
+        let _layout_guard =
+            match crate::download::file::lock_download_destination(&path, shutdown_token).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    errored += 1;
+                    continue;
+                }
+            };
+        if db.guard_primary_writer(&path).await.is_err() {
+            deferred += 1;
+            continue;
+        }
+
         if let Err(error) = crate::download::file::recover_metadata_replacements(&path).await {
             tracing::warn!(path = %path.display(), error = %format!("{error:#}"),
                 "Could not recover metadata replacement; leaving marker for retry");

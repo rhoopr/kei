@@ -16,7 +16,7 @@ pub(crate) const METADATA_CAPTURE_REVISION: i64 = 1;
 ///
 /// This is a 1-byte enum representing the version size, saving ~23 bytes
 /// per `AssetRecord` compared to storing as a String.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum VersionSizeKey {
     Original = 0,
@@ -93,7 +93,7 @@ impl From<AssetVersionSize> for VersionSizeKey {
 }
 
 /// Status of an asset in the state database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AssetStatus {
     /// Asset has been seen but not yet downloaded.
     Pending,
@@ -130,7 +130,7 @@ impl AssetStatus {
 }
 
 /// Media type of an asset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MediaType {
     Photo,
     Video,
@@ -181,7 +181,7 @@ impl MediaType {
 ///
 /// `metadata_hash` is computed from the metadata fields and stored alongside
 /// them so that incremental sync can detect metadata-only changes in O(1).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AssetMetadata {
     /// Source label for this record. Currently "icloud".
     /// Uses `Arc<str>` so cloned records can share string storage without
@@ -381,7 +381,7 @@ fn format_f64(v: f64) -> String {
 /// - 1-byte enums grouped at the end
 /// - `metadata` carried last (variable-size nullable fields, not part of the
 ///   memory-hot path for skip decisions)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssetRecord {
     // 8-byte aligned heap types
     /// CloudKit zone name (e.g. "PrimarySync", "SharedSync-A1B2C3D4-...")
@@ -602,9 +602,19 @@ pub struct MetadataCaptureStatus {
     pub last_error: Option<String>,
 }
 
+/// Durable managed-primary inventory; preservation is separate from network downloads.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct PrimaryLayoutSummary {
+    pub(crate) bound_families: u64,
+    pub(crate) preserved_files: u64,
+    pub(crate) pending_operations: u64,
+    pub(crate) held_operations: u64,
+}
+
 /// Summary of the current state database.
 #[derive(Debug, Clone)]
 pub struct SyncSummary {
+    pub(crate) primary_layout: Option<PrimaryLayoutSummary>,
     /// Zones retaining unresolved asset delta identity evidence.
     pub(crate) unresolved_identity_zones: u64,
     pub(crate) unresolved_sparse_records: u64,

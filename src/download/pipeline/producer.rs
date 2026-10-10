@@ -212,6 +212,12 @@ pub(super) struct StreamProducerMetrics {
     pub(super) provider_auth_errors: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) state_write_failures: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) enumeration_complete: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) layout_downloaded: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) layout_photos: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) layout_videos: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) layout_recap: Arc<std::sync::Mutex<crate::download::recap::RunRecap>>,
+    pub(super) layout_bytes: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) layout_disk_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub(super) struct StreamProducer {
@@ -220,6 +226,7 @@ pub(super) struct StreamProducer {
 }
 
 pub(super) fn spawn_stream_download_producer<S>(
+    client: reqwest::Client,
     combined: S,
     download_ctx: Arc<DownloadContext>,
     task_tx: mpsc::Sender<DownloadTask>,
@@ -241,6 +248,12 @@ where
     let provider_auth_errors = Arc::clone(&metrics.provider_auth_errors);
     let state_write_failures_producer = Arc::clone(&metrics.state_write_failures);
     let enumeration_complete_producer = Arc::clone(&metrics.enumeration_complete);
+    let layout_downloaded = Arc::clone(&metrics.layout_downloaded);
+    let layout_photos = Arc::clone(&metrics.layout_photos);
+    let layout_videos = Arc::clone(&metrics.layout_videos);
+    let layout_recap = Arc::clone(&metrics.layout_recap);
+    let layout_bytes = Arc::clone(&metrics.layout_bytes);
+    let layout_disk_bytes = Arc::clone(&metrics.layout_disk_bytes);
     let queued_bytes_producer = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let space_warn_emitted_producer = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -570,62 +583,81 @@ where
                                 continue 'assets;
                             }
                         }
-                        // Apply changed provider metadata before filtering and
-                        // path planning, so a metadata-only edit reaches the
-                        // catalogue even when the media task is filtered or
-                        // skipped as already on disk.
-                        let capture = crate::download::filter::metadata_capture(&asset);
-                        let drift = download_ctx.has_provider_metadata_drift(
-                            &library,
-                            asset.state_id(),
-                            &capture,
-                        );
-                        // A marker outlives a stale row whose stored hash still
-                        // matches the provider, which drift alone cannot see.
-                        let retry_marker = !drift
-                            && download_ctx
-                                .has_downloaded_metadata_retry_marker(&library, asset.state_id());
-                        if config.refresh_metadata || drift || retry_marker {
-                            metadata_refresh_attempted = true;
-                            // A marker-only refresh must not queue more work:
-                            // the marker is already visible for retry.
-                            let mark_for_rewrite =
-                                metadata_writers_enabled && (config.refresh_metadata || drift);
-                            match db
-                                .refresh_downloaded_asset_metadata(
+                        let layout_owns_metadata =
+                            match crate::download::orchestration::primary_layout::owns_metadata(
+                                &asset, config,
+                            )
+                            .await
+                            {
+                                Ok(owned) => owned,
+                                Err(error) => {
+                                    state_write_failures_producer
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!(%error, "Could not resolve managed metadata ownership");
+                                    producer_pb.inc(1);
+                                    continue 'assets;
+                                }
+                            };
+                        if !layout_owns_metadata {
+                            // Apply changed provider metadata before filtering and
+                            // path planning, so a metadata-only edit reaches the
+                            // catalogue even when the media task is filtered or
+                            // skipped as already on disk.
+                            let capture = crate::download::filter::metadata_capture(&asset);
+                            let drift = download_ctx.has_provider_metadata_drift(
+                                &library,
+                                asset.state_id(),
+                                &capture,
+                            );
+                            // A marker outlives a stale row whose stored hash still
+                            // matches the provider, which drift alone cannot see.
+                            let retry_marker = !drift
+                                && download_ctx.has_downloaded_metadata_retry_marker(
                                     &library,
                                     asset.state_id(),
-                                    (&capture, asset.created(), Some(asset.added_date())),
-                                    mark_for_rewrite,
-                                    capture_repair_requested(config),
-                                    crate::state::METADATA_CAPTURE_REVISION,
-                                )
-                                .await
-                            {
-                                Ok(updated) if updated > 0 => {}
-                                Ok(_) => {
-                                    // A forced sweep legitimately visits assets
-                                    // with no live downloaded row; drift and
-                                    // markers imply one exists.
-                                    if drift || retry_marker {
+                                );
+                            if config.refresh_metadata || drift || retry_marker {
+                                metadata_refresh_attempted = true;
+                                // A marker-only refresh must not queue more work:
+                                // the marker is already visible for retry.
+                                let mark_for_rewrite =
+                                    metadata_writers_enabled && (config.refresh_metadata || drift);
+                                match db
+                                    .refresh_downloaded_asset_metadata(
+                                        &library,
+                                        asset.state_id(),
+                                        (&capture, asset.created(), Some(asset.added_date())),
+                                        mark_for_rewrite,
+                                        capture_repair_requested(config),
+                                        crate::state::METADATA_CAPTURE_REVISION,
+                                    )
+                                    .await
+                                {
+                                    Ok(updated) if updated > 0 => {}
+                                    Ok(_) => {
+                                        // A forced sweep legitimately visits assets
+                                        // with no live downloaded row; drift and
+                                        // markers imply one exists.
+                                        if drift || retry_marker {
+                                            state_write_failures_producer
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            tracing::warn!(target: "kei::download::pipeline",
+                                                asset_id = %asset.id(),
+                                                library = %library,
+                                                "Changed provider metadata matched no downloaded state row"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
                                         state_write_failures_producer
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         tracing::warn!(target: "kei::download::pipeline",
                                             asset_id = %asset.id(),
                                             library = %library,
-                                            "Changed provider metadata matched no downloaded state row"
+                                            error = %e,
+                                            "Failed to refresh downloaded asset metadata"
                                         );
                                     }
-                                }
-                                Err(e) => {
-                                    state_write_failures_producer
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    tracing::warn!(target: "kei::download::pipeline",
-                                        asset_id = %asset.id(),
-                                        library = %library,
-                                        error = %e,
-                                        "Failed to refresh downloaded asset metadata"
-                                    );
                                 }
                             }
                         }
@@ -662,6 +694,66 @@ where
                             }
                         }
                     };
+                    if let Some(session) = task_planner.managed_layout_session() {
+                        match crate::download::orchestration::primary_layout::process_asset(
+                            &client,
+                            asset.clone(),
+                            config,
+                            &session,
+                            &producer_shutdown,
+                        )
+                        .await
+                        {
+                            Ok(Some((_asset, outcome))) => {
+                                layout_downloaded.fetch_add(
+                                    outcome.downloaded,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                layout_photos.fetch_add(
+                                    outcome.photos_downloaded,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                layout_videos.fetch_add(
+                                    outcome.videos_downloaded,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                if let Ok(mut recap) = layout_recap.lock() {
+                                    for downloaded in outcome.downloaded_assets {
+                                        recap.observe(config.pass_label(), downloaded);
+                                    }
+                                }
+                                layout_bytes.fetch_add(
+                                    outcome.network_bytes,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                layout_disk_bytes.fetch_add(
+                                    outcome.disk_bytes,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                if outcome.downloaded == 0 {
+                                    skips.on_disk += 1;
+                                } else {
+                                    // This asset completed through the layout
+                                    // owner instead of the ordinary task queue.
+                                    assets_forwarded += 1;
+                                }
+                            }
+                            Ok(None) => {
+                                enum_errors_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Err(error) => {
+                                enum_errors_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if let Some(run) = &config.selection_run {
+                                    run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                tracing::error!(%error,"Primary layout remains pending; checkpoint held");
+                            }
+                        }
+                        producer_pb.inc(1);
+                        continue 'assets;
+                    }
                     if let Some(reason) = plan.filter_reason {
                         skips.record_filter_reason(reason);
                         producer_pb.inc(1);

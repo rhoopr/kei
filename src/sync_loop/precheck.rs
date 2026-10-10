@@ -119,6 +119,10 @@ pub(super) async fn include_pending_local_work(
                 true
             }
         };
+        let layout_pending = db
+            .primary_layout_operations(zone.to_owned())
+            .await
+            .map_or(true, |rows| !rows.is_empty());
         let retained_checkpoint_pending = match db
             .get_metadata(&format!(
                 "{}{zone}",
@@ -132,7 +136,12 @@ pub(super) async fn include_pending_local_work(
                 true
             }
         };
-        if capture_pending || rewrite_pending || identity_pending || retained_checkpoint_pending {
+        if capture_pending
+            || rewrite_pending
+            || identity_pending
+            || layout_pending
+            || retained_checkpoint_pending
+        {
             local_work_zones.insert(library.zone_name.clone());
         }
     }

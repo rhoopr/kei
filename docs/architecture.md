@@ -150,6 +150,13 @@ replacement calls platform primitives and fingerprinting; reconciliation calls
 platform primitives and fingerprinting; validation uses fingerprinting for
 local-size evidence. Platform primitives do not decide replacement or retry
 policy. In particular, Windows partial-exchange recovery stays in replacement.
+Windows native move and backup-replacement calls share an absolute, lossless
+UTF-16 path adapter. It resolves ordinary Win32 separators and components
+without filesystem traversal, then supplies extended drive or UNC paths.
+Existing verbatim namespaces and native units remain intact; embedded NUL is
+rejected. Stored paths, confinement, no-overwrite flags, ownership checks and
+replacement recovery do not change. This avoids MAX_PATH failures in nested
+managed-primary staging without requiring a registry or manifest change.
 
 Pipeline tests use `download::pipeline::<owner>::tests::<test_name>` instead
 of `download::pipeline::tests::<test_name>`. The owners are `adoption`,
@@ -705,6 +712,11 @@ Validation does not advance the sync checkpoint or complete local processing.
 This lets more than 100 deleted sources complete over bounded lookup batches
 while unrelated zone records change, without relaxing checkpoint or state-write
 guards. Existing schema-26 outcome labels remain readable.
+
+Sparse observation and retry writes acquire an immediate SQLite transaction
+before reading generation or stale-attempt evidence. Independent WAL writers
+therefore serialize before those reads, preserving generation fences without
+a deferred snapshot upgrade.
 
 Hydration, explicitly soft-deleted source `CPLAsset` deltas, and exact-source
 hard-deletion tombstones supply generation-fenced receipts, not permission to
@@ -1784,7 +1796,7 @@ Stable IDs connect safety rules to production owners and focused tests.
 
 | Contract | Owner | Required behavior |
 |----------|-------|-------------------|
-| `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs`, `src/download/pipeline.rs` | Publishing a completed `.part` file never replaces an existing final file unless `--repair-truncated` carries exact durable path and fingerprint authorization. A no-replace collision succeeds only when the verified `.part` and destination bytes are identical. Different or unverifiable bytes retain retry evidence and cannot reach metadata writes or downloaded finalization. |
+| `FILE_PUBLISH_NO_OVERWRITE` | `src/download/file.rs`, `src/download/pipeline.rs` | Publishing a completed `.part` file never replaces an existing final file unless `--repair-truncated` carries exact durable path and fingerprint authorization, or opt-in `photos.edited_naming="primary"` carries a journaled owned-slot handover with an independent exact preservation receipt. A no-replace collision succeeds only when the verified `.part` and destination bytes are identical. Different or unverifiable bytes retain retry evidence and cannot reach metadata writes or downloaded finalization. |
 | `TEMP_FILE_DELETE_REQUIRES_DURABLE_OWNERSHIP` | `src/download/orchestration/cleanup.rs`, `src/download/pipeline.rs`, `src/fs_util.rs`, `src/state/db.rs` | Orphan cleanup deletes only an exact stale path claimed in durable state. It retains verified filesystem handles through removal and never follows a directory or file symlink. Normal completion and graceful interruption retire the claim. |
 | `SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE` | `src/sync_cycle.rs` | The database pre-check token advances only after a successful non-dry-run cycle with a current pass plan. |
 | `SOURCE_CHECKPOINT_REQUIRES_DURABLE_RECOVERY` | `src/sync_cycle.rs`, `src/download/orchestration/` | A zone checkpoint advances only with complete token evidence and durable recovery for unfinished work. |
@@ -1848,3 +1860,13 @@ Update this file in the same pull request when a change:
 
 Keep the guide focused on stable ownership and safety. Source code remains the
 final authority.
+
+## Managed edited-primary layouts
+
+`download/orchestration/primary_layout.rs` owns opt-in `photos.edited_naming` transitions. The shared selected-rendition renderer assigns current/original-archive roles without changing rendition keys, RAW selection or URL deduplication. The layout owner confirms current provider resources through the Photos adapter, prepares all selected members, preserves displaced media and sidecars as independent exact copies, then conditionally publishes and retires verified obsolete aliases. Default suffix families retain ordinary append-only behavior.
+
+Schema 35 adds independently addressable layout bindings, operations, members, path claims and immutable preservation receipts under `state/db/primary_layout.rs`. Scoped native paths, stable child and pass identity, source/config decisions and a checked binding generation pin each operation. Durable phases are planned, prepared, preserved, publishing and committed; cancellation retains its journal and private prepared files. Recovery runs after filesystem replacement recovery and before ordinary source dispatch. A started handover finishes its recorded generation before new source/config work may plan another operation. Config/path reconciliation performs this recovery before reading catalogue paths, including operations at a previous root or template. First-binding migration inventories each scoped per-path rendition receipt and its own recorded placement independently of current selection or the latest catalogue filename; exact local bytes and the complete path-owner census remain required before preservation or retirement.
+
+The claims fence ordinary transfer, finalization, adoption and queued metadata. Current-publication retry recovery leaves managed plans with the layout owner and rechecks slot generation and exact local-byte claims in its state transaction, including claims created after the reader snapshot. Metadata for selected renditions is prepared off the visible path; it commits with the new binding and matching provider selection receipts. Ordinary whole-asset metadata refresh resolves ownership across every binding and pending claim for the scoped provider child, including when the caller has no concrete pass key; it does not queue competing writes for managed paths. Explicit metadata refresh uses the preserving owner and records its intent in the operation; pending operations recover before unchanged-binding shortcuts. Retained-source reuse carries the SHA-verified fingerprint through candidate receipt capture and independent copying; a second snapshot must equal the trusted first snapshot. Local path reconciliation uses this same layout owner for managed families. Current/archived media and sidecars must match their pinned fingerprints. Unknown ownership or local changes hold completion and protect existing contents. Real album membership is persisted before managed reconciliation commits matching metadata; an unfiled path label is never recorded as album membership. Original archives retain their prior metadata and retry evidence outside the ordinary writer queue; prepared capture-repair evidence stays visible to source-deletion guards. Archive receipt and whole-asset ownership lookups use scoped library/child indexes. Historical catalogue receipts remain evidence, not permission to write a superseded slot.
+
+Files in a Live Photo family are reserved and prepared together. Publication across separate files is recoverable rather than simultaneously atomic to external readers. Filesystems without the required atomic conditional publication/retirement operations leave durable work pending. See [edited primary usage](edited-primary.md) for storage, exclusion and downgrade guidance.

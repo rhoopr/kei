@@ -13,6 +13,85 @@ use crate::state::types::VersionSizeKey;
 
 #[async_trait]
 impl ReconciliationStateStore for SqliteStateDb {
+    async fn primary_layout_binding(
+        &self,
+        family: String,
+    ) -> Result<Option<super::primary_layout::LayoutBinding>, StateError> {
+        self.primary_layout_binding(family).await
+    }
+    async fn primary_layout_operations(
+        &self,
+        library: String,
+    ) -> Result<Vec<super::primary_layout::LayoutOperation>, StateError> {
+        self.primary_layout_operations(library).await
+    }
+    async fn begin_primary_layout(
+        &self,
+        op: super::primary_layout::LayoutOperation,
+    ) -> Result<(), StateError> {
+        self.begin_primary_layout(op).await
+    }
+    async fn cancel_primary_layout(&self, operation: String) -> Result<(), StateError> {
+        self.cancel_primary_layout(operation).await
+    }
+    async fn hold_primary_layout(&self, operation: String) -> Result<(), StateError> {
+        self.hold_primary_layout(operation).await
+    }
+    async fn save_primary_layout(
+        &self,
+        op: super::primary_layout::LayoutOperation,
+    ) -> Result<(), StateError> {
+        self.save_primary_layout(op).await
+    }
+    async fn commit_primary_layout(
+        &self,
+        op: super::primary_layout::LayoutOperation,
+    ) -> Result<(), StateError> {
+        self.commit_primary_layout(op).await
+    }
+    async fn has_primary_layouts(&self, library: &str) -> Result<bool, StateError> {
+        let library = library.to_owned();
+        self.with_conn("has_primary_layouts",move |conn| {
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM primary_layout_bindings WHERE library=?1 OR source_library=?1) OR EXISTS(SELECT 1 FROM primary_layout_operations WHERE source_library=?1 AND phase NOT IN ('committed','cancelled'))",[library],|r|r.get(0))?)
+        }).await
+    }
+    async fn primary_layout_owns_asset(
+        &self,
+        library: &str,
+        child: &str,
+    ) -> Result<bool, StateError> {
+        let (library, child) = (library.to_owned(), child.to_owned());
+        self.with_conn("primary_layout_owns_asset", move |conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM primary_layout_bindings WHERE library=?1 AND child=?2)
+                    OR EXISTS(SELECT 1 FROM primary_layout_claims WHERE library=?1 AND child=?2)",
+                rusqlite::params![library, child],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+    }
+    async fn guard_primary_slot(
+        &self,
+        library: &str,
+        child: &str,
+        version: &str,
+        checksum: &str,
+        path: &std::path::Path,
+    ) -> Result<(), StateError> {
+        let (library, child, version, checksum, path) = (
+            library.to_owned(),
+            child.to_owned(),
+            version.to_owned(),
+            checksum.to_owned(),
+            path.to_owned(),
+        );
+        self.with_conn("guard_primary_slot", move |conn| {
+            super::primary_layout::guard_slot(conn, &library, &child, &version, &checksum, &path)
+        })
+        .await
+    }
+
     async fn get_reconciliation_catalog_paths(
         &self,
     ) -> Result<Vec<ReconciliationCatalogPath>, StateError> {

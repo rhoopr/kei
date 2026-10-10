@@ -158,6 +158,27 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
         }
     }
 
+    if config.edited_naming == crate::types::EditedNaming::Primary {
+        let metadata = build_payload(asset, config);
+        return Ok(super::derive_expected_paths(asset, config)
+            .into_iter()
+            .map(|d| DownloadTask {
+                url: d.url,
+                download_path: d.path,
+                replacement_fingerprint: None,
+                pending_cross_parent_root: None,
+                checksum: d.checksum,
+                asset_id: asset.state_id_arc(),
+                asset_record_name: asset.asset_record_name_arc(),
+                library: Arc::from(asset.source_zone().unwrap_or(&config.library)),
+                metadata: Arc::clone(&metadata),
+                size: d.size,
+                created_local: asset.created_local(),
+                version_size: d.version_size,
+                media_type: determine_media_type(d.version_size, asset),
+            })
+            .collect());
+    }
     let ctx = DerivationContext::build(asset, config);
     let payload = build_payload(asset, config);
     let mut tasks = Vec::with_capacity(5);
@@ -184,6 +205,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
             size,
             version_size,
             check_ampm_on_disk,
+            naming_role: _,
         } = d;
         let primary_resolution = {
             let mut rctx = ResolveContext {
@@ -256,6 +278,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
             size,
             version_size,
             check_ampm_on_disk,
+            naming_role: _,
         } = d;
         let final_path = {
             let mut rctx = ResolveContext {
@@ -315,6 +338,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
             size,
             version_size,
             check_ampm_on_disk,
+            naming_role: _,
         } = d;
         if seen_urls.iter().any(|seen| seen.as_ref() == url.as_ref()) {
             return Ok(tasks);

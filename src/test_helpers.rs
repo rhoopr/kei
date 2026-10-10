@@ -1251,6 +1251,70 @@ pub(crate) fn process_death_force_journal() -> bool {
     })
 }
 
+// A path-scoped, one-shot seam for the retained-source proof boundary. Other
+// parallel fixtures cannot consume it, and the guard removes unused hooks.
+struct PrimarySourceMutation {
+    path: std::path::PathBuf,
+    bytes: Vec<u8>,
+    replace_inode: bool,
+    fired: Arc<std::sync::atomic::AtomicBool>,
+}
+static PRIMARY_SOURCE_MUTATIONS: std::sync::Mutex<Vec<PrimarySourceMutation>> =
+    std::sync::Mutex::new(Vec::new());
+pub(crate) struct PrimarySourceMutationGuard {
+    path: std::path::PathBuf,
+    fired: Arc<std::sync::atomic::AtomicBool>,
+}
+impl PrimarySourceMutationGuard {
+    pub(crate) fn fired(&self) -> bool {
+        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+impl Drop for PrimarySourceMutationGuard {
+    fn drop(&mut self) {
+        PRIMARY_SOURCE_MUTATIONS
+            .lock()
+            .unwrap()
+            .retain(|hook| hook.path != self.path);
+    }
+}
+pub(crate) fn primary_source_mutation(
+    path: std::path::PathBuf,
+    bytes: Vec<u8>,
+    replace_inode: bool,
+) -> PrimarySourceMutationGuard {
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut hooks = PRIMARY_SOURCE_MUTATIONS.lock().unwrap();
+    assert!(!hooks.iter().any(|hook| hook.path == path));
+    hooks.push(PrimarySourceMutation {
+        path: path.clone(),
+        bytes,
+        replace_inode,
+        fired: fired.clone(),
+    });
+    PrimarySourceMutationGuard { path, fired }
+}
+pub(crate) async fn primary_source_snapshot_point(path: &std::path::Path) -> anyhow::Result<()> {
+    let hook = {
+        let mut hooks = PRIMARY_SOURCE_MUTATIONS.lock().unwrap();
+        hooks
+            .iter()
+            .position(|hook| hook.path == path)
+            .map(|index| hooks.remove(index))
+    };
+    if let Some(hook) = hook {
+        if hook.replace_inode {
+            let replacement = path.with_extension("primary-snapshot-test");
+            tokio::fs::write(&replacement, &hook.bytes).await?;
+            tokio::fs::rename(replacement, path).await?;
+        } else {
+            tokio::fs::write(path, &hook.bytes).await?;
+        }
+        hook.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,6 +12,7 @@
 
 mod fingerprint;
 mod platform;
+pub(in crate::download) mod primary_layout;
 mod publication;
 mod reconciliation;
 mod replacement;

@@ -27,8 +27,11 @@ pub(in crate::download) async fn recover_current_pending_publication(
         !shutdown.is_cancelled(),
         "Current publication recovery cancelled"
     );
-    // Managed selection keeps its separate destination/provenance finalization.
-    if config.selection_run.is_some() || is_asset_filtered(asset, config).is_some() {
+    // Managed selection and layout journals keep their publication owner.
+    if config.selection_run.is_some()
+        || planner.managed_layout_session().is_some()
+        || is_asset_filtered(asset, config).is_some()
+    {
         return Ok(None);
     }
     let derived_paths = derive_expected_paths(asset, config);

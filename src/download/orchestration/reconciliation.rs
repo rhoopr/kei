@@ -46,7 +46,18 @@ async fn requeue_missing_catalog_file(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn reconcile_catalog_paths(
+    passes: &[crate::commands::AlbumPass],
+    config: Arc<DownloadConfig>,
+    shutdown_token: CancellationToken,
+) -> Result<PathReconciliationResult> {
+    reconcile_catalog_paths_with_client(&reqwest::Client::new(), passes, config, shutdown_token)
+        .await
+}
+
+pub(crate) async fn reconcile_catalog_paths_with_client(
+    client: &reqwest::Client,
     passes: &[crate::commands::AlbumPass],
     config: Arc<DownloadConfig>,
     shutdown_token: CancellationToken,
@@ -72,6 +83,26 @@ pub(crate) async fn reconcile_catalog_paths(
                 failed: 1,
                 ..SyncStats::default()
             },
+        });
+    }
+
+    let managed = config.edited_naming == crate::types::EditedNaming::Primary
+        || db.has_primary_layouts(&config.library).await?;
+    // A changed root or template identifies a new family. Finish recorded
+    // handovers before reading catalogue paths or allowing that family to
+    // commit, so an old operation cannot later restore stale rendition facts.
+    // The layout owner also recovers replacements at each recorded old root.
+    if managed
+        && let Err(error) =
+            super::primary_layout::recover(client, passes, &config, &shutdown_token).await
+    {
+        tracing::warn!(error = %format!("{error:#}"), "Could not recover managed layouts before path reconciliation; keeping checkpoints unchanged");
+        return Ok(PathReconciliationResult {
+            stats: SyncStats {
+                failed: 1,
+                ..SyncStats::default()
+            },
+            ..PathReconciliationResult::default()
         });
     }
 
@@ -175,6 +206,11 @@ pub(crate) async fn reconcile_catalog_paths(
         }
     }
 
+    let layout_session = if managed {
+        Some(super::primary_layout::LayoutSession::load(db.as_ref()).await?)
+    } else {
+        None
+    };
     let pass_configs: Vec<Arc<DownloadConfig>> = passes
         .iter()
         .map(|pass| Arc::new(config.with_pass(pass)))
@@ -262,6 +298,58 @@ pub(crate) async fn reconcile_catalog_paths(
                     }
                     if filter::is_asset_filtered(&asset, pass_config.as_ref()).is_some() {
                         continue;
+                    }
+                    if let Some(session) = &layout_session {
+                        let effective = DownloadConfig {
+                            primary_layout_active: true,
+                            ..pass_config.as_ref().clone()
+                        };
+                        let asset = asset
+                            .clone()
+                            .with_state_record_name(Arc::from(state_id.as_str()));
+                        // Establish this pass's grouping evidence before the
+                        // layout commits matching selected metadata. Adding it
+                        // afterward would queue an ordinary writer into the
+                        // just-committed managed slot.
+                        if pass.kind == crate::commands::PassKind::Album
+                            && let Err(error) = planner::record_album_membership_if_named(
+                                db.as_ref(),
+                                &effective,
+                                &asset,
+                            )
+                            .await
+                        {
+                            stats.failed += 1;
+                            tracing::warn!(%error, "Managed reconciliation could not persist album membership");
+                            continue;
+                        }
+                        match super::primary_layout::process_asset(
+                            client,
+                            asset,
+                            &effective,
+                            session,
+                            &shutdown_token,
+                        )
+                        .await
+                        {
+                            Ok(Some((_asset, outcome))) => {
+                                stats.downloaded += outcome.downloaded;
+                                stats.photos_downloaded += outcome.photos_downloaded;
+                                stats.videos_downloaded += outcome.videos_downloaded;
+                                for downloaded in outcome.downloaded_assets {
+                                    stats.recap.observe(effective.pass_label(), downloaded);
+                                }
+                                stats.bytes_downloaded += outcome.network_bytes;
+                                stats.disk_bytes_written += outcome.disk_bytes;
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                stats.failed += 1;
+                                tracing::warn!(%error,"Managed primary reconciliation remains pending");
+                                continue;
+                            }
+                        }
                     }
                     let mut unsafe_destination = false;
                     for expected in filter::expected_paths_for(&asset, pass_config.as_ref()) {
@@ -431,6 +519,13 @@ pub(crate) async fn reconcile_catalog_paths(
                 tracing::warn!(asset_id = %task.asset_id, path = %source_path.display(), %error, "Path reconciliation could not inspect the catalog file");
                 continue;
             }
+        }
+        // Ordinary copy/sidecar finalization cannot land through a managed
+        // slot, even when a retained reconciliation plan predates handover.
+        if let Err(error) = db.guard_primary_writer(&task.download_path).await {
+            stats.failed += 1;
+            tracing::warn!(%error,"Reconciliation destination is owned by managed primary layout");
+            continue;
         }
         match file::copy_local_file_no_replace(
             &config.directory,

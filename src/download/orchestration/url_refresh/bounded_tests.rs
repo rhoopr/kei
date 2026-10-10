@@ -624,9 +624,9 @@ async fn refresh_authentication_and_shutdown_remain_authoritative() {
                 Duration::from_secs(300)
             },
         );
-        let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+        let (result, ()) = Box::pin(tokio::time::timeout(Duration::from_secs(3), async {
             tokio::join!(worker, cancel)
-        })
+        }))
         .await
         .expect("cancel a pending lookup promptly");
         let result = result.unwrap();

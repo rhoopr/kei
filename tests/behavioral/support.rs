@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 34;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 35;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -666,6 +666,45 @@ BEGIN SELECT RAISE(ABORT, 'unattributed legacy path must be retained'); END;
         }
     }
 
+    conn.execute_batch(r"
+CREATE TABLE IF NOT EXISTS primary_layout_bindings (
+ family TEXT PRIMARY KEY, library TEXT NOT NULL, source_library TEXT NOT NULL, child TEXT NOT NULL,
+ generation INTEGER NOT NULL CHECK(generation > 0), decision TEXT NOT NULL,
+ policy TEXT NOT NULL, binding BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS primary_layout_operations (
+ operation TEXT PRIMARY KEY, family TEXT NOT NULL, library TEXT NOT NULL, source_library TEXT NOT NULL,
+ prior_generation INTEGER NOT NULL, decision TEXT NOT NULL, policy TEXT NOT NULL,
+ phase TEXT NOT NULL CHECK(phase IN ('planned','prepared','preserved','publishing','committed','conflict','cancelled')),
+ header BLOB NOT NULL, conflict TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS primary_layout_one_pending ON primary_layout_operations(family) WHERE phase NOT IN ('committed','cancelled');
+CREATE TABLE IF NOT EXISTS primary_layout_members (
+ operation TEXT NOT NULL REFERENCES primary_layout_operations(operation),
+ member INTEGER NOT NULL, evidence BLOB NOT NULL, PRIMARY KEY(operation,member)
+);
+CREATE TABLE IF NOT EXISTS primary_layout_claims (
+ path_key TEXT PRIMARY KEY, family TEXT NOT NULL, operation TEXT,
+ library TEXT NOT NULL, child TEXT NOT NULL, version TEXT NOT NULL,
+ provider_checksum TEXT NOT NULL, local_checksum TEXT,
+ native_path BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS primary_layout_preserved (
+ operation TEXT NOT NULL, member INTEGER NOT NULL, native_path BLOB NOT NULL,
+ media_checksum TEXT NOT NULL, sidecar_checksum TEXT, evidence BLOB NOT NULL,
+ PRIMARY KEY(operation,member)
+);
+CREATE TABLE IF NOT EXISTS primary_layout_superseded_paths (
+ library TEXT NOT NULL, child TEXT NOT NULL, version TEXT NOT NULL,
+ provider_checksum TEXT NOT NULL, native_path BLOB NOT NULL, compat_path TEXT,
+ PRIMARY KEY(library,child,version,provider_checksum,native_path)
+);
+CREATE INDEX IF NOT EXISTS primary_layout_superseded_compat ON primary_layout_superseded_paths(library,child,version,provider_checksum,compat_path);
+CREATE INDEX IF NOT EXISTS primary_layout_binding_source ON primary_layout_bindings(source_library);
+CREATE INDEX IF NOT EXISTS primary_layout_binding_owner ON primary_layout_bindings(library,child);
+CREATE INDEX IF NOT EXISTS primary_layout_claim_owner ON primary_layout_claims(library,child);
+CREATE INDEX IF NOT EXISTS primary_layout_pending_library ON primary_layout_operations(source_library,phase);
+").unwrap();
     conn.pragma_update(None, "user_version", HELPER_SCHEMA_VERSION)
         .unwrap();
     conn

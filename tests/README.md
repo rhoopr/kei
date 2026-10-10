@@ -1274,6 +1274,18 @@ before the selected scope passes its own check. Malformed-list tests prove that
 invalid complete-list evidence is never cached. Existing queue admission tests
 cover capture attachment, durable receipts, rollback, replay and unchanged follow-up.
 
+### Managed edited-primary qualification
+
+`cargo test --all-features --lib primary_layout` exercises the opt-in owner with file-backed SQLite, synthetic provider generations and a real local HTTP server. The fixture checks original, two edits, revert, edit-again from verified history, HEIC/JPEG extension changes, preserved media/sidecar hashes, rendition keys, manifests, private destination generations, suffix migration/reversal, collisions, source drift, read-only plans, state-write failure, process death and quiet reopened cycles. The ignored worker is launched and killed by the parent process-death test; it is not a skipped standalone proof.
+
+The process-death oracle restarts at every journal boundary, checks independently retained old bytes before completion, and requires two subsequent zero-download, zero-lookup cycles. Real Live Photo fixture bytes cover both MOV naming policies; automated byte preservation does not qualify Immich pairing. Manual Immich testing requires both exclusion patterns documented in `docs/edited-primary.md`.
+
+The independent-review `review501` regressions compose a failed started handover with root/template changes and policy reversal, checking the latest catalogue checksum/path after two quiet reopens. First-binding migrations also cover an unselected owned original, a provider-reverted suffix edit, a legacy HEIC/JPEG edit history with equal-content aliases, exact sidecar/history retention and a locally changed unselected original that must hold completion.
+
+A deterministic, path-scoped one-shot hook mutates a committed retained source between its SHA-verified snapshot and candidate receipt snapshot, covering both in-place edits and inode replacement. The operation must hold without publishing mismatched bytes or advancing the checkpoint; restoring the synthetic history then proves convergence and two quiet reopens. Managed selected metadata belongs to the layout owner; ordinary whole-asset refresh must resolve ownership across all passes before updating any stored path. A selected album collecting delta after suffix reversal checks updated current sidecar/catalogue metadata, exact prior sidecar preservation, empty ordinary rewrite debt and two quiet reopens. A collecting media edit injects final binding-commit failure, holds its checkpoint, independently preserves the prior edit and restarts without another GET. Explicit refresh exercises a preparation-state failure, durable forced intent and restart without the operator flag before quiet reopens. Migration establishes real album membership before publication, while preserving an unfiled label only for path rendering; retains original-archive debt outside ordinary writers and checks that prepared capture repair still blocks source deletion.
+
+Qualification requires the full `just gate` at the candidate commit plus the final format and strict all-target/all-feature Clippy checks. Record macOS, Windows and target-filesystem checks separately; Linux fixture results do not stand in for unrun platform checks.
+
 
 ## Retained checkpoint expiry and mixed delta proof
 

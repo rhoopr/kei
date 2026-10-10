@@ -59,6 +59,7 @@ fn manifest_joined_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Man
             media_type,
             status,
             albums: Vec::new(),
+            preserved_files: Vec::new(),
         },
         album_name,
     })
@@ -461,7 +462,10 @@ impl SqliteStateDb {
                 )?);
             }
 
+            let primary = conn.query_row("SELECT (SELECT COUNT(*) FROM primary_layout_bindings),(SELECT COUNT(DISTINCT native_path) FROM primary_layout_preserved),(SELECT COUNT(*) FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled')),(SELECT COUNT(*) FROM primary_layout_operations WHERE conflict IS NOT NULL AND phase NOT IN ('committed','cancelled'))",[],|row|Ok(crate::state::types::PrimaryLayoutSummary {bound_families:u64::try_from(row.get::<_,i64>(0)?).unwrap_or(0),preserved_files:u64::try_from(row.get::<_,i64>(1)?).unwrap_or(0),pending_operations:u64::try_from(row.get::<_,i64>(2)?).unwrap_or(0),held_operations:u64::try_from(row.get::<_,i64>(3)?).unwrap_or(0)}))?;
+            let primary_layout = (primary.bound_families + primary.preserved_files + primary.pending_operations > 0).then_some(primary);
             Ok(SyncSummary {
+                primary_layout,
                 unresolved_identity_zones,
                 unresolved_sparse_records,
                 deferred_sparse_records,
@@ -574,6 +578,33 @@ impl SqliteStateDb {
                 }
             }
 
+            // A superseded path is historical evidence, never a claim that the
+            // rendition still owns the reused primary. Export its independent
+            // preservation receipt with the provider and local hashes instead.
+            let mut statement = conn.prepare("SELECT o.library,o.header,p.evidence,o.operation,o.family,o.prior_generation,o.phase FROM primary_layout_preserved p JOIN primary_layout_operations o ON o.operation=p.operation ORDER BY o.operation,p.member")?;
+            let receipts = statement.query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,Vec<u8>>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,i64>(5)?,row.get::<_,String>(6)?)))?;
+            for receipt in receipts {
+                let (library,header,evidence,operation,family,previous_generation,phase) = receipt?;
+                let header: super::primary_layout::LayoutOperation = super::primary_layout::decode(&header)?;
+                let child = header.child;
+                let file: super::primary_layout::LayoutFile = super::primary_layout::decode(&evidence)?;
+                if let Some(asset) = assets.get_mut(&(library,child,file.version.clone())) {
+                    asset.preserved_files.push(super::primary_layout::PreservedManifestFile {
+                        operation,family,previous_generation,phase,native_path:file.path,
+                        provider_checksum:file.provider_checksum,
+                        local_checksum:data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),
+                        source_checksum:file.source_checksum,
+                        sidecar_checksum:file.sidecar.map(|sidecar|data_encoding::HEXLOWER.encode(&sidecar.sha256)),
+                        size_bytes:file.fingerprint.size,
+                    });
+                }
+            }
+            for asset in assets.values_mut() {
+                if let Some(path) = &asset.local_path {
+                    let superseded: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM primary_layout_superseded_paths s WHERE s.library=?1 AND s.child=?2 AND s.version=?3 AND s.provider_checksum=?4 AND s.compat_path=?5) AND NOT EXISTS(SELECT 1 FROM primary_layout_claims c WHERE c.library=?1 AND c.child=?2 AND c.version=?3 AND c.provider_checksum=?4 AND c.path_key=?6 AND c.operation IS NULL)",rusqlite::params![asset.library,asset.asset_id,asset.version,asset.checksum,path.to_str(),super::primary_layout::path_key(path)?],|row|row.get(0))?;
+                    if superseded { asset.local_path = None; }
+                }
+            }
             Ok(assets.into_values().collect())
         })
         .await

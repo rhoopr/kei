@@ -235,6 +235,7 @@ pub struct PhotoConfig {
     pub live_photo_mode: LivePhotoMode,
     pub live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub edited: bool,
+    pub edited_naming: crate::types::EditedNaming,
     pub alternative: bool,
     pub raw_policy: RawPolicy,
     pub file_match_policy: FileMatchPolicy,

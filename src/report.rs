@@ -88,6 +88,8 @@ pub(crate) struct RunOptions {
     pub live_photo_mode: String,
     pub live_resolution: String,
     pub edited: bool,
+    #[serde(skip_serializing_if = "edited_naming_is_default")]
+    pub edited_naming: crate::types::EditedNaming,
     pub alternative: bool,
     pub raw_policy: String,
     pub file_match_policy: String,
@@ -118,6 +120,7 @@ impl RunOptions {
             live_photo_mode: format!("{:?}", config.photos.live_photo_mode).to_lowercase(),
             live_resolution: format!("{:?}", config.photos.live_resolution).to_lowercase(),
             edited: config.photos.edited,
+            edited_naming: config.photos.edited_naming,
             alternative: config.photos.alternative,
             raw_policy: match config.photos.raw_policy {
                 crate::types::RawPolicy::AsIs => "as-is".to_string(),
@@ -173,10 +176,32 @@ pub(crate) async fn write_report(path: &Path, report: &SyncReport) -> anyhow::Re
     .await?
 }
 
+fn edited_naming_is_default(value: &crate::types::EditedNaming) -> bool {
+    *value == crate::types::EditedNaming::Suffix
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::download::SkipBreakdown;
+
+    #[test]
+    fn primary_layout_report_inventory_is_distinct_from_network_counters() {
+        let mut stats = crate::download::SyncStats::default();
+        let json = serde_json::to_value(&stats).unwrap();
+        assert!(json.get("primary_layout").is_none());
+        stats.primary_layout = Some(crate::state::types::PrimaryLayoutSummary {
+            bound_families: 5,
+            preserved_files: 12,
+            pending_operations: 2,
+            held_operations: 1,
+        });
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["primary_layout"]["preserved_files"], 12);
+        assert_eq!(json["primary_layout"]["held_operations"], 1);
+        assert_eq!(json["downloaded"], 0);
+        assert_eq!(json["bytes_downloaded"], 0);
+    }
 
     #[test]
     fn report_serialization_roundtrip() {
@@ -193,6 +218,7 @@ mod tests {
                 live_photo_mode: "original".to_string(),
                 live_resolution: "original".to_string(),
                 edited: false,
+                edited_naming: crate::types::EditedNaming::Suffix,
                 alternative: false,
                 raw_policy: "as-is".to_string(),
                 force_resolution: false,
@@ -374,6 +400,7 @@ mod tests {
                 live_photo_mode: String::new(),
                 live_resolution: String::new(),
                 edited: false,
+                edited_naming: crate::types::EditedNaming::Suffix,
                 alternative: false,
                 raw_policy: String::new(),
                 force_resolution: false,
@@ -427,6 +454,7 @@ mod tests {
                 live_photo_mode: String::new(),
                 live_resolution: String::new(),
                 edited: false,
+                edited_naming: crate::types::EditedNaming::Suffix,
                 alternative: false,
                 raw_policy: String::new(),
                 force_resolution: false,
@@ -475,6 +503,7 @@ mod tests {
                 live_photo_mode: String::new(),
                 live_resolution: String::new(),
                 edited: false,
+                edited_naming: crate::types::EditedNaming::Suffix,
                 alternative: false,
                 raw_policy: String::new(),
                 force_resolution: false,
@@ -524,6 +553,7 @@ mod tests {
                 live_photo_mode: "original".to_string(),
                 live_resolution: "original".to_string(),
                 edited: false,
+                edited_naming: crate::types::EditedNaming::Suffix,
                 alternative: false,
                 raw_policy: "as-is".to_string(),
                 force_resolution: false,

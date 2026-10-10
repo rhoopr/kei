@@ -370,6 +370,18 @@ async fn apply_changed_provider_metadata(
     let Some(db) = &config.state_db else {
         return;
     };
+    match super::primary_layout::owns_metadata(asset, config).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            summary.state_transition_failures += 1;
+            summary
+                .token_unsafe_reason
+                .get_or_insert(PROVIDER_METADATA_STATE_WRITE_FAILED_REASON);
+            tracing::warn!(%error, "Could not resolve managed metadata ownership for delta");
+            return;
+        }
+    }
     let library = asset.source_zone().unwrap_or(&config.library);
     let capture = filter::metadata_capture(asset);
     if !download_ctx.has_provider_metadata_drift(library, asset.state_id(), &capture) {
@@ -889,6 +901,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         None => preload_download_context(config).await,
     };
     let mut planning_state_write_failures = 0usize;
+    let mut managed_stats = SyncStats::default();
 
     tracing::debug!(
         count = downloadable_assets.len(),
@@ -951,6 +964,61 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 reason = %resource.reason,
                 "Malformed CloudKit resource prevented incremental download planning"
             );
+            continue;
+        }
+
+        // Collecting deltas must use the same journal owner as streaming and
+        // reconciliation, including metadata-only observations whose media
+        // checksum would otherwise discard every task below.
+        if controls.run_mode.downloads_files()
+            && let Some(session) = task_planner.managed_layout_session()
+        {
+            if let Some(db) = &config.state_db
+                && let Err(error) =
+                    planner::record_album_membership_if_named(db.as_ref(), effective_config, asset)
+                        .await
+            {
+                planning_state_write_failures += 1;
+                tracing::warn!(%error, "Managed collecting delta could not persist album membership");
+                continue;
+            }
+            match super::primary_layout::process_asset(
+                download_client,
+                asset.clone(),
+                effective_config,
+                &session,
+                &shutdown_token,
+            )
+            .await
+            {
+                Ok(Some((_asset, outcome))) => {
+                    managed_stats.assets_seen += 1;
+                    managed_stats.downloaded += outcome.downloaded;
+                    managed_stats.photos_downloaded += outcome.photos_downloaded;
+                    managed_stats.videos_downloaded += outcome.videos_downloaded;
+                    managed_stats.bytes_downloaded += outcome.network_bytes;
+                    managed_stats.disk_bytes_written += outcome.disk_bytes;
+                    for downloaded in outcome.downloaded_assets {
+                        managed_stats
+                            .recap
+                            .observe(effective_config.pass_label(), downloaded);
+                    }
+                    if outcome.downloaded == 0 {
+                        skip_breakdown.on_disk += 1;
+                    }
+                }
+                Ok(None) => {
+                    enumeration_errors += 1;
+                    tracing::error!("Managed collecting delta lost its layout owner");
+                }
+                Err(error) => {
+                    if is_provider_session_error(&error) {
+                        return Err(error);
+                    }
+                    enumeration_errors += 1;
+                    tracing::error!(%error, "Managed collecting delta remains pending; checkpoint held");
+                }
+            }
             continue;
         }
 
@@ -1089,6 +1157,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
+        stats.accumulate(&managed_stats);
         stats.identity_incomplete = delta_summary.identity_incomplete;
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
@@ -1137,6 +1206,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             elapsed_secs: started.elapsed().as_secs_f64(),
             ..SyncStats::default()
         };
+        stats.accumulate(&managed_stats);
         stats.identity_incomplete = delta_summary.identity_incomplete;
         if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
@@ -1321,6 +1391,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         recap: pass_result.recap.clone(),
         ..SyncStats::default()
     };
+    stats.accumulate(&managed_stats);
     stats.identity_incomplete = delta_summary.identity_incomplete;
     if let Some(reason) = delta_summary.token_unsafe_reason {
         block_sync_token_for_incremental_delta(&mut stats, reason);

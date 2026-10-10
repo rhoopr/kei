@@ -32,13 +32,13 @@ pub(super) fn capture_repair_requested(config: &DownloadConfig) -> bool {
 /// Returns `Ok(true)` on full success, `Ok(false)` if the download succeeded
 /// but EXIF stamping failed (the file is usable but lacks EXIF metadata).
 #[derive(Clone, Copy)]
-pub(super) struct DownloadSingleContext<'a> {
-    pub(super) temp_suffix: &'a str,
-    pub(super) state_db: Option<&'a dyn DownloadStore>,
-    pub(super) rate_limit_counter: Option<&'a std::sync::atomic::AtomicUsize>,
-    pub(super) bandwidth_limiter: Option<&'a crate::download::BandwidthLimiter>,
-    pub(super) shutdown_token: &'a CancellationToken,
-    pub(super) mode: crate::personality::Mode,
+pub(in crate::download) struct DownloadSingleContext<'a> {
+    pub(in crate::download) temp_suffix: &'a str,
+    pub(in crate::download) state_db: Option<&'a dyn DownloadStore>,
+    pub(in crate::download) rate_limit_counter: Option<&'a std::sync::atomic::AtomicUsize>,
+    pub(in crate::download) bandwidth_limiter: Option<&'a crate::download::BandwidthLimiter>,
+    pub(in crate::download) shutdown_token: &'a CancellationToken,
+    pub(in crate::download) mode: crate::personality::Mode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,13 +94,16 @@ pub(super) type DownloadSingleResult = (
     Option<Arc<crate::download::file::RetainedPendingFile>>,
 );
 
-pub(super) async fn download_single_task<C: crate::download::file::DownloadClient>(
+pub(in crate::download) async fn download_single_task<C: crate::download::file::DownloadClient>(
     client: &C,
     task: &DownloadTask,
     retry_config: &RetryConfig,
     metadata_flags: MetadataFlags,
     context: DownloadSingleContext<'_>,
 ) -> Result<DownloadSingleResult> {
+    if let Some(db) = context.state_db {
+        db.guard_primary_writer(&task.download_path).await?;
+    }
     // A producer can commit retry state immediately before cancellation. Do not
     // start another HTTP request for its queued task while draining that batch.
     if context.shutdown_token.is_cancelled() {
@@ -151,6 +154,7 @@ pub(super) async fn download_single_task<C: crate::download::file::DownloadClien
         .into());
     }
     if let Some(db) = context.state_db {
+        db.guard_primary_writer(&task.download_path).await?;
         db.claim_temp_file(&owned_part_path)
             .await
             .context("Could not record temporary-file ownership")?;

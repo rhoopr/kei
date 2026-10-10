@@ -15,5 +15,7 @@ mod process_death;
 
 mod smart_reconciliation;
 
+mod primary_layout;
+
 mod mixed_delta;
 mod retained_recovery;

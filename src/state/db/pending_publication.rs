@@ -244,6 +244,22 @@ impl SqliteStateDb {
             if !owns_publication(&tx, &proof)? || !identity_matches(&tx, &proof, &child, &master)? {
                 return Ok(false);
             }
+            // A managed handover may claim this path after the reader snapshot.
+            // Apply the same transactional generation and local-byte fences as
+            // ordinary downloaded-state finalization before clearing retry debt.
+            super::primary_layout::guard_slot(
+                &tx,
+                &proof.library,
+                &proof.id,
+                proof.version_size.as_str(),
+                &proof.checksum,
+                &proof.local_path,
+            )?;
+            super::primary_layout::guard_downloaded_checksum(
+                &tx,
+                &proof.local_path,
+                &proof.local_checksum,
+            )?;
             super::asset_writes::ensure_asset_has_no_prepared_capture_repair(
                 &tx,
                 &proof.library,

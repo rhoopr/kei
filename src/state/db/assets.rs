@@ -596,6 +596,7 @@ impl SqliteStateDb {
                 let version_size: String = row.get(2)?;
                 let local_path: Option<String> = row.get(4)?;
                 Ok(DownloadedFileRecord {
+                    is_preserved_history: false,
                     is_current_path: true,
                     added_at: row
                         .get::<_, Option<f64>>(7)?
@@ -1488,6 +1489,69 @@ impl DownloadContextStateStore for SqliteStateDb {
         SqliteStateDb::get_downloaded_file_records(self).await
     }
 
+    async fn get_primary_layout_receipts(&self) -> Result<Vec<DownloadedFileRecord>, StateError> {
+        self.with_conn("get_primary_layout_receipts", |conn| {
+            let mut statement = conn.prepare_cached(
+                "SELECT p.library, p.id, p.version_size, p.provider_checksum, p.local_path, \
+                        p.local_checksum, p.download_checksum, (p.local_path IS a.local_path), a.added_at \
+                 FROM asset_metadata_paths p JOIN assets a \
+                   ON a.library = p.library AND a.id = p.id AND a.version_size = p.version_size \
+                 WHERE a.is_deleted = 0 \
+                 ORDER BY (p.local_path IS a.local_path) DESC, p.local_path",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(DownloadedFileRecord {
+                    is_preserved_history: false,
+                    is_current_path: row.get(7)?,
+                    added_at: row.get::<_, Option<f64>>(8)?.map(|date| decode_asset_date(date, 8)).transpose()?,
+                    library: row.get(0)?,
+                    id: row.get(1)?,
+                    version_size: VersionSizeKey::from_str(&row.get::<_, String>(2)?)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                    checksum: row.get(3)?,
+                    local_path: Some(PathBuf::from(row.get::<_, String>(4)?)),
+                    local_checksum: row.get(5)?,
+                    download_checksum: row.get(6)?,
+                })
+            })?;
+            let mut receipts = rows.collect::<Result<Vec<_>, _>>()?;
+            // Earlier revisions are independently owned sources, not current
+            // path ownership. Reuse them only through the layout owner's exact
+            // native-path and SHA proof plus a retained inode before copying to a stage.
+            let mut history = conn.prepare_cached(
+                "SELECT o.header,p.evidence FROM primary_layout_preserved p \
+                 JOIN primary_layout_operations o ON o.operation=p.operation \
+                 WHERE o.phase='committed' ORDER BY o.operation,p.member",
+            )?;
+            let history = history.query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            for entry in history {
+                let (header, evidence) = entry?;
+                let operation: super::primary_layout::LayoutOperation =
+                    super::primary_layout::decode(&header)?;
+                let file: super::primary_layout::LayoutFile =
+                    super::primary_layout::decode(&evidence)?;
+                let version_size = VersionSizeKey::from_str(&file.version)
+                    .ok_or(StateError::ProviderSelectionInvalid)?;
+                receipts.push(DownloadedFileRecord {
+                    is_preserved_history: true,
+                    library: operation.library,
+                    id: operation.child,
+                    version_size,
+                    checksum: file.provider_checksum,
+                    local_path: Some(file.path.to_path()),
+                    local_checksum: Some(data_encoding::HEXLOWER.encode(&file.fingerprint.sha256)),
+                    download_checksum: file.source_checksum,
+                    is_current_path: false,
+                    added_at: None,
+                });
+            }
+            Ok(receipts)
+        })
+        .await
+    }
+
     async fn get_downloaded_path_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError> {
         self.with_conn("get_downloaded_path_records", |conn| {
             let mut statement = conn.prepare_cached(
@@ -1501,6 +1565,7 @@ impl DownloadContextStateStore for SqliteStateDb {
             )?;
             let rows = statement.query_map([], |row| {
                 Ok(DownloadedFileRecord {
+                    is_preserved_history: false,
                     is_current_path: row.get(7)?,
                     added_at: row.get::<_, Option<f64>>(8)?.map(|date| decode_asset_date(date, 8)).transpose()?,
                     library: row.get(0)?,

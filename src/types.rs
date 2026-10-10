@@ -456,3 +456,13 @@ mod tests {
         );
     }
 }
+
+/// Placement of selected adjusted renditions. Primary mode opts into
+/// preservation-backed management of kei-owned current paths.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditedNaming {
+    #[default]
+    Suffix,
+    Primary,
+}
