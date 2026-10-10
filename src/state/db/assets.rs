@@ -1464,6 +1464,27 @@ impl DownloadStateStore for SqliteStateDb {
 
 #[async_trait]
 impl DownloadContextStateStore for SqliteStateDb {
+    async fn get_pending_publication(
+        &self,
+        library: &str,
+        id: &str,
+        version: VersionSizeKey,
+    ) -> Result<Option<super::PendingPublicationRecord>, StateError> {
+        self.pending_publication(library, id, version).await
+    }
+
+    async fn recover_pending_publication(
+        &self,
+        proof: &super::PendingPublicationRecord,
+        selected: &AssetRecord,
+        child: &str,
+        master: &str,
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::recover_pending_publication(self, proof, selected, child, master, shutdown)
+            .await
+    }
+
     async fn get_downloaded_file_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError> {
         SqliteStateDb::get_downloaded_file_records(self).await
     }

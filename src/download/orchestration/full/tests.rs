@@ -3312,3 +3312,6 @@ fn classify_pagination_shortfall_billimek_sharedsync_fixture_reports_shortfall()
     let decision = classify_pagination_shortfall(31_000, 30_959, 0);
     assert_eq!(decision, PaginationShortfall::Shortfall { shortfall: 41 });
 }
+
+#[path = "issue845_l1.rs"]
+mod issue845_l1;

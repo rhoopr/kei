@@ -255,6 +255,7 @@ async fn claim_legacy_owner_for_retry(
 struct PendingRetryPlanning<'a> {
     db: &'a dyn DownloadStore,
     run_mode: super::DownloadRunMode,
+    shutdown: &'a CancellationToken,
     pass_configs: &'a [Arc<DownloadConfig>],
     pending_evidence: &'a FxHashMap<PendingRetryTarget, PendingRetryEvidence>,
     pending_targets: &'a mut FxHashSet<PendingRetryTarget>,
@@ -290,34 +291,67 @@ impl PendingRetryPlanning<'_> {
                 let Some(evidence) = self.pending_evidence.get(&target) else {
                     continue;
                 };
-                match pipeline::adopt_pending_on_disk_for_retry(
-                    self.db,
-                    pass_config,
-                    asset,
-                    self.task_planner,
-                    &plan.tasks,
-                    pipeline::PendingRetryFileEvidence {
-                        version_size: target.version_size,
-                        filename: &evidence.filename,
-                        checksum: &evidence.checksum,
-                        local_path: evidence.local_path_evidence_under(&pass_config.directory),
-                        cross_parent_recorded_file: evidence
-                            .downloaded_at
-                            .and(evidence.local_file.as_ref()),
-                        size: evidence.size_bytes,
-                    },
-                )
-                .await?
+                let recovered = if self.run_mode.downloads_files()
+                    && plan.filter_reason.is_none()
+                    && plan.malformed_resource.is_none()
                 {
+                    pipeline::recover_current_pending_publication(
+                        self.db,
+                        pass_config,
+                        asset,
+                        self.task_planner,
+                        target.version_size,
+                        self.shutdown,
+                    )
+                    .await?
+                    .map(pipeline::PendingRetryAdoption::from)
+                } else {
+                    None
+                };
+                let recovered_current = recovered.is_some();
+                let adoption = if let Some(recovered) = recovered {
+                    if recovered == pipeline::PendingRetryAdoption::Adopted {
+                        for task in plan
+                            .tasks
+                            .iter()
+                            .filter(|task| task.version_size == target.version_size)
+                        {
+                            self.task_planner.release_unpublished_task_claim(task);
+                        }
+                    }
+                    recovered
+                } else {
+                    pipeline::adopt_pending_on_disk_for_retry(
+                        self.db,
+                        pass_config,
+                        asset,
+                        self.task_planner,
+                        &plan.tasks,
+                        pipeline::PendingRetryFileEvidence {
+                            version_size: target.version_size,
+                            filename: &evidence.filename,
+                            checksum: &evidence.checksum,
+                            local_path: evidence.local_path_evidence_under(&pass_config.directory),
+                            cross_parent_recorded_file: evidence
+                                .downloaded_at
+                                .and(evidence.local_file.as_ref()),
+                            size: evidence.size_bytes,
+                        },
+                    )
+                    .await?
+                };
+                match adoption {
                     pipeline::PendingRetryAdoption::Adopted => {
                         self.pending_targets.remove(&target);
-                        self.db
-                            .clear_asset_verification(
-                                &target.library,
-                                &target.asset_id,
-                                target.version_size.as_str(),
-                            )
-                            .await?;
+                        if !recovered_current {
+                            self.db
+                                .clear_asset_verification(
+                                    &target.library,
+                                    &target.asset_id,
+                                    target.version_size.as_str(),
+                                )
+                                .await?;
+                        }
                     }
                     pipeline::PendingRetryAdoption::StateWriteFailed => {
                         state_write_failed_targets.insert(target);
@@ -882,6 +916,7 @@ pub(super) async fn build_pending_retry_download_tasks(
                 }
                 PendingRetryPlanning {
                     run_mode,
+                    shutdown: &shutdown_token,
                     db: db.as_ref(),
                     pass_configs: &pass_configs,
                     pending_evidence: &pending_evidence,
@@ -1088,6 +1123,7 @@ pub(super) async fn build_pending_retry_download_tasks(
                     let asset = asset.with_state_record_name(Arc::from(state_id.as_str()));
                     PendingRetryPlanning {
                         run_mode,
+                        shutdown: &shutdown_token,
                         db: db.as_ref(),
                         pass_configs: &pass_configs,
                         pending_evidence: &pending_evidence,
@@ -1305,6 +1341,7 @@ mod tests {
         let mut sources = FxHashMap::default();
         PendingRetryPlanning {
             db: &db,
+            shutdown: &CancellationToken::new(),
             run_mode: super::super::DownloadRunMode::Download,
             pass_configs: &configs,
             pending_evidence: &evidence,
@@ -1598,3 +1635,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "retry/current_publication_tests.rs"]
+mod current_publication_tests;

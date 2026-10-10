@@ -181,6 +181,56 @@ impl TaskPlanner {
         Ok(planner)
     }
 
+    /// Pending recovery needs positive ownership even in ordinary download mode.
+    #[must_use]
+    pub(super) fn pending_publication_path_owned(
+        &self,
+        proof: &crate::state::PendingPublicationRecord,
+    ) -> bool {
+        let Ok(key) = PathPlanningMode::Reconciliation.key(&proof.local_path) else {
+            return false;
+        };
+        self.reconciliation
+            .path_owners
+            .get(&key)
+            .is_some_and(|owners| {
+                !owners.is_empty()
+                    && owners.iter().all(|owner| {
+                        owner.library.as_ref() == proof.library
+                            && owner.asset_id.as_ref() == proof.id
+                            && owner.version_size == proof.version_size
+                    })
+            })
+            && self.content_path_allowed(&key, &proof.checksum, proof.size)
+    }
+
+    pub(super) fn remember_recovered_publication(
+        &mut self,
+        proof: &crate::state::PendingPublicationRecord,
+    ) {
+        self.add_downloaded_paths(vec![crate::state::DownloadedFileRecord {
+            added_at: None,
+            is_current_path: true,
+            library: proof.library.clone(),
+            id: proof.id.clone(),
+            version_size: proof.version_size,
+            checksum: proof.checksum.clone(),
+            local_path: Some(proof.local_path.clone()),
+            local_checksum: Some(proof.local_checksum.clone()),
+            download_checksum: Some(proof.download_checksum.clone()),
+        }]);
+    }
+
+    /// Retire only an ordinary in-flight claim; durable choices remain occupied.
+    pub(super) fn release_unpublished_task_claim(&mut self, task: &DownloadTask) {
+        if matches!(self.path_mode, PathPlanningMode::Download)
+            && let Ok(key) = self.path_mode.key(&task.download_path)
+            && self.claimed_paths.get(key.as_ref()) == Some(&task.size)
+        {
+            self.claimed_paths.remove(key.as_ref());
+        }
+    }
+
     /// Index every finalized publication, including another selected album's copy.
     pub(super) fn add_downloaded_paths(
         &mut self,

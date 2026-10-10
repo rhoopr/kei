@@ -1157,6 +1157,30 @@ inventory. The retry owner:
 
 Unknown identity is not permission to delete or forget work.
 
+A pending rendition can retain a valid prior publication after a later download
+attempt failed. Ordinary sync and targeted retry recovery may reuse only its
+current catalog path when prior
+publication time, unchanged provider checksum and size, a matching path receipt,
+equal recorded local/download hashes, the current filename family and positive
+catalog/reservation ownership all agree. Recovery runs before fresh plan choices
+are saved; recovered renditions and failed recovery writes stay out of transfer
+and reservation dispatch. A healthy rendition about to receive a fresh choice
+uses the same current-file proof so that a later failure can still recover it.
+Existing durable choices keep their replay policy; saved different destinations
+still retain debt.
+The file is hashed beneath the current root without following links. A retained
+file and namespace, plus the process's
+destination guard, remain live through immediate conditional state finalization.
+The state owner rechecks the row, receipt, identity, protected legacy evidence,
+reservations and provider generations in one transaction. Recovery preserves the
+original path, publication timestamp, all receipts, source provenance and metadata
+debt; it does not mint provider progress from local bytes. Unknown identity or a
+saved different destination remains pending. Cancellation before commit or a
+failed state write cannot dispatch a fallback copy from that recovery attempt.
+The destination guard coordinates participating writers in this process; it is
+not an interprocess or network-filesystem lease. Managed selection keeps its
+separate destination and source-provenance finalization.
+
 Policy-excluded rows stay outside the actionable pending reader. After a
 successful source pass, targeted revalidation checks their durable provider
 identities only for explicit deletion. Present, omitted, malformed, and

@@ -22,6 +22,7 @@ mod legacy_preservation;
 mod membership;
 mod metadata;
 mod metadata_capture_retry;
+mod pending_publication;
 pub(crate) mod provider_catalog;
 pub(crate) mod provider_generations;
 pub(crate) mod provider_inbox;
@@ -49,10 +50,10 @@ pub use contracts::{
 };
 pub(crate) use contracts::{
     AssetGroupingRows, AssetVerificationState, CheckpointTransition, DownloadContextStateStore,
-    DownloadedFileRecord, ManifestAssetRow, OwnedTempFile, ReconciliationCatalogPath,
-    ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
-    ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken, SelectionMetadataReceipt,
-    TempFileOwnershipStore,
+    DownloadedFileRecord, ManifestAssetRow, OwnedTempFile, PendingPublicationRecord,
+    ReconciliationCatalogPath, ReconciliationContent, ReconciliationPathKey,
+    ReconciliationReservation, ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken,
+    SelectionMetadataReceipt, TempFileOwnershipStore,
 };
 
 #[cfg(test)]
