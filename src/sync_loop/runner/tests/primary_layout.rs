@@ -749,6 +749,49 @@ async fn contract_source_checkpoint_requires_durable_recovery_primary_layout_aft
         ),
         1
     );
+    // A real interrupted publication must wake its selected zone even when
+    // the provider is quiet and no retained-checkpoint marker can mask it.
+    {
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert!(
+            db.get_metadata(&format!(
+                "{}PrimarySync",
+                crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
+            ))
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            !db.has_metadata_capture_work(&["PrimarySync"], state::METADATA_CAPTURE_REVISION)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.get_metadata(&state::unresolved_identity_key("PrimarySync"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let selected = crate::sync_loop::test_support::make_run_cycle_library_state(
+            "PrimarySync",
+            "sync_token",
+            "zone_token",
+        );
+        let mut precheck = crate::sync_loop::precheck::WatchPrecheck::SkipAll;
+        crate::sync_loop::precheck::include_pending_local_work(
+            &mut precheck,
+            &db,
+            &crate::config::MetadataConfig::default(),
+            &[selected],
+        )
+        .await;
+        assert!(precheck.should_sync_zone("PrimarySync"));
+        assert!(!precheck.should_sync_zone("SharedSync-unselected"));
+        assert!(precheck.db_sync_token_after_success().is_none());
+    }
     let requests = server.received_requests().await.unwrap().len();
     rusqlite::Connection::open(root.path().join("state.db"))
         .unwrap()
