@@ -2806,6 +2806,11 @@ fn docker_support_export_skips_repairs_and_keeps_numeric_privilege_drop() {
         !repairs.exists(),
         "support collection traversed or repaired a volume"
     );
+    let text = std::fs::read_to_string(&output).unwrap();
+    let bundle: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(bundle["schema_version"], 1);
+    assert_eq!(bundle["configuration"]["status"], "available");
+    assert!(!text.contains("private-"));
     assert_eq!(std::fs::read_to_string(&uid).unwrap(), "4321:4322");
     assert_eq!(std::fs::read_dir(&config).unwrap().count(), 1);
     assert_eq!(

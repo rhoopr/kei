@@ -132,6 +132,14 @@ test "$(stat -c %u:%g "$export_output/bundle.json")" = "$(id -u):$(id -g)"
 test "$(stat -c %a "$export_output/bundle.json")" = 600
 test "$(cat "$export_photos/private-photo.jpg")" = private-media
 ! grep -q 'private-' "$export_output/bundle.json"
+python3 - "$export_output/bundle.json" <<'PYTHON'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    bundle = json.load(source)
+assert bundle["schema_version"] == 1
+assert bundle["configuration"]["status"] == "available"
+PYTHON
 ! grep -Eq 'forbidden-volume-initialization|warning: chown' <<<"$export_out"
 explicit_out=$(export_run /usr/local/bin/kei --config /config/config.toml support-export --output /output/explicit.json 2>&1)
 test -f "$export_output/explicit.json"
