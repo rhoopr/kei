@@ -769,7 +769,7 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
     .await;
     let mut end = match &result {
         Ok(()) => serde_json::json!({"phase": "shutdown", "outcome": "success"}),
-        Err(error) => support::error_fields("startup", error),
+        Err(error) => support::classify_support_error("startup", error),
     };
     if let Some(map) = end.as_object_mut() {
         map.insert("phase".into(), serde_json::json!("shutdown"));

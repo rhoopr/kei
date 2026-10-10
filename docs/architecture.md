@@ -1927,6 +1927,9 @@ fields, labels, arbitrary errors and provider identifiers cannot broaden it.
 Random process-local aliases are bounded and renumbered at collection time.
 Counts are scoped observations and must not be added as unique asset counts.
 SQL observations before transaction commit are explicitly identified as attempts.
+`src/support/mod.rs::classify_support_error` owns diagnostic typed-error
+projection. It exports fixed classes and numeric status codes from the cause
+chain, never messages or provider payloads, and does not decide retry policy.
 
 History and export schema version 1 are separate from report version 3 and state
 schema 35. Raw reports and databases are never packaged. Interrupted writes

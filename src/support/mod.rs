@@ -222,7 +222,8 @@ pub(crate) async fn export(
     Ok(())
 }
 
-pub(crate) fn error_fields(operation: &'static str, error: &anyhow::Error) -> Value {
+/// Projects typed causes to fixed diagnostic fields without exposing error text.
+pub(crate) fn classify_support_error(operation: &'static str, error: &anyhow::Error) -> Value {
     let mut class = "other";
     let mut errno = None;
     let mut http_status = None;
@@ -313,7 +314,7 @@ pub(crate) fn download_error_fields(
         DownloadError::InvalidContent { .. } => {
             json!({"operation": operation, "class": "invalid_content"})
         }
-        DownloadError::Other(error) => error_fields(operation, error),
+        DownloadError::Other(error) => classify_support_error(operation, error),
     }
 }
 
@@ -332,7 +333,7 @@ pub(crate) fn metadata_error(
     error: &anyhow::Error,
     committed: Option<bool>,
 ) {
-    let mut fields = error_fields("metadata_capture", error);
+    let mut fields = classify_support_error("metadata_capture", error);
     if let Some(map) = fields.as_object_mut() {
         map.insert("stage".into(), json!(stage));
         map.insert("publication_committed".into(), json!(committed));

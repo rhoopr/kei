@@ -1923,6 +1923,7 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_selection_incremental_error",
         "classify_shadow_page_error",
         "classify_srp_post_error",
+        "classify_support_error",
         "classify_sync_auth_error",
         "is_session_error",
         "map_library_init_error",

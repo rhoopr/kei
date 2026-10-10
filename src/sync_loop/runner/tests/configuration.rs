@@ -217,6 +217,112 @@ async fn run_cycle_enum_config_drift_atomically_promotes_bridged_checkpoint() {
 }
 
 #[tokio::test]
+async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_restarts() {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let config = make_run_cycle_config();
+    let db = make_state_db();
+    db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
+        .await
+        .unwrap();
+    db.set_metadata("sync_token:PrimarySync", "PRIVATE_PRIOR_TOKEN")
+        .await
+        .unwrap();
+    let download_dir = tempfile::tempdir().unwrap();
+    let history_dir = tempfile::tempdir().unwrap();
+    let history_path = history_dir.path().join("history.json");
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    let build_download_config =
+        make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+    // Actual cycle orchestration: failed inventory token repair, then complete
+    // inventory with a failed bridge, then successful bridge after reopening.
+    for (inventory, bridge, advance) in [
+        ("", "PRIVATE_UNUSED_TOKEN", false),
+        ("PRIVATE_INVENTORY_TOKEN", "", false),
+        ("PRIVATE_INVENTORY_TOKEN", "PRIVATE_BRIDGE_TOKEN", true),
+    ] {
+        let album = make_full_album_with_boxed_session(
+            "PrimarySync",
+            Box::new(ConfigBridgeSession::new("PrimarySync", inventory, bridge)),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let (recorder, guard) =
+            crate::support::history::start(history_path.clone(), serde_json::json!({})).unwrap();
+        let subscriber = tracing_subscriber::registry().with(recorder).with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::sink)
+                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+        );
+        let result = run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+        assert_eq!(result.db_sync_token_advance_safe, advance);
+        guard.finish().await;
+    }
+    let history: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&history_path).unwrap()).unwrap();
+    let cycles = history["cycles"].as_array().unwrap();
+    assert_eq!(cycles.len(), 3);
+    let component = |cycle: usize, name: &str| -> &serde_json::Value {
+        &cycles[cycle]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["kind"] == "support_pass_completion_v1" && d["fields"]["component"] == name)
+            .unwrap()["fields"]
+    };
+    assert_eq!(component(0, "initial")["same_cycle_recovery_attempts"], 1);
+    assert_eq!(component(0, "initial")["same_cycle_recovery_successes"], 0);
+    assert_eq!(component(0, "initial")["sync_token_receivers_blank"], 1);
+    assert_eq!(component(0, "initial")["sync_token_blocked"], true);
+    assert_eq!(component(1, "initial")["token_present"], true);
+    assert_eq!(
+        component(1, "initial")["sync_token_blocked"],
+        false,
+        "{}",
+        cycles[1]
+    );
+    assert_eq!(component(1, "delta_bridge")["token_present"], true);
+    assert_eq!(component(1, "delta_bridge")["token_usable"], true);
+    assert_eq!(
+        component(1, "delta_bridge")["completed_delta_replay"],
+        false
+    );
+    assert_eq!(component(1, "delta_bridge")["phase"], "full");
+    assert_eq!(component(1, "combined")["sync_token_blocked"], true);
+    assert_eq!(
+        component(1, "combined")["sync_token_blocked_reason"],
+        "inventory_delta_bridge_failed"
+    );
+    assert_eq!(component(2, "delta_bridge")["token_present"], true);
+    assert_eq!(component(2, "combined")["sync_token_blocked"], false);
+    let encoded = history.to_string();
+    for private in [
+        "PRIVATE",
+        "PrimarySync",
+        "sync_token:PrimarySync",
+        download_dir.path().to_str().unwrap(),
+        history_dir.path().to_str().unwrap(),
+    ] {
+        assert!(!encoded.contains(private), "private fixture value retained");
+    }
+}
+
+#[tokio::test]
 async fn run_cycle_multi_zone_reconciliation_preserves_all_active_tokens_on_partial_failure() {
     let config = make_run_cycle_config();
     let db = make_state_db();

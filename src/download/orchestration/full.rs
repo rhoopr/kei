@@ -89,6 +89,50 @@ enum ZoneTokenEvidence {
     },
 }
 
+fn observe_token_evidence(
+    zone: &str,
+    phase: &'static str,
+    observations: &[PassTokenObservation],
+    evidence: &ZoneTokenEvidence,
+    enumeration_complete: bool,
+    enumeration_errors: usize,
+) {
+    let (completion, gap) = match evidence {
+        ZoneTokenEvidence::Complete { .. } => ("complete", None),
+        ZoneTokenEvidence::Recoverable { reason, .. } => ("recoverable", Some(reason)),
+        ZoneTokenEvidence::Incomplete { reason } => ("incomplete", Some(reason)),
+    };
+    let reason = gap.map(|gap| match gap {
+        TokenGap::Missing => "icloud_sync_token_missing",
+        TokenGap::Blank => "icloud_blank_sync_token",
+        TokenGap::ReceiverDropped => "kei_internal_token_receiver_dropped",
+        TokenGap::EnumerationIncomplete => "enumeration_incomplete",
+        TokenGap::Mismatch => "icloud_sync_token_mismatch",
+    });
+    let tokens = observations
+        .iter()
+        .filter_map(|o| match &o.result {
+            PassTokenResult::Present(token) => Some(token.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    crate::support::observe_scoped(
+        zone,
+        None,
+        "support_token_evidence_v1",
+        serde_json::json!({
+            "phase":phase, "completion":completion, "reason":reason,
+            "sync_token_expected_receivers":observations.len(),
+            "sync_token_receivers_with_token":tokens.len(),
+            "sync_token_receivers_missing":observations.iter().filter(|o| matches!(o.result, PassTokenResult::Missing)).count(),
+            "sync_token_receivers_blank":observations.iter().filter(|o| matches!(o.result, PassTokenResult::Blank)).count(),
+            "sync_token_receivers_dropped":observations.iter().filter(|o| matches!(o.result, PassTokenResult::ReceiverDropped)).count(),
+            "sync_token_unique_values":tokens.into_iter().collect::<FxHashSet<_>>().len(),
+            "enumeration_incomplete":!enumeration_complete, "enumeration_errors":enumeration_errors,
+        }),
+    );
+}
+
 fn classify_zone_token_evidence(observations: &[PassTokenObservation]) -> ZoneTokenEvidence {
     let passes_without_tokens = || {
         observations
@@ -1454,6 +1498,14 @@ pub(super) async fn download_photos_full_with_token_policy(
         } else {
             classify_zone_token_evidence(&observations)
         };
+        observe_token_evidence(
+            &config.library,
+            "initial",
+            &observations,
+            &initial_evidence,
+            streaming_result.enumeration_complete,
+            streaming_result.enumeration_errors,
+        );
         match initial_evidence {
             ZoneTokenEvidence::Complete { token } => Some(token),
             ZoneTokenEvidence::Recoverable { passes, reason } if !repair_token_gaps => {
@@ -1628,7 +1680,16 @@ pub(super) async fn download_photos_full_with_token_policy(
                 token_unique_values =
                     Some(final_tokens.iter().copied().collect::<FxHashSet<_>>().len());
 
-                match classify_zone_token_evidence(&observations) {
+                let recovery_evidence = classify_zone_token_evidence(&observations);
+                observe_token_evidence(
+                    &config.library,
+                    "same_cycle_recovery",
+                    &observations,
+                    &recovery_evidence,
+                    streaming_result.enumeration_complete,
+                    streaming_result.enumeration_errors,
+                );
+                match recovery_evidence {
                     ZoneTokenEvidence::Complete { token }
                         if streaming_result.enumeration_complete
                             && streaming_result.enumeration_errors == 0 =>

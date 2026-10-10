@@ -660,7 +660,7 @@ impl ImportPreflight {
                         if let Err(error) = &result {
                             crate::support::observe(
                                 "support_task_error_v1",
-                                crate::support::error_fields("adoption", error),
+                                crate::support::classify_support_error("adoption", error),
                             );
                         }
                         record_strict_refusal(&mut stats, &heartbeat_state);

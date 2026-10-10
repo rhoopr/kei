@@ -20,7 +20,7 @@ fn malicious_reports_configurations_and_errors_are_allowlisted() {
     let error = anyhow::anyhow!(
         "https://private-url /private-path password=private-token AppleID=private-apple-id"
     );
-    let fields = super::error_fields("download", &error);
+    let fields = super::classify_support_error("download", &error);
     assert_eq!(fields["class"], "other");
     assert!(!fields.to_string().contains("private"));
 }

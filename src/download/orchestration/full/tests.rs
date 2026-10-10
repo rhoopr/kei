@@ -2015,6 +2015,109 @@ async fn full_sync_filtered_sibling_cannot_displace_legacy_master_owner_next_cyc
     );
 }
 
+#[derive(Clone)]
+struct DiagnosticMismatchSession {
+    initial_token: &'static str,
+    queries: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for DiagnosticMismatchSession {
+    async fn post(
+        &self,
+        url: &str,
+        _body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        if url.contains("/internal/records/query/batch") {
+            return Ok(json!({"batch":[{"records":[{"fields":{"itemCount":{"value":0}}}]}]}));
+        }
+        let token = if self.queries.fetch_add(1, Ordering::SeqCst) < 6 {
+            self.initial_token
+        } else {
+            "PRIVATE_REPAIRED_TOKEN"
+        };
+        Ok(json!({"records":[], "syncToken":token}))
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn support_history_keeps_initial_mismatch_and_repaired_token_counts_at_info() {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    let passes = ["PRIVATE_INITIAL_A", "PRIVATE_INITIAL_B"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, token)| AlbumPass {
+            kind: PassKind::Album,
+            album: album_with_session(
+                "PrimarySync",
+                &format!("PRIVATE_ALBUM_{index}"),
+                Box::new(DiagnosticMismatchSession {
+                    initial_token: token,
+                    queries: Arc::new(AtomicUsize::new(0)),
+                }),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        })
+        .collect::<Vec<_>>();
+    let mut config = test_config();
+    let media_dir = TempDir::new().unwrap();
+    config.directory = Arc::from(media_dir.path());
+    let history_dir = TempDir::new().unwrap();
+    let path = history_dir.path().join("history.json");
+    let (recorder, guard) = crate::support::history::start(path.clone(), json!({})).unwrap();
+    let subscriber = tracing_subscriber::registry().with(recorder).with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::sink)
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+    );
+    // This test uses Tokio's current-thread runtime, so the thread-local
+    // default covers provider streams and the orchestrator for the whole run.
+    let _default = tracing::subscriber::set_default(subscriber);
+    let result = download_photos_full_with_token(
+        &Client::new(),
+        &passes,
+        &Arc::new(config),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.stats.same_cycle_recovery_attempts, 1);
+    assert_eq!(result.stats.same_cycle_recovery_successes, 1);
+    assert_eq!(result.stats.sync_token_unique_values, Some(1));
+    guard.finish().await;
+    let history: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let events = history["cycles"][0]["diagnostics"].as_array().unwrap();
+    let proof = |phase: &str| -> &Value {
+        &events
+            .iter()
+            .find(|d| d["kind"] == "support_token_evidence_v1" && d["fields"]["phase"] == phase)
+            .unwrap_or_else(|| panic!("missing {phase} evidence: {history}"))["fields"]
+    };
+    assert_eq!(proof("initial")["reason"], "icloud_sync_token_mismatch");
+    assert_eq!(proof("initial")["sync_token_expected_receivers"], 2);
+    assert_eq!(proof("initial")["sync_token_unique_values"], 2);
+    assert_eq!(proof("same_cycle_recovery")["completion"], "complete");
+    assert_eq!(
+        proof("same_cycle_recovery")["sync_token_receivers_with_token"],
+        2
+    );
+    assert_eq!(proof("same_cycle_recovery")["sync_token_unique_values"], 1);
+    for private in [
+        "PRIVATE",
+        "PrimarySync",
+        media_dir.path().to_str().unwrap(),
+        history_dir.path().to_str().unwrap(),
+    ] {
+        assert!(!history.to_string().contains(private));
+    }
+}
+
 #[tokio::test]
 async fn full_sync_blank_query_sync_token_blocks_advancement() {
     let records = mock_photo_records_with_filename("MASTER_BLANK_TOKEN", "blank-token.jpg");

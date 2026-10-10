@@ -101,8 +101,15 @@ transition, not durable finalization. A successful receipt recovery describes
 state recovery without a new byte publication. Fractional metadata observations
 contain booleans and verification results, never capture dates or locations.
 Absent fields were not recorded; null selection comparability is unavailable.
-Initial inventory, delta bridge and combined invocation counts are labeled
-separately. Query completion is recorded by the provider fetcher; aggregate
+Initial inventory, delta bridge and combined invocation counts, token receiver
+counters, recovery attempts/results and blocked reasons are labeled separately.
+These records survive at the default log level, so an earlier failed repair or
+successful inventory is not replaced by the later bridge outcome. Token proof
+also records the initial receiver counts and the same-cycle retry counts
+separately, preserving an initial mismatch even when retry repairs it. Token
+proof completion describes receiver agreement; enumeration and checkpoint
+fields independently describe whether source progress is safe. Token presence
+and usability are separate booleans. Query completion is recorded by the provider fetcher; aggregate
 absence of errors never asserts inventory completeness. Import records identify
 child versus legacy-master selection and path-shape matches without identifiers.
 Metadata plan records compare source and actual planned precision in one event;
