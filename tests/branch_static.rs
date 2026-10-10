@@ -2773,6 +2773,7 @@ fn docker_support_export_skips_repairs_and_keeps_numeric_privilege_drop() {
     .unwrap();
     let run = |arguments: &[&str]| {
         Command::new("sh")
+            .env_clear()
             .current_dir(root)
             .arg(&entrypoint)
             .args(arguments)
@@ -2783,9 +2784,6 @@ fn docker_support_export_skips_repairs_and_keeps_numeric_privilege_drop() {
             .env("KEI_CONFIG", &cfg)
             .env("REPAIR_MARKER", &repairs)
             .env("UID_MARKER", &uid)
-            .env_remove("KEI_DOCKER_ENTRYPOINT_QUERY")
-            .env_remove("KEI_CHOWN_PHOTOS")
-            .env_remove("KEI_DOWNLOAD_DIR")
             .output()
             .unwrap()
     };
