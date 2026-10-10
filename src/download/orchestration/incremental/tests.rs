@@ -2465,7 +2465,34 @@ async fn shared_delta_state_streaming_receiver_drop_keeps_completion_uncommitted
 
 #[tokio::test]
 async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
     for collecting in [true, false] {
+        let server = crate::start_wiremock_or_skip!();
+        let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+        Mock::given(method("GET"))
+            .and(path("/earlier.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+            .expect(if collecting { 0 } else { 1 })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rejected.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut earlier = incremental_photo_records_with_url(
+            "EARLIER",
+            "earlier.jpg",
+            &format!("{}/earlier.jpg", server.uri()),
+            bytes.len() as u64,
+        );
+        earlier[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes)));
         let dir = TempDir::new().unwrap();
         let db = Arc::new(
             SqliteStateDb::open(&dir.path().join("state.db"))
@@ -2475,12 +2502,14 @@ async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
         db.set_metadata("sync_token:PrimarySync", "saved")
             .await
             .unwrap();
-        let rejected = incremental_photo_records_with_url(
+        let mut rejected = incremental_photo_records_with_url(
             "REJECTED_PAGE",
             "rejected.jpg",
-            "https://example.invalid/rejected.jpg",
-            1024,
+            &format!("{}/rejected.jpg", server.uri()),
+            bytes.len() as u64,
         );
+        rejected[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            earlier[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"].clone();
         let page = |records: Vec<serde_json::Value>, token: &str, more: bool| {
             json!({
                 "zones": [{"zoneID": {"zoneName": "PrimarySync"}, "records": records,
@@ -2496,7 +2525,7 @@ async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
             album: changes_album(
                 "",
                 crate::test_helpers::MockPhotosSession::new()
-                    .ok(page(vec![], "accepted-page", true))
+                    .ok(page(earlier, "accepted-page", true))
                     .ok(bad),
             ),
             exclude_ids: Arc::new(FxHashSet::default()),
@@ -2509,10 +2538,7 @@ async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
             &[pass],
             &Arc::new(config),
             "saved",
-            DownloadControls {
-                run_mode: DownloadRunMode::PrintFilenames,
-                reporting: DownloadReporting::hidden(),
-            },
+            DownloadControls::download_hidden(),
             CancellationToken::new(),
         )
         .await;
@@ -2527,7 +2553,19 @@ async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
                 .as_deref(),
             Some("saved")
         );
-        assert!(db.get_all_known_ids().await.unwrap().is_empty());
+        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+        if collecting {
+            assert!(db.get_all_known_ids().await.unwrap().is_empty());
+        } else {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id.as_ref(), "asset-EARLIER");
+            assert_eq!(
+                std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+                bytes
+            );
+            assert_eq!(db.get_all_known_ids().await.unwrap().len(), 1);
+        }
+        server.verify().await;
     }
 }
 
