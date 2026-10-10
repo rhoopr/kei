@@ -1860,6 +1860,12 @@ Stable IDs connect safety rules to production owners and focused tests.
 
 - Unit tests live near their owner module.
 - Cross-module and binary behavior lives under `tests/`.
+- Strict changes-page recovery is also exercised through production `run_cycle`
+  with real earlier downloads, malformed later work, reopened SQLite and valid
+  replay in both incremental strategies. The proof preserves historical bytes
+  and retry/identity debt, then checks exactly-once transfers, unchanged download
+  receipts and two quiet cycles. See the strict changes/zone section of the
+  [test guide](../tests/README.md#strict-changeszone-pages).
 - Live iCloud tests are ignored by default and run single-threaded.
 - `tests/data/media-manifest.json` owns the bundled media inventory and size
   budget. `download::orchestration::fixture_tests` exercises these bytes

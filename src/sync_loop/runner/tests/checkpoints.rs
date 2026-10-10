@@ -1830,6 +1830,369 @@ async fn run_cycle_rejected_zone_page_preserves_cursor_debt_and_media_across_res
     }
 }
 
+#[derive(Clone)]
+struct DownloadReplayPageSession {
+    phase: u8,
+    earlier: Vec<serde_json::Value>,
+    debt: Vec<serde_json::Value>,
+    rejected: Vec<serde_json::Value>,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for DownloadReplayPageSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        use serde_json::json;
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if url.contains("/changes/zone?") {
+            let token = body["zones"][0]["syncToken"].as_str().unwrap();
+            self.requests.lock().unwrap().push(format!("delta:{token}"));
+            let (records, successor, more) = match (self.phase, token) {
+                (0, "saved") => (self.earlier.clone(), "accepted-page", true),
+                (0, "accepted-page") => {
+                    let mut records = self.rejected.clone();
+                    records.push(
+                        json!({"recordName": "private-error", "recordType": "FutureType",
+                        "serverErrorCode": "UNKNOWN_ITEM", "reason": "private-reason"}),
+                    );
+                    (records, "rejected-successor", false)
+                }
+                (1, "saved") => (vec![], "saved", false),
+                (2, "saved") => (self.earlier.clone(), "accepted-page", true),
+                (2, "accepted-page") => (self.debt.clone(), "recovered", false),
+                (3 | 4, "recovered") => (vec![], "recovered", false),
+                _ => anyhow::bail!("Unexpected replay phase or cursor"),
+            };
+            return Ok(json!({"zones": [{"zoneID": {"zoneName": "PrimarySync"},
+                "records": records, "syncToken": successor, "moreComing": more}]}));
+        }
+        if url.contains("/records/lookup?") {
+            self.requests.lock().unwrap().push("lookup".to_owned());
+            return Ok(json!({"records": if self.phase < 2 {vec![]} else {self.debt.clone()}}));
+        }
+        // A malformed delta must not be rescued by invented authoritative
+        // inventory. Later recent-selection queries see the same valid work.
+        anyhow::ensure!(self.phase > 0, "No authoritative fallback fixture");
+        if url.contains("/internal/records/query/batch?") {
+            self.requests.lock().unwrap().push("count".to_owned());
+            return Ok(album_count_response(if self.phase == 1 { 0 } else { 2 }));
+        }
+        if url.contains("/records/query?") {
+            self.requests.lock().unwrap().push("query".to_owned());
+            let records = if self.phase == 1 {
+                vec![]
+            } else {
+                self.earlier.iter().chain(&self.debt).cloned().collect()
+            };
+            return Ok(
+                json!({"records": records, "syncToken": if self.phase == 1 {"saved"} else {"recovered"}}),
+            );
+        }
+        anyhow::bail!("Unexpected provider endpoint");
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    for collecting in [false, true] {
+        let server = wiremock::MockServer::start().await;
+        let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+        for (name, transfers) in [("earlier", 1), ("debt", 1), ("rejected", 0)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{name}.jpg")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+                .expect(transfers)
+                .mount(&server)
+                .await;
+        }
+        let records = |name: &str| {
+            let mut page = full_album_page_with_download(
+                "PrimarySync",
+                &format!("master-{name}"),
+                "unused",
+                &format!("{}/{name}.jpg", server.uri()),
+                bytes.len() as u64,
+                &checksum,
+            );
+            page["records"][0]["fields"]["filenameEnc"]["value"] = serde_json::json!(
+                base64::engine::general_purpose::STANDARD.encode(format!("{name}.jpg"))
+            );
+            page["records"].as_array().unwrap().clone()
+        };
+        let config = make_run_cycle_config();
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("state.db");
+        let media_dir = dir.path().join("media");
+        tokio::fs::create_dir(&media_dir).await.unwrap();
+        let historical = media_dir.join("historical.jpg");
+        let history_bytes = b"historical media remains intact";
+        tokio::fs::write(&historical, history_bytes).await.unwrap();
+        let history_snapshot;
+        {
+            let db = state::SqliteStateDb::open(&database).await.unwrap();
+            db.set_metadata("sync_token:PrimarySync", "saved")
+                .await
+                .unwrap();
+            db.set_metadata(
+                ENUM_CONFIG_HASH_KEY,
+                &download::compute_config_hash(&config),
+            )
+            .await
+            .unwrap();
+            db.upsert_seen(&crate::test_helpers::TestAssetRecord::new("asset-HISTORY").build())
+                .await
+                .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                "asset-HISTORY",
+                "original",
+                &historical,
+                "historical-checksum",
+                None,
+            )
+            .await
+            .unwrap();
+            db.upsert_asset_master_mapping("PrimarySync", "asset-HISTORY", "master-HISTORY")
+                .await
+                .unwrap();
+            db.upsert_seen(
+                &crate::test_helpers::TestAssetRecord::new("asset-master-debt")
+                    .filename("debt.jpg")
+                    .size(bytes.len() as u64)
+                    .checksum(&checksum)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            db.upsert_asset_master_mapping("PrimarySync", "asset-master-debt", "master-debt")
+                .await
+                .unwrap();
+            db.set_metadata(&state::unresolved_identity_key("PrimarySync"), "1")
+                .await
+                .unwrap();
+            history_snapshot = db.get_downloaded_page(0, 10).await.unwrap().remove(0);
+        }
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let mut earlier_snapshot = None;
+        let mut recovered_snapshot = None;
+        for phase in 0..5 {
+            let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            let db: Arc<dyn download::DownloadStore> = inner.clone();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let library = make_run_cycle_library_state_with_album(
+                "PrimarySync",
+                "sync_token:PrimarySync",
+                make_full_album_with_boxed_session(
+                    "PrimarySync",
+                    Box::new(DownloadReplayPageSession {
+                        phase,
+                        earlier: records("earlier"),
+                        debt: records("debt"),
+                        rejected: records("rejected"),
+                        requests: requests.clone(),
+                    }),
+                ),
+            );
+            if phase == 1 {
+                let mut precheck = crate::sync_loop::precheck::WatchPrecheck::SkipAll;
+                crate::sync_loop::precheck::include_pending_local_work(
+                    &mut precheck,
+                    inner.as_ref(),
+                    &config.metadata,
+                    std::slice::from_ref(&library),
+                )
+                .await;
+                assert!(precheck.should_sync_zone("PrimarySync"));
+            }
+            let builder = make_run_cycle_download_config_builder_with_options(
+                &media_dir,
+                db.clone(),
+                RunCycleDownloadConfigOptions {
+                    recent: collecting.then_some(10),
+                    ..RunCycleDownloadConfigOptions::default()
+                },
+            );
+            let result = run_cycle(
+                &[&library],
+                &config,
+                Some(db.as_ref()),
+                false,
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &shared_session,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            drop(builder);
+            drop(db);
+            drop(inner);
+
+            // Read the committed outcomes through a new SQLite connection.
+            let db = state::SqliteStateDb::open(&database).await.unwrap();
+            let summary = db.get_summary().await.unwrap();
+            let rows = db.get_downloaded_page(0, 10).await.unwrap();
+            let history = rows
+                .iter()
+                .find(|row| row.id.as_ref() == "asset-HISTORY")
+                .unwrap();
+            assert_eq!(history.local_path, history_snapshot.local_path);
+            assert_eq!(history.local_checksum, history_snapshot.local_checksum);
+            assert_eq!(history.downloaded_at, history_snapshot.downloaded_at);
+            assert_eq!(history.created_at, history_snapshot.created_at);
+            assert_eq!(tokio::fs::read(&historical).await.unwrap(), history_bytes);
+            for row in rows.iter().filter(|row| row.id.as_ref() != "asset-HISTORY") {
+                assert_eq!(
+                    tokio::fs::read(row.local_path.as_ref().unwrap())
+                        .await
+                        .unwrap(),
+                    bytes
+                );
+                assert_eq!(
+                    row.local_checksum.as_deref(),
+                    Some(format!("{:x}", Sha256::digest(bytes)).as_str())
+                );
+            }
+            assert!(
+                !db.get_all_known_ids()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|(_, id)| id.contains("rejected"))
+            );
+            let cursor = db
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .unwrap();
+            if phase < 2 {
+                assert_eq!(cursor, "saved", "collecting={collecting} phase={phase}");
+                assert_eq!(summary.pending + summary.failed, 1);
+                assert!(!result.can_advance_database_checkpoint());
+                assert_eq!(summary.downloaded, if collecting { 1 } else { 2 });
+                let mut pending = db.get_pending().await.unwrap();
+                pending.extend(db.get_failed().await.unwrap());
+                assert_eq!(pending.len(), 1);
+                assert_eq!(pending[0].id.as_ref(), "asset-master-debt");
+                assert_eq!(pending[0].checksum.as_ref(), checksum);
+                assert_eq!(pending[0].filename.as_ref(), "debt.jpg");
+                // The marker schedules replay; a completed quiet delta may
+                // clear it while durable targeted-retry work remains.
+                if phase == 0 {
+                    assert!(
+                        db.get_metadata(&state::unresolved_identity_key("PrimarySync"))
+                            .await
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+                if !collecting {
+                    let row = rows
+                        .iter()
+                        .find(|row| row.id.as_ref() == "asset-master-earlier")
+                        .unwrap();
+                    if phase == 0 {
+                        earlier_snapshot = Some(row.clone());
+                    }
+                    assert_eq!(
+                        row.local_path,
+                        earlier_snapshot.as_ref().unwrap().local_path
+                    );
+                    assert_eq!(
+                        row.downloaded_at,
+                        earlier_snapshot.as_ref().unwrap().downloaded_at
+                    );
+                }
+            } else {
+                assert_eq!(cursor, "recovered");
+                assert_eq!(summary.pending + summary.failed, 0);
+                assert_eq!(
+                    summary.source_deleted, 0,
+                    "recovery must download, not delete"
+                );
+                assert_eq!(summary.downloaded, 3);
+                assert!(result.can_advance_database_checkpoint(), "{result:?}");
+                assert!(
+                    db.get_metadata(&state::unresolved_identity_key("PrimarySync"))
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                if phase == 2 {
+                    recovered_snapshot = Some(rows.clone());
+                }
+                for row in &rows {
+                    let saved = recovered_snapshot
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .find(|saved| saved.id == row.id)
+                        .unwrap();
+                    assert_eq!(row.local_path, saved.local_path);
+                    assert_eq!(row.local_checksum, saved.local_checksum);
+                    assert_eq!(row.downloaded_at, saved.downloaded_at);
+                }
+                if !collecting {
+                    let row = rows
+                        .iter()
+                        .find(|row| row.id.as_ref() == "asset-master-earlier")
+                        .unwrap();
+                    assert_eq!(
+                        row.downloaded_at,
+                        earlier_snapshot.as_ref().unwrap().downloaded_at
+                    );
+                }
+            }
+            if phase == 0 || phase == 2 {
+                assert_eq!(
+                    &requests.lock().unwrap()[..2],
+                    ["delta:saved", "delta:accepted-page"]
+                );
+            }
+            if phase > 2 {
+                assert_eq!(result.stats.downloaded, 0);
+                assert_eq!(*requests.lock().unwrap(), ["delta:recovered"]);
+                assert!(result.stats.full_enumeration_reason.is_none());
+                let mut directories = vec![media_dir.clone()];
+                let mut files = Vec::new();
+                while let Some(directory) = directories.pop() {
+                    for entry in std::fs::read_dir(directory).unwrap() {
+                        let entry = entry.unwrap();
+                        if entry.file_type().unwrap().is_dir() {
+                            directories.push(entry.path());
+                        } else {
+                            files.push(entry.path());
+                        }
+                    }
+                }
+                let mut expected: Vec<_> = rows
+                    .iter()
+                    .map(|row| row.local_path.clone().unwrap())
+                    .collect();
+                files.sort();
+                expected.sort();
+                assert_eq!(files, expected, "no duplicate or orphaned publication");
+            }
+        }
+        server.verify().await;
+    }
+}
+
 #[tokio::test]
 async fn account_adoption_reopens_owned_state_and_runs_two_production_quiet_cycles() {
     use base64::Engine as _;

@@ -422,7 +422,9 @@ silly-rename mechanism or physical NAS behavior.
 null and non-array records, zone cardinality and owner scope, mixed nested record
 errors, and unusable tokens. Continuation-cycle and valid empty/unknown-record
 controls run beside it. Both incremental consumer strategies reject a malformed
-later page through their production entry point.
+later page containing downloadable work through their production entry point.
+The earlier valid page downloads once through streaming; collecting leaves it
+replayable. Neither strategy downloads records from the rejected page.
 
 `run_cycle_rejected_zone_page_preserves_cursor_debt_and_media_across_restart`
 seeds file-backed SQLite with a checkpoint, downloaded media and pending retry
@@ -431,6 +433,18 @@ checks a quiet provider delta and the watch local-work bypass, resolves the retr
 with explicit provider deletion evidence, then checks an unchanged cycle. Existing
 media bytes remain intact and no cycle publishes another file. The synthetic
 fallback cannot provide authoritative completion during the malformed cycle.
+
+`run_cycle_rejected_page_replays_downloads_exactly_once_across_restart` runs both
+strategies with a bundled JPEG served by a local HTTP fixture. It seeds a real
+SQLite cursor, retry/identity debt and historical media in a nonempty destination.
+A valid downloadable page precedes a malformed page containing otherwise valid
+work. Rejection and a reopened quiet delta preserve the cursor and debt; the
+watch precheck must include local work. Valid two-page replay subsequently
+downloads the earlier work and pending asset, resolves the identity hold and
+advances the checkpoint. Exactly one HTTP transfer per valid asset and none for
+the rejected asset, stable download timestamps/paths/checksums, preserved
+historical bytes and two reopened quiet cycles prove publication idempotency.
+The quiet cycles request only a zone delta and leave exactly the catalogued files.
 
 ## Observed incremental shadow capture
 
