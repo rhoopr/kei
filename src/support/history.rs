@@ -312,7 +312,7 @@ pub(crate) fn start(path: PathBuf, configuration: Value) -> Option<(Recorder, Gu
             else {
                 return;
             };
-            if lock.try_lock_exclusive().is_err() {
+            if !matches!(lock.try_lock_exclusive(), Ok(true)) {
                 return;
             }
             let (mut history, status) = read(&path);
