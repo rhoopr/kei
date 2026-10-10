@@ -446,3 +446,162 @@ async fn pending_publication_recovery_accepts_missing_path_download_hash_with_ma
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn pending_publication_recovery_respects_managed_claims_after_snapshot() {
+    for mutation in [
+        "UPDATE primary_layout_claims SET operation='pending-handover'",
+        "UPDATE primary_layout_claims SET library='SharedSync-foreign'",
+        "UPDATE primary_layout_claims SET child='foreign'",
+        "UPDATE primary_layout_claims SET version='live_adjusted'",
+        "UPDATE primary_layout_claims SET provider_checksum='new-content'",
+        "UPDATE primary_layout_claims SET local_checksum='different-local-bytes'",
+    ] {
+        let (dir, db, record) = fixture().await;
+        db.set_asset_verification(
+            "PrimarySync",
+            "L1",
+            "live_original",
+            AssetVerificationState::TransientFailure,
+            "retained retry debt",
+        )
+        .await
+        .unwrap();
+        let proof = db
+            .pending_publication("PrimarySync", "L1", VersionSizeKey::LiveOriginal)
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            // A layout can claim the prior path after the recovery reader's snapshot.
+            let conn = db
+                .acquire_lock("claim current publication after snapshot")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO primary_layout_claims(path_key,family,operation,library,child,version,provider_checksum,local_checksum,native_path) \
+                 VALUES(?1,'managed-family',NULL,'PrimarySync','L1','live_original',?2,?3,X'00')",
+                rusqlite::params![super::super::primary_layout::path_key(&proof.local_path).unwrap(),proof.checksum,proof.local_checksum],
+            ).unwrap();
+            conn.execute_batch(mutation).unwrap();
+        }
+        assert!(
+            db.recover_pending_publication(&proof, &record, "L1", "L1", &CancellationToken::new())
+                .await
+                .is_err(),
+            "{mutation}"
+        );
+        let db_path = dir.path().join("state.db");
+        drop(db);
+        let reopened = SqliteStateDb::open(&db_path).await.unwrap();
+        assert_eq!(
+            reopened
+                .pending_publication("PrimarySync", "L1", VersionSizeKey::LiveOriginal)
+                .await
+                .unwrap()
+                .unwrap(),
+            proof,
+            "{mutation}"
+        );
+        assert_eq!(
+            reopened
+                .acquire_lock("claim refusal retains retry debt")
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM asset_verifications WHERE id='L1'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "transient_failure",
+            "{mutation}"
+        );
+        assert_eq!(fs::read(&proof.local_path).unwrap(), b"movie");
+        reopened
+            .acquire_lock("release managed claim")
+            .unwrap()
+            .execute_batch("DELETE FROM primary_layout_claims")
+            .unwrap();
+        assert!(
+            reopened
+                .recover_pending_publication(&proof, &record, "L1", "L1", &CancellationToken::new())
+                .await
+                .unwrap()
+        );
+        let mut completed = proof.clone();
+        completed.status = "downloaded".into();
+        completed.last_error = None;
+        drop(reopened);
+        let quiet = SqliteStateDb::open(&db_path).await.unwrap();
+        assert_eq!(
+            quiet
+                .pending_publication("PrimarySync", "L1", VersionSizeKey::LiveOriginal)
+                .await
+                .unwrap()
+                .unwrap(),
+            completed
+        );
+        assert!(
+            quiet
+                .recover_pending_publication(
+                    &completed,
+                    &record,
+                    "L1",
+                    "L1",
+                    &CancellationToken::new()
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(fs::read(&proof.local_path).unwrap(), b"movie");
+        assert_eq!(
+            fs::read_dir(proof.local_path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "MOV"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn pending_publication_recovery_accepts_exact_committed_managed_receipt() {
+    let (dir, db, record) = fixture().await;
+    let proof = db
+        .pending_publication("PrimarySync", "L1", VersionSizeKey::LiveOriginal)
+        .await
+        .unwrap()
+        .unwrap();
+    db.acquire_lock("compatible committed managed receipt").unwrap().execute(
+        "INSERT INTO primary_layout_claims(path_key,family,operation,library,child,version,provider_checksum,local_checksum,native_path) \
+         VALUES(?1,'managed-family',NULL,'PrimarySync','L1','live_original',?2,?3,X'00')",
+        rusqlite::params![super::super::primary_layout::path_key(&proof.local_path).unwrap(),proof.checksum,proof.local_checksum],
+    ).unwrap();
+    assert!(
+        db.recover_pending_publication(&proof, &record, "L1", "L1", &CancellationToken::new())
+            .await
+            .unwrap()
+    );
+    let mut completed = proof.clone();
+    completed.status = "downloaded".into();
+    completed.last_error = None;
+    drop(db);
+    let reopened = SqliteStateDb::open(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .pending_publication("PrimarySync", "L1", VersionSizeKey::LiveOriginal)
+            .await
+            .unwrap()
+            .unwrap(),
+        completed
+    );
+    assert!(
+        reopened
+            .recover_pending_publication(&completed, &record, "L1", "L1", &CancellationToken::new())
+            .await
+            .unwrap()
+    );
+    assert_eq!(fs::read(&proof.local_path).unwrap(), b"movie");
+}
