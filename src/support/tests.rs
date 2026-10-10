@@ -204,3 +204,45 @@ fn owning_checkpoint_decisions_survive_support_allowlist_without_tokens() {
         "inventory_delta_bridge_failed"
     );
 }
+
+#[test]
+fn existing_refresh_hold_and_hardlink_fixed_fields_survive_production_layer() {
+    use tracing_subscriber::prelude::*;
+    let (layer, drain) = super::history::test_layer();
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+        tracing::warn!(
+            diagnostic = "expired_url_refresh_failed",
+            failed_records = 17u64,
+            authentication_failures = 2u64,
+            rate_limit_observations = 3u64,
+            error = "PRIVATE_TOKEN"
+        );
+        tracing::warn!(
+            diagnostic = "retained_checkpoint_expired",
+            retry_deferred = true,
+            state_write_failed = false,
+            retry_exhausted = true,
+            zone = "PRIVATE_ZONE"
+        );
+        tracing::warn!(
+            diagnostic = "legacy_preservation_hardlink_trust",
+            affected_paths = 4u64
+        );
+    });
+    let evidence = drain();
+    assert_eq!(evidence.len(), 3);
+    assert_eq!(
+        evidence[0]["fields"],
+        json!({"failed_records":17,"authentication_failures":2,"rate_limit_observations":3})
+    );
+    assert_eq!(
+        evidence[1]["fields"],
+        json!({"retry_deferred":true,"state_write_failed":false,"retry_exhausted":true})
+    );
+    assert_eq!(evidence[2]["fields"], json!({"affected_paths":4}));
+    assert!(
+        !serde_json::to_string(&evidence)
+            .unwrap()
+            .contains("PRIVATE")
+    );
+}

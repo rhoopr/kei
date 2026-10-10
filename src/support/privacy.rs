@@ -404,15 +404,21 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "http_status",
             "interrupted",
         ]),
-        "legacy_preservation_hardlink_trust" => Some(&["stage", "reason"]),
+        "legacy_preservation_hardlink_trust" => Some(&["stage", "reason", "affected_paths"]),
+        "expired_url_refresh_failed" => Some(&[
+            "failed_records",
+            "authentication_failures",
+            "rate_limit_observations",
+        ]),
+        "retained_checkpoint_expired" => {
+            Some(&["retry_deferred", "state_write_failed", "retry_exhausted"])
+        }
         "sparse_identity_state_failed"
         | "sparse_deletion_validation_failed"
         | "sparse_share_reference_changed"
         | "asset_delta_identity_unresolved"
         | "incomplete_record_pair"
-        | "expired_url_refresh_failed"
         | "retained_checkpoint_hold_invalid"
-        | "retained_checkpoint_expired"
         | "stale_plan_unaffected_zone"
         | "authentication"
         | "rate_limited"
@@ -445,6 +451,7 @@ pub(crate) fn fixed_label(value: &str) -> bool {
 }
 
 const LABELS: &[&str] = &[
+    "enumeration_incomplete",
     "dry_run",
     "stale_pass_plan",
     "state_not_durable",

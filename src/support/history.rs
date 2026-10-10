@@ -22,6 +22,8 @@ const QUEUE: usize = 256;
 
 #[derive(Default, Serialize, Deserialize)]
 pub(super) struct History {
+    #[serde(skip)]
+    active_generation: Option<u64>,
     pub schema_version: u32,
     pub cycles_evicted: u64,
     pub queue_dropped: u64,
@@ -165,6 +167,7 @@ fn trim(history: &mut History) {
 }
 
 enum Message {
+    Tagged(u64, Box<Message>),
     Start(Value),
     Begin(Value),
     Complete(Value, &'static str),
@@ -176,14 +179,24 @@ enum Message {
 #[derive(Clone)]
 pub(crate) struct Recorder {
     sender: mpsc::SyncSender<Message>,
+    generation: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     aliases: Arc<Mutex<std::collections::HashMap<String, String>>>,
     alias_namespace: uuid::Uuid,
 }
 
 impl Recorder {
+    fn tagged(&self, message: Message) -> Message {
+        let generation = if matches!(message, Message::Start(_) | Message::Begin(_)) {
+            self.generation.fetch_add(1, Ordering::SeqCst) + 1
+        } else {
+            self.generation.load(Ordering::SeqCst)
+        };
+        Message::Tagged(generation, Box::new(message))
+    }
+
     fn send(&self, message: Message) {
-        if self.sender.try_send(message).is_err() {
+        if self.sender.try_send(self.tagged(message)).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -279,7 +292,10 @@ impl Guard {
         // A blocking queue handoff joins the writer after every accepted event.
         // File work and joining never block Tokio's executor threads.
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = self.recorder.sender.send(Message::Stop);
+            let _ = self
+                .recorder
+                .sender
+                .send(self.recorder.tagged(Message::Stop));
             let _ = self.worker.join();
         })
         .await;
@@ -290,6 +306,7 @@ pub(crate) fn start(path: PathBuf, configuration: Value) -> Option<(Recorder, Gu
     let (sender, receiver) = mpsc::sync_channel(QUEUE);
     let recorder = Recorder {
         sender,
+        generation: Arc::new(AtomicU64::new(0)),
         dropped: Arc::new(AtomicU64::new(0)),
         aliases: Arc::new(Mutex::new(std::collections::HashMap::new())),
         alias_namespace: uuid::Uuid::new_v4(),
@@ -362,10 +379,23 @@ pub(crate) fn start(path: PathBuf, configuration: Value) -> Option<(Recorder, Gu
 
 fn apply(history: &mut History, message: Message) -> bool {
     match message {
+        Message::Tagged(generation, message) => {
+            if matches!(*message, Message::Start(_) | Message::Begin(_)) {
+                history.active_generation = Some(generation);
+            } else if history.active_generation != Some(generation) {
+                // Losing a Begin omits that cycle rather than attributing its
+                // events or completion to the previous (possibly completed) one.
+                history.queue_dropped = history.queue_dropped.saturating_add(1);
+                return matches!(*message, Message::Stop);
+            }
+            return apply(history, *message);
+        }
         Message::Start(configuration) => begin_record(history, configuration, false),
         Message::Begin(configuration) => begin_record(history, configuration, true),
         Message::Complete(stats, outcome) => {
-            if let Some(cycle) = history.cycles.last_mut() {
+            if let Some(cycle) = history.cycles.last_mut()
+                && cycle.completed_at.is_none()
+            {
                 cycle.completed_at = Some(now());
                 cycle.outcome = outcome.into();
                 cycle.stats = stats;
@@ -574,6 +604,7 @@ pub(crate) fn test_layer() -> (Recorder, impl Fn() -> Vec<Value>) {
     let (sender, receiver) = mpsc::sync_channel(QUEUE);
     let recorder = Recorder {
         sender,
+        generation: Arc::new(AtomicU64::new(0)),
         dropped: Arc::new(AtomicU64::new(0)),
         aliases: Arc::new(Mutex::new(std::collections::HashMap::new())),
         alias_namespace: uuid::Uuid::new_v4(),
@@ -582,6 +613,12 @@ pub(crate) fn test_layer() -> (Recorder, impl Fn() -> Vec<Value>) {
         receiver
             .try_iter()
             .filter_map(|message| match message {
+                Message::Tagged(_, message) => match *message {
+                    Message::Event(kind, fields) => {
+                        Some(serde_json::json!({"kind":kind,"fields":fields}))
+                    }
+                    _ => None,
+                },
                 Message::Event(kind, fields) => {
                     Some(serde_json::json!({"kind":kind,"fields":fields}))
                 }

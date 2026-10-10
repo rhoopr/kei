@@ -94,6 +94,7 @@ fn groups_and_queue_have_explicit_omission_counts() {
     let (sender, _receiver) = mpsc::sync_channel(QUEUE);
     let recorder = Recorder {
         sender,
+        generation: Arc::new(AtomicU64::new(0)),
         dropped: Arc::new(AtomicU64::new(0)),
         aliases: Arc::new(Mutex::new(std::collections::HashMap::new())),
         alias_namespace: uuid::Uuid::new_v4(),
@@ -112,6 +113,7 @@ fn diagnostic_layer_runs_below_log_filter_and_ignores_private_fields() {
     let (sender, receiver) = mpsc::sync_channel(QUEUE);
     let recorder = Recorder {
         sender,
+        generation: Arc::new(AtomicU64::new(0)),
         dropped: Arc::new(AtomicU64::new(0)),
         aliases: Arc::new(Mutex::new(std::collections::HashMap::new())),
         alias_namespace: uuid::Uuid::new_v4(),
@@ -142,7 +144,10 @@ fn diagnostic_layer_runs_below_log_filter_and_ignores_private_fields() {
             "private message"
         );
     });
-    let Message::Event(kind, fields) = receiver.try_recv().unwrap() else {
+    let Message::Tagged(_, message) = receiver.try_recv().unwrap() else {
+        panic!("expected attribution envelope")
+    };
+    let Message::Event(kind, fields) = *message else {
         panic!("expected diagnostic")
     };
     assert_eq!(kind, "exact_lookup_rejection_v1");
@@ -306,4 +311,56 @@ fn restarting_does_not_complete_an_interrupted_prior_startup() {
     assert!(history.cycles[0].completed_at.is_none());
     assert_eq!(history.cycles[1].outcome, "success");
     assert!(history.cycles[1].completed_at.is_some());
+}
+
+#[test]
+fn dropped_cycle_handoff_cannot_overwrite_prior_completed_evidence() {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let recorder = Recorder {
+        sender,
+        generation: Arc::new(AtomicU64::new(0)),
+        dropped: Arc::new(AtomicU64::new(0)),
+        aliases: Arc::new(Mutex::new(Default::default())),
+        alias_namespace: uuid::Uuid::new_v4(),
+    };
+    let mut history = History {
+        schema_version: 1,
+        ..History::default()
+    };
+    recorder.send(Message::Begin(json!({"threads":2})));
+    apply(&mut history, receiver.recv().unwrap());
+    recorder.send(Message::Complete(json!({"downloaded":17}), "success"));
+    apply(&mut history, receiver.recv().unwrap());
+    let prior = serde_json::to_value(&history.cycles[0]).unwrap();
+    // A stalled writer has a full observation queue at the next cycle boundary.
+    recorder.send(Message::Observe(
+        "sparse_identity_state_failed",
+        Default::default(),
+    ));
+    recorder.send(Message::Begin(json!({"threads":4})));
+    assert_eq!(recorder.dropped.load(Ordering::Relaxed), 1);
+    apply(&mut history, receiver.recv().unwrap());
+    recorder.send(Message::Complete(
+        json!({"downloaded":604}),
+        "partial_failure",
+    ));
+    apply(&mut history, receiver.recv().unwrap());
+    assert_eq!(
+        serde_json::to_value(&history.cycles[0]).unwrap()["stats"],
+        prior["stats"]
+    );
+    assert_eq!(
+        history.cycles[0].completed_at,
+        prior["completed_at"].as_str().map(str::to_owned)
+    );
+    assert_eq!(history.cycles[0].outcome, "success");
+    assert_eq!(history.cycles.len(), 1);
+    assert_eq!(history.queue_dropped, 1);
+    // A later accepted handoff resumes accurate collection with a separate record.
+    recorder.send(Message::Begin(json!({"threads":8})));
+    apply(&mut history, receiver.recv().unwrap());
+    recorder.send(Message::Complete(json!({"downloaded":2}), "success"));
+    apply(&mut history, receiver.recv().unwrap());
+    assert_eq!(history.cycles.len(), 2);
+    assert_eq!(history.cycles[1].stats["downloaded"], 2);
 }
