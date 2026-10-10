@@ -64,7 +64,10 @@ start_server() {
     server_pid=$!
     for _ in {1..50}; do
         [[ -f "$work/port" ]] && return
-        kill -0 "$server_pid" || { cat "$work/server.log"; return 1; }
+        kill -0 "$server_pid" || {
+            cat "$work/server.log"
+            return 1
+        }
         sleep 0.1
     done
     return 1

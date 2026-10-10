@@ -2356,7 +2356,7 @@ if [[ "${0##*/}" == just || "${0##*/}" == run_* ]]; then
 fi
 "#;
     for name in ["just", "systemd-analyze"] {
-        write_executable(&bin.join(&name), recorder);
+        write_executable(&bin.join(name), recorder);
     }
     for name in [
         "check_userland.sh",

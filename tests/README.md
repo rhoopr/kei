@@ -975,8 +975,8 @@ happens:
   diagnostics, media validation, pass templates, and config paths. Run it
   before releases that touch those areas.
 - **`scripts/full-test/run_docker_puid_smoke.sh`** - offline Docker entrypoint
-  checks for PUID/PGID drop, UID/GID repair and opt-out, symlink safety, `MALLOC_ARENA_MAX=2`, root-default
-  behavior, and invalid env rejection. `just test docker-full` runs this with
+  checks for PUID/PGID drop, UID/GID repair and opt-out, symlink safety,
+  `MALLOC_ARENA_MAX=2`, root-default behavior, and invalid env rejection. `just test docker-full` runs this with
   Docker build, multiarch, and CLI/default-command smokes.
 - **`scripts/full-test/run_docker_packaging_smoke.sh`** - offline checks of real
   Docker build-context filtering and the image healthcheck at default/custom

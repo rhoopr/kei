@@ -44,6 +44,8 @@ puid_run() {
     docker run --rm -e PUID="$test_puid" -e PGID="$test_pgid" \
         -v "$work/config:/config" -v "$work/photos:/photos" "$image" "$@"
 }
+# Expansion happens inside the container shell.
+# shellcheck disable=SC2016
 puid_run sh -ec '
     test "$(id -u):$(id -g)" = "$1:$2"
     for path in /config /config/nested "/config/nested/uid only" /photos /photos/nested "/photos/nested/gid only" /photos/nested/mixed /photos/nested/outside; do
@@ -53,6 +55,8 @@ puid_run sh -ec '
     touch /config/created /photos/created
     test "$(stat -c %u:%g /photos/created)" = "$1:$2"
 ' sh "$test_puid" "$test_pgid"
+# Expansion happens inside the container shell.
+# shellcheck disable=SC2016
 puid_run sh -ec 'test "$(id -u):$(id -g)" = "$1:$2"' sh "$test_puid" "$test_pgid"
 
 echo "--- photo repair opt-out leaves all photo ownership intact ---"
