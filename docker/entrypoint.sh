@@ -175,6 +175,14 @@ case "$1" in
     kei | /usr/local/bin/kei)
         if KEI_DOCKER_ENTRYPOINT_QUERY=1 "$@"; then
             exec gosu "$PUID:$PGID" "$@"
+        else
+            query_status=$?
+            # Only the reserved ordinary-command response permits repair.
+            # A crashed or killed classifier must not authorize traversal.
+            if [ "$query_status" -ne 1 ]; then
+                echo "kei: command classification failed; refusing volume initialization" >&2
+                exit "$query_status"
+            fi
         fi
         ;;
 esac

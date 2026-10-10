@@ -2739,6 +2739,7 @@ fn docker_support_export_skips_repairs_and_keeps_numeric_privilege_drop() {
     std::fs::write(photos.join("private-photo.jpg"), b"private-photo").unwrap();
     let repairs = root.join("repairs");
     let uid = root.join("uid");
+    let actual_exec = root.join("actual-exec");
     let entrypoint = root.join("entrypoint.sh");
     // Replace only container mount locations; all routing and repair logic is
     // the shipped wrapper, with real CLI classification and execution.
@@ -2784,6 +2785,7 @@ fn docker_support_export_skips_repairs_and_keeps_numeric_privilege_drop() {
             .env("KEI_CONFIG", &cfg)
             .env("REPAIR_MARKER", &repairs)
             .env("UID_MARKER", &uid)
+            .env("ACTUAL_EXEC_MARKER", &actual_exec)
             .output()
             .unwrap()
     };
@@ -2844,6 +2846,24 @@ fn docker_support_export_skips_repairs_and_keeps_numeric_privilege_drop() {
         "find\nfind\n",
         "a config value must not bypass normal volume initialization"
     );
+    std::fs::remove_file(&repairs).unwrap();
+    std::fs::remove_file(root.join("kei")).unwrap();
+    for query_status in [2, 101, 137] {
+        write_executable(
+            &root.join("kei"),
+            &format!(
+                "#!/bin/sh\nif [ \"${{KEI_DOCKER_ENTRYPOINT_QUERY:-}}\" = 1 ]; then exit {query_status}; fi\n: > \"$ACTUAL_EXEC_MARKER\"\n"
+            ),
+        );
+        let result = run(&["support-export"]);
+        assert_eq!(result.status.code(), Some(query_status), "{result:?}");
+        assert!(!repairs.exists(), "failed classifier authorized traversal");
+        assert!(
+            !actual_exec.exists(),
+            "failed classifier ran actual command"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("refusing volume initialization"));
+    }
 }
 
 fn docker_visible_commands() -> Vec<String> {

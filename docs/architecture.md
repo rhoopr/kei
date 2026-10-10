@@ -184,7 +184,9 @@ bindings and returns an exit status without runtime, config-file reads or
 credential resolution. Export launches and their help routes skip both
 volume traversal and ownership repair, including incomplete export arguments,
 then drop to the requested numeric UID:GID. Option values cannot select this
-exception. Normal launches retain their existing ownership initialization.
+exception. Status 0 selects export, and only status 1 permits ordinary volume
+initialization. An unexpected query exit, including a crash or signal, aborts
+before traversal. Normal launches retain their existing ownership initialization.
 
 The Docker HTTP healthcheck defaults to port 9090. A deployment using a custom
 `[server].port` must set `KEI_HEALTHCHECK_PORT` to that same port, including
