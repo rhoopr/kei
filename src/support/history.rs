@@ -225,7 +225,8 @@ pub(crate) fn observe(kind: &'static str, fields: Value) {
     {
         // One production bridge lets typed owners and provider tracing share the
         // same allowlist and enables disposable production-path fixture capture.
-        tracing::debug!(diagnostic = kind, support_fields = %Value::Object(fields));
+        let fields = Value::Object(fields);
+        tracing::debug!(diagnostic = kind, support_fields = %fields);
     }
 }
 

@@ -306,6 +306,33 @@ pub(crate) fn checkpoint_support_fields(decision: &SourceCheckpointDecision) -> 
     }
 }
 
+fn observe_sync_component(
+    zone: &str,
+    component: &'static str,
+    result: &download::SyncResult,
+    passes: usize,
+) {
+    crate::support::observe_scoped(
+        zone,
+        None,
+        "support_pass_completion_v1",
+        serde_json::json!({
+            "component":component, "count_scope":"selected_invocation", "passes":passes,
+            "phase":if result.full_enumeration_ran {"full"} else {"incremental"},
+            // These totals describe this invocation, before any bridge composition.
+            // Query EOF evidence is recorded by the provider fetcher, not inferred
+            // from absence of reported errors or widened into inventory coverage.
+            "inventory_complete":serde_json::Value::Null,
+            "selection_comparable":serde_json::Value::Null,
+            "enumeration_incomplete":result.checkpoint.enumeration_incomplete,
+            "enumeration_errors":result.checkpoint.enumeration_errors,
+            "identity_incomplete":result.checkpoint.identity_incomplete,
+            "interrupted":result.checkpoint.interrupted,
+            "api_total":result.stats.api_total_at_start, "assets_seen":result.stats.assets_seen,
+        }),
+    );
+}
+
 fn source_checkpoint_decision(
     result: &download::SyncResult,
     dry_run: bool,
@@ -1253,6 +1280,13 @@ pub(crate) async fn run_cycle(
         )
         .await?;
 
+        observe_sync_component(
+            &lib_state.zone_name,
+            "initial",
+            &sync_result,
+            lib_state.plan.passes.len(),
+        );
+
         if legacy_cycle.requires_inventory()
             && sync_result.full_enumeration_ran
             && matches!(
@@ -1341,6 +1375,12 @@ pub(crate) async fn run_cycle(
                         shutdown_token.clone(),
                     )
                     .await?;
+                    observe_sync_component(
+                        &lib_state.zone_name,
+                        "delta_bridge",
+                        &bridge_result,
+                        lib_state.plan.passes.len(),
+                    );
                     let bridge_decision = source_checkpoint_decision(
                         &bridge_result,
                         config.runtime.dry_run,
@@ -1785,16 +1825,11 @@ pub(crate) async fn run_cycle(
             "support_checkpoint_v1",
             checkpoint_evidence,
         );
-        crate::support::observe_scoped(
+        observe_sync_component(
             &lib_state.zone_name,
-            None,
-            "support_pass_completion_v1",
-            serde_json::json!({
-                "phase": if sync_result.full_enumeration_ran { "full" } else { "incremental" },
-                "selected_scope": "selected", "inventory_complete": !sync_result.stats.enumeration_incomplete && sync_result.stats.enumeration_errors == 0,
-                "selection_comparable": serde_json::Value::Null,
-                "api_total": sync_result.stats.api_total_at_start, "assets_seen": sync_result.stats.assets_seen,
-            }),
+            "combined",
+            &sync_result,
+            lib_state.plan.passes.len(),
         );
         if sync_result.stats.sync_token_blocked
             && sync_result.stats.sync_token_blocked_zone.is_none()
@@ -2121,6 +2156,49 @@ pub(crate) fn hash_legacy_preservation_policy(
 mod tests {
     use super::*;
     use crate::commands::PassKind;
+
+    #[test]
+    fn support_component_totals_keep_inventory_and_bridge_separate() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let (layer, drain) = crate::support::history::test_layer();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            let mut inventory = download::SyncResult::from_execution(
+                download::DownloadOutcome::Success,
+                Some("PRIVATE_TOKEN".into()),
+                download::SyncStats {
+                    assets_seen: 3899,
+                    api_total_at_start: 3899,
+                    ..Default::default()
+                },
+            );
+            inventory.full_enumeration_ran = true;
+            let bridge = download::SyncResult::from_execution(
+                download::DownloadOutcome::Success,
+                Some("PRIVATE_SUCCESSOR".into()),
+                download::SyncStats {
+                    assets_seen: 238,
+                    api_total_at_start: 238,
+                    ..Default::default()
+                },
+            );
+            observe_sync_component("PRIVATE_ZONE", "initial", &inventory, 1);
+            observe_sync_component("PRIVATE_ZONE", "delta_bridge", &bridge, 1);
+            inventory.accumulate(&bridge);
+            observe_sync_component("PRIVATE_ZONE", "combined", &inventory, 1);
+        });
+        let evidence = drain();
+        assert_eq!(evidence.len(), 3);
+        assert_eq!(evidence[0]["fields"]["assets_seen"], 3899);
+        assert_eq!(evidence[1]["fields"]["assets_seen"], 238);
+        assert_eq!(evidence[2]["fields"]["assets_seen"], 4137);
+        assert_eq!(evidence[0]["fields"]["component"], "initial");
+        assert!(evidence[2]["fields"]["inventory_complete"].is_null());
+        assert!(
+            !serde_json::to_string(&evidence)
+                .unwrap()
+                .contains("PRIVATE")
+        );
+    }
 
     #[test]
     fn retained_checkpoint_hold_round_trip_and_version_one_migration() {

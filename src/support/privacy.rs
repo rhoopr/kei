@@ -357,7 +357,9 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "skipped_already_imported",
             "dry_run",
             "legacy_identity",
-            "master_child_match",
+            "master_child_distinct",
+            "selected_identity",
+            "candidate_paths",
             "path_shape_equal",
         ]),
         "support_metadata_v1" => Some(&[
@@ -371,6 +373,13 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "applied",
         ]),
         "support_pass_completion_v1" => Some(&[
+            "component",
+            "count_scope",
+            "passes",
+            "enumeration_incomplete",
+            "enumeration_errors",
+            "identity_incomplete",
+            "interrupted",
             "phase",
             "completion",
             "expected_fetchers",
@@ -454,6 +463,11 @@ pub(crate) fn fixed_label(value: &str) -> bool {
 }
 
 const LABELS: &[&str] = &[
+    "initial",
+    "delta_bridge",
+    "combined",
+    "selected_invocation",
+    "legacy_master",
     "name-size-dedup-with-suffix",
     "name-id7",
     "prefer-raw",

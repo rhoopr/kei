@@ -928,6 +928,19 @@ where
                 dir_cache,
             )
             .await;
+            crate::support::observe_scoped(
+                library_label,
+                Some((asset.state_id(), expected_path.version_size.as_str())),
+                "support_import_v1",
+                serde_json::json!({
+                    "phase":"scan", "reason":if matches.is_empty() {"no_match"} else {"candidate"},
+                    "legacy_identity":asset.state_id()==asset.id() && asset.asset_record_name()!=asset.id(),
+                    "master_child_distinct":asset.asset_record_name()!=asset.id(),
+                    "selected_identity":if asset.state_id()==asset.asset_record_name() {"child"} else {"legacy_master"},
+                    "path_shape_equal":matches.iter().any(|(path,_)|path==&expected_path.path),
+                    "candidate_paths":matches.len(), "dry_run":options.dry_run,
+                }),
+            );
             let record = state::AssetRecord::new_pending(
                 Arc::from(library_label),
                 asset.state_id().to_string(),
@@ -2430,6 +2443,10 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn import_ambiguous_legacy_family_uses_child_and_preserves_master() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+        let (layer, drain) = crate::support::history::test_layer();
+        let subscriber = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
         let server = crate::start_wiremock_or_skip!();
         let tmp = TempDir::new().unwrap();
         let mut asset = WiremockAsset::new("master-913", "legacy.JPG", "public.jpeg").orig(
@@ -2475,6 +2492,7 @@ mod wiremock_tests {
                 &config,
                 false,
             )
+            .with_subscriber(subscriber.clone())
             .await;
             assert_eq!(stats.matched, 1);
             assert_eq!(stats.skipped_already_imported, cycle);
@@ -2498,6 +2516,16 @@ mod wiremock_tests {
                 .unwrap();
             assert_eq!(child.local_path.as_deref(), Some(child_path.as_path()));
         }
+        let evidence = drain();
+        assert!(evidence.iter().any(|v| v["kind"] == "support_import_v1"
+            && v["fields"]["master_child_distinct"] == true
+            && v["fields"]["selected_identity"] == "child"
+            && v["fields"]["path_shape_equal"] == true));
+        assert!(
+            !serde_json::to_string(&evidence)
+                .unwrap()
+                .contains("master-913")
+        );
     }
 
     #[tokio::test]
