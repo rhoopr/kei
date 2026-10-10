@@ -522,6 +522,7 @@ pub(super) struct FailingMetadataSetDb {
     /// Fails the rewritten-media checksum write so a drain can be driven
     /// into the window where the file changed but the row has not caught up.
     pub(super) fail_metadata_checksum_write: bool,
+    completed_candidate_mutation: Option<(String, String, std::sync::atomic::AtomicBool)>,
 }
 
 impl std::fmt::Debug for FailingMetadataSetDb {
@@ -556,7 +557,18 @@ impl FailingMetadataSetDb {
             refresh_on_mark_downloaded: None,
             drains: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_metadata_checksum_write: false,
+            completed_candidate_mutation: None,
         }
+    }
+
+    pub(super) fn with_completed_candidate_mutation(
+        mut self,
+        key: String,
+        replacement: String,
+    ) -> Self {
+        self.completed_candidate_mutation =
+            Some((key, replacement, std::sync::atomic::AtomicBool::new(false)));
+        self
     }
 
     #[cfg(feature = "xmp")]
@@ -1063,7 +1075,17 @@ impl state::SyncTokenStore for FailingMetadataSetDb {
         if self.get_failure.is_some_and(|failure| failure.matches(key)) {
             Err(state::error::StateError::LockPoisoned(self.message.into()))
         } else {
-            self.inner.get_metadata(key).await
+            let value = self.inner.get_metadata(key).await?;
+            if value.is_some()
+                && let Some((candidate, replacement, injected)) = &self.completed_candidate_mutation
+                && key == candidate
+                && !injected.swap(true, Ordering::SeqCst)
+            {
+                // Inject independently after the cycle reads a completed candidate,
+                // immediately before its aggregate transaction validates the read.
+                self.inner.set_metadata(key, replacement).await?;
+            }
+            Ok(value)
         }
     }
 

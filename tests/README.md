@@ -1273,3 +1273,38 @@ test separately proves that cached valid descriptors cannot publish ownership
 before the selected scope passes its own check. Malformed-list tests prove that
 invalid complete-list evidence is never cached. Existing queue admission tests
 cover capture attachment, durable receipts, rollback, replay and unchanged follow-up.
+
+
+## Retained checkpoint expiry and mixed delta proof
+
+The `sync_loop::runner::tests::retained_recovery` production-cycle fixtures use
+populated file-backed SQLite, distinct original capture/addition dates,
+finalized still and companion paths, sidecar bytes, and retained owner/checksum
+receipts. Provider responses are synthetic; no reporter database or live
+account reproduction is implied. Selection disables new photo transfers while
+existing files and current-child receipts remain populated. The source-arrival
+control uses account-bound shadow capture and independent mutable provider
+state, then asserts actual retained source observations after valid replay.
+Historical policy-excluded transfers retain their attempt/error receipts.
+`retained_checkpoint_reopened_hold_preserves_actual_failed_transfer_history`
+independently seeds a failed transfer after the first hold and proves exact row
+preservation on deferred/exhausted reopen. Ordinary active transfer preparation
+keeps its existing retry-reset behavior. Malformed/unsupported receipt controls
+prove zero provider requests while retaining the original raw evidence;
+`retained_checkpoint_hold_round_trip_and_version_one_migration` checks receipt
+serialization and the default attempt count for existing version-one receipts.
+
+| Acceptance | Production proof |
+|------------|------------------|
+| #897: eligibility drift, legacy preservation, sparse/unresolved identity with permanent retained rejection and valid fresh inventory | `retained_checkpoint_expiry_holds_all_trigger_classes_and_quiet_reopen` covers all three triggers, complete fresh anchors, unchanged historical state and redacted holds. |
+| #897: reopen, original owners/dates/bytes and retry/deletion uncertainty, independent scan-time changes | The trigger matrix checks exact SQLite rows and media after reopen; `retained_checkpoint_provider_change_during_scan_remains_replayable_then_is_durable` injects source changes independently after the first snapshot; `retained_checkpoint_expiry_controls_never_promote_or_clear_debt` injects durable sparse work through a separate connection. |
+| #897: cancellation, partial inventory, state-write failure, stale staging/promotion | `retained_checkpoint_expiry_controls_never_promote_or_clear_debt` covers incomplete/cancelled inventory, hold insertion failure, stale plans and independent cursor/config mutations. `retained_checkpoint_due_retry_write_failure_prevents_every_provider_request` and `retained_checkpoint_due_interrupted_inventory_consumes_attempt_without_promotion` cover reserved retries. `retained_checkpoint_metadata_fence_rolls_back_stale_plans` proves transactional rollback; `retained_checkpoint_candidate_changed_at_promotion_preserves_concurrent_state` fences the staged value itself; mixed-pass checkpoint-write controls prove atomic configuration activation. |
+| #897: bounded eventual recovery or truthful unresolved hold and quiet cycles | The permanent matrix spends attempts 1/2/3 then proves zero provider work after exhausted reopen even with a past deadline. `retained_checkpoint_hold_valid_old_replay_recovers_then_two_quiet_reopens` supplies valid original-boundary replay and proves atomic successor/config promotion followed by two unchanged cycles. This proves retained replay recovery, not permanent-expiry rebootstrap. |
+| #897: existing bridge/fallback and unaffected-zone progress | Existing `run_cycle_enum_config_drift_atomically_promotes_bridged_checkpoint` and ordinary invalid-token fallback controls remain. `retained_checkpoint_held_zone_does_not_block_clean_zone_or_clear_aggregate_hold` proves independent progress and truthful aggregate state without clearing held debt. |
+| #924: valid unfiled delta plus Hidden refresh, exact successor, atomic hash promotion and quiet reopen | `mixed_valid_delta_hidden_refresh_promotes_inventory_bridge_then_quiet_reopen` uses actual pass definitions; `mixed_valid_delta_hidden_refresh_clears_retained_identity_marker_without_extra_replay` pins mixed-pass classification. |
+| #924: distinguish expiry, valid delta, missing successor, failed smart refresh, cancellation and state-write failure | `retained_token_fallback_distinguishes_expiry_from_missing_successor` checks typed fallback classification. `mixed_delta_hidden_refresh_preserves_vetoes_then_recovers_after_reopen` checks five vetoes and staged-successor recovery. Existing `incremental_sync_skips_smaller_metadata_rewritten_file` checks ordinary collecting provenance; model composition tests reject query-token substitution. |
+
+Fresh inventory totals, including partial/additive totals tracked in #925, are
+never retained-history recovery proof. Permanently expired boundaries with
+unproven history retain a finite actionable hold. Successful replay does not
+resolve the distinct reporter limitations tracked in #765, #853 or #845.

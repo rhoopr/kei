@@ -62,6 +62,19 @@ pub(crate) async fn run_status(
         .filter(|action| *action != "none")
     {
         println!("Last recovery action: {action}");
+        if action == "repair_retained_checkpoint_evidence" {
+            println!(
+                "  Retained recovery evidence is malformed or unsupported. Provider work is paused. Preserve the state database and media and restore validated recovery evidence before resuming."
+            );
+        } else if action == "retained_checkpoint_retry_exhausted" {
+            println!(
+                "  Automatic retained-checkpoint recovery exhausted. Active source/configuration and historical work remain retained. Preserve the state database and media while obtaining authoritative retained-history evidence."
+            );
+        } else if action == "await_retained_checkpoint_evidence" {
+            println!(
+                "  Retained cursor rejected. Recovery makes at most three automatic attempts, at least one hour apart; exhausted holds require authoritative retained-history evidence. Preserve the state database and media. Fresh inventory alone cannot resolve this hold."
+            );
+        }
     }
     if summary.unresolved_sparse_records > 0 {
         println!();
@@ -195,6 +208,22 @@ pub(crate) fn backup_status_line(summary: &state::types::SyncSummary) -> String 
     }
 
     let mut reasons = Vec::new();
+    if summary
+        .last_recovery_action
+        .as_deref()
+        .is_some_and(|action| {
+            matches!(
+                action,
+                "await_retained_checkpoint_evidence"
+                    | "retained_checkpoint_retry_exhausted"
+                    | "repair_retained_checkpoint_evidence"
+            )
+        })
+    {
+        reasons.push(
+            "retained provider history is unavailable; recovery evidence is required".to_owned(),
+        );
+    }
     if summary.unresolved_identity_zones > 0 {
         reasons.push(format!(
             "unresolved asset identity in {}; checkpoint replay is required",

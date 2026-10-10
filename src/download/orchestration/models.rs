@@ -206,6 +206,9 @@ pub(crate) struct CheckpointEvidence {
     /// selection also ran or source progress remains held. Any offered successor
     /// belongs to that replay. A rank query never sets this evidence.
     pub(crate) completed_delta_replay: bool,
+    /// The provider explicitly rejected the retained changes/zone cursor.
+    /// Static decoding failures and rank-query tokens do not prove expiry.
+    pub(crate) retained_token_rejected: bool,
 }
 
 impl CheckpointEvidence {
@@ -232,6 +235,7 @@ impl CheckpointEvidence {
         self.identity_incomplete |= other.identity_incomplete;
         self.sync_token_blocked |= other.sync_token_blocked;
         self.completed_delta_replay |= other.completed_delta_replay;
+        self.retained_token_rejected |= other.retained_token_rejected;
         self.retry_passes.extend(other.retry_passes.iter().cloned());
         self.revalidate_records
             .extend(other.revalidate_records.iter().cloned());
@@ -250,16 +254,20 @@ impl CheckpointEvidence {
 }
 
 impl SyncResult {
-    /// Carry durable sparse receipts with zone-local execution evidence.
+    /// Carry durable sparse receipts and validated source replay provenance.
+    /// Completion must come from the changes/zone successor receipt, before
+    /// checkpoint vetoes can withhold the offered token.
     #[must_use]
     pub(super) fn from_incremental_execution(
         outcome: DownloadOutcome,
         sync_token: Option<String>,
         stats: SyncStats,
         proofs: Vec<crate::state::SparseIdentityProof>,
+        completed_delta_replay: bool,
     ) -> Self {
         let mut result = Self::from_execution(outcome, sync_token, stats);
         result.checkpoint.sparse_identity_proofs = proofs;
+        result.checkpoint.completed_delta_replay = completed_delta_replay;
         result
     }
 
@@ -749,6 +757,15 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
         PENDING_RETRY_UNMATCHED_REASON => {
             "kei could not refresh every pending retry target; the rows remain durable for a later cycle"
         }
+        "retained_checkpoint_hold_invalid" => {
+            "retained recovery evidence is malformed or unsupported; kei preserved the hold without provider work; restore validated recovery evidence from the preserved state before resuming"
+        }
+        "retained_checkpoint_retry_exhausted" => {
+            "automatic retained-checkpoint recovery is exhausted; active source state and historical work remain retained; obtain authoritative retained-history evidence before resuming recovery"
+        }
+        "retained_checkpoint_expired" => {
+            "the provider rejected the retained checkpoint; kei preserved local history with a bounded automatic retry budget; authoritative retained-history evidence is required to resolve an exhausted hold"
+        }
         "sync_token_unavailable" | "sync_token_missing" => {
             "no usable sync token was available at the end of the cycle"
         }
@@ -857,6 +874,9 @@ pub(crate) enum RecoveryAction {
     RetryPasses(Vec<PassKey>),
     RevalidateRecords(Vec<ProviderRecordId>),
     ReplayFromPriorToken,
+    AwaitRetainedCheckpointEvidence,
+    RetainedCheckpointRetryExhausted,
+    RepairRetainedCheckpointEvidence,
     ReconcileInventory(FullEnumerationReason),
     Reauthenticate,
     Stop,
@@ -869,6 +889,9 @@ impl RecoveryAction {
             Self::RetryPasses(_) => "retry_passes",
             Self::RevalidateRecords(_) => "revalidate_records",
             Self::ReplayFromPriorToken => "replay_from_prior_token",
+            Self::AwaitRetainedCheckpointEvidence => "await_retained_checkpoint_evidence",
+            Self::RetainedCheckpointRetryExhausted => "retained_checkpoint_retry_exhausted",
+            Self::RepairRetainedCheckpointEvidence => "repair_retained_checkpoint_evidence",
             Self::ReconcileInventory(_) => "reconcile_inventory",
             Self::Reauthenticate => "reauthenticate",
             Self::Stop => "stop",

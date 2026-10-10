@@ -1353,6 +1353,7 @@ pub(super) async fn after_delta(
     if let Some(reason) = delta.token_unsafe_reason {
         block_sync_token_for_incremental_delta(&mut stats, reason)
     }
+    let completed_delta_replay = delta.sync_token.is_some();
     let delta_result = SyncResult::from_incremental_execution(
         if delta.state_transition_failures > 0 {
             DownloadOutcome::PartialFailure {
@@ -1364,13 +1365,13 @@ pub(super) async fn after_delta(
         None,
         stats,
         delta.sparse_identity_proofs,
+        completed_delta_replay,
     );
     selected.outcome = merge_download_outcomes(&selected.outcome, &delta_result.outcome);
     selected.accumulate(&delta_result);
     if let Some(reason) = delta.token_unsafe_reason {
         selected.block_incremental_token(reason)
     }
-    selected.checkpoint.completed_delta_replay = delta.sync_token.is_some();
     selected.sync_token = None;
     if delta.sync_token.is_some()
         && !selected.checkpoint.sync_token_blocked
