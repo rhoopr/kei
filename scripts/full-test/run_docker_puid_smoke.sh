@@ -30,21 +30,51 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "--- PUID/PGID drop and chown ---"
-puid_out=$(docker run --rm \
-    -e PUID="$test_puid" \
-    -e PGID="$test_pgid" \
-    -v "$work/config:/config" \
-    -v "$work/photos:/photos" \
-    --entrypoint /usr/local/bin/entrypoint.sh \
-    "$image" \
-    sh -c 'id -u; id -g; stat -c %u /config; stat -c %u /photos' 2>&1)
-printf '%s\n' "$puid_out"
-expected=$(printf '%s\n%s\n%s\n%s' "$test_puid" "$test_pgid" "$test_puid" "$test_puid")
-if [[ "$puid_out" != "$expected" ]]; then
-    echo "run_docker_puid_smoke: PUID/PGID output mismatch" >&2
-    exit 1
-fi
+echo "--- UID-only, GID-only, mixed and symlink ownership repair ---"
+docker run --rm -v "$work/config:/config" -v "$work/photos:/photos" "$image" sh -ec '
+    mkdir -p /config/nested /photos/nested
+    touch "/config/nested/uid only" "/photos/nested/gid only" /photos/nested/mixed
+    chown "0:$2" "/config/nested/uid only"
+    chown "$1:0" "/photos/nested/gid only"
+    chown 0:0 /photos/nested/mixed
+    ln -s /etc/passwd /photos/nested/outside
+' sh "$test_puid" "$test_pgid"
+
+puid_run() {
+    docker run --rm -e PUID="$test_puid" -e PGID="$test_pgid" \
+        -v "$work/config:/config" -v "$work/photos:/photos" "$image" "$@"
+}
+puid_run sh -ec '
+    test "$(id -u):$(id -g)" = "$1:$2"
+    for path in /config /config/nested "/config/nested/uid only" /photos /photos/nested "/photos/nested/gid only" /photos/nested/mixed /photos/nested/outside; do
+        test "$(stat -c %u:%g "$path")" = "$1:$2"
+    done
+    test "$(stat -Lc %u:%g /photos/nested/outside)" = 0:0
+    touch /config/created /photos/created
+    test "$(stat -c %u:%g /photos/created)" = "$1:$2"
+' sh "$test_puid" "$test_pgid"
+puid_run sh -ec 'test "$(id -u):$(id -g)" = "$1:$2"' sh "$test_puid" "$test_pgid"
+
+echo "--- photo repair opt-out leaves all photo ownership intact ---"
+docker run --rm -v "$work/photos:/photos" "$image" chown -hR 0:0 /photos
+docker run --rm -e PUID="$test_puid" -e PGID="$test_pgid" -e KEI_CHOWN_PHOTOS=0 \
+    -v "$work/config:/config" -v "$work/photos:/photos" "$image" sh -ec '
+    test "$(id -u):$(id -g)" = "$1:$2"
+    test "$(stat -c %u:%g /config)" = "$1:$2"
+    test "$(stat -c %u:%g /photos)" = 0:0
+    test "$(stat -c %u:%g /photos/nested/mixed)" = 0:0
+' sh "$test_puid" "$test_pgid"
+
+echo "--- read-only repair warns and still drops privileges ---"
+readonly_out=$(docker run --rm -e PUID="$test_puid" -e PGID="$test_pgid" \
+    -v "$work/photos:/photos:ro" "$image" id -u 2>&1)
+echo "$readonly_out" | grep -q 'warning: chown /photos failed'
+test "${readonly_out##*$'\n'}" = "$test_puid"
+
+echo "--- explicit numeric root UID and non-root GID ---"
+docker run --rm -e PUID=0 -e PGID="$test_pgid" "$image" sh -ec '
+    test "$(id -u):$(id -g)" = "0:$1"
+' sh "$test_pgid"
 
 echo "--- allocator env default ---"
 arena_out=$(docker run --rm \
@@ -72,6 +102,12 @@ bad_out=$(docker run --rm \
 printf '%s\n' "$bad_out"
 echo "$bad_out" | grep -q "PUID/PGID must be numeric"
 
+echo "--- invalid PGID and photo policy rejected ---"
+for assignment in PGID=notanumber KEI_CHOWN_PHOTOS=invalid; do
+    invalid_out=$(docker run --rm -e PUID="$test_puid" -e PGID="$test_pgid" -e "$assignment" "$image" id 2>&1 || true)
+    echo "$invalid_out" | grep -Eq 'must be numeric|must be 0 or 1'
+done
+
 echo "--- partial PUID/PGID rejected ---"
 partial_out=$(docker run --rm \
     -e PUID="$test_puid" \
@@ -79,6 +115,9 @@ partial_out=$(docker run --rm \
     "$image" id 2>&1 || true)
 printf '%s\n' "$partial_out"
 echo "$partial_out" | grep -q "must be set together"
+
+pgid_only_out=$(docker run --rm -e PGID="$test_pgid" "$image" id 2>&1 || true)
+echo "$pgid_only_out" | grep -q "must be set together"
 
 echo "--- v0.20 Docker preflight: removed env config requires /config/config.toml ---"
 prefail_out=$(docker run --rm \

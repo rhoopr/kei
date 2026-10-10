@@ -214,6 +214,7 @@ test MODE="" *ARGS="":
     run_docker_full() {
         just docker build
         scripts/full-test/run_docker_puid_smoke.sh
+        scripts/full-test/run_docker_packaging_smoke.sh
         just docker multiarch
         docker run --rm "${KEI_DOCKER_IMAGE:-kei:dev}" --version
         docker run --rm "${KEI_DOCKER_IMAGE:-kei:dev}" --help

@@ -166,6 +166,23 @@ Test names and assertions are unchanged. Shared test fixtures stay in
 
 ## Main flows
 
+### Container startup
+
+`docker/entrypoint.sh` owns command collision routing and PUID/PGID privilege
+drop. The explicit command list mirrors visible clap commands before checking
+external executables. Without PUID/PGID, it executes as root without ownership
+repair. With both numeric IDs, it recursively repairs UID and GID on /config
+and /photos, including symlinks themselves without following their targets.
+Traversal or repair failures warn before privilege drop. Every restart scans
+all inodes; KEI_CHOWN_PHOTOS=0 skips /photos repair when host permissions are
+already managed, while /config remains repaired.
+
+The Docker HTTP healthcheck defaults to port 9090. A deployment using a custom
+`[server].port` must set `KEI_HEALTHCHECK_PORT` to that same port, including
+when overriding the command with a custom config path. Docker does not parse
+TOML separately. Disabled HTTP servers require a deployment healthcheck override.
+See `docker-compose.yml` for runtime examples.
+
 ### Command dispatch
 
 ```text

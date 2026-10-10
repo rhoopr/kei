@@ -975,9 +975,12 @@ happens:
   diagnostics, media validation, pass templates, and config paths. Run it
   before releases that touch those areas.
 - **`scripts/full-test/run_docker_puid_smoke.sh`** - offline Docker entrypoint
-  checks for PUID/PGID drop, volume chown, `MALLOC_ARENA_MAX=2`, root-default
+  checks for PUID/PGID drop, UID/GID repair and opt-out, symlink safety, `MALLOC_ARENA_MAX=2`, root-default
   behavior, and invalid env rejection. `just test docker-full` runs this with
   Docker build, multiarch, and CLI/default-command smokes.
+- **`scripts/full-test/run_docker_packaging_smoke.sh`** - offline checks of real
+  Docker build-context filtering and the image healthcheck at default/custom
+  ports, including HTTP failure. Requires host port 9090 to be free.
 - **`scripts/full-test/run_live_import_rehearsal.sh`** - live mini rehearsal
   for the TOML-first import path: seed a tiny real tree, import it into a fresh
   DB, and verify a repeat dry-run stays matched. `just test live-smoke` runs

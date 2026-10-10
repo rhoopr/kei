@@ -35,6 +35,14 @@ services:
       # these the container runs as root.
       # - PUID=1000
       # - PGID=1000
+      # Both UID and GID are repaired recursively on /config and /photos
+      # at every startup. This scans every inode, even when ownership matches.
+      # For a large or pre-owned library, skip /photos repair and manage its
+      # permissions on the host; /config is still repaired:
+      # - KEI_CHOWN_PHOTOS=0
+      #
+      # If [server].port differs from 9090, match it here for HEALTHCHECK:
+      # - KEI_HEALTHCHECK_PORT=9091
     volumes:
       - ./config:/config
       - /path/to/photos:/photos
@@ -49,11 +57,11 @@ services:
 
     # ── Credential options (pick one) ──────────────────────────────
     #
-    # Option 2 (recommended): Encrypted credential store
+    # Option 1 (recommended): Encrypted credential store
     #   First run:  docker exec -it kei kei password set
     #   Subsequent: kei decrypts from /config automatically on each re-auth.
     #
-    # Option 3: Docker secrets (file-based)
+    # Option 2: Docker secrets (file-based)
     #   secrets:
     #     - icloud_password
     #   command: >-
@@ -61,13 +69,13 @@ services:
     #     --config /config/config.toml
     #     --password-file /run/secrets/icloud_password
     #
-    # Option 4: External secret manager (zero password on host)
+    # Option 3: External secret manager (zero password on host)
     #   command: >-
     #     service run
     #     --config /config/config.toml
     #     --password-command "cat /run/secrets/icloud_password"
 
-# Uncomment for Docker secrets (Option 3):
+# Uncomment for Docker secrets (Option 2):
 # secrets:
 #   icloud_password:
 #     file: ./icloud_password.txt

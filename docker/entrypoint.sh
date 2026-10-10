@@ -2,7 +2,8 @@
 # kei container entrypoint.
 #
 # When PUID and PGID are set, drops to that UID:GID via gosu after
-# fixing ownership of /config and /photos. Without them, runs as root.
+# fixing ownership of /config and /photos. KEI_CHOWN_PHOTOS=0 skips
+# /photos repair. Without PUID/PGID, runs as root without changing ownership.
 #
 # `kei` subcommand list is hard-coded to avoid colliding with debian
 # binaries: /usr/bin/{sync,login,reset} would otherwise hijack the
@@ -16,7 +17,7 @@ elif [ "${1#-}" != "$1" ]; then
     set -- kei "$@"
 else
     case "$1" in
-        sync | login | list | password | reset | config | status | doctor | manifest | verify | reconcile | import-existing | install | uninstall | service | help)
+        sync | login | list | password | reset | config | status | doctor | manifest | verify | reconcile | import-existing | migrate-state | install | uninstall | service | help)
             set -- kei "$@"
             ;;
         *)
@@ -159,15 +160,27 @@ case "$PUID$PGID" in
         ;;
 esac
 
-# Touch only mismatched inodes. A blind `chown -R` on a multi-TB
-# Synology library would take hours; `find -not -uid` is O(stragglers)
-# and a no-op on steady-state restarts. Read-only mounts produce a
-# warning but don't fail; the user may have mounted them deliberately.
+case "${KEI_CHOWN_PHOTOS:-1}" in
+    0 | 1) ;;
+    *)
+        echo "kei: KEI_CHOWN_PHOTOS must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
+
+# Preserve recursive repair by default. Finding mismatches still scans every
+# inode (O(total inodes)); only chown work is limited to mismatches. Large or
+# pre-owned photo libraries can skip this scan with KEI_CHOWN_PHOTOS=0.
+# Never follow symlinks or change their targets outside these volumes.
+# Read-only mounts and traversal failures warn, then still drop privileges.
 for d in /config /photos; do
     [ -d "$d" ] || continue
-    find "$d" \! -uid "$PUID" -print0 2>/dev/null |
-        xargs -0 -r chown "$PUID:$PGID" 2>/dev/null ||
-        echo "kei: warning: chown $d failed (read-only mount?)" >&2
+    if [ "$d" = /photos ] && [ "${KEI_CHOWN_PHOTOS:-1}" = 0 ]; then
+        continue
+    fi
+    find "$d" \( \! -uid "$PUID" -o \! -gid "$PGID" \) \
+        -exec chown -h "$PUID:$PGID" {} + 2>/dev/null ||
+        echo "kei: warning: chown $d failed (read-only mount or inaccessible path?)" >&2
 done
 
 # gosu accepts numeric uid:gid and runs without an /etc/passwd entry.
