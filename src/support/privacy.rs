@@ -361,6 +361,7 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "selected_identity",
             "candidate_paths",
             "path_shape_equal",
+            "candidate_path_shape_equal",
         ]),
         "support_metadata_v1" => Some(&[
             "timestamp_planned",

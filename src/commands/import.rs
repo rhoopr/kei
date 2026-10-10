@@ -625,6 +625,18 @@ impl ImportPreflight {
                     continue;
                 }
             };
+            crate::support::observe_scoped(
+                library_label,
+                Some((&candidate.child, candidate.record.version_size.as_str())),
+                "support_import_v1",
+                serde_json::json!({
+                    "phase":"adoption", "reason":"candidate", "dry_run":options.dry_run,
+                    "legacy_identity":candidate.record.id.as_ref()==candidate.master.as_ref() && candidate.child!=candidate.master,
+                    "master_child_distinct":candidate.child!=candidate.master,
+                    "selected_identity":if candidate.record.id.as_ref()==candidate.child.as_ref() {"child"} else {"legacy_master"},
+                    "path_shape_equal":path==candidate.expected_path,
+                }),
+            );
             let Ok(metadata) = tokio::fs::metadata(&path).await else {
                 stats.unmatched += 1;
                 continue;
@@ -937,7 +949,7 @@ where
                     "legacy_identity":asset.state_id()==asset.id() && asset.asset_record_name()!=asset.id(),
                     "master_child_distinct":asset.asset_record_name()!=asset.id(),
                     "selected_identity":if asset.state_id()==asset.asset_record_name() {"child"} else {"legacy_master"},
-                    "path_shape_equal":matches.iter().any(|(path,_)|path==&expected_path.path),
+                    "candidate_path_shape_equal":matches.iter().any(|(path,_)|path==&expected_path.path),
                     "candidate_paths":matches.len(), "dry_run":options.dry_run,
                 }),
             );
@@ -2517,10 +2529,20 @@ mod wiremock_tests {
             assert_eq!(child.local_path.as_deref(), Some(child_path.as_path()));
         }
         let evidence = drain();
-        assert!(evidence.iter().any(|v| v["kind"] == "support_import_v1"
-            && v["fields"]["master_child_distinct"] == true
-            && v["fields"]["selected_identity"] == "child"
-            && v["fields"]["path_shape_equal"] == true));
+        let expected_shape = expected_paths_for(
+            &photo.clone().with_state_record_name(Arc::from("child-913")),
+            &config,
+        )
+        .iter()
+        .any(|expected| expected.path == child_path);
+        assert!(
+            evidence.iter().any(|v| v["kind"] == "support_import_v1"
+                && v["fields"]["phase"] == "adoption"
+                && v["fields"]["master_child_distinct"] == true
+                && v["fields"]["selected_identity"] == "child"
+                && v["fields"]["path_shape_equal"] == expected_shape),
+            "{evidence:?}"
+        );
         assert!(
             !serde_json::to_string(&evidence)
                 .unwrap()
