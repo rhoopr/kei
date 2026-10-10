@@ -795,6 +795,7 @@ mod tests {
 
         let first = MetadataWrite {
             datetime: Some("2024:06:15 10:00:00".into()),
+            datetime_subseconds: None,
             offset_time_original: Some("+10:00".into()),
             clear_datetime_offsets: false,
             require_native_heif_capture_time: false,

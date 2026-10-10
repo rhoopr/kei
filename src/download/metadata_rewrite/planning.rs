@@ -159,6 +159,8 @@ pub(super) fn plan_metadata_write_with_repair(
         );
         if probe.datetime_original.is_none() || replace_existing {
             write.datetime = Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string());
+            let millis = created_local.timestamp_subsec_millis();
+            write.datetime_subseconds = (millis != 0).then(|| format!("{millis:03}"));
             write.clear_datetime_offsets = probe.has_any_datetime_offset();
         }
         // An offset describes one specific timestamp. Attach it only to a

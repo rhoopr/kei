@@ -44,6 +44,7 @@ pub(crate) struct MetadataWrite {
     /// `YYYY-MM-DDTHH:MM:SS` with optional fractional seconds for sidecars.
     /// `offset_time_original` supplies the XMP zone separately.
     pub(crate) datetime: Option<String>,
+    pub(crate) datetime_subseconds: Option<String>,
     /// EXIF `OffsetTimeOriginal`, formatted as `+HH:MM` or `-HH:MM`.
     pub(crate) offset_time_original: Option<String>,
     /// Remove offset tags before writing a replacement timestamp.
@@ -78,6 +79,7 @@ pub(crate) struct MetadataWrite {
 impl MetadataWrite {
     pub(crate) fn is_empty(&self) -> bool {
         self.datetime.is_none()
+            && self.datetime_subseconds.is_none()
             && self.offset_time_original.is_none()
             && !self.clear_datetime_offsets
             && self.gps_datetime.is_none()
