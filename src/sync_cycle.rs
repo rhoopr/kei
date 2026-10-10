@@ -1725,6 +1725,29 @@ pub(crate) async fn run_cycle(
             }
         }
 
+        crate::support::observe_scoped(
+            &lib_state.zone_name,
+            None,
+            "support_checkpoint_v1",
+            serde_json::json!({
+                "reason": sync_result.stats.sync_token_blocked_reason.unwrap_or(if sync_result.stats.sync_token_blocked { "provider_checkpoint_preserved" } else { "advanced" }),
+                "token_present": sync_result.sync_token.is_some(), "full_enumeration": sync_result.full_enumeration_ran,
+                "identity_incomplete": sync_result.checkpoint.identity_incomplete,
+                "state_write_failures": sync_result.checkpoint.state_write_failures,
+                "enumeration_errors": sync_result.checkpoint.enumeration_errors,
+            }),
+        );
+        crate::support::observe_scoped(
+            &lib_state.zone_name,
+            None,
+            "support_pass_completion_v1",
+            serde_json::json!({
+                "phase": if sync_result.full_enumeration_ran { "full" } else { "incremental" },
+                "selected_scope": "selected", "inventory_complete": !sync_result.stats.enumeration_incomplete && sync_result.stats.enumeration_errors == 0,
+                "selection_comparable": serde_json::Value::Null,
+                "api_total": sync_result.stats.api_total_at_start, "assets_seen": sync_result.stats.assets_seen,
+            }),
+        );
         if sync_result.stats.sync_token_blocked
             && sync_result.stats.sync_token_blocked_zone.is_none()
         {

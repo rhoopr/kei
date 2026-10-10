@@ -613,6 +613,10 @@ impl ImportPreflight {
                 Some(path) => path,
                 None => {
                     if !candidate.matches.is_empty() {
+                        crate::support::observe(
+                            "support_import_v1",
+                            serde_json::json!({"phase": "adoption", "reason": "ambiguous_collision", "dry_run": options.dry_run}),
+                        );
                         tracing::warn!(version = ?candidate.record.version_size,
                             "Import refused an ambiguous collision-family file");
                     }
@@ -637,6 +641,10 @@ impl ImportPreflight {
                     Ok(StrictImportDecision::Accepted) => {}
                     result => {
                         tracing::warn!(?result, "Strict import refused file");
+                        crate::support::observe(
+                            "support_import_v1",
+                            serde_json::json!({"phase": "adoption", "reason": "strict_refusal", "dry_run": options.dry_run}),
+                        );
                         record_strict_refusal(&mut stats, &heartbeat_state);
                         continue;
                     }
@@ -1026,6 +1034,13 @@ pub(crate) async fn run_import_existing(
     let directory = Arc::clone(&path_config.directory);
     let strict_import = resolve_import_strict(&args, toml);
     let strict_verifier = strict_import.then(HttpStrictImportVerifier::new);
+    crate::support::observe(
+        "support_import_v1",
+        serde_json::json!({
+            "phase": "initialization", "dry_run": args.dry_run, "strict": strict_import,
+            "recent_limit_present": args.recent.is_some(),
+        }),
+    );
 
     let recent_count: Option<u32> = match args.recent {
         None => None,
@@ -1210,6 +1225,15 @@ pub(crate) async fn run_import_existing(
         )
         .await?;
 
+    crate::support::observe(
+        "support_import_v1",
+        serde_json::json!({
+            "phase": "complete", "total": totals.total, "matched": totals.matched,
+            "unmatched": totals.unmatched, "filtered": totals.filtered, "strict_refused": totals.strict_refused,
+            "hash_errors": totals.hash_errors, "skipped_already_imported": totals.skipped_already_imported,
+            "dry_run": args.dry_run,
+        }),
+    );
     println!();
     if args.dry_run {
         println!("Import complete (DRY RUN - no changes written to state DB):");

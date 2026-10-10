@@ -136,6 +136,12 @@ pub(crate) fn log_preservation_hold(stage: &'static str, error: &anyhow::Error) 
             records = diagnostic.records,
             transferred_bytes = diagnostic.transferred_bytes,
             retained_bytes = diagnostic.retained_bytes,
+            scope_mismatch_component = diagnostic.scope_mismatch_component,
+            elapsed_secs = diagnostic.elapsed_secs,
+            page_budget = diagnostic.page_budget,
+            record_budget = diagnostic.record_budget,
+            page_byte_budget = diagnostic.page_byte_budget,
+            retained_byte_budget = diagnostic.retained_byte_budget,
             "Legacy preservation inventory unavailable; retaining attribution checkpoint hold"
         );
     } else if let Some(reason) = classify_legacy_file_error(error) {

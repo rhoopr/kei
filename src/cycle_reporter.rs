@@ -209,6 +209,7 @@ where
         health: &mut HealthStatus,
         input: CycleFacts<'_>,
     ) {
+        crate::support::complete(input.stats, input.status.as_report_str());
         let friendly_summary = self.friendly_summary().await;
         self.report_friendly_output(&input, friendly_summary.as_ref());
         self.update_health(health, &input);

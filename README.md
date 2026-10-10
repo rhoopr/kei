@@ -168,3 +168,10 @@ MIT - see [LICENSE](LICENSE)
 ## Acknowledgments
 
 kei's iCloud support builds on reverse-engineering from [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader). kei was originally published as `icloudpd-rs` before broadening beyond iCloud Photos.
+
+## Reporting a bug
+
+Attach a locally reviewed [support export](docs/support-export.md) when available.
+Run `kei support-export --output kei-support.json` with your normal configuration
+and data directory. The command collects saved evidence offline without a new
+sync or automatic upload. Older versions and partial exports are welcome too.

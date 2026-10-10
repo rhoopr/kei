@@ -42,6 +42,12 @@ pub(crate) struct LegacyInventoryDiagnostic {
     pub(crate) records: usize,
     pub(crate) transferred_bytes: usize,
     pub(crate) retained_bytes: usize,
+    pub(crate) scope_mismatch_component: &'static str,
+    pub(crate) elapsed_secs: f64,
+    pub(crate) page_budget: usize,
+    pub(crate) record_budget: usize,
+    pub(crate) page_byte_budget: usize,
+    pub(crate) retained_byte_budget: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -197,7 +203,13 @@ impl PhotoAlbum {
         cancel: &CancellationToken,
         budget: InventoryBudget,
     ) -> anyhow::Result<CompleteLegacyInventory> {
+        let started = std::time::Instant::now();
         let mut progress = LegacyInventoryDiagnostic {
+            page_budget: budget.pages,
+            record_budget: budget.records,
+            page_byte_budget: budget.page_bytes,
+            retained_byte_budget: budget.retained_bytes,
+            scope_mismatch_component: "not_applicable",
             phase: "initialization",
             subreason: "unclassified",
             family_context: "not_applicable",
@@ -218,7 +230,10 @@ impl PhotoAlbum {
                     };
                 }
                 LegacyInventoryFailure {
-                    diagnostic: progress,
+                    diagnostic: LegacyInventoryDiagnostic {
+                        elapsed_secs: started.elapsed().as_secs_f64(),
+                        ..progress
+                    },
                     source,
                 }
                 .into()
@@ -422,6 +437,21 @@ impl PhotoAlbum {
                 } else {
                     "unrelated"
                 };
+                if let Some(scope) = reference.get("zoneID") {
+                    progress.scope_mismatch_component = if scope
+                        .get("zoneName")
+                        .is_none_or(|name| name.as_str() != Some(self.zone_name()))
+                    {
+                        "zone_name"
+                    } else if scope
+                        .get("ownerRecordName")
+                        .is_some_and(|owner| self.zone_id.get("ownerRecordName") != Some(owner))
+                    {
+                        "owner"
+                    } else {
+                        "not_applicable"
+                    };
+                }
                 anyhow::ensure!(
                     reference.get("zoneID").is_none_or(|zone| {
                         zone.get("zoneName")

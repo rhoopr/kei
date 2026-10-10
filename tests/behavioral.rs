@@ -40,6 +40,8 @@ mod released_upgrade;
 mod state;
 #[path = "behavioral/support.rs"]
 mod support;
+#[path = "behavioral/support_export.rs"]
+mod support_export;
 #[path = "behavioral/validation.rs"]
 mod validation;
 

@@ -102,12 +102,21 @@ impl ExifProbe {
 }
 
 fn capture_timestamp_matches(value: &str, expected: &DateTime<FixedOffset>) -> bool {
-    parse_capture_timestamp(value).is_some_and(|(wall_clock, zone)| {
+    let parsed = parse_capture_timestamp(value);
+    let verified = parsed.is_some_and(|(wall_clock, zone)| {
         // Native writers may omit subseconds. Never forgive an incorrect nonzero fraction.
         (wall_clock == expected.naive_local()
             || Some(wall_clock) == expected.naive_local().with_nanosecond(0))
             && zone.is_none_or(|zone| zone == *expected.offset())
-    })
+    });
+    crate::support::observe(
+        "support_metadata_v1",
+        serde_json::json!({
+            "operation": "probe", "source_fractional": expected.timestamp_subsec_nanos() != 0,
+            "written_fractional": parsed.map(|(clock, _)| clock.nanosecond() != 0), "verified": verified,
+        }),
+    );
+    verified
 }
 
 /// Split a capture timestamp into its wall clock and the zone it names, if

@@ -120,6 +120,7 @@ changing behavior.
 | State reports | `src/state/db/reports.rs` | Reads status, verification and manifest data, and records sync-run history. |
 | Import-existing | `src/commands/import.rs` | Matches existing files to expected iCloud paths and adopts verified files into state. |
 | Service integration | `src/service/` | Owns install, uninstall, status, service execution, and platform renderers. |
+| Support evidence | `src/support/`, `src/state/db/support.rs` | Allowlisted bounded runtime history and strictly offline immutable collection; see [support export](support-export.md). |
 | Operator surfaces | `src/commands/status.rs`, `src/commands/doctor.rs`, `src/commands/manifest.rs` | Read local state for status, redacted diagnostics, and catalog export. |
 | Reports and monitoring | `src/cycle_reporter.rs`, `src/report.rs`, `src/health.rs`, `src/metrics.rs`, `src/notifications.rs` | Converts cycle facts into reports, health, metrics, and notifications. |
 
@@ -1906,3 +1907,28 @@ Schema 35 adds independently addressable layout bindings, operations, members, p
 The claims fence ordinary transfer, finalization, adoption and queued metadata. Current-publication retry recovery leaves managed plans with the layout owner and rechecks slot generation and exact local-byte claims in its state transaction, including claims created after the reader snapshot. Metadata for selected renditions is prepared off the visible path; it commits with the new binding and matching provider selection receipts. Ordinary whole-asset metadata refresh resolves ownership across every binding and pending claim for the scoped provider child, including when the caller has no concrete pass key; it does not queue competing writes for managed paths. Explicit metadata refresh uses the preserving owner and records its intent in the operation; pending operations recover before unchanged-binding shortcuts. Retained-source reuse carries the SHA-verified fingerprint through candidate receipt capture and independent copying; a second snapshot must equal the trusted first snapshot. Local path reconciliation uses this same layout owner for managed families. Current/archived media and sidecars must match their pinned fingerprints. Unknown ownership or local changes hold completion and protect existing contents. Real album membership is persisted before managed reconciliation commits matching metadata; an unfiled path label is never recorded as album membership. Original archives retain their prior metadata and retry evidence outside the ordinary writer queue; prepared capture-repair evidence stays visible to source-deletion guards. Archive receipt and whole-asset ownership lookups use scoped library/child indexes. Historical catalogue receipts remain evidence, not permission to write a superseded slot.
 
 Files in a Live Photo family are reserved and prepared together. Publication across separate files is recoverable rather than simultaneously atomic to external readers. Filesystems without the required atomic conditional publication/retirement operations leave durable work pending. See [edited primary usage](edited-primary.md) for storage, exclusion and downgrade guidance.
+
+
+## Support evidence boundary
+
+`support-export` dispatches before startup configuration construction, logging,
+credentials or provider initialization. `src/support/collect.rs` reads bounded
+local files; `src/state/db/support.rs` owns immutable SQLite inspection without
+normal `open_owned` or schema migration. Unsupported schemas and nonempty WAL or
+journal snapshots degrade explicitly. Export output uses exclusive creation.
+
+Normal sync, import and service operations publish typed evidence from their
+existing owners through a bounded optional worker. The worker groups only
+allowlisted fields, persists account-scoped history with private atomic writes
+and a single-writer lock, and never feeds decisions back to provider, checkpoint,
+state or publication policy. Its tracing layer is independent of log verbosity.
+Stored history is revalidated against the same contract before export. Unknown
+fields, labels, arbitrary errors and provider identifiers cannot broaden it.
+Random process-local aliases are bounded and renumbered at collection time.
+Counts are scoped observations and must not be added as unique asset counts.
+SQL observations before transaction commit are explicitly identified as attempts.
+
+History and export schema version 1 are separate from report version 3 and state
+schema 35. Raw reports and databases are never packaged. Interrupted writes
+preserve the previous history; read errors and limits appear as partial evidence.
+See [the operator guide](support-export.md) for limits and unavailable evidence.

@@ -35,6 +35,7 @@ pub(crate) mod primary_layout;
 mod reconciliation;
 mod reports;
 mod sparse_identity;
+pub(crate) mod support;
 pub(crate) use metadata_capture_retry::MetadataCaptureRetryGeneration;
 pub(crate) use sparse_identity::{
     SparseAttemptOutcome, SparseDeletionCheckpoint, SparseEvidence, SparseIdentity,

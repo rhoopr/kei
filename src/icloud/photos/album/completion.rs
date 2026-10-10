@@ -47,6 +47,12 @@ fn unanimous_fetcher_sync_token(album: &str, tokens: &[String]) -> Option<String
     for token in tokens {
         unique_tokens.insert(token.as_str());
     }
+    crate::support::observe(
+        "support_pass_completion_v1",
+        serde_json::json!({
+            "phase": "full", "token_count": tokens.len(), "unique_token_count": unique_tokens.len(),
+        }),
+    );
     tracing::warn!(target: "kei::icloud::photos::album",
         album,
         token_count = tokens.len(),
@@ -71,6 +77,20 @@ impl FetcherSyncTokenCapture {
     }
 
     pub(super) async fn complete(&self, token: Option<String>, completion: EnumerationCompletion) {
+        crate::support::observe(
+            "support_pass_completion_v1",
+            serde_json::json!({
+                "phase": "full", "token_present": token.as_ref().is_some_and(|s| !s.trim().is_empty()),
+                "completion": match completion {
+                    EnumerationCompletion::ProvenEof => "proven_eof",
+                    EnumerationCompletion::UserBoundReached => "user_bound",
+                    EnumerationCompletion::Incomplete(EnumerationFailure::FetcherError) => "fetcher_error",
+                    EnumerationCompletion::Incomplete(EnumerationFailure::ConsumerDropped) => "consumer_dropped",
+                    EnumerationCompletion::Incomplete(EnumerationFailure::MalformedRecord) => "malformed_record",
+                    EnumerationCompletion::Incomplete(EnumerationFailure::UnpairedRecords) => "unpaired_records",
+                },
+            }),
+        );
         self.observations.lock().await.push((token, completion));
         self.completed_fetchers.fetch_add(1, Ordering::Relaxed);
     }
@@ -81,6 +101,13 @@ impl FetcherSyncTokenCapture {
 
     pub(super) async fn resolve(&self, album: &str) -> Option<String> {
         if self.suppressed.load(Ordering::Relaxed) {
+            crate::support::observe(
+                "support_pass_completion_v1",
+                serde_json::json!({
+                    "phase": "full", "expected_fetchers": self.expected_fetchers.load(Ordering::Relaxed),
+                    "completed_fetchers": self.completed_fetchers.load(Ordering::Relaxed), "suppressed": true,
+                }),
+            );
             tracing::debug!(target: "kei::icloud::photos::album",
                 album,
                 "Full enumeration stopped at the caller's limit; syncToken is not a complete-zone checkpoint"
@@ -90,6 +117,13 @@ impl FetcherSyncTokenCapture {
 
         let expected = self.expected_fetchers.load(Ordering::Relaxed);
         let completed = self.completed_fetchers.load(Ordering::Relaxed);
+        crate::support::observe(
+            "support_pass_completion_v1",
+            serde_json::json!({
+                "phase": "full", "expected_fetchers": expected, "completed_fetchers": completed,
+                "suppressed": self.suppressed.load(Ordering::Relaxed),
+            }),
+        );
         if completed != expected {
             tracing::warn!(target: "kei::icloud::photos::album",
                 album,

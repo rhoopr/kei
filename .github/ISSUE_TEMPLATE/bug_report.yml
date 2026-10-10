@@ -7,6 +7,20 @@ body:
       value: |
         Thanks for reporting a bug. Please fill out the sections below so we can reproduce and fix the issue.
 
+  - type: textarea
+    id: support-export
+    attributes:
+      label: Support diagnostic export
+      description: |
+        Please attach the locally reviewed JSON file up front, if available:
+        `kei --config ~/.config/kei/config.toml support-export --output kei-support.json`
+        Use your normal config and KEI_DATA_DIR. In Docker: `docker exec kei kei --config /config/config.toml support-export --output /config/kei-support.json`, then copy it from your config mount.
+        This runs offline without a new sync, login, repair or migration and uploads nothing. It excludes credentials, personal paths, album/asset IDs, checksums and free-text errors. Partial files are useful too.
+        If your version lacks the command or collection fails, submit anyway and say so here. Do not attach raw databases, auth files, config or reports.
+      placeholder: Attach kei-support.json here, or explain why it is unavailable.
+    validations:
+      required: false
+
   - type: checkboxes
     id: adp-check
     attributes:
@@ -37,7 +51,7 @@ body:
     id: reproduction
     attributes:
       label: Reproduction
-      description: Steps, config, or commands to reproduce the issue.
+      description: Steps and commands to reproduce the issue. Include only reviewed, redacted config snippets if necessary.
       placeholder: |
         ```toml
         # config.toml (if applicable)

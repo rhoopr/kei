@@ -29,6 +29,7 @@ const ALL_SUBCOMMANDS: &[&str] = &[
     "config",
     "status",
     "doctor",
+    "support-export",
     "manifest",
     "import-existing",
     "verify",
@@ -1571,4 +1572,15 @@ fn report_json_not_visible_in_help() {
         !stdout.contains("\n      --report-json"),
         "sync help should not expose a --report-json option, got:\n{stdout}"
     );
+}
+
+#[test]
+fn support_export_help_explains_offline_review_and_partial_evidence() {
+    common::cmd()
+        .args(["support-export", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--output"))
+        .stdout(predicate::str::contains("No automatic upload"))
+        .stdout(predicate::str::contains("no new sync is required"));
 }

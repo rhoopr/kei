@@ -114,6 +114,10 @@ impl PhotosService {
         let service_endpoint = Self::build_service_endpoint(&service_root, "private");
         let zone_id = Arc::new(json!({"zoneName": "PrimarySync"}));
 
+        crate::support::observe(
+            "support_discovery_v1",
+            json!({"phase": "name_only_indexing", "database": "private", "owner": "absent", "qualification_published": false}),
+        );
         let lib_session = session.clone_box();
 
         let primary_library = PhotoLibrary::new(
@@ -326,6 +330,16 @@ impl PhotosService {
         library_type: &str,
     ) -> anyhow::Result<PhotoLibrary> {
         let zone_name = &zone.zone_id.zone_name;
+        crate::support::observe(
+            "support_discovery_v1",
+            json!({
+                "phase": "selected_qualified_indexing", "database": if library_type == "private" { "private" } else { "shared" },
+                "owner": match zone.zone_id.extra.get("ownerRecordName") {
+                    None => "absent", Some(Value::String(v)) if v == "_defaultOwner" => "private_default",
+                    Some(Value::String(_)) => "other_string", Some(_) => "malformed",
+                }, "selected_indexing": false, "qualification_published": false,
+            }),
+        );
         let mut library = PhotoLibrary::new(
             self.get_service_endpoint(library_type),
             Arc::clone(&self.params),
@@ -339,6 +353,14 @@ impl PhotosService {
             tracing::error!(zone = %zone_name, error = %error, "Failed to load library zone");
             anyhow::anyhow!("Could not load iCloud Photos library zone {zone_name}: {error}")
         })?;
+        crate::support::observe(
+            "support_discovery_v1",
+            json!({
+                "phase": "selected_qualified_indexing", "database": if library_type == "private" { "private" } else { "shared" },
+                "owner": if library.is_private_default_owner() { "private_default" } else { "other" },
+                "selected_indexing": true, "qualification_published": true,
+            }),
+        );
         library.shadow_capture = self.shadow_capture.clone();
         tracing::debug!(zone = %zone_name, "Loaded library zone");
         Ok(library)

@@ -191,6 +191,10 @@ pub(in crate::download) async fn download_file_with_mode<C: DownloadClient>(
         {
             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        crate::support::observe(
+            "support_task_error_v1",
+            crate::support::download_error_fields("download", &error),
+        );
         if !error.is_retryable() {
             return Err(error);
         }
