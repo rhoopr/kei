@@ -193,6 +193,10 @@ pub struct SyncResult {
 #[derive(Debug, Default)]
 #[must_use]
 pub(crate) struct CheckpointEvidence {
+    /// Every fresh ordered path-selection query (including the global frontier)
+    /// reached proven EOF with usable unanimous tokens, but the selected work
+    /// excluded a tail. This certifies local work only, never a source cursor.
+    pub(crate) bounded_path_selection_complete: bool,
     pub(crate) state_write_failures: usize,
     pub(crate) enumeration_errors: usize,
     pub(crate) enumeration_incomplete: bool,
@@ -228,6 +232,13 @@ impl CheckpointEvidence {
     }
 
     fn accumulate(&mut self, other: &Self) {
+        // Additional work may veto the original query proof, but cannot create it.
+        self.bounded_path_selection_complete &= !other.sync_token_blocked
+            && !other.enumeration_incomplete
+            && !other.identity_incomplete
+            && !other.interrupted
+            && other.enumeration_errors == 0
+            && other.state_write_failures == 0;
         self.state_write_failures += other.state_write_failures;
         self.enumeration_errors += other.enumeration_errors;
         self.enumeration_incomplete |= other.enumeration_incomplete;
@@ -310,6 +321,9 @@ impl SyncResult {
     }
 
     pub(super) fn block_incremental_token(&mut self, reason: &'static str) {
+        // A later veto is independent of the original structural bounds hold.
+        // In particular, retained selection debt must also hold path promotion.
+        self.checkpoint.bounded_path_selection_complete = false;
         self.checkpoint.sync_token_blocked = true;
         block_sync_token_for_incremental_delta(&mut self.stats, reason);
     }

@@ -789,6 +789,7 @@ pub(crate) async fn run_cycle(
     let mut enum_config_hash_outcome = EnumConfigHashOutcome::Unchanged;
     let mut pending_download_config_hash = None;
     let mut path_reconciliation_complete = true;
+    let mut path_reconciliation_cycle_safe = true;
     let path_reconciliation_has_smart_folders = library_states.iter().any(|state| {
         state
             .plan
@@ -900,6 +901,21 @@ pub(crate) async fn run_cycle(
             db_sync_token_advance_safe = false;
         }
     }
+
+    let path_metadata_at_start = if let Some(db) = state_db {
+        vec![
+            (
+                download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+                db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY).await?,
+            ),
+            (
+                PENDING_DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+                pending_download_config_hash.clone(),
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
 
     let enum_metadata_at_start = if let Some(db) = state_db {
         vec![
@@ -1176,12 +1192,15 @@ pub(crate) async fn run_cycle(
         // Each pass carries its own exclude-asset-ids, so the config built
         // here starts with an empty set; download_photos_with_sync derives
         // per-pass configs internally via `with_exclude_ids`.
-        let download_config = build_download_config(
+        let mut download_config = build_download_config(
             sync_mode,
             Arc::new(rustc_hash::FxHashSet::default()),
             Arc::clone(&asset_groupings),
             Arc::from(lib_state.zone_name.as_str()),
         );
+        if pending_download_config_hash.is_some() && path_reconciliation_has_smart_folders {
+            Arc::make_mut(&mut download_config).complete_path_selection = true;
+        }
         let download_client = shared_session.read().await.download_client().clone();
         let mut path_reconciliation_requires_smart_query = false;
         if pending_download_config_hash.is_some() && download_controls.run_mode.downloads_files() {
@@ -1426,23 +1445,11 @@ pub(crate) async fn run_cycle(
                 && sync_result.checkpoint.enumeration_errors == 0
                 && !shutdown_token.is_cancelled();
         if path_reconciliation_requires_smart_query {
-            // Historical smart membership cannot complete local reconciliation.
-            // Only the current unbounded query plus durable successful work can
-            // discharge that dependency; source checkpoint policy stays separate.
+            // Historical smart membership cannot certify the current selection.
+            // Full query proof is separate from a bounded source cursor hold.
             path_reconciliation_complete &= library_completed_without_errors
                 && download_controls.run_mode.downloads_files()
-                && download_config.recent.is_none()
-                && download_config.skip_created_before.is_none()
-                && sync_result.full_enumeration_ran
-                && matches!(
-                    source_checkpoint_decision(
-                        &sync_result,
-                        config.runtime.dry_run,
-                        cycle_has_stale_plan,
-                        checkpoint_basis,
-                    ),
-                    SourceCheckpointDecision::Advance { .. }
-                );
+                && sync_result.full_enumeration_ran;
         }
         if should_warn_zero_assets(
             &sync_result,
@@ -1540,6 +1547,23 @@ pub(crate) async fn run_cycle(
             }
         }
 
+        path_reconciliation_cycle_safe &= library_completed_without_errors
+            && checkpoint_transition_state_safe
+            && !retained_checkpoint_expired
+            && (matches!(
+                checkpoint_decision,
+                SourceCheckpointDecision::Advance { .. }
+            ) || (matches!(
+                checkpoint_decision,
+                SourceCheckpointDecision::Preserve {
+                    reason: CheckpointHoldReason::TokenProofIncomplete,
+                    ..
+                }
+            ) && sync_result.checkpoint.bounded_path_selection_complete
+                && !sync_result.checkpoint.enumeration_incomplete
+                && sync_result.checkpoint.state_write_failures == 0
+                && !legacy_cycle.requires_inventory()));
+
         match checkpoint_decision {
             SourceCheckpointDecision::Advance { token, basis } => {
                 crate::metrics::record_checkpoint_decision("advanced", basis.as_str());
@@ -1577,6 +1601,7 @@ pub(crate) async fn run_cycle(
                             checkpoint_hold_action =
                                 Some(RecoveryAction::ReplayFromPriorToken.as_str());
                             db_sync_token_advance_safe = false;
+                            path_reconciliation_cycle_safe = false;
                             tracing::warn!(
                                 zone = %lib_state.zone_name,
                                 error = %e,
@@ -1622,6 +1647,7 @@ pub(crate) async fn run_cycle(
                             checkpoint_hold_action =
                                 Some(RecoveryAction::ReplayFromPriorToken.as_str());
                             db_sync_token_advance_safe = false;
+                            path_reconciliation_cycle_safe = false;
                             tracing::warn!(error = %e, "Failed to store provider checkpoint");
                         } else {
                             if cycle_has_stale_plan && !lib_state.plan_is_stale {
@@ -1677,6 +1703,7 @@ pub(crate) async fn run_cycle(
                         })
                         .await
                 {
+                    path_reconciliation_cycle_safe = false;
                     tracing::debug!(error = %e, "Failed to persist checkpoint hold status");
                 }
                 let diagnostic = sync_result
@@ -1763,6 +1790,7 @@ pub(crate) async fn run_cycle(
                     .filter(|token| !token.trim().is_empty())
                 else {
                     db_sync_token_advance_safe = false;
+                    path_reconciliation_cycle_safe = false;
                     tracing::warn!(
                         zone = %lib_state.zone_name,
                         "Config reconciliation has no completed checkpoint for selected zone"
@@ -1798,6 +1826,7 @@ pub(crate) async fn run_cycle(
                 .await
             {
                 db_sync_token_advance_safe = false;
+                path_reconciliation_cycle_safe = false;
                 tracing::warn!(error = %e, "Failed to atomically promote checkpoint reconciliation");
             }
         }
@@ -1805,13 +1834,13 @@ pub(crate) async fn run_cycle(
 
     if path_reconciliation_complete
         && (!path_reconciliation_has_smart_folders
-            || (cycle_failed_count == 0 && db_sync_token_advance_safe && !cycle_has_stale_plan))
+            || (cycle_failed_count == 0 && path_reconciliation_cycle_safe && !cycle_has_stale_plan))
         && !cycle_session_expired
         && !shutdown_token.is_cancelled()
         && let (Some(db), Some(download_config_hash)) = (state_db, pending_download_config_hash)
         && let Err(e) = db
             .commit_checkpoint_transition(state::CheckpointTransition {
-                expected_metadata: Vec::new(),
+                expected_metadata: path_metadata_at_start,
                 legacy_preservation_proofs: Vec::new(),
                 legacy_config_hash: None,
                 sparse_identity_proofs: Vec::new(),
