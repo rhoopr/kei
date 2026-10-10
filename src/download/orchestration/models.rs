@@ -321,6 +321,9 @@ impl SyncResult {
     }
 
     pub(super) fn block_incremental_token(&mut self, reason: &'static str) {
+        // A later veto is independent of the original structural bounds hold.
+        // In particular, retained selection debt must also hold path promotion.
+        self.checkpoint.bounded_path_selection_complete = false;
         self.checkpoint.sync_token_blocked = true;
         block_sync_token_for_incremental_delta(&mut self.stats, reason);
     }

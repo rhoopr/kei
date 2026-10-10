@@ -704,6 +704,8 @@ path-hash promotion, held source/database checkpoints and an unchanged cycle
 without catalog reconciliation or duplicate files. Failure cases cover malformed
 queries, missing or mismatched frontier tokens, cancellation after the selected
 prefix, stale plans, local finalization and checkpoint/promotion write failures.
+An owned private selection with real retained deferred debt also keeps the path
+transition pending after a successful bounded query and file-backed reopen.
 Ordinary bounded refresh queries remain part of the unchanged cycle.
 
 ## Running

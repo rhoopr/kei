@@ -41,6 +41,7 @@ enum SmartReconciliationFault {
     DownloadWrite,
     IncompleteAlbumSnapshot,
     OtherLibraryFailure,
+    RetainedSelectionDebt,
 }
 #[async_trait::async_trait]
 impl PhotosSession for SmartReconciliationSession {
@@ -258,6 +259,18 @@ async fn run_cycle_bounded_smart_reconciliation_failures_retain_then_recover() {
     }
 }
 
+#[tokio::test]
+async fn run_cycle_bounded_smart_reconciliation_retained_selection_debt_holds_promotion() {
+    Box::pin(smart_reconciliation_lifecycle_bounded(
+        "Hidden",
+        false,
+        false,
+        Some(SmartReconciliationFault::RetainedSelectionDebt),
+        Some(SmartBound::Recent(crate::cli::RecentScope::Global)),
+    ))
+    .await;
+}
+
 async fn smart_reconciliation_lifecycle_bounded(
     smart_name: &str,
     mixed: bool,
@@ -420,7 +433,85 @@ async fn smart_reconciliation_lifecycle_bounded(
         } else if cycle > 1 && failure == Some(SmartReconciliationFault::IncompleteAlbumSnapshot) {
             lib.plan.passes.retain(|pass| pass.kind != PassKind::Album);
         }
-        let db = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
+        let owner = state::db::account::AccountOwner::authenticated(
+            "smart-debt@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"smart-debt-provider"}})).unwrap(),
+        )
+        .unwrap();
+        let db = Arc::new(
+            if failure == Some(SmartReconciliationFault::RetainedSelectionDebt) {
+                state::SqliteStateDb::open_owned(&db_path, &owner)
+                    .await
+                    .unwrap()
+            } else {
+                state::SqliteStateDb::open(&db_path).await.unwrap()
+            },
+        );
+        if held && failure == Some(SmartReconciliationFault::RetainedSelectionDebt) {
+            use state::db::provider_generations::{
+                ActiveDecision, GenerationSpec, MAX_GENERATION_BYTES,
+            };
+            use state::db::provider_selection::{SelectionDecision, SelectionOutcome};
+            let pass = &mut lib.plan.passes[0];
+            pass.album.set_shadow_capture(
+                crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com"),
+                Arc::from("private"),
+            );
+            let (_, scope, zone) = pass.album.owned_private_scope().unwrap().unwrap();
+            let key = "b".repeat(64);
+            let generation = db.begin_selection_generation(owner.clone(), GenerationSpec {
+                format: 1, scope: scope.clone(), zone, config_hash: "a".repeat(64),
+                basis: db.selection_basis(owner.clone(), scope.clone()).await.unwrap(),
+                profile: json!({"coverage":"observed_selection_window","passes":[{"key":key,"scope":pass.album.selection_scope()}]}),
+                metadata_enabled: false, metadata_flags: 0,
+            }, MAX_GENERATION_BYTES).await.unwrap();
+            let observed = pass.album.clone().with_rank_capture(&generation.id, &key);
+            assert_eq!(observed.photos(None).await.unwrap().len(), 2);
+            let child = records["records"][1]["recordName"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let sources = db
+                .selection_rank_sources(
+                    owner.clone(),
+                    generation.id.clone(),
+                    key.clone(),
+                    child.clone(),
+                )
+                .await
+                .unwrap();
+            assert!(!sources.is_empty());
+            assert!(
+                !db.project_selection_decision(
+                    owner.clone(),
+                    generation.id,
+                    ActiveDecision {
+                        decision: SelectionDecision {
+                            pass_key: key,
+                            child: child.clone(),
+                            master: None,
+                            confirmation: None,
+                            outcome: SelectionOutcome::Deferred,
+                            reason: "confirmation_unavailable".into(),
+                            destinations: vec![],
+                        },
+                        sources,
+                        state_id: child,
+                    },
+                    vec![],
+                    MAX_GENERATION_BYTES
+                )
+                .await
+                .unwrap()
+                .admitted
+            );
+            assert!(
+                db.unfinished_selection_debt(owner.clone(), scope)
+                    .await
+                    .unwrap()
+            );
+        }
         if held
             && matches!(
                 failure,
@@ -600,6 +691,62 @@ async fn smart_reconciliation_lifecycle_bounded(
             assert_eq!(std::fs::read(path).unwrap(), *bytes);
         }
         let files = media_snapshot(&media);
+        if held && failure == Some(SmartReconciliationFault::RetainedSelectionDebt) {
+            assert_eq!(
+                result.stats.sync_token_blocked_reason,
+                Some("recent_limited_full_enumeration")
+            );
+            assert!(!result.can_advance_database_checkpoint());
+            let (_, scope, _) = lib.plan.passes[0]
+                .album
+                .owned_private_scope()
+                .unwrap()
+                .unwrap();
+            assert!(
+                db.unfinished_selection_debt(owner.clone(), scope.clone())
+                    .await
+                    .unwrap()
+            );
+            drop(db);
+            let reopened = state::SqliteStateDb::open_owned(&db_path, &owner)
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened
+                    .get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(initial_hash.as_str())
+            );
+            assert_eq!(
+                reopened
+                    .get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(hash.as_str())
+            );
+            assert_eq!(
+                reopened
+                    .get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("smart-current")
+            );
+            assert!(
+                reopened
+                    .unfinished_selection_debt(owner, scope)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                std::fs::read(original_path.as_ref().unwrap()).unwrap(),
+                bytes
+            );
+            return;
+        }
         if cycle == final_cycle {
             assert_eq!(
                 result.stats.downloaded, 0,
@@ -745,7 +892,7 @@ fn smart_album(
             obj_type: Arc::from(def.obj_type),
             query_filter: def.query_filter,
             page_size: 100,
-            zone_id: Arc::new(json!({"zoneName": zone})),
+            zone_id: Arc::new(json!({"zoneName": zone, "ownerRecordName": "_defaultOwner"})),
             retry_config: crate::retry::RetryConfig::default(),
             container_id: None,
             cross_zone_sources: Vec::new(),
