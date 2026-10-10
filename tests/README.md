@@ -696,6 +696,16 @@ canonical database inode. This proves process-interruption recovery, not
 power-loss durability or automatic orphan cleanup. Other platforms run the
 owner, CLI and quiet-cycle tests without the Linux SIGKILL matrix.
 
+The `smart_reconciliation` production-cycle tests use file-backed SQLite,
+pre-existing downloaded media and a changed smart-folder path template. Bounded
+cases change recent eligibility or a lower date bound, preserve the excluded
+provider tail, reopen state each cycle and check retained old media, atomic
+path-hash promotion, held source/database checkpoints and an unchanged cycle
+without catalog reconciliation or duplicate files. Failure cases cover malformed
+queries, missing or mismatched frontier tokens, cancellation after the selected
+prefix, stale plans, local finalization and checkpoint/promotion write failures.
+Ordinary bounded refresh queries remain part of the unchanged cycle.
+
 ## Running
 
 Choose the route by purpose:

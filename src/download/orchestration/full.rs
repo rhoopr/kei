@@ -270,9 +270,22 @@ fn open_photo_stream_for_controls(
     }
 }
 
+async fn receive_pass_token(
+    receiver: tokio::sync::oneshot::Receiver<Option<String>>,
+    shutdown_token: &CancellationToken,
+) -> Result<Option<String>, tokio::sync::oneshot::error::RecvError> {
+    tokio::select! {
+        biased;
+        () = shutdown_token.cancelled() => Ok(None),
+        result = receiver => result,
+    }
+}
+
 struct RecentFrontier {
     asset_ids: Arc<FxHashSet<String>>,
     oldest_created: Option<DateTime<Utc>>,
+    query_token: Option<String>,
+    truncated: bool,
 }
 
 struct FullPassStreamOptions {
@@ -454,37 +467,57 @@ async fn build_recent_frontier(
         return Ok(None);
     };
 
-    let (stream, _token_rx) = open_photo_stream_for_controls(
+    let (stream, token_rx) = open_photo_stream_for_controls(
         &frontier_source,
-        Some(recent),
+        (!config.complete_path_selection).then_some(recent),
         None,
         config.concurrent_downloads,
         config.concurrent_downloads,
         controls,
         false,
     );
-    tokio::pin!(stream);
+    let mut stream = Box::pin(stream.take_until(shutdown_token.clone().cancelled_owned()));
 
     let mut asset_ids = FxHashSet::default();
     let mut oldest_created: Option<DateTime<Utc>> = None;
+    let mut prefix_ended = false;
+    let mut selected = 0u32;
     while let Some(item) = stream.next().await {
         if shutdown_token.is_cancelled() {
             break;
         }
         let asset = item?;
         let created = asset.created();
-        if enumeration_created_lower_bound(config)
-            .map(|boundary| created < boundary)
-            .unwrap_or(false)
-        {
+        prefix_ended |= selected >= recent
+            || enumeration_created_lower_bound(config)
+                .map(|boundary| created < boundary)
+                .unwrap_or(false);
+        if prefix_ended {
+            if config.complete_path_selection {
+                continue;
+            }
             break;
         }
+        selected += 1;
         oldest_created = Some(oldest_created.map_or(created, |oldest| oldest.min(created)));
         asset_ids.insert(asset.asset_record_name().to_string());
     }
+    drop(stream);
+    let query_token = if !shutdown_token.is_cancelled() {
+        receive_pass_token(token_rx, &shutdown_token)
+            .await
+            .ok()
+            .flatten()
+            .map(|token| token.trim().to_owned())
+            .filter(|token| !token.is_empty())
+    } else {
+        None
+    };
     Ok(Some(RecentFrontier {
         asset_ids: Arc::new(asset_ids),
         oldest_created,
+        truncated: prefix_ended || query_token.is_none(),
+        query_token,
     }))
 }
 
@@ -513,9 +546,38 @@ fn filter_stream_to_enumeration_bounds(
     config: &DownloadConfig,
     frontier: Option<&RecentFrontier>,
     bounds_truncated: Arc<AtomicBool>,
+    shutdown_token: CancellationToken,
 ) -> DownloadPhotoStream {
     let asset_ids = frontier.map(|frontier| Arc::clone(&frontier.asset_ids));
     let lower_created_bound = stream_created_lower_bound(config, frontier);
+    if config.complete_path_selection {
+        let limit = frontier.is_none().then_some(config.recent).flatten();
+        let mut seen = 0u64;
+        let mut prefix_ended = false;
+        let stream = stream.take_until(shutdown_token.cancelled_owned());
+        return Box::pin(stream.filter_map(move |item| {
+            std::future::ready(match item {
+                Ok(asset) => {
+                    prefix_ended |= lower_created_bound
+                        .is_some_and(|bound| asset.created() < bound)
+                        || limit.is_some_and(|limit| seen >= u64::from(limit));
+                    seen = seen.saturating_add(1);
+                    let selected = !prefix_ended
+                        && asset_ids
+                            .as_ref()
+                            .is_none_or(|ids| ids.contains(asset.asset_record_name()));
+                    if selected {
+                        Some(Ok(asset))
+                    } else {
+                        bounds_truncated.store(true, Ordering::Relaxed);
+                        None
+                    }
+                }
+                Err(error) => Some(Err(error)),
+            })
+        }));
+    }
+    let id_filter_truncated = Arc::clone(&bounds_truncated);
     Box::pin(
         stream
             .take_while(move |item| {
@@ -542,7 +604,10 @@ fn filter_stream_to_enumeration_bounds(
                     {
                         Some(Ok(asset))
                     }
-                    Ok(_) => None,
+                    Ok(_) => {
+                        id_filter_truncated.store(true, Ordering::Relaxed);
+                        None
+                    }
                     Err(e) => Some(Err(e)),
                 })
             }),
@@ -553,7 +618,11 @@ fn scope_frontier_limit(
     config: &DownloadConfig,
     recent_frontier: Option<&RecentFrontier>,
 ) -> Option<u32> {
-    recent_frontier.map_or(config.recent, |_| None)
+    if config.complete_path_selection {
+        None
+    } else {
+        recent_frontier.map_or(config.recent, |_| None)
+    }
 }
 
 async fn run_full_pass_stream<S>(
@@ -853,9 +922,13 @@ pub(super) async fn download_photos_full_with_token_policy(
     let deferred_unfiled = deferred_unfiled_index(passes);
     let recent_frontier =
         build_recent_frontier(passes, config, controls, shutdown_token.clone()).await?;
-    let bounds_truncated = Arc::new(AtomicBool::new(false));
-    let strict_empty_tail_errors = config.recent.is_none()
-        && config.skip_created_before.is_none()
+    let bounds_truncated = Arc::new(AtomicBool::new(
+        recent_frontier
+            .as_ref()
+            .is_some_and(|frontier| frontier.truncated),
+    ));
+    let strict_empty_tail_errors = (config.complete_path_selection
+        || (config.recent.is_none() && config.skip_created_before.is_none()))
         && !controls.run_mode.only_print_filenames()
         && !controls.run_mode.is_dry_run();
 
@@ -955,6 +1028,7 @@ pub(super) async fn download_photos_full_with_token_policy(
                         config,
                         recent_frontier,
                         Arc::clone(&bounds_truncated),
+                        shutdown_token.clone(),
                     );
 
                     if pass.kind == crate::commands::PassKind::Album
@@ -1085,6 +1159,7 @@ pub(super) async fn download_photos_full_with_token_policy(
                         config,
                         recent_frontier.as_ref(),
                         Arc::clone(&bounds_truncated),
+                        shutdown_token.clone(),
                     );
                     let stream =
                         track_deferred_unfiled_heartbeat(stream, library, stream_total_count)
@@ -1185,6 +1260,7 @@ pub(super) async fn download_photos_full_with_token_policy(
                     config,
                     recent_frontier.as_ref(),
                     Arc::clone(&bounds_truncated),
+                    shutdown_token.clone(),
                 )
             })
             .collect();
@@ -1296,16 +1372,17 @@ pub(super) async fn download_photos_full_with_token_policy(
     let mut same_cycle_recovery_attempts = 0usize;
     let mut same_cycle_recovery_successes = 0usize;
     let mut checkpoint_retry_passes = Vec::new();
+    let mut path_selection_queries_complete = false;
     let sync_token = if token_attempt_allowed && streaming_result.provider_auth_errors == 0 {
         let expected_token_count = token_receivers.len();
         token_expected_receivers = Some(expected_token_count);
         let mut observations = Vec::with_capacity(expected_token_count);
         for receiver in token_receivers {
             let result = if !receiver.enumeration_complete {
-                let _ = receiver.receiver.await;
+                let _ = receive_pass_token(receiver.receiver, &shutdown_token).await;
                 PassTokenResult::EnumerationIncomplete
             } else {
-                match receiver.receiver.await {
+                match receive_pass_token(receiver.receiver, &shutdown_token).await {
                     Ok(Some(token)) if token.trim().is_empty() => PassTokenResult::Blank,
                     Ok(Some(token)) => PassTokenResult::Present(token.trim().to_string()),
                     Ok(None) => PassTokenResult::Missing,
@@ -1342,11 +1419,27 @@ pub(super) async fn download_photos_full_with_token_policy(
         token_receivers_blank = Some(blank_tokens);
         token_receivers_dropped = Some(dropped_receivers);
         token_unique_values = Some(unique_token_count);
+        path_selection_queries_complete = config.complete_path_selection
+            && streaming_result.enumeration_complete
+            && streaming_result.enumeration_errors == 0
+            && match classify_zone_token_evidence(&observations) {
+                ZoneTokenEvidence::Complete { token } => recent_frontier
+                    .as_ref()
+                    .is_none_or(|frontier| frontier.query_token.as_deref() == Some(token.as_str())),
+                _ => false,
+            };
         let bounded_stream_truncated = bounds_truncated.load(Ordering::Relaxed);
         let repair_entire_enumeration = (!streaming_result.enumeration_complete
             || streaming_result.enumeration_errors > 0)
             && !bounded_stream_truncated;
-        let initial_evidence = if bounded_stream_truncated {
+        let frontier_proof_incomplete = config.complete_path_selection
+            && recent_frontier.is_some()
+            && !path_selection_queries_complete;
+        let initial_evidence = if frontier_proof_incomplete {
+            ZoneTokenEvidence::Incomplete {
+                reason: TokenGap::Mismatch,
+            }
+        } else if bounded_stream_truncated {
             ZoneTokenEvidence::Incomplete {
                 reason: TokenGap::EnumerationIncomplete,
             }
@@ -1425,6 +1518,7 @@ pub(super) async fn download_photos_full_with_token_policy(
                         config,
                         recent_frontier.as_ref(),
                         Arc::clone(&bounds_truncated),
+                        shutdown_token.clone(),
                     );
                     let recovered = run_full_pass_stream(
                         download_client.clone(),
@@ -1466,10 +1560,10 @@ pub(super) async fn download_photos_full_with_token_policy(
                     let recovered_result = if !recovered.result.enumeration_complete
                         || recovered.result.enumeration_errors > 0
                     {
-                        let _ = recovered.token_rx.await;
+                        let _ = receive_pass_token(recovered.token_rx, &shutdown_token).await;
                         PassTokenResult::EnumerationIncomplete
                     } else {
-                        match recovered.token_rx.await {
+                        match receive_pass_token(recovered.token_rx, &shutdown_token).await {
                             Ok(Some(token)) if token.trim().is_empty() => PassTokenResult::Blank,
                             Ok(Some(token)) => PassTokenResult::Present(token.trim().to_string()),
                             Ok(None) => PassTokenResult::Missing,
@@ -1701,6 +1795,8 @@ pub(super) async fn download_photos_full_with_token_policy(
         } else {
             DATE_BOUNDED_FULL_ENUMERATION_REASON
         };
+        checkpoint.bounded_path_selection_complete =
+            path_selection_queries_complete && !checkpoint.sync_token_blocked;
         checkpoint.sync_token_blocked = true;
         stats.sync_token_blocked_reason = Some(bounded_reason);
         stats.sync_token_blocked_source = Some(sync_token_blocked_source(bounded_reason));

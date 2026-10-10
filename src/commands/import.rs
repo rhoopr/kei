@@ -1794,6 +1794,7 @@ mod wiremock_tests {
     fn base_config(directory: &StdPath) -> DownloadConfig {
         let dir_arc: Arc<StdPath> = Arc::from(directory);
         DownloadConfig {
+            complete_path_selection: false,
             selection_context: None,
             selection_run: None,
             selection_pass: None,

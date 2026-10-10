@@ -888,11 +888,22 @@ Historical smart-folder membership cannot complete local path reconciliation. It
 is its only remaining dependency: album snapshots and catalog identity must be
 complete, with no deferred missing file or failed local work. The cycle owner
 can discharge that dependency only after successful current smart enumeration
-and durable work satisfy the existing checkpoint checks. Recent or lower-date
-bounds, a stale plan, interruption, unresolved identity, failed enumeration or
-state writes retain the pending path hash. Every selected library must finish;
-current smart query evidence does not establish global inventory completeness
-or replace provider checkpoint policy.
+and durable work. During pending path drift, recent-count and lower-date-bounded
+selections drain ordered provider queries to EOF while forwarding only their
+configured selection to the existing download planner. The global recent
+frontier also drains to EOF and must report the same usable token as every
+selected pass. This costs a complete query on path drift, with bounded retained
+frontier IDs and streaming tail filtering. Cancellation stops the raw drain.
+
+Fresh query evidence certifies selected local work separately from source
+checkpoint coverage. Any excluded tail, including equal-date global-frontier
+IDs, still holds zone and database checkpoints. Stale plans, interruption,
+unresolved identity, failed enumeration, local work or state transactions retain
+the pending path hash. Every selected library must finish. Atomic promotion
+compares the active path hash and exact pending target before publishing the new
+hash and removing its marker. Eligibility inventory-and-bridge promotion remains
+separate. Unchanged cycles skip catalog reconciliation and the exhaustive path
+proof; ordinary bounded smart-folder refreshes may still query the provider.
 
 Local path reconciliation retains an unowned legacy master with multiple
 historical children as unresolved work, even when targeted lookup returns one

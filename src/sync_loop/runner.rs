@@ -478,6 +478,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             filename_exclude: Arc::clone(&cfg_filename_exclude),
             temp_suffix: Arc::clone(&cfg_temp_suffix),
             state_db: state_db.clone(),
+            complete_path_selection: false,
             selection_context: None,
             selection_run: None,
             selection_pass: None,

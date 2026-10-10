@@ -69,6 +69,7 @@ async fn test_producer_panic_propagates_as_error() {
         filename_exclude: std::sync::Arc::from(Vec::<glob::Pattern>::new()),
         temp_suffix: std::sync::Arc::from(".kei-tmp"),
         state_db: None,
+        complete_path_selection: false,
         selection_context: None,
         selection_run: None,
         selection_pass: None,
