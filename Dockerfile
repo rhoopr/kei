@@ -52,7 +52,7 @@ RUN export TARGET=$(cat /tmp/target) && \
     cp target/$TARGET/release/kei /kei
 
 # ── Runtime stage ────────────────────────────────────────────────────
-FROM debian:bookworm-20260918-slim
+FROM debian:bookworm-20261005-slim
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends bash curl ca-certificates libdbus-1-3 gosu && \
