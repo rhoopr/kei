@@ -208,7 +208,7 @@ async fn refresh_drain_repairs_a_state_recorded_host_local_timestamp() {
         .await
         .unwrap();
 
-    let created_local = now_local();
+    let created_local = now_local() + chrono::Duration::milliseconds(629);
     let db = SqliteStateDb::open_in_memory().unwrap();
     let record = crate::test_helpers::TestAssetRecord::new("CAPTURE_REPAIR")
         .filename("host-local-drain.jpg")

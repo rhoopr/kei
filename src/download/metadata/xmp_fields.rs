@@ -253,6 +253,11 @@ pub(super) fn apply_to_xmp(
     if let Some(dt) = &write.datetime {
         // Embedded plans use EXIF form; sidecar plans already carry unzoned ISO 8601.
         let iso = exif_datetime_to_iso(dt);
+        let iso = if let Some(subseconds) = &write.datetime_subseconds {
+            format!("{iso}.{subseconds}")
+        } else {
+            iso
+        };
         let iso_with_offset = write
             .offset_time_original
             .as_ref()
@@ -433,6 +438,7 @@ mod tests {
     fn xmp_datetime_includes_capture_offset() {
         let packet = build_xmp_packet(&MetadataWrite {
             datetime: Some("2026:02:01 09:31:59".to_string()),
+            datetime_subseconds: Some("629".to_string()),
             offset_time_original: Some("+11:00".to_string()),
             ..MetadataWrite::default()
         })
@@ -454,7 +460,7 @@ mod tests {
             meta.property(xmp_ns::EXIF, "DateTimeOriginal")
                 .unwrap()
                 .value,
-            "2026-02-01T09:31:59+11:00"
+            "2026-02-01T09:31:59.629+11:00"
         );
     }
 

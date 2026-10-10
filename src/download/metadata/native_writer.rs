@@ -54,6 +54,10 @@ pub(super) fn prepare_metadata_native(
         metadata.set_tag(ExifTag::DateTimeOriginal(dt.clone()));
         metadata.set_tag(ExifTag::CreateDate(dt.clone()));
         metadata.set_tag(ExifTag::ModifyDate(dt.clone()));
+        metadata.remove_tag(ExifTag::SubSecTimeOriginal(String::new()));
+        if let Some(subseconds) = &write.datetime_subseconds {
+            metadata.set_tag(ExifTag::SubSecTimeOriginal(subseconds.clone()));
+        }
     }
     if write.clear_datetime_offsets {
         metadata.remove_tag(ExifTag::OffsetTimeOriginal(String::new()));
@@ -265,6 +269,43 @@ mod native_tests {
         let error = result.expect_err("a concurrent edit must block native EXIF publication");
         assert!(crate::download::file::classify_conditional_publish_error(&error).target_changed);
         assert_eq!(fs::read(&path).unwrap(), external);
+    }
+
+    #[test]
+    fn native_apply_metadata_preserves_datetime_subseconds_without_xmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_jpeg(dir.path(), "native-subseconds.jpg");
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                datetime: Some("2024:06:15 10:00:00".into()),
+                datetime_subseconds: Some("629".into()),
+                ..MetadataWrite::default()
+            },
+            ".kei-tmp",
+        )
+        .unwrap();
+        let metadata = Metadata::new_from_path(&path).unwrap();
+        assert!(matches!(
+            metadata.get_tag(&ExifTag::SubSecTimeOriginal(String::new())).next(),
+            Some(ExifTag::SubSecTimeOriginal(value)) if value == "629"
+        ));
+        apply_metadata(
+            &path,
+            &MetadataWrite {
+                datetime: Some("2024:06:15 10:00:01".into()),
+                ..MetadataWrite::default()
+            },
+            ".kei-tmp",
+        )
+        .unwrap();
+        let metadata = Metadata::new_from_path(&path).unwrap();
+        assert!(
+            metadata
+                .get_tag(&ExifTag::SubSecTimeOriginal(String::new()))
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
