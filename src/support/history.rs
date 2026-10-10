@@ -165,6 +165,7 @@ fn trim(history: &mut History) {
 }
 
 enum Message {
+    Start(Value),
     Begin(Value),
     Complete(Value, &'static str),
     Observe(&'static str, Map<String, Value>),
@@ -355,39 +356,14 @@ pub(crate) fn start(path: PathBuf, configuration: Value) -> Option<(Recorder, Gu
         })
         .ok()?;
     let _ = ACTIVE.set(recorder.clone());
-    recorder.send(Message::Begin(privacy::configuration(&configuration)));
+    recorder.send(Message::Start(privacy::configuration(&configuration)));
     Some((recorder.clone(), Guard { recorder, worker }))
 }
 
 fn apply(history: &mut History, message: Message) -> bool {
     match message {
-        Message::Begin(configuration) => {
-            // Entering the next cycle proves startup reached normal operation.
-            // A process that stops before this handoff retains an unfinished record.
-            if let Some(previous) = history.cycles.last_mut()
-                && previous.completed_at.is_none()
-                && previous
-                    .diagnostics
-                    .iter()
-                    .any(|d| d.kind == "support_startup_v1")
-            {
-                previous.completed_at = Some(now());
-                previous.outcome = "success".into();
-            }
-            history.cycles.push(Cycle {
-                id: uuid::Uuid::new_v4().to_string(),
-                started_at: now(),
-                completed_at: None,
-                outcome: "running".into(),
-                build_version: env!("CARGO_PKG_VERSION").into(),
-                build_revision: option_env!("KEI_BUILD_REVISION").map(str::to_owned),
-                build_dirty: option_env!("KEI_BUILD_DIRTY").and_then(|v| v.parse().ok()),
-                configuration,
-                stats: Value::Object(Map::new()),
-                diagnostics: Vec::new(),
-            });
-            trim(history);
-        }
+        Message::Start(configuration) => begin_record(history, configuration, false),
+        Message::Begin(configuration) => begin_record(history, configuration, true),
         Message::Complete(stats, outcome) => {
             if let Some(cycle) = history.cycles.last_mut() {
                 cycle.completed_at = Some(now());
@@ -418,6 +394,35 @@ fn apply(history: &mut History, message: Message) -> bool {
         }
     }
     false
+}
+
+fn begin_record(history: &mut History, configuration: Value, complete_startup: bool) {
+    // Entering the next cycle proves startup reached normal operation.
+    // A process that stops before this handoff retains an unfinished record.
+    if complete_startup
+        && let Some(previous) = history.cycles.last_mut()
+        && previous.completed_at.is_none()
+        && previous
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == "support_startup_v1")
+    {
+        previous.completed_at = Some(now());
+        previous.outcome = "success".into();
+    }
+    history.cycles.push(Cycle {
+        id: uuid::Uuid::new_v4().to_string(),
+        started_at: now(),
+        completed_at: None,
+        outcome: "running".into(),
+        build_version: env!("CARGO_PKG_VERSION").into(),
+        build_revision: option_env!("KEI_BUILD_REVISION").map(str::to_owned),
+        build_dirty: option_env!("KEI_BUILD_DIRTY").and_then(|v| v.parse().ok()),
+        configuration,
+        stats: Value::Object(Map::new()),
+        diagnostics: Vec::new(),
+    });
+    trim(history);
 }
 
 fn add(history: &mut History, kind: &str, fields: Map<String, Value>) {

@@ -281,3 +281,29 @@ async fn existing_writer_lock_preserves_prior_history() {
     guard.finish().await;
     assert_eq!(std::fs::read(path).unwrap(), before);
 }
+
+#[test]
+fn restarting_does_not_complete_an_interrupted_prior_startup() {
+    let mut history = History {
+        schema_version: 1,
+        ..History::default()
+    };
+    apply(&mut history, Message::Start(json!({})));
+    add(
+        &mut history,
+        "support_startup_v1",
+        json!({"phase":"starting"}).as_object().unwrap().clone(),
+    );
+    apply(&mut history, Message::Start(json!({})));
+    assert!(history.cycles[0].completed_at.is_none());
+    assert_eq!(history.cycles[0].outcome, "running");
+    add(
+        &mut history,
+        "support_startup_v1",
+        json!({"phase":"starting"}).as_object().unwrap().clone(),
+    );
+    apply(&mut history, Message::Begin(json!({})));
+    assert!(history.cycles[0].completed_at.is_none());
+    assert_eq!(history.cycles[1].outcome, "success");
+    assert!(history.cycles[1].completed_at.is_some());
+}
