@@ -39,18 +39,34 @@ fn private_actual_late_io_faults_preserve_owned_work_and_recover_after_reopen() 
     );
     for case in [
         "write_enospc",
+        "write_boundary",
         "flush_transport",
         "flush_cancel",
         "file_sync",
         "directory_sync",
         "reconcile_sync",
+        "reconcile_parent",
         #[cfg(feature = "xmp")]
         "sidecar_sync",
+        #[cfg(feature = "xmp")]
+        "sidecar_parent",
     ] {
         let root = directory.path().join(case);
         std::fs::create_dir(&root).unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        let test_name = if case.starts_with("reconcile_") {
+            "sync_loop::runner::tests::configuration::late_io::actual_reconciliation_fault_child"
+        } else {
+            TEST_NAME
+        };
+        if case == "sidecar_parent" {
+            // Reuse the existing test-only fallback selector. This mode adds no
+            // Rust error: the preload fixture fails the real parent fsync.
+            child.env("KEI_TEST_TERMINAL_ROOT", root.join("media/A"));
+            child.env("KEI_TEST_TERMINAL_MODE", "late-io");
+        }
+        let output = child
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
             .env("LD_PRELOAD", &shim)
             .env("KEI_TEST_LATE_IO_ROOT", &root)
             .env("KEI_TEST_LATE_IO_CASE", case)
@@ -71,9 +87,9 @@ fn private_actual_late_io_faults_preserve_owned_work_and_recover_after_reopen() 
     }
 }
 
-async fn wait_for_fault(root: &Path) {
+async fn wait_for_marker(root: &Path, marker: &str) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !root.join("fault-reached").is_file() {
+        while !root.join(marker).is_file() {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     })
@@ -87,6 +103,15 @@ async fn run_case(root: &Path, case: &str) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    // A body larger than Tokio's file buffer forces another write_all poll.
+    // The flush-suppression control must still pass this write-error case.
+    let large_body = (case == "write_boundary").then(|| {
+        let mut bytes = MEDIA[..MEDIA.len() - 2].to_vec();
+        bytes.resize(4 * 1024 * 1024, 0);
+        bytes.extend_from_slice(&MEDIA[MEDIA.len() - 2..]);
+        bytes
+    });
+    let media = large_body.as_deref().unwrap_or(MEDIA);
     let mut fixture = Fixture::new().await;
     let media_root = root.join("media");
     std::fs::create_dir_all(media_root.join("A")).unwrap();
@@ -100,12 +125,12 @@ async fn run_case(root: &Path, case: &str) {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/recovered"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media.to_vec()))
         .mount(&server)
         .await;
     let mut endpoint = format!("{}/recovered", server.uri());
     let cancel = CancellationToken::new();
-    let transport = matches!(case, "flush_transport" | "flush_cancel");
+    let transport = matches!(case, "flush_transport" | "flush_cancel" | "write_boundary");
     let transport_stop = CancellationToken::new();
     let transport_requests = Arc::new(AtomicUsize::new(0));
     let transport_task = if transport {
@@ -114,8 +139,10 @@ async fn run_case(root: &Path, case: &str) {
         let root = root.to_owned();
         let cancel = cancel.clone();
         let cancellation = case == "flush_cancel";
+        let write_boundary = case == "write_boundary";
         let stop = transport_stop.clone();
         let requests = transport_requests.clone();
+        let media = media.to_vec();
         Some(tokio::spawn(async move {
             loop {
                 let accepted = tokio::select! {
@@ -126,16 +153,28 @@ async fn run_case(root: &Path, case: &str) {
                 requests.fetch_add(1, Ordering::SeqCst);
                 let mut request = [0; 4096];
                 let _ = stream.read(&mut request).await.unwrap();
-                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 22\r\nConnection: close\r\n\r\n").await.unwrap();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", media.len()).as_bytes()).await.unwrap();
                 if root.join("fault-enabled").is_file() {
-                    stream.write_all(&MEDIA[..12]).await.unwrap();
-                    wait_for_fault(&root).await;
-                    if cancellation {
-                        cancel.cancel();
+                    stream.write_all(&media[..12]).await.unwrap();
+                    wait_for_marker(&root, "fault-reached").await;
+                    if write_boundary {
+                        // A second write_all must consume the first write's
+                        // ENOSPC before terminal flush can hide this boundary.
+                        wait_for_marker(&root, "fault-returning").await;
+                        // The expected write refusal may close the connection
+                        // while the larger second body is still being sent.
+                        let _closed_by_disk_error = stream.write_all(&media[12..]).await;
+                    } else {
+                        if cancellation {
+                            cancel.cancel();
+                        }
+                        stream.shutdown().await.unwrap();
+                        drop(stream);
+                        std::fs::write(root.join("fault-release"), b"transport stopped").unwrap();
+                        continue;
                     }
-                    // The fixture syscall remains in flight while transport closes.
                 } else {
-                    stream.write_all(MEDIA).await.unwrap();
+                    stream.write_all(&media).await.unwrap();
                 }
                 drop(stream);
             }
@@ -144,7 +183,7 @@ async fn run_case(root: &Path, case: &str) {
         None
     };
     fixture.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = serde_json::json!({
-        "downloadURL":endpoint,"size":MEDIA.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(MEDIA))
+        "downloadURL":endpoint,"size":media.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))
     });
     fixture
         .capture(
@@ -152,8 +191,48 @@ async fn run_case(root: &Path, case: &str) {
             "late-io-source",
         )
         .await;
+    fixture.db.acquire_lock("seed independent config checkpoints").unwrap().execute_batch(
+        "INSERT INTO metadata(key,value) VALUES('config_hash','active-layout'),('enum_config_hash','active-enumeration'),('pending_download_config_hash','retained-layout-debt');"
+    ).unwrap();
+    let unrelated_checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(b"existing-media"));
+    fixture
+        .db
+        .upsert_seen(
+            &crate::test_helpers::TestAssetRecord::new("unrelated-owned")
+                .filename("existing.jpg")
+                .size(14)
+                .build(),
+        )
+        .await
+        .unwrap();
+    fixture
+        .db
+        .mark_downloaded(
+            "PrimarySync",
+            "unrelated-owned",
+            "original",
+            &media_root.join("existing.jpg"),
+            &unrelated_checksum,
+            None,
+        )
+        .await
+        .unwrap();
+    let unrelated_receipts = durable_rows(
+        &fixture,
+        &[
+            "assets WHERE id='unrelated-owned'",
+            "asset_metadata_paths WHERE id='unrelated-owned'",
+        ],
+    );
+    let owner_before = durable_rows(&fixture, &["account_owner"]);
+    let checkpoints_before = durable_rows(
+        &fixture,
+        &[
+            "metadata WHERE key IN ('config_hash','enum_config_hash','pending_download_config_hash','pending_sync_token:sparse:OtherZone','sync_token:PrimarySync')",
+        ],
+    );
     #[cfg(feature = "xmp")]
-    if case == "sidecar_sync" {
+    if matches!(case, "sidecar_sync" | "sidecar_parent") {
         fixture.config.metadata.xmp_sidecar = true;
         let write = crate::download::metadata::MetadataWrite {
             title: Some("old-owned-title".into()),
@@ -168,10 +247,7 @@ async fn run_case(root: &Path, case: &str) {
         .unwrap();
     }
     let old_sidecar = std::fs::read(media_root.join("A/changed.JPG.xmp")).ok();
-    // Local copy qualification starts from an actual completed owned download.
-    if case != "reconcile_sync" {
-        std::fs::write(root.join("fault-enabled"), b"enabled").unwrap();
-    }
+    std::fs::write(root.join("fault-enabled"), b"enabled").unwrap();
     let first = crate::download::download_photos_with_sync(
         &reqwest::Client::new(),
         std::slice::from_ref(&fixture.pass),
@@ -181,11 +257,34 @@ async fn run_case(root: &Path, case: &str) {
     )
     .await
     .unwrap();
-    if case != "reconcile_sync" {
+    // Release every owner and independently reopen before any SQL outcome
+    // assertion or fault removal. Reopened values, not cached owners, qualify.
+    fixture = reopen_destination_fixture(fixture).await;
+    assert_eq!(durable_rows(&fixture, &["account_owner"]), owner_before);
+    assert_eq!(
+        durable_rows(
+            &fixture,
+            &[
+                "assets WHERE id='unrelated-owned'",
+                "asset_metadata_paths WHERE id='unrelated-owned'"
+            ]
+        ),
+        unrelated_receipts
+    );
+    assert_eq!(
+        durable_rows(
+            &fixture,
+            &[
+                "metadata WHERE key IN ('config_hash','enum_config_hash','pending_download_config_hash','pending_sync_token:sparse:OtherZone','sync_token:PrimarySync')"
+            ]
+        ),
+        checkpoints_before
+    );
+    {
         let reached = std::fs::read_to_string(root.join("fault-reached"))
             .expect("the exact syscall fault must be reached before interpreting its outcome");
         assert!(
-            reached.contains(if case == "write_enospc" {
+            reached.contains(if matches!(case, "write_enospc" | "write_boundary") {
                 "errno=28"
             } else {
                 "errno=5"
@@ -194,20 +293,60 @@ async fn run_case(root: &Path, case: &str) {
         );
         assert!(!reached.contains("progress=0\n"), "{case}: {reached}");
     }
+    let enumeration_pending = fixture
+        .db
+        .get_metadata("enum_in_progress:PrimarySync")
+        .await
+        .unwrap();
+    if case == "flush_cancel" {
+        assert!(
+            enumeration_pending
+                .as_deref()
+                .is_some_and(|value| value.parse::<i64>().is_ok_and(|time| time > 0)),
+            "cancelled enumeration must retain its durable restart marker"
+        );
+    } else {
+        assert!(
+            enumeration_pending.is_none(),
+            "{case}: unexpected interrupted enumeration"
+        );
+    }
+    assert_eq!(
+        fixture
+            .db
+            .get_metadata("active_selection_metadata_retry_offset")
+            .await
+            .unwrap(),
+        matches!(case, "sidecar_sync" | "sidecar_parent").then(|| "1".to_owned()),
+        "{case}: metadata retry work must survive reopening"
+    );
     let selected = media_root.join("A/changed.JPG");
-    if case == "directory_sync" || case == "reconcile_sync" {
+    if case == "directory_sync" {
         assert_eq!(first.stats.downloaded, 1, "{case}: {first:?}");
-        assert_eq!(std::fs::read(&selected).unwrap(), MEDIA);
-    } else if case == "sidecar_sync" {
+        assert_eq!(std::fs::read(&selected).unwrap(), media);
+    } else if matches!(case, "sidecar_sync" | "sidecar_parent") {
         assert_eq!(first.stats.downloaded, 1, "{first:?}");
         assert!(
             first.checkpoint.sync_token_blocked,
             "metadata debt cannot be forgotten: {first:?}"
         );
-        assert_eq!(
-            std::fs::read(media_root.join("A/changed.JPG.xmp")).ok(),
-            old_sidecar
-        );
+        if case == "sidecar_sync" {
+            assert_eq!(
+                std::fs::read(media_root.join("A/changed.JPG.xmp")).ok(),
+                old_sidecar
+            );
+        } else {
+            // The strict failure follows installed bytes and a synced commit
+            // marker. Changed target bytes are truthful unfinished metadata.
+            assert_ne!(
+                std::fs::read(media_root.join("A/changed.JPG.xmp")).ok(),
+                old_sidecar
+            );
+            assert!(file_census(&media_root).iter().any(
+                |entry| entry.0.contains(".kei-replace-") && entry.0.ends_with("manifest.json")
+            ));
+        }
+        assert_eq!(std::fs::read(&selected).unwrap(), media);
         assert_eq!(fixture.db.acquire_lock("failed strict sidecar receipt").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap(),1);
     } else {
         assert_eq!(first.stats.downloaded, 0, "{case}: {first:?}");
@@ -244,35 +383,76 @@ async fn run_case(root: &Path, case: &str) {
             0
         );
     }
-    let copied = media_root.join("reconciled.JPG");
-    if case == "reconcile_sync" {
-        std::fs::write(root.join("fault-enabled"), b"enabled").unwrap();
-        let error = crate::download::file::copy_local_file_no_replace(
-            &media_root,
-            &selected,
-            &copied,
-            ".part",
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("Input/output error"),
-            "{error:#}"
-        );
-        assert!(!copied.exists());
-        assert_eq!(std::fs::read(&selected).unwrap(), MEDIA);
-    }
     let reached = std::fs::read_to_string(root.join("fault-reached")).unwrap();
-    if case == "write_enospc" {
+    if matches!(case, "write_enospc" | "write_boundary") {
         assert!(reached.contains("errno=28"));
     } else {
         assert!(reached.contains("errno=5"));
     }
+    if !matches!(case, "directory_sync" | "sidecar_sync" | "sidecar_parent") {
+        let catalog: (String, Option<String>, Option<String>) = fixture
+            .db
+            .acquire_lock("failed catalogue truth")
+            .unwrap()
+            .query_row(
+                "SELECT status,local_path,local_checksum FROM assets WHERE id='asset-m'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            catalog,
+            ("failed".into(), None, None),
+            "{case}: failed work is durable"
+        );
+        assert_eq!(
+            fixture
+                .db
+                .acquire_lock("no false path receipt")
+                .unwrap()
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM asset_metadata_paths WHERE id='asset-m'",
+                    [],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
     fixture.preserved().await;
-    // Remove only the exact fault. Ownership/state is independently reopened.
+    assert_eq!(
+        fixture.count("owned_temp_files"),
+        0,
+        "all transfer claims retire"
+    );
+    let failed_files = file_census(&media_root);
+    if !matches!(case, "sidecar_parent") {
+        assert!(
+            failed_files.iter().all(|entry| !entry.0.ends_with(".part")),
+            "{case}: {failed_files:?}"
+        );
+    }
+    let retained_preparation = failed_files
+        .iter()
+        .filter(|entry| entry.0.ends_with(".part"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        retained_preparation.len(),
+        usize::from(case == "sidecar_parent")
+    );
+    if case == "sidecar_parent" {
+        let installed = failed_files
+            .iter()
+            .find(|entry| entry.0 == "A/changed.JPG.xmp")
+            .unwrap();
+        assert_eq!(retained_preparation[0].1, installed.1);
+        assert_eq!(retained_preparation[0].2, installed.2);
+        assert_eq!(retained_preparation[0].3, 2);
+    }
+    // Remove only the exact fault after the independent failure oracle.
     std::fs::remove_file(root.join("fault-enabled")).unwrap();
-    fixture = reopen_destination_fixture(fixture).await;
-    if !matches!(case, "directory_sync" | "reconcile_sync") {
+    if case != "directory_sync" {
         let recovered = crate::download::download_photos_with_sync(
             &reqwest::Client::new(),
             std::slice::from_ref(&fixture.pass),
@@ -288,24 +468,53 @@ async fn run_case(root: &Path, case: &str) {
         );
         assert_eq!(
             recovered.stats.downloaded,
-            usize::from(case != "sidecar_sync")
+            usize::from(!matches!(case, "sidecar_sync" | "sidecar_parent"))
         );
-        assert_eq!(std::fs::read(&selected).unwrap(), MEDIA);
+        assert_eq!(std::fs::read(&selected).unwrap(), media);
     }
-    if case == "reconcile_sync" {
-        let copied_receipt = crate::download::file::copy_local_file_no_replace(
-            &media_root,
-            &selected,
-            &copied,
-            ".part",
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        copied_receipt.validate().await.unwrap();
-        assert_eq!(std::fs::read(&copied).unwrap(), MEDIA);
-    }
-    let checksum = format!("{:x}", Sha256::digest(MEDIA));
+    fixture = reopen_destination_fixture(fixture).await;
+    assert_eq!(fixture.count("owned_temp_files"), 0);
+    let completed_receipts = durable_rows(
+        &fixture,
+        &[
+            "assets",
+            "asset_metadata_paths",
+            "provider_active_destinations",
+            "account_owner",
+            "metadata",
+        ],
+    );
+    let completed_files = file_census(&media_root);
+    assert!(
+        completed_files
+            .iter()
+            .all(|entry| !entry.0.contains(".kei-replace-")),
+        "{case}: {completed_files:?}"
+    );
+    // Recovery has no persisted name/ownership for the writer's prepared
+    // sidecar hardlink. Retain that exact historical entry; never grow it.
+    assert_eq!(
+        completed_files
+            .iter()
+            .filter(|entry| entry.0.ends_with(".part"))
+            .cloned()
+            .collect::<Vec<_>>(),
+        retained_preparation
+    );
+    assert_eq!(
+        fixture
+            .db
+            .acquire_lock("exact completed catalogue path")
+            .unwrap()
+            .query_row::<String, _, _>(
+                "SELECT local_path FROM assets WHERE id='asset-m'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        selected.to_str().unwrap()
+    );
+    let checksum = format!("{:x}", Sha256::digest(media));
     assert_eq!(fixture.db.acquire_lock("verified independent source after recovery").unwrap().query_row::<String,_,_>("SELECT source_checksum FROM provider_active_destinations WHERE verified_media=1 LIMIT 1",[],|r|r.get(0)).unwrap(),checksum);
     let requests = server.received_requests().await.unwrap().len();
     let raw_requests = transport_requests.load(Ordering::SeqCst);
@@ -357,10 +566,88 @@ async fn run_case(root: &Path, case: &str) {
             std::fs::metadata(&selected).unwrap().modified().unwrap(),
             time
         );
+        assert_eq!(
+            file_census(&media_root),
+            completed_files,
+            "{case}: quiet files/sidecars/temp census"
+        );
+        assert_eq!(
+            durable_rows(
+                &fixture,
+                &[
+                    "assets",
+                    "asset_metadata_paths",
+                    "provider_active_destinations",
+                    "account_owner",
+                    "metadata"
+                ]
+            ),
+            completed_receipts,
+            "{case}: quiet full receipts"
+        );
         fixture.preserved().await;
     }
     transport_stop.cancel();
     if let Some(transport_task) = transport_task {
         transport_task.await.unwrap();
     }
+}
+
+// Full rows include receipt paths, hashes, retry markers and ownership. Sort
+// every column so WITHOUT ROWID and native path spellings are both preserved.
+fn durable_rows(fixture: &Fixture, tables: &[&str]) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+    let connection = fixture
+        .db
+        .acquire_lock("independent full-row oracle")
+        .unwrap();
+    tables
+        .iter()
+        .map(|table| {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM {table}"))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows: Vec<Vec<rusqlite::types::Value>> = statement
+                .query_map([], |row| {
+                    (0..columns).map(|column| row.get(column)).collect()
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            rows.sort_by_key(|row| format!("{row:?}"));
+            rows
+        })
+        .collect()
+}
+
+type FileEntry = (String, Vec<u8>, u64, u64, std::time::SystemTime);
+
+fn file_census(root: &Path) -> Vec<FileEntry> {
+    use std::os::unix::fs::MetadataExt;
+    fn visit(root: &Path, path: &Path, files: &mut Vec<FileEntry>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() {
+                visit(root, &path, files);
+            } else {
+                assert!(metadata.is_file());
+                files.push((
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                    std::fs::read(&path).unwrap(),
+                    metadata.ino(),
+                    metadata.nlink(),
+                    metadata.modified().unwrap(),
+                ));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    visit(root, root, &mut files);
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
 }

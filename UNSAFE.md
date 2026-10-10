@@ -110,9 +110,17 @@ only inside an exclusive disposable test child. It is compiled locally and
 passed through that child's `LD_PRELOAD`; production executables do not load it.
 `pthread_once` resolves matching libc forwarding signatures before concurrent
 calls. `fstat` and bounded `/proc/self/fd` reads restrict injected failures to
-regular `.part` files beneath the immutable child-owned root, or its directories
-for the directory-sync case. Successful prefix writes precede injected errors.
-A bounded audit marker contains only operation, errno and byte progress.
+regular `.part` files beneath the immutable child-owned root, or the existing
+`.kei-reconcile-*.kei-tmp` copy files for the reconciliation file-sync case.
+Directory cases restrict failures to child-owned paths; strict reconciliation
+matches the recorded target parent only after target bytes exist, and strict
+replacement matches the sidecar parent only after a synced journal commit marker.
+Successful prefix writes precede injected write errors. Atomically renamed audit
+markers contain only operation, errno and byte progress. A monotonic ten-second
+child-local rendezvous holds EIO writes until transport shutdown/cancellation;
+polling waits do not claim physical storage timing or durability. The existing
+Rust test-only terminal selector forces the journal fallback without constructing
+a sync error; the preload fixture supplies the actual syscall error.
 
 The fixture never changes a running host service or fault setting. Its parent
 runs one child per case and checks the actual syscall marker plus filesystem

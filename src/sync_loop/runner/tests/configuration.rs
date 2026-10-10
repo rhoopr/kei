@@ -2306,3 +2306,6 @@ async fn retained_checkpoint_candidate_changed_at_promotion_preserves_concurrent
         Some(download::compute_config_hash(&config).as_str())
     );
 }
+
+#[cfg(target_os = "linux")]
+mod late_io;

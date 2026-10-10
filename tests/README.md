@@ -1181,21 +1181,66 @@ native publication proof.
 runs on Linux with `cc` and libc dynamic loading. It compiles
 `fixtures/late_io_fixture.c` into a disposable shim and launches one exclusive
 child per case. Only that child receives `LD_PRELOAD` and a child-owned root.
-Real `.part` prefix writes precede ENOSPC or EIO; transport EOF/cancellation
-compose with the outstanding write, and real file-sync errors precede final
-publication. Strict sidecar and reconciliation tempfile sync cases preserve
-existing bytes and do not produce completion receipts. The existing directory
-fsync warning policy remains unchanged and is checked after publication.
-The reconciliation syscall case invokes the existing copy owner directly;
-state/queue reconciliation has separate dispatcher controls.
+The existing seven cases remain, with a distinct second-write boundary and two
+strict parent-directory cases. XMP cases require the `xmp` feature.
 
-Each child proves the reached syscall, disk-error precedence, preserved old
-SQLite/filesystem evidence, released-handle recovery and two quiet cycles. The
-partial TCP endpoint remains alive and serves complete bytes after only the
-fault is removed, so changed transport identity cannot masquerade as recovery.
-These are local synthetic syscall proofs. They do not qualify another OS,
-network filesystem, sudden power loss, provider snapshots, reporter data or a
-stronger SQLite durability guarantee.
+| Case | Actual operation and errno | Route and failure boundary |
+| --- | --- | --- |
+| `write_enospc` | `write`, ENOSPC (28), after a successful prefix | Ordinary buffered download; the small single-body case can surface at terminal flush |
+| `write_boundary` | `write`, ENOSPC (28), after a successful prefix | Ordinary download; a separately released body larger than the file buffer reaches `write_all` after the first write fault |
+| `flush_transport` | `write`, EIO (5), after a successful prefix | Terminal flush must settle the pending syscall and override premature transport EOF |
+| `flush_cancel` | `write`, EIO (5), after a successful prefix | Terminal flush must settle the pending syscall and override cancellation |
+| `file_sync` | `fdatasync`, EIO (5), after complete media writes | Ordinary download, before publication |
+| `directory_sync` | directory `fsync`, EIO (5) | Ordinary publication retains its warning-only policy and completed receipt |
+| `reconcile_sync` | regular-file `fsync`, EIO (5) | Local config-path reconciliation, after copying media to its private temporary file |
+| `reconcile_parent` | directory `fsync`, EIO (5) | Local config-path reconciliation, after no-overwrite publication and before state finalization |
+| `sidecar_sync` | regular-file `fsync`, EIO (5) | XMP preparation, before guarded replacement of an existing sidecar |
+| `sidecar_parent` | directory `fsync`, EIO (5) | Existing journaled guarded-replacement fallback, after installation and synced commit-marker writes |
+
+EOF/cancellation cases use an atomic fault marker and bounded child-local
+release handshake. The syscall stays pending until the child closes transport
+or requests cancellation; no fixed scheduling delay certifies error precedence.
+The second-write case sends its second body chunk only after the first syscall
+reaches its error-return boundary; its body exceeds Tokio's file buffer. A
+reversible flush-suppression control still passes this case, distinguishing the
+write error from the small body's terminal flush error. Real syscall markers and
+the durable disk error distinguish these cases from a constructed result or
+free-space estimate.
+
+Each child begins with populated disposable media/sidecars, file-backed owned
+SQLite, known path receipts and retained checkpoint debt. All database owners
+are dropped and SQLite is independently reopened while the fault remains active,
+before asserting catalogue paths, ownership, receipts, failed/metadata work and
+config/provider checkpoints. Permanent disk errors may remove their partial
+prefix; the test requires retired transfer claims and exact original/unrelated
+bytes rather than incorrectly requiring resumability. Strict sidecar failure
+after publication may leave changed target bytes and a recovery journal, but
+cannot complete metadata receipts or forget debt. Journal recovery retires its
+manifest and preserves the writer's prepared sidecar hardlink: the manifest does
+not persist that temporary name or authorize deleting it. The test requires that
+single historical entry's exact bytes, inode, link count and mtime through
+recovery and quiet restarts.
+
+Reconciliation enters the production `run_cycle` config-drift path, including
+reservation, copy, durable finalization, source-dispatch suppression and atomic
+path-hash promotion. A strict copy/parent-sync failure preserves the old catalogue
+path, active config hash and provider token, with the new path hash pending.
+Only the fault switch is removed before recovery. An ambiguous reconciliation
+temporary file is retained byte-for-byte under the existing inspection policy.
+
+Recovery and two independently reopened quiet cycles compare full path and
+selection receipts and the recursive file census: exact media/sidecar bytes,
+inode, link count, mtime and operation-owned temporary entries. Completed writes
+do not repeat and the temporary census does not grow. The partial TCP endpoint
+remains alive and serves complete bytes after only the fault is removed, so
+changed transport identity cannot masquerade as recovery.
+
+Normal download and exchange replacement parent-sync warnings remain distinct
+from strict reconciliation and journaled replacement sync failures. No production
+policy changes. These local synthetic syscall proofs do not qualify another OS,
+physical NFS, sudden power loss, every disk fault, provider snapshots, reporter
+data or a stronger SQLite durability guarantee. Physical NFS confirmation stays
+with #858.
 
 Repeated-source controls retain every duplicate ordinal while measuring actual
 strict page decodes. Exact-fit and below-fit byte budgets, zero-capacity refusal,
