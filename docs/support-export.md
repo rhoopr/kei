@@ -58,6 +58,11 @@ Aliases change after a restart and are renumbered within each export.
 Normal sync, service-run and import operations retain evidence independently of
 log verbosity. Recording is optional evidence and cannot change backup or
 checkpoint decisions. History is account-scoped and persists across restarts.
+Normal sync/import/service startup may create the support history and its lock
+before pre-authentication validation completes, so validation failures can be
+reported later. Authentication/session/database state is still not created by
+failed pre-authentication validation. The export command creates only its
+requested output file.
 It retains at most 16 records, 128 diagnostic groups per record and 512 KiB.
 Per-item success details are sampled at 64 groups per record. Later failures can
 replace older detail/failure groups, and terminal summaries take priority over
