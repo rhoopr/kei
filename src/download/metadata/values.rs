@@ -31,6 +31,7 @@ pub(crate) struct SourceGpsMetadata {
     pub(crate) latitude: Option<f64>,
     pub(crate) longitude: Option<f64>,
     pub(crate) datetime: Option<String>,
+    pub(crate) datetime_subseconds: Option<String>,
     pub(crate) speed: Option<XmpRational>,
     pub(crate) speed_ref: Option<String>,
     pub(crate) horizontal_positioning_error: Option<XmpRational>,
@@ -78,6 +79,7 @@ pub(crate) struct MetadataWrite {
 impl MetadataWrite {
     pub(crate) fn is_empty(&self) -> bool {
         self.datetime.is_none()
+            && self.datetime_subseconds.is_none()
             && self.offset_time_original.is_none()
             && !self.clear_datetime_offsets
             && self.gps_datetime.is_none()

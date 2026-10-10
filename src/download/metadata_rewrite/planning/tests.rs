@@ -198,6 +198,7 @@ fn capture_timestamp_repair_requires_an_offset_and_replaces_the_pair() {
         &probe,
     );
     assert_eq!(write.datetime.as_deref(), Some("2024:06:15 10:00:00"));
+    assert_eq!(write.datetime_subseconds.as_deref(), Some("629"));
     assert_eq!(write.offset_time_original.as_deref(), Some("+11:00"));
     assert!(write.clear_datetime_offsets);
 
