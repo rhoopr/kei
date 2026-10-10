@@ -360,6 +360,7 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "master_child_distinct",
             "selected_identity",
             "candidate_paths",
+            "scan_index",
             "path_shape_equal",
             "candidate_path_shape_equal",
         ]),

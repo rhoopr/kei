@@ -59,6 +59,13 @@ Normal sync, service-run and import operations retain evidence independently of
 log verbosity. Recording is optional evidence and cannot change backup or
 checkpoint decisions. History is account-scoped and persists across restarts.
 It retains at most 16 records, 128 diagnostic groups per record and 512 KiB.
+Per-item success details are sampled at 64 groups per record. Later failures can
+replace older detail/failure groups, and terminal summaries take priority over
+both. Each new record reports observations_total, observations_shown and
+observations_omitted; these count observations, not distinct assets. Older saved
+records without accounting report null for these fields. Import scan_index is a
+cycle-local ordinal, not an asset identifier. Group omissions and queue drops
+remain explicit, so sampled detail is never presented as exhaustive.
 An asynchronous queue holds at most 256 observations. If a cycle handoff is
 lost, its later observations are omitted rather than assigned to a prior cycle. Repeated observations
 with identical fixed fields are grouped; overflow and rotation are counted.

@@ -390,3 +390,109 @@ fn failed_history_rename_never_uses_an_unowned_copy_fallback() {
     );
     assert!(path.is_dir());
 }
+
+#[test]
+fn late_failures_and_summary_survive_sampled_details_and_report_counts() {
+    let mut h = History {
+        schema_version: 1,
+        ..History::default()
+    };
+    apply(&mut h, Message::Begin(json!({})));
+    for n in 0..200 {
+        let fields = json!({"phase":"scan","reason":"candidate","scan_index":n});
+        for _ in 0..2 {
+            add(
+                &mut h,
+                "support_import_v1",
+                fields.as_object().unwrap().clone(),
+            );
+        }
+    }
+    add(
+        &mut h,
+        "support_import_v1",
+        json!({"phase":"adoption","reason":"strict_refusal"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    add(
+        &mut h,
+        "support_import_v1",
+        json!({"phase":"complete","total":200,"strict_refused":1})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let c = &h.cycles[0];
+    assert_eq!(c.diagnostics.len(), super::MAX_DETAIL_GROUPS + 2);
+    assert_eq!(c.observations_total, Some(402));
+    assert_eq!(c.observations_shown, Some(130));
+    assert_eq!(c.observations_omitted, Some(272));
+    assert!(
+        c.diagnostics
+            .iter()
+            .any(|d| d.fields.get("strict_refused") == Some(&json!(1)))
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("support.json");
+    save(&path, &mut h).unwrap();
+    let (clean, status) = read(&path);
+    assert_eq!(status, "available");
+    assert_eq!(clean.cycles[0].observations_omitted, Some(272));
+    // Exhaust failure groups too: late summary displaces an earlier failure.
+    for n in 0..MAX_GROUPS {
+        add(
+            &mut h,
+            "exact_lookup_rejection_v1",
+            json!({"rejected_requests":n}).as_object().unwrap().clone(),
+        );
+    }
+    add(
+        &mut h,
+        "support_import_v1",
+        json!({"phase":"complete","total":201,"strict_refused":2})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let c = &h.cycles[0];
+    assert_eq!(c.diagnostics.len(), MAX_GROUPS);
+    assert_eq!(
+        c.observations_total,
+        c.observations_shown
+            .zip(c.observations_omitted)
+            .map(|(a, b)| a + b)
+    );
+    assert!(
+        c.diagnostics
+            .iter()
+            .any(|d| d.fields.get("total") == Some(&json!(201)))
+    );
+}
+
+#[test]
+fn older_history_observation_accounting_is_explicitly_unavailable() {
+    let mut h = History {
+        schema_version: 1,
+        ..History::default()
+    };
+    apply(&mut h, Message::Begin(json!({})));
+    let mut saved = serde_json::to_value(&h).unwrap();
+    let c = saved["cycles"][0].as_object_mut().unwrap();
+    for field in [
+        "observations_total",
+        "observations_shown",
+        "observations_omitted",
+    ] {
+        c.remove(field);
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("support.json");
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let (read, status) = read(&path);
+    assert_eq!(status, "available");
+    assert!(read.cycles[0].observations_total.is_none());
+    assert!(read.cycles[0].observations_shown.is_none());
+    assert!(read.cycles[0].observations_omitted.is_none());
+}

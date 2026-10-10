@@ -89,7 +89,11 @@ pub(super) fn export(
         || history.previous_history_unavailable
         || history.queue_dropped > 0
         || history.groups_omitted > 0
-        || history.cycles_evicted > 0;
+        || history.cycles_evicted > 0
+        || history
+            .cycles
+            .iter()
+            .any(|c| c.observations_total.is_none());
     let cycles = history.cycles.len();
     let bundle = json!({
         "schema_version": 1,

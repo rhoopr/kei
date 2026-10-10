@@ -19,6 +19,9 @@ pub(super) const MAX_BYTES: u64 = 512 * 1024;
 pub(super) const MAX_CYCLES: usize = 16;
 pub(super) const MAX_GROUPS: usize = 128;
 const QUEUE: usize = 256;
+// Per-item successes are sampled so late failures and terminal summaries retain
+// room even when a cycle processes thousands of distinct item aliases.
+const MAX_DETAIL_GROUPS: usize = 64;
 
 #[derive(Default, Serialize, Deserialize)]
 pub(super) struct History {
@@ -46,6 +49,13 @@ pub(super) struct Cycle {
     pub configuration: Value,
     pub stats: Value,
     pub diagnostics: Vec<Diagnostic>,
+    /// None identifies history written before observation accounting existed.
+    #[serde(default)]
+    pub observations_total: Option<u64>,
+    #[serde(default)]
+    pub observations_shown: Option<u64>,
+    #[serde(default)]
+    pub observations_omitted: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -100,6 +110,10 @@ pub(super) fn read(path: &Path) -> (History, &'static str) {
         cycle.configuration = privacy::configuration(&cycle.configuration);
         cycle.stats = privacy::stats(&cycle.stats);
         let original_groups = cycle.diagnostics.len();
+        let original_observations = cycle
+            .diagnostics
+            .iter()
+            .fold(0_u64, |n, d| n.saturating_add(d.observations));
         cycle.diagnostics.retain(|d| {
             privacy::contract(&d.kind).is_some()
                 && utc(&d.first_at).is_some()
@@ -118,6 +132,20 @@ pub(super) fn read(path: &Path) -> (History, &'static str) {
                 u64::try_from(cycle.diagnostics.len() - MAX_GROUPS).unwrap_or(u64::MAX),
             );
             cycle.diagnostics.truncate(MAX_GROUPS);
+        }
+        let shown = cycle
+            .diagnostics
+            .iter()
+            .fold(0_u64, |n, d| n.saturating_add(d.observations));
+        cycle.observations_shown = cycle.observations_shown.map(|_| shown);
+        cycle.observations_omitted = cycle
+            .observations_omitted
+            .map(|n| n.saturating_add(original_observations.saturating_sub(shown)));
+        if let (Some(shown), Some(omitted)) = (cycle.observations_shown, cycle.observations_omitted)
+        {
+            cycle.observations_total = cycle
+                .observations_total
+                .map(|_| shown.saturating_add(omitted));
         }
     }
     let mut aliases = std::collections::HashMap::new();
@@ -459,14 +487,44 @@ fn begin_record(history: &mut History, configuration: Value, complete_startup: b
         configuration,
         stats: Value::Object(Map::new()),
         diagnostics: Vec::new(),
+        observations_total: Some(0),
+        observations_shown: Some(0),
+        observations_omitted: Some(0),
     });
     trim(history);
+}
+
+// This is a retention policy only: it does not change ownership or checkpoint
+// decisions. Summary and failure observations can displace sampled detail.
+fn priority(kind: &str, fields: &Map<String, Value>) -> u8 {
+    let phase = fields.get("phase").and_then(Value::as_str);
+    let reason = fields.get("reason").and_then(Value::as_str);
+    if matches!(
+        kind,
+        "support_checkpoint_v1"
+            | "support_pass_completion_v1"
+            | "support_transfer_pass_v1"
+            | "support_startup_v1"
+    ) || (kind == "support_import_v1" && phase == Some("complete"))
+    {
+        2
+    } else if (kind == "support_import_v1" && matches!(reason, Some("candidate" | "no_match")))
+        || (kind == "support_metadata_v1" && fields.get("verified") != Some(&Value::Bool(false)))
+        || (kind == "support_publication_v1"
+            && reason.is_none()
+            && fields.get("receipt_match") != Some(&Value::Bool(false)))
+    {
+        0
+    } else {
+        1
+    }
 }
 
 fn add(history: &mut History, kind: &str, fields: Map<String, Value>) {
     let Some(cycle) = history.cycles.last_mut() else {
         return;
     };
+    cycle.observations_total = cycle.observations_total.map(|n| n.saturating_add(1));
     let time = now();
     if let Some(existing) = cycle
         .diagnostics
@@ -475,17 +533,51 @@ fn add(history: &mut History, kind: &str, fields: Map<String, Value>) {
     {
         existing.observations = existing.observations.saturating_add(1);
         existing.last_at = time;
-    } else if cycle.diagnostics.len() < MAX_GROUPS {
-        cycle.diagnostics.push(Diagnostic {
-            kind: kind.into(),
-            fields,
-            observations: 1,
-            first_at: time.clone(),
-            last_at: time,
-        });
-    } else {
-        history.groups_omitted = history.groups_omitted.saturating_add(1);
+        cycle.observations_shown = cycle.observations_shown.map(|n| n.saturating_add(1));
+        return;
     }
+    let incoming = priority(kind, &fields);
+    let detail_full = incoming == 0
+        && cycle
+            .diagnostics
+            .iter()
+            .filter(|d| priority(&d.kind, &d.fields) == 0)
+            .count()
+            >= MAX_DETAIL_GROUPS;
+    if detail_full {
+        history.groups_omitted = history.groups_omitted.saturating_add(1);
+        cycle.observations_omitted = cycle.observations_omitted.map(|n| n.saturating_add(1));
+        return;
+    }
+    if cycle.diagnostics.len() >= MAX_GROUPS {
+        // Lowest priority first, oldest first within a priority. A new terminal
+        // summary always survives; a failure can replace older failure/detail.
+        let victim = cycle
+            .diagnostics
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| priority(&d.kind, &d.fields) <= incoming)
+            .min_by_key(|(_, d)| priority(&d.kind, &d.fields))
+            .map(|(i, _)| i);
+        history.groups_omitted = history.groups_omitted.saturating_add(1);
+        let Some(index) = victim else {
+            cycle.observations_omitted = cycle.observations_omitted.map(|n| n.saturating_add(1));
+            return;
+        };
+        let removed = cycle.diagnostics.remove(index).observations;
+        cycle.observations_shown = cycle.observations_shown.map(|n| n.saturating_sub(removed));
+        cycle.observations_omitted = cycle
+            .observations_omitted
+            .map(|n| n.saturating_add(removed));
+    }
+    cycle.diagnostics.push(Diagnostic {
+        kind: kind.into(),
+        fields,
+        observations: 1,
+        first_at: time.clone(),
+        last_at: time,
+    });
+    cycle.observations_shown = cycle.observations_shown.map(|n| n.saturating_add(1));
 }
 
 fn private_options() -> std::fs::OpenOptions {
