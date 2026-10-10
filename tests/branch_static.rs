@@ -2727,6 +2727,122 @@ fn docker_entrypoint_routes_visible_commands_before_conflicting_executables() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn docker_support_export_skips_repairs_and_keeps_numeric_privilege_drop() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let config = root.join("config");
+    let photos = root.join("photos");
+    std::fs::create_dir(&config).unwrap();
+    std::fs::create_dir(&photos).unwrap();
+    std::fs::write(photos.join("private-photo.jpg"), b"private-photo").unwrap();
+    let repairs = root.join("repairs");
+    let uid = root.join("uid");
+    let entrypoint = root.join("entrypoint.sh");
+    // Replace only container mount locations; all routing and repair logic is
+    // the shipped wrapper, with real CLI classification and execution.
+    std::fs::write(
+        &entrypoint,
+        repo_file("docker/entrypoint.sh")
+            .replace("/config", &config.display().to_string())
+            .replace("/photos", &photos.display().to_string()),
+    )
+    .unwrap();
+    let binary = assert_cmd::cargo::cargo_bin_cmd!("kei")
+        .get_program()
+        .to_owned();
+    std::os::unix::fs::symlink(binary, root.join("kei")).unwrap();
+    write_executable(
+        &root.join("find"),
+        "#!/bin/sh\nprintf 'find\\n' >> \"$REPAIR_MARKER\"\n",
+    );
+    write_executable(
+        &root.join("chown"),
+        "#!/bin/sh\nprintf 'chown\\n' >> \"$REPAIR_MARKER\"\n",
+    );
+    write_executable(
+        &root.join("gosu"),
+        "#!/bin/sh\ntest -z \"${KEI_DOCKER_ENTRYPOINT_QUERY:-}\" || exit 98\nprintf '%s' \"$1\" > \"$UID_MARKER\"\nshift\nexec \"$@\"\n",
+    );
+    let cfg = config.join("config.toml");
+    std::fs::write(
+        &cfg,
+        "[auth]\nusername = \"private-user@example.invalid\"\n",
+    )
+    .unwrap();
+    let run = |arguments: &[&str]| {
+        Command::new("sh")
+            .current_dir(root)
+            .arg(&entrypoint)
+            .args(arguments)
+            .env("PATH", format!("{}:/usr/bin:/bin", root.display()))
+            .env("PUID", "4321")
+            .env("PGID", "4322")
+            .env("KEI_DATA_DIR", &config)
+            .env("KEI_CONFIG", &cfg)
+            .env("REPAIR_MARKER", &repairs)
+            .env("UID_MARKER", &uid)
+            .env_remove("KEI_DOCKER_ENTRYPOINT_QUERY")
+            .env_remove("KEI_CHOWN_PHOTOS")
+            .env_remove("KEI_DOWNLOAD_DIR")
+            .output()
+            .unwrap()
+    };
+    let output = root.join("bundle.json");
+    let result = run(&[
+        "--config",
+        cfg.to_str().unwrap(),
+        "support-export",
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert!(result.status.success(), "{result:?}");
+    assert!(
+        output.exists(),
+        "the query flag must not suppress real collection"
+    );
+    assert!(
+        !repairs.exists(),
+        "support collection traversed or repaired a volume"
+    );
+    assert_eq!(std::fs::read_to_string(&uid).unwrap(), "4321:4322");
+    assert_eq!(std::fs::read_dir(&config).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read_to_string(&cfg).unwrap(),
+        "[auth]\nusername = \"private-user@example.invalid\"\n"
+    );
+    assert_eq!(
+        std::fs::read(photos.join("private-photo.jpg")).unwrap(),
+        b"private-photo"
+    );
+    for (args, success) in [
+        (&["support-export"][..], true),
+        (&["support-export", "--output"][..], false),
+        (&["support-export", "--help"][..], true),
+        (&["help", "support-export"][..], true),
+    ] {
+        let result = run(args);
+        assert_eq!(result.status.success(), success, "{args:?}: {result:?}");
+        assert!(
+            !repairs.exists(),
+            "export/help arguments ran repair: {args:?}"
+        );
+    }
+    assert!(
+        root.join("kei-support.json").exists(),
+        "default output stays in the disposable working directory"
+    );
+    assert_eq!(std::fs::read_dir(&config).unwrap().count(), 1);
+    let result = run(&["--config", "support-export", "status"]);
+    assert!(!result.status.success());
+    assert_eq!(
+        std::fs::read_to_string(&repairs).unwrap(),
+        "find\nfind\n",
+        "a config value must not bypass normal volume initialization"
+    );
+}
+
 fn docker_visible_commands() -> Vec<String> {
     let output = assert_cmd::cargo::cargo_bin_cmd!("kei")
         .arg("--help")

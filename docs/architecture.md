@@ -178,6 +178,14 @@ Traversal or repair failures warn before privilege drop. Every restart scans
 all inodes; KEI_CHOWN_PHOTOS=0 skips /photos repair when host permissions are
 already managed, while /config remains repaired.
 
+For `support-export`, the wrapper queries the owning Rust CLI parser before
+volume initialization. The private query ignores captured CLI environment
+bindings and returns an exit status without runtime, config-file reads or
+credential resolution. Export launches and their help routes skip both
+volume traversal and ownership repair, including incomplete export arguments,
+then drop to the requested numeric UID:GID. Option values cannot select this
+exception. Normal launches retain their existing ownership initialization.
+
 The Docker HTTP healthcheck defaults to port 9090. A deployment using a custom
 `[server].port` must set `KEI_HEALTHCHECK_PORT` to that same port, including
 when overriding the command with a custom config path. Docker does not parse

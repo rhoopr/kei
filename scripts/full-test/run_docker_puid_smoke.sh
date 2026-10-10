@@ -97,6 +97,58 @@ if [[ "$root_out" != "0" ]]; then
     exit 1
 fi
 
+echo "--- support export drops privileges without traversal or repair ---"
+export_config="$work/export-config"
+export_photos="$work/export-photos"
+export_output="$work/export-output"
+mkdir -p "$export_config" "$export_photos" "$export_output"
+cat >"$export_config/config.toml" <<'TOML'
+[auth]
+username = "private-user@example.invalid"
+password_command = "touch /output/private-command-ran"
+[download]
+directory = "/photos"
+TOML
+printf private-media >"$export_photos/private-photo.jpg"
+cat >"$work/forbidden-repair" <<'SH'
+#!/bin/sh
+echo forbidden-volume-initialization >&2
+exit 93
+SH
+chmod 755 "$work/forbidden-repair"
+export_run() {
+    docker run --rm --network none --read-only --tmpfs /tmp \
+        -e PUID="$(id -u)" -e PGID="$(id -g)" -e KEI_DATA_DIR=/config \
+        -v "$export_config:/config:ro" -v "$export_photos:/photos:ro" \
+        -v "$export_output:/output" \
+        -v "$work/forbidden-repair:/usr/bin/find:ro" \
+        -v "$work/forbidden-repair:/usr/bin/chown:ro" \
+        "$image" "$@"
+}
+export_out=$(export_run --config /config/config.toml support-export --output /output/bundle.json 2>&1)
+test -f "$export_output/bundle.json"
+test ! -e "$export_output/private-command-ran"
+test "$(stat -c %u:%g "$export_output/bundle.json")" = "$(id -u):$(id -g)"
+test "$(stat -c %a "$export_output/bundle.json")" = 600
+test "$(cat "$export_photos/private-photo.jpg")" = private-media
+! grep -q 'private-' "$export_output/bundle.json"
+! grep -Eq 'forbidden-volume-initialization|warning: chown' <<<"$export_out"
+explicit_out=$(export_run /usr/local/bin/kei --config /config/config.toml support-export --output /output/explicit.json 2>&1)
+test -f "$export_output/explicit.json"
+! grep -Eq 'forbidden-volume-initialization|warning: chown' <<<"$explicit_out"
+for mode in missing-output help-flag help-command; do
+    case "$mode" in
+        missing-output) args=(support-export --output) ;;
+        help-flag) args=(support-export --help) ;;
+        help-command) args=(help support-export) ;;
+    esac
+    export_help=$(export_run "${args[@]}" 2>&1 || true)
+    ! grep -Eq 'forbidden-volume-initialization|warning: chown' <<<"$export_help"
+done
+# This control proves the injected executable catches normal traversal.
+normal_out=$(export_run --config /config/config.toml status 2>&1 || true)
+grep -q 'warning: chown /config failed' <<<"$normal_out"
+
 echo "--- invalid PUID rejected ---"
 bad_out=$(docker run --rm \
     -e PUID=notanumber \

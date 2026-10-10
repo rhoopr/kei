@@ -885,6 +885,40 @@ fn with_removed_sync_surface_hint(message: String) -> String {
     )
 }
 
+/// Classify the Docker launch before any volume ownership initialization.
+/// Clap still consumes option values, so a value named `support-export` cannot
+/// masquerade as the command. Partial export arguments must also avoid repair.
+#[must_use]
+pub(crate) fn is_support_export_invocation<I, T>(itr: I) -> bool
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    fn query_command(command: clap::Command) -> clap::Command {
+        command
+            .disable_help_flag(true)
+            .disable_version_flag(true)
+            .disable_help_subcommand(true)
+            .mut_args(|argument| argument.env(None::<&str>))
+            .mut_subcommands(query_command)
+    }
+    // Derive help from the same tree rather than guessing from tokens or
+    // rendering help. Discard captured env bindings so invalid configuration
+    // or credential environment cannot alter this argv decision.
+    let command = query_command(<Cli as clap::CommandFactory>::command());
+    let help = clap::Command::new("help").subcommands(command.get_subcommands().cloned());
+    command
+        .subcommand(help)
+        .ignore_errors(true)
+        .try_get_matches_from(itr)
+        .is_ok_and(|matches| {
+            matches.subcommand_name() == Some("support-export")
+                || matches
+                    .subcommand_matches("help")
+                    .is_some_and(|help| help.subcommand_name() == Some("support-export"))
+        })
+}
+
 /// Parse CLI arguments and render migration hints for removed sync flags.
 pub fn parse_cli_with_sources<I, T>(itr: I) -> Result<Cli, ParseCliError>
 where

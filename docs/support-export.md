@@ -12,6 +12,13 @@ For Docker, use the existing container and mounted configuration:
 docker exec kei kei --config /config/config.toml support-export --output /config/kei-support.json
 ```
 
+Fresh container launches also skip ownership initialization for this command,
+including when PUID/PGID are set. Prepare a writable output directory owned by
+that UID:GID yourself; collection does not fix its permissions. Older images
+may initialize volume ownership on fresh launches, so use the existing-container
+route above or explicitly bypass their wrapper with `--entrypoint /usr/local/bin/kei`
+and `--user UID:GID`.
+
 Copy the JSON file from your configuration mount, review it locally, and attach
 it to your bug report if you choose. Describe the symptoms, when they occurred,
 and what you expected. Nothing is uploaded automatically. Choose a new filename

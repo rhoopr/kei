@@ -3,6 +3,69 @@ use super::support::{clean_cmd, sanitize_username};
 use serde_json::Value;
 use std::path::Path;
 
+#[test]
+fn docker_export_query_parses_only_arguments_without_collecting() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("private-config.toml");
+    let output = root.path().join("bundle.json");
+    let marker = root.path().join("credential-command-ran");
+    std::fs::write(
+        &config,
+        format!(
+            "[auth]\nusername = \"private-user@example.invalid\"\npassword_command = {}\n",
+            crate::common::toml_string(&format!("touch {}", marker.display()))
+        ),
+    )
+    .unwrap();
+    let before = snapshot(root.path());
+    for (arguments, expected) in [
+        (
+            vec![
+                "--config",
+                config.to_str().unwrap(),
+                "support-export",
+                "--output",
+                output.to_str().unwrap(),
+            ],
+            0,
+        ),
+        (vec!["support-export"], 0),
+        (vec!["support-export", "--output"], 0),
+        (vec!["support-export", "--help"], 0),
+        (vec!["help", "support-export"], 0),
+        (vec!["--config", "support-export", "help", "status"], 1),
+        (vec!["--config=support-export", "status"], 1),
+        (vec!["--config", "support-export", "status"], 1),
+        (vec!["sync", "--password-command", "support-export"], 1),
+        (vec!["sync"], 1),
+        (vec!["--version"], 1),
+        (vec![], 1),
+    ] {
+        let result = clean_cmd()
+            .env("KEI_DOCKER_ENTRYPOINT_QUERY", "1")
+            .env("KEI_DATA_DIR", root.path().join("absent-data"))
+            .env("ICLOUD_PASSWORD", "private-secret")
+            .env("KEI_PASSWORD_FILE", "private-secret-file")
+            .env("KEI_PASSWORD_COMMAND", "private-secret-command")
+            .env("KEI_LOG_LEVEL", "private-invalid-level")
+            .args(&arguments)
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(expected),
+            "{arguments:?}: {result:?}"
+        );
+        assert!(
+            result.stdout.is_empty() && result.stderr.is_empty(),
+            "{arguments:?}: {result:?}"
+        );
+        assert_eq!(snapshot(root.path()), before);
+        assert!(!marker.exists() && !output.exists());
+        assert!(!root.path().join("absent-data").exists());
+    }
+}
+
 fn snapshot(directory: &Path) -> Vec<(String, Vec<u8>)> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(directory).unwrap() {

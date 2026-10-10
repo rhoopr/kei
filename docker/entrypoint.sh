@@ -2,7 +2,8 @@
 # kei container entrypoint.
 #
 # When PUID and PGID are set, drops to that UID:GID via gosu after
-# fixing ownership of /config and /photos. KEI_CHOWN_PHOTOS=0 skips
+# fixing ownership of /config and /photos, except for support-export.
+# Support collection never traverses or repairs either volume. KEI_CHOWN_PHOTOS=0 skips
 # /photos repair. Without PUID/PGID, runs as root without changing ownership.
 #
 # `kei` subcommand list is hard-coded to avoid colliding with debian
@@ -165,6 +166,16 @@ case "${KEI_CHOWN_PHOTOS:-1}" in
     *)
         echo "kei: KEI_CHOWN_PHOTOS must be 0 or 1" >&2
         exit 1
+        ;;
+esac
+
+# Ask the owning CLI parser before traversing volumes. This assignment exists
+# only for the query child; the real command still collects normally under gosu.
+case "$1" in
+    kei | /usr/local/bin/kei)
+        if KEI_DOCKER_ENTRYPOINT_QUERY=1 "$@"; then
+            exec gosu "$PUID:$PGID" "$@"
+        fi
         ;;
 esac
 
