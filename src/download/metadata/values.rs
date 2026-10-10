@@ -31,7 +31,6 @@ pub(crate) struct SourceGpsMetadata {
     pub(crate) latitude: Option<f64>,
     pub(crate) longitude: Option<f64>,
     pub(crate) datetime: Option<String>,
-    pub(crate) datetime_subseconds: Option<String>,
     pub(crate) speed: Option<XmpRational>,
     pub(crate) speed_ref: Option<String>,
     pub(crate) horizontal_positioning_error: Option<XmpRational>,
@@ -45,6 +44,7 @@ pub(crate) struct MetadataWrite {
     /// `YYYY-MM-DDTHH:MM:SS` with optional fractional seconds for sidecars.
     /// `offset_time_original` supplies the XMP zone separately.
     pub(crate) datetime: Option<String>,
+    pub(crate) datetime_subseconds: Option<String>,
     /// EXIF `OffsetTimeOriginal`, formatted as `+HH:MM` or `-HH:MM`.
     pub(crate) offset_time_original: Option<String>,
     /// Remove offset tags before writing a replacement timestamp.
