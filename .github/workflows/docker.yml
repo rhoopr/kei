@@ -8,6 +8,10 @@ on:
       - Cargo.toml
       - Cargo.lock
       - Dockerfile
+      - docker/**
+      - .dockerignore
+      - build.rs
+      - .github/workflows/docker.yml
     tags: ['v*']
 
 # Back-to-back main pushes: only the latest matters (same :main tag).

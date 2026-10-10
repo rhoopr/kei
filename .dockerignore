@@ -1,5 +1,7 @@
 # Rust
-target/
+**/target/
+**/artifacts/
+**/corpus/
 
 # Git & GitHub
 .git/

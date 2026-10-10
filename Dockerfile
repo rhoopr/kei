@@ -20,8 +20,6 @@ WORKDIR /build
 
 # Resolve target triple and linker from TARGETPLATFORM once.
 # Shared by the dependency-cache and real build steps.
-ARG CARGO_TARGET
-ARG CARGO_LINKER_ENV
 RUN case "$TARGETPLATFORM" in \
       "linux/amd64") echo "x86_64-unknown-linux-gnu"  > /tmp/target ;; \
       "linux/arm64") echo "aarch64-unknown-linux-gnu" > /tmp/target ;; \
@@ -31,7 +29,7 @@ RUN case "$TARGETPLATFORM" in \
 # Cache dependency compilation: copy manifests first, build a dummy, then
 # copy the real source. This means changing src/ doesn't invalidate the
 # dependency layer.
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 RUN export TARGET=$(cat /tmp/target) && \
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc && \
     export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ && \
@@ -67,11 +65,12 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 VOLUME ["/config", "/photos"]
 
 # Always-on HTTP server: /healthz (health check) and /metrics (Prometheus).
-# Default port 9090; override with [server] port in TOML.
+# Default port 9090. For a custom [server].port, set KEI_HEALTHCHECK_PORT
+# to the same port (including when using a custom config path).
 EXPOSE 9090
 
 HEALTHCHECK --interval=60s --timeout=5s --start-period=15m --retries=3 \
-  CMD curl -f http://localhost:9090/healthz || exit 1
+  CMD curl -fsS "http://localhost:${KEI_HEALTHCHECK_PORT:-9090}/healthz" || exit 1
 
 # entrypoint.sh drops to PUID:PGID when those env vars are set; otherwise
 # exec's kei as root (preserves prior behavior). Required for NAS

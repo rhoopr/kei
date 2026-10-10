@@ -182,24 +182,7 @@ fn docker_packaging_defaults_to_service_run() {
                 .all(|subcommand| line.contains(subcommand))
         })
         .expect("entrypoint must keep an explicit kei subcommand whitelist");
-    for subcommand in [
-        "sync",
-        "login",
-        "list",
-        "password",
-        "reset",
-        "config",
-        "status",
-        "doctor",
-        "manifest",
-        "verify",
-        "reconcile",
-        "import-existing",
-        "install",
-        "uninstall",
-        "service",
-        "help",
-    ] {
+    for subcommand in docker_visible_commands() {
         assert!(
             whitelist
                 .split(['|', ')', ' ', '\t'])
@@ -2692,4 +2675,75 @@ kei_db_exec 'DELETE FROM metadata'"#,
         );
     }
     assert!(!root.path().join("firstlastexampleinvalid.db").exists());
+}
+
+#[test]
+fn docker_publish_covers_real_build_inputs() {
+    let workflow = repo_file(".github/workflows/docker.yml");
+    for input in [
+        "docker/**",
+        ".dockerignore",
+        "build.rs",
+        ".github/workflows/docker.yml",
+    ] {
+        assert!(
+            workflow
+                .lines()
+                .any(|line| line.trim() == format!("- {input}")),
+            "Docker publication must include {input}"
+        );
+    }
+    let dockerfile = repo_file("Dockerfile");
+    assert!(dockerfile.contains("COPY Cargo.toml Cargo.lock build.rs ./"));
+    assert!(!dockerfile.contains("ARG CARGO_TARGET\n"));
+    assert!(!dockerfile.contains("ARG CARGO_LINKER_ENV\n"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn docker_entrypoint_routes_visible_commands_before_conflicting_executables() {
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path();
+    write_executable(&bin.join("kei"), "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+    for name in docker_visible_commands() {
+        write_executable(
+            &bin.join(&name),
+            "#!/bin/sh\necho wrong-executable\nexit 99\n",
+        );
+        let output = Command::new("sh")
+            .arg(repo_path("docker/entrypoint.sh"))
+            .args([name.as_str(), "--help"])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env_remove("PUID")
+            .env_remove("PGID")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{name}: {output:?}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{name}\n--help\n")
+        );
+    }
+}
+
+fn docker_visible_commands() -> Vec<String> {
+    let output = assert_cmd::cargo::cargo_bin_cmd!("kei")
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    let commands: Vec<String> = help
+        .split_once("Commands:\n")
+        .unwrap()
+        .1
+        .split_once("\nOptions:")
+        .unwrap()
+        .0
+        .lines()
+        .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+        .collect();
+    assert!(commands.iter().any(|name| name == "sync"));
+    assert!(commands.iter().any(|name| name == "migrate-state"));
+    commands
 }
