@@ -338,6 +338,34 @@ async fn asset_identity_diagnostics_use_only_bounded_redacted_labels() {
 }
 
 #[tokio::test]
+async fn sparse_share_lookup_rejects_foreign_source_scope() {
+    for kind in ["INT64", "NUMBER_INT64"] {
+        for scope in [
+            json!({"zoneName": "SharedSync-other"}),
+            json!({"zoneName": "PrimarySync", "ownerRecordName": "other"}),
+        ] {
+            let mut record = crate::test_helpers::sparse_shared_asset_record();
+            record["fields"]["isSparsePrivateRecord"]["type"] = json!(kind);
+            record["zoneID"] = scope.clone();
+            let album = make_album_with_session(
+                100,
+                Box::new(MockPhotosSession::new().ok(json!({"records": [record]}))),
+            );
+            let batch = album
+                .resolve_records(&[RecordLookupRequest::asset_only(ProviderRecordId::new(
+                    "private-sparse-child",
+                ))])
+                .await;
+            assert!(!batch.complete, "{kind}: {scope}");
+            assert!(
+                matches!(batch.results[0].1, RecordResolution::Unknown),
+                "{kind}: {scope}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn sparse_share_lookup_requests_evidence_but_never_follows_the_link() {
     #[derive(Debug, Clone)]
     struct SparseSession {

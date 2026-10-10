@@ -685,8 +685,10 @@ existing scope matcher; the older reference-zone JSON-equality classification
 alone does not establish rejection. No owner or record value is emitted.
 
 Unpaired asset deltas retain typed sparse-share evidence from
-`isSparsePrivateRecord` and the `linkedShare*` fields. Targeted record lookups
-request these fields too; ordinary media enumeration keeps its existing field
+`isSparsePrivateRecord` and the `linkedShare*` fields. The marker accepts exact
+`INT64` and `NUMBER_INT64` type spellings, or an absent type, with integer
+value `1`; this does not broaden deletion-field validation. Targeted record
+lookups request these fields too; ordinary media enumeration keeps its existing field
 projection. A structurally valid link remains unverified. Malformed links and
 valid links without a usable master remain unresolved. Link identifiers are
 opaque and their debug output is redacted. Lookup changes do not overwrite the
