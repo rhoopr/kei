@@ -125,13 +125,22 @@ export_run() {
         -v "$work/forbidden-repair:/usr/bin/chown:ro" \
         "$image" "$@"
 }
+assert_no_export_repair() {
+    if grep -Eq 'forbidden-volume-initialization|warning: chown' <<<"$1"; then
+        echo "support export attempted volume traversal or repair" >&2
+        exit 1
+    fi
+}
 export_out=$(export_run --config /config/config.toml support-export --output /output/bundle.json 2>&1)
 test -f "$export_output/bundle.json"
 test ! -e "$export_output/private-command-ran"
 test "$(stat -c %u:%g "$export_output/bundle.json")" = "$(id -u):$(id -g)"
 test "$(stat -c %a "$export_output/bundle.json")" = 600
 test "$(cat "$export_photos/private-photo.jpg")" = private-media
-! grep -q 'private-' "$export_output/bundle.json"
+if grep -q 'private-' "$export_output/bundle.json"; then
+    echo "support export leaked a private fixture value" >&2
+    exit 1
+fi
 python3 - "$export_output/bundle.json" <<'PYTHON'
 import json
 import sys
@@ -140,10 +149,10 @@ with open(sys.argv[1], encoding="utf-8") as source:
 assert bundle["schema_version"] == 1
 assert bundle["configuration"]["status"] == "available"
 PYTHON
-! grep -Eq 'forbidden-volume-initialization|warning: chown' <<<"$export_out"
+assert_no_export_repair "$export_out"
 explicit_out=$(export_run /usr/local/bin/kei --config /config/config.toml support-export --output /output/explicit.json 2>&1)
 test -f "$export_output/explicit.json"
-! grep -Eq 'forbidden-volume-initialization|warning: chown' <<<"$explicit_out"
+assert_no_export_repair "$explicit_out"
 for mode in missing-output help-flag help-command; do
     case "$mode" in
         missing-output) args=(support-export --output) ;;
@@ -151,7 +160,7 @@ for mode in missing-output help-flag help-command; do
         help-command) args=(help support-export) ;;
     esac
     export_help=$(export_run "${args[@]}" 2>&1 || true)
-    ! grep -Eq 'forbidden-volume-initialization|warning: chown' <<<"$export_help"
+    assert_no_export_repair "$export_help"
 done
 # This control proves the injected executable catches normal traversal.
 normal_out=$(export_run --config /config/config.toml status 2>&1 || true)
