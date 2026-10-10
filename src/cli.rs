@@ -373,6 +373,14 @@ pub struct DoctorArgs {
     pub live: bool,
 }
 
+/// Arguments for a privacy-safe, offline support export.
+#[derive(Parser, Debug, Clone)]
+pub struct SupportExportArgs {
+    /// Write one locally reviewable JSON file; existing files are never replaced
+    #[arg(long, default_value = "kei-support.json")]
+    pub output: std::path::PathBuf,
+}
+
 /// Manifest export format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ManifestFormat {
@@ -687,6 +695,12 @@ pub enum Command {
     #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Doctor")]
     Doctor(DoctorArgs),
 
+    /// Export privacy-safe saved diagnostics without login, network, scans or repairs
+    #[command(
+        after_help = "Review the JSON file locally before attaching it to a bug report. No automatic upload. Missing evidence is reported explicitly; no new sync is required.\n\nDocumentation: https://github.com/rhoopr/kei/blob/main/docs/support-export.md"
+    )]
+    SupportExport(SupportExportArgs),
+
     /// Export the local state catalog without contacting iCloud
     #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Manifest")]
     Manifest(ManifestArgs),
@@ -930,6 +944,7 @@ impl Command {
             | Self::Config { .. }
             | Self::Status(_)
             | Self::Doctor(_)
+            | Self::SupportExport(_)
             | Self::Manifest(_)
             | Self::Verify(_)
             | Self::Reconcile(_)

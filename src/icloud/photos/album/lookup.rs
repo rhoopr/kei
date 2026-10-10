@@ -239,6 +239,43 @@ fn lookup_zone_matches(actual: &Value, expected: &Value) -> bool {
     })
 }
 
+fn supplied_owner_shape(
+    master: Option<&Value>,
+    asset: Option<&Value>,
+    stage: &str,
+    expected: &Value,
+) -> (&'static str, &'static str) {
+    let scope = master
+        .into_iter()
+        .chain(asset)
+        .filter_map(|record| {
+            if stage == "master_reference_scope" {
+                record.pointer("/fields/masterRef/value/zoneID")
+            } else {
+                record.get("zoneID")
+            }
+        })
+        .find(|scope| !lookup_zone_matches(scope, expected));
+    match scope.and_then(|v| v.get("ownerRecordName")) {
+        None => ("absent", "absent"),
+        Some(Value::Null) => ("null", "null"),
+        Some(Value::String(s)) => (
+            if s.is_empty() {
+                "empty"
+            } else if s == "_defaultOwner" {
+                "private_default"
+            } else {
+                "other_string"
+            },
+            "string",
+        ),
+        Some(Value::Number(_)) => ("malformed", "number"),
+        Some(Value::Bool(_)) => ("malformed", "boolean"),
+        Some(Value::Array(_)) => ("malformed", "array"),
+        Some(Value::Object(_)) => ("malformed", "object"),
+    }
+}
+
 // Classify only a rejected scope. Acceptance remains owned by the matcher above.
 fn lookup_scope_rejection(actual: &Value, expected: &Value) -> &'static str {
     if !actual.is_object() {
@@ -542,8 +579,10 @@ impl PhotoAlbum {
                         }
                         RecordLookupTarget::Master => "master",
                     };
+                    let (supplied_owner, supplied_owner_type) =
+                        supplied_owner_shape(master, asset, stage, &self.zone_id);
                     *rejection_diagnostics
-                        .entry((target, stage, reason))
+                        .entry((target, stage, reason, supplied_owner, supplied_owner_type))
                         .or_insert(0usize) += 1;
                 }
                 if request.target == RecordLookupTarget::Asset
@@ -582,10 +621,12 @@ impl PhotoAlbum {
             Some(owner) if owner.as_str() == Some("_defaultOwner") => "private_default",
             Some(_) => "other",
         };
-        for ((target, stage, reason), rejected_requests) in rejection_diagnostics {
+        for ((target, stage, reason, supplied_owner, supplied_owner_type), rejected_requests) in
+            rejection_diagnostics
+        {
             tracing::info!(target: "kei::icloud::photos::album",
                 diagnostic = "exact_lookup_rejection_v1",
-                target, stage, reason, expected_owner, lookup_zone, rejected_requests,
+                target, stage, reason, expected_owner, lookup_zone, rejected_requests, supplied_owner, supplied_owner_type, owner_provenance = "lookup_request",
                 "Targeted identity lookup retained unresolved requests"
             );
         }

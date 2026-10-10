@@ -354,6 +354,16 @@ pub(in crate::download) async fn build_download_result(
         interrupted: shutdown_token.is_cancelled(),
         ..CheckpointEvidence::default()
     };
+    crate::support::observe(
+        "support_transfer_pass_v1",
+        serde_json::json!({
+            "phase": "first", "failed": streaming_result.failed.len(), "downloaded": downloaded,
+            "auth_errors": auth_errors + provider_auth_errors, "state_write_failures": state_write_failures,
+            "exif_failures": exif_failures, "url_expired": streaming_result.url_expired_abort,
+            "interrupted": shutdown_token.is_cancelled(), "elapsed_secs": started.elapsed().as_secs_f64(),
+            "concurrency": config.concurrent_downloads,
+        }),
+    );
     let failed_tasks = streaming_result.failed;
     let skip_breakdown: crate::download::SkipBreakdown = streaming_result.skip_summary.into();
 
@@ -607,6 +617,15 @@ pub(in crate::download) async fn build_download_result(
     let mut pass_result = run_download_pass(pass_config, retry_plan.tasks).await;
     pass_result.rate_limit_observations += retry_plan.rate_limit_observations;
 
+    crate::support::observe(
+        "support_transfer_pass_v1",
+        serde_json::json!({
+            "phase": "retry", "failed": pass_result.failed.len(), "downloaded": pass_result.downloaded,
+            "auth_errors": pass_result.auth_errors, "state_write_failures": pass_result.state_write_failures,
+            "exif_failures": pass_result.exif_failures, "concurrency": cleanup_concurrency,
+            "interrupted": shutdown_token.is_cancelled(),
+        }),
+    );
     let phase2_downloaded = pass_result.downloaded;
     // Only completed exact tasks retire the original failed work.
     let downloaded_keys: FxHashSet<_> = pass_result

@@ -70,6 +70,12 @@ pub(in crate::download) fn prepare_metadata_with_expected_fingerprint(
     crate::download::file::recover_file_replacement(path)?;
     #[cfg(not(feature = "xmp"))]
     {
+        crate::support::observe(
+            "support_metadata_v1",
+            serde_json::json!({
+                "operation": "prepare", "backend": "native_exif", "planned_fractional": write.datetime.as_ref().is_some_and(|v| v.contains('.')),
+            }),
+        );
         prepare_metadata_native(path, write, temp_suffix, expected_fingerprint)
     }
     #[cfg(feature = "xmp")]
@@ -104,8 +110,16 @@ pub(in crate::download) fn prepare_metadata_with_expected_fingerprint(
     };
     #[cfg(feature = "xmp")]
     if is_heif {
+        crate::support::observe(
+            "support_metadata_v1",
+            serde_json::json!({"operation": "prepare", "backend": "heif", "planned_fractional": write.datetime.as_ref().is_some_and(|v| v.contains('.'))}),
+        );
         prepare_metadata_heif(path, write, temp_suffix, expected_fingerprint)
     } else {
+        crate::support::observe(
+            "support_metadata_v1",
+            serde_json::json!({"operation": "prepare", "backend": "xmp", "planned_fractional": write.datetime.as_ref().is_some_and(|v| v.contains('.'))}),
+        );
         prepare_metadata_xmp_toolkit(path, write, temp_suffix, expected_fingerprint)
     }
 }

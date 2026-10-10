@@ -34,7 +34,8 @@ pub(super) async fn prepare_embed_metadata(
 ) -> EmbedPrepareResult {
     let embed_path = path.to_path_buf();
     let metadata_temp_suffix = temp_suffix.to_string();
-    match tokio::task::spawn_blocking(move || {
+    let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+    match tokio::task::spawn_blocking(move || tracing::dispatcher::with_default(&dispatcher, || {
         let repair_requested = matches!(
             capture_timestamp_repair,
             CaptureTimestampRepair::ReplaceWithCaptureLocal
@@ -55,6 +56,7 @@ pub(super) async fn prepare_embed_metadata(
         let probe = match crate::download::metadata::probe_exif(&embed_path) {
             Ok(p) => p,
             Err(e) => {
+                crate::support::metadata_error(&embed_path, "metadata_probe", &e, Some(false));
                 tracing::warn!(
                     target: "kei::download::metadata_rewrite",
                     path = %embed_path.display(), error = %e, "Failed to read EXIF");
@@ -98,6 +100,11 @@ pub(super) async fn prepare_embed_metadata(
                 }
             }
         }
+        crate::support::observe_metadata(&embed_path, "support_metadata_v1", serde_json::json!({
+            "operation":"prepare", "source_fractional":created_local.timestamp_subsec_nanos()!=0,
+            "planned_fractional":write.datetime.as_ref().is_some_and(|v|v.contains('.')),
+            "timestamp_planned":write.datetime.is_some(),
+        }));
         if write.is_empty() {
             return EmbedPrepareResult::NoWrite;
         }
@@ -108,6 +115,7 @@ pub(super) async fn prepare_embed_metadata(
             expected_fingerprint,
         ) {
             Err(e) => {
+                crate::support::metadata_error(&embed_path, "metadata_prepare", &e, Some(false));
                 let disposition = crate::download::file::classify_conditional_publish_error(&e);
                 let result = if disposition.target_changed {
                     EmbedPrepareResult::InputChanged
@@ -125,7 +133,7 @@ pub(super) async fn prepare_embed_metadata(
             }
             Ok(prepared) => EmbedPrepareResult::Prepared(prepared),
         }
-    })
+    }))
     .await
     {
         Ok(result) => result,
@@ -152,6 +160,7 @@ pub(super) async fn publish_embed_metadata(
     {
         Ok(Ok(output_fingerprint)) => EmbedWriteResult::Applied(Some(output_fingerprint)),
         Ok(Err(error)) => {
+            crate::support::metadata_error(path, "metadata_publish", &error, None);
             let disposition = crate::download::file::classify_conditional_publish_error(&error);
             let result = if disposition.target_changed {
                 EmbedWriteResult::InputChanged

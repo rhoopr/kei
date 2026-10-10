@@ -384,15 +384,15 @@ pub(super) fn update_status_to_downloaded(
     mark_capture_repair: bool,
     downloaded_at: i64,
 ) -> Result<usize, StateError> {
-    let checksum: Option<String> = conn
+    let prior: Option<(String, String, Option<i64>)> = conn
         .query_row(
-            "SELECT checksum FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
+            "SELECT checksum,status,downloaded_at FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
             rusqlite::params![library, id, version_size],
-            |r| r.get(0),
-        )
-        .optional()?;
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+    let checksum = prior.as_ref().map(|p| p.0.as_str());
     if let Some(checksum) = checksum {
-        super::primary_layout::guard_slot(conn, library, id, version_size, &checksum, local_path)?;
+        super::primary_layout::guard_slot(conn, library, id, version_size, checksum, local_path)?;
         super::primary_layout::guard_downloaded_checksum(conn, local_path, local_checksum)?;
     }
     let mut stmt = conn
@@ -423,6 +423,16 @@ pub(super) fn update_status_to_downloaded(
             version_size
         ])
         .map_err(|e| StateError::query("mark_downloaded", e))?;
+    crate::support::observe_scoped(
+        library,
+        Some((id, version_size)),
+        "support_publication_v1",
+        serde_json::json!({
+            "operation": "publication", "transaction_committed": false, "source_status": prior.as_ref().map(|p| p.1.as_str()),
+            "destination_status": "downloaded", "publication_time_retained": prior.as_ref().and_then(|p| p.2) == Some(downloaded_at),
+            "metadata_requested": mark_capture_repair, "updated": updated,
+        }),
+    );
     record_metadata_path(
         conn,
         library,

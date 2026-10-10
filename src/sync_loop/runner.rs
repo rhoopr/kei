@@ -683,6 +683,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
             let cycle_started_at = std::time::Instant::now();
             let cycle_wall_started_at = chrono::Utc::now();
+            crate::support::begin(crate::support::runtime_configuration(&config));
             let mut cycle_result = run_cycle(
                 &cycle_library_states,
                 &config,

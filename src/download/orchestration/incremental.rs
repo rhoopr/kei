@@ -827,6 +827,14 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             && selected.checkpoint.enumeration_errors == 0
             && selected.checkpoint.state_write_failures == 0
             && controls.run_mode.downloads_files();
+        crate::support::observe(
+            "support_checkpoint_v1",
+            serde_json::json!({
+                "bridge": true, "successor_provenance": "provider", "token_present": delta_summary.sync_token.is_some(),
+                "identity_incomplete": selected.checkpoint.identity_incomplete,
+                "reason": if selection_complete { "advanced" } else { "veto" },
+            }),
+        );
         if selection_complete && let Some(successor) = delta_summary.sync_token {
             super::recent::record(
                 passes,

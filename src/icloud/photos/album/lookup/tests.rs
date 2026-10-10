@@ -728,3 +728,36 @@ async fn targeted_lookup_retains_per_response_url_observation_across_batches() {
         "earlier URLs must not inherit the later batch completion time"
     );
 }
+
+#[test]
+fn support_owner_morphology_preserves_guard_and_never_exports_owner_value() {
+    for (owner, category, value_type) in [
+        (json!("_defaultOwner"), "private_default", "string"),
+        (json!("PRIVATE_SCOPE_CANARY"), "other_string", "string"),
+        (json!(null), "null", "null"),
+        (json!(5), "malformed", "number"),
+        (json!(false), "malformed", "boolean"),
+        (json!([]), "malformed", "array"),
+        (json!({"private":"secret"}), "malformed", "object"),
+    ] {
+        let mut scope = json!({"zoneName":"PrimarySync","ownerRecordName":owner});
+        let mut record = json!({"fields":{"masterRef":{"value":{"zoneID":scope}}}});
+        let bare = json!({"zoneName":"PrimarySync"});
+        assert!(!super::lookup_zone_matches(&scope, &bare));
+        assert_eq!(
+            super::supplied_owner_shape(None, Some(&record), "master_reference_scope", &bare),
+            (category, value_type)
+        );
+        let qualified = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        assert_eq!(
+            super::lookup_zone_matches(&scope, &qualified),
+            category == "private_default"
+        );
+        scope.as_object_mut().unwrap().remove("ownerRecordName");
+        record["fields"]["masterRef"]["value"]["zoneID"] = scope;
+        assert_eq!(
+            super::supplied_owner_shape(None, Some(&record), "master_reference_scope", &qualified),
+            ("absent", "absent")
+        );
+    }
+}

@@ -229,3 +229,45 @@ async fn embed_path_replaces_orphaned_offset_before_writing_timestamp() {
     assert!(after.denotes_capture_time(&created_local));
     assert_eq!(after.offset_time_original.as_deref(), Some("+11:00"));
 }
+
+#[tokio::test]
+async fn production_metadata_plan_and_io_error_are_safe_support_evidence() {
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+    let dir = tempfile::tempdir().unwrap();
+    let history = dir.path().join("retained.support.json");
+    let (layer, guard) =
+        crate::support::history::start(history.clone(), serde_json::json!({})).unwrap();
+    let path = dir.path().join("PRIVATE_MEDIA.jpg");
+    let created = chrono::DateTime::parse_from_rfc3339("2026-10-10T10:20:30.123+00:00").unwrap();
+    let result = super::prepare_embed_metadata(
+        &path,
+        None,
+        Arc::new(MetadataPayload::default()),
+        created,
+        MetadataFlags::DATETIME,
+        CaptureTimestampRepair::Preserve,
+        ".temp",
+    )
+    .with_subscriber(tracing_subscriber::registry().with(layer))
+    .await;
+    assert!(matches!(
+        result,
+        super::EmbedPrepareResult::Failed | super::EmbedPrepareResult::InputChanged
+    ));
+    guard.finish().await;
+    let evidence = crate::support::history::test_retained_events(&history);
+    let plan = evidence
+        .iter()
+        .find(|v| v["kind"] == "support_metadata_v1" && v["fields"]["source_fractional"] == true)
+        .unwrap();
+    assert_eq!(plan["fields"]["planned_fractional"], false);
+    assert!(evidence.iter().any(|v| v["kind"] == "support_task_error_v1"
+        && v["fields"]["stage"] == "metadata_prepare"
+        && v["fields"]["errno"].is_number()));
+    assert!(
+        !serde_json::to_string(&evidence)
+            .unwrap()
+            .contains("PRIVATE")
+    );
+}

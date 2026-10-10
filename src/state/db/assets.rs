@@ -285,6 +285,9 @@ impl SqliteStateDb {
                 )
                 .map_err(|e| StateError::query("mark_failed", e))?;
 
+            crate::support::observe_scoped(&library, Some((&id, &version_size)), "support_publication_v1", serde_json::json!({
+                "operation": "download", "destination_status": "failed", "updated": rows,
+            }));
             if rows == 0 {
                 tracing::error!(
                     id = %id,
@@ -439,6 +442,9 @@ impl SqliteStateDb {
             #[allow(clippy::cast_sign_loss, reason = "SQL COUNT(*) is always non-negative")]
             let total_pending = total_pending as u64;
 
+            crate::support::observe("support_publication_v1", serde_json::json!({
+                "operation": "retry", "source_status": "failed", "destination_status": "pending", "updated": failed,
+            }));
             Ok((failed, pending, total_pending))
         })
         .await

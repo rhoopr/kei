@@ -48,6 +48,7 @@ mod service;
 mod setup;
 mod shutdown;
 mod state;
+mod support;
 mod sync_cycle;
 mod sync_loop;
 mod systemd;
@@ -714,13 +715,39 @@ pub fn main_inner() -> ExitCode {
 
 async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Result<()> {
     let cli = cli::parse_cli_with_sources(std::env::args_os()).map_err(|e| anyhow::anyhow!(e))?;
+    // Export has its own input path: no runtime config construction, logging,
+    // credentials, service hooks, or network-capable command dispatch.
+    if let cli::Command::SupportExport(args) = &cli.command {
+        return support::export(args.clone(), &cli.config).await;
+    }
     let config = load_startup_config(&cli)?;
     let output = resolve_startup_output(&cli, config.toml.as_ref());
 
     // Keep the guard until dispatch returns so fast commands drain their logs.
     // BarSuspendingStderr pauses progress rendering around each log write.
     let (make_writer, _writer_guard, redact_password) = build_redacting_writer(BarSuspendingStderr);
-    initialize_logging(&output, make_writer);
+    let globals = config::GlobalArgs::from_bootstrap_env();
+    let recording = matches!(
+        &cli.command,
+        cli::Command::Sync { .. }
+            | cli::Command::ImportExisting(_)
+            | cli::Command::Service {
+                action: cli::ServiceAction::Run(_)
+            }
+    );
+    let (recorder, support_guard) = if recording {
+        match support::initialize(&globals, config.toml.as_ref(), config.explicitly_set) {
+            Some((recorder, guard)) => (Some(recorder), Some(guard)),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+    initialize_logging(&output, make_writer, recorder);
+    support::observe(
+        "support_startup_v1",
+        serde_json::json!({"phase": "startup", "outcome": "starting"}),
+    );
     if config.used_docker_fallback {
         tracing::debug!(
             path = %config.path.display(),
@@ -728,11 +755,10 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
         );
     }
 
-    let globals = config::GlobalArgs::from_bootstrap_env();
     let mut command = cli.command;
     // Restore the password scrubbed before runtime creation for every command.
     command.inject_env_password(env_password);
-    dispatch_command(
+    let result = dispatch_command(
         command,
         &globals,
         config,
@@ -740,7 +766,27 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
         redact_password,
         input_mode,
     )
-    .await
+    .await;
+    let mut end = match &result {
+        Ok(()) => serde_json::json!({"phase": "shutdown", "outcome": "success"}),
+        Err(error) => support::error_fields("startup", error),
+    };
+    if let Some(map) = end.as_object_mut() {
+        map.insert("phase".into(), serde_json::json!("shutdown"));
+        map.insert(
+            "outcome".into(),
+            serde_json::json!(if result.is_ok() {
+                "success"
+            } else {
+                "partial_failure"
+            }),
+        );
+    }
+    support::observe("support_startup_v1", end);
+    if let Some(guard) = support_guard {
+        guard.finish().await;
+    }
+    result
 }
 
 /// Config discovery facts and the load result, including recoverable doctor errors.
@@ -889,21 +935,33 @@ fn resolve_startup_output(cli: &cli::Cli, toml_config: Option<&TomlConfig>) -> S
 fn initialize_logging(
     output: &StartupOutput,
     make_writer: impl for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+    recorder: Option<support::history::Recorder>,
 ) {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
     let env_filter = personality::tracing::env_filter(&output.default_filter);
     if output.personality_mode.is_friendly() {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_writer(make_writer)
-            .with_target(false)
-            .with_level(false)
-            .without_time()
-            .event_format(personality::tracing::FriendlyFormat)
+        tracing_subscriber::registry()
+            .with(recorder)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(make_writer)
+                    .with_target(false)
+                    .with_level(false)
+                    .without_time()
+                    .event_format(personality::tracing::FriendlyFormat)
+                    .with_filter(env_filter),
+            )
             .init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_writer(make_writer)
+        tracing_subscriber::registry()
+            .with(recorder)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(make_writer)
+                    .with_filter(env_filter),
+            )
             .init();
     }
 }
@@ -931,6 +989,9 @@ async fn dispatch_command(
     let (is_one_shot, pw, sync) = match command {
         Command::Status(args) => {
             return run_status(args, globals, toml_config.as_ref()).await;
+        }
+        Command::SupportExport(_) => {
+            anyhow::bail!("support-export must use the offline entry point");
         }
         Command::Doctor(args) => {
             return run_doctor(

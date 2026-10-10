@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument::WithSubscriber;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
 
 #[derive(Clone)]
 struct LogWriter(Arc<Mutex<Vec<u8>>>);
@@ -29,13 +31,75 @@ impl std::io::Write for LogWriter {
 async fn capture<T>(future: impl std::future::Future<Output = T>) -> (T, String) {
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let sink = bytes.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_target(false)
-        .with_writer(move || LogWriter(sink.clone()))
-        .finish();
+    let (recorder, evidence) = crate::support::history::test_layer();
+    let subscriber = tracing_subscriber::registry().with(recorder).with(
+        tracing_subscriber::fmt::layer()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(move || LogWriter(sink.clone()))
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+    );
     let result = future.with_subscriber(subscriber).await;
+    for observation in evidence() {
+        let fields = &observation["fields"];
+        let text = observation.to_string();
+        for private in [
+            "PRIVATE_",
+            "https://",
+            "synthetic-fresh",
+            "synthetic-healthy",
+        ] {
+            assert!(
+                !text.contains(private),
+                "support tracing projection leaked fixture data"
+            );
+        }
+        if observation["kind"] == "exact_lookup_rejection_v1" {
+            for key in [
+                "target",
+                "stage",
+                "reason",
+                "expected_owner",
+                "lookup_zone",
+                "rejected_requests",
+                "supplied_owner",
+                "supplied_owner_type",
+                "owner_provenance",
+            ] {
+                assert!(
+                    fields.get(key).is_some(),
+                    "production lookup diagnostic lost {key}: {observation}"
+                );
+            }
+        }
+        if observation["kind"] == "legacy_inventory_failure_v2" {
+            for key in [
+                "stage",
+                "reason",
+                "phase",
+                "subreason",
+                "eof_observed",
+                "family_context",
+                "child_soft_deleted",
+                "pages",
+                "records",
+                "transferred_bytes",
+                "retained_bytes",
+                "scope_mismatch_component",
+                "elapsed_secs",
+                "page_budget",
+                "record_budget",
+                "page_byte_budget",
+                "retained_byte_budget",
+            ] {
+                assert!(
+                    fields.get(key).is_some(),
+                    "production inventory diagnostic lost {key}: {observation}"
+                );
+            }
+        }
+    }
     let log = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
     (result, log)
 }

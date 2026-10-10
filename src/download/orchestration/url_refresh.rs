@@ -374,9 +374,10 @@ async fn refresh_failed_download_urls(
         );
     }
     tracing::info!(
-        requested = requested_count,
-        refreshed = retry.tasks.len(),
-        missing,
+        diagnostic = "exact_refresh_outcomes_v1",
+        requested_task_keys = requested_count,
+        refreshed_task_keys = retry.tasks.len(),
+        remaining_task_keys = missing,
         phase_elapsed_secs = started.elapsed().as_secs_f64(),
         oldest_refreshed_url_observed_age_secs = ?retry.url_obtained_at.values().map(|at| at.elapsed()).max().map(|age| age.as_secs_f64()),
         "Targeted download URL refresh completed"

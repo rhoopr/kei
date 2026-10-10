@@ -63,6 +63,7 @@ pub(in crate::download) async fn write_download_metadata(
 ) -> MetadataWriteOutcome {
     // CONTRACT: METADATA_WRITES_REQUIRE_OPT_IN
     let mut outcome = MetadataWriteOutcome::default();
+    let mut embed_applied = false;
 
     if request.flags.any_embed()
         && let Some(embed_path) = request.embed_path
@@ -83,6 +84,7 @@ pub(in crate::download) async fn write_download_metadata(
         .await
         {
             EmbedWriteResult::Applied(output_fingerprint) => {
+                embed_applied = true;
                 outcome.embed_output_fingerprint = output_fingerprint;
             }
             EmbedWriteResult::NoWrite => outcome.embed_no_write = true,
@@ -108,6 +110,17 @@ pub(in crate::download) async fn write_download_metadata(
         .await;
     }
 
+    if request.flags.any_embed() && request.embed_path.is_some() {
+        crate::support::observe_metadata(
+            request.embed_path.unwrap_or(request.final_path),
+            "support_metadata_v1",
+            serde_json::json!({
+                "operation": "embed", "source_fractional": request.created_local.timestamp_subsec_nanos() != 0,
+                "planned_fractional": serde_json::Value::Null,
+                "applied": embed_applied,
+            }),
+        );
+    }
     outcome
 }
 

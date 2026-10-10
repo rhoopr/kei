@@ -240,10 +240,59 @@ fn sync_unwritable_download_directory_errors_before_auth() {
         ));
 
     std::fs::set_permissions(&download_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(
-        std::fs::read_dir(&data_dir).unwrap().next().is_none(),
-        "unwritable download dir must fail before auth/session state is written"
+    // Diagnostic evidence intentionally precedes authentication. Accept only
+    // the exact support history and its lock; session/credential/DB files remain
+    // forbidden when validation fails, rather than ignoring arbitrary new files.
+    let namespace = super::support::sanitize_username("test@example.com");
+    let history_path = data_dir.join(format!("{namespace}.support.json"));
+    let mut actual = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            assert_eq!(entry.metadata().unwrap().permissions().mode() & 0o077, 0);
+            entry.file_name().to_string_lossy().into_owned()
+        })
+        .collect::<Vec<_>>();
+    actual.sort();
+    let mut allowed = vec![
+        format!("{namespace}.support.json"),
+        format!("{namespace}.support.support-lock"),
+    ];
+    allowed.sort();
+    assert_eq!(
+        actual, allowed,
+        "validation failure must not create auth/session/DB state"
     );
+    assert_eq!(
+        std::fs::metadata(history_path.with_extension("support-lock"))
+            .unwrap()
+            .len(),
+        0
+    );
+    let evidence = std::fs::read_to_string(history_path).unwrap();
+    let history: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+    assert_eq!(history["schema_version"], 1);
+    assert_eq!(history["cycles"].as_array().unwrap().len(), 1);
+    assert_eq!(history["cycles"][0]["outcome"], "partial_failure");
+    assert!(history["cycles"][0]["completed_at"].is_string());
+    assert!(
+        history["cycles"][0]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["kind"] == "support_startup_v1"
+                && d["fields"]["phase"] == "shutdown"
+                && d["fields"]["outcome"] == "partial_failure")
+    );
+    for private in [
+        "test@example.com",
+        "not-used-before-auth",
+        "Cannot write to download directory",
+        download_dir.to_str().unwrap(),
+    ] {
+        assert!(!evidence.contains(private));
+    }
 }
 
 #[test]

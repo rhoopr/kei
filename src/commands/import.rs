@@ -613,6 +613,10 @@ impl ImportPreflight {
                 Some(path) => path,
                 None => {
                     if !candidate.matches.is_empty() {
+                        crate::support::observe(
+                            "support_import_v1",
+                            serde_json::json!({"phase": "adoption", "reason": "ambiguous_collision", "dry_run": options.dry_run}),
+                        );
                         tracing::warn!(version = ?candidate.record.version_size,
                             "Import refused an ambiguous collision-family file");
                     }
@@ -621,6 +625,18 @@ impl ImportPreflight {
                     continue;
                 }
             };
+            crate::support::observe_scoped(
+                library_label,
+                Some((&candidate.child, candidate.record.version_size.as_str())),
+                "support_import_v1",
+                serde_json::json!({
+                    "phase":"adoption", "reason":"candidate", "dry_run":options.dry_run,
+                    "legacy_identity":candidate.record.id.as_ref()==candidate.master.as_ref() && candidate.child!=candidate.master,
+                    "master_child_distinct":candidate.child!=candidate.master,
+                    "selected_identity":if candidate.record.id.as_ref()==candidate.child.as_ref() {"child"} else {"legacy_master"},
+                    "path_shape_equal":path==candidate.expected_path,
+                }),
+            );
             let Ok(metadata) = tokio::fs::metadata(&path).await else {
                 stats.unmatched += 1;
                 continue;
@@ -637,6 +653,16 @@ impl ImportPreflight {
                     Ok(StrictImportDecision::Accepted) => {}
                     result => {
                         tracing::warn!(?result, "Strict import refused file");
+                        crate::support::observe(
+                            "support_import_v1",
+                            serde_json::json!({"phase": "adoption", "reason": "strict_refusal", "dry_run": options.dry_run}),
+                        );
+                        if let Err(error) = &result {
+                            crate::support::observe(
+                                "support_task_error_v1",
+                                crate::support::error_fields("adoption", error),
+                            );
+                        }
                         record_strict_refusal(&mut stats, &heartbeat_state);
                         continue;
                     }
@@ -717,6 +743,18 @@ impl ImportPreflight {
 /// `photo_stream` -- after the stream is drained, we check it and bail
 /// loudly if any fetcher task panicked, since a panicked fetcher closes
 /// the stream early and would otherwise read as a clean enumeration.
+fn record_import_summary(stats: &ImportStats, dry_run: bool) {
+    crate::support::observe(
+        "support_import_v1",
+        serde_json::json!({
+            "phase": "complete", "total": stats.total, "matched": stats.matched,
+            "unmatched": stats.unmatched, "filtered": stats.filtered, "strict_refused": stats.strict_refused,
+            "hash_errors": stats.hash_errors, "skipped_already_imported": stats.skipped_already_imported,
+            "dry_run": dry_run,
+        }),
+    );
+}
+
 #[cfg(test)]
 pub(crate) async fn import_assets<S>(
     stream: S,
@@ -743,6 +781,7 @@ where
     )
     .await?;
     stats += preflight.adopt(db, options).await?;
+    record_import_summary(&stats, options.dry_run);
     Ok(stats)
 }
 
@@ -920,6 +959,20 @@ where
                 dir_cache,
             )
             .await;
+            crate::support::observe_scoped(
+                library_label,
+                Some((asset.state_id(), expected_path.version_size.as_str())),
+                "support_import_v1",
+                serde_json::json!({
+                    "phase":"scan", "reason":if matches.is_empty() {"no_match"} else {"candidate"},
+                    "legacy_identity":asset.state_id()==asset.id() && asset.asset_record_name()!=asset.id(),
+                    "master_child_distinct":asset.asset_record_name()!=asset.id(),
+                    "selected_identity":if asset.state_id()==asset.asset_record_name() {"child"} else {"legacy_master"},
+                    "scan_index":stats.total,
+                    "candidate_path_shape_equal":matches.iter().any(|(path,_)|path==&expected_path.path),
+                    "candidate_paths":matches.len(), "dry_run":options.dry_run,
+                }),
+            );
             let record = state::AssetRecord::new_pending(
                 Arc::from(library_label),
                 asset.state_id().to_string(),
@@ -1026,6 +1079,13 @@ pub(crate) async fn run_import_existing(
     let directory = Arc::clone(&path_config.directory);
     let strict_import = resolve_import_strict(&args, toml);
     let strict_verifier = strict_import.then(HttpStrictImportVerifier::new);
+    crate::support::observe(
+        "support_import_v1",
+        serde_json::json!({
+            "phase": "initialization", "dry_run": args.dry_run, "strict": strict_import,
+            "recent_limit_present": args.recent.is_some(),
+        }),
+    );
 
     let recent_count: Option<u32> = match args.recent {
         None => None,
@@ -1210,6 +1270,7 @@ pub(crate) async fn run_import_existing(
         )
         .await?;
 
+    record_import_summary(&totals, args.dry_run);
     println!();
     if args.dry_run {
         println!("Import complete (DRY RUN - no changes written to state DB):");
@@ -2406,6 +2467,10 @@ mod wiremock_tests {
 
     #[tokio::test]
     async fn import_ambiguous_legacy_family_uses_child_and_preserves_master() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+        let (layer, drain) = crate::support::history::test_layer();
+        let subscriber = tracing_subscriber::registry().with(layer);
         let server = crate::start_wiremock_or_skip!();
         let tmp = TempDir::new().unwrap();
         let mut asset = WiremockAsset::new("master-913", "legacy.JPG", "public.jpeg").orig(
@@ -2442,38 +2507,153 @@ mod wiremock_tests {
                 .await
                 .unwrap();
         }
-        for cycle in 0..2 {
-            server.reset().await;
-            let stats = run_import(
-                &server,
-                std::slice::from_ref(&asset),
-                db.as_ref(),
-                &config,
-                false,
-            )
-            .await;
-            assert_eq!(stats.matched, 1);
-            assert_eq!(stats.skipped_already_imported, cycle);
-            assert!(
-                db.get_legacy_master_state_owners()
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            let rows = all_downloaded(db.as_ref()).await;
-            assert_eq!(rows.len(), 2);
-            let master = rows
-                .iter()
-                .find(|row| row.id.as_ref() == "master-913")
-                .unwrap();
-            assert_eq!(master.local_checksum.as_deref(), Some("retained-checksum"));
-            assert_eq!(master.local_path.as_deref(), Some(master_path.as_path()));
-            let child = rows
-                .iter()
-                .find(|row| row.id.as_ref() == "child-913")
-                .unwrap();
-            assert_eq!(child.local_path.as_deref(), Some(child_path.as_path()));
+        async {
+            for cycle in 0..2 {
+                server.reset().await;
+                let stats = run_import(
+                    &server,
+                    std::slice::from_ref(&asset),
+                    db.as_ref(),
+                    &config,
+                    false,
+                )
+                .await;
+                assert_eq!(stats.matched, 1);
+                assert_eq!(stats.skipped_already_imported, cycle);
+                assert!(
+                    db.get_legacy_master_state_owners()
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                let rows = all_downloaded(db.as_ref()).await;
+                assert_eq!(rows.len(), 2);
+                let master = rows
+                    .iter()
+                    .find(|row| row.id.as_ref() == "master-913")
+                    .unwrap();
+                assert_eq!(master.local_checksum.as_deref(), Some("retained-checksum"));
+                assert_eq!(master.local_path.as_deref(), Some(master_path.as_path()));
+                let child = rows
+                    .iter()
+                    .find(|row| row.id.as_ref() == "child-913")
+                    .unwrap();
+                assert_eq!(child.local_path.as_deref(), Some(child_path.as_path()));
+            }
         }
+        .with_subscriber(subscriber)
+        .await;
+        let evidence = drain();
+        let expected_shape = expected_paths_for(
+            &photo.clone().with_state_record_name(Arc::from("child-913")),
+            &config,
+        )
+        .iter()
+        .any(|expected| expected.path == child_path);
+        assert!(
+            evidence.iter().any(|v| v["kind"] == "support_import_v1"
+                && v["fields"]["phase"] == "adoption"
+                && v["fields"]["master_child_distinct"] == true
+                && v["fields"]["selected_identity"] == "child"
+                && v["fields"]["path_shape_equal"] == expected_shape),
+            "{evidence:?}"
+        );
+        assert!(
+            !serde_json::to_string(&evidence)
+                .unwrap()
+                .contains("master-913")
+        );
+    }
+
+    #[tokio::test]
+    async fn support_import_retains_late_refusal_and_summary_after_many_candidates() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+        #[derive(Debug)]
+        struct LateRefusal(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl StrictImportVerifier for LateRefusal {
+            async fn verify(
+                &self,
+                _path: &StdPath,
+                _url: &str,
+                _size: u64,
+            ) -> anyhow::Result<StrictImportDecision> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 148 {
+                    Err(std::io::Error::from_raw_os_error(95).into())
+                } else {
+                    Ok(StrictImportDecision::Accepted)
+                }
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = base_config(tmp.path());
+        config.folder_structure = "none".into();
+        let db = open_db(&tmp).await;
+        let mut assets = Vec::new();
+        for n in 0..149 {
+            let asset = WiremockAsset::new(
+                &format!("PRIVATE-master-{n}"),
+                &format!("PRIVATE-{n}.JPG"),
+                "public.jpeg",
+            )
+            .orig(32, "PRIVATE-checksum", "public.jpeg")
+            .to_photo_asset();
+            stage_expected(&asset, &config);
+            assets.push(Ok(asset));
+        }
+        let path = tmp.path().join("support.json");
+        let (layer, guard) = crate::support::history::start(path.clone(), json!({})).unwrap();
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let verifier = LateRefusal(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(tx);
+        let stats = import_assets(
+            futures_util::stream::iter(assets),
+            rx,
+            db.as_ref(),
+            &config,
+            "PRIVATE-library",
+            &mut DirCache::new(),
+            ImportRunOptions {
+                strict_verifier: Some(&verifier),
+                ..Default::default()
+            },
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+        assert_eq!(stats.total, 149);
+        assert_eq!(stats.matched, 148);
+        assert_eq!(stats.strict_refused, 1);
+        guard.finish().await;
+        let evidence = crate::support::history::test_retained_events(&path);
+        assert!(
+            evidence.iter().any(|v| v["kind"] == "support_import_v1"
+                && v["fields"]["phase"] == "complete"
+                && v["fields"]["total"] == 149
+                && v["fields"]["strict_refused"] == 1),
+            "{evidence:?}"
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|v| v["fields"]["reason"] == "strict_refusal")
+        );
+        assert!(evidence.iter().any(|v| v["fields"]["errno"] == 95));
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let c = &saved["cycles"][0];
+        assert!(c["observations_omitted"].as_u64().unwrap() > 0);
+        assert_eq!(
+            c["observations_total"].as_u64().unwrap(),
+            c["observations_shown"].as_u64().unwrap() + c["observations_omitted"].as_u64().unwrap()
+        );
+        assert!(c["diagnostics"].as_array().unwrap().len() <= 128);
+        assert!(
+            !serde_json::to_string(&evidence)
+                .unwrap()
+                .contains("PRIVATE")
+        );
     }
 
     #[tokio::test]
