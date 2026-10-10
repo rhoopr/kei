@@ -713,6 +713,11 @@ This lets more than 100 deleted sources complete over bounded lookup batches
 while unrelated zone records change, without relaxing checkpoint or state-write
 guards. Existing schema-26 outcome labels remain readable.
 
+Sparse observation and retry writes acquire an immediate SQLite transaction
+before reading generation or stale-attempt evidence. Independent WAL writers
+therefore serialize before those reads, preserving generation fences without
+a deferred snapshot upgrade.
+
 Hydration, explicitly soft-deleted source `CPLAsset` deltas, and exact-source
 hard-deletion tombstones supply generation-fenced receipts, not permission to
 advance a checkpoint. Incremental results carry these receipts in

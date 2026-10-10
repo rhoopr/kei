@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::SqliteStateDb;
 use crate::state::error::StateError;
@@ -264,7 +264,9 @@ impl SparseIdentityStore for SqliteStateDb {
             if source.as_str().trim().is_empty() {
                 return Err(invariant("empty sparse source identity"));
             }
-            let tx = conn.transaction()?;
+            // Acquire the writer slot before reading generation evidence so
+            // another WAL writer cannot invalidate a deferred read snapshot.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let generation = next_generation(&tx)?;
             tx.execute("INSERT INTO unresolved_sparse_identities (library, source_record_name, original_evidence, observed_evidence, generation, first_seen_at) VALUES (?1,?2,?3,?3,?5,?4) ON CONFLICT(library,source_record_name) DO UPDATE SET observed_evidence=excluded.observed_evidence, generation=excluded.generation, attempts=0, next_retry_at=NULL, last_outcome=NULL WHERE observed_evidence <> excluded.observed_evidence", params![library, source.as_str(), evidence.as_str(), now.timestamp(), generation])?;
             tx.execute("INSERT INTO metadata (key,value) VALUES (?1,'1') ON CONFLICT(key) DO UPDATE SET value='1'", [crate::state::unresolved_identity_key(&library)])?;
@@ -286,7 +288,9 @@ impl SparseIdentityStore for SqliteStateDb {
     ) -> Result<SparseIdentity, StateError> {
         let identity = identity.clone();
         self.with_conn_mut("record_sparse_attempt", move |conn| {
-            let tx = conn.transaction()?;
+            // Acquire the writer slot before reading generation evidence so
+            // another WAL writer cannot invalidate a deferred read snapshot.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let attempts: Option<u32> = tx.query_row("SELECT attempts FROM unresolved_sparse_identities WHERE library=?1 AND source_record_name=?2 AND generation=?3", params![identity.library, identity.source.as_str(), identity.generation.0], |r| r.get(0)).optional()?;
             let attempts = attempts.ok_or_else(|| invariant("stale sparse retry result"))?;
             let (lookup, label, next) = match outcome {
@@ -378,6 +382,77 @@ mod tests {
         ] {
             assert!(SparseDeletionCheckpoint::from_outcome(Some(invalid)).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn sparse_concurrent_connections_preserve_generations_and_retry_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let seed = SqliteStateDb::open(&path).await.unwrap();
+        seed.set_metadata("unrelated-checkpoint", "retained-token")
+            .await
+            .unwrap();
+        drop(seed);
+        let workers = 16;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(workers));
+        let mut tasks = Vec::new();
+        for index in 0..workers {
+            // Each writer has its own WAL connection, as scan-time arrivals do.
+            let db = SqliteStateDb::open(&path).await.unwrap();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                let source = SparseSourceId::new(&format!("concurrent-source-{index}"));
+                let original = evidence(&format!("original-{index}"));
+                let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+                barrier.wait().await;
+                let observed = db
+                    .observe_sparse_identity("PrimarySync", &source, &original, now)
+                    .await
+                    .unwrap();
+                let retried = db
+                    .record_sparse_attempt(
+                        &observed,
+                        SparseAttemptOutcome::Unresolved(original.clone()),
+                        now,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(retried.original, original);
+                assert_eq!(retried.lookup.as_ref(), Some(&original));
+                assert_eq!(retried.next_retry, Some(now + TimeDelta::hours(1)));
+                assert_ne!(observed.proof(), retried.proof());
+                (observed.generation, retried.generation)
+            }));
+        }
+        let mut generations = std::collections::HashSet::new();
+        for task in tasks {
+            let (observed, retried) = task.await.unwrap();
+            assert!(generations.insert(observed.0));
+            assert!(generations.insert(retried.0));
+        }
+        assert_eq!(generations.len(), workers * 2);
+        let reopened = SqliteStateDb::open(&path).await.unwrap();
+        let rows = reopened.sparse_identities("PrimarySync").await.unwrap();
+        assert_eq!(rows.len(), workers);
+        assert!(
+            rows.iter()
+                .all(|row| row.lookup.as_ref() == Some(&row.original))
+        );
+        assert!(
+            reopened
+                .get_metadata(&unresolved_identity_key("PrimarySync"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            reopened
+                .get_metadata("unrelated-checkpoint")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("retained-token")
+        );
     }
 
     #[tokio::test]
