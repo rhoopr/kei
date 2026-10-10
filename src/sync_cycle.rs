@@ -55,6 +55,112 @@ const LAST_FULL_ENUMERATION_REASON_KEY: &str = "last_full_enumeration_reason";
 /// Prefix for every per-zone CloudKit sync token row in the metadata table.
 pub(crate) const SYNC_TOKEN_PREFIX: &str = "sync_token:";
 const INVENTORY_ANCHOR_PREFIX: &str = "inventory_anchor:";
+pub(crate) const RETAINED_CHECKPOINT_HOLD_PREFIX: &str = "retained_checkpoint_hold:";
+const RETAINED_CHECKPOINT_RETRY_SECONDS: i64 = 60 * 60;
+const RETAINED_CHECKPOINT_MAX_ATTEMPTS: u8 = 3;
+
+const fn first_retained_checkpoint_attempt() -> u8 {
+    1
+}
+
+/// A delay is bound to the retained boundary and the requested policy. It never
+/// certifies inventory coverage or historical identity/deletion resolution.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedCheckpointHold {
+    version: u8,
+    prior_cursor_sha256: String,
+    enum_config_hash: String,
+    preservation_config_hash: Option<String>,
+    next_attempt_at: i64,
+    #[serde(default = "first_retained_checkpoint_attempt")]
+    attempt_count: u8,
+}
+
+impl RetainedCheckpointHold {
+    fn new(prior_cursor: &str, enum_hash: &str, preservation_hash: Option<&str>) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            version: 1,
+            attempt_count: 1,
+            prior_cursor_sha256: data_encoding::HEXLOWER.encode(&Sha256::digest(prior_cursor)),
+            enum_config_hash: enum_hash.to_owned(),
+            preservation_config_hash: preservation_hash.map(str::to_owned),
+            next_attempt_at: chrono::Utc::now()
+                .timestamp()
+                .saturating_add(RETAINED_CHECKPOINT_RETRY_SECONDS),
+        }
+    }
+
+    fn matches(&self, current: &Self) -> bool {
+        self.version == 1
+            && self.attempt_count > 0
+            && self.prior_cursor_sha256 == current.prior_cursor_sha256
+            && self.enum_config_hash == current.enum_config_hash
+            && self.preservation_config_hash == current.preservation_config_hash
+    }
+
+    fn deferred(&self, now: i64) -> bool {
+        self.next_attempt_at > now
+            && self.next_attempt_at <= now.saturating_add(RETAINED_CHECKPOINT_RETRY_SECONDS)
+    }
+}
+
+pub(crate) fn retained_checkpoint_hold_action(encoded: &str) -> &'static str {
+    match serde_json::from_str::<RetainedCheckpointHold>(encoded) {
+        Ok(hold) if hold.version == 1 && hold.attempt_count > 0 => {
+            if hold.attempt_count >= RETAINED_CHECKPOINT_MAX_ATTEMPTS {
+                RecoveryAction::RetainedCheckpointRetryExhausted.as_str()
+            } else {
+                RecoveryAction::AwaitRetainedCheckpointEvidence.as_str()
+            }
+        }
+        _ => RecoveryAction::RepairRetainedCheckpointEvidence.as_str(),
+    }
+}
+
+fn retained_checkpoint_hold_key(zone: &str) -> String {
+    format!("{RETAINED_CHECKPOINT_HOLD_PREFIX}{zone}")
+}
+
+fn block_for_retained_checkpoint(stats: &mut download::SyncStats) {
+    stats.sync_token_blocked = true;
+    stats.sync_token_blocked_reason = Some("retained_checkpoint_expired");
+    stats.sync_token_blocked_source = Some("kei");
+    stats.sync_token_blocked_explanation = Some(download::sync_token_blocked_explanation(
+        "retained_checkpoint_expired",
+    ));
+}
+
+async fn persist_retained_checkpoint_hold(
+    db: &dyn download::DownloadStore,
+    key: String,
+    hold: &RetainedCheckpointHold,
+    expected_metadata: Vec<(String, Option<String>)>,
+) -> anyhow::Result<()> {
+    db.commit_checkpoint_transition(state::CheckpointTransition {
+        expected_metadata,
+        legacy_preservation_proofs: Vec::new(),
+        legacy_config_hash: None,
+        sparse_identity_proofs: Vec::new(),
+        metadata_updates: vec![
+            (key, serde_json::to_string(hold)?),
+            (
+                LAST_CHECKPOINT_STATUS_KEY.to_owned(),
+                "preserved".to_owned(),
+            ),
+            (
+                LAST_RECOVERY_ACTION_KEY.to_owned(),
+                RecoveryAction::AwaitRetainedCheckpointEvidence
+                    .as_str()
+                    .to_owned(),
+            ),
+        ],
+        metadata_deletes: Vec::new(),
+    })
+    .await?;
+    Ok(())
+}
 const INVENTORY_DROP_THRESHOLD_PERCENT: f64 = 5.0;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -597,6 +703,7 @@ where
         Ok(Some(stored)) if stored == legacy_hash => {
             if let Err(e) = db
                 .commit_checkpoint_transition(state::CheckpointTransition {
+                    expected_metadata: Vec::new(),
                     legacy_preservation_proofs: Vec::new(),
                     legacy_config_hash: None,
                     sparse_identity_proofs: Vec::new(),
@@ -794,6 +901,22 @@ pub(crate) async fn run_cycle(
         }
     }
 
+    let enum_metadata_at_start = if let Some(db) = state_db {
+        vec![
+            (
+                ENUM_CONFIG_HASH_KEY.to_owned(),
+                db.get_metadata(ENUM_CONFIG_HASH_KEY).await?,
+            ),
+            (
+                PENDING_ENUM_CONFIG_HASH_KEY.to_owned(),
+                db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY).await?,
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
+    let mut active_cursor_fences = Vec::new();
+
     for lib_state in library_states
         .iter()
         .copied()
@@ -801,6 +924,123 @@ pub(crate) async fn run_cycle(
     {
         if shutdown_token.is_cancelled() {
             break;
+        }
+
+        let retained_cursor_at_start = if let Some(db) = state_db {
+            db.get_metadata(&lib_state.sync_token_key).await?
+        } else {
+            None
+        };
+        let mut retained_checkpoint_attempt = 1;
+        let hold_key = retained_checkpoint_hold_key(&lib_state.zone_name);
+        let retained_hold_at_start = if let Some(db) = state_db {
+            db.get_metadata(&hold_key).await?
+        } else {
+            None
+        };
+        let mut zone_metadata_fence = enum_metadata_at_start.clone();
+        zone_metadata_fence.push((
+            lib_state.sync_token_key.clone(),
+            retained_cursor_at_start.clone(),
+        ));
+        active_cursor_fences.push((
+            lib_state.sync_token_key.clone(),
+            retained_cursor_at_start.clone(),
+        ));
+        zone_metadata_fence.push((hold_key.clone(), retained_hold_at_start.clone()));
+        // Successful zone staging removes its hold before aggregate activation.
+        active_cursor_fences.push((hold_key.clone(), None));
+
+        if !config.runtime.dry_run
+            && retained_hold_at_start.as_deref().is_some_and(|encoded| {
+                retained_checkpoint_hold_action(encoded)
+                    == RecoveryAction::RepairRetainedCheckpointEvidence.as_str()
+            })
+        {
+            cycle_stats.sync_token_blocked = true;
+            cycle_stats.sync_token_blocked_reason = Some("retained_checkpoint_hold_invalid");
+            cycle_stats.sync_token_blocked_source = Some("kei");
+            cycle_stats.sync_token_blocked_explanation = Some(
+                download::sync_token_blocked_explanation("retained_checkpoint_hold_invalid"),
+            );
+            cycle_stats
+                .sync_token_blocked_zone
+                .get_or_insert_with(|| lib_state.zone_name.clone());
+            cycle_failed_count = cycle_failed_count.saturating_add(1);
+            db_sync_token_advance_safe = false;
+            checkpoint_hold_action =
+                Some(RecoveryAction::RepairRetainedCheckpointEvidence.as_str());
+            tracing::warn!(
+                diagnostic = "retained_checkpoint_hold_invalid",
+                "Retained checkpoint evidence requires validation; preserving the durable hold"
+            );
+            continue;
+        }
+
+        // A rejected retained boundary cannot be repaired by repeating the same
+        // rank inventory. Reserve each due attempt durably before provider or
+        // legacy work, including attempts later cancelled or found incomplete.
+        if !config.runtime.dry_run
+            && let Some(db) = state_db
+        {
+            if let Some(encoded) = retained_hold_at_start
+                && let Ok(hold) = serde_json::from_str::<RetainedCheckpointHold>(&encoded)
+                && let Some(prior) = retained_cursor_at_start.as_deref()
+            {
+                let mut current = RetainedCheckpointHold::new(
+                    &prior,
+                    &enum_config_hash,
+                    preservation_config_hash.as_deref(),
+                );
+                if hold.matches(&current) {
+                    let exhausted = hold.attempt_count >= RETAINED_CHECKPOINT_MAX_ATTEMPTS;
+                    current.attempt_count = hold.attempt_count.saturating_add(1);
+                    retained_checkpoint_attempt = current.attempt_count;
+                    let deferred = exhausted || hold.deferred(chrono::Utc::now().timestamp());
+                    let reservation_failed = if deferred {
+                        false
+                    } else {
+                        persist_retained_checkpoint_hold(
+                            db,
+                            hold_key.clone(),
+                            &current,
+                            zone_metadata_fence.clone(),
+                        )
+                        .await
+                        .is_err()
+                    };
+                    if !deferred && !reservation_failed {
+                        if let Some((_, expected)) = zone_metadata_fence.last_mut() {
+                            *expected = Some(serde_json::to_string(&current)?);
+                        }
+                    }
+                    if deferred || reservation_failed {
+                        block_for_retained_checkpoint(&mut cycle_stats);
+                        cycle_stats
+                            .sync_token_blocked_zone
+                            .get_or_insert_with(|| lib_state.zone_name.clone());
+                        if reservation_failed {
+                            cycle_stats.state_write_failures =
+                                cycle_stats.state_write_failures.saturating_add(1);
+                        }
+                        cycle_failed_count = cycle_failed_count.saturating_add(1);
+                        db_sync_token_advance_safe = false;
+                        checkpoint_hold_action = Some(if exhausted {
+                            RecoveryAction::RetainedCheckpointRetryExhausted.as_str()
+                        } else {
+                            RecoveryAction::AwaitRetainedCheckpointEvidence.as_str()
+                        });
+                        tracing::warn!(
+                            diagnostic = "retained_checkpoint_expired",
+                            retry_deferred = deferred,
+                            state_write_failed = reservation_failed,
+                            retry_exhausted = exhausted,
+                            "Retained checkpoint evidence is unavailable; preserving history and deferring recovery"
+                        );
+                        continue;
+                    }
+                }
+            }
         }
 
         let mut legacy_cycle = download::legacy_preservation::LegacyCycle::default();
@@ -1014,6 +1254,7 @@ pub(crate) async fn run_cycle(
             }
         }
 
+        let mut retained_checkpoint_expired = false;
         let mut checkpoint_basis =
             if sync_result.full_enumeration_ran && !sync_result.checkpoint.completed_delta_replay {
                 CheckpointBasis::CompleteInventory
@@ -1040,11 +1281,7 @@ pub(crate) async fn run_cycle(
             && !sync_result.checkpoint.completed_delta_replay
             && checkpoint_transition_state_safe
         {
-            let prior_token = if let Some(db) = state_db {
-                db.get_metadata(&lib_state.sync_token_key).await?
-            } else {
-                None
-            };
+            let prior_token = retained_cursor_at_start.clone();
             if let Some(prior_token) = prior_token.filter(|token| !token.trim().is_empty()) {
                 let inventory_decision = source_checkpoint_decision(
                     &sync_result,
@@ -1055,7 +1292,7 @@ pub(crate) async fn run_cycle(
                 if matches!(inventory_decision, SourceCheckpointDecision::Advance { .. }) {
                     let bridge_config = build_download_config(
                         download::SyncMode::Incremental {
-                            zone_sync_token: prior_token,
+                            zone_sync_token: prior_token.clone(),
                         },
                         Arc::new(rustc_hash::FxHashSet::default()),
                         Arc::clone(&asset_groupings),
@@ -1082,6 +1319,35 @@ pub(crate) async fn run_cycle(
                     sync_result.outcome =
                         merge_download_outcomes(&sync_result.outcome, &bridge_result.outcome);
                     sync_result.accumulate(&bridge_result);
+                    if bridge_result.checkpoint.retained_token_rejected
+                        && !bridge_result.checkpoint.completed_delta_replay
+                        && let Some(db) = state_db
+                    {
+                        retained_checkpoint_expired = true;
+                        let mut hold = RetainedCheckpointHold::new(
+                            &prior_token,
+                            &enum_config_hash,
+                            preservation_config_hash.as_deref(),
+                        );
+                        hold.attempt_count = retained_checkpoint_attempt;
+                        if persist_retained_checkpoint_hold(
+                            db,
+                            retained_checkpoint_hold_key(&lib_state.zone_name),
+                            &hold,
+                            zone_metadata_fence.clone(),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            sync_result.checkpoint.state_write_failures = sync_result
+                                .checkpoint
+                                .state_write_failures
+                                .saturating_add(1);
+                            sync_result.stats.state_write_failures =
+                                sync_result.stats.state_write_failures.saturating_add(1);
+                        }
+                        block_for_retained_checkpoint(&mut sync_result.stats);
+                    }
                     if !bridge_result.full_enumeration_ran
                         || bridge_result.checkpoint.completed_delta_replay
                     {
@@ -1103,12 +1369,16 @@ pub(crate) async fn run_cycle(
                         sync_result.sync_token = None;
                         sync_result.checkpoint.sync_token_blocked = true;
                         sync_result.checkpoint.project(&mut sync_result.stats);
-                        sync_result.stats.sync_token_blocked_reason =
-                            Some("inventory_delta_bridge_failed");
-                        sync_result.stats.sync_token_blocked_source = Some("kei");
-                        sync_result.stats.sync_token_blocked_explanation = Some(
-                            "the prior provider checkpoint could not be replayed incrementally after inventory reconciliation",
-                        );
+                        if bridge_result.checkpoint.retained_token_rejected {
+                            block_for_retained_checkpoint(&mut sync_result.stats);
+                        } else {
+                            sync_result.stats.sync_token_blocked_reason =
+                                Some("inventory_delta_bridge_failed");
+                            sync_result.stats.sync_token_blocked_source = Some("kei");
+                            sync_result.stats.sync_token_blocked_explanation = Some(
+                                "the prior provider checkpoint could not be replayed incrementally after inventory reconciliation",
+                            );
+                        }
                     }
                 }
             }
@@ -1118,6 +1388,10 @@ pub(crate) async fn run_cycle(
             // An inventory cannot prove that the previously ambiguous deltas
             // were resolved. Require replay from the retained cursor.
             sync_result.block_for_unresolved_identity();
+        }
+
+        if retained_checkpoint_expired {
+            block_for_retained_checkpoint(&mut sync_result.stats);
         }
 
         if sync_result.full_enumeration_ran && sync_result.stats.full_enumeration_reason.is_none() {
@@ -1223,6 +1497,15 @@ pub(crate) async fn run_cycle(
                 }
             };
 
+        if sync_result.stats.sync_token_blocked_reason == Some("retained_checkpoint_expired")
+            && let SourceCheckpointDecision::Preserve { reason, .. } = checkpoint_decision
+        {
+            checkpoint_decision = SourceCheckpointDecision::Preserve {
+                reason,
+                recovery: RecoveryAction::AwaitRetainedCheckpointEvidence,
+            };
+        }
+
         let mut legacy_proofs = Vec::new();
         if let SourceCheckpointDecision::Advance { token, .. } = &checkpoint_decision
             && let Some(db) = state_db
@@ -1280,11 +1563,14 @@ pub(crate) async fn run_cycle(
                             pending_zone_token_key(&enum_config_hash, &lib_state.zone_name);
                         if let Err(e) = db
                             .commit_checkpoint_transition(state::CheckpointTransition {
+                                expected_metadata: zone_metadata_fence.clone(),
                                 legacy_preservation_proofs: legacy_proofs,
                                 legacy_config_hash: preservation_config_hash.clone(),
                                 sparse_identity_proofs: Vec::new(),
                                 metadata_updates: vec![(candidate_key, token)],
-                                metadata_deletes: Vec::new(),
+                                metadata_deletes: vec![retained_checkpoint_hold_key(
+                                    &lib_state.zone_name,
+                                )],
                             })
                             .await
                         {
@@ -1318,6 +1604,7 @@ pub(crate) async fn run_cycle(
                         }
                         if let Err(e) = db
                             .commit_checkpoint_transition(state::CheckpointTransition {
+                                expected_metadata: zone_metadata_fence.clone(),
                                 legacy_preservation_proofs: legacy_proofs,
                                 legacy_config_hash: preservation_config_hash.clone(),
                                 sparse_identity_proofs: sync_result
@@ -1325,9 +1612,10 @@ pub(crate) async fn run_cycle(
                                     .sparse_identity_proofs
                                     .clone(),
                                 metadata_updates,
-                                metadata_deletes: vec![state::unresolved_identity_key(
-                                    &lib_state.zone_name,
-                                )],
+                                metadata_deletes: vec![
+                                    state::unresolved_identity_key(&lib_state.zone_name),
+                                    retained_checkpoint_hold_key(&lib_state.zone_name),
+                                ],
                             })
                             .await
                         {
@@ -1371,6 +1659,7 @@ pub(crate) async fn run_cycle(
                 if let Some(db) = state_db
                     && let Err(e) = db
                         .commit_checkpoint_transition(state::CheckpointTransition {
+                            expected_metadata: Vec::new(),
                             legacy_preservation_proofs: Vec::new(),
                             legacy_config_hash: None,
                             sparse_identity_proofs: Vec::new(),
@@ -1480,6 +1769,7 @@ pub(crate) async fn run_cycle(
                     );
                     break;
                 };
+                active_cursor_fences.push((candidate_key.clone(), Some(token.clone())));
                 metadata_updates.push((lib_state.sync_token_key.clone(), token));
                 metadata_deletes.push(candidate_key);
                 metadata_deletes.push(state::unresolved_identity_key(&lib_state.zone_name));
@@ -1494,6 +1784,11 @@ pub(crate) async fn run_cycle(
             metadata_updates.push((LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()));
             if let Err(e) = db
                 .commit_checkpoint_transition(state::CheckpointTransition {
+                    expected_metadata: enum_metadata_at_start
+                        .iter()
+                        .cloned()
+                        .chain(active_cursor_fences)
+                        .collect(),
                     legacy_preservation_proofs: Vec::new(),
                     legacy_config_hash: preservation_config_hash.clone(),
                     sparse_identity_proofs,
@@ -1516,6 +1811,7 @@ pub(crate) async fn run_cycle(
         && let (Some(db), Some(download_config_hash)) = (state_db, pending_download_config_hash)
         && let Err(e) = db
             .commit_checkpoint_transition(state::CheckpointTransition {
+                expected_metadata: Vec::new(),
                 legacy_preservation_proofs: Vec::new(),
                 legacy_config_hash: None,
                 sparse_identity_proofs: Vec::new(),
@@ -1543,6 +1839,38 @@ pub(crate) async fn run_cycle(
             .any(|capture| capture.unresolved_assets > 0)
         {
             download::block_sync_token_for_metadata_capture(&mut cycle_stats);
+            cycle_failed_count = cycle_failed_count.max(1);
+            db_sync_token_advance_safe = false;
+        }
+        if summary
+            .last_recovery_action
+            .as_deref()
+            .is_some_and(|action| {
+                matches!(
+                    action,
+                    "await_retained_checkpoint_evidence"
+                        | "retained_checkpoint_retry_exhausted"
+                        | "repair_retained_checkpoint_evidence"
+                )
+            })
+        {
+            block_for_retained_checkpoint(&mut cycle_stats);
+            if summary.last_recovery_action.as_deref()
+                == Some("retained_checkpoint_retry_exhausted")
+            {
+                cycle_stats.sync_token_blocked_reason = Some("retained_checkpoint_retry_exhausted");
+                cycle_stats.sync_token_blocked_explanation = Some(
+                    download::sync_token_blocked_explanation("retained_checkpoint_retry_exhausted"),
+                );
+            }
+            if summary.last_recovery_action.as_deref()
+                == Some("repair_retained_checkpoint_evidence")
+            {
+                cycle_stats.sync_token_blocked_reason = Some("retained_checkpoint_hold_invalid");
+                cycle_stats.sync_token_blocked_explanation = Some(
+                    download::sync_token_blocked_explanation("retained_checkpoint_hold_invalid"),
+                );
+            }
             cycle_failed_count = cycle_failed_count.max(1);
             db_sync_token_advance_safe = false;
         }
@@ -1693,6 +2021,43 @@ pub(crate) fn hash_legacy_preservation_policy(
 mod tests {
     use super::*;
     use crate::commands::PassKind;
+
+    #[test]
+    fn retained_checkpoint_hold_round_trip_and_version_one_migration() {
+        let hold = RetainedCheckpointHold::new(
+            "private-cursor",
+            "enum-policy",
+            Some("preservation-policy"),
+        );
+        let encoded = serde_json::to_string(&hold).expect("encode receipt");
+        assert!(!encoded.contains("private-cursor"));
+        let decoded: RetainedCheckpointHold =
+            serde_json::from_str(&encoded).expect("decode receipt");
+        assert!(decoded.matches(&hold));
+        assert_eq!(decoded.attempt_count, 1);
+        assert_eq!(decoded.next_attempt_at, hold.next_attempt_at);
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+
+        let mut version_one: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        version_one.as_object_mut().unwrap().remove("attempt_count");
+        let migrated: RetainedCheckpointHold = serde_json::from_value(version_one).unwrap();
+        assert!(migrated.matches(&hold));
+        assert_eq!(
+            migrated.attempt_count, 1,
+            "an existing receipt already consumed its first attempt"
+        );
+        let migrated_encoded = serde_json::to_string(&migrated).unwrap();
+        assert_eq!(
+            retained_checkpoint_hold_action(&migrated_encoded),
+            "await_retained_checkpoint_evidence"
+        );
+        let mut exhausted = migrated;
+        exhausted.attempt_count = RETAINED_CHECKPOINT_MAX_ATTEMPTS;
+        assert_eq!(
+            retained_checkpoint_hold_action(&serde_json::to_string(&exhausted).unwrap()),
+            "retained_checkpoint_retry_exhausted"
+        );
+    }
 
     #[test]
     fn legacy_preservation_trust_hash_preserves_strict_compatibility() {

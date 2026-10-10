@@ -416,8 +416,8 @@ async fn download_photos_with_sync_inner(
             {
                 Ok(result) => Ok(result),
                 Err(error) => match classify_selection_incremental_error(&error) {
-                    IncrementalErrorClass::TokenFallback
-                    | IncrementalErrorClass::StaticFallback => {
+                    class @ (IncrementalErrorClass::TokenFallback
+                    | IncrementalErrorClass::StaticFallback) => {
                         Box::pin(super::generation::inventory(
                             download_client,
                             passes,
@@ -426,6 +426,11 @@ async fn download_photos_with_sync_inner(
                             shutdown_token.clone(),
                         ))
                         .await
+                        .map(|mut result| {
+                            result.checkpoint.retained_token_rejected =
+                                class == IncrementalErrorClass::TokenFallback;
+                            result
+                        })
                     }
                     IncrementalErrorClass::SessionExpired
                     | IncrementalErrorClass::TransientFailure
@@ -534,8 +539,8 @@ async fn download_photos_with_sync_inner(
                     match incremental_result {
                         Ok(result) => Ok(result),
                         Err(e) => match classify_incremental_error(&e) {
-                            IncrementalErrorClass::TokenFallback
-                            | IncrementalErrorClass::StaticFallback => {
+                            class @ (IncrementalErrorClass::TokenFallback
+                            | IncrementalErrorClass::StaticFallback) => {
                                 let reason = FullEnumerationReason::OtherStaticReason;
                                 tracing::warn!(
                                     error = %e,
@@ -551,6 +556,11 @@ async fn download_photos_with_sync_inner(
                                     reason,
                                 )
                                 .await
+                                .map(|mut result| {
+                                    result.checkpoint.retained_token_rejected =
+                                        class == IncrementalErrorClass::TokenFallback;
+                                    result
+                                })
                             }
                             IncrementalErrorClass::SessionExpired
                             | IncrementalErrorClass::TransientFailure

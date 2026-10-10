@@ -298,6 +298,27 @@ impl SqliteStateDb {
                     last_recovery_action = Some("replay_from_prior_token".to_owned());
                 }
             }
+            // Zone-local holds survive another zone's successful status write.
+            // Malformed hold contents cannot make the operator status current.
+            let retained_hold_exists = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM metadata WHERE substr(key,1,length(?1))=?1)",
+                [crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if retained_hold_exists {
+                provider_checkpoint_status = Some("preserved".to_owned());
+                let mut holds = conn.prepare("SELECT value FROM metadata WHERE substr(key,1,length(?1))=?1")?;
+                let values = holds.query_map([crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX], |row| row.get::<_, String>(0))?;
+                let mut action = "await_retained_checkpoint_evidence";
+                for value in values {
+                    let value = value?;
+                    let candidate = crate::sync_cycle::retained_checkpoint_hold_action(&value);
+                    if candidate == "repair_retained_checkpoint_evidence"
+                        || (candidate == "retained_checkpoint_retry_exhausted" && action != "repair_retained_checkpoint_evidence")
+                    { action = candidate; }
+                }
+                last_recovery_action = Some(action.to_owned());
+            }
             let last_full_enumeration_reason = metadata_value("last_full_enumeration_reason")
                 .map_err(|e| StateError::query("get_summary::full_enumeration_reason", e))?;
 

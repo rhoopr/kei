@@ -14,3 +14,6 @@ mod mixed_provider_shapes;
 mod process_death;
 
 mod smart_reconciliation;
+
+mod mixed_delta;
+mod retained_recovery;

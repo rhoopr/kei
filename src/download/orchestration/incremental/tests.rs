@@ -2274,6 +2274,9 @@ async fn incremental_sync_skips_smaller_metadata_rewritten_file() {
     .await
     .expect("incremental sync should skip the verified local file");
 
+    assert!(result.checkpoint.completed_delta_replay);
+    assert!(!result.checkpoint.retained_token_rejected);
+    assert!(!result.full_enumeration_ran);
     assert!(matches!(result.outcome, DownloadOutcome::Success));
     assert_eq!(result.stats.downloaded, 0);
     assert_eq!(result.stats.failed, 0);

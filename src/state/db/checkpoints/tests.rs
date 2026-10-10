@@ -142,6 +142,7 @@ async fn checkpoint_transition_is_atomic() {
 
     let result = db
         .commit_checkpoint_transition(CheckpointTransition {
+            expected_metadata: Vec::new(),
             legacy_preservation_proofs: Vec::new(),
             legacy_config_hash: None,
             sparse_identity_proofs: Vec::new(),
@@ -291,4 +292,62 @@ async fn metadata_empty_string_key_and_value() {
     db.set_metadata("", "").await.unwrap();
     let val = db.get_metadata("").await.unwrap();
     assert_eq!(val, Some(String::new()));
+}
+
+#[tokio::test]
+async fn retained_checkpoint_metadata_fence_rolls_back_stale_plans() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    {
+        let db = SqliteStateDb::open(&path).await.unwrap();
+        db.set_metadata("sync_token:zone", "concurrent-cursor")
+            .await
+            .unwrap();
+        db.set_metadata("enum_config_hash", "old-config")
+            .await
+            .unwrap();
+        db.set_metadata("pending_enum_config_hash", "new-config")
+            .await
+            .unwrap();
+        db.set_metadata("retained_checkpoint_hold:zone", "durable-hold")
+            .await
+            .unwrap();
+        let result = db
+            .commit_checkpoint_transition(CheckpointTransition {
+                expected_metadata: vec![("sync_token:zone".into(), Some("planned-cursor".into()))],
+                legacy_preservation_proofs: Vec::new(),
+                legacy_config_hash: None,
+                sparse_identity_proofs: Vec::new(),
+                metadata_updates: vec![
+                    ("sync_token:zone".into(), "new-cursor".into()),
+                    ("enum_config_hash".into(), "new-config".into()),
+                ],
+                metadata_deletes: vec![
+                    "pending_enum_config_hash".into(),
+                    "retained_checkpoint_hold:zone".into(),
+                ],
+            })
+            .await;
+        assert!(result.is_err());
+    }
+    let db = SqliteStateDb::open(&path).await.unwrap();
+    for (key, expected) in [
+        ("sync_token:zone", "concurrent-cursor"),
+        ("enum_config_hash", "old-config"),
+        ("pending_enum_config_hash", "new-config"),
+        ("retained_checkpoint_hold:zone", "durable-hold"),
+    ] {
+        assert_eq!(
+            db.get_metadata(key).await.unwrap().as_deref(),
+            Some(expected)
+        );
+    }
+    assert_eq!(
+        db.get_summary()
+            .await
+            .unwrap()
+            .provider_checkpoint_status
+            .as_deref(),
+        Some("preserved")
+    );
 }

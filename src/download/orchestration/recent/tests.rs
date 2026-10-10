@@ -400,6 +400,7 @@ async fn recent_scope_overflow_reopens_then_increases_removes_and_converges() {
                     assert_eq!(result.stats.downloaded, 0);
                 }
                 let transition = || crate::state::CheckpointTransition {
+                    expected_metadata: Vec::new(),
                     legacy_preservation_proofs: Vec::new(),
                     legacy_config_hash: None,
                     sparse_identity_proofs: Vec::new(),
@@ -582,6 +583,7 @@ async fn private_recent_equal_dates_preserve_provider_ties_and_recover_after_cap
                     .sync_token
                     .expect("uncapped complete coverage retains existing checkpoint bridge");
                 db.commit_checkpoint_transition(crate::state::CheckpointTransition {
+                    expected_metadata: Vec::new(),
                     legacy_preservation_proofs: Vec::new(),
                     legacy_config_hash: None,
                     sparse_identity_proofs: Vec::new(),
@@ -836,6 +838,7 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
             .sync_token
             .expect("complete current coverage preserves source checkpoint gate");
         db.commit_checkpoint_transition(crate::state::CheckpointTransition {
+            expected_metadata: Vec::new(),
             legacy_preservation_proofs: Vec::new(),
             legacy_config_hash: None,
             sparse_identity_proofs: Vec::new(),
@@ -987,6 +990,7 @@ async fn private_filter_expansion_reopens_retained_coverage_and_converges_withou
             "retain the existing full-query and incremental source checkpoint owners"
         );
         db.commit_checkpoint_transition(crate::state::CheckpointTransition {
+            expected_metadata: Vec::new(),
             legacy_preservation_proofs: Vec::new(),
             legacy_config_hash: None,
             sparse_identity_proofs: Vec::new(),
@@ -1162,6 +1166,7 @@ async fn recent_recovery_receipt_task_fault_and_cancellation_preserve_then_reope
                 );
                 assert_eq!(result.sync_token.as_deref(), Some("delta-successor"));
                 db.commit_checkpoint_transition(crate::state::CheckpointTransition {
+                    expected_metadata: Vec::new(),
                     legacy_preservation_proofs: Vec::new(),
                     legacy_config_hash: None,
                     sparse_identity_proofs: Vec::new(),
@@ -1285,6 +1290,7 @@ async fn recent_one_asset_keeps_both_companion_renditions_and_recovers_unchanged
             assert_eq!(result.sync_token.as_deref(), Some("delta-successor"));
             assert_eq!(paths(&db).len(), 6);
             db.commit_checkpoint_transition(crate::state::CheckpointTransition {
+                expected_metadata: Vec::new(),
                 legacy_preservation_proofs: Vec::new(),
                 legacy_config_hash: None,
                 sparse_identity_proofs: Vec::new(),

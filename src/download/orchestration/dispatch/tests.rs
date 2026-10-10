@@ -393,6 +393,8 @@ async fn smart_folder_refresh_blank_query_token_does_not_block_incremental_zone_
         crate::icloud::photos::MAX_EMPTY_PAGE_PROBES as usize
     );
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+    assert!(result.checkpoint.completed_delta_replay);
+    assert!(!result.checkpoint.retained_token_rejected);
     assert!(
         !result.stats.sync_token_blocked,
         "blank smart-folder query token is telemetry for the refresh, not a reason to block the incremental zone token"
@@ -481,6 +483,8 @@ async fn smart_folder_refresh_failure_blocks_incremental_token() {
         Some(SMART_FOLDER_REFRESH_FAILED_REASON)
     );
     assert_eq!(result.sync_token, None);
+    assert!(result.checkpoint.completed_delta_replay);
+    assert!(!result.checkpoint.retained_token_rejected);
 }
 
 #[tokio::test]
@@ -666,4 +670,63 @@ async fn targeted_album_backfill_failure_blocks_incremental_token() {
 
     assert_eq!(result.sync_token, None);
     assert!(result.stats.sync_token_blocked);
+}
+
+#[tokio::test]
+async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
+    #[derive(Clone)]
+    struct FallbackSession {
+        expired: bool,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for FallbackSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/changes/zone?") {
+                let mut zone = json!({
+                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                    "moreComing": false,
+                    "records": []
+                });
+                if self.expired {
+                    zone["serverErrorCode"] = json!("BAD_REQUEST");
+                }
+                return Ok(json!({"zones": [zone]}));
+            }
+            if url.contains("/internal/records/query/batch?") {
+                return Ok(
+                    json!({"batch": [{"records": [{"fields": {"itemCount": {"value": 0}}}]}]}),
+                );
+            }
+            Ok(json!({"records": [], "syncToken": "healthy-query-eof"}))
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+    for expired in [false, true] {
+        let directory = TempDir::new().unwrap();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album("", FallbackSession { expired }),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(incremental_test_config(&directory)),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(result.full_enumeration_ran);
+        assert!(!result.checkpoint.completed_delta_replay);
+        assert_eq!(result.checkpoint.retained_token_rejected, expired);
+        assert_eq!(result.sync_token.as_deref(), Some("healthy-query-eof"));
+    }
 }

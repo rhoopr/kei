@@ -756,6 +756,7 @@ mod tests {
     }
     fn transition(proofs: Vec<LegacyActivationProof>) -> CheckpointTransition {
         CheckpointTransition {
+            expected_metadata: Vec::new(),
             legacy_preservation_proofs: proofs,
             legacy_config_hash: Some("config".into()),
             sparse_identity_proofs: Vec::new(),
