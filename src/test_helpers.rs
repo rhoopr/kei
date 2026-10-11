@@ -13,6 +13,29 @@ use crate::icloud::photos::PhotoAsset;
 use crate::icloud::photos::session::PhotosSession;
 use crate::state::types::{AssetMetadata, AssetRecord, MediaType, VersionSizeKey};
 
+/// Synthetic QuickTime track metadata without an ISO FullBox prefix.
+#[cfg(feature = "xmp")]
+pub(crate) fn bare_track_meta_movie() -> Vec<u8> {
+    let atom = |kind: &[u8; 4], body: &[u8]| {
+        let mut bytes = u32::try_from(body.len() + 8)
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(body);
+        bytes
+    };
+    let mut handler = vec![0; 24];
+    handler[8..12].copy_from_slice(b"mdta");
+    let track_meta = atom(b"meta", &atom(b"hdlr", &handler));
+    let mut movie = atom(b"mvhd", &[0; 100]);
+    movie.extend(atom(b"trak", &track_meta));
+    let mut original = atom(b"ftyp", b"qt  \0\0\0\0qt  ");
+    original.extend(atom(b"moov", &movie));
+    original.extend(atom(b"mdat", b"unchanged media"));
+    original
+}
+
 /// Synthetic sparse-share shape reported in #765, with invented identifiers.
 #[cfg(test)]
 pub(crate) fn sparse_shared_asset_record() -> Value {

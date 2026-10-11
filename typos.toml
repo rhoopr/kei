@@ -17,6 +17,8 @@ THM = "THM"
 # `Nd` is the placeholder in `--recent Nd` (days form); a CLI-shape
 # template, not a typo for "And".
 Nd = "Nd"
+# QuickTime/ISO BMFF track box FourCC.
+trak = "trak"
 
 [default]
 # The `mis-` prefix (mis-routing, mis-attributed, mis-directed) is grammatical
