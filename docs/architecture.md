@@ -1934,6 +1934,13 @@ and a single-writer lock, and never feeds decisions back to provider, checkpoint
 state or publication policy. Its tracing layer is independent of log verbosity.
 Stored history is revalidated against the same contract before export. Unknown
 fields, labels, arbitrary errors and provider identifiers cannot broaden it.
+The Photos owner projects only fixed owner morphology and JSON types for rejected
+inventory scopes. Private discovery records identify primary versus other zones
+and validated primary eligibility. A primary-publication observation follows the
+actual qualified-primary assignment; selected indexing alone does not imply it.
+Owner categories are revalidated as strings, so a malformed numeric owner cannot
+escape through an aggregate-count allowance. Missing older fields remain missing.
+
 Random process-local aliases are bounded and renumbered at collection time.
 Counts are scoped observations and must not be added as unique asset counts.
 SQL observations before transaction commit are explicitly identified as attempts.

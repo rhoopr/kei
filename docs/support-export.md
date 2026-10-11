@@ -55,6 +55,17 @@ The version 1 export has a versioned allowlist and these sections:
   transfer, import, publication and completion evidence. New free-text provider
   failures remain unavailable until an explicit safe contract is added.
 
+Inventory scope failures record expected and supplied owner class and JSON type,
+never the owner value. A supplied owner is `not_recorded` when the failure did not
+reach the response or child-reference scope being diagnosed. An observed missing
+owner is `absent`; an explicit JSON null is the string category `null`.
+Discovery records distinguish primary and other zones, validated private-primary
+eligibility, selected indexing and actual publication of the qualified primary
+library. Indexing an unrelated private zone does not establish primary ownership.
+Older discovery records with `owner = other` have no precise owner type. Missing
+historical fields remain unavailable; they are not filled with absent-owner or
+successful-publication claims.
+
 No credentials, cookies, tokens, Apple IDs, provider IDs, album names, private
 paths, checksums, provider URLs, responses or arbitrary error text are exported.
 Random aliases permit limited correlation within a bounded process lifetime.

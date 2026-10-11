@@ -309,3 +309,140 @@ fn support_export_current_owned_state_is_bounded_and_wrong_owner_degrades() {
     );
     assert!(bundle["state"].get("status_counts").is_none());
 }
+
+#[test]
+fn support_export_owner_provenance_roundtrip_preserves_old_unavailable_fields() {
+    use serde_json::json;
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let username = "private-user@example.invalid";
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!("[auth]\nusername={}", crate::common::toml_string(username)),
+    )
+    .unwrap();
+    let diagnostic = |kind: &str, fields: Value| {
+        json!({
+            "kind":kind,"fields":fields,"observations":1,
+            "first_at":"2026-10-11T00:00:00Z","last_at":"2026-10-11T00:00:00Z",
+        })
+    };
+    let cycle = |diagnostics: Vec<Value>| {
+        json!({
+            "id":uuid::Uuid::new_v4().to_string(),"started_at":"2026-10-11T00:00:00Z","completed_at":"2026-10-11T00:01:00Z",
+            "outcome":"partial_failure","build_version":"0.25.1","configuration":{},"stats":{},"diagnostics":diagnostics,
+        })
+    };
+    let new_inventory = |owner: &str, owner_type: &str| {
+        diagnostic(
+            "legacy_inventory_failure_v2",
+            json!({
+                "phase":"child_reference","reason":"invalid_inventory_evidence","subreason":"child_reference_scope_mismatch",
+                "scope_mismatch_component":"owner","expected_owner":"absent","expected_owner_type":"absent",
+                "supplied_owner":owner,"supplied_owner_type":owner_type,"eof_observed":true,"pages":461,
+            }),
+        )
+    };
+    let current = cycle(vec![
+        new_inventory("private_default", "string"),
+        new_inventory("other_string", "string"),
+        new_inventory("null", "null"),
+        new_inventory("malformed", "number"),
+        diagnostic(
+            "support_discovery_v1",
+            json!({"phase":"primary_discovery","database":"private","zone_class":"primary","listing_validated":true,
+            "primary_eligibility":"eligible","owner":"private_default","owner_type":"string","qualification_published":false}),
+        ),
+        diagnostic(
+            "support_discovery_v1",
+            json!({"phase":"selected_qualified_indexing","database":"private","zone_class":"other",
+            "owner":"private_default","owner_type":"string","selected_indexing":true,"qualification_published":true}),
+        ),
+        diagnostic(
+            "support_discovery_v1",
+            json!({"phase":"primary_publication","database":"private","zone_class":"primary",
+            "owner":"private_default","owner_type":"string","selected_indexing":true,"qualification_published":true}),
+        ),
+    ]);
+    let old = cycle(vec![
+        diagnostic(
+            "legacy_inventory_failure_v2",
+            json!({"phase":"child_reference","scope_mismatch_component":"owner","pages":461}),
+        ),
+        diagnostic(
+            "support_discovery_v1",
+            json!({"phase":"selected_qualified_indexing","database":"private","owner":"other","selected_indexing":true,"qualification_published":true}),
+        ),
+    ]);
+    let malicious = cycle(vec![
+        diagnostic(
+            "legacy_inventory_failure_v2",
+            json!({"expected_owner":123456789,"expected_owner_type":true,"supplied_owner":"PRIVATE_OWNER_CANARY",
+            "supplied_owner_type":"PRIVATE_TYPE_CANARY","raw_owner":"PRIVATE_RAW_CANARY","pages":17}),
+        ),
+        diagnostic(
+            "support_discovery_v1",
+            json!({"owner":123456789,"owner_type":"PRIVATE_TYPE_CANARY","zone_class":"PRIVATE_ZONE_CANARY",
+            "primary_eligibility":"success","private_payload":"https://PRIVATE_PROVIDER_CANARY","listing_validated":true}),
+        ),
+    ]);
+    let history = json!({"schema_version":1,"cycles_evicted":0,"queue_dropped":0,"groups_omitted":0,"previous_history_unavailable":false,"cycles":[current,old,malicious]});
+    let path = data.join(format!("{}.support.json", sanitize_username(username)));
+    std::fs::write(&path, serde_json::to_vec(&history).unwrap()).unwrap();
+    let before = snapshot(&data);
+    let output = root.path().join("support.json");
+    clean_cmd()
+        .env("KEI_DATA_DIR", &data)
+        .arg("--config")
+        .arg(&config)
+        .arg("support-export")
+        .arg("--output")
+        .arg(&output)
+        .assert()
+        .success();
+    assert_eq!(snapshot(&data), before);
+    let bytes = std::fs::read(output).unwrap();
+    assert!(bytes.len() <= 2 * 1024 * 1024);
+    let text = std::str::from_utf8(&bytes).unwrap();
+    for private in ["PRIVATE_", "123456789", username, path.to_str().unwrap()] {
+        assert!(!text.contains(private), "{text}");
+    }
+    let bundle: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(bundle["history"]["status"], "available");
+    let cycles = bundle["history"]["data"]["cycles"].as_array().unwrap();
+    let events = cycles[0]["diagnostics"].as_array().unwrap();
+    assert_eq!(events[0]["fields"]["expected_owner"], "absent");
+    assert_ne!(events[0]["fields"], events[1]["fields"]);
+    assert_eq!(events[2]["fields"]["supplied_owner"], "null");
+    assert_eq!(events[3]["fields"]["supplied_owner_type"], "number");
+    assert_eq!(events[4]["fields"]["primary_eligibility"], "eligible");
+    assert_eq!(events[5]["fields"]["zone_class"], "other");
+    assert_eq!(events[6]["fields"]["phase"], "primary_publication");
+    // Missing historical fields remain unavailable. They are never synthesized
+    // into an observed absent owner or a false primary-publication decision.
+    for key in [
+        "expected_owner",
+        "expected_owner_type",
+        "supplied_owner",
+        "supplied_owner_type",
+    ] {
+        assert!(cycles[1]["diagnostics"][0]["fields"].get(key).is_none());
+    }
+    for key in [
+        "zone_class",
+        "owner_type",
+        "primary_eligibility",
+        "listing_validated",
+    ] {
+        assert!(cycles[1]["diagnostics"][1]["fields"].get(key).is_none());
+    }
+    assert_eq!(cycles[1]["diagnostics"][1]["fields"]["owner"], "other");
+    assert_eq!(cycles[1]["observations_total"], Value::Null);
+    assert_eq!(cycles[2]["diagnostics"][0]["fields"], json!({"pages":17}));
+    assert_eq!(
+        cycles[2]["diagnostics"][1]["fields"],
+        json!({"listing_validated":true})
+    );
+}

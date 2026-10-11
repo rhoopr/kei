@@ -256,24 +256,7 @@ fn supplied_owner_shape(
             }
         })
         .find(|scope| !lookup_zone_matches(scope, expected));
-    match scope.and_then(|v| v.get("ownerRecordName")) {
-        None => ("absent", "absent"),
-        Some(Value::Null) => ("null", "null"),
-        Some(Value::String(s)) => (
-            if s.is_empty() {
-                "empty"
-            } else if s == "_defaultOwner" {
-                "private_default"
-            } else {
-                "other_string"
-            },
-            "string",
-        ),
-        Some(Value::Number(_)) => ("malformed", "number"),
-        Some(Value::Bool(_)) => ("malformed", "boolean"),
-        Some(Value::Array(_)) => ("malformed", "array"),
-        Some(Value::Object(_)) => ("malformed", "object"),
-    }
+    super::super::owner_diagnostic_shape(scope.and_then(|v| v.get("ownerRecordName")))
 }
 
 // Classify only a rejected scope. Acceptance remains owned by the matcher above.

@@ -45,6 +45,41 @@ use crate::icloud::photos::cloudkit::ChangesDatabaseResponse;
 use crate::icloud::photos::queries::encode_params;
 use crate::retry::RetryConfig;
 
+/// Diagnostic morphology never establishes scope authority or returns identity.
+fn owner_diagnostic_shape(owner: Option<&Value>) -> (&'static str, &'static str) {
+    match owner {
+        None => ("absent", "absent"),
+        Some(Value::Null) => ("null", "null"),
+        Some(Value::String(s)) => (
+            if s.is_empty() {
+                "empty"
+            } else if s == "_defaultOwner" {
+                "private_default"
+            } else {
+                "other_string"
+            },
+            "string",
+        ),
+        Some(Value::Number(_)) => ("malformed", "number"),
+        Some(Value::Bool(_)) => ("malformed", "boolean"),
+        Some(Value::Array(_)) => ("malformed", "array"),
+        Some(Value::Object(_)) => ("malformed", "object"),
+    }
+}
+
+/// Called only after an already qualified private PrimarySync replaces the
+/// effective primary library. Initializing a library alone is not publication.
+fn observe_primary_publication() {
+    crate::support::observe(
+        "support_discovery_v1",
+        json!({
+            "phase": "primary_publication", "database": "private", "zone_class": "primary",
+            "owner": "private_default", "owner_type": "string",
+            "selected_indexing": true, "qualification_published": true,
+        }),
+    );
+}
+
 pub struct PhotosService {
     shadow_capture: Option<inbox::ShadowCapture>,
     service_root: String,
@@ -116,7 +151,7 @@ impl PhotosService {
 
         crate::support::observe(
             "support_discovery_v1",
-            json!({"phase": "name_only_indexing", "database": "private", "owner": "absent", "qualification_published": false}),
+            json!({"phase": "name_only_indexing", "database": "private", "zone_class": "primary", "owner": "absent", "owner_type": "absent", "qualification_published": false}),
         );
         let lib_session = session.clone_box();
 
@@ -201,7 +236,28 @@ impl PhotosService {
     /// Validate the complete private listing without initializing unrelated libraries.
     async fn fetch_private_zones(&mut self) -> anyhow::Result<()> {
         if self.private_zones.is_none() {
-            self.private_zones = Some(self.fetch_zone_list("private").await?);
+            let zones = self.fetch_zone_list("private").await?;
+            let primary = zones
+                .iter()
+                .find(|zone| zone.zone_id.zone_name == PRIMARY_ZONE_NAME);
+            let (owner, owner_type) = owner_diagnostic_shape(
+                primary.and_then(|zone| zone.zone_id.extra.get("ownerRecordName")),
+            );
+            let primary_eligibility = match primary {
+                None => "no_primary",
+                Some(zone) if zone.deleted.unwrap_or(false) => "primary_deleted",
+                Some(_) if owner != "private_default" => "owner_not_default",
+                Some(_) => "eligible",
+            };
+            crate::support::observe(
+                "support_discovery_v1",
+                json!({
+                    "phase": "primary_discovery", "database": "private", "zone_class": "primary",
+                    "listing_validated": true, "primary_eligibility": primary_eligibility,
+                    "owner": owner, "owner_type": owner_type, "qualification_published": false,
+                }),
+            );
+            self.private_zones = Some(zones);
         }
         Ok(())
     }
@@ -215,6 +271,7 @@ impl PhotosService {
                 && primary.is_private_default_owner()
             {
                 self.primary_library = primary.clone();
+                observe_primary_publication();
             }
             return Ok(());
         }
@@ -236,6 +293,7 @@ impl PhotosService {
             // Publish qualification only after this exact selected scope passes
             // its own indexing check. A validated listing is not indexing proof.
             self.primary_library = self.initialize_library(zone, "private").await?;
+            observe_primary_publication();
         }
         Ok(())
     }
@@ -255,6 +313,7 @@ impl PhotosService {
                 && primary.is_private_default_owner()
             {
                 self.primary_library = primary.clone();
+                observe_primary_publication();
             }
             self.private_libraries = Some(libs);
         }
@@ -330,14 +389,18 @@ impl PhotosService {
         library_type: &str,
     ) -> anyhow::Result<PhotoLibrary> {
         let zone_name = &zone.zone_id.zone_name;
+        let zone_class = if zone_name == PRIMARY_ZONE_NAME {
+            "primary"
+        } else {
+            "other"
+        };
+        let (owner, owner_type) = owner_diagnostic_shape(zone.zone_id.extra.get("ownerRecordName"));
         crate::support::observe(
             "support_discovery_v1",
             json!({
                 "phase": "selected_qualified_indexing", "database": if library_type == "private" { "private" } else { "shared" },
-                "owner": match zone.zone_id.extra.get("ownerRecordName") {
-                    None => "absent", Some(Value::String(v)) if v == "_defaultOwner" => "private_default",
-                    Some(Value::String(_)) => "other_string", Some(_) => "malformed",
-                }, "selected_indexing": false, "qualification_published": false,
+                "zone_class": zone_class, "owner": owner, "owner_type": owner_type,
+                "selected_indexing": false, "qualification_published": false,
             }),
         );
         let mut library = PhotoLibrary::new(
@@ -357,7 +420,7 @@ impl PhotosService {
             "support_discovery_v1",
             json!({
                 "phase": "selected_qualified_indexing", "database": if library_type == "private" { "private" } else { "shared" },
-                "owner": if library.is_private_default_owner() { "private_default" } else { "other" },
+                "zone_class": zone_class, "owner": owner, "owner_type": owner_type,
                 "selected_indexing": true, "qualification_published": true,
             }),
         );

@@ -74,7 +74,7 @@ fn historical_support_questions_have_safe_structured_answers() {
         (
             "845 inventory unrelated scope",
             "legacy_inventory_failure_v2",
-            json!({"reason":"invalid_inventory_evidence","phase":"family_scan","subreason":"child_reference_scope_mismatch","eof_observed":true,"family_context":"unrelated","scope_mismatch_component":"owner","pages":5,"records":604,"transferred_bytes":40000000,"retained_bytes":25000000,"retained_byte_budget":268435456,"elapsed_secs":1020.0}),
+            json!({"reason":"invalid_inventory_evidence","phase":"family_scan","subreason":"child_reference_scope_mismatch","eof_observed":true,"family_context":"unrelated","scope_mismatch_component":"owner","expected_owner":"absent","expected_owner_type":"absent","supplied_owner":"private_default","supplied_owner_type":"string","pages":5,"records":604,"transferred_bytes":40000000,"retained_bytes":25000000,"retained_byte_budget":268435456,"elapsed_secs":1020.0}),
         ),
         (
             "845 refresh omissions",

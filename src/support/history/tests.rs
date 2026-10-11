@@ -230,7 +230,8 @@ fn serialized_byte_limit_rotates_complete_records() {
             let fields = json!({"pages":n,"records":u64::MAX,"transferred_bytes":u64::MAX,"retained_bytes":u64::MAX,
                 "page_budget":u64::MAX,"record_budget":u64::MAX,"page_byte_budget":u64::MAX,"retained_byte_budget":u64::MAX,
                 "elapsed_secs":1.7976931348623157e308,"reason":"invalid_inventory_evidence","phase":"family_scan","subreason":"child_reference_scope_mismatch",
-                "eof_observed":true,"family_context":"unrelated","scope_mismatch_component":"owner","child_soft_deleted":false});
+                "eof_observed":true,"family_context":"unrelated","scope_mismatch_component":"owner","child_soft_deleted":false,
+                "expected_owner":"private_default","expected_owner_type":"string","supplied_owner":"other_string","supplied_owner_type":"string"});
             add(
                 &mut history,
                 "legacy_inventory_failure_v2",

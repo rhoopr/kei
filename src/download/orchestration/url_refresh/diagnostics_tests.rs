@@ -87,6 +87,10 @@ async fn capture<T>(future: impl std::future::Future<Output = T>) -> (T, String)
                 "transferred_bytes",
                 "retained_bytes",
                 "scope_mismatch_component",
+                "expected_owner",
+                "expected_owner_type",
+                "supplied_owner",
+                "supplied_owner_type",
                 "elapsed_secs",
                 "page_budget",
                 "record_budget",
@@ -124,6 +128,8 @@ fn assert_redacted(log: &str, private_path: &std::path::Path) {
 struct Fixture {
     fail_lookup: bool,
     discover_owner: bool,
+    private_zones: Option<Value>,
+    fail_indexing_zone: Option<&'static str>,
     records: Arc<Vec<Value>>,
     pages: Arc<Vec<Value>>,
     calls: Arc<Mutex<Vec<Value>>>,
@@ -142,7 +148,12 @@ impl PhotosSession for Fixture {
         if request.pointer("/query/recordType").and_then(Value::as_str)
             == Some("CheckIndexingState")
         {
-            return Ok(json!({"records":[{"fields":{"state":{"value":"FINISHED"}}}]}));
+            let fail = request.pointer("/zoneID/ownerRecordName").is_some()
+                && request.pointer("/zoneID/zoneName").and_then(Value::as_str)
+                    == self.fail_indexing_zone;
+            return Ok(
+                json!({"records":[{"fields":{"state":{"value":if fail { "IN_PROGRESS" } else { "FINISHED" }}}}]}),
+            );
         }
         if url.contains("/zones/list") {
             return Ok(if url.contains("/shared/") {
@@ -200,6 +211,9 @@ impl PhotosSession for Fixture {
 }
 impl Fixture {
     fn zone_list(&self) -> Value {
+        if let Some(zones) = &self.private_zones {
+            return zones.clone();
+        }
         if self.discover_owner {
             json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}}]})
         } else {
@@ -210,6 +224,8 @@ impl Fixture {
         Self {
             fail_lookup: false,
             discover_owner,
+            private_zones: None,
+            fail_indexing_zone: None,
             records: Arc::new(records),
             pages: Arc::new(pages),
             calls: Arc::new(Mutex::new(Vec::new())),
@@ -351,6 +367,12 @@ async fn exact_refresh_diagnostics_scope_and_resource_matrix() {
                 "bare",
                 "same_owner",
                 "foreign_owner",
+                "null_owner",
+                "number_owner",
+                "boolean_owner",
+                "array_owner",
+                "object_owner",
+                "empty_owner",
                 "foreign_zone",
                 "partial",
                 "missing_child",
@@ -368,6 +390,20 @@ async fn exact_refresh_diagnostics_scope_and_resource_matrix() {
                     }
                     "foreign_owner" => {
                         records[1]["fields"]["masterRef"]["value"]["zoneID"] = json!({"zoneName":"PrimarySync","ownerRecordName":"PRIVATE_SCOPE_CANARY"})
+                    }
+                    "null_owner" | "number_owner" | "boolean_owner" | "array_owner"
+                    | "object_owner" | "empty_owner" => {
+                        let owner = match fault {
+                            "null_owner" => Value::Null,
+                            "number_owner" => json!(1),
+                            "boolean_owner" => json!(true),
+                            "array_owner" => json!([]),
+                            "object_owner" => json!({}),
+                            "empty_owner" => json!(""),
+                            _ => panic!("unknown synthetic owner fault: {fault}"),
+                        };
+                        records[1]["fields"]["masterRef"]["value"]["zoneID"] =
+                            json!({"zoneName":"PrimarySync","ownerRecordName":owner});
                     }
                     "foreign_zone" => {
                         records[1]["fields"]["masterRef"]["value"]["zoneID"] = json!({"zoneName":"SharedSync-PRIVATE_SCOPE_CANARY","ownerRecordName":"_defaultOwner"})
@@ -492,7 +528,8 @@ async fn exact_refresh_diagnostics_scope_and_resource_matrix() {
                 assert_redacted(&log, dir.path());
                 let expected_reason = match fault {
                     "same_owner" if !discover_owner => Some("owner_unqualified"),
-                    "foreign_owner" => Some(if discover_owner {
+                    "foreign_owner" | "null_owner" | "number_owner" | "boolean_owner"
+                    | "array_owner" | "object_owner" | "empty_owner" => Some(if discover_owner {
                         "owner_conflict"
                     } else {
                         "owner_unqualified"
@@ -517,6 +554,30 @@ async fn exact_refresh_diagnostics_scope_and_resource_matrix() {
                     assert!(
                         !log.contains("_rejection_v1"),
                         "accepted matching subset was labeled rejected"
+                    );
+                }
+                if let Some((owner_class, owner_type)) = match fault {
+                    "same_owner" if !discover_owner => Some(("private_default", "string")),
+                    "foreign_owner" => Some(("other_string", "string")),
+                    "null_owner" => Some(("null", "null")),
+                    "number_owner" => Some(("malformed", "number")),
+                    "boolean_owner" => Some(("malformed", "boolean")),
+                    "array_owner" => Some(("malformed", "array")),
+                    "object_owner" => Some(("malformed", "object")),
+                    "empty_owner" => Some(("empty", "string")),
+                    _ => None,
+                } {
+                    let rejection = log
+                        .lines()
+                        .find(|line| line.contains("exact_lookup_rejection_v1"))
+                        .unwrap();
+                    assert!(
+                        rejection.contains(&format!("supplied_owner=\"{owner_class}\"")),
+                        "{rejection}"
+                    );
+                    assert!(
+                        rejection.contains(&format!("supplied_owner_type=\"{owner_type}\"")),
+                        "{rejection}"
                     );
                 }
                 let summary = log
@@ -690,6 +751,16 @@ async fn preservation_diagnostics_two_page_matrix() {
             } else if let Err(error) = result {
                 let diagnostic = classify_legacy_inventory_error(&error).unwrap();
                 assert_eq!(diagnostic.reason, "invalid_inventory_evidence");
+                if matches!(
+                    fault,
+                    "sparse" | "soft_deleted_sparse" | "missing_capture_date"
+                ) {
+                    assert_eq!(diagnostic.supplied_owner, "not_recorded");
+                    assert_eq!(diagnostic.supplied_owner_type, "not_recorded");
+                } else if fault == "foreign_unrelated" {
+                    assert_eq!(diagnostic.supplied_owner, "absent");
+                    assert_eq!(diagnostic.supplied_owner_type, "absent");
+                }
                 assert_eq!(diagnostic.pages, 2);
                 assert!(diagnostic.transferred_bytes < 64 * 1024 * 1024);
                 assert!(diagnostic.retained_bytes < 256 * 1024 * 1024);
@@ -763,6 +834,439 @@ async fn preservation_diagnostics_two_page_matrix() {
             eprintln!(
                 "preservation scope={discover_owner} case={fault} pages=2 success={expected_success} checkpoint=retained debt=retained media_writes=0"
             );
+        }
+    }
+}
+
+/// Capture the production allowlisted projection without using saved history or
+/// private state. This checks producer meaning, not just allowlist membership.
+async fn support_capture<T>(future: impl std::future::Future<Output = T>) -> (T, Vec<Value>) {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("support.json");
+    let (recorder, guard) = crate::support::history::start(path.clone(), json!({})).unwrap();
+    let result = future
+        .with_subscriber(
+            tracing_subscriber::registry().with(recorder).with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::sink)
+                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            ),
+        )
+        .await;
+    guard.finish().await;
+    let observations = crate::support::history::test_retained_events(&path);
+    for observation in &observations {
+        assert!(!observation.to_string().contains("PRIVATE_"));
+        assert!(!observation.to_string().contains("https://"));
+    }
+    (result, observations)
+}
+
+#[tokio::test]
+async fn inventory_owner_diagnostics_distinguish_default_foreign_and_malformed() {
+    let mut projections = Vec::new();
+    for discover_owner in [false, true] {
+        for (label, owner, owner_class, owner_type) in [
+            (
+                "default",
+                json!("_defaultOwner"),
+                "private_default",
+                "string",
+            ),
+            ("foreign", json!("PRIVATE_OTHER"), "other_string", "string"),
+            ("null", Value::Null, "null", "null"),
+            ("number", json!(1000), "malformed", "number"),
+            ("boolean", json!(true), "malformed", "boolean"),
+            ("array", json!([]), "malformed", "array"),
+            ("object", json!({}), "malformed", "object"),
+            ("empty", json!(""), "empty", "string"),
+        ] {
+            let first = family();
+            let mut sibling = first[1].clone();
+            sibling["recordName"] = json!("PRIVATE_SECOND_CHILD_CANARY");
+            let unrelated = json!({"recordName":"PRIVATE_UNRELATED_CHILD_CANARY","recordType":"CPLAsset","fields":{"masterRef":{"value":{"recordName":"outside-family","zoneID":{"zoneName":"PrimarySync","ownerRecordName":owner}}}}});
+            let fixture = Fixture::new(
+                discover_owner,
+                vec![],
+                vec![
+                    page(first, "first", true),
+                    page(vec![sibling, unrelated], "final", false),
+                ],
+            );
+            let album = fixture.actual_album("all").await;
+            let (result, observations) = support_capture(async {
+                let result = album
+                    .complete_legacy_inventory(
+                        &FxHashSet::from_iter(["PRIVATE_MASTER_ID_CANARY".to_string()]),
+                        &CancellationToken::new(),
+                    )
+                    .await;
+                if let Err(error) = &result {
+                    crate::download::legacy_preservation::log_preservation_hold(
+                        "preparation",
+                        error,
+                    );
+                }
+                result
+            })
+            .await;
+            assert_eq!(
+                result.is_ok(),
+                discover_owner && label == "default",
+                "{discover_owner} {label}"
+            );
+            if let Err(error) = result {
+                let diagnostic = classify_legacy_inventory_error(&error).unwrap();
+                assert_eq!(diagnostic.subreason, "child_reference_scope_mismatch");
+                assert_eq!(diagnostic.scope_mismatch_component, "owner");
+                assert_eq!(diagnostic.family_context, "unrelated");
+                assert!(diagnostic.eof_observed);
+                let mut fields = observations
+                    .iter()
+                    .find(|o| o["kind"] == "legacy_inventory_failure_v2")
+                    .unwrap()["fields"]
+                    .clone();
+                let map = fields.as_object_mut().unwrap();
+                assert_eq!(
+                    map["expected_owner"],
+                    if discover_owner {
+                        "private_default"
+                    } else {
+                        "absent"
+                    }
+                );
+                assert_eq!(
+                    map["expected_owner_type"],
+                    if discover_owner { "string" } else { "absent" }
+                );
+                assert_eq!(map["supplied_owner"], owner_class);
+                assert_eq!(map["supplied_owner_type"], owner_type);
+                // Duration is not provenance. Equal-length fixtures previously
+                // collided even when page, record and byte counters were retained.
+                map.remove("elapsed_secs");
+                if !discover_owner {
+                    projections.push((label, fields));
+                }
+            }
+        }
+    }
+    let projection = |label| {
+        &projections
+            .iter()
+            .find(|(name, _)| *name == label)
+            .unwrap()
+            .1
+    };
+    assert_ne!(projection("default"), projection("foreign"));
+    assert_ne!(projection("null"), projection("number"));
+}
+
+#[tokio::test]
+async fn discovery_diagnostics_identify_qualified_primary_scope() {
+    let mut projections = Vec::new();
+    for (zone_name, owner, deleted, eligibility, owner_class, owner_type, qualified_primary) in [
+        (
+            Some("PrimarySync"),
+            Some(json!("_defaultOwner")),
+            false,
+            "eligible",
+            "private_default",
+            "string",
+            true,
+        ),
+        (
+            Some("SharedSync-PRIVATE_OTHER"),
+            Some(json!("_defaultOwner")),
+            false,
+            "no_primary",
+            "absent",
+            "absent",
+            false,
+        ),
+        (None, None, false, "no_primary", "absent", "absent", false),
+        (
+            Some("PrimarySync"),
+            Some(json!("_defaultOwner")),
+            true,
+            "primary_deleted",
+            "private_default",
+            "string",
+            false,
+        ),
+        (
+            Some("PrimarySync"),
+            None,
+            false,
+            "owner_not_default",
+            "absent",
+            "absent",
+            false,
+        ),
+        (
+            Some("PrimarySync"),
+            Some(json!("PRIVATE_OTHER")),
+            false,
+            "owner_not_default",
+            "other_string",
+            "string",
+            false,
+        ),
+        (
+            Some("PrimarySync"),
+            Some(Value::Null),
+            false,
+            "owner_not_default",
+            "null",
+            "null",
+            false,
+        ),
+        (
+            Some("PrimarySync"),
+            Some(json!(1000)),
+            false,
+            "owner_not_default",
+            "malformed",
+            "number",
+            false,
+        ),
+        (
+            Some("PrimarySync"),
+            Some(json!(true)),
+            false,
+            "owner_not_default",
+            "malformed",
+            "boolean",
+            false,
+        ),
+        (
+            Some("PrimarySync"),
+            Some(json!([])),
+            false,
+            "owner_not_default",
+            "malformed",
+            "array",
+            false,
+        ),
+        (
+            Some("PrimarySync"),
+            Some(json!({})),
+            false,
+            "owner_not_default",
+            "malformed",
+            "object",
+            false,
+        ),
+        (
+            Some("PrimarySync"),
+            Some(json!("")),
+            false,
+            "owner_not_default",
+            "empty",
+            "string",
+            false,
+        ),
+    ] {
+        let mut fixture = Fixture::new(false, vec![], vec![]);
+        let zones = if let Some(zone_name) = zone_name {
+            let mut zone = json!({"zoneID":{"zoneName":zone_name}, "deleted":deleted});
+            if let Some(owner) = owner {
+                zone["zoneID"]["ownerRecordName"] = owner;
+            }
+            vec![zone]
+        } else {
+            vec![]
+        };
+        fixture.private_zones = Some(json!({"zones":zones}));
+        let (primary_is_qualified, observations) = support_capture(async {
+            let mut service = PhotosService::new(
+                "https://synthetic.invalid".into(),
+                Box::new(fixture.clone()),
+                Default::default(),
+                RetryConfig {
+                    max_retries: 0,
+                    base_delay_secs: 0,
+                    max_delay_secs: 0,
+                },
+            )
+            .await
+            .unwrap();
+            let album = service
+                .all_libraries()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|library| library.zone_name() == "PrimarySync")
+                .unwrap()
+                .all();
+            use crate::icloud::photos::{ProviderRecordId, RecordLookupRequest};
+            let _batch = album
+                .resolve_records(&[RecordLookupRequest::paired(
+                    ProviderRecordId::new("PRIVATE_CHILD"),
+                    ProviderRecordId::new("PRIVATE_MASTER"),
+                    ProviderRecordId::new("PRIVATE_CHILD"),
+                )])
+                .await;
+            fixture
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|request| request.get("records").is_some())
+                .unwrap()["zoneID"]
+                .get("ownerRecordName")
+                .and_then(Value::as_str)
+                == Some("_defaultOwner")
+        })
+        .await;
+        assert_eq!(primary_is_qualified, qualified_primary);
+        let fields: Vec<_> = observations
+            .into_iter()
+            .filter(|o| o["kind"] == "support_discovery_v1")
+            .map(|o| o["fields"].clone())
+            .collect();
+        let discovery = fields
+            .iter()
+            .find(|event| event["phase"] == "primary_discovery")
+            .unwrap();
+        assert_eq!(discovery["database"], "private");
+        assert_eq!(discovery["zone_class"], "primary");
+        assert_eq!(discovery["listing_validated"], true);
+        assert_eq!(discovery["primary_eligibility"], eligibility);
+        assert_eq!(discovery["owner"], owner_class);
+        assert_eq!(discovery["owner_type"], owner_type);
+        assert_eq!(
+            fields
+                .iter()
+                .any(|event| event["phase"] == "primary_publication"),
+            qualified_primary
+        );
+        if zone_name == Some("SharedSync-PRIVATE_OTHER") {
+            let selected = fields
+                .iter()
+                .find(|event| event["selected_indexing"] == true)
+                .unwrap();
+            assert_eq!(selected["zone_class"], "other");
+            assert_eq!(selected["owner"], "private_default");
+        }
+        projections.push(fields);
+    }
+    // These two production-path cases previously had identical retained events.
+    assert_ne!(projections[0], projections[1]);
+}
+
+#[tokio::test]
+async fn discovery_diagnostics_do_not_publish_after_failed_listing_or_indexing() {
+    for fault in [
+        "invalid_listing",
+        "primary_indexing",
+        "later_private_indexing",
+    ] {
+        let mut fixture = Fixture::new(false, vec![], vec![]);
+        let mut zones =
+            vec![json!({"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}})];
+        match fault {
+            "invalid_listing" => zones.push(zones[0].clone()),
+            "primary_indexing" => fixture.fail_indexing_zone = Some("PrimarySync"),
+            "later_private_indexing" => {
+                zones.push(json!({"zoneID":{"zoneName":"SharedSync-PRIVATE_OTHER","ownerRecordName":"_defaultOwner"}}));
+                fixture.fail_indexing_zone = Some("SharedSync-PRIVATE_OTHER");
+            }
+            _ => panic!("unknown discovery fixture"),
+        }
+        fixture.private_zones = Some(json!({"zones":zones}));
+        let (result, observations) = support_capture(async {
+            let mut service = PhotosService::new(
+                "https://synthetic.invalid".into(),
+                Box::new(fixture),
+                Default::default(),
+                RetryConfig {
+                    max_retries: 0,
+                    base_delay_secs: 0,
+                    max_delay_secs: 0,
+                },
+            )
+            .await
+            .unwrap();
+            service.all_libraries().await
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(
+            !observations
+                .iter()
+                .any(|event| event["fields"]["phase"] == "primary_publication")
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .any(|event| event["fields"]["listing_validated"] == true),
+            fault != "invalid_listing"
+        );
+        if fault == "later_private_indexing" {
+            // Primary initialization succeeded, but the complete private map
+            // failed before publication. Generic indexing success is insufficient.
+            assert!(
+                observations
+                    .iter()
+                    .any(|event| event["fields"]["zone_class"] == "primary"
+                        && event["fields"]["selected_indexing"] == true)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn inventory_envelope_owner_diagnostics_preserve_request_scope_guards() {
+    for discover_owner in [false, true] {
+        for (owner, owner_class, owner_type) in [
+            (json!("_defaultOwner"), "private_default", "string"),
+            (json!("PRIVATE_OTHER"), "other_string", "string"),
+            (Value::Null, "null", "null"),
+            (json!(1000), "malformed", "number"),
+            (json!(true), "malformed", "boolean"),
+            (json!([]), "malformed", "array"),
+            (json!({}), "malformed", "object"),
+            (json!(""), "empty", "string"),
+        ] {
+            let mut response = page(family(), "final", false);
+            response["zones"][0]["zoneID"]["ownerRecordName"] = owner;
+            let fixture = Fixture::new(discover_owner, vec![], vec![response]);
+            let album = fixture.actual_album("primary").await;
+            let (result, observations) = support_capture(async {
+                let result = album
+                    .complete_legacy_inventory(
+                        &FxHashSet::from_iter(["PRIVATE_MASTER_ID_CANARY".to_string()]),
+                        &CancellationToken::new(),
+                    )
+                    .await;
+                if let Err(error) = &result {
+                    crate::download::legacy_preservation::log_preservation_hold(
+                        "preparation",
+                        error,
+                    );
+                }
+                result
+            })
+            .await;
+            // A supplied envelope owner does not grant an ownerless request
+            // authority. Preserve the existing envelope and reference asymmetry.
+            assert_eq!(
+                result.is_ok(),
+                !discover_owner || owner_class == "private_default"
+            );
+            if result.is_err() {
+                let fields = &observations
+                    .iter()
+                    .find(|event| event["kind"] == "legacy_inventory_failure_v2")
+                    .unwrap()["fields"];
+                assert_eq!(fields["phase"], "scope");
+                assert_eq!(fields["subreason"], "zone_scope_mismatch");
+                assert_eq!(fields["scope_mismatch_component"], "owner");
+                assert_eq!(fields["expected_owner"], "private_default");
+                assert_eq!(fields["expected_owner_type"], "string");
+                assert_eq!(fields["supplied_owner"], owner_class);
+                assert_eq!(fields["supplied_owner_type"], owner_type);
+            }
         }
     }
 }

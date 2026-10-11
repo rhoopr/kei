@@ -258,6 +258,10 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "transferred_bytes",
             "retained_bytes",
             "scope_mismatch_component",
+            "expected_owner",
+            "expected_owner_type",
+            "supplied_owner",
+            "supplied_owner_type",
             "elapsed_secs",
             "page_budget",
             "record_budget",
@@ -324,7 +328,11 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
         "support_discovery_v1" => Some(&[
             "phase",
             "database",
+            "zone_class",
+            "listing_validated",
+            "primary_eligibility",
             "owner",
+            "owner_type",
             "selected_indexing",
             "qualification_published",
         ]),
@@ -471,14 +479,72 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+// Owner morphology is a fixed string category, never a numeric provider value.
+// Revalidate saved history as strictly as current producer observations.
+fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
+    let label = value.as_str();
+    match key {
+        "expected_owner" if kind == "exact_lookup_rejection_v1" => {
+            label.is_some_and(|label| matches!(label, "absent" | "private_default" | "other"))
+        }
+        "expected_owner" | "supplied_owner" => label.is_some_and(|label| {
+            matches!(
+                label,
+                "absent"
+                    | "null"
+                    | "private_default"
+                    | "other_string"
+                    | "malformed"
+                    | "empty"
+                    | "not_recorded"
+            )
+        }),
+        "owner" if kind == "support_discovery_v1" => label.is_some_and(|label| {
+            matches!(
+                label,
+                "absent"
+                    | "null"
+                    | "private_default"
+                    | "other_string"
+                    | "malformed"
+                    | "empty"
+                    | "not_recorded"
+                    | "other"
+            )
+        }),
+        "expected_owner_type" | "supplied_owner_type" | "owner_type" => {
+            label.is_some_and(|label| {
+                matches!(
+                    label,
+                    "absent"
+                        | "null"
+                        | "string"
+                        | "number"
+                        | "boolean"
+                        | "array"
+                        | "object"
+                        | "not_recorded"
+                )
+            })
+        }
+        "zone_class" => label.is_some_and(|label| matches!(label, "primary" | "other")),
+        "primary_eligibility" => label.is_some_and(|label| {
+            matches!(
+                label,
+                "eligible" | "no_primary" | "primary_deleted" | "owner_not_default"
+            )
+        }),
+        _ => scalar(value) || label.is_some_and(fixed_label),
+    }
+}
+
 pub(super) fn diagnostic(kind: &str, fields: &Map<String, Value>) -> Option<Map<String, Value>> {
     let allowed = contract(kind)?;
     Some(
         fields
             .iter()
             .filter(|(k, v)| {
-                (allowed.contains(&k.as_str())
-                    && (scalar(v) || v.as_str().is_some_and(fixed_label)))
+                (allowed.contains(&k.as_str()) && diagnostic_value(kind, k, v))
                     || (matches!(k.as_str(), "item_alias" | "scope_alias")
                         && v.as_str().is_some_and(valid_alias))
                     || (k.as_str() == "correlation_unavailable" && v.is_boolean())
@@ -493,6 +559,12 @@ pub(crate) fn fixed_label(value: &str) -> bool {
 }
 
 const LABELS: &[&str] = &[
+    "primary_discovery",
+    "primary_publication",
+    "no_primary",
+    "primary_deleted",
+    "owner_not_default",
+    "eligible",
     "same_cycle_recovery",
     "recoverable",
     "initial",

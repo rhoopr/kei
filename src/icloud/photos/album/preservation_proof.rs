@@ -43,6 +43,10 @@ pub(crate) struct LegacyInventoryDiagnostic {
     pub(crate) transferred_bytes: usize,
     pub(crate) retained_bytes: usize,
     pub(crate) scope_mismatch_component: &'static str,
+    pub(crate) expected_owner: &'static str,
+    pub(crate) expected_owner_type: &'static str,
+    pub(crate) supplied_owner: &'static str,
+    pub(crate) supplied_owner_type: &'static str,
     pub(crate) elapsed_secs: f64,
     pub(crate) page_budget: usize,
     pub(crate) record_budget: usize,
@@ -204,7 +208,13 @@ impl PhotoAlbum {
         budget: InventoryBudget,
     ) -> anyhow::Result<CompleteLegacyInventory> {
         let started = std::time::Instant::now();
+        let (expected_owner, expected_owner_type) =
+            super::super::owner_diagnostic_shape(self.zone_id.get("ownerRecordName"));
         let mut progress = LegacyInventoryDiagnostic {
+            expected_owner,
+            expected_owner_type,
+            supplied_owner: "not_recorded",
+            supplied_owner_type: "not_recorded",
             page_budget: budget.pages,
             record_budget: budget.records,
             page_byte_budget: budget.page_bytes,
@@ -292,6 +302,20 @@ impl PhotoAlbum {
                 .get("zoneID")
                 .context(InventoryFailureKind::Evidence("missing_zone_scope"))?;
             progress.phase = "scope";
+            (progress.supplied_owner, progress.supplied_owner_type) =
+                super::super::owner_diagnostic_shape(zone_id.get("ownerRecordName"));
+            progress.scope_mismatch_component =
+                if zone_id.get("zoneName") != self.zone_id.get("zoneName") {
+                    "zone_name"
+                } else if self
+                    .zone_id
+                    .get("ownerRecordName")
+                    .is_some_and(|owner| zone_id.get("ownerRecordName") != Some(owner))
+                {
+                    "owner"
+                } else {
+                    "not_applicable"
+                };
             anyhow::ensure!(
                 zone_id.get("zoneName") == self.zone_id.get("zoneName")
                     && self
@@ -300,6 +324,9 @@ impl PhotoAlbum {
                         .is_none_or(|owner| zone_id.get("ownerRecordName") == Some(owner)),
                 InventoryFailureKind::Evidence("zone_scope_mismatch")
             );
+            progress.supplied_owner = "not_recorded";
+            progress.supplied_owner_type = "not_recorded";
+            progress.scope_mismatch_component = "not_applicable";
             progress.phase = "envelope";
             anyhow::ensure!(
                 zone.get("moreComing").and_then(Value::as_bool).is_some(),
@@ -411,6 +438,10 @@ impl PhotoAlbum {
                 .filter(|record| record.record_type == "CPLAsset" && record.deleted != Some(true))
             {
                 progress.phase = "child_reference";
+                // A later sparse child must not inherit a previous child's scope.
+                progress.scope_mismatch_component = "not_applicable";
+                progress.supplied_owner = "not_recorded";
+                progress.supplied_owner_type = "not_recorded";
                 progress.family_context = "unknown";
                 progress.child_soft_deleted = record
                     .fields
@@ -437,6 +468,12 @@ impl PhotoAlbum {
                 } else {
                     "unrelated"
                 };
+                (progress.supplied_owner, progress.supplied_owner_type) =
+                    super::super::owner_diagnostic_shape(
+                        reference
+                            .get("zoneID")
+                            .and_then(|scope| scope.get("ownerRecordName")),
+                    );
                 if let Some(scope) = reference.get("zoneID") {
                     progress.scope_mismatch_component = if scope
                         .get("zoneName")
@@ -478,6 +515,9 @@ impl PhotoAlbum {
             progress.phase = "family_hydration";
             progress.family_context = "candidate";
             progress.child_soft_deleted = false;
+            progress.supplied_owner = "not_recorded";
+            progress.supplied_owner_type = "not_recorded";
+            progress.scope_mismatch_component = "not_applicable";
             let family_records = latest
                 .into_values()
                 .map(|(record, _)| record)
