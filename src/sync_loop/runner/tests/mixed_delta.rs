@@ -957,11 +957,11 @@ async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
                 step.drift = true;
                 step.fault = Some(InventoryFault::BridgeQuery);
             }
-            12 => {
+            _ => {
+                assert_eq!(case, 12, "unexpected inventory veto case");
                 step.drift = true;
                 step.fault = Some(InventoryFault::BridgeCancellation);
             }
-            _ => unreachable!(),
         }
         let result = inventory_cycle(root.path(), &step).await;
         assert_eq!(
