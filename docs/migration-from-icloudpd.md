@@ -7,11 +7,18 @@ This guide is for moving an existing
 (`icloudpd`) library to kei without downloading everything again. It matches
 kei v0.20.
 
-The short version:
+Before importing, stop other writers and keep an independent backup of the
+archive and any existing kei state. Do not start the setup wizard's immediate
+sync against an existing archive.
 
-1. Put the existing photo directory in `[download].directory`.
-2. Put the path-shaping options Python used in TOML.
-3. Run `kei import-existing`, then `kei sync` from then on.
+1. Put the existing photo directory in `[download].directory` and match the
+   path-shaping options Python used.
+2. Preview with `kei import-existing --dry-run` using that config. Consider
+   `--strict` for a cloud-prefix comparison; even a preview authenticates and
+   enumerates iCloud.
+3. Inspect matched and unmatched results. Fix layout mismatches before a real
+   import, then inspect its summary before syncing. Unmatched files can cause
+   another copy to be downloaded; import is not proof of a complete backup.
 
 kei can't reuse Python's `~/.pyicloud` cookies, so the first run still needs a
 fresh Apple login and 2FA approval. Your local photo files can stay in place.
@@ -42,10 +49,10 @@ Point kei at the directory that `icloudpd` has been writing to:
 directory = "~/Photos/iCloud"
 ```
 
-Then run the import with that config:
+Preview the import with that config first:
 
 ```sh
-ICLOUD_USERNAME=you@example.com kei import-existing --config ~/.config/kei/config.toml
+ICLOUD_USERNAME=you@example.com kei import-existing --config ~/.config/kei/config.toml --dry-run
 ```
 
 `import-existing` signs in, enumerates the selected iCloud libraries, computes
@@ -70,10 +77,10 @@ sanitized child IDs also remain unmatched without verified durable ownership.
 Import does not rename or overwrite these files.
 
 
-Run a dry import first when you're not sure the config matches the old tree:
+After reviewing the preview and matching the layout, run the actual import:
 
 ```sh
-ICLOUD_USERNAME=you@example.com kei import-existing --config ~/.config/kei/config.toml --dry-run
+ICLOUD_USERNAME=you@example.com kei import-existing --config ~/.config/kei/config.toml
 ```
 
 If most files show as unmatched, stop and fix the path options before running a

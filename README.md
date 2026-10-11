@@ -21,28 +21,108 @@ It handles the parts that make photo backups annoying: big libraries, shared lib
 > 
 > Read [CHANGELOG.md](CHANGELOG.md) before updating.
 
-## Install
+## Before you install
+
+- Use macOS, Linux, or Windows with a native binary, or Docker on a supported
+  host/NAS. Choose writable storage with room for the selected originals,
+  videos, companion files, and temporary downloads. Start in a new, empty folder.
+- Have your Apple Account password and a trusted Apple device ready for the
+  six-digit 2FA code. SMS-only 2FA, app-specific passwords, and accounts with
+  registered FIDO/WebAuthn security keys are not supported.
+- kei requires iCloud Photos web access and Advanced Data Protection (ADP)
+  turned off. Turning off ADP removes end-to-end encryption for Photos and the
+  other data categories it protects; Apple then holds the recovery keys under
+  standard data protection. Read [Apple's explanation](https://support.apple.com/en-us/108756)
+  and [kei authentication requirements](https://github.com/rhoopr/kei/wiki/Authentication)
+  before deciding. If you want to keep ADP enabled, stop here: kei cannot back up
+  that library. Web access alone does not make ADP compatible.
+
+Already have an `icloudpd` archive? Start with
+[Migrating from icloudpd](docs/migration-from-icloudpd.md), including the import
+preview and path checks, before pointing kei at it. For an existing kei install,
+read [Upgrade and compatibility](docs/v0.25-upgrade.md) before opening its state.
+
+## Choose your installation route
+
+### Native CLI
+
+On macOS with Homebrew:
 
 ```sh
 brew install rhoopr/kei/kei
 ```
 
-```sh
-docker pull ghcr.io/rhoopr/kei:latest
-```
+For macOS, Linux, or Windows without Homebrew, download the matching binary from
+[Releases](https://github.com/rhoopr/kei/releases), unpack it, and put `kei` on
+your PATH. Confirm the installed version with `kei --version`. Source builds
+and FreeBSD instructions are in [Install](https://github.com/rhoopr/kei/wiki/Install).
 
-Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, source builds, FreeBSD, and NAS setup, see [Install](https://github.com/rhoopr/kei/wiki/Install).
+### Docker or NAS
 
-## Start
+Follow [First backup with Docker](docs/docker-first-backup.md) for persistent
+mounts, configuration, password storage, login, and a small trial sync. Run
+those commands on the Docker host; the native commands below assume `kei` is
+installed directly on your computer.
+
+## Make a small first backup
+
+For a new native setup, run:
 
 ```sh
 kei config setup
-kei sync
 ```
 
-The setup wizard creates `~/.config/kei/config.toml`, asks where photos should land, and can save your password in the OS keyring. You'll still approve 2FA on a trusted Apple device the first time.
+Choose a fresh destination such as `~/Photos/kei-first-backup`, your main library,
+and **Manually when needed**. Leave date/recent limits unset for now. Review the
+selected albums, media types, and output paths before saving. At **Want to kick
+off your first sync right now?**, answer **no** for this trial. The default is
+**yes**, which immediately starts a one-shot sync with the saved selection.
+Even if you choose watch mode, that wizard-started sync runs only once; later
+`kei sync` runs can inherit the saved watch interval.
 
-A tiny config looks like this:
+The wizard writes `~/.config/kei/config.toml` and offers credential storage.
+If it writes an environment file, follow its printed load instructions before
+the next command. Then run the bounded trial:
+
+```sh
+kei sync --recent 10
+kei status
+```
+
+Approve the trusted-device prompt and enter the six-digit code when asked.
+`--recent 10` caps recent asset candidates per selected library before filters;
+it does not promise ten files or ten successful downloads. Album copies, Live
+Photo companions, and selected renditions can produce more files, and filters
+can leave fewer. This is a sample, not a complete library backup.
+
+### Check the result
+
+1. Read the sync summary and any warnings. Failed, pending, unresolved, or
+   incomplete work needs attention even if some files downloaded successfully.
+2. Open the destination in your file manager. Find expected recent photos in
+   the configured album/date folders and open a photo and video when selected.
+   Live Photos normally include a still image and a MOV companion.
+3. Use `kei status` to inspect recorded progress. Its clean status describes
+   recorded work, not proof that every iCloud item or rendition was selected.
+   Optional `kei verify --checksums` checks recorded local bytes; it cannot prove
+   cloud completeness or restore damaged files.
+
+Photos live under `[download].directory`. Config, sessions, credentials, and
+SQLite state normally live under `~/.config/kei`; with a custom config path,
+state defaults to that file's parent unless `data_dir` or `KEI_DATA_DIR` overrides
+it. Keep this state as well as the media. Default renditions include originals
+and Live Photo companions; edited versions and alternative/RAW renditions need
+explicit selection. See [example.config.toml](example.config.toml).
+
+## Expand the backup
+
+Once the trial looks right, `kei sync` without the one-run `--recent` flag syncs
+your saved selection. Review the config first: saved date/recent filters still
+apply, and the wizard can select all visible libraries, including shared ones.
+Check albums, smart folders, unfiled media, edited versions, and RAW options
+before calling the result a full backup.
+
+As an alternative to the wizard, a minimal config is:
 
 ```toml
 [auth]
@@ -52,94 +132,55 @@ username = "you@example.com"
 directory = "~/Photos/iCloud"
 ```
 
-After the first run:
+This uses the primary library, all its user albums, and an unfiled pass by
+default. Keep persistent settings in TOML. For a one-run date window instead
+of the full saved selection, use `kei sync --recent 30d`.
 
-```sh
-kei status
-kei sync --recent 30d
-kei list albums
-```
-
-For unattended login and two-factor recovery, see [Authentication](https://github.com/rhoopr/kei/wiki/Authentication).
-Keep saved settings in TOML; use [example.config.toml](example.config.toml) for defaults and supported options.
-
-## What kei gives you
-
-- Fast, parallel downloads for large cloud photo libraries.
-- A local copy of your media, with no Apple Photos library required.
-- Folder layouts for dates, albums, smart folders, shared libraries, and unfiled photos.
-- Original photos and videos, plus Live Photos, RAW siblings, and edited versions when you ask for them.
-- Resumable downloads and checksum checks before files are marked complete.
-- One-shot sync, watch mode, Docker, systemd, launchd, and Windows service support.
-- Maintenance commands for status checks, local diagnostics, manifest export, verification, reconcile, reset, and existing-file import.
-
-> [!IMPORTANT]
-> kei needs iCloud Photos web access. If `Advanced Data Protection` is on, turn it off and enable "Access iCloud Data on the Web" in your Apple ID settings. See [Authentication](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp).
-
-## Common setups
-
-### Run a daily backup
+For a daily unattended run, add this table to your existing config:
 
 ```toml
-[auth]
-username = "you@example.com"
-
-[download]
-directory = "/photos"
-
 [watch]
 interval = 86400
 ```
 
-Run it with `kei service run`, Docker Compose, or `kei install`.
+`kei service run` runs in the foreground; `kei install` installs a native
+service. Follow [Service mode](https://github.com/rhoopr/kei/wiki/Service) and
+[Authentication](https://github.com/rhoopr/kei/wiki/Authentication) for startup,
+saved credentials, and future 2FA recovery. Docker users should finish the
+[container guide](docs/docker-first-backup.md#run-unattended).
 
-### Sync only part of the library
+## Get help or maintain a backup
 
-```toml
-[filters]
-albums = ["Family", "Trips"]
-unfiled = false
-media = ["photos", "videos", "live-photos"]
-```
+For a failed first run, check the destination permissions, free space, selection,
+and [authentication requirements](https://github.com/rhoopr/kei/wiki/Authentication).
+See [Status](https://github.com/rhoopr/kei/wiki/Status) and
+[Doctor](https://github.com/rhoopr/kei/wiki/Doctor) for diagnostics.
 
-You can also sync recent media for one run:
+For bugs or confusing results, open an [issue](https://github.com/rhoopr/kei/issues)
+with the version, expected result, and symptoms. When available, run
+`kei support-export --output kei-support.json` with the same config and data
+directory. It collects saved evidence offline without a new sync or automatic
+upload. Review the file locally before attaching it; older versions and partial
+exports are welcome. See [Support export](docs/support-export.md), including
+Docker instructions.
 
-```sh
-kei sync --recent 100
-kei sync --recent 30d
-```
+Repair commands can change state or replace recorded files. Read
+[Backup maintenance](docs/backup-maintenance.md) first. Do not delete state or
+conflicting files to clear a warning. Legacy preservation normally refuses
+multiply linked files; its [hardlink waiver](docs/backup-maintenance.md#legacy-preservation-and-hardlinks)
+can affect shared inodes and does not make kei read-only.
 
-### Adopt files you already have
+## What kei gives you
 
-```sh
-kei import-existing
-kei sync
-```
-
-### Check or repair a backup
-
-Use `kei status` to inspect recorded progress and `kei verify --checksums` to
-check local bytes. Repair commands can change state or replace recorded files.
-Read [Backup maintenance](docs/backup-maintenance.md) before using them.
+- Parallel downloads, resumable transfers, and checksum checks before completion.
+- Local media without an Apple Photos library, with configurable album/date layouts.
+- Shared libraries, Live Photos, and optional edited and alternative/RAW renditions.
+- One-shot sync, watch mode, Docker, systemd, launchd, and Windows service support.
+- Status, diagnostics, manifest export, verification, repair, and existing-file import.
 
 Metadata capture in the catalogue is automatic. Embedded metadata and XMP
 sidecars are opt-in. See [Metadata output](docs/metadata.md) for supported
 formats, safe refusals, and explicit timestamp repair.
-
-Legacy preservation normally refuses files with multiple hard links. The TOML-only
-`[download].legacy_preservation_allow_hardlinks = true` setting waives that
-link-count check for legacy originals and qualifying current outputs, including
-sidecars. When used, it emits one warning per library cycle with the number of
-distinct evidence paths whose shared-link check was waived. It assumes you coordinate external tools so they do not change linked
-contents, metadata, or kei-managed names during the operation.
-
-This setting does not make kei read-only: distinct original and current paths
-can share an inode, and existing identical-file reuse can set timestamps through
-aliases even when metadata output is disabled. Repair and recovery behavior is
-unchanged. Other preservation checks still apply. Broader hardlink support remains
-open in [#884](https://github.com/rhoopr/kei/issues/884).
-
-Coming from `icloudpd`? Read [Migrating from icloudpd](docs/migration-from-icloudpd.md).
 
 ## Docs
 
@@ -168,10 +209,3 @@ MIT - see [LICENSE](LICENSE)
 ## Acknowledgments
 
 kei's iCloud support builds on reverse-engineering from [icloud-photos-downloader](https://github.com/icloud-photos-downloader/icloud_photos_downloader). kei was originally published as `icloudpd-rs` before broadening beyond iCloud Photos.
-
-## Reporting a bug
-
-Attach a locally reviewed [support export](docs/support-export.md) when available.
-Run `kei support-export --output kei-support.json` with your normal configuration
-and data directory. The command collects saved evidence offline without a new
-sync or automatic upload. Older versions and partial exports are welcome too.
