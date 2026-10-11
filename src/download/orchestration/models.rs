@@ -184,6 +184,18 @@ pub struct SyncResult {
     pub(crate) full_enumeration_ran: bool,
     /// Per-zone safety evidence. Reporting snapshots never authorize a checkpoint.
     pub(crate) checkpoint: CheckpointEvidence,
+    /// Complete count evidence from this result's original full-query invocation.
+    /// Composition never promotes a later subset or adds repeated observations.
+    pub(crate) inventory: Option<InventoryMeasurement>,
+}
+
+/// Diagnostic count evidence, not source-checkpoint authority.
+#[derive(Debug)]
+#[must_use]
+pub(crate) struct InventoryMeasurement {
+    pub(crate) scope: super::config::InventoryScope,
+    pub(crate) total: u64,
+    pub(crate) assets_seen: u64,
 }
 
 /// Execution facts used by the existing source-checkpoint classifier.
@@ -296,6 +308,7 @@ impl SyncResult {
             stats,
             full_enumeration_ran: false,
             checkpoint,
+            inventory: None,
         }
     }
 
@@ -306,6 +319,8 @@ impl SyncResult {
         self.checkpoint.accumulate(&other.checkpoint);
         self.checkpoint.project(&mut self.stats);
         self.full_enumeration_ran |= other.full_enumeration_ran;
+        // Inventory belongs only to the original query invocation. Do not
+        // import a later smart refresh, targeted retry, or bridge measurement.
     }
 
     pub(crate) fn block_for_metadata_capture(&mut self) {
@@ -341,6 +356,7 @@ pub struct SyncStats {
     /// Durable inventory at report time, distinct from this cycle's network counters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) primary_layout: Option<crate::state::types::PrimaryLayoutSummary>,
+    /// Additive count observations across invocations, not a comparable inventory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_total_at_start: Option<u64>,
     #[serde(skip_serializing_if = "is_false")]

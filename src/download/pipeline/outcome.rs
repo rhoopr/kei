@@ -751,6 +751,7 @@ fn finish_download_result(
         stats,
         checkpoint,
         full_enumeration_ran: false,
+        inventory: None,
     }
 }
 

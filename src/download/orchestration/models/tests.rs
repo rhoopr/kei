@@ -639,3 +639,47 @@ fn retained_token_rejection_composes_as_execution_evidence() {
     assert!(result.checkpoint.retained_token_rejected);
     assert!(!result.checkpoint.completed_delta_replay);
 }
+
+#[test]
+fn inventory_measurement_is_not_added_or_imported_during_composition() {
+    use super::super::config::InventoryScope;
+    use super::InventoryMeasurement;
+
+    let mut initial = SyncResult::from_execution(
+        DownloadOutcome::Success,
+        None,
+        SyncStats {
+            api_total_at_start: Some(100),
+            ..Default::default()
+        },
+    );
+    initial.inventory = Some(InventoryMeasurement {
+        scope: InventoryScope("complete selected scope".to_owned()),
+        total: 100,
+        assets_seen: 100,
+    });
+    let mut smart = SyncResult::from_execution(
+        DownloadOutcome::Success,
+        None,
+        SyncStats {
+            api_total_at_start: Some(10),
+            ..Default::default()
+        },
+    );
+    smart.inventory = Some(InventoryMeasurement {
+        scope: InventoryScope("smart subset".to_owned()),
+        total: 10,
+        assets_seen: 10,
+    });
+    initial.accumulate(&smart);
+    assert_eq!(initial.stats.api_total_at_start, Some(110));
+    let measurement = initial.inventory.as_ref().unwrap();
+    assert_eq!(measurement.total, 100);
+    assert_eq!(measurement.assets_seen, 100);
+    let mut delta =
+        SyncResult::from_execution(DownloadOutcome::Success, None, SyncStats::default());
+    delta.accumulate(&smart);
+    assert_eq!(delta.stats.api_total_at_start, Some(10));
+    assert!(delta.stats.api_total_at_start_partial);
+    assert!(delta.inventory.is_none());
+}

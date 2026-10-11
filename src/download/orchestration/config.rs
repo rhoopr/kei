@@ -305,6 +305,85 @@ pub(crate) fn sync_coverage_fingerprint_json(
     .context("serialize sync coverage fingerprint")
 }
 
+fn canonical_inventory_query(mut scope: serde_json::Value) -> serde_json::Value {
+    if let Some(serde_json::Value::Array(sources)) = scope.get_mut("cross_zone_sources") {
+        for source in sources.iter_mut() {
+            *source = canonical_inventory_query(source.take());
+        }
+        sources.sort_unstable_by_key(serde_json::Value::to_string);
+    }
+    scope
+}
+
+/// Canonical resolved query and filter coverage for diagnostic inventories.
+/// This is separate from cursor compatibility and never authorizes checkpoints.
+#[derive(Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(transparent)]
+pub(crate) struct InventoryScope(pub(crate) String);
+
+impl std::fmt::Debug for InventoryScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("InventoryScope([redacted])")
+    }
+}
+
+#[must_use]
+pub(crate) fn inventory_scope(
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+) -> InventoryScope {
+    let mut resolved: Vec<String> = passes
+        .iter()
+        .map(|pass| {
+            let mut excludes: Vec<&str> = pass.exclude_ids.iter().map(String::as_str).collect();
+            excludes.sort_unstable();
+            serde_json::json!({
+                "kind": format!("{:?}", pass.kind),
+                "query": canonical_inventory_query(pass.album.selection_scope()),
+                "excludes": excludes,
+            })
+            .to_string()
+        })
+        .collect();
+    resolved.sort_unstable();
+    // Keep multiplicity: querying the same pass twice changes the measured sum.
+    let mut excludes: Vec<&str> = config
+        .exclude_asset_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    excludes.sort_unstable();
+    let mut filenames: Vec<&str> = config
+        .filename_exclude
+        .iter()
+        .map(glob::Pattern::as_str)
+        .collect();
+    filenames.sort_unstable();
+    InventoryScope(
+        serde_json::json!({
+            "passes": resolved,
+            "filters": {
+                "media": [config.media.photos, config.media.videos, config.media.live_photos],
+                "resolution": config.resolution as u8,
+                "live_resolution": config.live_resolution as u8,
+                "live_photo_mode": config.live_photo_mode as u8,
+                "edited": config.edited,
+                "alternative": config.alternative,
+                "raw_policy": config.raw_policy as u8,
+                "force_resolution": config.force_resolution,
+                "filename_exclude": filenames,
+                "exclude_asset_ids": excludes,
+                "skip_created_before": config.skip_created_before.map(crate::config::CreatedDateFilter::fingerprint),
+                "skip_created_after": config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
+                "recent": config.recent,
+                "recent_scope": config.recent_scope,
+                "retry_only": config.retry_only,
+            },
+        })
+        .to_string(),
+    )
+}
+
 /// Compute a deterministic hash of the config fields that affect path resolution.
 ///
 /// When this hash changes between runs, we can't trust the state DB's download

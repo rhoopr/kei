@@ -1390,7 +1390,16 @@ serialization and the default attempt count for existing version-one receipts.
 | #924: valid unfiled delta plus Hidden refresh, exact successor, atomic hash promotion and quiet reopen | `mixed_valid_delta_hidden_refresh_promotes_inventory_bridge_then_quiet_reopen` uses actual pass definitions; `mixed_valid_delta_hidden_refresh_clears_retained_identity_marker_without_extra_replay` pins mixed-pass classification. |
 | #924: distinguish expiry, valid delta, missing successor, failed smart refresh, cancellation and state-write failure | `retained_token_fallback_distinguishes_expiry_from_missing_successor` checks typed fallback classification. `mixed_delta_hidden_refresh_preserves_vetoes_then_recovers_after_reopen` checks five vetoes and staged-successor recovery. Existing `incremental_sync_skips_smaller_metadata_rewritten_file` checks ordinary collecting provenance; model composition tests reject query-token substitution. |
 
-Fresh inventory totals, including partial/additive totals tracked in #925, are
-never retained-history recovery proof. Permanently expired boundaries with
+The `comparable_inventory_` tests in `src/sync_loop/runner/tests/mixed_delta.rs`
+exercise the production cycle, JSON reporter and ledger through file-backed SQLite
+reopen. They cover full inventory then smart refresh, inventory plus bridge,
+changed resolved passes, order independence, complete smart-only scope, the 5%
+threshold, bounds and failure vetoes, legacy/invalid anchors, anchor I/O failures,
+empty counts and independent zones. Synthetic 100/10 counts stand in for the
+reporter's 3899/238 totals; no account or Windows reproduction is implied.
+Composition and coverage round-trip tests protect the separate diagnostic evidence.
+
+Fresh inventory measurements and partial/additive activity totals are never
+retained-history recovery proof. Permanently expired boundaries with
 unproven history retain a finite actionable hold. Successful replay does not
 resolve the distinct reporter limitations tracked in #765, #853 or #845.

@@ -217,6 +217,7 @@ async fn run_targeted_recovery_pass(
         stats,
         checkpoint,
         full_enumeration_ran: false,
+        inventory: None,
     })
 }
 
@@ -251,6 +252,7 @@ fn pending_retry_no_download_result(
         stats,
         checkpoint,
         full_enumeration_ran: false,
+        inventory: None,
     }
 }
 

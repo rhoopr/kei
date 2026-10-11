@@ -349,6 +349,7 @@ async fn download_photos_with_sync_inner(
             stats: metadata_capture_repair.stats,
             checkpoint: metadata_capture_repair.checkpoint,
             full_enumeration_ran: false,
+            inventory: None,
         });
     }
 
@@ -635,6 +636,7 @@ async fn download_photos_with_sync_inner(
         stats: metadata_capture_repair.stats,
         checkpoint: metadata_capture_repair.checkpoint,
         full_enumeration_ran: false,
+        inventory: None,
     };
     if matches!(repair.outcome, DownloadOutcome::PartialFailure { .. }) {
         result.outcome = merge_download_outcomes(&result.outcome, &repair.outcome);

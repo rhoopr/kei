@@ -606,6 +606,23 @@ sync_loop::run_sync
   -> cycle reporting and watch control
 ```
 
+Inventory-drop diagnostics use a complete count measurement from the initial
+full-query invocation, captured before activity and delta-bridge composition.
+The download owner records natural completion, usable counts, and canonical
+resolved pass/query/filter coverage. The cycle compares only equivalent complete
+scopes after the existing success, interruption, cancellation and stale-plan
+vetoes. Configured bounds, missing counts, targeted subsets and retries cannot
+replace a complete anchor. A complete selected smart-folder-only query can qualify.
+Public `api_total_at_start` remains additive activity telemetry.
+
+Diagnostic anchors use `inventory_anchor_v1:` metadata keys scoped by enumeration
+hash, zone and coverage digest, with version and exact canonical coverage in the
+payload. Legacy `inventory_anchor:` rows remain untouched and are never certified
+retroactively. Malformed or unsupported evidence is ignored; the next eligible
+inventory seeds a fresh baseline without an upgrade-time drop warning. Inventory
+evidence never authorizes source checkpoints or proves retained deletion history.
+The same accepted drop facts feed JSON reports and the durable cycle ledger.
+
 CloudKit HTTP 401, 403, and 421 failures during enumeration or metadata
 hydration return a session-expired outcome. The cycle preserves its provider
 checkpoint and pending capture work. It does not treat these failures as a

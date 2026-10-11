@@ -54,7 +54,9 @@ const LAST_FULL_ENUMERATION_REASON_KEY: &str = "last_full_enumeration_reason";
 
 /// Prefix for every per-zone CloudKit sync token row in the metadata table.
 pub(crate) const SYNC_TOKEN_PREFIX: &str = "sync_token:";
-const INVENTORY_ANCHOR_PREFIX: &str = "inventory_anchor:";
+// Legacy inventory_anchor: rows lack coverage proof and are never read or migrated.
+const INVENTORY_ANCHOR_PREFIX: &str = "inventory_anchor_v1:";
+const INVENTORY_ANCHOR_VERSION: u8 = 1;
 pub(crate) const RETAINED_CHECKPOINT_HOLD_PREFIX: &str = "retained_checkpoint_hold:";
 const RETAINED_CHECKPOINT_RETRY_SECONDS: i64 = 60 * 60;
 const RETAINED_CHECKPOINT_MAX_ATTEMPTS: u8 = 3;
@@ -164,7 +166,10 @@ async fn persist_retained_checkpoint_hold(
 const INVENTORY_DROP_THRESHOLD_PERCENT: f64 = 5.0;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct InventoryAnchor {
+    version: u8,
+    scope: download::InventoryScope,
     api_total_at_start: u64,
     assets_seen: u64,
     completed_at: i64,
@@ -183,8 +188,14 @@ pub(crate) fn sync_token_key(zone_name: &str) -> String {
     format!("{SYNC_TOKEN_PREFIX}{zone_name}")
 }
 
-fn inventory_anchor_key(enum_config_hash: &str, zone_name: &str) -> String {
-    format!("{INVENTORY_ANCHOR_PREFIX}{enum_config_hash}:{zone_name}")
+fn inventory_anchor_key(
+    enum_config_hash: &str,
+    zone_name: &str,
+    scope: &download::InventoryScope,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let scope_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(scope.0.as_bytes()));
+    format!("{INVENTORY_ANCHOR_PREFIX}{enum_config_hash}:{zone_name}:{scope_hash}")
 }
 
 pub(crate) fn pending_zone_token_key(enum_config_hash: &str, zone_name: &str) -> String {
@@ -517,17 +528,19 @@ async fn update_inventory_anchor_for_cycle<D>(
     db: &D,
     enum_config_hash: &str,
     zone_name: &str,
+    inventory: &download::InventoryMeasurement,
     stats: &mut download::SyncStats,
 ) where
     D: state::SyncTokenStore + ?Sized,
 {
-    let Some(current_total) = stats.api_total_at_start else {
-        return;
-    };
-    let key = inventory_anchor_key(enum_config_hash, zone_name);
+    let current_total = inventory.total;
+    let key = inventory_anchor_key(enum_config_hash, zone_name, &inventory.scope);
     match db.get_metadata(&key).await {
         Ok(Some(raw)) => match serde_json::from_str::<InventoryAnchor>(&raw) {
-            Ok(anchor) => {
+            Ok(anchor)
+                if anchor.version == INVENTORY_ANCHOR_VERSION
+                    && anchor.scope == inventory.scope =>
+            {
                 if let Some(drop) =
                     classify_inventory_drop(anchor.api_total_at_start, current_total)
                 {
@@ -550,6 +563,7 @@ async fn update_inventory_anchor_for_cycle<D>(
                     stats.inventory_drop_library = Some(zone_name.to_string());
                 }
             }
+            Ok(_) => {}
             Err(e) => {
                 tracing::debug!(
                     error = %e,
@@ -565,12 +579,15 @@ async fn update_inventory_anchor_for_cycle<D>(
                 library = zone_name,
                 "Failed to read inventory anchor"
             );
+            return;
         }
     }
 
     let anchor = InventoryAnchor {
+        version: INVENTORY_ANCHOR_VERSION,
+        scope: inventory.scope.clone(),
         api_total_at_start: current_total,
-        assets_seen: stats.assets_seen,
+        assets_seen: inventory.assets_seen,
         completed_at: chrono::Utc::now().timestamp(),
     };
     match serde_json::to_string(&anchor) {
@@ -1300,6 +1317,12 @@ pub(crate) async fn run_cycle(
         )
         .await?;
 
+        // Capture only the initial complete selected scope, before a bridge
+        // adds repeated count observations to the public activity statistics.
+        let inventory = sync_result.inventory.take().filter(|measurement| {
+            measurement.scope == download::inventory_scope(&lib_state.plan.passes, &download_config)
+        });
+
         observe_sync_component(
             &lib_state.zone_name,
             "initial",
@@ -1539,14 +1562,19 @@ pub(crate) async fn run_cycle(
             );
         }
         if library_completed_without_errors
+            && !sync_result.checkpoint.enumeration_incomplete
+            && sync_result.checkpoint.state_write_failures == 0
             && !cycle_has_stale_plan
+            && !is_retry_failed
             && download_controls.run_mode.downloads_files()
+            && let Some(inventory) = inventory.as_ref()
             && let Some(db) = state_db
         {
             update_inventory_anchor_for_cycle(
                 db,
                 &enum_config_hash,
                 &lib_state.zone_name,
+                inventory,
                 &mut sync_result.stats,
             )
             .await;
@@ -2530,8 +2558,15 @@ mod tests {
     #[tokio::test]
     async fn inventory_anchor_warns_and_updates_on_comparable_drop() {
         let db = state::SqliteStateDb::open_in_memory().expect("state db");
-        let key = inventory_anchor_key("hash-a", "PrimarySync");
+        let inventory = download::InventoryMeasurement {
+            scope: download::InventoryScope("test complete scope".to_owned()),
+            total: 80,
+            assets_seen: 80,
+        };
+        let key = inventory_anchor_key("hash-a", "PrimarySync", &inventory.scope);
         let prior = InventoryAnchor {
+            version: INVENTORY_ANCHOR_VERSION,
+            scope: inventory.scope.clone(),
             api_total_at_start: 100,
             assets_seen: 100,
             completed_at: 1_700_000_000,
@@ -2545,7 +2580,8 @@ mod tests {
             assets_seen: 80,
             ..download::SyncStats::default()
         };
-        update_inventory_anchor_for_cycle(&db, "hash-a", "PrimarySync", &mut stats).await;
+        update_inventory_anchor_for_cycle(&db, "hash-a", "PrimarySync", &inventory, &mut stats)
+            .await;
 
         assert_eq!(stats.inventory_drop_warnings, 1);
         assert_eq!(stats.inventory_drop_assets, 20);
@@ -2567,8 +2603,15 @@ mod tests {
     #[tokio::test]
     async fn inventory_anchor_is_scoped_by_enum_config_hash() {
         let db = state::SqliteStateDb::open_in_memory().expect("state db");
-        let old_key = inventory_anchor_key("old-hash", "PrimarySync");
+        let inventory = download::InventoryMeasurement {
+            scope: download::InventoryScope("test complete scope".to_owned()),
+            total: 80,
+            assets_seen: 80,
+        };
+        let old_key = inventory_anchor_key("old-hash", "PrimarySync", &inventory.scope);
         let prior = InventoryAnchor {
+            version: INVENTORY_ANCHOR_VERSION,
+            scope: inventory.scope.clone(),
             api_total_at_start: 100,
             assets_seen: 100,
             completed_at: 1_700_000_000,
@@ -2582,14 +2625,19 @@ mod tests {
             assets_seen: 80,
             ..download::SyncStats::default()
         };
-        update_inventory_anchor_for_cycle(&db, "new-hash", "PrimarySync", &mut stats).await;
+        update_inventory_anchor_for_cycle(&db, "new-hash", "PrimarySync", &inventory, &mut stats)
+            .await;
 
         assert_eq!(stats.inventory_drop_warnings, 0);
         assert!(
-            db.get_metadata(&inventory_anchor_key("new-hash", "PrimarySync"))
-                .await
-                .expect("read new anchor")
-                .is_some(),
+            db.get_metadata(&inventory_anchor_key(
+                "new-hash",
+                "PrimarySync",
+                &inventory.scope
+            ))
+            .await
+            .expect("read new anchor")
+            .is_some(),
             "new hash should get an independent anchor"
         );
     }

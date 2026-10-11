@@ -997,3 +997,84 @@ fn primary_layout_policy_preserves_legacy_suffix_hash_and_provider_cursor_safety
         "naming alone must retain provider cursor safety"
     );
 }
+
+#[test]
+fn inventory_scope_round_trip_preserves_resolved_queries_and_filters() {
+    use crate::commands::{AlbumPass, PassKind};
+    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig};
+    use rustc_hash::FxHashSet;
+    use serde_json::json;
+
+    let pass = |filter: &str| AlbumPass {
+        kind: PassKind::SmartFolder,
+        album: PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::new(std::collections::HashMap::new()),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from("Same label"),
+                list_type: Arc::from("CPLAssetAndMasterInSmartAlbumByAssetDate"),
+                obj_type: Arc::from("count-scope"),
+                query_filter: Some(Arc::new(json!([{
+                    "fieldName": "smartAlbum",
+                    "comparator": "EQUALS",
+                    "fieldValue": {"type": "STRING", "value": filter},
+                }]))),
+                page_size: 100,
+                zone_id: Arc::new(json!({"zoneName": "PrimarySync"})),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(crate::test_helpers::MockPhotosSession::new()),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let hidden = pass("HIDDEN");
+    let favorite = pass("FAVORITE");
+    let config = test_config();
+    let scope = super::inventory_scope(&[hidden.clone(), favorite.clone()], &config);
+    let encoded = serde_json::to_string(&scope).unwrap();
+    let decoded: super::InventoryScope = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, scope);
+    assert_eq!(format!("{scope:?}"), "InventoryScope([redacted])");
+    assert_eq!(
+        super::inventory_scope(&[favorite.clone(), hidden.clone()], &config),
+        scope
+    );
+    assert_ne!(
+        super::inventory_scope(std::slice::from_ref(&hidden), &config),
+        super::inventory_scope(std::slice::from_ref(&favorite), &config),
+        "the same label cannot hide a changed provider query",
+    );
+    assert_ne!(
+        super::inventory_scope(&[hidden.clone(), hidden.clone()], &config),
+        super::inventory_scope(std::slice::from_ref(&hidden), &config),
+        "multiplicity changes the observation sum",
+    );
+    let mut filtered = config.clone();
+    filtered.filename_exclude = Arc::from(vec![glob::Pattern::new("private*").unwrap()]);
+    assert_ne!(
+        super::inventory_scope(&[hidden.clone(), favorite.clone()], &filtered),
+        scope
+    );
+    let mut excluded = hidden.clone();
+    excluded.exclude_ids = Arc::new(FxHashSet::from_iter(["asset-A".to_owned()]));
+    assert_ne!(
+        super::inventory_scope(&[excluded, favorite.clone()], &config),
+        scope,
+    );
+    let first_source = PhotoAlbum::stub_for_test(Arc::from("SharedSync-A"));
+    let second_source = PhotoAlbum::stub_for_test(Arc::from("SharedSync-B"));
+    let mut first = hidden.clone();
+    first.album = first
+        .album
+        .with_cross_zone_sources(vec![first_source.clone(), second_source.clone()]);
+    let mut second = hidden;
+    second.album = second
+        .album
+        .with_cross_zone_sources(vec![second_source, first_source]);
+    assert_eq!(
+        super::inventory_scope(&[first], &config),
+        super::inventory_scope(&[second], &config),
+    );
+}

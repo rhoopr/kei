@@ -19,13 +19,14 @@ use crate::download::pipeline::{
 };
 use crate::icloud::photos::PhotoAsset;
 
-use super::config::DownloadConfig;
+use super::config::{DownloadConfig, inventory_scope};
 use super::context::{DownloadContext, preload_download_context};
 use super::models::{
     DATE_BOUNDED_FULL_ENUMERATION_REASON, DownloadControls, DownloadStore, FullEnumerationReason,
-    ICLOUD_ALBUM_COUNT_ERROR_REASON, PassKey, RECENT_LIMITED_FULL_ENUMERATION_REASON,
-    RecoveryAction, SyncResult, merge_streaming_result, merge_token_recovery_result,
-    set_full_enumeration_reason, sync_token_blocked_explanation, sync_token_blocked_source,
+    ICLOUD_ALBUM_COUNT_ERROR_REASON, InventoryMeasurement, PassKey,
+    RECENT_LIMITED_FULL_ENUMERATION_REASON, RecoveryAction, SyncResult, merge_streaming_result,
+    merge_token_recovery_result, set_full_enumeration_reason, sync_token_blocked_explanation,
+    sync_token_blocked_source,
 };
 use super::selection::{
     build_pass_configs_resolving_deferred_excludes, build_pass_configs_with_download_concurrency,
@@ -1903,6 +1904,32 @@ pub(super) async fn download_photos_full_with_token_policy(
     checkpoint.project(stats);
     result.sync_token = sync_token;
     result.full_enumeration_ran = true;
+    // Counts are diagnostic only. Natural completion and the actual queried
+    // passes, not a full-query flag or the composed activity total, establish
+    // coverage. Configured bounds never seed a complete inventory baseline.
+    if enumeration_complete
+        && !passes.is_empty()
+        && !result.checkpoint.enumeration_incomplete
+        && result.checkpoint.enumeration_errors == 0
+        && result.checkpoint.state_write_failures == 0
+        && !result.checkpoint.identity_incomplete
+        && !result.checkpoint.interrupted
+        && matches!(result.outcome, super::models::DownloadOutcome::Success)
+        && controls.run_mode.downloads_files()
+        && !config.retry_only
+        && config.recent.is_none()
+        && config.skip_created_before.is_none()
+        && config.skip_created_after.is_none()
+        && !bounds_truncated.load(Ordering::Relaxed)
+        && !result.stats.api_total_at_start_partial
+        && let Some(total) = api_total_at_start
+    {
+        result.inventory = Some(InventoryMeasurement {
+            scope: inventory_scope(passes, config),
+            total,
+            assets_seen: result.stats.assets_seen,
+        });
+    }
     Ok(result)
 }
 
