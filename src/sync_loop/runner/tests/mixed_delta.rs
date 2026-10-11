@@ -387,6 +387,7 @@ enum InventoryFault {
     BridgeCancellation,
     AnchorRead,
     AnchorWrite,
+    StateWrite,
 }
 
 #[derive(Clone)]
@@ -611,6 +612,10 @@ async fn inventory_cycle(
             MetadataSetFailure::Prefix("inventory_anchor_v1:"),
             "inventory write fault",
         )),
+        Some(InventoryFault::StateWrite) => Arc::new(
+            FailingMetadataSetDb::without_set_failure(db.clone(), "inventory state write fault")
+                .with_upsert_seen_failure(),
+        ),
         _ => db.clone(),
     };
     let cancel = CancellationToken::new();
@@ -975,6 +980,134 @@ async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
         assert_eq!(recovered.stats.inventory_drop_warnings, 0, "case {case}");
         assert_eq!(anchor_total(&inventory_anchors(root.path()).await), 100);
     }
+}
+
+#[tokio::test]
+async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_then_recovers() {
+    use crate::sync_loop::test_support::run_cycle_expected_date_dir;
+
+    let root = inventory_root();
+    let media = root
+        .path()
+        .join("media")
+        .join(run_cycle_expected_date_dir());
+    std::fs::create_dir_all(&media).unwrap();
+    // The mock resources advertise 1024 bytes. Matching landed files keep
+    // every clean cycle offline, while one missing file exercises upsert_seen.
+    let body = [0_u8; 1024];
+    let mut paths = Vec::with_capacity(100);
+    for (prefix, count) in [("unfiled", 90), ("Hidden", 10)] {
+        for index in 0..count {
+            let path = media.join(format!("{prefix}-{index:04}.jpg"));
+            std::fs::write(&path, body).unwrap();
+            paths.push(path);
+        }
+    }
+    let mut step = InventoryStep::mixed(90, 10);
+    step.options.media = Default::default();
+    let first = inventory_cycle(root.path(), &step).await;
+    assert_eq!(first.failed_count, 0);
+    assert_eq!(first.stats.state_write_failures, 0);
+    assert_eq!(first.stats.assets_seen, 100);
+    assert_eq!(first.stats.downloaded, 0);
+    let before = inventory_anchors(root.path()).await;
+    assert_eq!(anchor_total(&before), 100);
+
+    // A real incremental cycle establishes a distinct retained successor:
+    // the upcoming full query offers inventory-query-eof, not this cursor.
+    step.full = false;
+    let delta = inventory_cycle(root.path(), &step).await;
+    assert!(delta.db_sync_token_advance_safe);
+    assert_eq!(inventory_anchors(root.path()).await, before);
+    {
+        let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("validated-delta-successor")
+        );
+    }
+
+    std::fs::remove_file(&paths[0]).unwrap();
+    step.full = true;
+    step.passes[0].2 = 85;
+    step.fault = Some(InventoryFault::StateWrite);
+    let failed = inventory_cycle(root.path(), &step).await;
+    assert_eq!(failed.stats.api_total_at_start, Some(95));
+    assert!(!failed.stats.api_total_at_start_partial);
+    assert_eq!(failed.stats.assets_seen, 95);
+    assert_eq!(failed.stats.enumeration_errors, 0);
+    assert!(!failed.stats.enumeration_incomplete);
+    assert!(!failed.stats.interrupted);
+    assert_eq!(failed.stats.state_write_failures, 1);
+    assert!(!failed.db_sync_token_advance_safe);
+    assert_eq!(failed.stats.downloaded, 0);
+    assert_eq!(failed.stats.bytes_downloaded, 0);
+    assert_eq!(failed.stats.inventory_drop_warnings, 0);
+    assert_eq!(inventory_anchors(root.path()).await, before);
+    assert_inventory_ledger(root.path(), &failed).await;
+    {
+        let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("validated-delta-successor"),
+            "a complete count cannot authorize a checkpoint after upsert_seen fails"
+        );
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.pending + summary.failed, 0);
+    }
+    assert!(!paths[0].exists());
+    for path in &paths[1..] {
+        assert_eq!(std::fs::read(path).unwrap(), body);
+    }
+
+    // Restore the landed file and remove only the injected failure. The same
+    // resolved scope now admits the real 5% decline and its query checkpoint.
+    std::fs::write(&paths[0], body).unwrap();
+    step.fault = None;
+    let recovered = inventory_cycle(root.path(), &step).await;
+    assert_eq!(recovered.failed_count, 0);
+    assert_eq!(recovered.stats.state_write_failures, 0);
+    assert!(recovered.db_sync_token_advance_safe);
+    assert_eq!(recovered.stats.inventory_drop_warnings, 1);
+    assert_eq!(recovered.stats.inventory_drop_previous_total, Some(100));
+    assert_eq!(recovered.stats.inventory_drop_current_total, Some(95));
+    assert_eq!(anchor_total(&inventory_anchors(root.path()).await), 95);
+    assert_inventory_ledger(root.path(), &recovered).await;
+    {
+        let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("inventory-query-eof")
+        );
+    }
+
+    let steady = inventory_cycle(root.path(), &step).await;
+    assert_eq!(steady.failed_count, 0);
+    assert_eq!(steady.stats.state_write_failures, 0);
+    assert!(steady.db_sync_token_advance_safe);
+    assert_eq!(steady.stats.inventory_drop_warnings, 0);
+    assert_eq!(steady.stats.downloaded, 0);
+    assert_eq!(anchor_total(&inventory_anchors(root.path()).await), 95);
+    assert_inventory_ledger(root.path(), &steady).await;
+    for path in &paths {
+        assert_eq!(std::fs::read(path).unwrap(), body);
+    }
+    assert_eq!(std::fs::read_dir(&media).unwrap().count(), paths.len());
 }
 
 #[tokio::test]
