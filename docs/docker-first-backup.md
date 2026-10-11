@@ -101,8 +101,18 @@ docker compose logs -f kei
 The image's default command is `kei service run --config /config/config.toml`.
 It syncs the saved selection, without the trial's one-run recent limit, and
 repeats daily. `service run` also uses a daily fallback if no interval is saved.
-Apple may require 2FA again; use the same mounts, config, and owning UID/GID for
-[headless recovery](https://github.com/rhoopr/kei/wiki/Authentication#headless-mfa-docker--cron).
+Apple may require 2FA again. For this Compose service, request and submit a code:
+
+```sh
+docker compose exec --user UID:GID kei kei login get-code --config /config/config.toml
+docker compose exec --user UID:GID kei kei login submit-code 123456 --config /config/config.toml
+```
+
+Replace `UID:GID` with the numeric owner IDs used for `/config` (your configured
+PUID/PGID, or `0:0` for the default root setup), and `123456` with the new code.
+`exec` bypasses the entrypoint, so it needs the correct user explicitly. The
+waiting service resumes from the saved session. See
+[Authentication](https://github.com/rhoopr/kei/wiki/Authentication) for details.
 Do not run a second sync against the same state while the service is active.
 
 See [Docker reference](https://github.com/rhoopr/kei/wiki/Docker) for monitoring,
