@@ -417,10 +417,11 @@ impl PhotosSession for InventorySession {
                 "records": []
             }]}));
         }
-        if self.smart && url.contains("/internal/records/query/batch?") {
-            if self.fault == Some(InventoryFault::MissingCount) {
-                return Ok(json!({"batch": [{"records": [{"fields": {}}]}]}));
-            }
+        if self.smart
+            && url.contains("/internal/records/query/batch?")
+            && self.fault == Some(InventoryFault::MissingCount)
+        {
+            return Ok(json!({"batch": [{"records": [{"fields": {}}]}]}));
         }
         if url.contains("/records/query?") {
             let bridge = self.smart && self.changes.load(Ordering::SeqCst) > 0;
@@ -665,7 +666,7 @@ async fn inventory_cycle(
         config
     };
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
-    let result = run_cycle(
+    let result = Box::pin(run_cycle(
         &[&library],
         &config,
         Some(store.as_ref()),
@@ -674,7 +675,7 @@ async fn inventory_cycle(
         download::DownloadControls::new(step.mode, download::DownloadReporting::hidden()),
         &shared,
         &cancel,
-    )
+    ))
     .await
     .unwrap();
     crate::sync_loop::reporting::record_cycle_run(Some(db.as_ref()), &result, chrono::Utc::now())
