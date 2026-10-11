@@ -396,6 +396,7 @@ struct InventorySession {
     zone: &'static str,
     smart: bool,
     fault: Option<InventoryFault>,
+    download_url: Option<String>,
     changes: Arc<AtomicUsize>,
     cancel: CancellationToken,
 }
@@ -438,6 +439,25 @@ impl PhotosSession for InventorySession {
             }
         }
         let mut response = self.inner.post(url, body, headers).await?;
+        if let Some(download_url) = &self.download_url
+            && let Some(records) = response["records"].as_array_mut()
+        {
+            use sha2::Digest;
+            let media = include_bytes!("../../../../tests/data/media/pattern.jpg");
+            for record in records {
+                if record["recordType"] == "CPLMaster"
+                    && let Some(resource) =
+                        record["fields"]["resOriginalRes"]["value"].as_object_mut()
+                {
+                    resource.insert("downloadURL".into(), json!(download_url));
+                    resource.insert("size".into(), json!(media.len()));
+                    resource.insert(
+                        "fileChecksum".into(),
+                        json!(data_encoding::BASE64.encode(&sha2::Sha256::digest(media))),
+                    );
+                }
+            }
+        }
         if self.fault == Some(InventoryFault::MalformedAsset)
             && url.contains("/records/query?")
             && let Some(records) = response["records"].as_array_mut()
@@ -495,6 +515,7 @@ struct InventoryStep {
     retry: bool,
     mode: download::DownloadRunMode,
     fault: Option<InventoryFault>,
+    download_url: Option<String>,
     options: crate::sync_loop::test_support::RunCycleDownloadConfigOptions,
 }
 
@@ -512,6 +533,7 @@ impl InventoryStep {
             retry: false,
             mode: download::DownloadRunMode::Download,
             fault: None,
+            download_url: None,
             options: crate::sync_loop::test_support::RunCycleDownloadConfigOptions {
                 media: crate::sync_loop::test_support::media_without_photo_downloads(),
                 ..Default::default()
@@ -635,6 +657,7 @@ async fn inventory_cycle(
                 zone: step.zone,
                 smart: kind == PassKind::SmartFolder,
                 fault: step.fault,
+                download_url: step.download_url.clone(),
                 changes: changes.clone(),
                 cancel: cancel.clone(),
             };
@@ -983,6 +1006,7 @@ async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
 }
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_then_recovers() {
     use crate::sync_loop::test_support::run_cycle_expected_date_dir;
 
@@ -992,24 +1016,32 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
         .join("media")
         .join(run_cycle_expected_date_dir());
     std::fs::create_dir_all(&media).unwrap();
-    // The mock resources advertise 1024 bytes. Matching landed files keep
-    // every clean cycle offline, while one missing file exercises upsert_seen.
-    let body = [0_u8; 1024];
+    // Seed owned media through real downloads from a local server. Later
+    // cycles must preserve those files without another transfer.
+    let body = include_bytes!("../../../../tests/data/media/pattern.jpg").as_slice();
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
     let mut paths = Vec::with_capacity(100);
     for (prefix, count) in [("unfiled", 90), ("Hidden", 10)] {
         for index in 0..count {
-            let path = media.join(format!("{prefix}-{index:04}.jpg"));
-            std::fs::write(&path, body).unwrap();
+            let path = media.join(format!("{prefix}-{index:04}.JPG"));
             paths.push(path);
         }
     }
     let mut step = InventoryStep::mixed(90, 10);
     step.options.media = Default::default();
+    step.download_url = Some(format!("{}/inventory-fixture.jpg", server.uri()));
     let first = inventory_cycle(root.path(), &step).await;
-    assert_eq!(first.failed_count, 0);
+    assert_eq!(first.failed_count, 0, "{first:?}");
     assert_eq!(first.stats.state_write_failures, 0);
     assert_eq!(first.stats.assets_seen, 100);
-    assert_eq!(first.stats.downloaded, 0);
+    assert_eq!(first.stats.downloaded, 100);
+    for path in &paths {
+        assert_eq!(std::fs::read(path).unwrap(), body);
+    }
     let before = inventory_anchors(root.path()).await;
     assert_eq!(anchor_total(&before), 100);
 
@@ -1038,7 +1070,8 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
     step.fault = Some(InventoryFault::StateWrite);
     let failed = inventory_cycle(root.path(), &step).await;
     assert_eq!(failed.stats.api_total_at_start, Some(95));
-    assert!(!failed.stats.api_total_at_start_partial);
+    // Composed activity counts remain distinct from complete inventory evidence.
+    assert!(failed.stats.api_total_at_start_partial);
     assert_eq!(failed.stats.assets_seen, 95);
     assert_eq!(failed.stats.enumeration_errors, 0);
     assert!(!failed.stats.enumeration_incomplete);
@@ -1108,6 +1141,7 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
         assert_eq!(std::fs::read(path).unwrap(), body);
     }
     assert_eq!(std::fs::read_dir(&media).unwrap().count(), paths.len());
+    assert_eq!(server.received_requests().await.unwrap().len(), 100);
 }
 
 #[tokio::test]
