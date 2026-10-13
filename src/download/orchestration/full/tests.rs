@@ -3420,3 +3420,41 @@ fn classify_pagination_shortfall_billimek_sharedsync_fixture_reports_shortfall()
 
 #[path = "issue845_l1.rs"]
 mod issue845_l1;
+
+#[test]
+fn issue845_46_completed_passes_with_two_tokens_require_recovery() {
+    for conflicting in [false, true] {
+        let observations = (0..46)
+            .map(|index| PassTokenObservation {
+                pass: PassKey {
+                    index,
+                    kind: PassKind::Album,
+                    label: format!("synthetic-{index}"),
+                },
+                result: PassTokenResult::Present(
+                    if conflicting && index == 45 {
+                        "token-b"
+                    } else {
+                        "token-a"
+                    }
+                    .into(),
+                ),
+            })
+            .collect::<Vec<_>>();
+        let evidence = classify_zone_token_evidence(&observations);
+        if conflicting {
+            let ZoneTokenEvidence::Recoverable { passes, reason } = evidence else {
+                panic!("conflicting selected-pass tokens must remain recoverable");
+            };
+            assert_eq!(reason, TokenGap::Mismatch);
+            assert_eq!(passes.len(), 46);
+        } else {
+            assert_eq!(
+                evidence,
+                ZoneTokenEvidence::Complete {
+                    token: "token-a".into()
+                }
+            );
+        }
+    }
+}

@@ -371,17 +371,20 @@ backfill-only execution. Default `PrimarySync` selection lazily discovers the
 private `/zones/list` response using the pinned authenticated session. Discovery
 requires bounded original JSON with unique keys, an explicit zones array, unique
 zone names, no zone errors and no unsupported continuation. Only a live exact
-`PrimarySync` entry with explicit `_defaultOwner` replaces the constructor's
-ownerless primary library after that selected scope passes its indexing check.
+`PrimarySync` entry with a nonblank string owner replaces the constructor's
+ownerless primary library after that exact selected scope passes its indexing
+check. The complete discovered scope is preserved, including explicit owners
+other than `_defaultOwner`; lookup and inventory references must still match it.
 The complete validated private zone descriptors are cached separately from
 initialized libraries. Primary-only lookup initializes only the selected primary;
 unrelated private indexing failures do not block it. Private and shared library
 maps publish only after all requested library initialization succeeds. A failed
 full-map initialization preserves an already qualified primary and retries
 initialization using the validated private descriptors. Shared endpoint evidence cannot
-replace private primary ownership. Missing, deleted or different-owner primary
-entries preserve the ownerless constructor and skip admission; no owner is
-inferred from a name. Default selection needs only the cached private listing and selected primary's
+replace private primary ownership. Missing, deleted, blank or malformed primary
+owners preserve the ownerless constructor; no owner is inferred from a name.
+The current-work admission slice still requires `_defaultOwner` and is unchanged.
+Default selection needs only the cached private listing and selected primary's
 indexing success. Normal sync planning and import still request all libraries;
 their existing full-map initialization contract is unchanged.
 

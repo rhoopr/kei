@@ -553,8 +553,11 @@ unfinished projected work. A real conflicting file forces safe current-generatio
 leaf replanning through the shared planner/upsert without stranding the queue.
 Fixtures qualify default `PrimarySync` through actual `PhotosService::new` and
 `resolve_libraries` before and after capture attachment. Authenticated private
-zone discovery supplies an explicit owner; missing, deleted and different-owner
-entries never infer one, and shared endpoint evidence cannot qualify primary.
+zone discovery supplies a nonblank string owner after that selected scope passes
+indexing. Missing, deleted, blank and malformed owners never infer one, and shared
+endpoint evidence cannot qualify primary. Explicit private primary owners other
+than the default are preserved for exact lookup and inventory validation; the
+current-work admission slice still requires the default owner.
 Malformed, duplicate, errored and unsupported-continuation listings fail before
 cache publication, then valid discovery recovers and remains cached. A retained
 explicit-owner source triggers current admission on the default route. A real

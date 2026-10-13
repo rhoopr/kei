@@ -997,7 +997,7 @@ async fn discovery_diagnostics_identify_qualified_primary_scope() {
             Some("PrimarySync"),
             None,
             false,
-            "owner_not_default",
+            "owner_unqualified",
             "absent",
             "absent",
             false,
@@ -1006,16 +1006,16 @@ async fn discovery_diagnostics_identify_qualified_primary_scope() {
             Some("PrimarySync"),
             Some(json!("PRIVATE_OTHER")),
             false,
-            "owner_not_default",
+            "eligible",
             "other_string",
             "string",
-            false,
+            true,
         ),
         (
             Some("PrimarySync"),
             Some(Value::Null),
             false,
-            "owner_not_default",
+            "owner_unqualified",
             "null",
             "null",
             false,
@@ -1024,7 +1024,7 @@ async fn discovery_diagnostics_identify_qualified_primary_scope() {
             Some("PrimarySync"),
             Some(json!(1000)),
             false,
-            "owner_not_default",
+            "owner_unqualified",
             "malformed",
             "number",
             false,
@@ -1033,7 +1033,7 @@ async fn discovery_diagnostics_identify_qualified_primary_scope() {
             Some("PrimarySync"),
             Some(json!(true)),
             false,
-            "owner_not_default",
+            "owner_unqualified",
             "malformed",
             "boolean",
             false,
@@ -1042,7 +1042,7 @@ async fn discovery_diagnostics_identify_qualified_primary_scope() {
             Some("PrimarySync"),
             Some(json!([])),
             false,
-            "owner_not_default",
+            "owner_unqualified",
             "malformed",
             "array",
             false,
@@ -1051,7 +1051,7 @@ async fn discovery_diagnostics_identify_qualified_primary_scope() {
             Some("PrimarySync"),
             Some(json!({})),
             false,
-            "owner_not_default",
+            "owner_unqualified",
             "malformed",
             "object",
             false,
@@ -1060,7 +1060,7 @@ async fn discovery_diagnostics_identify_qualified_primary_scope() {
             Some("PrimarySync"),
             Some(json!("")),
             false,
-            "owner_not_default",
+            "owner_unqualified",
             "empty",
             "string",
             false,
@@ -1115,7 +1115,7 @@ async fn discovery_diagnostics_identify_qualified_primary_scope() {
                 .unwrap()["zoneID"]
                 .get("ownerRecordName")
                 .and_then(Value::as_str)
-                == Some("_defaultOwner")
+                .is_some_and(|owner| !owner.trim().is_empty())
         })
         .await;
         assert_eq!(primary_is_qualified, qualified_primary);
@@ -1140,6 +1140,14 @@ async fn discovery_diagnostics_identify_qualified_primary_scope() {
                 .any(|event| event["phase"] == "primary_publication"),
             qualified_primary
         );
+        if qualified_primary {
+            let published = fields
+                .iter()
+                .find(|event| event["phase"] == "primary_publication")
+                .unwrap();
+            assert_eq!(published["owner"], owner_class);
+            assert_eq!(published["owner_type"], owner_type);
+        }
         if zone_name == Some("SharedSync-PRIVATE_OTHER") {
             let selected = fields
                 .iter()
@@ -1272,7 +1280,7 @@ async fn inventory_envelope_owner_diagnostics_preserve_request_scope_guards() {
 }
 
 #[tokio::test]
-async fn issue765_unrelated_private_owner_cannot_qualify_primary_lookup() {
+async fn issue765_unrelated_private_zone_cannot_replace_primary_owner() {
     use crate::icloud::photos::{ProviderRecordId, RecordLookupRequest, RecordResolution};
 
     for route in ["primary", "all"] {
@@ -1297,15 +1305,77 @@ async fn issue765_unrelated_private_owner_cannot_qualify_primary_lookup() {
                 assert!(matches!(batch.results[0].1, RecordResolution::Present(_)));
             } else {
                 assert!(matches!(batch.results[0].1, RecordResolution::Unknown));
-                assert!(log.contains("owner_unqualified"));
+                assert!(log.contains("owner_conflict"));
             }
             let calls = fixture.calls.lock().unwrap();
             let request = calls.iter().find(|r| r.get("records").is_some()).unwrap();
-            assert_eq!(
-                request["zoneID"].get("ownerRecordName").is_some(),
-                owner == "_defaultOwner"
-            );
+            assert_eq!(request["zoneID"]["ownerRecordName"], owner);
+            assert_eq!(batch.complete, owner == "_defaultOwner");
             assert_redacted(&log, std::path::Path::new("/PRIVATE_PATH_CANARY"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_primary_owner_lookup_and_inventory_validate_exact_scope_on_repeat() {
+    use crate::icloud::photos::{ProviderRecordId, RecordLookupRequest, RecordResolution};
+    for route in ["primary", "all"] {
+        for foreign in [false, true] {
+            let scope = json!({"zoneName":"PrimarySync","ownerRecordName":"PRIVATE_OWNER_CANARY","zoneType":"REGULAR_CUSTOM_ZONE"});
+            let mut records = family();
+            records[1]["fields"]["masterRef"]["value"]["zoneID"] = if foreign {
+                json!({"zoneName":"PrimarySync","ownerRecordName":"PRIVATE_FOREIGN_CANARY","zoneType":"REGULAR_CUSTOM_ZONE"})
+            } else {
+                scope.clone()
+            };
+            let mut unrelated = records[1].clone();
+            unrelated["recordName"] = json!("PRIVATE_UNRELATED_CHILD");
+            unrelated["fields"]["masterRef"]["value"]["recordName"] =
+                json!("PRIVATE_UNRELATED_MASTER");
+            let mut inventory_records = records.clone();
+            inventory_records.push(unrelated);
+            let mut inventory_page = page(inventory_records, "PRIVATE_FINAL_CURSOR", false);
+            inventory_page["zones"][0]["zoneID"] = scope.clone();
+            let mut fixture = Fixture::new(false, records, vec![inventory_page]);
+            fixture.private_zones = Some(json!({"zones":[{"zoneID":scope}]}));
+            // These provider owners validate scope without granting checkpoint authority.
+            for _ in 0..2 {
+                let album = fixture.actual_album(route).await;
+                let batch = album
+                    .resolve_records(&[RecordLookupRequest::paired(
+                        ProviderRecordId::new("asset-PRIVATE_MASTER_ID_CANARY"),
+                        ProviderRecordId::new("PRIVATE_MASTER_ID_CANARY"),
+                        ProviderRecordId::new("asset-PRIVATE_MASTER_ID_CANARY"),
+                    )])
+                    .await;
+                assert_eq!(batch.complete, !foreign);
+                assert_eq!(
+                    matches!(batch.results[0].1, RecordResolution::Present(_)),
+                    !foreign
+                );
+                let inventory = album
+                    .complete_legacy_inventory(
+                        &FxHashSet::from_iter(["PRIVATE_MASTER_ID_CANARY".to_owned()]),
+                        &CancellationToken::new(),
+                    )
+                    .await;
+                if foreign {
+                    let diagnostic =
+                        classify_legacy_inventory_error(&inventory.unwrap_err()).unwrap();
+                    assert_eq!(diagnostic.subreason, "child_reference_scope_mismatch");
+                    assert_eq!(diagnostic.scope_mismatch_component, "owner");
+                    assert!(diagnostic.eof_observed);
+                } else {
+                    assert_eq!(inventory.unwrap().children.len(), 1);
+                }
+                let calls = fixture.calls.lock().unwrap();
+                assert!(
+                    calls
+                        .iter()
+                        .filter(|call| call.get("records").is_some())
+                        .all(|call| call["zoneID"] == scope)
+                );
+            }
         }
     }
 }
