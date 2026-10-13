@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.25.1] - 2026-10-13
+
+### Added
+
+- Added opt-in `photos.edited_naming = "primary"` to keep selected edited media at its ordinary filename while independently preserving original and previous media/sidecars. History is retained; see [edited-primary guidance](docs/edited-primary.md).
+- Added offline `kei support-export` for bounded, privacy-safe diagnostic evidence, including owner-scope and checkpoint history. Docker support export does not repair mounted-volume ownership. ([#938](https://github.com/rhoopr/kei/pull/938), [#940](https://github.com/rhoopr/kei/pull/940), [#944](https://github.com/rhoopr/kei/pull/944))
+
+### Changed
+
+- SQLite schema advances from 34 to 35 for managed layout and history receipts. Stop all writers and take a matched cold backup of configuration/state and media/sidecars before upgrading. v0.25.0 cannot read schema 35; rollback requires the matched old set and old binary. See [v0.25.1 upgrade guidance](docs/v0.25.1-upgrade.md).
+
+### Fixed
+
+- Pending downloads resume at their reserved destinations and can adopt verified current publications after an interrupted finalization. ([#920](https://github.com/rhoopr/kei/pull/920), [#923](https://github.com/rhoopr/kei/pull/923))
+- Smart-folder path and bounded-selection reconciliation can complete while preserving prior media and durable recovery evidence. ([#921](https://github.com/rhoopr/kei/pull/921), [#934](https://github.com/rhoopr/kei/pull/934))
+- Retained-checkpoint recovery preserves incomplete replay, and inventory comparisons require matching selection and coverage. These changes do not establish recovery for every Shared Photo Library case. ([#928](https://github.com/rhoopr/kei/pull/928), [#949](https://github.com/rhoopr/kei/pull/949))
+- Shutdown cancels incremental provider and channel waits while allowing already-started durable writes to finish. ([#952](https://github.com/rhoopr/kei/pull/952))
+- Embedded capture timestamps preserve supported fractional seconds; Docker ownership and packaging checks cover the updated entrypoint and image. ([#931](https://github.com/rhoopr/kei/pull/931), [#932](https://github.com/rhoopr/kei/pull/932))
+- Updated locked `quinn-proto` to 0.11.18 for RUSTSEC-2026-0338 through RUSTSEC-2026-0342. HTTP/3 remains disabled. ([#959](https://github.com/rhoopr/kei/pull/959))
+
+### Known limitations
+
+- Embedded metadata rewriting can damage existing metadata structures in some MOV files. [#947](https://github.com/rhoopr/kei/issues/947) remains open; [#948](https://github.com/rhoopr/kei/pull/948) is not included. For libraries containing MOV files, disable all in-file metadata write options; sidecars remain available. See the [verified configuration workaround](docs/v0.25.1-upgrade.md#mov-metadata-workaround). Existing damage is not automatically repaired.
+- Provider indexing/restart behavior, unsupported identity and checkpoint recovery, legacy attribution, physical NFS/NAS behavior, and representative HEIF memory bounds remain scoped limitations. Passing source tests does not establish every private-library recovery or downstream Immich pairing behavior.
+
 ## [0.25.0] - 2026-10-07
 
 ### Added
