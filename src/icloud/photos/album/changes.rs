@@ -330,23 +330,31 @@ impl PhotoAlbum {
                     let _ = token_tx.send(current_token);
                     return;
                 }
-                let body = build_changes_zone_request(&zone_id, Some(&current_token), 200);
+                let body =
+                    build_changes_zone_request(&zone_id, Some(&current_token), 200).to_string();
                 tracing::debug!(target: "kei::icloud::photos::album",
                     album = %album_name,
                     "changes/zone request"
                 );
 
-                let raw_body = match session::retry_post_changes_body(
-                    session.as_ref(),
-                    &url,
-                    &body.to_string(),
-                    &[("Content-type", "text/plain")],
-                    &retry_config,
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(e) => break Some(e),
+                // Receiver closure cancels read-only requests and retry delays.
+                // An already-started durable shadow capture still finishes below.
+                let raw_body = tokio::select! {
+                    biased;
+                    () = tx.closed() => {
+                        let _ = token_tx.send(current_token);
+                        return;
+                    }
+                    result = session::retry_post_changes_body(
+                        session.as_ref(),
+                        &url,
+                        &body,
+                        &[("Content-type", "text/plain")],
+                        &retry_config,
+                    ) => match result {
+                        Ok(body) => body,
+                        Err(error) => break Some(error),
+                    },
                 };
 
                 let response = match super::super::changes_json::parse(&raw_body) {

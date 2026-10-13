@@ -137,6 +137,72 @@ async fn incremental_multi_page_unfiled_streams_through_bounded_pipeline() {
     assert_eq!(result.stats.downloaded, 2);
 }
 
+#[tokio::test]
+async fn issue765_cancel_backpressured_incremental_producer_with_receiver_retained() {
+    const DRAIN_BOUND: Duration = Duration::from_secs(1);
+    const CLEANUP_BOUND: Duration = Duration::from_secs(5);
+    // Progressing pages respect the 200-record request limit.
+    let session = [
+        (0..100, "page-one", true),
+        (100..200, "page-two", true),
+        (200..250, "zone-token-after", false),
+    ]
+    .into_iter()
+    .fold(MockPhotosFlow::new(), |flow, (range, token, more)| {
+        let records = range
+            .flat_map(|index| incremental_photo_records(&format!("BACKPRESSURE_{index}")))
+            .collect();
+        flow.changes_zone_page(records, token, more)
+    })
+    .build();
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: mock_album("Library", session),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let directory = TempDir::new().unwrap();
+    let mut config = test_config();
+    config.directory = Arc::from(directory.path());
+    config.concurrent_downloads = 1;
+    let cancel = CancellationToken::new();
+    let pending = Arc::new(tokio::sync::Notify::new());
+    let (assets, mut producer) = super::stream_incremental_assets_for_single_unfiled_pass(
+        pass,
+        Arc::new(config),
+        "zone-token-before".to_owned(),
+        DownloadRunMode::Download,
+        cancel.clone(),
+        Some(pending.clone()),
+    );
+    let blocked = tokio::time::timeout(CLEANUP_BOUND, pending.notified()).await;
+    if blocked.is_err() {
+        producer.abort();
+        let _ = tokio::time::timeout(CLEANUP_BOUND, &mut producer)
+            .await
+            .unwrap();
+    }
+    blocked.expect("production send must first be polled Pending");
+    assert!(!producer.is_finished());
+    cancel.cancel();
+    let result = tokio::time::timeout(DRAIN_BOUND, &mut producer).await;
+    if result.is_err() {
+        producer.abort();
+        let _ = tokio::time::timeout(CLEANUP_BOUND, &mut producer)
+            .await
+            .expect("aborted synthetic producer must join");
+    }
+    drop(assets);
+    let summary = result
+        .expect("shutdown must not wait for retained channel capacity")
+        .expect("producer task joins")
+        .expect("producer returns a partial summary");
+    assert_eq!(
+        summary.total_events, 3,
+        "two queued assets and one blocked send"
+    );
+    assert_eq!(summary.sync_token, None);
+}
+
 // ── extract_skip_candidates tests ──────────────────────────────
 
 // ── hash_download_config additional sensitivity tests ──────────
@@ -2423,6 +2489,86 @@ async fn incremental_collecting_paired_asset_preserves_child_state_identity() {
 
 #[tokio::test]
 async fn shared_delta_state_streaming_receiver_drop_keeps_completion_uncommitted() {
+    const DRAIN_BOUND: Duration = Duration::from_secs(1);
+    const CLEANUP_BOUND: Duration = Duration::from_secs(5);
+    let dir = TempDir::new().unwrap();
+    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+    let mut config = test_config();
+    config.directory = Arc::from(dir.path());
+    config.state_db = Some(db.clone());
+    config.concurrent_downloads = 1;
+    let records = ["UNCONSUMED", "QUEUED", "BLOCKED"]
+        .into_iter()
+        .flat_map(incremental_photo_records)
+        .collect();
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: changes_album(
+            "",
+            changes_zone_session(Arc::new(AtomicUsize::new(0)), records),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let pending = Arc::new(tokio::sync::Notify::new());
+    let (assets, mut producer) = super::stream_incremental_assets_for_single_unfiled_pass(
+        pass,
+        Arc::new(config),
+        "zone-token-prev".to_string(),
+        DownloadRunMode::Download,
+        CancellationToken::new(),
+        Some(pending.clone()),
+    );
+    // Two assets fill the channel; the third send is actually polled Pending
+    // after all three source mappings have finished their SQLite writes.
+    let blocked = tokio::time::timeout(CLEANUP_BOUND, pending.notified()).await;
+    if blocked.is_err() {
+        producer.abort();
+        let _ = tokio::time::timeout(CLEANUP_BOUND, &mut producer)
+            .await
+            .expect("aborted synthetic producer must join");
+    }
+    blocked.expect("receiver drop must follow actual durable event processing");
+    assert!(!producer.is_finished());
+    drop(assets);
+    let result = tokio::time::timeout(DRAIN_BOUND, &mut producer).await;
+    if result.is_err() {
+        producer.abort();
+        let _ = tokio::time::timeout(CLEANUP_BOUND, &mut producer)
+            .await
+            .expect("aborted synthetic producer must join");
+    }
+    let summary = result
+        .expect("receiver closure must release the blocked asset send")
+        .expect("producer task joins")
+        .expect("producer returns its partial summary");
+    assert_eq!(summary.sync_token, None);
+    assert_eq!(summary.total_events, 3);
+    assert_eq!(summary.created_count, 3);
+    assert_eq!(summary.state_transition_failures, 0);
+    assert_eq!(
+        db.get_master_record_name_for_asset("PrimarySync", "asset-UNCONSUMED")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("UNCONSUMED"),
+    );
+    for master in ["QUEUED", "BLOCKED"] {
+        assert_eq!(
+            db.get_master_record_name_for_asset("PrimarySync", &format!("asset-{master}"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(master),
+        );
+    }
+    assert!(db.get_pending().await.unwrap().is_empty());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn shared_delta_state_streaming_receiver_drop_before_processing_preserves_empty_state() {
+    const DRAIN_BOUND: Duration = Duration::from_secs(1);
+    const CLEANUP_BOUND: Duration = Duration::from_secs(5);
     let dir = TempDir::new().unwrap();
     let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
     let mut config = test_config();
@@ -2439,25 +2585,37 @@ async fn shared_delta_state_streaming_receiver_drop_keeps_completion_uncommitted
         ),
         exclude_ids: Arc::new(FxHashSet::default()),
     };
-    let (assets, producer) = super::stream_incremental_assets_for_single_unfiled_pass(
+    let (assets, mut producer) = super::stream_incremental_assets_for_single_unfiled_pass(
         pass,
         Arc::new(config),
         "zone-token-prev".to_string(),
         DownloadRunMode::Download,
         CancellationToken::new(),
+        None,
     );
+    // This current-thread fixture closes the receiver before yielding to the
+    // spawned incremental consumer. No event has begun durable processing.
     drop(assets);
-    let summary = producer.await.unwrap().unwrap();
+    let result = tokio::time::timeout(DRAIN_BOUND, &mut producer).await;
+    if result.is_err() {
+        producer.abort();
+        let _ = tokio::time::timeout(CLEANUP_BOUND, &mut producer)
+            .await
+            .expect("aborted synthetic producer must join");
+    }
+    let summary = result
+        .expect("pre-work receiver closure must drain")
+        .expect("producer task joins")
+        .expect("producer returns an empty partial summary");
     assert_eq!(summary.sync_token, None);
-    assert_eq!(summary.total_events, 1);
-    assert_eq!(summary.created_count, 1);
+    assert_eq!(summary.total_events, 0);
+    assert_eq!(summary.created_count, 0);
     assert_eq!(summary.state_transition_failures, 0);
     assert_eq!(
         db.get_master_record_name_for_asset("PrimarySync", "asset-UNCONSUMED")
             .await
-            .unwrap()
-            .as_deref(),
-        Some("UNCONSUMED"),
+            .unwrap(),
+        None,
     );
     assert!(db.get_pending().await.unwrap().is_empty());
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
@@ -24,6 +24,8 @@ struct ConfigBridgeSession {
     zone: Arc<str>,
     inventory_token: Arc<str>,
     bridge_token: Arc<str>,
+    bridge_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    calls: Arc<Mutex<Vec<(&'static str, String)>>>,
 }
 
 impl ConfigBridgeSession {
@@ -32,6 +34,8 @@ impl ConfigBridgeSession {
             zone: Arc::from(zone),
             inventory_token: Arc::from(inventory_token),
             bridge_token: Arc::from(bridge_token),
+            bridge_gate: None,
+            calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -41,19 +45,32 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
     async fn post(
         &self,
         url: &str,
-        _body: String,
+        body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<serde_json::Value> {
         if url.contains("/internal/records/query/batch") {
             return Ok(album_count_response(0));
         }
         if url.contains("/records/query?") {
+            self.calls.lock().unwrap().push(("query", String::new()));
             return Ok(serde_json::json!({
                 "records": [],
                 "syncToken": self.inventory_token.as_ref()
             }));
         }
         if url.contains("/changes/zone?") {
+            let request: serde_json::Value = serde_json::from_str(&body)?;
+            self.calls.lock().unwrap().push((
+                "changes",
+                request["zones"][0]["syncToken"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            ));
+            if let Some((requested, release)) = &self.bridge_gate {
+                requested.notify_one();
+                release.notified().await;
+            }
             return Ok(serde_json::json!({
                 "zones": [{
                     "zoneID": {"zoneName": self.zone.as_ref(), "ownerRecordName": "_defaultOwner"},
@@ -63,12 +80,245 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
                 }]
             }));
         }
+        if url.contains("/records/lookup?") {
+            self.calls.lock().unwrap().push(("lookup", String::new()));
+        }
         Ok(serde_json::json!({"records": []}))
     }
 
     fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
         Box::new(self.clone())
     }
+}
+
+#[tokio::test]
+async fn issue765_cancel_pending_bridge_preserves_checkpoint_then_replays() {
+    use std::time::Duration;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    const DRAIN_BOUND: Duration = Duration::from_secs(1);
+    const CLEANUP_BOUND: Duration = Duration::from_secs(5);
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("issue765.db");
+    let media = directory.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    let sentinel = media.join("existing.jpg");
+    std::fs::write(&sentinel, b"existing synthetic media").unwrap();
+    let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+    let marker = state::unresolved_identity_key("PrimarySync");
+    db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
+        .await
+        .unwrap();
+    db.set_metadata("sync_token:PrimarySync", "prior-token")
+        .await
+        .unwrap();
+    db.set_metadata(&marker, "1").await.unwrap();
+    let requested = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut session = ConfigBridgeSession::new("PrimarySync", "inventory-token", "bridge-token");
+    session.bridge_gate = Some((requested.clone(), release.clone()));
+    let calls = session.calls.clone();
+    let album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: Arc::from("https://example.invalid"),
+            name: Arc::from("Synthetic album"),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(serde_json::json!({"zoneName":"PrimarySync"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: Some(Arc::from("synthetic-album")),
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(session),
+    );
+    let library = make_run_cycle_library_state_with_passes(
+        "PrimarySync",
+        "sync_token:PrimarySync",
+        vec![crate::commands::AlbumPass {
+            kind: crate::commands::PassKind::Album,
+            album,
+            exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+        }],
+    );
+    let states = [&library];
+    let config = make_run_cycle_config();
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    let builder = make_run_cycle_download_config_builder(&media, db.clone());
+    let (layer, diagnostics) = crate::support::history::test_layer();
+    let _default = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+    // Keep cold callsite registration independent of a worker's missing TLS
+    // subscriber. Production installs a global subscriber instead.
+    let _worker_callsite_registration = tracing::Dispatch::new(tracing_subscriber::registry());
+    let cancel = CancellationToken::new();
+    let mut cycle = Box::pin(run_cycle(
+        &states,
+        &config,
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        &shared_session,
+        &cancel,
+    ));
+    tokio::select! {
+        () = requested.notified() => {}
+        result = cycle.as_mut() => panic!("bridge gate was not reached: {result:?}"),
+        () = tokio::time::sleep(CLEANUP_BOUND) => {
+            release.notify_one();
+            panic!("bridge gate was not reached within the fixture bound");
+        }
+    }
+    cancel.cancel();
+    let result = tokio::time::timeout(DRAIN_BOUND, cycle.as_mut()).await;
+    let drained = result.is_ok();
+    // Release even on the red path: no blocked provider task may escape this test.
+    release.notify_one();
+    let result = match result {
+        Ok(result) => result,
+        Err(_) => tokio::time::timeout(CLEANUP_BOUND, cycle.as_mut())
+            .await
+            .expect("released synthetic bridge must finish cleanup"),
+    }
+    .expect("cancelled cycle returns its checkpoint hold");
+    assert!(result.stats.interrupted);
+    assert!(!result.db_sync_token_advance_safe);
+    assert!(!result.can_advance_database_checkpoint());
+    let bridge = diagnostics()
+        .into_iter()
+        .find(|event| {
+            event["kind"] == "support_pass_completion_v1"
+                && event["fields"]["component"] == "delta_bridge"
+        })
+        .expect("production cycle records its cancelled bridge decision");
+    assert_eq!(bridge["fields"]["interrupted"], true);
+    assert_eq!(bridge["fields"]["completed_delta_replay"], false);
+    drop(cycle);
+    drop(builder);
+    drop(db);
+    let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+    for (key, expected) in [
+        ("sync_token:PrimarySync", "prior-token"),
+        (ENUM_CONFIG_HASH_KEY, "old-enum-hash"),
+        (marker.as_str(), "1"),
+    ] {
+        assert_eq!(
+            db.get_metadata(key).await.unwrap().as_deref(),
+            Some(expected)
+        );
+    }
+    let expected_hash = download::compute_config_hash(&config);
+    assert_eq!(
+        db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(expected_hash.as_str())
+    );
+    assert_eq!(
+        db.get_metadata(&pending_zone_token_key(&expected_hash, "PrimarySync"))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"existing synthetic media"
+    );
+    let initial_calls = calls.lock().unwrap().clone();
+    assert_eq!(
+        initial_calls
+            .iter()
+            .filter(|(kind, _)| *kind == "changes")
+            .map(|(_, cursor)| cursor.as_str())
+            .collect::<Vec<_>>(),
+        ["prior-token"]
+    );
+    let inventory_queries = initial_calls
+        .iter()
+        .filter(|(kind, _)| *kind == "query")
+        .count();
+    assert!(inventory_queries > 0);
+    let builder = make_run_cycle_download_config_builder(&media, db.clone());
+    let mut replay_queries = 0;
+    for replay in 0..2 {
+        // Reuse the exact Album/container route, releasing its synthetic gate.
+        release.notify_one();
+        let result = tokio::time::timeout(
+            CLEANUP_BOUND,
+            run_cycle(
+                &[&library],
+                &config,
+                Some(db.as_ref()),
+                false,
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &shared_session,
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("valid synthetic replay is bounded")
+        .unwrap();
+        assert!(result.can_advance_database_checkpoint());
+        assert!(!result.stats.interrupted);
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(
+            db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(expected_hash.as_str())
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("bridge-token")
+        );
+        assert_eq!(db.get_metadata(&marker).await.unwrap(), None);
+        let observed = calls.lock().unwrap().clone();
+        assert!(!observed.iter().any(|(kind, _)| *kind == "lookup"));
+        let queries = observed.iter().filter(|(kind, _)| *kind == "query").count();
+        if replay == 0 {
+            assert!(
+                queries > inventory_queries,
+                "recovery must reconcile inventory"
+            );
+            replay_queries = queries;
+        } else {
+            assert_eq!(
+                queries, replay_queries,
+                "quiet follow-up must not repeat inventory"
+            );
+        }
+        let cursors: Vec<_> = observed
+            .iter()
+            .filter(|(kind, _)| *kind == "changes")
+            .map(|(_, cursor)| cursor.as_str())
+            .collect();
+        let expected = if replay == 0 {
+            vec!["prior-token", "prior-token"]
+        } else {
+            vec!["prior-token", "prior-token", "bridge-token"]
+        };
+        assert_eq!(cursors, expected);
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"existing synthetic media"
+        );
+    }
+    assert!(
+        drained,
+        "cancellation waited for the pending bridge request instead of draining"
+    );
 }
 
 #[tokio::test]
@@ -218,7 +468,6 @@ async fn run_cycle_enum_config_drift_atomically_promotes_bridged_checkpoint() {
 
 #[tokio::test]
 async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_restarts() {
-    use tracing::instrument::WithSubscriber;
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -257,6 +506,12 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
                 .with_writer(std::io::sink)
                 .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
         );
+        // This current-thread test must cover spawned provider/pipeline tasks,
+        // not only polls of run_cycle (see the full-sync history test).
+        let _default = tracing::subscriber::set_default(subscriber);
+        // Keep cold callsite registration independent of a worker's missing TLS
+        // subscriber. Production installs a global subscriber instead.
+        let _worker_callsite_registration = tracing::Dispatch::new(tracing_subscriber::registry());
         let result = run_cycle(
             &[&lib_state],
             &config,
@@ -267,7 +522,6 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
             &shared_session,
             &CancellationToken::new(),
         )
-        .with_subscriber(subscriber)
         .await
         .unwrap();
         assert_eq!(result.db_sync_token_advance_safe, advance);
