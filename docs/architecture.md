@@ -808,7 +808,9 @@ zones. Zone-local hold aggregation keeps status and backup safety truthful even
 when another zone succeeds.
 
 Ordinary incremental producers carry validated changes/zone completion separately
-from query enumeration. Mixed unfiled and smart-folder refreshes retain the actual
+from query enumeration. Smart-folder-only passes also replay the source zone;
+that delta has no media destinations, and the selected folder query still owns
+media admission. Its query token never substitutes for the source successor. Mixed unfiled and smart-folder refreshes retain the actual
 delta successor and every identity, partial-scan, cancellation and durable-write
 veto. A successful smart query does not certify retained-boundary replay. Typed
 provider cursor rejection is distinct from malformed or missing successor data.
@@ -1665,7 +1667,12 @@ receipt evidence reactivates the hold while retaining every original snapshot an
 prior proof. Reactivation does not authorize historical attribution or rewriting.
 
 `status`, cycle reports and health JSON expose `unattributed_legacy_assets` and
-`unattributed_legacy_pending` separately from download failures. The first counts
+`unattributed_legacy_pending` separately from download failures. Pending current
+proof makes one-shot exit status, cycle reports and health incomplete, including
+idle health for unselected libraries. Certified but unattributed history alone
+does not fail current sync. Certification refusals include the fixed-label
+`legacy_certification_refusal_v1` diagnostic and a bounded `subreason`; unknown
+errors use `unclassified`, without logging their private source text. The first counts
 legacy records still needing attribution; the second counts records awaiting
 valid current-work preservation proof. Original capture revision and retry history
 remain stored. Advancing current sync does not claim a complete historical backup;

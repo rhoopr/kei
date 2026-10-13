@@ -1403,3 +1403,21 @@ Fresh inventory measurements and partial/additive activity totals are never
 retained-history recovery proof. Permanently expired boundaries with
 unproven history retain a finite actionable hold. Successful replay does not
 resolve the distinct reporter limitations tracked in #765, #853 or #845.
+
+## Legacy current-work certification regression
+
+`run_cycle_legacy_smart_only_bridge_qualifies_after_reopen` uses the Hidden query
+with real SQLite, independently named current outputs and retained originals.
+`run_cycle_legacy_smart_only_bridge_preserves_failure_guards` exercises cancellation, current receipt write failure and proof transaction
+failure before reopened recovery. The same helper checks unchanged historical
+rows, dates, owners, original files, sidecars and mapping history.
+`run_cycle_ambiguous_children_unselected_hidden` retains missing-current-receipt
+holds and verifies a redacted fixed-label refusal. Cycle reporting distinguishes
+pending certification from certified history still needing attribution.
+
+`run_cycle_legacy_smart_only_query_cannot_replace_missing_delta_successor` keeps
+healthy query tokens separate from missing/blank source successors and retains
+original cursors without proof publication. The positive cycle fixture uses a
+distinct delta successor. `smart_only_delta_replays_source_without_admitting_unselected_media`
+adds a delta-only child while the smart query is empty; source replay supplies the
+token but no off-selection download. Existing bridge-debt controls remain active.

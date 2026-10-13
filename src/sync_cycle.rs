@@ -2019,6 +2019,16 @@ pub(crate) async fn run_cycle(
         if summary
             .metadata_capture
             .iter()
+            .any(|capture| capture.unattributed_legacy_pending > 0)
+        {
+            // Protected history no longer appears in the capture retry count,
+            // but pending current-work proof is still incomplete cycle work.
+            cycle_failed_count = cycle_failed_count.max(1);
+            db_sync_token_advance_safe = false;
+        }
+        if summary
+            .metadata_capture
+            .iter()
             .any(|capture| capture.unresolved_assets > 0)
         {
             download::block_sync_token_for_metadata_capture(&mut cycle_stats);

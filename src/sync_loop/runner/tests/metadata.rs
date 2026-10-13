@@ -3621,6 +3621,8 @@ enum AmbiguousChildFault {
     PreservePaginatedHidden,
     PreserveHiddenUnselected,
     PreserveBridgeDebt,
+    PreserveMissingDelta,
+    PreserveBlankDelta,
     PreserveCancel,
     PreserveStateWrite,
     PreservePathConflict,
@@ -3660,6 +3662,21 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
     child_counts: &[usize],
     hardlink_fault: Option<LegacyHardlinkFault>,
 ) {
+    Box::pin(exercise_legacy_child_cycles_with_selection(
+        fault,
+        child_counts,
+        hardlink_fault,
+        false,
+    ))
+    .await;
+}
+
+async fn exercise_legacy_child_cycles_with_selection(
+    fault: AmbiguousChildFault,
+    child_counts: &[usize],
+    hardlink_fault: Option<LegacyHardlinkFault>,
+    smart_only: bool,
+) {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -3674,7 +3691,7 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
         omit_hidden: bool,
         incomplete_inventory: bool,
         inventory_requests: Arc<std::sync::atomic::AtomicUsize>,
-        quiet_token: &'static str,
+        quiet_token: Option<&'static str>,
     }
     #[async_trait::async_trait]
     impl crate::icloud::photos::PhotosSession for ChildSession {
@@ -3708,9 +3725,14 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
                 && request["zones"][0]["syncToken"].is_string()
                 && !self.bridge_debt
             {
-                return Ok(
-                    serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":self.quiet_token,"moreComing":false,"records":[]}]}),
-                );
+                let mut response = serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":self.quiet_token,"moreComing":false,"records":[]}]});
+                if self.quiet_token.is_none() {
+                    response["zones"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("syncToken");
+                }
+                return Ok(response);
             }
             if url.contains("/changes/zone?") {
                 let mut response = serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"after","moreComing":false,"records":self.records}]});
@@ -3793,6 +3815,8 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
             | AmbiguousChildFault::PreservePaginatedHidden
             | AmbiguousChildFault::PreserveHiddenUnselected
             | AmbiguousChildFault::PreserveBridgeDebt
+            | AmbiguousChildFault::PreserveMissingDelta
+            | AmbiguousChildFault::PreserveBlankDelta
             | AmbiguousChildFault::PreserveCancel
             | AmbiguousChildFault::PreserveStateWrite
             | AmbiguousChildFault::PreservePathConflict
@@ -3839,6 +3863,9 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
             for (index, name) in names.iter().enumerate() {
                 let mut child = page["records"][1].clone();
                 child["recordName"] = serde_json::json!(name);
+                if smart_only {
+                    child["fields"]["isHidden"] = serde_json::json!({"value":1});
+                }
                 child["fields"]["isFavorite"] = serde_json::json!({"value":index % 2});
                 if index == children - 1
                     && matches!(
@@ -4137,10 +4164,16 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
                     ) || (cycle == 0
                         && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery)),
                     inventory_requests: Arc::clone(&inventory_requests),
-                    quiet_token: if hardlink_fault.is_some() && cycle >= 2 {
-                        "later"
+                    quiet_token: if matches!(fault, AmbiguousChildFault::PreserveMissingDelta) {
+                        None
+                    } else if matches!(fault, AmbiguousChildFault::PreserveBlankDelta) {
+                        Some("")
+                    } else if smart_only {
+                        Some("delta-after")
+                    } else if hardlink_fault.is_some() && cycle >= 2 {
+                        Some("later")
                     } else {
-                        "after"
+                        Some("after")
                     },
                 };
                 let mut primary = make_run_cycle_library_state_with_album(
@@ -4152,6 +4185,28 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
                     primary.library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
                         Box::new(provider.clone()),
                         "PrimarySync",
+                    );
+                }
+                if smart_only {
+                    primary.plan.passes[0].kind = crate::commands::PassKind::SmartFolder;
+                    primary.pass_scope.include_smart_folders = true;
+                    primary.pass_scope.include_unfiled = false;
+                    // Use the real Hidden query definition, with a fully synthetic session.
+                    primary.plan.passes[0].album = crate::icloud::photos::PhotoAlbum::new(
+                        crate::icloud::photos::PhotoAlbumConfig {
+                            params: Arc::new(std::collections::HashMap::new()),
+                            service_endpoint: Arc::from("https://example.com"),
+                            name: Arc::from("Hidden"),
+                            list_type: Arc::from("CPLAssetAndMasterHiddenByAssetDate"),
+                            obj_type: Arc::from("CPLAssetHiddenByAssetDate"),
+                            query_filter: None,
+                            page_size: 100,
+                            zone_id: Arc::new(serde_json::json!({"zoneName":"PrimarySync"})),
+                            retry_config: crate::retry::RetryConfig::default(),
+                            container_id: None,
+                            cross_zone_sources: Vec::new(),
+                        },
+                        Box::new(provider.clone()),
                     );
                 }
                 let base_builder = make_run_cycle_download_config_builder_with_options(
@@ -4469,6 +4524,11 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
                     "no guessed owner {label}"
                 );
                 let activated = preserving
+                    && !matches!(
+                        fault,
+                        AmbiguousChildFault::PreserveMissingDelta
+                            | AmbiguousChildFault::PreserveBlankDelta
+                    )
                     && !(cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveFreshRetry))
                     && !(cycle < 2
                         && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
@@ -4496,7 +4556,9 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
                         .unwrap()
                         .as_deref(),
                     Some(if activated {
-                        if hardlink_fault.is_some() && cycle >= 2 {
+                        if smart_only {
+                            "delta-after"
+                        } else if hardlink_fault.is_some() && cycle >= 2 {
                             "later"
                         } else {
                             "after"
@@ -4507,6 +4569,49 @@ async fn exercise_legacy_child_cycles_with_hardlinks(
                     "checkpoint {label}: {:?}",
                     result.stats
                 );
+                if matches!(
+                    fault,
+                    AmbiguousChildFault::PreserveMissingDelta
+                        | AmbiguousChildFault::PreserveBlankDelta
+                ) {
+                    assert_eq!(
+                        result.stats.sync_token_blocked_reason,
+                        Some("inventory_delta_bridge_failed")
+                    );
+                    assert!(rows(&database, "SELECT * FROM unattributed_legacy_proofs").is_empty());
+                    assert!(
+                        inner
+                            .get_metadata(&format!(
+                                "{}PrimarySync",
+                                crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
+                            ))
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "missing successor is not evidence of an expired cursor"
+                    );
+                }
+                if preserving && result.stats.unattributed_legacy_pending > 0 {
+                    assert!(
+                        result.failed_count > 0,
+                        "pending certification must fail the cycle {label}"
+                    );
+                    assert!(!result.can_advance_database_checkpoint());
+                    assert_eq!(
+                        crate::cycle_reporter::classify_cycle(
+                            &result.stats,
+                            result.failed_count,
+                            result.session_expired
+                        ),
+                        crate::cycle_reporter::CycleStatus::Failed
+                    );
+                }
+                if matches!(fault, AmbiguousChildFault::PreserveHiddenUnselected) {
+                    let warning = std::fs::read_to_string(&warning_path).unwrap();
+                    assert!(warning.contains("legacy_certification_refusal_v1"));
+                    assert!(warning.contains("child_receipt_missing"));
+                    assert!(!warning.contains("child-0-unique"));
+                }
                 if activated {
                     assert!(
                         !result.stats.identity_incomplete,
@@ -5010,4 +5115,48 @@ async fn run_cycle_legacy_hardlink_opt_in_incomplete_inventory_still_holds() {
         Some(LegacyHardlinkFault::Quiet),
     ))
     .await;
+}
+
+#[tokio::test]
+async fn run_cycle_legacy_smart_only_bridge_qualifies_after_reopen() {
+    Box::pin(exercise_legacy_child_cycles_with_selection(
+        AmbiguousChildFault::Preserve,
+        &[1, 2],
+        None,
+        true,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_legacy_smart_only_bridge_preserves_failure_guards() {
+    for fault in [
+        AmbiguousChildFault::PreserveCancel,
+        AmbiguousChildFault::PreserveStateWrite,
+        AmbiguousChildFault::PreserveCheckpointFailure,
+    ] {
+        Box::pin(exercise_legacy_child_cycles_with_selection(
+            fault,
+            &[1],
+            None,
+            true,
+        ))
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn run_cycle_legacy_smart_only_query_cannot_replace_missing_delta_successor() {
+    for fault in [
+        AmbiguousChildFault::PreserveMissingDelta,
+        AmbiguousChildFault::PreserveBlankDelta,
+    ] {
+        Box::pin(exercise_legacy_child_cycles_with_selection(
+            fault,
+            &[1],
+            None,
+            true,
+        ))
+        .await;
+    }
 }

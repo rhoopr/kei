@@ -121,6 +121,12 @@ fn classify_legacy_file_error(error: &anyhow::Error) -> Option<&'static str> {
     }
 }
 
+/// Only owning call sites supply these fixed labels. Private source errors stay
+/// in the chain for typed inventory/file classification, never ordinary logs.
+#[derive(Debug, thiserror::Error)]
+#[error("Legacy current evidence refused ({0})")]
+struct LegacyProofRefusal(&'static str);
+
 pub(crate) fn log_preservation_hold(stage: &'static str, error: &anyhow::Error) {
     if let Some(diagnostic) = crate::icloud::photos::classify_legacy_inventory_error(error) {
         tracing::warn!(
@@ -160,6 +166,10 @@ pub(crate) fn log_preservation_hold(stage: &'static str, error: &anyhow::Error) 
         tracing::warn!(
             stage,
             reason = "current_evidence_incomplete",
+            diagnostic = "legacy_certification_refusal_v1",
+            subreason = error
+                .downcast_ref::<LegacyProofRefusal>()
+                .map_or("unclassified", |refusal| refusal.0),
             "Legacy preservation evidence incomplete; retaining attribution checkpoint hold"
         );
     }
@@ -419,7 +429,7 @@ impl LegacyCycle {
         let inventory = album.complete_legacy_inventory(&masters, cancel).await?;
         anyhow::ensure!(
             inventory.library == config.library.as_ref(),
-            "Legacy preservation scope changed"
+            LegacyProofRefusal("inventory_scope_changed")
         );
         for record in self
             .preserved
@@ -450,7 +460,7 @@ impl LegacyCycle {
                     == db
                         .legacy_dependency_evidence(&record.library, &record.asset_id)
                         .await?,
-                "Legacy current receipts changed during qualification"
+                LegacyProofRefusal("dependencies_changed_during_qualification")
             );
             let mut expected_metadata = Vec::new();
             for key in [
@@ -503,7 +513,7 @@ impl LegacyCycle {
                     record
                         .provider_evidence
                         .as_deref()
-                        .context("Missing legacy current file evidence")?,
+                        .context(LegacyProofRefusal("current_file_evidence_missing"))?,
                 )?;
                 verify_files(
                     &files,
@@ -514,18 +524,18 @@ impl LegacyCycle {
                 .await?;
                 anyhow::ensure!(
                     record.dependency_evidence.as_deref() == Some(current.as_str()),
-                    "Legacy current coverage changed"
+                    LegacyProofRefusal("active_dependencies_changed")
                 );
             } else {
                 let mut proof = self
                     .prepared_proofs
                     .iter()
                     .find(|proof| proof.asset_id == record.asset_id)
-                    .context("Legacy current coverage is incomplete")?
+                    .context(LegacyProofRefusal("current_proof_missing"))?
                     .clone();
                 anyhow::ensure!(
                     proof.expected_dependencies == current,
-                    "Legacy current receipts changed after inventory"
+                    LegacyProofRefusal("dependencies_changed_after_inventory")
                 );
                 verify_files(
                     &provider_files(&proof.provider_evidence)?,
@@ -649,14 +659,17 @@ async fn qualify_family(
         .collect();
     anyhow::ensure!(
         !children.is_empty(),
-        "Legacy family has no current children"
+        LegacyProofRefusal("no_current_children")
     );
     let mut paths: FxHashSet<_> = record
         .files
         .iter()
         .map(|file| crate::fs_util::confined_path_key(&file.path))
         .collect::<Result<_, _>>()?;
-    let catalog = db.get_reconciliation_catalog_paths().await?;
+    let catalog = db
+        .get_reconciliation_catalog_paths()
+        .await
+        .context(LegacyProofRefusal("catalog_read_failed"))?;
     let mut evidence = Vec::new();
     for child in children {
         anyhow::ensure!(
@@ -664,47 +677,48 @@ async fn qualify_family(
                 .await?
                 .as_deref()
                 == Some(record.asset_id.as_str()),
-            "Legacy current child mapping is not durable"
+            LegacyProofRefusal("child_mapping_missing")
         );
         anyhow::ensure!(
             child.asset_record_name() != record.asset_id,
-            "Legacy identity conflicts with current child"
+            LegacyProofRefusal("child_identity_conflict")
         );
         anyhow::ensure!(
             super::filter::is_asset_filtered(child, config).is_none(),
-            "Legacy family includes policy-excluded work"
+            LegacyProofRefusal("child_policy_excluded")
         );
         let versions = super::filter::extract_skip_candidates(child, config);
         anyhow::ensure!(
             !versions.is_empty(),
-            "Legacy family has no eligible renditions"
+            LegacyProofRefusal("child_renditions_empty")
         );
         let receipts = db
             .legacy_child_receipts(&record.library, child.asset_record_name())
-            .await?;
+            .await
+            .context(LegacyProofRefusal("child_receipt_read_failed"))?;
         for (version, checksum) in versions {
             let receipt = receipts
                 .iter()
                 .find(|receipt| receipt.version_size == version)
-                .context("Legacy child rendition is not durably downloaded")?;
+                .context(LegacyProofRefusal("child_receipt_missing"))?;
             anyhow::ensure!(
                 receipt.checksum.as_ref() == checksum
                     && Some(receipt.created_at) == child.asset_date_evidence()
                     && receipt.added_at == child.added_date_evidence(),
-                "Legacy child receipt does not match current provider evidence"
+                LegacyProofRefusal("child_receipt_provider_mismatch")
             );
             let metadata = super::filter::metadata_for_selected_version(child, config, version);
             anyhow::ensure!(
                 receipt.metadata.compute_hash() == metadata.compute_hash(),
-                "Legacy child metadata is not current"
+                LegacyProofRefusal("child_metadata_mismatch")
             );
             let path = receipt
                 .local_path
                 .as_deref()
-                .context("Legacy child receipt has no output")?;
+                .context(LegacyProofRefusal("child_output_missing"))?;
             anyhow::ensure!(
                 paths.insert(crate::fs_util::confined_path_key(path)?),
-                "Legacy and current children share an output path"
+                LegacyProofRefusal("output_path_conflict")
             );
             let key = crate::fs_util::confined_path_key(path)?;
             for owner in &catalog {
@@ -712,7 +726,7 @@ async fn qualify_family(
                     crate::fs_util::confined_path_key(&owner.path)? != key
                         || (owner.library.as_ref() == record.library
                             && owner.asset_id.as_ref() == child.asset_record_name()),
-                    "Legacy current output has conflicting catalog ownership"
+                    LegacyProofRefusal("output_catalog_conflict")
                 );
             }
             let file = fingerprint(
@@ -723,7 +737,8 @@ async fn qualify_family(
                 cancel,
                 hardlink_trust,
             )
-            .await?;
+            .await
+            .context(LegacyProofRefusal("current_file_unavailable"))?;
             anyhow::ensure!(
                 file.sha256 == receipt.local_checksum
                     && verified_current_content(
@@ -731,7 +746,7 @@ async fn qualify_family(
                         file.sha256.as_deref(),
                         receipt.download_checksum.as_deref()
                     ),
-                "Legacy child output has no independent verified receipt"
+                LegacyProofRefusal("child_content_unverified")
             );
             #[cfg(feature = "xmp")]
             let sidecar_required = config.metadata.xmp_sidecar;
@@ -745,10 +760,11 @@ async fn qualify_family(
                 cancel,
                 hardlink_trust,
             )
-            .await?;
+            .await
+            .context(LegacyProofRefusal("current_sidecar_unavailable"))?;
             anyhow::ensure!(
                 paths.insert(crate::fs_util::confined_path_key(&sidecar_file.path)?),
-                "Legacy current sidecar aliases another output"
+                LegacyProofRefusal("sidecar_path_conflict")
             );
             evidence.push(json!({"child":child.asset_record_name(),"version":version.as_str(),"provider_checksum":checksum,"created_at":child.asset_date_evidence(),"added_at":child.added_date_evidence(),"metadata_hash":metadata.compute_hash(),"files":[file,sidecar_file]}));
         }
@@ -776,7 +792,10 @@ fn provider_files(evidence: &str) -> anyhow::Result<Vec<LegacyFileEvidence>> {
             files.push(serde_json::from_value(file.clone())?);
         }
     }
-    anyhow::ensure!(!files.is_empty(), "Missing legacy current file evidence");
+    anyhow::ensure!(
+        !files.is_empty(),
+        LegacyProofRefusal("current_file_evidence_missing")
+    );
     Ok(files)
 }
 
@@ -803,6 +822,44 @@ mod tests {
     use super::{fingerprint, provider_files, sidecar, verified_current_content, verify_files};
     use base64::Engine as _;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn certification_refusal_labels_never_log_private_error_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("warnings.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for reason in [
+                "child_receipt_missing",
+                "child_receipt_provider_mismatch",
+                "child_metadata_mismatch",
+                "child_content_unverified",
+                "output_path_conflict",
+                "current_file_unavailable",
+            ] {
+                let error = anyhow::anyhow!("private provider id, URL and path")
+                    .context(super::LegacyProofRefusal(reason))
+                    .context("private outer context");
+                super::log_preservation_hold("certification", &error);
+            }
+            super::log_preservation_hold(
+                "certification",
+                &anyhow::anyhow!("private unknown error"),
+            );
+        });
+        let warnings = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            warnings.matches("legacy_certification_refusal_v1").count(),
+            7
+        );
+        assert!(warnings.contains("subreason=\"child_receipt_missing\""));
+        assert!(warnings.contains("subreason=\"unclassified\""));
+        assert!(!warnings.contains("private"));
+    }
 
     #[tokio::test]
     async fn preservation_file_evidence_detects_changes_and_never_writes() {

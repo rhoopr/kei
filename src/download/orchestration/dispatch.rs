@@ -209,20 +209,19 @@ async fn download_photos_incremental_with_smart_folder_refresh(
     let (incremental_passes, smart_folder_passes) =
         split_incremental_and_smart_folder_passes(passes);
 
-    if incremental_passes.is_empty() {
-        return download_photos_full_with_token(
-            download_client,
-            &smart_folder_passes,
-            config,
-            controls,
-            shutdown_token,
-        )
-        .await;
-    }
+    // Smart queries establish selection, not source replay. With no album or
+    // unfiled pass, use the smart pass only to access its zone change stream.
+    // Incremental routing has no destinations for SmartFolder passes, so media
+    // admission remains owned by the selected query below.
+    let delta_passes = if incremental_passes.is_empty() {
+        &smart_folder_passes
+    } else {
+        &incremental_passes
+    };
 
     let mut incremental_result = download_photos_incremental(
         download_client,
-        &incremental_passes,
+        delta_passes,
         config,
         zone_sync_token,
         controls,
