@@ -1270,3 +1270,42 @@ async fn inventory_envelope_owner_diagnostics_preserve_request_scope_guards() {
         }
     }
 }
+
+#[tokio::test]
+async fn issue765_unrelated_private_owner_cannot_qualify_primary_lookup() {
+    use crate::icloud::photos::{ProviderRecordId, RecordLookupRequest, RecordResolution};
+
+    for route in ["primary", "all"] {
+        for owner in ["PRIVATE_OWNER_CANARY", "_defaultOwner"] {
+            let mut records = family();
+            records[1]["fields"]["masterRef"]["value"]["zoneID"] =
+                json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+            let mut fixture = Fixture::new(false, records, vec![]);
+            fixture.private_zones = Some(json!({"zones":[
+                {"zoneID":{"zoneName":"PrimarySync","ownerRecordName":owner}},
+                {"zoneID":{"zoneName":"SharedSync-PRIVATE_OTHER","ownerRecordName":"_defaultOwner"}}
+            ]}));
+            let album = fixture.actual_album(route).await;
+            let requests = [RecordLookupRequest::paired(
+                ProviderRecordId::new("asset-PRIVATE_MASTER_ID_CANARY"),
+                ProviderRecordId::new("PRIVATE_MASTER_ID_CANARY"),
+                ProviderRecordId::new("asset-PRIVATE_MASTER_ID_CANARY"),
+            )];
+            let (batch, log) = capture(album.resolve_records(&requests)).await;
+            assert_eq!(batch.results.len(), 1);
+            if owner == "_defaultOwner" {
+                assert!(matches!(batch.results[0].1, RecordResolution::Present(_)));
+            } else {
+                assert!(matches!(batch.results[0].1, RecordResolution::Unknown));
+                assert!(log.contains("owner_unqualified"));
+            }
+            let calls = fixture.calls.lock().unwrap();
+            let request = calls.iter().find(|r| r.get("records").is_some()).unwrap();
+            assert_eq!(
+                request["zoneID"].get("ownerRecordName").is_some(),
+                owner == "_defaultOwner"
+            );
+            assert_redacted(&log, std::path::Path::new("/PRIVATE_PATH_CANARY"));
+        }
+    }
+}

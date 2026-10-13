@@ -79,6 +79,7 @@ fn stream_incremental_assets_for_single_unfiled_pass(
     zone_sync_token: String,
     run_mode: DownloadRunMode,
     shutdown_token: CancellationToken,
+    #[cfg(test)] send_pending: Option<Arc<tokio::sync::Notify>>,
 ) -> (
     ReceiverStream<Result<PhotoAsset>>,
     tokio::task::JoinHandle<Result<IncrementalDeltaSummary>>,
@@ -93,14 +94,22 @@ fn stream_incremental_assets_for_single_unfiled_pass(
         let mut relation_events = Vec::new();
         let mut unpaired_asset_events = Vec::new();
 
-        while let Some(result) = change_stream.next().await {
-            if shutdown_token.is_cancelled() {
-                break;
-            }
+        loop {
+            let result = tokio::select! {
+                biased;
+                () = shutdown_token.cancelled() => break,
+                () = asset_tx.closed() => return Ok(delta.summary),
+                result = change_stream.next() => result,
+            };
+            let Some(result) = result else { break };
             let event = match result {
                 Err(error) if is_provider_session_error(&error) => {
                     delta.summary.auth_errors += 1;
-                    let _ = asset_tx.send(Err(error)).await;
+                    tokio::select! {
+                        biased;
+                        () = shutdown_token.cancelled() => {},
+                        _ = asset_tx.send(Err(error)) => {},
+                    }
                     return Ok(delta.summary);
                 }
                 other => other?,
@@ -112,8 +121,33 @@ fn stream_incremental_assets_for_single_unfiled_pass(
                 IncrementalDeltaRouting::Relation => relation_events.push(event),
                 IncrementalDeltaRouting::Created => {
                     if let Some(asset) = event.asset {
-                        if asset_tx.send(Ok(asset)).await.is_err() {
-                            return Ok(delta.summary);
+                        #[cfg(test)]
+                        let send = asset_tx.send(Ok(asset));
+                        #[cfg(test)]
+                        tokio::pin!(send);
+                        #[cfg(test)]
+                        let send = std::future::poll_fn(|cx| {
+                            let result = std::future::Future::poll(send.as_mut(), cx);
+                            if result.is_pending()
+                                && let Some(probe) = &send_pending
+                            {
+                                probe.notify_one();
+                            }
+                            result
+                        });
+                        tokio::select! {
+                            biased;
+                            () = shutdown_token.cancelled() => return Ok(delta.summary),
+                            result = {
+                                #[cfg(test)]
+                                { send }
+                                #[cfg(not(test))]
+                                { asset_tx.send(Ok(asset)) }
+                            } => {
+                                if result.is_err() {
+                                    return Ok(delta.summary);
+                                }
+                            }
                         }
                     } else if matches!(event.record_type.as_deref(), Some("CPLAsset")) {
                         unpaired_asset_events.push(event);
@@ -130,7 +164,15 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             }
         }
 
-        delta.record_completion(token_rx.await.ok());
+        // Release provider backpressure before waiting for its completion proof.
+        drop(change_stream);
+        let token = tokio::select! {
+            biased;
+            () = shutdown_token.cancelled() => None,
+            () = asset_tx.closed() => None,
+            token = token_rx => token.ok(),
+        };
+        delta.record_completion(token);
         hydrate_unpaired_created_asset_deltas(
             &mut unpaired_asset_events,
             Some(&pass),
@@ -183,8 +225,17 @@ fn stream_incremental_assets_for_single_unfiled_pass(
                     )
                     .await;
                 }
-                if asset_tx.send(Ok(asset)).await.is_err() {
-                    return Ok(delta.summary);
+                tokio::select! {
+                    biased;
+                    () = shutdown_token.cancelled() => {
+                        delta.record_completion(None);
+                        return Ok(delta.summary);
+                    },
+                    result = asset_tx.send(Ok(asset)) => {
+                        if result.is_err() {
+                            return Ok(delta.summary);
+                        }
+                    }
                 }
             }
         }
@@ -199,7 +250,11 @@ fn stream_incremental_assets_for_single_unfiled_pass(
         // Send hydration failures before EOF so the pipeline persists an
         // interrupted run instead of recording a successful enumeration.
         if let Some(error) = delta.summary.first_auth_error.take() {
-            let _ = asset_tx.send(Err(error)).await;
+            tokio::select! {
+                biased;
+                () = shutdown_token.cancelled() => {},
+                _ = asset_tx.send(Err(error)) => {},
+            }
             return Ok(delta.summary);
         }
         Ok(delta.summary)
@@ -223,6 +278,8 @@ async fn download_photos_incremental_streaming(
         zone_sync_token.to_string(),
         controls.run_mode,
         shutdown_token.clone(),
+        #[cfg(test)]
+        None,
     );
     let mut streaming_result = match stream_and_download_from_stream(
         download_client,
@@ -497,13 +554,15 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     // cycle with work.
     if let Some(pass) = delta_pass {
         let phase_started = Instant::now();
-        let (change_stream, token_rx) = pass.album.changes_stream(zone_sync_token);
-        tokio::pin!(change_stream);
+        let (mut change_stream, token_rx) = pass.album.changes_stream(zone_sync_token);
 
-        while let Some(result) = change_stream.next().await {
-            if shutdown_token.is_cancelled() {
-                break;
-            }
+        loop {
+            let result = tokio::select! {
+                biased;
+                () = shutdown_token.cancelled() => break,
+                result = change_stream.next() => result,
+            };
+            let Some(result) = result else { break };
             let event = result?;
             if first_download_url_obtained_at.is_none() && event.asset.is_some() {
                 first_download_url_obtained_at = Some(Instant::now());
@@ -512,7 +571,14 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             change_events.push(event);
         }
 
-        delta.record_completion(token_rx.await.ok());
+        // Drop the owned receiver, not just a pinned borrow of it.
+        drop(change_stream);
+        let token = tokio::select! {
+            biased;
+            () = shutdown_token.cancelled() => None,
+            token = token_rx => token.ok(),
+        };
+        delta.record_completion(token);
         tracing::debug!(
             phase_elapsed = %format_duration(phase_started.elapsed()),
             elapsed = %format_duration(started.elapsed()),

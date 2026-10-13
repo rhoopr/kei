@@ -1104,6 +1104,11 @@ assets through a bounded channel and defers album, relation, and unpaired-asset
 work. The collecting strategy observes all events before state writes, hydrates
 missing identities, and applies relations before routing created assets.
 These orders preserve each strategy's token-safety and selected-album behavior.
+Shutdown races provider-event and successor waits in both strategies; the owned
+receiver is dropped before the successor wait to release provider backpressure.
+Receiver closure cancels pending changes/zone requests and retry delays, but does
+not interrupt an already-started durable shadow capture. Cancellation during
+either consumer wait supplies no replay-completion proof.
 
 Downloadable photo records require non-blank `CPLMaster` and `CPLAsset` record names
 and a usable `assetDate` before they enter filtering or path planning. Full

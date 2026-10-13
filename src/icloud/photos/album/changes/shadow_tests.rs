@@ -5,6 +5,7 @@ use crate::state::SqliteStateDb;
 use crate::state::db::account::AccountOwner;
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_stream::StreamExt;
 
 #[derive(Clone)]
@@ -414,6 +415,8 @@ async fn shadow_scopes_and_revisions_remain_distinct_and_owner_is_rechecked() {
 struct DelayedBody {
     requested: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
+    retry_after: Option<std::time::Duration>,
+    attempts: Arc<AtomicUsize>,
 }
 #[async_trait::async_trait]
 impl PhotosSession for DelayedBody {
@@ -426,7 +429,17 @@ impl PhotosSession for DelayedBody {
         _: String,
         _: &[(&str, &str)],
     ) -> anyhow::Result<Vec<u8>> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
         self.requested.notify_one();
+        if let Some(delay) = self.retry_after {
+            return Err(crate::icloud::photos::session::HttpStatusError {
+                status: 503,
+                url: "https://example.invalid".to_owned(),
+                retry_after: Some(delay),
+                body: None,
+            }
+            .into());
+        }
         self.release.notified().await;
         Ok(unknown_page())
     }
@@ -450,22 +463,28 @@ async fn shadow_cancelled_receiver_before_capture_preserves_page_and_legacy_curs
         Box::new(DelayedBody {
             requested: requested.clone(),
             release: release.clone(),
+            retry_after: None,
+            attempts: Arc::new(AtomicUsize::new(0)),
         }),
     );
     bound.set_shadow_capture(capture(&db), Arc::from("private"));
-    let (stream, token) = bound.changes_stream("saved");
+    let (stream, mut token) = bound.changes_stream("saved");
     tokio::time::timeout(std::time::Duration::from_secs(5), requested.notified())
         .await
         .unwrap();
     drop(stream);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut token).await;
+    let drained = result.is_ok();
+    // Unblock and join the old producer on red before checking the drain bound.
     release.notify_one();
-    assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(5), token)
+    let token = match result {
+        Ok(token) => token,
+        Err(_) => tokio::time::timeout(std::time::Duration::from_secs(5), &mut token)
             .await
-            .unwrap()
-            .unwrap(),
-        "saved"
-    );
+            .expect("released provider must finish cleanup"),
+    };
+    assert_eq!(token.unwrap(), "saved");
+    assert!(drained, "receiver closure must cancel the pending request");
     assert_eq!(counts(&db), (0, 0, 0));
     drop(bound);
     drop(db);
@@ -492,4 +511,50 @@ async fn shadow_cancelled_receiver_before_capture_preserves_page_and_legacy_curs
         Some("saved"),
         "capture is not checkpoint authority"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue765_receiver_close_cancels_scheduled_retry_after() {
+    use std::time::Duration;
+
+    const RETRY_DELAY: Duration = Duration::from_secs(60);
+    const DRAIN_BOUND: Duration = Duration::from_secs(1);
+    let requested = Arc::new(tokio::sync::Notify::new());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (events, _default) = crate::test_helpers::TracingCapture::install();
+    let bound = make_album_with_session(
+        100,
+        Box::new(DelayedBody {
+            requested: requested.clone(),
+            release: Arc::new(tokio::sync::Notify::new()),
+            retry_after: Some(RETRY_DELAY),
+            attempts: attempts.clone(),
+        }),
+    );
+    let started = tokio::time::Instant::now();
+    let (stream, mut token) = bound.changes_stream("saved");
+    tokio::time::timeout(DRAIN_BOUND, requested.notified())
+        .await
+        .unwrap();
+    assert!(events.contains_event(|event| {
+        event.field("retry_delay_secs") == Some("60") && event.field("attempt") == Some("1")
+    }));
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    drop(stream);
+    let result = tokio::time::timeout(DRAIN_BOUND, &mut token).await;
+    let drained = result.is_ok();
+    let token = match result {
+        Ok(token) => token,
+        Err(_) => tokio::time::timeout(RETRY_DELAY * 4, &mut token)
+            .await
+            .expect("virtual-time cleanup joins the old retry loop"),
+    };
+    assert!(
+        drained,
+        "receiver closure must drain before Retry-After expires"
+    );
+    assert_eq!(token.unwrap(), "saved");
+    assert!(started.elapsed() < RETRY_DELAY);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }

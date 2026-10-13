@@ -472,6 +472,8 @@ impl PhotoAlbum {
     /// Returns a stream of `ChangeEvent`s and a oneshot receiver for the final syncToken.
     /// The syncToken is sent through the oneshot after all pages have been consumed
     /// (moreComing: false), or on error with the last successfully consumed token.
+    /// Dropping the stream cancels pending requests, not a started durable capture.
+    /// A token returned after receiver closure is not completion proof.
     ///
     /// This method is inherently sequential -- each page's syncToken feeds the next request.
     /// No parallel fetchers.
