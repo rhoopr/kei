@@ -263,9 +263,19 @@ async fn download_photos_incremental_with_smart_folder_refresh(
     }
 
     if incremental_passes.is_empty() {
-        // This query covers every selected pass, so retain its comparable count
-        // evidence. Mixed refreshes remain subsets and must not replace it.
-        incremental_result.inventory = smart_folder_result.inventory.take();
+        // This query owns the whole selection, its bounded local path proof,
+        // and comparable inventory. Source replay may veto that evidence, but
+        // its token is the only candidate for the source checkpoint.
+        smart_folder_result.outcome =
+            merge_download_outcomes(&incremental_result.outcome, &smart_folder_result.outcome);
+        smart_folder_result.accumulate(&incremental_result);
+        if smart_folder_refresh_failed {
+            smart_folder_result.block_incremental_token(SMART_FOLDER_REFRESH_FAILED_REASON);
+        }
+        smart_folder_result.sync_token = (!smart_folder_result.checkpoint.sync_token_blocked)
+            .then_some(incremental_result.sync_token)
+            .flatten();
+        return Ok(smart_folder_result);
     }
 
     incremental_result.outcome =

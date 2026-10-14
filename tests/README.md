@@ -1421,3 +1421,11 @@ original cursors without proof publication. The positive cycle fixture uses a
 distinct delta successor. `smart_only_delta_replays_source_without_admitting_unselected_media`
 adds a delta-only child while the smart query is empty; source replay supplies the
 token but no off-selection download. Existing bridge-debt controls remain active.
+
+The smart-only replay controls also cover a date bound already active before a
+path-template change. A real initial source cursor and subsequent zone request
+prove this uses incremental replay; fresh bounded query evidence may complete
+local path/config reconciliation while the source stays held. Missing query
+tokens retain the pending config until healthy query recovery. The query owns
+its local selection proof and inventory; delta evidence adds vetoes and supplies
+only the source successor.

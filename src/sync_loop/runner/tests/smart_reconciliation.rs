@@ -22,6 +22,7 @@ struct SmartReconciliationSession {
     frontier_only_tail: bool,
     lookups: Arc<AtomicUsize>,
     queries: Arc<AtomicUsize>,
+    delta_calls: Arc<AtomicUsize>,
     fault: Arc<std::sync::Mutex<Option<SmartReconciliationFault>>>,
     cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
 }
@@ -127,6 +128,7 @@ impl PhotosSession for SmartReconciliationSession {
             return Ok(response);
         }
         if url.contains("/changes/zone?") {
+            self.delta_calls.fetch_add(1, Ordering::SeqCst);
             return Ok(
                 json!({"zones": [{"zoneID": {"zoneName": self.zone, "ownerRecordName": "_defaultOwner"}, "syncToken": "smart-current", "moreComing": false, "records": []}]}),
             );
@@ -211,7 +213,22 @@ async fn smart_reconciliation_lifecycle(
 enum SmartBound {
     Recent(crate::cli::RecentScope),
     Date,
+    ExistingDate,
     GlobalFrontierOnlyTail,
+}
+
+#[tokio::test]
+async fn run_cycle_existing_date_bound_smart_path_drift_keeps_source_hold() {
+    for failure in [None, Some(SmartReconciliationFault::MissingQueryToken)] {
+        Box::pin(smart_reconciliation_lifecycle_bounded(
+            "Hidden",
+            false,
+            false,
+            failure,
+            Some(SmartBound::ExistingDate),
+        ))
+        .await;
+    }
 }
 
 #[tokio::test]
@@ -297,6 +314,14 @@ async fn smart_reconciliation_lifecycle_bounded(
     let mut config = make_run_cycle_config();
     let lookups = Arc::new(AtomicUsize::new(0));
     let queries = Arc::new(AtomicUsize::new(0));
+    let delta_calls = Arc::new(AtomicUsize::new(0));
+    if matches!(bound, Some(SmartBound::ExistingDate)) {
+        // Establish a real cursor with the date bound already active and no
+        // excluded tail. Cycle 1 changes only paths, then adds the old tail.
+        config.filters.skip_created_before = Some(crate::config::CreatedDateFilter::CaptureDate(
+            chrono::NaiveDate::from_ymd_opt(2023, 1, 1).unwrap(),
+        ));
+    }
     let mut records = full_album_page_with_download(
         "PrimarySync",
         "SMART",
@@ -319,6 +344,7 @@ async fn smart_reconciliation_lifecycle_bounded(
         frontier_only_tail: matches!(bound, Some(SmartBound::GlobalFrontierOnlyTail)),
         lookups: lookups.clone(),
         queries: queries.clone(),
+        delta_calls: delta_calls.clone(),
         fault: fault.clone(),
         cancel: cancel.clone(),
     };
@@ -361,6 +387,7 @@ async fn smart_reconciliation_lifecycle_bounded(
                     frontier_only_tail: false,
                     lookups: Arc::new(AtomicUsize::new(0)),
                     queries: Arc::new(AtomicUsize::new(0)),
+                    delta_calls: Arc::new(AtomicUsize::new(0)),
                     fault: fault.clone(),
                     cancel: Arc::new(std::sync::Mutex::new(None)),
                 }),
@@ -389,7 +416,7 @@ async fn smart_reconciliation_lifecycle_bounded(
                     config.filters.recent = Some(1);
                     config.filters.recent_scope = scope;
                 }
-                SmartBound::Date => {
+                SmartBound::Date | SmartBound::ExistingDate => {
                     config.filters.skip_created_before =
                         Some(crate::config::CreatedDateFilter::CaptureDate(
                             chrono::NaiveDate::from_ymd_opt(2023, 1, 1).unwrap(),
@@ -405,7 +432,7 @@ async fn smart_reconciliation_lifecycle_bounded(
                 &checksum,
             );
             // Count cases exercise equal-date ties. Date cases have a genuine old tail.
-            if matches!(bound, SmartBound::Date) {
+            if matches!(bound, SmartBound::Date | SmartBound::ExistingDate) {
                 excluded["records"][1]["fields"]["assetDate"]["value"] =
                     json!(1_500_000_000_000i64);
             }
@@ -562,6 +589,7 @@ async fn smart_reconciliation_lifecycle_bounded(
         let hash = download::hash_download_config(&candidate);
         current_hash = hash.clone();
         let before = lookups.load(Ordering::SeqCst);
+        let delta_before = delta_calls.load(Ordering::SeqCst);
         let requests_before = server.received_requests().await.unwrap().len();
         let states = if failure == Some(SmartReconciliationFault::OtherLibraryFailure) {
             vec![&lib, &other_library]
@@ -620,6 +648,30 @@ async fn smart_reconciliation_lifecycle_bounded(
                 result.failed_count, 0,
                 "{failure:?} cycle {cycle}: {result:?}"
             );
+        }
+        if matches!(bound, Some(SmartBound::ExistingDate)) {
+            if cycle == 0 {
+                assert_eq!(
+                    db.get_metadata("sync_token:PrimarySync")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("smart-current")
+                );
+            } else {
+                assert!(
+                    delta_calls.load(Ordering::SeqCst) > delta_before,
+                    "path-only drift must exercise source replay"
+                );
+                assert!(!result.can_advance_database_checkpoint());
+                assert_eq!(
+                    db.get_metadata("sync_token:PrimarySync")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("smart-current")
+                );
+            }
         }
         let rows = db.get_downloaded_page(0, 10).await.unwrap();
         if !(held && failure == Some(SmartReconciliationFault::DownloadWrite)) {
