@@ -246,7 +246,7 @@ async fn download_photos_incremental_with_smart_folder_refresh(
         &smart_folder_config,
         controls,
         shutdown_token,
-        false,
+        incremental_passes.is_empty(),
     )
     .await?;
 
@@ -254,13 +254,11 @@ async fn download_photos_incremental_with_smart_folder_refresh(
         !matches!(smart_folder_result.outcome, DownloadOutcome::Success)
             || smart_folder_result.checkpoint.interrupted
             || smart_folder_result.checkpoint.enumeration_errors > 0;
-    if !smart_folder_refresh_failed {
-        // The token that matters for this mixed incremental cycle is the
-        // `/changes/zone` token captured below. A selected smart-folder
-        // records/query refresh can complete cleanly while still lacking a
-        // full-enumeration query token, especially under bounded modes. Keep
-        // refresh failures conservative, but do not let query-token telemetry
-        // veto the safe incremental zone checkpoint.
+    if !incremental_passes.is_empty() && !smart_folder_refresh_failed {
+        // A mixed cycle's smart query is a subset refresh; the independently
+        // selected incremental passes own its zone checkpoint. A sole-smart
+        // query establishes all selection evidence and must retain its token
+        // hold, even when the source replay has a usable successor.
         smart_folder_result.clear_full_query_token_block();
     }
 

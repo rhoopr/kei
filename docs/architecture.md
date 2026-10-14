@@ -812,7 +812,9 @@ when another zone succeeds.
 Ordinary incremental producers carry validated changes/zone completion separately
 from query enumeration. Smart-folder-only passes also replay the source zone;
 that delta has no media destinations, and the selected folder query still owns
-media admission. Its query token never substitutes for the source successor. Mixed unfiled and smart-folder refreshes retain the actual
+media admission. Its query token never substitutes for the source successor, and
+a missing query token retains the selection-proof hold and same-cycle query
+recovery policy. Mixed unfiled and smart-folder refreshes retain the actual
 delta successor and every identity, partial-scan, cancellation and durable-write
 veto. A successful smart query does not certify retained-boundary replay. Typed
 provider cursor rejection is distinct from malformed or missing successor data.
