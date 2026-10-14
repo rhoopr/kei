@@ -36,6 +36,30 @@ pub(crate) fn bare_track_meta_movie() -> Vec<u8> {
     original
 }
 
+/// Supported synthetic QuickTime metadata with a caller-selected user-data tail.
+#[cfg(feature = "xmp")]
+pub(crate) fn quicktime_user_data_movie(tail: &[u8]) -> Vec<u8> {
+    let mut bytes = bare_track_meta_movie();
+    let meta = bytes.windows(4).position(|value| value == b"meta").unwrap();
+    bytes.splice(meta + 4..meta + 4, [0; 4]);
+    for kind in [b"moov", b"trak", b"meta"] {
+        let start = bytes.windows(4).position(|value| value == kind).unwrap() - 4;
+        let size = u32::from_be_bytes(bytes[start..start + 4].try_into().unwrap());
+        bytes[start..start + 4].copy_from_slice(&(size + 4).to_be_bytes());
+    }
+    let mut user_data = b"\0\0\0\x14udta\0\0\0\x0cnamekept".to_vec();
+    user_data.extend_from_slice(tail);
+    let size = u32::try_from(user_data.len()).unwrap();
+    user_data[..4].copy_from_slice(&size.to_be_bytes());
+    let movie = bytes.windows(4).position(|value| value == b"moov").unwrap() - 4;
+    let size = u32::from_be_bytes(bytes[movie..movie + 4].try_into().unwrap());
+    let end = movie + usize::try_from(size).unwrap();
+    bytes[movie..movie + 4]
+        .copy_from_slice(&(size + u32::try_from(user_data.len()).unwrap()).to_be_bytes());
+    bytes.splice(end..end, user_data);
+    bytes
+}
+
 /// Synthetic sparse-share shape reported in #765, with invented identifiers.
 #[cfg(test)]
 pub(crate) fn sparse_shared_asset_record() -> Value {

@@ -168,8 +168,9 @@ Test names and assertions are unchanged. Shared test fixtures stay in
 XMP Toolkit preparation checks movie box boundaries with bounded file reads before
 updating the temporary copy. Nested QuickTime `meta` boxes without a supported
 FullBox prefix are rejected because the toolkit can corrupt their existing child
-boxes. Rejection preserves the original media and leaves embedded rewrite work
-pending through the existing retry owner.
+boxes. The optional four-byte zero terminator is accepted only at the end of a
+`udta` child list. Rejection preserves the original media and leaves embedded
+rewrite work pending through the existing retry owner.
 
 ## Main flows
 
