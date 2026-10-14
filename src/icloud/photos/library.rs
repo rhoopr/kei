@@ -184,10 +184,15 @@ impl PhotoLibrary {
         })
     }
 
-    /// An explicit private owner is provider evidence, never a zone-name default.
-    pub(super) fn is_private_default_owner(&self) -> bool {
+    /// Only the indexed private primary from validated discovery can be published.
+    pub(super) fn is_qualified_private_primary(&self) -> bool {
         self.library_type.as_ref() == "private"
-            && self.zone_id.get("ownerRecordName").and_then(Value::as_str) == Some("_defaultOwner")
+            && self.zone_id.get("zoneName").and_then(Value::as_str) == Some(PRIMARY_ZONE_NAME)
+            && super::has_explicit_owner(self.zone_id.get("ownerRecordName"))
+    }
+
+    pub(super) fn owner_diagnostic_shape(&self) -> (&'static str, &'static str) {
+        super::owner_diagnostic_shape(self.zone_id.get("ownerRecordName"))
     }
 
     /// Return smart-folder albums plus user-created albums.

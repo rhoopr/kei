@@ -45,6 +45,14 @@ use crate::icloud::photos::cloudkit::ChangesDatabaseResponse;
 use crate::icloud::photos::queries::encode_params;
 use crate::retry::RetryConfig;
 
+// Syntax alone grants no authority. Callers require validated private discovery
+// and successful indexing of the exact selected primary scope.
+fn has_explicit_owner(owner: Option<&Value>) -> bool {
+    owner
+        .and_then(Value::as_str)
+        .is_some_and(|owner| !owner.trim().is_empty())
+}
+
 /// Diagnostic morphology never establishes scope authority or returns identity.
 fn owner_diagnostic_shape(owner: Option<&Value>) -> (&'static str, &'static str) {
     match owner {
@@ -69,12 +77,13 @@ fn owner_diagnostic_shape(owner: Option<&Value>) -> (&'static str, &'static str)
 
 /// Called only after an already qualified private PrimarySync replaces the
 /// effective primary library. Initializing a library alone is not publication.
-fn observe_primary_publication() {
+fn observe_primary_publication(primary: &PhotoLibrary) {
+    let (owner, owner_type) = primary.owner_diagnostic_shape();
     crate::support::observe(
         "support_discovery_v1",
         json!({
             "phase": "primary_publication", "database": "private", "zone_class": "primary",
-            "owner": "private_default", "owner_type": "string",
+            "owner": owner, "owner_type": owner_type,
             "selected_indexing": true, "qualification_published": true,
         }),
     );
@@ -246,7 +255,9 @@ impl PhotosService {
             let primary_eligibility = match primary {
                 None => "no_primary",
                 Some(zone) if zone.deleted.unwrap_or(false) => "primary_deleted",
-                Some(_) if owner != "private_default" => "owner_not_default",
+                Some(zone) if !has_explicit_owner(zone.zone_id.extra.get("ownerRecordName")) => {
+                    "owner_unqualified"
+                }
                 Some(_) => "eligible",
             };
             crate::support::observe(
@@ -263,15 +274,15 @@ impl PhotosService {
     }
 
     async fn qualify_primary_library(&mut self) -> anyhow::Result<()> {
-        if self.primary_library.is_private_default_owner() {
+        if self.primary_library.is_qualified_private_primary() {
             return Ok(());
         }
         if let Some(libraries) = &self.private_libraries {
             if let Some(primary) = libraries.get(PRIMARY_ZONE_NAME)
-                && primary.is_private_default_owner()
+                && primary.is_qualified_private_primary()
             {
                 self.primary_library = primary.clone();
-                observe_primary_publication();
+                observe_primary_publication(&self.primary_library);
             }
             return Ok(());
         }
@@ -283,17 +294,12 @@ impl PhotosService {
         if let Some(zone) = zones.iter().find(|zone| {
             zone.zone_id.zone_name == PRIMARY_ZONE_NAME
                 && !zone.deleted.unwrap_or(false)
-                && zone
-                    .zone_id
-                    .extra
-                    .get("ownerRecordName")
-                    .and_then(Value::as_str)
-                    == Some("_defaultOwner")
+                && has_explicit_owner(zone.zone_id.extra.get("ownerRecordName"))
         }) {
             // Publish qualification only after this exact selected scope passes
             // its own indexing check. A validated listing is not indexing proof.
             self.primary_library = self.initialize_library(zone, "private").await?;
-            observe_primary_publication();
+            observe_primary_publication(&self.primary_library);
         }
         Ok(())
     }
@@ -310,10 +316,10 @@ impl PhotosService {
                 .context("Private zone list was not cached")?;
             let libs = self.initialize_libraries(zones, "private").await?;
             if let Some(primary) = libs.get(PRIMARY_ZONE_NAME)
-                && primary.is_private_default_owner()
+                && primary.is_qualified_private_primary()
             {
                 self.primary_library = primary.clone();
-                observe_primary_publication();
+                observe_primary_publication(&self.primary_library);
             }
             self.private_libraries = Some(libs);
         }
@@ -764,7 +770,7 @@ mod tests {
         svc.private_libraries = Some(HashMap::new());
         let lib = svc.get_library("PrimarySync").await.unwrap();
         assert_eq!(lib.zone_name(), "PrimarySync");
-        assert!(!lib.is_private_default_owner());
+        assert!(!lib.is_qualified_private_primary());
     }
 
     #[derive(Clone)]
@@ -848,7 +854,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(request["zoneID"].clone());
-            if request["zoneID"]["ownerRecordName"] == "_defaultOwner"
+            if request["zoneID"].get("ownerRecordName").is_some()
                 && self.blocked_zone.lock().unwrap().as_deref()
                     == request["zoneID"]["zoneName"].as_str()
             {
@@ -897,7 +903,7 @@ mod tests {
         .expect("unselected private library indexing must not block selected primary ownership");
         assert_eq!(selected.len(), 1);
         assert!(
-            selected[0].is_private_default_owner(),
+            selected[0].is_qualified_private_primary(),
             "ownership must remain explicitly provider-qualified"
         );
         // This is run_list(Albums)' selected-library path after authentication.
@@ -920,7 +926,7 @@ mod tests {
                 .get_library(PRIMARY_ZONE_NAME)
                 .await
                 .unwrap()
-                .is_private_default_owner()
+                .is_qualified_private_primary()
         );
         assert_eq!(*session.indexing_requests.lock().unwrap(), requests);
         assert_eq!(session.discovery.listings.lock().unwrap().len(), 1);
@@ -936,7 +942,7 @@ mod tests {
                 .get_library(PRIMARY_ZONE_NAME)
                 .await
                 .unwrap()
-                .is_private_default_owner()
+                .is_qualified_private_primary()
         );
         assert_eq!(session.discovery.listings.lock().unwrap().len(), 1);
         *session.blocked_zone.lock().unwrap() = None;
@@ -951,46 +957,48 @@ mod tests {
 
     #[tokio::test]
     async fn primary_discovery_selected_indexing_failure_does_not_publish_ownership() {
-        let session = UnrelatedIndexingSession {
-            discovery: raw_discovery(
-                serde_json::to_vec(&json!({"zones":[
-                    {"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}}
-                ]}))
-                .unwrap(),
-            ),
-            indexing_requests: Arc::new(Mutex::new(Vec::new())),
-            blocked_zone: Arc::new(Mutex::new(Some(PRIMARY_ZONE_NAME.into()))),
-            folder_requests: Arc::new(Mutex::new(Vec::new())),
-        };
-        let mut service = PhotosService::new(
-            "https://example.invalid".into(),
-            Box::new(session.clone()),
-            HashMap::new(),
-            RetryConfig::default(),
-        )
-        .await
-        .unwrap();
-        assert!(
-            service
-                .get_library(PRIMARY_ZONE_NAME)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("RUNNING")
-        );
-        assert!(!service.primary_library.is_private_default_owner());
-        assert!(service.private_zones.is_some());
-        assert!(service.private_libraries.is_none());
-        *session.blocked_zone.lock().unwrap() = None;
-        assert!(
-            service
-                .get_library(PRIMARY_ZONE_NAME)
-                .await
-                .unwrap()
-                .is_private_default_owner()
-        );
-        assert_eq!(session.discovery.listings.lock().unwrap().len(), 1);
-        assert_eq!(session.indexing_requests.lock().unwrap().len(), 3);
+        for owner in ["_defaultOwner", "PRIVATE_OWNER_CANARY"] {
+            let session = UnrelatedIndexingSession {
+                discovery: raw_discovery(
+                    serde_json::to_vec(&json!({"zones":[
+                        {"zoneID":{"zoneName":"PrimarySync","ownerRecordName":owner}}
+                    ]}))
+                    .unwrap(),
+                ),
+                indexing_requests: Arc::new(Mutex::new(Vec::new())),
+                blocked_zone: Arc::new(Mutex::new(Some(PRIMARY_ZONE_NAME.into()))),
+                folder_requests: Arc::new(Mutex::new(Vec::new())),
+            };
+            let mut service = PhotosService::new(
+                "https://example.invalid".into(),
+                Box::new(session.clone()),
+                HashMap::new(),
+                RetryConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                service
+                    .get_library(PRIMARY_ZONE_NAME)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("RUNNING")
+            );
+            assert!(!service.primary_library.is_qualified_private_primary());
+            assert!(service.private_zones.is_some());
+            assert!(service.private_libraries.is_none());
+            *session.blocked_zone.lock().unwrap() = None;
+            assert!(
+                service
+                    .get_library(PRIMARY_ZONE_NAME)
+                    .await
+                    .unwrap()
+                    .is_qualified_private_primary()
+            );
+            assert_eq!(session.discovery.listings.lock().unwrap().len(), 1);
+            assert_eq!(session.indexing_requests.lock().unwrap().len(), 3);
+        }
     }
 
     #[tokio::test]
@@ -1025,21 +1033,21 @@ mod tests {
             );
             assert!(svc.private_libraries.is_none());
             assert!(svc.private_zones.is_none());
-            assert!(!svc.primary_library.is_private_default_owner());
+            assert!(!svc.primary_library.is_qualified_private_primary());
             // Failure did not publish a cache; valid evidence can recover.
             *session.private.lock().unwrap() = serde_json::to_vec(&json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}}]})).unwrap();
             assert!(
                 svc.get_library(PRIMARY_ZONE_NAME)
                     .await
                     .unwrap()
-                    .is_private_default_owner()
+                    .is_qualified_private_primary()
             );
             assert_eq!(session.listings.lock().unwrap().len(), 2);
             assert!(
                 svc.get_library(PRIMARY_ZONE_NAME)
                     .await
                     .unwrap()
-                    .is_private_default_owner()
+                    .is_qualified_private_primary()
             );
             assert_eq!(session.listings.lock().unwrap().len(), 2);
         }
@@ -1052,14 +1060,18 @@ mod tests {
             json!([{"zoneID":{"zoneName":"PrimarySync"}}]),
             json!([{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":null}}]),
             json!([{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":""}}]),
-            json!([{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"different"}}]),
+            json!([{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"   "}}]),
+            json!([{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":42}}]),
+            json!([{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":true}}]),
+            json!([{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":[]}}]),
+            json!([{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":{}}}]),
             json!([{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"deleted":true}]),
             json!([{"zoneID":{"zoneName":"PrimarySyncExtra","ownerRecordName":"_defaultOwner"}}]),
         ] {
             let session = raw_discovery(serde_json::to_vec(&json!({"zones":zones})).unwrap());
             let mut svc = make_service(Box::new(session.clone()), HashMap::new());
             let primary = svc.get_library(PRIMARY_ZONE_NAME).await.unwrap();
-            assert!(!primary.is_private_default_owner());
+            assert!(!primary.is_qualified_private_primary());
             assert_eq!(
                 session.listings.lock().unwrap().len(),
                 1,
@@ -1072,12 +1084,12 @@ mod tests {
                 !svc.get_library(PRIMARY_ZONE_NAME)
                     .await
                     .unwrap()
-                    .is_private_default_owner()
+                    .is_qualified_private_primary()
             );
             assert_eq!(
                 all.iter()
                     .filter(|lib| lib.zone_name() == PRIMARY_ZONE_NAME
-                        && lib.is_private_default_owner())
+                        && lib.is_qualified_private_primary())
                     .count(),
                 0
             );
@@ -1087,21 +1099,23 @@ mod tests {
 
     #[tokio::test]
     async fn primary_discovery_qualifies_all_first_and_reuses_cached_owner() {
-        let session = raw_discovery(serde_json::to_vec(&json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}}]})).unwrap());
-        let mut svc = make_service(Box::new(session.clone()), HashMap::new());
-        let all = svc.all_libraries().await.unwrap();
-        let primary = all
-            .iter()
-            .find(|lib| lib.is_private_default_owner())
-            .unwrap();
-        assert_eq!(primary.zone_name(), PRIMARY_ZONE_NAME);
-        assert!(
-            svc.get_library(PRIMARY_ZONE_NAME)
-                .await
-                .unwrap()
-                .is_private_default_owner()
-        );
-        assert_eq!(session.listings.lock().unwrap().len(), 2);
+        for owner in ["_defaultOwner", "PRIVATE_OWNER_CANARY"] {
+            let session = raw_discovery(serde_json::to_vec(&json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":owner,"zoneType":"REGULAR_CUSTOM_ZONE"}}]})).unwrap());
+            let mut svc = make_service(Box::new(session.clone()), HashMap::new());
+            let all = svc.all_libraries().await.unwrap();
+            let primary = all
+                .iter()
+                .find(|lib| lib.is_qualified_private_primary())
+                .unwrap();
+            assert_eq!(primary.zone_name(), PRIMARY_ZONE_NAME);
+            assert!(
+                svc.get_library(PRIMARY_ZONE_NAME)
+                    .await
+                    .unwrap()
+                    .is_qualified_private_primary()
+            );
+            assert_eq!(session.listings.lock().unwrap().len(), 2);
+        }
     }
 
     /// Cloneable capturing session - unlike CapturingSession above,

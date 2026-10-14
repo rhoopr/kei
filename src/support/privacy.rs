@@ -531,7 +531,11 @@ fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
         "primary_eligibility" => label.is_some_and(|label| {
             matches!(
                 label,
-                "eligible" | "no_primary" | "primary_deleted" | "owner_not_default"
+                "eligible"
+                    | "no_primary"
+                    | "primary_deleted"
+                    | "owner_not_default"
+                    | "owner_unqualified"
             )
         }),
         _ => scalar(value) || label.is_some_and(fixed_label),
