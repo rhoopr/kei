@@ -3887,6 +3887,9 @@ async fn exercise_legacy_child_cycles_with_selection(
             let legacy_xmp = destination.join("photo.jpg.xmp");
             std::fs::write(&legacy_path, bytes).unwrap();
             std::fs::write(&legacy_xmp, b"legacy sidecar: never adopt or replace").unwrap();
+            let original_mtime = std::fs::metadata(&legacy_path).unwrap().modified().unwrap();
+            let original_sidecar_mtime =
+                std::fs::metadata(&legacy_xmp).unwrap().modified().unwrap();
             let external_alias = dir.path().join("importer-alias.jpg");
             if matches!(fault, AmbiguousChildFault::PreserveSharedOriginal)
                 || hardlink_fault
@@ -4497,6 +4500,18 @@ async fn exercise_legacy_child_cycles_with_selection(
                         std::fs::read(&legacy_motion_xmp).unwrap(),
                         b"retained motion sidecar",
                         "original motion metadata {label}"
+                    );
+                }
+                if smart_only {
+                    assert_eq!(
+                        std::fs::metadata(&legacy_path).unwrap().modified().unwrap(),
+                        original_mtime,
+                        "retained original timestamp {label}"
+                    );
+                    assert_eq!(
+                        std::fs::metadata(&legacy_xmp).unwrap().modified().unwrap(),
+                        original_sidecar_mtime,
+                        "retained sidecar timestamp {label}"
                     );
                 }
                 assert_eq!(rows(&database, receipt_sql), receipt, "receipt {label}");
