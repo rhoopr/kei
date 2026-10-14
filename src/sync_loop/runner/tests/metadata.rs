@@ -4538,15 +4538,15 @@ async fn exercise_legacy_child_cycles_with_selection(
                         .is_empty(),
                     "no guessed owner {label}"
                 );
+                let source_evidence_ready = match fault {
+                    AmbiguousChildFault::PreserveMissingDelta
+                    | AmbiguousChildFault::PreserveBlankDelta => false,
+                    AmbiguousChildFault::PreserveFreshRetry => cycle > 0,
+                    AmbiguousChildFault::PreserveInventoryRecovery => cycle >= 2,
+                    _ => true,
+                };
                 let activated = preserving
-                    && !matches!(
-                        fault,
-                        AmbiguousChildFault::PreserveMissingDelta
-                            | AmbiguousChildFault::PreserveBlankDelta
-                    )
-                    && !(cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveFreshRetry))
-                    && !(cycle < 2
-                        && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
+                    && source_evidence_ready
                     && children > 0
                     && !matches!(
                         fault,
