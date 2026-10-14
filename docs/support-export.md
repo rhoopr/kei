@@ -141,3 +141,28 @@ incident window. The command gives next actions for missing, unfinished,
 checkpoint-blocked and truncated evidence. A maintainer may still request
 case-specific evidence for a novel provider field, external restart cause or
 real-platform media verification.
+
+### Full-enumeration token relationships
+
+New runs can retain `support_token_equivalence_v1` when full enumeration reaches
+token classification. Each record contains up to 64 selected passes, identified
+only by local ordinal, with fixed pass/query kinds and scope-comparison categories.
+`same_first_pass` compares the selected zone name, full zone ID, endpoint and
+container with the first selected pass; it is a comparison, not new authorization.
+No album names, provider identifiers or opaque tokens are included.
+
+Within a single record, equal group numbers mean equal nonblank tokens. The
+recovery record includes both initial and retried observations: unchanged groups
+show persistent values, whereas disjoint groups show that the values changed.
+Neither result alone identifies the provider cause. Never compare group numbers
+between records or accounts. `not_retried` distinguishes retained initial proof
+from a fresh recovery observation. Missing, blank, dropped, incomplete, oversized
+and unobserved token evidence remains explicitly unavailable.
+
+Completion order records stream drainage within each round, before all media
+work necessarily completes. It does not measure token arrival or server snapshot
+time or prove natural provider EOF; filtered/cancelled streams can also drain.
+A null means drainage was not observed. `passes_omitted`, `rows_rejected`
+and `rows_unavailable`, together with the existing history/queue omission counts,
+identify partial evidence. Older exports have no such record, and cannot recover
+these relationships retroactively. Unanimity and checkpoint holds are unchanged.

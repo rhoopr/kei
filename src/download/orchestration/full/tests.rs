@@ -2108,6 +2108,30 @@ async fn support_history_keeps_initial_mismatch_and_repaired_token_counts_at_inf
         2
     );
     assert_eq!(proof("same_cycle_recovery")["sync_token_unique_values"], 1);
+    let relationships = &events
+        .iter()
+        .find(|event| {
+            event["kind"] == "support_token_equivalence_v1"
+                && event["fields"]["phase"] == "same_cycle_recovery"
+        })
+        .unwrap()["fields"]["rows"];
+    assert_ne!(
+        relationships[0]["initial_group"],
+        relationships[1]["initial_group"]
+    );
+    assert_eq!(
+        relationships[0]["recovery_group"],
+        relationships[1]["recovery_group"]
+    );
+    assert_ne!(
+        relationships[0]["initial_group"],
+        relationships[0]["recovery_group"]
+    );
+    assert_ne!(
+        relationships[1]["initial_group"],
+        relationships[0]["recovery_group"]
+    );
+
     for private in [
         "PRIVATE",
         "PrimarySync",
@@ -3458,3 +3482,5 @@ fn issue845_46_completed_passes_with_two_tokens_require_recovery() {
         }
     }
 }
+
+mod token_equivalence;

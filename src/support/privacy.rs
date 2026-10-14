@@ -382,6 +382,7 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "verified",
             "applied",
         ]),
+        "support_token_equivalence_v1" => Some(&["phase", "passes_total", "passes_omitted"]),
         "support_token_evidence_v1" => Some(&[
             "phase",
             "completion",
@@ -483,6 +484,13 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
 // Revalidate saved history as strictly as current producer observations.
 fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
     let label = value.as_str();
+    if kind == "support_token_equivalence_v1" {
+        return match key {
+            "phase" => matches!(label, Some("initial" | "same_cycle_recovery")),
+            "passes_total" | "passes_omitted" => value.as_u64().is_some(),
+            _ => false,
+        };
+    }
     match key {
         "expected_owner" if kind == "exact_lookup_rejection_v1" => {
             label.is_some_and(|label| matches!(label, "absent" | "private_default" | "other"))
@@ -544,18 +552,20 @@ fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
 
 pub(super) fn diagnostic(kind: &str, fields: &Map<String, Value>) -> Option<Map<String, Value>> {
     let allowed = contract(kind)?;
-    Some(
-        fields
-            .iter()
-            .filter(|(k, v)| {
-                (allowed.contains(&k.as_str()) && diagnostic_value(kind, k, v))
-                    || (matches!(k.as_str(), "item_alias" | "scope_alias")
-                        && v.as_str().is_some_and(valid_alias))
-                    || (k.as_str() == "correlation_unavailable" && v.is_boolean())
-            })
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-    )
+    let mut out: Map<String, Value> = fields
+        .iter()
+        .filter(|(k, v)| {
+            (allowed.contains(&k.as_str()) && diagnostic_value(kind, k, v))
+                || (matches!(k.as_str(), "item_alias" | "scope_alias")
+                    && v.as_str().is_some_and(valid_alias))
+                || (k.as_str() == "correlation_unavailable" && v.is_boolean())
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if kind == "support_token_equivalence_v1" {
+        super::token_equivalence::retain_rows(fields, &mut out);
+    }
+    Some(out)
 }
 
 pub(crate) fn fixed_label(value: &str) -> bool {

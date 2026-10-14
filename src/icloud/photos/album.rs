@@ -24,6 +24,8 @@ mod preservation_proof;
 pub(crate) use preservation_proof::{CompleteLegacyInventory, classify_legacy_inventory_error};
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod token_diagnostics_tests;
 
 use super::asset::{ChangeEvent, PhotoAsset};
 use super::session::PhotosSession;
@@ -187,6 +189,36 @@ impl PhotoAlbum {
             "container_id": self.container_id.as_deref(),
             "cross_zone_sources": self.cross_zone_sources.iter().map(Self::selection_scope).collect::<Vec<_>>(),
         })
+    }
+
+    /// Fixed diagnostic categories only; no provider values leave this owner.
+    pub(crate) fn token_diagnostic_categories(
+        &self,
+        reference: &Self,
+        selected_zone: &str,
+    ) -> (&'static str, &'static str) {
+        let query = match self.list_type.as_ref() {
+            QUERY_ALL_LIST => "library_wide",
+            QUERY_FOLDER_LIST => "album_membership",
+            "CPLAssetAndMasterInSmartAlbumByAssetDate" => "smart_album",
+            "CPLBurstStackAssetAndMasterByAssetDate" => "burst",
+            "CPLAssetAndMasterDeletedByExpungedDate" => "deleted",
+            "CPLAssetAndMasterHiddenByAssetDate" => "hidden",
+            _ => "other",
+        };
+        let scope = if self.zone_name().is_empty() {
+            "unavailable"
+        } else if self.zone_name() != selected_zone {
+            "different_selected_zone"
+        } else if self.zone_id == reference.zone_id
+            && self.service_endpoint == reference.service_endpoint
+            && self.container_id == reference.container_id
+        {
+            "same_first_pass"
+        } else {
+            "different_first_pass"
+        };
+        (query, scope)
     }
 
     pub(crate) fn container_id(&self) -> Option<&str> {

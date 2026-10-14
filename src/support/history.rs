@@ -504,6 +504,7 @@ fn priority(kind: &str, fields: &Map<String, Value>) -> u8 {
         "support_checkpoint_v1"
             | "support_pass_completion_v1"
             | "support_token_evidence_v1"
+            | "support_token_equivalence_v1"
             | "support_transfer_pass_v1"
             | "support_startup_v1"
     ) || (kind == "support_import_v1" && phase == Some("complete"))

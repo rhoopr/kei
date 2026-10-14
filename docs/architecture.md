@@ -1977,6 +1977,21 @@ actual qualified-primary assignment; selected indexing alone does not imply it.
 Owner categories are revalidated as strings, so a malformed numeric owner cannot
 escape through an aggregate-count allowance. Missing older fields remain missing.
 
+Full enumeration also emits `support_token_equivalence_v1` from
+`full/token_diagnostics.rs`. Each self-contained snapshot relates initial and
+same-cycle recovery token groups for at most 64 selected passes. Tokens are
+compared only in a bounded invocation-local table (128 values, at most 4096 bytes
+per value); only assigned ordinals reach the support boundary. The provider owner
+supplies fixed query and scope-comparison categories. A passive stream wrapper
+records drainage order without extra polling or tasks. Missing drainage is null;
+this order is not token-arrival, HTTP-completion or media-publication order.
+`support/token_equivalence.rs` revalidates nested rows at capture and export,
+rejects malformed or duplicate rows, and preserves explicit omission markers.
+Group numbers have meaning only within one snapshot, never across invocations,
+cycles or accounts. The recovery snapshot repeats the initial evidence so history
+retention cannot silently sever cross-round relationships. This evidence has no
+consumer in enumeration, recovery or checkpoint policy.
+
 Random process-local aliases are bounded and renumbered at collection time.
 Counts are scoped observations and must not be added as unique asset counts.
 SQL observations before transaction commit are explicitly identified as attempts.

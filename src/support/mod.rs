@@ -6,6 +6,7 @@
 mod collect;
 pub(crate) mod history;
 mod privacy;
+pub(crate) mod token_equivalence;
 
 pub(crate) use history::{begin, complete, observe, observe_scoped};
 pub(crate) use privacy::fixed_label;

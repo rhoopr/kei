@@ -1432,3 +1432,16 @@ local path/config reconciliation while the source stays held. Missing query
 tokens retain the pending config until healthy query recovery. The query owns
 its local selection proof and inventory; delta evidence adds vetoes and supplies
 only the source successor.
+
+## Token-equivalence diagnostics
+
+`cargo test --lib token_equivalence` covers invocation-local token groups,
+missing/blank/dropped/incomplete and oversized evidence, collection bounds,
+malformed stored rows, redaction and export round trips. The 46-pass fixture
+runs the real full-enumeration and retry path with an empty synthetic destination,
+then exports its persisted history through the production offline collector.
+Persistent split and moving snapshot controls both retain the checkpoint and all
+46 retry passes; only their exported cross-round equivalence differs. A separate
+stream fixture proves drainage order and missing order after drop. These are
+observational tests, not a new durable state transition or a proof of media
+idempotence. Existing checkpoint and L1 preservation controls remain applicable.
