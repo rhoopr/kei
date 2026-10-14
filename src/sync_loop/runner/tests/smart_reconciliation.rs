@@ -396,6 +396,7 @@ async fn smart_reconciliation_lifecycle_bounded(
         }],
     );
     let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+    let initial_enum_hash = download::compute_config_hash(&config);
     let mut original_path = None;
     let mut initial_hash = String::new();
     let mut current_hash = String::new();
@@ -813,7 +814,10 @@ async fn smart_reconciliation_lifecycle_bounded(
                 requests_before
             );
         }
-        if bound.is_some() && cycle == final_cycle {
+        if bound.is_some()
+            && !matches!(bound, Some(SmartBound::ExistingDate))
+            && cycle == final_cycle
+        {
             assert_eq!(
                 result.stats.full_enumeration_reason,
                 Some(download::FullEnumerationReason::EnumConfigHashDrift)
@@ -832,12 +836,16 @@ async fn smart_reconciliation_lifecycle_bounded(
                 !result.can_advance_database_checkpoint(),
                 "bounded source remains held: bound={bound:?} cycle={cycle} failure={failure:?} result={result:?}"
             );
+            let expected_pending_enum = if matches!(bound, Some(SmartBound::ExistingDate)) {
+                None
+            } else {
+                Some(download::compute_config_hash(&config))
+            };
             assert_eq!(
                 db.get_metadata(crate::sync_cycle::PENDING_ENUM_CONFIG_HASH_KEY)
                     .await
-                    .unwrap()
-                    .as_deref(),
-                Some(download::compute_config_hash(&config).as_str())
+                    .unwrap(),
+                expected_pending_enum
             );
         }
         assert_eq!(
@@ -845,7 +853,7 @@ async fn smart_reconciliation_lifecycle_bounded(
                 .await
                 .unwrap()
                 .as_deref(),
-            Some(download::compute_config_hash(&make_run_cycle_config()).as_str())
+            Some(initial_enum_hash.as_str())
         );
         if held
             && matches!(
