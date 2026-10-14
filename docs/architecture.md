@@ -612,7 +612,9 @@ The download owner records natural completion, usable counts, and canonical
 resolved pass/query/filter coverage. The cycle compares only equivalent complete
 scopes after the existing success, interruption, cancellation and stale-plan
 vetoes. Configured bounds, missing counts, targeted subsets and retries cannot
-replace a complete anchor. A complete selected smart-folder-only query can qualify.
+replace a complete anchor. A complete selected smart-folder-only query can qualify;
+source replay preserves that query's measurement without adding delta activity.
+Mixed refresh subsets cannot supply a complete anchor.
 Public `api_total_at_start` remains additive activity telemetry.
 
 Diagnostic anchors use `inventory_anchor_v1:` metadata keys scoped by enumeration

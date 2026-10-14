@@ -410,7 +410,15 @@ impl PhotosSession for InventorySession {
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
         if url.contains("/changes/zone?") {
-            assert!(!self.smart, "smart selection must use its actual query");
+            // Smart-only plans also replay the source boundary; their query
+            // still owns selection and the comparable inventory measurement.
+            let request: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(request["zones"].as_array().unwrap().len(), 1);
+            assert_eq!(request["zones"][0]["zoneID"]["zoneName"], self.zone);
+            assert!(matches!(
+                request["zones"][0]["syncToken"].as_str(),
+                Some("inventory-query-eof" | "validated-delta-successor" | "retained-valid-cursor")
+            ));
             self.changes.fetch_add(1, Ordering::SeqCst);
             return Ok(json!({"zones": [{
                 "zoneID": {"zoneName": self.zone, "ownerRecordName": "_defaultOwner"},

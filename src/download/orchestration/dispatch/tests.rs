@@ -750,10 +750,12 @@ async fn smart_only_delta_replays_source_without_admitting_unselected_media() {
         exclude_ids: Arc::new(FxHashSet::default()),
     }];
     let dir = TempDir::new().unwrap();
+    let config = Arc::new(incremental_test_config(&dir));
+    let expected_scope = crate::download::inventory_scope(&passes, &config);
     let result = download_photos_with_sync(
         &Client::new(),
         &passes,
-        Arc::new(incremental_test_config(&dir)),
+        config,
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
@@ -769,5 +771,9 @@ async fn smart_only_delta_replays_source_without_admitting_unselected_media() {
     );
     assert_eq!(result.stats.failed, 0);
     assert_eq!(result.stats.bytes_downloaded, 0);
+    let inventory = result.inventory.as_ref().unwrap();
+    assert_eq!(inventory.scope, expected_scope);
+    assert_eq!(inventory.total, 0);
+    assert_eq!(inventory.assets_seen, 0);
     assert!(server.received_requests().await.unwrap().is_empty());
 }

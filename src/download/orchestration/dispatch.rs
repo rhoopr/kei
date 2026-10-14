@@ -264,6 +264,12 @@ async fn download_photos_incremental_with_smart_folder_refresh(
         smart_folder_result.clear_full_query_token_block();
     }
 
+    if incremental_passes.is_empty() {
+        // This query covers every selected pass, so retain its comparable count
+        // evidence. Mixed refreshes remain subsets and must not replace it.
+        incremental_result.inventory = smart_folder_result.inventory.take();
+    }
+
     incremental_result.outcome =
         merge_download_outcomes(&incremental_result.outcome, &smart_folder_result.outcome);
     incremental_result.accumulate(&smart_folder_result);
