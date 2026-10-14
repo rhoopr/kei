@@ -733,10 +733,14 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
 
 #[tokio::test]
 async fn smart_only_delta_replays_source_without_admitting_unselected_media() {
+    let server = crate::start_wiremock_or_skip!();
+    let mut records = incremental_photo_records("OUTSIDE_SMART");
+    records[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+        json!(format!("{}/unselected.jpg", server.uri()));
     let calls = Arc::new(AtomicUsize::new(0));
     let session = super::super::test_support::changes_zone_session_with_query_page(
         Arc::clone(&calls),
-        incremental_photo_records("OUTSIDE_SMART"),
+        records,
         json!({"records":[],"syncToken":"selected-query-token"}),
         0,
     );
@@ -765,4 +769,5 @@ async fn smart_only_delta_replays_source_without_admitting_unselected_media() {
     );
     assert_eq!(result.stats.failed, 0);
     assert_eq!(result.stats.bytes_downloaded, 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
