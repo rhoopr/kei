@@ -127,6 +127,12 @@ fn classify_legacy_file_error(error: &anyhow::Error) -> Option<&'static str> {
 #[error("Legacy current evidence refused ({0})")]
 struct LegacyProofRefusal(&'static str);
 
+fn classify_legacy_proof_refusal(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<LegacyProofRefusal>()
+        .map_or("unclassified", |refusal| refusal.0)
+}
+
 pub(crate) fn log_preservation_hold(stage: &'static str, error: &anyhow::Error) {
     if let Some(diagnostic) = crate::icloud::photos::classify_legacy_inventory_error(error) {
         tracing::warn!(
@@ -167,9 +173,7 @@ pub(crate) fn log_preservation_hold(stage: &'static str, error: &anyhow::Error) 
             stage,
             reason = "current_evidence_incomplete",
             diagnostic = "legacy_certification_refusal_v1",
-            subreason = error
-                .downcast_ref::<LegacyProofRefusal>()
-                .map_or("unclassified", |refusal| refusal.0),
+            subreason = classify_legacy_proof_refusal(error),
             "Legacy preservation evidence incomplete; retaining attribution checkpoint hold"
         );
     }
