@@ -677,6 +677,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             &routing,
             &mut hydration_context,
             &mut delta.summary,
+            &shutdown_token,
         )
         .await;
     }

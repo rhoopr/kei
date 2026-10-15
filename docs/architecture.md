@@ -713,6 +713,16 @@ validation result and resets the HTTP connection pool. A recovered session
 replays the retained checkpoint. Ambiguous provider identities remain pending;
 authentication recovery does not authorize choosing a child or discarding work.
 
+Incremental asset-identity lookups, paired-asset lookups, and selected-album
+relation hydration in `src/download/orchestration/delta.rs` cancel provider reads
+on shutdown. Started state writes finish outside these cancellable waits.
+`support_hydration_wait_v1` reports a fixed phase and started, waiting, returned,
+or cancelled outcome at INFO, with a waiting observation every 30 seconds.
+Returned means the read returned, including errors; it does not certify replay,
+identity, or a checkpoint. Interrupted hydration retains the existing checkpoint
+and pending configuration. These waits have no new overall time limit and do
+not establish a universal shutdown deadline.
+
 Legacy-master hydration scans all current visible and hidden children before
 metadata-capture repair or pending-download recovery selects an owner. Hidden
 children remain identity candidates; soft- and hard-deleted children do not.

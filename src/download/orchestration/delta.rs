@@ -31,6 +31,48 @@ use super::models::{
 };
 use super::selection::IncrementalPassRouting;
 
+// Wrap only provider reads. Dropping a state transition here could abandon a
+// started durable write; callers apply and persist evidence after this returns.
+async fn wait_for_hydration_read<T>(
+    read: impl std::future::Future<Output = T>,
+    phase: &'static str,
+    shutdown_token: &CancellationToken,
+) -> Option<T> {
+    let started = tokio::time::Instant::now();
+    let cadence = std::time::Duration::from_secs(30);
+    let mut progress = tokio::time::interval_at(started + cadence, cadence);
+    progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::pin!(read);
+    tracing::info!(
+        diagnostic = "support_hydration_wait_v1",
+        phase,
+        outcome = "started",
+        "Incremental provider hydration read started"
+    );
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown_token.cancelled() => {
+                tracing::info!(diagnostic = "support_hydration_wait_v1", phase, outcome = "cancelled",
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "Incremental provider hydration cancelled; checkpoint remains held");
+                return None;
+            }
+            result = read.as_mut() => {
+                tracing::info!(diagnostic = "support_hydration_wait_v1", phase, outcome = "returned",
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "Incremental provider hydration read returned; validation is still required");
+                return Some(result);
+            }
+            _ = progress.tick() => {
+                tracing::info!(diagnostic = "support_hydration_wait_v1", phase, outcome = "waiting",
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "Waiting for incremental provider hydration; checkpoint is not yet qualified");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncrementalStateTransition {
     SoftDelete,
@@ -844,7 +886,13 @@ pub(super) async fn hydrate_unpaired_created_asset_deltas(
         return;
     }
     hydrate_unpaired_created_asset_deltas_inner(
-        events, pass, config, summary, &mut retry, run_mode,
+        events,
+        pass,
+        config,
+        summary,
+        &mut retry,
+        run_mode,
+        shutdown_token,
     )
     .await;
     for event in events.iter().filter(|event| {
@@ -899,6 +947,7 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
     summary: &mut IncrementalDeltaSummary,
     retry: &mut SparseRetryContext,
     run_mode: DownloadRunMode,
+    shutdown_token: &CancellationToken,
 ) {
     let mut pending = Vec::new();
     let mut unresolved: FxHashMap<String, Vec<usize>> = FxHashMap::default();
@@ -972,7 +1021,16 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                 RecordLookupRequest::asset_only(ProviderRecordId::new(record_name.as_str()))
             })
             .collect();
-        let identity_resolutions = pass.album.resolve_records(&requests).await;
+        let Some(identity_resolutions) = wait_for_hydration_read(
+            pass.album.resolve_records(&requests),
+            "asset_identity",
+            shutdown_token,
+        )
+        .await
+        else {
+            summary.block_identity();
+            return;
+        };
         for (state_id, resolution) in identity_resolutions.results {
             let Some(indices) = unresolved.remove(state_id.as_str()) else {
                 summary.block_identity();
@@ -1103,7 +1161,16 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
         .iter()
         .map(|(index, record_name, master)| (record_name.clone(), (*index, master.clone())))
         .collect();
-    let resolutions = pass.album.resolve_records(&requests).await;
+    let Some(resolutions) = wait_for_hydration_read(
+        pass.album.resolve_records(&requests),
+        "paired_asset",
+        shutdown_token,
+    )
+    .await
+    else {
+        summary.block_identity();
+        return;
+    };
     for (state_id, resolution) in resolutions.results {
         let Some((index, master_record_name)) = event_by_record_name.get(state_id.as_str()) else {
             summary.block_identity();
@@ -1198,6 +1265,7 @@ pub(super) async fn hydrate_missing_selected_relation_assets(
     routing: &IncrementalPassRouting,
     context: &mut IncrementalAssetHydrationContext<'_>,
     delta_summary: &mut IncrementalDeltaSummary,
+    shutdown_token: &CancellationToken,
 ) {
     let mut missing_by_hydrator: FxHashMap<usize, FxHashSet<String>> = FxHashMap::default();
     let mut pass_indices_by_asset: FxHashMap<String, FxHashSet<usize>> = FxHashMap::default();
@@ -1248,11 +1316,20 @@ pub(super) async fn hydrate_missing_selected_relation_assets(
             continue;
         };
 
-        let assets = match pass
-            .album
-            .hydrate_matching_assets_from_changes(&mut missing)
-            .await
-        {
+        let Some(result) = wait_for_hydration_read(
+            pass.album
+                .hydrate_matching_assets_from_changes(&mut missing),
+            "album_relation",
+            shutdown_token,
+        )
+        .await
+        else {
+            delta_summary
+                .token_unsafe_reason
+                .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
+            return;
+        };
+        let assets = match result {
             Ok(assets) => assets,
             Err(e) => {
                 tracing::warn!(

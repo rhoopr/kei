@@ -1868,3 +1868,56 @@ async fn shared_delta_state_preserves_strategy_failure_precedence() {
         assert_source_flags(&db.get_pending().await.unwrap(), "HIDDEN", false, false);
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn issue958_hydration_wait_reports_progress_and_terminal_outcomes_without_values() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let (layer, diagnostics) = crate::support::history::test_layer();
+    let _default = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+    let _worker_callsite_registration = tracing::Dispatch::new(tracing_subscriber::registry());
+    for cancel in [false, true] {
+        let token = CancellationToken::new();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let observe = super::wait_for_hydration_read(receive, "asset_identity", &token);
+        let complete = async {
+            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_secs(31)).await;
+            tokio::task::yield_now().await;
+            if cancel {
+                token.cancel();
+            } else {
+                send.send("private_provider_value").unwrap();
+            }
+        };
+        let (result, ()) = tokio::join!(observe, complete);
+        assert_eq!(result.is_none(), cancel);
+        let events = diagnostics();
+        let outcomes: Vec<_> = events
+            .iter()
+            .map(|event| event["fields"]["outcome"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                "started",
+                "waiting",
+                if cancel { "cancelled" } else { "returned" }
+            ]
+        );
+        assert_eq!(events[1]["fields"]["elapsed_secs"], 31);
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("private_provider_value")
+        );
+    }
+    let token = CancellationToken::new();
+    token.cancel();
+    let result = super::wait_for_hydration_read(
+        async { panic!("cancelled read must not be polled") },
+        "paired_asset",
+        &token,
+    )
+    .await;
+    assert!(result.is_none());
+}

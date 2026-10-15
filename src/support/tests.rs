@@ -313,3 +313,27 @@ fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
             .contains("PRIVATE")
     );
 }
+
+#[test]
+fn hydration_wait_contract_retains_only_fixed_phases_outcomes_and_unsigned_time() {
+    for phase in ["asset_identity", "paired_asset", "album_relation"] {
+        for outcome in ["started", "waiting", "returned", "cancelled"] {
+            let fields = json!({"phase": phase, "outcome": outcome, "elapsed_secs": 31,
+                "token": "private-token", "library": "private-zone", "message": "private-body"});
+            let safe =
+                privacy::diagnostic("support_hydration_wait_v1", fields.as_object().unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::Value::Object(safe),
+                json!({"phase": phase, "outcome": outcome, "elapsed_secs": 31})
+            );
+        }
+    }
+    let fields =
+        json!({"phase": "private-zone", "outcome": "private-response", "elapsed_secs": -1});
+    assert!(
+        privacy::diagnostic("support_hydration_wait_v1", fields.as_object().unwrap())
+            .unwrap()
+            .is_empty()
+    );
+}

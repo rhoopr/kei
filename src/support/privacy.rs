@@ -396,6 +396,7 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "sync_token_receivers_dropped",
             "sync_token_unique_values",
         ]),
+        "support_hydration_wait_v1" => Some(&["phase", "outcome", "elapsed_secs"]),
         "support_pass_completion_v1" => Some(&[
             "outcome",
             "sync_token_blocked",
@@ -484,6 +485,20 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
 // Revalidate saved history as strictly as current producer observations.
 fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
     let label = value.as_str();
+    if kind == "support_hydration_wait_v1" {
+        return match key {
+            "phase" => matches!(
+                label,
+                Some("asset_identity" | "paired_asset" | "album_relation")
+            ),
+            "outcome" => matches!(
+                label,
+                Some("started" | "waiting" | "returned" | "cancelled")
+            ),
+            "elapsed_secs" => value.as_u64().is_some(),
+            _ => false,
+        };
+    }
     if kind == "support_token_equivalence_v1" {
         return match key {
             "phase" => matches!(label, Some("initial" | "same_cycle_recovery")),
@@ -573,6 +588,12 @@ pub(crate) fn fixed_label(value: &str) -> bool {
 }
 
 const LABELS: &[&str] = &[
+    "waiting",
+    "started",
+    "asset_identity",
+    "paired_asset",
+    "album_relation",
+    "returned",
     "primary_discovery",
     "primary_publication",
     "no_primary",

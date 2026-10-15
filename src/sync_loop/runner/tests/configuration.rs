@@ -19,11 +19,21 @@ use crate::sync_loop::test_support::{
 };
 use crate::{config, download, state};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BridgeWait {
+    Replay,
+    AssetIdentity,
+    PairedAsset,
+    AlbumRelation,
+}
+
 #[derive(Clone)]
 struct ConfigBridgeSession {
     zone: Arc<str>,
     inventory_token: Arc<str>,
     bridge_token: Arc<str>,
+    wait: BridgeWait,
+    gate_active: Arc<std::sync::atomic::AtomicBool>,
     bridge_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     calls: Arc<Mutex<Vec<(&'static str, String)>>>,
 }
@@ -34,6 +44,8 @@ impl ConfigBridgeSession {
             zone: Arc::from(zone),
             inventory_token: Arc::from(inventory_token),
             bridge_token: Arc::from(bridge_token),
+            wait: BridgeWait::Replay,
+            gate_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             bridge_gate: None,
             calls: Arc::new(Mutex::new(Vec::new())),
         }
@@ -64,24 +76,57 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
                 "changes",
                 request["zones"][0]["syncToken"]
                     .as_str()
-                    .unwrap()
+                    .unwrap_or("")
                     .to_owned(),
             ));
-            if let Some((requested, release)) = &self.bridge_gate {
+            let active = self.gate_active.load(std::sync::atomic::Ordering::SeqCst);
+            let scan = !request["zones"][0]["syncToken"].is_string();
+            if active
+                && (self.wait == BridgeWait::Replay || scan)
+                && let Some((requested, release)) = &self.bridge_gate
+            {
                 requested.notify_one();
                 release.notified().await;
             }
+            let records = if active && self.bridge_gate.is_some() && !scan {
+                match self.wait {
+                    BridgeWait::Replay => Vec::new(),
+                    BridgeWait::AssetIdentity | BridgeWait::PairedAsset => {
+                        let mut asset = serde_json::json!({
+                            "recordName": "WAIT_CHILD", "recordType": "CPLAsset",
+                            "fields": {"masterRef": {"value": {"recordName": "WAIT_MASTER"}}}
+                        });
+                        if self.wait == BridgeWait::AssetIdentity {
+                            asset["fields"].as_object_mut().unwrap().remove("masterRef");
+                        }
+                        vec![asset]
+                    }
+                    BridgeWait::AlbumRelation => vec![serde_json::json!({
+                        "recordName": "WAIT_RELATION", "recordType": "CPLContainerRelation",
+                        "fields": {"containerId": {"value": "synthetic-album"},
+                                   "itemId": {"value": "WAIT_CHILD"}}
+                    })],
+                }
+            } else {
+                Vec::new()
+            };
             return Ok(serde_json::json!({
                 "zones": [{
                     "zoneID": {"zoneName": self.zone.as_ref(), "ownerRecordName": "_defaultOwner"},
                     "syncToken": self.bridge_token.as_ref(),
                     "moreComing": false,
-                    "records": []
+                    "records": records
                 }]
             }));
         }
         if url.contains("/records/lookup?") {
             self.calls.lock().unwrap().push(("lookup", String::new()));
+            if self.gate_active.load(std::sync::atomic::Ordering::SeqCst)
+                && let Some((requested, release)) = &self.bridge_gate
+            {
+                requested.notify_one();
+                release.notified().await;
+            }
         }
         Ok(serde_json::json!({"records": []}))
     }
@@ -93,6 +138,32 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
 
 #[tokio::test]
 async fn issue765_cancel_pending_bridge_preserves_checkpoint_then_replays() {
+    cancelled_bridge_fixture(BridgeWait::Replay, false).await;
+}
+
+#[tokio::test]
+async fn issue958_cancel_identity_wait_preserves_checkpoint_then_replays() {
+    cancelled_bridge_fixture(BridgeWait::AssetIdentity, false).await;
+}
+
+#[tokio::test]
+async fn issue958_cancel_paired_wait_preserves_checkpoint_then_replays() {
+    cancelled_bridge_fixture(BridgeWait::PairedAsset, false).await;
+}
+
+#[tokio::test]
+async fn issue958_cancel_relation_scan_preserves_checkpoint_then_replays() {
+    cancelled_bridge_fixture(BridgeWait::AlbumRelation, false).await;
+}
+
+#[tokio::test]
+async fn issue958_cancel_streaming_identity_wait_preserves_checkpoint_then_replays() {
+    for wait in [BridgeWait::AssetIdentity, BridgeWait::PairedAsset] {
+        cancelled_bridge_fixture(wait, true).await;
+    }
+}
+
+async fn cancelled_bridge_fixture(wait: BridgeWait, streaming: bool) {
     use std::time::Duration;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -117,6 +188,8 @@ async fn issue765_cancel_pending_bridge_preserves_checkpoint_then_replays() {
     let release = Arc::new(tokio::sync::Notify::new());
     let mut session = ConfigBridgeSession::new("PrimarySync", "inventory-token", "bridge-token");
     session.bridge_gate = Some((requested.clone(), release.clone()));
+    session.wait = wait;
+    let gate_active = session.gate_active.clone();
     let calls = session.calls.clone();
     let album = crate::icloud::photos::PhotoAlbum::new(
         crate::icloud::photos::PhotoAlbumConfig {
@@ -129,7 +202,7 @@ async fn issue765_cancel_pending_bridge_preserves_checkpoint_then_replays() {
             page_size: 100,
             zone_id: Arc::new(serde_json::json!({"zoneName":"PrimarySync"})),
             retry_config: crate::retry::RetryConfig::default(),
-            container_id: Some(Arc::from("synthetic-album")),
+            container_id: (!streaming).then(|| Arc::from("synthetic-album")),
             cross_zone_sources: Vec::new(),
         },
         Box::new(session),
@@ -138,7 +211,11 @@ async fn issue765_cancel_pending_bridge_preserves_checkpoint_then_replays() {
         "PrimarySync",
         "sync_token:PrimarySync",
         vec![crate::commands::AlbumPass {
-            kind: crate::commands::PassKind::Album,
+            kind: if streaming {
+                crate::commands::PassKind::Unfiled
+            } else {
+                crate::commands::PassKind::Album
+            },
             album,
             exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
         }],
@@ -186,7 +263,35 @@ async fn issue765_cancel_pending_bridge_preserves_checkpoint_then_replays() {
     assert!(result.stats.interrupted);
     assert!(!result.db_sync_token_advance_safe);
     assert!(!result.can_advance_database_checkpoint());
-    let bridge = diagnostics()
+    let observations = diagnostics();
+    // The streaming producer runs on a spawned task without this test's TLS
+    // subscriber; its durable cycle outcome is still captured below.
+    if wait != BridgeWait::Replay && !streaming {
+        let phase = match wait {
+            BridgeWait::AssetIdentity => "asset_identity",
+            BridgeWait::PairedAsset => "paired_asset",
+            BridgeWait::AlbumRelation => "album_relation",
+            BridgeWait::Replay => unreachable!(),
+        };
+        assert!(
+            observations
+                .iter()
+                .any(|event| event["kind"] == "support_hydration_wait_v1"
+                    && event["fields"]["phase"] == phase
+                    && event["fields"]["outcome"] == "cancelled")
+        );
+        let encoded = serde_json::to_string(&observations).unwrap();
+        for private in [
+            "WAIT_CHILD",
+            "WAIT_MASTER",
+            "WAIT_RELATION",
+            "synthetic-album",
+            "example.invalid",
+        ] {
+            assert!(!encoded.contains(private));
+        }
+    }
+    let bridge = observations
         .into_iter()
         .find(|event| {
             event["kind"] == "support_pass_completion_v1"
@@ -194,7 +299,10 @@ async fn issue765_cancel_pending_bridge_preserves_checkpoint_then_replays() {
         })
         .expect("production cycle records its cancelled bridge decision");
     assert_eq!(bridge["fields"]["interrupted"], true);
-    assert_eq!(bridge["fields"]["completed_delta_replay"], false);
+    assert_eq!(
+        bridge["fields"]["completed_delta_replay"],
+        wait != BridgeWait::Replay
+    );
     drop(cycle);
     drop(builder);
     drop(db);
@@ -231,7 +339,7 @@ async fn issue765_cancel_pending_bridge_preserves_checkpoint_then_replays() {
     assert_eq!(
         initial_calls
             .iter()
-            .filter(|(kind, _)| *kind == "changes")
+            .filter(|(kind, cursor)| *kind == "changes" && !cursor.is_empty())
             .map(|(_, cursor)| cursor.as_str())
             .collect::<Vec<_>>(),
         ["prior-token"]
@@ -241,9 +349,23 @@ async fn issue765_cancel_pending_bridge_preserves_checkpoint_then_replays() {
         .filter(|(kind, _)| *kind == "query")
         .count();
     assert!(inventory_queries > 0);
-    let builder = make_run_cycle_download_config_builder(&media, db.clone());
+    gate_active.store(false, std::sync::atomic::Ordering::SeqCst);
+    let initial_lookups = initial_calls
+        .iter()
+        .filter(|(kind, _)| *kind == "lookup")
+        .count();
+    assert_eq!(
+        initial_lookups,
+        usize::from(matches!(
+            wait,
+            BridgeWait::AssetIdentity | BridgeWait::PairedAsset
+        ))
+    );
+    drop(db);
     let mut replay_queries = 0;
     for replay in 0..2 {
+        let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let builder = make_run_cycle_download_config_builder(&media, db.clone());
         // Reuse the exact Album/container route, releasing its synthetic gate.
         release.notify_one();
         let result = tokio::time::timeout(
@@ -285,7 +407,13 @@ async fn issue765_cancel_pending_bridge_preserves_checkpoint_then_replays() {
         );
         assert_eq!(db.get_metadata(&marker).await.unwrap(), None);
         let observed = calls.lock().unwrap().clone();
-        assert!(!observed.iter().any(|(kind, _)| *kind == "lookup"));
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|(kind, _)| *kind == "lookup")
+                .count(),
+            initial_lookups
+        );
         let queries = observed.iter().filter(|(kind, _)| *kind == "query").count();
         if replay == 0 {
             assert!(
@@ -301,7 +429,7 @@ async fn issue765_cancel_pending_bridge_preserves_checkpoint_then_replays() {
         }
         let cursors: Vec<_> = observed
             .iter()
-            .filter(|(kind, _)| *kind == "changes")
+            .filter(|(kind, cursor)| *kind == "changes" && !cursor.is_empty())
             .map(|(_, cursor)| cursor.as_str())
             .collect();
         let expected = if replay == 0 {
