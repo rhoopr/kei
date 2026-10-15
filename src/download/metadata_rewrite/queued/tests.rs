@@ -86,6 +86,124 @@ fn grouped_xmp(meta: &xmp_toolkit::XmpMeta) -> (Vec<String>, Vec<String>) {
     (keywords, people)
 }
 
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn run_pending_preserves_bare_quicktime_metadata_and_retry_across_reopen() {
+    use crate::state::SqliteStateDb;
+    use crate::state::types::AssetMetadata;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.mov");
+    let original = crate::test_helpers::bare_track_meta_movie();
+    std::fs::write(&path, &original).unwrap();
+    let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+    let db_path = dir.path().join("state.db");
+    let db = SqliteStateDb::open(&db_path).await.unwrap();
+    seed_downloaded_marker(
+        &db,
+        "MOV_RETRY",
+        "live.mov",
+        &path,
+        &checksum,
+        AssetMetadata {
+            rating: Some(3),
+            metadata_hash: Some("fresh-hash".into()),
+            ..AssetMetadata::default()
+        },
+        None,
+    )
+    .await;
+    let checksums = stored_checksums(&db).await;
+    let hashes = db.get_downloaded_metadata_hashes().await.unwrap();
+    drop(db);
+
+    for _ in 0..2 {
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let result = run_pending(
+            &db,
+            embedded_rating_flags(),
+            Arc::from(".kei-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(result.applied, 0);
+        assert_eq!(result.failed, 1);
+        let pending = db.get_pending_metadata_rewrites(32).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id.as_ref(), "MOV_RETRY");
+        assert_eq!(stored_checksums(&db).await, checksums);
+        assert_eq!(db.get_downloaded_metadata_hashes().await.unwrap(), hashes);
+        assert_eq!(db.get_summary().await.unwrap().downloaded, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn run_pending_completes_terminated_quicktime_user_data_across_reopen() {
+    use crate::state::SqliteStateDb;
+    use crate::state::types::AssetMetadata;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.mov");
+    std::fs::write(
+        &path,
+        crate::test_helpers::quicktime_user_data_movie(&[0; 4]),
+    )
+    .unwrap();
+    let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+    let db_path = dir.path().join("state.db");
+    let db = SqliteStateDb::open(&db_path).await.unwrap();
+    seed_downloaded_marker(
+        &db,
+        "MOV_TERMINATOR",
+        "live.mov",
+        &path,
+        &checksum,
+        AssetMetadata {
+            rating: Some(3),
+            metadata_hash: Some("fresh-hash".into()),
+            ..AssetMetadata::default()
+        },
+        None,
+    )
+    .await;
+    assert_eq!(stored_checksums(&db).await, (Some(checksum.clone()), None));
+    drop(db);
+
+    let mut published = None;
+    for applied in [1, 0] {
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let result = run_pending(
+            &db,
+            embedded_rating_flags(),
+            Arc::from(".kei-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(result.applied, applied);
+        assert_eq!(result.failed, 0);
+        assert!(
+            db.get_pending_metadata_rewrites(32)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let current = crate::download::file::compute_sha256(&path).await.unwrap();
+        assert_ne!(current, checksum);
+        assert_eq!(
+            stored_checksums(&db).await,
+            (Some(current), Some(checksum.clone()))
+        );
+        assert_eq!(db.get_summary().await.unwrap().downloaded, 1);
+        let bytes = std::fs::read(&path).unwrap();
+        if let Some(previous) = &published {
+            assert_eq!(&bytes, previous);
+        }
+        published = Some(bytes);
+    }
+}
+
 async fn queue_capture_repair(
     db: &crate::state::SqliteStateDb,
     record: &crate::state::types::AssetRecord,

@@ -4,6 +4,7 @@ use super::prepared::{PreparedMetadataFile, TmpGuard, create_unique_embed_temp};
 use super::values::MetadataWrite;
 use super::xmp_fields::{apply_to_xmp, ensure_initialized};
 use anyhow::{Context, Result};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use xmp_toolkit::{OpenFileOptions, XmpFile, XmpMeta};
 
@@ -57,6 +58,7 @@ pub(super) fn prepare_metadata_xmp_toolkit(
         );
     }
 
+    validate_movie_metadata_layout(&tmp_path)?;
     let result: Result<()> = (|| {
         let mut file = XmpFile::new().context("Could not create XMP handle")?;
         file.open_file(
@@ -107,6 +109,107 @@ pub(super) fn prepare_metadata_xmp_toolkit(
     })
 }
 
+/// The toolkit assumes every nested `meta` has a four-byte FullBox prefix.
+/// QuickTime also permits bare child boxes there, which its rewrite corrupts.
+fn validate_movie_metadata_layout(path: &Path) -> Result<()> {
+    let mut file = std::fs::File::open(path)?;
+    let end = file.metadata()?.len();
+    let mut header = [0; 8];
+    if end < 8 {
+        return Ok(());
+    }
+    file.read_exact(&mut header)?;
+    if !matches!(
+        &header[4..8],
+        b"ftyp" | b"moov" | b"mdat" | b"wide" | b"free" | b"skip"
+    ) {
+        return Ok(());
+    }
+    let mut budget = 100_000;
+    validate_movie_boxes(&mut file, 0, end, None, 0, &mut budget)
+}
+
+fn validate_movie_boxes(
+    file: &mut std::fs::File,
+    mut offset: u64,
+    end: u64,
+    parent: Option<&[u8; 4]>,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        depth <= 32,
+        "Movie metadata nesting exceeds preservation check limit"
+    );
+    while offset < end {
+        // QuickTime user-data lists may end with a four-byte zero terminator.
+        if parent == Some(b"udta") && end - offset == 4 {
+            file.seek(SeekFrom::Start(offset))?;
+            let mut terminator = [0; 4];
+            file.read_exact(&mut terminator)?;
+            anyhow::ensure!(terminator == [0; 4], "Invalid movie user-data terminator");
+            return Ok(());
+        }
+        anyhow::ensure!(
+            *budget > 0,
+            "Movie box count exceeds preservation check limit"
+        );
+        *budget -= 1;
+        anyhow::ensure!(end - offset >= 8, "Incomplete movie box header");
+        file.seek(SeekFrom::Start(offset))?;
+        let mut header = [0; 8];
+        file.read_exact(&mut header)?;
+        let kind: &[u8; 4] = header[4..8].try_into()?;
+        let size = u32::from_be_bytes(header[..4].try_into()?);
+        let (size, header_size) = match size {
+            0 => (end - offset, 8),
+            1 => {
+                anyhow::ensure!(end - offset >= 16, "Incomplete extended movie box header");
+                let mut extended = [0; 8];
+                file.read_exact(&mut extended)?;
+                (u64::from_be_bytes(extended), 16)
+            }
+            size => (u64::from(size), 8),
+        };
+        anyhow::ensure!(
+            size >= header_size && size <= end - offset,
+            "Invalid movie box bounds"
+        );
+        let next = offset + size;
+        let mut children = offset + header_size;
+        if kind == b"moov"
+            || (parent.is_some()
+                && matches!(
+                    kind,
+                    b"udta"
+                        | b"meta"
+                        | b"ilst"
+                        | b"trak"
+                        | b"edts"
+                        | b"mdia"
+                        | b"minf"
+                        | b"dinf"
+                        | b"stbl"
+                ))
+        {
+            if kind == b"meta" && parent != Some(b"moov") {
+                anyhow::ensure!(next - children >= 4, "Incomplete movie metadata prefix");
+                file.seek(SeekFrom::Start(children))?;
+                let mut prefix = [0; 4];
+                file.read_exact(&mut prefix)?;
+                anyhow::ensure!(
+                    prefix == [0; 4],
+                    "Refusing embedded metadata rewrite: nested QuickTime metadata lacks a supported FullBox prefix; the XMP toolkit could damage existing metadata"
+                );
+                children += 4;
+            }
+            validate_movie_boxes(file, children, next, Some(kind), depth + 1, budget)?;
+        }
+        offset = next;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unused_result_ok, reason = "test cleanup is best-effort")]
 mod tests {
@@ -127,6 +230,147 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use xmp_toolkit::xmp_ns;
+
+    #[test]
+    fn quicktime_rewrite_rejects_bare_track_metadata_before_damage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.mov");
+        let original = crate::test_helpers::bare_track_meta_movie();
+        fs::write(&path, &original).unwrap();
+        let error = apply_metadata_with_default_suffix(
+            &path,
+            &MetadataWrite {
+                rating: Some(3),
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("nested QuickTime metadata"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(embed_temp_entries(dir.path(), ".meta-tmp").is_empty());
+    }
+
+    #[test]
+    fn quicktime_supported_movie_still_embeds_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.mov.kei-tmp");
+        fs::write(
+            &path,
+            include_bytes!("../../../tests/data/media/apple-live.mov"),
+        )
+        .unwrap();
+        apply_metadata_with_default_suffix(
+            &path,
+            &MetadataWrite {
+                rating: Some(3),
+                ..MetadataWrite::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_meta(&path)
+                .property_i32(xmp_ns::XMP, "Rating")
+                .unwrap()
+                .value,
+            3
+        );
+    }
+
+    #[test]
+    fn quicktime_user_data_terminator_preserves_metadata_and_media() {
+        for tail in [&[][..], &[0; 4][..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("live.mov.kei-tmp");
+            let original = crate::test_helpers::quicktime_user_data_movie(tail);
+            fs::write(&path, &original).unwrap();
+            apply_metadata_with_default_suffix(
+                &path,
+                &MetadataWrite {
+                    rating: Some(3),
+                    ..MetadataWrite::default()
+                },
+            )
+            .unwrap();
+            let rewritten = fs::read(&path).unwrap();
+            for kind in [b"hdlr", b"name", b"mdat"] {
+                let atom = |bytes: &[u8]| {
+                    let start = bytes.windows(4).position(|value| value == kind).unwrap() - 4;
+                    let size = u32::from_be_bytes(bytes[start..start + 4].try_into().unwrap());
+                    bytes[start..start + usize::try_from(size).unwrap()].to_vec()
+                };
+                assert_eq!(atom(&rewritten), atom(&original), "{kind:?}");
+            }
+            assert_eq!(
+                read_meta(&path)
+                    .property_i32(xmp_ns::XMP, "Rating")
+                    .unwrap()
+                    .value,
+                3
+            );
+            assert!(embed_temp_entries(dir.path(), ".meta-tmp").is_empty());
+        }
+    }
+
+    #[test]
+    fn quicktime_user_data_terminator_does_not_allow_truncated_boxes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.mov");
+        for tail in [&[0; 3][..], &[0, 0, 0, 1][..], &[0; 5][..]] {
+            let original = crate::test_helpers::quicktime_user_data_movie(tail);
+            fs::write(&path, &original).unwrap();
+            assert!(
+                apply_metadata_with_default_suffix(
+                    &path,
+                    &MetadataWrite {
+                        rating: Some(3),
+                        ..MetadataWrite::default()
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert!(embed_temp_entries(dir.path(), ".meta-tmp").is_empty());
+        }
+        for parent in [b"trak", b"meta", b"moov"] {
+            let mut original = crate::test_helpers::quicktime_user_data_movie(&[0; 4]);
+            let user_data = original
+                .windows(4)
+                .position(|value| value == b"udta")
+                .unwrap();
+            original[user_data..user_data + 4].copy_from_slice(parent);
+            fs::write(&path, &original).unwrap();
+            assert!(
+                super::validate_movie_metadata_layout(&path).is_err(),
+                "{parent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quicktime_layout_check_accepts_fullbox_and_rejects_invalid_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("movie.part");
+        let mut bytes = crate::test_helpers::bare_track_meta_movie();
+        let meta_type = bytes.windows(4).position(|value| value == b"meta").unwrap();
+        bytes.splice(meta_type + 4..meta_type + 4, [0; 4]);
+        for kind in [b"moov", b"trak", b"meta"] {
+            let start = bytes.windows(4).position(|value| value == kind).unwrap() - 4;
+            let size = u32::from_be_bytes(bytes[start..start + 4].try_into().unwrap());
+            bytes[start..start + 4].copy_from_slice(&(size + 4).to_be_bytes());
+        }
+        fs::write(&path, &bytes).unwrap();
+        super::validate_movie_metadata_layout(&path).unwrap();
+        // A terminal size-zero media box is bounded by the file, not loaded.
+        let mdat = bytes.windows(4).position(|value| value == b"mdat").unwrap() - 4;
+        bytes[mdat..mdat + 4].copy_from_slice(&0u32.to_be_bytes());
+        fs::write(&path, &bytes).unwrap();
+        super::validate_movie_metadata_layout(&path).unwrap();
+        bytes[mdat..mdat + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        fs::write(&path, &bytes).unwrap();
+        assert!(super::validate_movie_metadata_layout(&path).is_err());
+        fs::write(&path, b"\0\0\0\x01moov").unwrap();
+        assert!(super::validate_movie_metadata_layout(&path).is_err());
+    }
 
     #[test]
     fn apply_metadata_uses_configured_temp_suffix() {
