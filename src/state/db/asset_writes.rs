@@ -307,14 +307,26 @@ pub(super) fn record_metadata_path(
     write: MetadataPathWrite,
 ) -> Result<(), StateError> {
     let preserve_debt = i64::from(matches!(write, MetadataPathWrite::Published));
+    // Only verified finalization establishes source provenance. Exact-byte
+    // relocation may reuse an unambiguous receipt for this child, rendition
+    // and provider generation. A checked metadata rewrite retains its source
+    // behind the new local fingerprint.
     conn.execute(
         "INSERT INTO asset_metadata_paths \
             (library, id, version_size, local_path, provider_checksum, local_checksum, \
              download_checksum, metadata_write_failed_at, capture_repair_metadata_hash, \
-             capture_repair_output_checksum, capture_repair_output_size) \
+             capture_repair_output_checksum, capture_repair_output_size, source_checksum) \
          SELECT library, id, version_size, local_path, checksum, local_checksum, \
                 download_checksum, metadata_write_failed_at, capture_repair_metadata_hash, \
-                capture_repair_output_checksum, capture_repair_output_size \
+                capture_repair_output_checksum, capture_repair_output_size, \
+                (SELECT MIN(p.source_checksum) FROM asset_metadata_paths p \
+                 WHERE p.library = assets.library AND p.id = assets.id \
+                   AND p.version_size = assets.version_size \
+                   AND p.provider_checksum = assets.checksum \
+                   AND p.local_checksum = assets.local_checksum \
+                 HAVING COUNT(DISTINCT p.source_checksum) = 1 \
+                   AND LENGTH(MIN(p.source_checksum)) = 64 \
+                   AND MIN(p.source_checksum) NOT GLOB '*[^0-9a-f]*') \
          FROM assets WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
              AND status = 'downloaded' AND local_path IS NOT NULL \
          ON CONFLICT(library, id, version_size, local_path) DO UPDATE SET \
@@ -322,7 +334,9 @@ pub(super) fn record_metadata_path(
              local_checksum = excluded.local_checksum, \
              download_checksum = excluded.download_checksum, \
              source_checksum = CASE WHEN asset_metadata_paths.provider_checksum = excluded.provider_checksum \
-                 THEN asset_metadata_paths.source_checksum ELSE NULL END, \
+                 AND (?4 = 0 OR asset_metadata_paths.local_checksum IS excluded.local_checksum) \
+                 THEN COALESCE(asset_metadata_paths.source_checksum, excluded.source_checksum) \
+                 ELSE excluded.source_checksum END, \
              metadata_write_failed_at = CASE WHEN ?4 = 1 THEN \
                  COALESCE(excluded.metadata_write_failed_at, asset_metadata_paths.metadata_write_failed_at) \
                  ELSE excluded.metadata_write_failed_at END, \

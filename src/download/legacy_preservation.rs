@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use base64::Engine as _;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -743,13 +742,11 @@ async fn qualify_family(
             )
             .await
             .context(LegacyProofRefusal("current_file_unavailable"))?;
+            // The store qualified separate verified source provenance for this
+            // exact child/rendition/provider generation/path. MMCS identifies a
+            // provider generation; it is never a local SHA-256 content hash.
             anyhow::ensure!(
-                file.sha256 == receipt.local_checksum
-                    && verified_current_content(
-                        checksum,
-                        file.sha256.as_deref(),
-                        receipt.download_checksum.as_deref()
-                    ),
+                file.sha256 == receipt.local_checksum,
                 LegacyProofRefusal("child_content_unverified")
             );
             #[cfg(feature = "xmp")]
@@ -803,28 +800,9 @@ fn provider_files(evidence: &str) -> anyhow::Result<Vec<LegacyFileEvidence>> {
     Ok(files)
 }
 
-// This proves bytes for an independently identified current child, never the
-// historical original's owner. A post-publication state failure may leave no
-// pre-metadata receipt; exact provider SHA-256 equality still verifies the file.
-fn verified_current_content(
-    provider: &str,
-    current: Option<&str>,
-    downloaded: Option<&str>,
-) -> bool {
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(provider) else {
-        return false;
-    };
-    if bytes.len() != 32 {
-        return false;
-    }
-    let hash = data_encoding::HEXLOWER.encode(&bytes);
-    current == Some(hash.as_str()) || downloaded == Some(hash.as_str())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{fingerprint, provider_files, sidecar, verified_current_content, verify_files};
-    use base64::Engine as _;
+    use super::{fingerprint, provider_files, sidecar, verify_files};
     use tokio_util::sync::CancellationToken;
 
     #[test]
@@ -991,32 +969,6 @@ mod tests {
             super::classify_legacy_file_error(&anyhow::anyhow!("shared_file_links")),
             None
         );
-    }
-
-    #[test]
-    fn preservation_current_content_requires_exact_source_bytes_or_verified_prewrite_receipt() {
-        use sha2::{Digest, Sha256};
-        let raw = Sha256::digest(b"synthetic source");
-        let provider = base64::engine::general_purpose::STANDARD.encode(raw);
-        let hash = data_encoding::HEXLOWER.encode(&raw);
-        let changed = data_encoding::HEXLOWER.encode(&Sha256::digest(b"changed bytes"));
-        assert!(verified_current_content(&provider, Some(&hash), None));
-        assert!(verified_current_content(
-            &provider,
-            Some(&changed),
-            Some(&hash)
-        ));
-        assert!(!verified_current_content(&provider, Some(&changed), None));
-        assert!(!verified_current_content(
-            &provider,
-            Some(&changed),
-            Some(&changed)
-        ));
-        assert!(!verified_current_content(
-            "unsupported",
-            Some(&hash),
-            Some(&hash)
-        ));
     }
 
     #[test]

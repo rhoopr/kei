@@ -1117,18 +1117,15 @@ fn validate_decision_rows(
             let (Some(local), Some(source), Some(stored)) = (local, source, progress) else {
                 return invalid();
             };
+            // The progress receipt binds independent local/source SHA-256 to
+            // the immutable provider generation and destination above. MMCS
+            // is opaque and has no content-hash equality relationship.
             if source.len() != 64
                 || local.len() != 64
                 || !source
                     .bytes()
                     .chain(local.bytes())
                     .all(|b| b.is_ascii_hexdigit())
-                || data_encoding::HEXLOWER
-                    .decode(source.as_bytes())
-                    .ok()
-                    .map(|sha| data_encoding::BASE64.encode(&sha))
-                    .as_deref()
-                    != Some(destination.checksum.as_str())
                 || progress_hash(
                     root,
                     manifest,
@@ -1847,12 +1844,19 @@ pub(super) fn record_verified_destination(
         })?,
     )
     .key()?;
-    let expected = data_encoding::BASE64.encode(
-        &data_encoding::HEXLOWER
-            .decode(source.as_bytes())
-            .map_err(|_invalid| StateError::ProviderSelectionInvalid)?,
-    );
-    let rows:Vec<(String,String,String)>=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND admitted=1 AND checksum=?7 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND a.checksum=provider_active_destinations.checksum AND a.size_bytes=provider_active_destinations.size_bytes AND a.metadata_hash=provider_active_destinations.metadata_hash)")?.query_map(params![library,asset,version,path,local,source,expected],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
+    if source.len() != 64
+        || local.len() != 64
+        || !source
+            .bytes()
+            .chain(local.bytes())
+            .all(|b| b.is_ascii_hexdigit())
+    {
+        return invalid();
+    }
+    // Verified finalization wrote this separate source receipt in the same
+    // transaction. Bind the opaque provider generation through the catalogue,
+    // never by interpreting MMCS as a local content digest.
+    let rows:Vec<(String,String,String)>=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND admitted=1 AND EXISTS(SELECT 1 FROM assets a JOIN asset_metadata_paths p USING(library,id,version_size) WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND a.checksum=provider_active_destinations.checksum AND a.size_bytes=provider_active_destinations.size_bytes AND a.metadata_hash=provider_active_destinations.metadata_hash AND a.created_at IS provider_active_destinations.created_at AND a.added_at IS provider_active_destinations.added_at AND a.status='downloaded' AND a.is_deleted=0 AND p.provider_checksum=a.checksum AND p.local_path=provider_active_destinations.compat_path AND p.local_checksum=?5 AND p.source_checksum=?6)")?.query_map(params![library,asset,version,path,local,source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
     for (generation, key, child) in rows {
         let root = load_generation(conn, &generation)?;
         let manifest = load_decision(conn, &root, &key, &child)?;
@@ -1902,7 +1906,7 @@ impl SqliteStateDb {
                 tx.commit()?;return Ok(true)
             }
             let Some(text)=native.to_str() else {tx.commit()?;return Ok(false)};
-            let receipt:Option<String>=tx.query_row("SELECT p.source_checksum FROM asset_metadata_paths p JOIN assets a USING(library,id,version_size) WHERE p.library=?1 AND p.id=?2 AND p.local_path=?3 AND p.local_checksum=?4 AND p.source_checksum IS NOT NULL AND a.metadata_hash IS ?5 AND p.version_size=?6",params![root.spec.zone.get("zoneName").and_then(Value::as_str),manifest.state_id,text,local,manifest.decision.destinations.iter().find(|d|d.path==path).map(|d|&d.metadata_hash),manifest.decision.destinations.iter().find(|d|d.path==path).map(|d|&d.version_size)],|r|r.get(0)).optional()?;
+            let receipt:Option<String>=tx.query_row("SELECT p.source_checksum FROM asset_metadata_paths p JOIN assets a USING(library,id,version_size) WHERE p.library=?1 AND p.id=?2 AND p.local_path=?3 AND p.local_checksum=?4 AND p.source_checksum IS NOT NULL AND a.metadata_hash IS ?5 AND p.version_size=?6 AND p.provider_checksum=?7 AND a.checksum=p.provider_checksum",params![root.spec.zone.get("zoneName").and_then(Value::as_str),manifest.state_id,text,local,manifest.decision.destinations.iter().find(|d|d.path==path).map(|d|&d.metadata_hash),manifest.decision.destinations.iter().find(|d|d.path==path).map(|d|&d.version_size),selected.checksum],|r|r.get(0)).optional()?;
             if let Some(source)=receipt {
                 record_verified_destination(&tx,root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,
                     &manifest.decision.destinations.iter().find(|d|d.path==path).ok_or(StateError::ProviderSelectionInvalid)?.version_size,&native,&local,&source)?;

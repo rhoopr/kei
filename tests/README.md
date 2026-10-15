@@ -215,6 +215,26 @@ changing code. Promote any demonstrated product defect to its own deterministic
 regression. These tests do not exercise arbitrary library shapes, real-account
 state, abrupt process death, or power-loss durability.
 
+### Legacy current-content provenance
+
+`run_cycle_legacy_opaque_mmcs_qualifies_after_reopen` uses opaque 21-byte and
+32-byte provider generation signatures unrelated to downloaded SHA-256. Actual
+ordinary and Hidden-only cycles qualify independently downloaded current work,
+then reopen SQLite twice without repeating downloads or altering retained
+legacy evidence. Unknown source provenance and failed checkpoint transactions
+have separate held-cycle controls. State receipt tests refuse unknown historical
+hashes, generation/path/local-byte mismatches, metadata debt and unverified
+replacement bytes after reopen. Exact-byte relocation retains only unambiguous,
+scope-matched source lineage. A publication state-write failure remains held
+after on-disk adoption; its recovery fixture retains that copy and performs
+a fresh verified download before certification and a quiet reopened cycle.
+
+`private_destination_opaque_mmcs_proofs_survive_reopen` covers native destination
+proof creation and validation through normal downloads, compatible destination
+reuse and reopened quiet cycles. Unix coverage includes a non-UTF-8 root;
+feature-gated sidecar coverage retains independent metadata completion. These
+fixtures use synthetic provider data and media, not a reporter-state replay.
+
 ### Mixed library provider response equivalence
 
 `mixed_library_provider_shapes` composes long-lived synthetic families in two

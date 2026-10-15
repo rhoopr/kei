@@ -3620,6 +3620,7 @@ enum AmbiguousChildFault {
     PreserveCompanion,
     PreservePaginatedHidden,
     PreserveHiddenUnselected,
+    PreserveUnknownSource,
     PreserveBridgeDebt,
     PreserveMissingDelta,
     PreserveBlankDelta,
@@ -3676,6 +3677,23 @@ async fn exercise_legacy_child_cycles_with_selection(
     child_counts: &[usize],
     hardlink_fault: Option<LegacyHardlinkFault>,
     smart_only: bool,
+) {
+    Box::pin(exercise_legacy_child_cycles_with_provenance(
+        fault,
+        child_counts,
+        hardlink_fault,
+        smart_only,
+        None,
+    ))
+    .await;
+}
+
+async fn exercise_legacy_child_cycles_with_provenance(
+    fault: AmbiguousChildFault,
+    child_counts: &[usize],
+    hardlink_fault: Option<LegacyHardlinkFault>,
+    smart_only: bool,
+    signature_bytes: Option<usize>,
 ) {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
@@ -3814,6 +3832,7 @@ async fn exercise_legacy_child_cycles_with_selection(
             | AmbiguousChildFault::PreserveCompanion
             | AmbiguousChildFault::PreservePaginatedHidden
             | AmbiguousChildFault::PreserveHiddenUnselected
+            | AmbiguousChildFault::PreserveUnknownSource
             | AmbiguousChildFault::PreserveBridgeDebt
             | AmbiguousChildFault::PreserveMissingDelta
             | AmbiguousChildFault::PreserveBlankDelta
@@ -3826,7 +3845,12 @@ async fn exercise_legacy_child_cycles_with_selection(
             let server = crate::start_wiremock_or_skip!();
             let bytes =
                 b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9";
-            let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+            let checksum = match signature_bytes {
+                Some(length) => {
+                    base64::engine::general_purpose::STANDARD.encode(vec![0x72; length])
+                }
+                None => base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes)),
+            };
             let motion = b"\0\0\0\x14ftypqt  \0\0\0\0qt  ";
             let motion_checksum =
                 base64::engine::general_purpose::STANDARD.encode(Sha256::digest(motion));
@@ -4039,7 +4063,13 @@ async fn exercise_legacy_child_cycles_with_selection(
                 AmbiguousChildFault::PreserveConfigChange
                     | AmbiguousChildFault::PreserveInventoryRecovery
             );
-            for cycle in 0..if relocating { 4 } else { 3 } {
+            let fresh_source_recovery = matches!(fault, AmbiguousChildFault::PreserveStateWrite);
+            let mut retained_unverified_outputs = Vec::new();
+            for cycle in 0..if relocating || fresh_source_recovery {
+                4
+            } else {
+                3
+            } {
                 let mut config = make_run_cycle_config();
                 let allow_hardlinks = hardlink_fault.is_some()
                     && !(cycle >= 2
@@ -4121,6 +4151,18 @@ async fn exercise_legacy_child_cycles_with_selection(
                         _ => {}
                     }
                 }
+                if cycle == 2 && fresh_source_recovery {
+                    // The first publication lost its verified-source transaction.
+                    // Retain those bytes and require an actual fresh download;
+                    // on-disk adoption alone must never invent provenance.
+                    let retained = dir.path().join("retained-unverified-publication");
+                    std::fs::create_dir(&retained).unwrap();
+                    for (index, (path, bytes)) in completed_outputs.iter().enumerate() {
+                        let saved = retained.join(index.to_string());
+                        std::fs::rename(path, &saved).unwrap();
+                        retained_unverified_outputs.push((saved, bytes.clone()));
+                    }
+                }
                 let original_before = hardlink_fault.map(|_| {
                     (
                         std::fs::read(&legacy_path).unwrap(),
@@ -4130,31 +4172,41 @@ async fn exercise_legacy_child_cycles_with_selection(
                 let requests_before = server.received_requests().await.unwrap().len();
                 let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
                 let cancel = CancellationToken::new();
-                let db: Arc<dyn download::DownloadStore> = if cycle == 0
-                    && matches!(
-                        fault,
-                        AmbiguousChildFault::Cancel
-                            | AmbiguousChildFault::StateWrite
-                            | AmbiguousChildFault::PreserveCancel
-                            | AmbiguousChildFault::PreserveStateWrite
-                    ) {
-                    let failing = FailingMetadataSetDb::without_set_failure(
-                        inner.clone(),
-                        "injected #765 state failure",
-                    );
-                    Arc::new(
-                        if matches!(
+                let db: Arc<dyn download::DownloadStore> =
+                    if matches!(fault, AmbiguousChildFault::PreserveUnknownSource) {
+                        Arc::new(
+                            FailingMetadataSetDb::without_set_failure(
+                                inner.clone(),
+                                "unknown source fixture",
+                            )
+                            .with_unknown_download_source(),
+                        )
+                    } else if cycle == 0
+                        && matches!(
                             fault,
-                            AmbiguousChildFault::Cancel | AmbiguousChildFault::PreserveCancel
-                        ) {
-                            failing.with_cancel_on_upsert(cancel.clone())
-                        } else {
-                            failing.with_mark_downloaded_failure()
-                        },
-                    )
-                } else {
-                    inner.clone()
-                };
+                            AmbiguousChildFault::Cancel
+                                | AmbiguousChildFault::StateWrite
+                                | AmbiguousChildFault::PreserveCancel
+                                | AmbiguousChildFault::PreserveStateWrite
+                        )
+                    {
+                        let failing = FailingMetadataSetDb::without_set_failure(
+                            inner.clone(),
+                            "injected #765 state failure",
+                        );
+                        Arc::new(
+                            if matches!(
+                                fault,
+                                AmbiguousChildFault::Cancel | AmbiguousChildFault::PreserveCancel
+                            ) {
+                                failing.with_cancel_on_upsert(cancel.clone())
+                            } else {
+                                failing.with_mark_downloaded_failure()
+                            },
+                        )
+                    } else {
+                        inner.clone()
+                    };
                 let provider = ChildSession {
                     records: records.clone(),
                     complete: preserving,
@@ -4542,10 +4594,12 @@ async fn exercise_legacy_child_cycles_with_selection(
                     AmbiguousChildFault::PreserveMissingDelta
                     | AmbiguousChildFault::PreserveBlankDelta => false,
                     AmbiguousChildFault::PreserveFreshRetry => cycle > 0,
-                    AmbiguousChildFault::PreserveInventoryRecovery => cycle >= 2,
+                    AmbiguousChildFault::PreserveInventoryRecovery
+                    | AmbiguousChildFault::PreserveStateWrite => cycle >= 2,
                     _ => true,
                 };
                 let activated = preserving
+                    && !matches!(fault, AmbiguousChildFault::PreserveUnknownSource)
                     && source_evidence_ready
                     && children > 0
                     && !matches!(
@@ -4623,7 +4677,11 @@ async fn exercise_legacy_child_cycles_with_selection(
                         crate::cycle_reporter::CycleStatus::Success
                     );
                 }
-                if matches!(fault, AmbiguousChildFault::PreserveHiddenUnselected) {
+                if matches!(
+                    fault,
+                    AmbiguousChildFault::PreserveHiddenUnselected
+                        | AmbiguousChildFault::PreserveUnknownSource
+                ) {
                     let warning = std::fs::read_to_string(&warning_path).unwrap();
                     assert!(warning.contains("legacy_certification_refusal_v1"));
                     assert!(warning.contains("child_receipt_missing"));
@@ -4648,7 +4706,7 @@ async fn exercise_legacy_child_cycles_with_selection(
                         ),
                         "active generation {label}"
                     );
-                    if cycle >= 2 && !(relocating && cycle == 2) {
+                    if cycle >= 2 && !((relocating || fresh_source_recovery) && cycle == 2) {
                         assert!(
                             result.stats.full_enumeration_reason.is_none(),
                             "unchanged cycle should remain incremental {label}"
@@ -4863,9 +4921,28 @@ async fn exercise_legacy_child_cycles_with_selection(
                     );
                     completed_requests = requests;
                 }
+                for (path, bytes) in &retained_unverified_outputs {
+                    assert_eq!(
+                        &std::fs::read(path).unwrap(),
+                        bytes,
+                        "retained failed publication {label}"
+                    );
+                }
+                if cycle == 2 && fresh_source_recovery {
+                    assert!(
+                        requests > completed_requests,
+                        "fresh verified recovery request {label}"
+                    );
+                    assert!(
+                        result.stats.downloaded > 0,
+                        "fresh verified recovery download {label}"
+                    );
+                    completed_requests = requests;
+                }
                 if cycle >= 2
                     && !(cycle == 2
-                        && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
+                        && (fresh_source_recovery
+                            || matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery)))
                 {
                     assert_eq!(requests, completed_requests, "steady network {label}");
                     if !(relocating && cycle == 2) {
@@ -5173,6 +5250,48 @@ async fn run_cycle_legacy_smart_only_query_cannot_replace_missing_delta_successo
             &[1],
             None,
             true,
+        ))
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn run_cycle_legacy_opaque_mmcs_qualifies_after_reopen() {
+    for signature_bytes in [21, 32] {
+        for smart_only in [false, true] {
+            Box::pin(exercise_legacy_child_cycles_with_provenance(
+                AmbiguousChildFault::Preserve,
+                &[1, 2],
+                None,
+                smart_only,
+                Some(signature_bytes),
+            ))
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn run_cycle_legacy_opaque_mmcs_checkpoint_failure_stays_atomic() {
+    Box::pin(exercise_legacy_child_cycles_with_provenance(
+        AmbiguousChildFault::PreserveCheckpointFailure,
+        &[1],
+        None,
+        true,
+        Some(21),
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn run_cycle_legacy_opaque_mmcs_unknown_source_stays_held() {
+    for smart_only in [false, true] {
+        Box::pin(exercise_legacy_child_cycles_with_provenance(
+            AmbiguousChildFault::PreserveUnknownSource,
+            &[1],
+            None,
+            smart_only,
+            Some(21),
         ))
         .await;
     }

@@ -210,7 +210,8 @@ fn preparation_snapshot(
 }
 
 impl SqliteStateDb {
-    /// Return only independently downloaded, finalized current-child receipts.
+    /// Return only finalized current-child receipts with verified per-path source
+    /// provenance for the exact provider generation and current local bytes.
     /// Reconciliation reservations are retained naming evidence, not pending
     /// work. They remain part of the dependency fence; the sync owner must
     /// independently prove reconciliation completed before certification.
@@ -224,7 +225,12 @@ impl SqliteStateDb {
         self.with_conn("legacy_child_receipts",move |conn| {
             let ready:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id=?2 AND revision>=?3) AND NOT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND (status!='downloaded' OR is_deleted!=0 OR metadata_hash IS NULL OR metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND (metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL))",params![library,id,crate::state::METADATA_CAPTURE_REVISION],|r|r.get(0))?;
             if !ready { return Ok(Vec::new()); }
-            let mut stmt=conn.prepare(&format!("SELECT {} FROM assets WHERE library=?1 AND id=?2 ORDER BY version_size",super::rows::ASSET_COLUMNS))?;
+            let mut stmt=conn.prepare(&format!("SELECT {} FROM assets WHERE library=?1 AND id=?2 AND EXISTS (
+                SELECT 1 FROM asset_metadata_paths p WHERE p.library=assets.library AND p.id=assets.id
+                AND p.version_size=assets.version_size AND p.local_path=assets.local_path
+                AND p.provider_checksum=assets.checksum AND p.local_checksum=assets.local_checksum
+                AND length(p.source_checksum)=64 AND p.source_checksum NOT GLOB '*[^0-9a-f]*'
+            ) ORDER BY version_size",super::rows::ASSET_COLUMNS))?;
             Ok(stmt.query_map(params![library,id],super::rows::row_to_asset_record)?.collect::<Result<Vec<_>,_>>()?)
         }).await
     }
@@ -465,6 +471,250 @@ mod tests {
     };
     use crate::state::CheckpointTransition;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn legacy_current_receipts_require_exact_verified_source_after_reopen() {
+        for fault in [
+            "none",
+            "historical",
+            "library",
+            "child",
+            "rendition",
+            "checked_rewrite",
+            "malformed",
+            "generation",
+            "path",
+            "bytes",
+            "debt",
+            "unverified_replacement",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.db");
+            let media = dir.path().join("current.jpg");
+            std::fs::write(&media, b"verified current source").unwrap();
+            let hash = crate::download::file::compute_sha256(&media).await.unwrap();
+            let db = SqliteStateDb::open(&path).await.unwrap();
+            let record = crate::test_helpers::TestAssetRecord::new("current-child")
+                .checksum("cnJycnJycnJycnJycnJycnJycnJy")
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            if fault == "historical" {
+                // Equal historical hashes never establish verified provenance.
+                db.mark_downloaded(
+                    "PrimarySync",
+                    "current-child",
+                    "original",
+                    &media,
+                    &hash,
+                    Some(&hash),
+                )
+                .await
+                .unwrap();
+            } else {
+                crate::state::DownloadStateStore::mark_verified_download(
+                    &db,
+                    "PrimarySync",
+                    "current-child",
+                    "original",
+                    &media,
+                    &hash,
+                    Some(&hash),
+                    false,
+                )
+                .await
+                .unwrap();
+            }
+            {
+                let conn = db.acquire_lock("source provenance fault").unwrap();
+                match fault {
+                    "library" => {
+                        conn.execute("UPDATE asset_metadata_paths SET library='OtherLibrary'", [])
+                            .unwrap();
+                    }
+                    "child" => {
+                        conn.execute("UPDATE asset_metadata_paths SET id='other-child'", [])
+                            .unwrap();
+                    }
+                    "rendition" => {
+                        conn.execute(
+                            "UPDATE asset_metadata_paths SET version_size='adjusted'",
+                            [],
+                        )
+                        .unwrap();
+                    }
+                    "malformed" => {
+                        conn.execute(
+                            "UPDATE asset_metadata_paths SET source_checksum='not-a-source-hash'",
+                            [],
+                        )
+                        .unwrap();
+                    }
+                    "generation" => {
+                        conn.execute("UPDATE asset_metadata_paths SET provider_checksum='different-generation'", []).unwrap();
+                    }
+                    "path" => {
+                        conn.execute(
+                            "UPDATE asset_metadata_paths SET local_path=local_path || '.other'",
+                            [],
+                        )
+                        .unwrap();
+                    }
+                    "bytes" => {
+                        conn.execute("UPDATE asset_metadata_paths SET local_checksum='different-local-bytes'", []).unwrap();
+                    }
+                    "debt" => {
+                        conn.execute("UPDATE asset_metadata_paths SET capture_repair_metadata_hash='pending'", []).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            if fault == "checked_rewrite" {
+                std::fs::write(&media, b"checked metadata rewrite").unwrap();
+                let changed = crate::download::file::compute_sha256(&media).await.unwrap();
+                let conn = db.acquire_lock("checked writer completion").unwrap();
+                conn.execute("UPDATE assets SET local_checksum=?1", [&changed])
+                    .unwrap();
+                super::super::asset_writes::record_metadata_path(
+                    &conn,
+                    "PrimarySync",
+                    "current-child",
+                    "original",
+                    super::super::asset_writes::MetadataPathWrite::Rewritten,
+                )
+                .unwrap();
+            }
+            if fault == "unverified_replacement" {
+                std::fs::write(&media, b"locally replaced bytes").unwrap();
+                let changed = crate::download::file::compute_sha256(&media).await.unwrap();
+                db.mark_downloaded(
+                    "PrimarySync",
+                    "current-child",
+                    "original",
+                    &media,
+                    &changed,
+                    Some(&hash),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    db.acquire_lock("unknown replacement source")
+                        .unwrap()
+                        .query_row::<Option<String>, _, _>(
+                            "SELECT source_checksum FROM asset_metadata_paths",
+                            [],
+                            |row| row.get(0)
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            drop(db);
+            let reopened = SqliteStateDb::open(&path).await.unwrap();
+            assert_eq!(
+                reopened
+                    .legacy_child_receipts("PrimarySync", "current-child")
+                    .await
+                    .unwrap()
+                    .len(),
+                usize::from(matches!(fault, "none" | "checked_rewrite")),
+                "{fault}"
+            );
+            assert!(
+                reopened
+                    .legacy_child_receipts("OtherLibrary", "current-child")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                reopened
+                    .legacy_child_receipts("PrimarySync", "other-child")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_relocated_receipts_reuse_only_exact_unambiguous_source() {
+        for fault in [
+            "none",
+            "library",
+            "child",
+            "rendition",
+            "generation",
+            "bytes",
+            "conflicting_source",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let database = dir.path().join("state.db");
+            let prior = dir.path().join("prior.jpg");
+            let current = dir.path().join("current.jpg");
+            std::fs::write(&prior, b"verified source").unwrap();
+            std::fs::copy(&prior, &current).unwrap();
+            let hash = crate::download::file::compute_sha256(&prior).await.unwrap();
+            let db = SqliteStateDb::open(&database).await.unwrap();
+            let record = crate::test_helpers::TestAssetRecord::new("current-child")
+                .checksum("cnJycnJycnJycnJycnJycnJycnJy")
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            crate::state::DownloadStateStore::mark_verified_download(
+                &db,
+                "PrimarySync",
+                "current-child",
+                "original",
+                &prior,
+                &hash,
+                Some(&hash),
+                false,
+            )
+            .await
+            .unwrap();
+            {
+                let conn = db.acquire_lock("relocation source fault").unwrap();
+                let sql = match fault {
+                    "library" => "UPDATE asset_metadata_paths SET library='other'",
+                    "child" => "UPDATE asset_metadata_paths SET id='other'",
+                    "rendition" => "UPDATE asset_metadata_paths SET version_size='adjusted'",
+                    "generation" => "UPDATE asset_metadata_paths SET provider_checksum='other'",
+                    "conflicting_source" => {
+                        "INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum,source_checksum) SELECT library,id,version_size,local_path || '.conflict',provider_checksum,local_checksum,printf('%064d',0) FROM asset_metadata_paths"
+                    }
+                    _ => "SELECT 1",
+                };
+                conn.execute_batch(sql).unwrap();
+            }
+            if fault == "bytes" {
+                std::fs::write(&current, b"different local bytes").unwrap();
+            }
+            let local = crate::download::file::compute_sha256(&current)
+                .await
+                .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                "current-child",
+                "original",
+                &current,
+                &local,
+                Some(&hash),
+            )
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(&prior).unwrap(), b"verified source");
+            drop(db);
+            let reopened = SqliteStateDb::open(&database).await.unwrap();
+            assert_eq!(
+                reopened
+                    .legacy_child_receipts("PrimarySync", "current-child")
+                    .await
+                    .unwrap()
+                    .len(),
+                usize::from(fault == "none"),
+                "{fault}"
+            );
+        }
+    }
 
     async fn seed(
         path: &Path,

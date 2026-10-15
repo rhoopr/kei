@@ -963,6 +963,9 @@ pub trait MetadataRewriteStore: Send + Sync {
         Ok(())
     }
 
+    /// Finalized current-child rows whose exact path/provider generation and
+    /// local checksum have independent verified source provenance. Historical
+    /// download hashes alone do not qualify; pending metadata work must refuse.
     async fn legacy_child_receipts(
         &self,
         _library: &str,
