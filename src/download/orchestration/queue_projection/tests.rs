@@ -6015,7 +6015,8 @@ async fn private_destination_opaque_mmcs_proofs_survive_reopen() {
         false, false, false, true,
     ))
     .await;
-    #[cfg(unix)]
+    // This root contains invalid UTF-8, which macOS filesystems reject.
+    #[cfg(target_os = "linux")]
     Box::pin(destination_reopen_fixture_with_signature(
         true, false, false, true,
     ))
