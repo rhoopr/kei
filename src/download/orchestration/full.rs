@@ -37,6 +37,58 @@ mod token_diagnostics;
 
 const MAX_SAME_CYCLE_CHECKPOINT_RECOVERY_ROUNDS: usize = 1;
 
+/// Reuse full-query scope, bounds, EOF and pass-token ownership while keeping
+/// managed qualification independent from local publication and retry owners.
+async fn stream_full_inventory<S>(
+    client: &Client,
+    stream: S,
+    config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
+    total: u64,
+    shutdown: CancellationToken,
+    runtime: StreamRuntime,
+) -> Result<StreamingResult>
+where
+    S: Stream<Item = Result<PhotoAsset>> + Send + 'static,
+{
+    if !config.indexing_inventory_only {
+        return stream_and_download_from_stream(
+            client, stream, config, controls, total, shutdown, runtime,
+        )
+        .await;
+    }
+    let mut result = StreamingResult::default();
+    tokio::pin!(stream);
+    loop {
+        let item = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            item = stream.next() => item,
+        };
+        match item {
+            None => {
+                result.enumeration_complete = true;
+                break;
+            }
+            Some(Ok(asset)) => {
+                result.assets_seen += 1;
+                if asset.id().trim().is_empty() || asset.asset_record_name().trim().is_empty() {
+                    result.enumeration_errors += 1;
+                }
+            }
+            Some(Err(error)) => {
+                result.enumeration_errors += 1;
+                if crate::icloud::photos::session::is_session_error(&error) {
+                    result.provider_auth_errors += 1;
+                    break;
+                }
+                tracing::warn!("Managed indexing inventory encountered an invalid provider record");
+            }
+        }
+    }
+    Ok(result)
+}
+
 #[derive(Debug)]
 struct PerPassStreamingResult {
     pass_index: usize,
@@ -711,7 +763,7 @@ where
         None => Box::pin(stream),
     };
 
-    let mut result = stream_and_download_from_stream(
+    let mut result = stream_full_inventory(
         &download_client,
         stream,
         &pass_config,
@@ -1323,7 +1375,7 @@ pub(super) async fn download_photos_full_with_token_policy(
         let combined = stream::select_all(streams);
         // Merged-stream branch already runs as a single call, so it creates
         // one bar internally; no shared-bar plumbing needed.
-        let result = stream_and_download_from_stream(
+        let result = stream_full_inventory(
             download_client,
             combined,
             &merged_config,
@@ -1803,6 +1855,7 @@ pub(super) async fn download_photos_full_with_token_policy(
     // wins whether or not it holds the newer metadata.
     let metadata_flags = MetadataFlags::from(config.as_ref());
     if controls.run_mode.downloads_files()
+        && !config.indexing_inventory_only
         && !config.refresh_metadata
         && config.selection_run.is_none()
         && metadata_flags.has_any_write()

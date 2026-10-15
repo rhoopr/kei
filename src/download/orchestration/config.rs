@@ -579,6 +579,10 @@ pub(crate) struct DownloadConfig {
     /// When true (retry-failed mode), only download assets already known to the
     /// state DB. Skip new assets discovered from iCloud that were never synced.
     pub(crate) retry_only: bool,
+    /// Incomplete provider inventory may download, but cannot certify absence.
+    pub(crate) provisional: bool,
+    /// Qualify managed recovery without planning or publishing local work.
+    pub(crate) indexing_inventory_only: bool,
     /// Sync mode: full enumeration or incremental delta via syncToken.
     pub(crate) sync_mode: SyncMode,
     /// Hash of enumeration-affecting config. Full album snapshots persist this
@@ -804,6 +808,8 @@ impl DownloadConfig {
             selection_run: None,
             selection_pass: None,
             retry_only: false,
+            provisional: false,
+            indexing_inventory_only: false,
             max_download_attempts: 10,
             sync_mode: SyncMode::Full,
             enum_config_hash: None,

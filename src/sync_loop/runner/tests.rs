@@ -19,3 +19,5 @@ mod primary_layout;
 
 mod mixed_delta;
 mod retained_recovery;
+
+mod indexing;

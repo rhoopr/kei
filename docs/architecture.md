@@ -379,8 +379,10 @@ private `/zones/list` response using the pinned authenticated session. Discovery
 requires bounded original JSON with unique keys, an explicit zones array, unique
 zone names, no zone errors and no unsupported continuation. Only a live exact
 `PrimarySync` entry with a nonblank string owner replaces the constructor's
-ownerless primary library after that exact selected scope passes its indexing
-check. The complete discovered scope is preserved, including explicit owners
+ownerless primary library after that exact selected scope returns a recognized
+indexing state. `RUNNING` retains provisional readiness and requires durable
+reconciliation; owner qualification alone never certifies a checkpoint.
+The complete discovered scope is preserved, including explicit owners
 other than `_defaultOwner`; lookup and inventory references must still match it.
 The complete validated private zone descriptors are cached separately from
 initialized libraries. Primary-only lookup initializes only the selected primary;
@@ -619,6 +621,66 @@ sync_loop::run_sync
   -> sync_cycle source checkpoint decision
   -> cycle reporting and watch control
 ```
+
+Photo readiness is explicit provider evidence. `PhotoLibrary` accepts `FINISHED`
+or `RUNNING`; missing and unknown states fail closed. Sync checks readiness before
+watch shortcuts and again at the checkpoint boundary. Before downloading from
+`RUNNING`, the cycle persists `indexing_reconciliation_required:<zone>` in the
+existing metadata table. Presence is the obligation, including unknown future
+payloads; no schema migration is needed. The previous trusted zone and database
+checkpoints remain unchanged. Cross-zone album sources also contribute readiness.
+
+While indexing, the download dispatcher uses full queries without incremental
+replay, retained-work admission, metadata repair, retry retirement, or album
+snapshot completion. Ordinary media still uses the existing verified publication
+and durable finalization path. Managed primary layouts wait for `FINISHED`.
+Watch cycles with a hold bypass the database no-change shortcut and rebuild
+collection and album plans so omitted albums can reappear after indexing.
+
+A retained hold forces full reconciliation after `FINISHED`. A scope refreshed
+while readiness is `RUNNING` remains stale even if the cycle's later probe says
+`FINISHED`; the next wake rebuilds it after readiness. Retry-only inventory can
+download known failed work but cannot discharge recovery of previously omitted
+assets. The held full-query path continues to suppress deletion-capable
+maintenance, album snapshot completion, and the retained-token bridge even when
+its initial probe reports `FINISHED`.
+
+Complete natural EOF, successful local work, a fresh FINISHED scope, and a final
+FINISHED probe qualify that inventory. One fenced transaction removes
+`indexing_reconciliation_required:<zone>` and writes
+`indexing_replay_required:<zone>` without moving the trusted source cursor or
+database cursor. The later trusted cycle replays the old cursor and applies
+source deletions. Replay presence, including an unknown future payload, bypasses
+the watch database shortcut across reopen. Only normal checkpoint promotion
+removes replay debt, including aggregate config-drift promotion. Rejection of
+the retained cursor preserves the existing checkpoint gates.
+
+Bounded coverage, interruption, retry-only selection, failed transfers or
+metadata, stale scope, missing proof, state-write failure, and readiness
+regression cannot qualify an inventory or advance its cursor. Provisional
+inventory cannot replace a comparable inventory anchor.
+
+Managed primary configuration, recorded bindings and pending operations retain
+the RUNNING guard, including a later suffix configuration. Once FINISHED, the
+held phase uses the same full-enumeration owner and token/EOF evidence, but
+only consumes validated provider identities. It does not invoke local task
+planning, journal recovery, publication, metadata drains, retry retirement or
+snapshot pruning. A fresh FINISHED plan, unbounded selected scope, valid token
+and final FINISHED observations from every source qualify that inventory.
+The fenced transition additionally writes
+`indexing_materialization_required:<zone>`. Presence, including unknown payloads,
+forces a fresh full managed materialization through the existing journal and
+publication owners before retained-cursor replay. It bypasses quiet watch
+shortcuts and refreshes plans across restarts. An empty change feed therefore
+cannot omit assets that inventory-only qualification never queued.
+
+Managed materialization debt survives retry-only/bounded runs, failed transfers,
+metadata failure, interruption, regression and checkpoint-write failure. When an
+old cursor exists, both full publication and its incremental bridge must qualify
+before one checkpoint transaction removes materialization and replay debt.
+Existing local-byte, collision, sidecar, ownership and interrupted-journal guards
+still control every managed write. Readiness probes are observations, not an
+atomic snapshot guarantee from Apple.
 
 Inventory-drop diagnostics use a complete count measurement from the initial
 full-query invocation, captured before activity and delta-bridge composition.

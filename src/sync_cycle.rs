@@ -57,6 +57,90 @@ pub(crate) const SYNC_TOKEN_PREFIX: &str = "sync_token:";
 // Legacy inventory_anchor: rows lack coverage proof and are never read or migrated.
 const INVENTORY_ANCHOR_PREFIX: &str = "inventory_anchor_v1:";
 const INVENTORY_ANCHOR_VERSION: u8 = 1;
+/// Presence is a durable obligation, including unknown future payloads. Only a
+/// proven FINISHED full inventory may remove it with checkpoint promotion.
+pub(crate) const INDEXING_RECONCILIATION_PREFIX: &str = "indexing_reconciliation_required:";
+
+pub(crate) fn indexing_reconciliation_key(zone: &str) -> String {
+    format!("{INDEXING_RECONCILIATION_PREFIX}{zone}")
+}
+
+/// A qualified inventory retains the old cursor and schedules its replay in a
+/// later trusted cycle. No deletion-capable bridge runs inside the held phase.
+pub(crate) const INDEXING_REPLAY_PREFIX: &str = "indexing_replay_required:";
+
+pub(crate) fn indexing_replay_key(zone: &str) -> String {
+    format!("{INDEXING_REPLAY_PREFIX}{zone}")
+}
+
+/// Managed qualification did not queue files. This obligation forces a full
+/// managed publication pass before retained-cursor replay may discharge it.
+pub(crate) fn indexing_materialization_key(zone: &str) -> String {
+    format!("indexing_materialization_required:{zone}")
+}
+
+/// Observe readiness and durably retain every RUNNING observation, even if a
+/// later readiness request fails before enumeration starts.
+pub(crate) async fn prepare_indexing_reconciliation(
+    library: &crate::icloud::photos::PhotoLibrary,
+    db: Option<&dyn download::DownloadStore>,
+    dry_run: bool,
+) -> anyhow::Result<(bool, Option<String>)> {
+    let key = indexing_reconciliation_key(library.zone_name());
+    let mut hold = match db {
+        Some(db) => db.get_metadata(&key).await?,
+        None => None,
+    };
+    if !library.last_indexing_finished() && !dry_run {
+        let db = db.ok_or_else(|| {
+            anyhow::anyhow!("Provisional indexing downloads require durable state")
+        })?;
+        if hold.is_none() {
+            db.set_metadata(&key, "1").await?;
+            hold = Some("1".to_owned());
+        }
+    }
+    let finished = library.check_indexing().await?;
+    if !finished && !dry_run {
+        let db = db.ok_or_else(|| {
+            anyhow::anyhow!("Provisional indexing downloads require durable state")
+        })?;
+        if hold.is_none() {
+            db.set_metadata(&key, "1").await?;
+            hold = Some("1".to_owned());
+        }
+    }
+    Ok((finished, hold))
+}
+
+/// Cross-zone album hydration contributes to the selected listing too. Any
+/// unfinished source makes the selected zone provisional until all are ready.
+pub(crate) async fn prepare_library_indexing(
+    library: &LibraryState,
+    db: Option<&dyn download::DownloadStore>,
+    dry_run: bool,
+) -> anyhow::Result<(bool, Option<String>)> {
+    let (mut finished, mut hold) =
+        prepare_indexing_reconciliation(&library.library, db, dry_run).await?;
+    for source in &library.cross_zone_libraries {
+        if source.zone_name() == library.zone_name {
+            continue;
+        }
+        let source_was_running = !source.last_indexing_finished();
+        let (source_finished, _) = prepare_indexing_reconciliation(source, db, dry_run).await?;
+        finished &= source_finished;
+        if (source_was_running || !source_finished) && hold.is_none() && !dry_run {
+            let db = db.ok_or_else(|| {
+                anyhow::anyhow!("Provisional indexing downloads require durable state")
+            })?;
+            db.set_metadata(&indexing_reconciliation_key(&library.zone_name), "1")
+                .await?;
+            hold = Some("1".to_owned());
+        }
+    }
+    Ok((finished, hold))
+}
+
 pub(crate) const RETAINED_CHECKPOINT_HOLD_PREFIX: &str = "retained_checkpoint_hold:";
 const RETAINED_CHECKPOINT_RETRY_SECONDS: i64 = 60 * 60;
 const RETAINED_CHECKPOINT_MAX_ATTEMPTS: u8 = 3;
@@ -1009,15 +1093,26 @@ pub(crate) async fn run_cycle(
     };
     let mut active_cursor_fences = Vec::new();
 
-    for lib_state in library_states
-        .iter()
-        .copied()
-        .filter(|state| has_active_passes(state))
-    {
+    for lib_state in library_states.iter().copied() {
         if shutdown_token.is_cancelled() {
             break;
         }
 
+        let indexing_key = indexing_reconciliation_key(&lib_state.zone_name);
+        let (indexing_finished, indexing_hold_at_start) =
+            prepare_library_indexing(lib_state, state_db, config.runtime.dry_run).await?;
+        let indexing_reconciliation = indexing_hold_at_start.is_some() || !indexing_finished;
+        if !has_active_passes(lib_state) {
+            db_sync_token_advance_safe &= !indexing_reconciliation;
+            continue;
+        }
+        if !indexing_finished {
+            db_sync_token_advance_safe = false;
+            path_reconciliation_complete = false;
+            tracing::warn!(
+                "Photo library indexing is RUNNING; downloads are provisional, deletions and checkpoint promotion are disabled"
+            );
+        }
         let retained_cursor_at_start = if let Some(db) = state_db {
             db.get_metadata(&lib_state.sync_token_key).await?
         } else {
@@ -1030,7 +1125,28 @@ pub(crate) async fn run_cycle(
         } else {
             None
         };
+        let replay_key = indexing_replay_key(&lib_state.zone_name);
+        let replay_at_start = match state_db {
+            Some(db) => db.get_metadata(&replay_key).await?,
+            None => None,
+        };
+        let indexing_replay_pending = replay_at_start.is_some();
+        let materialization_key = indexing_materialization_key(&lib_state.zone_name);
+        let materialization_at_start = match state_db {
+            Some(db) => db.get_metadata(&materialization_key).await?,
+            None => None,
+        };
+        let indexing_materialization_pending = materialization_at_start.is_some();
         let mut zone_metadata_fence = enum_metadata_at_start.clone();
+        zone_metadata_fence.push((
+            materialization_key.clone(),
+            materialization_at_start.clone(),
+        ));
+        active_cursor_fences.push((materialization_key.clone(), materialization_at_start));
+        zone_metadata_fence.push((indexing_key.clone(), indexing_hold_at_start.clone()));
+        zone_metadata_fence.push((replay_key.clone(), replay_at_start.clone()));
+        active_cursor_fences.push((replay_key.clone(), replay_at_start));
+        active_cursor_fences.push((indexing_key.clone(), indexing_hold_at_start.clone()));
         zone_metadata_fence.push((
             lib_state.sync_token_key.clone(),
             retained_cursor_at_start.clone(),
@@ -1135,7 +1251,9 @@ pub(crate) async fn run_cycle(
         }
 
         let mut legacy_cycle = download::legacy_preservation::LegacyCycle::default();
-        if download_controls.run_mode.downloads_files()
+        if indexing_finished
+            && !indexing_reconciliation
+            && download_controls.run_mode.downloads_files()
             && !lib_state.plan_is_stale
             && let Some(db) = state_db
             && db
@@ -1182,7 +1300,12 @@ pub(crate) async fn run_cycle(
             } else {
                 None
             };
-        let sync_mode_decision = if let Some(refresh_decision) =
+        let sync_mode_decision = if indexing_reconciliation || indexing_materialization_pending {
+            SyncModeDecision {
+                mode: download::SyncMode::Full,
+                full_enumeration_reason: Some(download::FullEnumerationReason::OtherStaticReason),
+            }
+        } else if let Some(refresh_decision) =
             metadata_refresh_mode_decision(config.runtime.refresh_metadata)
         {
             refresh_decision
@@ -1274,12 +1397,29 @@ pub(crate) async fn run_cycle(
             Arc::clone(&asset_groupings),
             Arc::from(lib_state.zone_name.as_str()),
         );
+        // FINISHED is a prerequisite, not proof that this inventory remained
+        // complete. Deletion-capable maintenance stays deferred until the
+        // full scope and its final readiness check have qualified.
+        Arc::make_mut(&mut download_config).provisional =
+            indexing_reconciliation || !indexing_finished;
+        let managed_indexing_recovery = indexing_reconciliation
+            && (download_config.edited_naming == crate::types::EditedNaming::Primary
+                || match state_db {
+                    Some(db) => db.has_primary_layouts(&lib_state.zone_name).await?,
+                    None => false,
+                });
+        Arc::make_mut(&mut download_config).indexing_inventory_only =
+            managed_indexing_recovery && indexing_finished;
         if pending_download_config_hash.is_some() && path_reconciliation_has_smart_folders {
             Arc::make_mut(&mut download_config).complete_path_selection = true;
         }
         let download_client = shared_session.read().await.download_client().clone();
         let mut path_reconciliation_requires_smart_query = false;
-        if pending_download_config_hash.is_some() && download_controls.run_mode.downloads_files() {
+        if indexing_finished
+            && !indexing_reconciliation
+            && pending_download_config_hash.is_some()
+            && download_controls.run_mode.downloads_files()
+        {
             let reconciliation = download::reconcile_catalog_paths_with_client(
                 &download_client,
                 &lib_state.plan.passes,
@@ -1330,7 +1470,8 @@ pub(crate) async fn run_cycle(
             lib_state.plan.passes.len(),
         );
 
-        if legacy_cycle.requires_inventory()
+        if indexing_finished
+            && legacy_cycle.requires_inventory()
             && sync_result.full_enumeration_ran
             && matches!(
                 source_checkpoint_decision(
@@ -1384,10 +1525,22 @@ pub(crate) async fn run_cycle(
         };
         if (matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed)
             || unresolved_identity
-            || legacy_cycle.requires_inventory())
+            || legacy_cycle.requires_inventory()
+            || ((indexing_replay_pending || indexing_materialization_pending)
+                && !is_retry_failed
+                && !download_config.retry_only))
+            && indexing_finished
+            && !indexing_reconciliation
             && sync_result.full_enumeration_ran
             && !sync_result.checkpoint.completed_delta_replay
             && checkpoint_transition_state_safe
+            && (!indexing_materialization_pending
+                || (matches!(sync_result.outcome, download::DownloadOutcome::Success)
+                    && sync_result.stats.failed == 0
+                    && sync_result.stats.exif_failures == 0
+                    && download_config.recent.is_none()
+                    && download_config.skip_created_before.is_none()
+                    && download_config.skip_created_after.is_none()))
         {
             let prior_token = retained_cursor_at_start.clone();
             if let Some(prior_token) = prior_token.filter(|token| !token.trim().is_empty()) {
@@ -1498,7 +1651,10 @@ pub(crate) async fn run_cycle(
             }
         }
 
-        if unresolved_identity && matches!(checkpoint_basis, CheckpointBasis::CompleteInventory) {
+        if unresolved_identity
+            && !indexing_reconciliation
+            && matches!(checkpoint_basis, CheckpointBasis::CompleteInventory)
+        {
             // An inventory cannot prove that the previously ambiguous deltas
             // were resolved. Require replay from the retained cursor.
             sync_result.block_for_unresolved_identity();
@@ -1561,7 +1717,9 @@ pub(crate) async fn run_cycle(
                  access and filters if this was unexpected"
             );
         }
-        if library_completed_without_errors
+        if indexing_finished
+            && !indexing_reconciliation
+            && library_completed_without_errors
             && !sync_result.checkpoint.enumeration_incomplete
             && sync_result.checkpoint.state_write_failures == 0
             && !cycle_has_stale_plan
@@ -1578,6 +1736,87 @@ pub(crate) async fn run_cycle(
                 &mut sync_result.stats,
             )
             .await;
+        }
+
+        // Readiness can regress during a long inventory. Recheck at the
+        // checkpoint boundary; even a failed probe leaves durable retry debt.
+        let readiness_after = tokio::select! {
+            biased;
+            () = shutdown_token.cancelled() => None,
+            result = async {
+                let mut finished = lib_state.library.check_indexing().await?;
+                for source in &lib_state.cross_zone_libraries {
+                    if source.zone_name() != lib_state.zone_name {
+                        finished &= source.check_indexing().await?;
+                    }
+                }
+                Ok::<_, crate::icloud::error::ICloudError>(finished)
+            } => Some(result),
+        };
+        // Cancellation is not an indexing observation. Preserve existing debt,
+        // but do not turn ordinary interrupted sync into a new indexing hold.
+        let indexing_hold_required =
+            !indexing_finished || matches!(readiness_after, Some(Ok(false)) | Some(Err(_)));
+        if indexing_hold_required {
+            if !config.runtime.dry_run
+                && let Some(db) = state_db
+            {
+                db.set_metadata(&indexing_key, "1").await?;
+                // This cycle must not stage or activate a token, even if all
+                // selected records happened to carry one unanimous candidate.
+            }
+            sync_result.checkpoint.sync_token_blocked = true;
+            sync_result.checkpoint.project(&mut sync_result.stats);
+            sync_result.stats.sync_token_blocked_reason = Some("indexing_reconciliation_required");
+            sync_result.stats.sync_token_blocked_source = Some("icloud");
+            sync_result.stats.sync_token_blocked_explanation = Some(
+                "indexing results are provisional; a FINISHED full reconciliation is required",
+            );
+            db_sync_token_advance_safe = false;
+            path_reconciliation_complete = false;
+        }
+        // Retry-only work cannot discharge either phase: new assets may be
+        // skipped before they acquire durable retry rows. Keep their cursor.
+        let recovery_retry_only = (indexing_reconciliation
+            || indexing_replay_pending
+            || indexing_materialization_pending)
+            && (is_retry_failed || download_config.retry_only);
+        if recovery_retry_only
+            || (indexing_reconciliation
+                && (!sync_result.full_enumeration_ran
+                    || !library_completed_without_errors
+                    || sync_result.stats.failed > 0
+                    || sync_result.stats.exif_failures > 0))
+        {
+            sync_result.checkpoint.sync_token_blocked = true;
+            sync_result.checkpoint.project(&mut sync_result.stats);
+            if recovery_retry_only && !indexing_reconciliation {
+                sync_result.stats.sync_token_blocked_reason = Some("indexing_replay_required");
+                sync_result.stats.sync_token_blocked_source = Some("kei");
+                sync_result.stats.sync_token_blocked_explanation =
+                    Some("retry-only processing cannot discharge retained-cursor replay");
+            }
+        }
+
+        // An inventory-only pass queued nothing. Unlike ordinary durable
+        // transfer retries, managed recovery cannot release its full-work debt
+        // until every selected publication and its retained bridge succeeds.
+        if indexing_materialization_pending
+            && !indexing_reconciliation
+            && (!library_completed_without_errors
+                || !sync_result.full_enumeration_ran
+                || sync_result.stats.failed > 0
+                || sync_result.stats.exif_failures > 0
+                || download_config.recent.is_some()
+                || download_config.skip_created_before.is_some()
+                || download_config.skip_created_after.is_some()
+                || (retained_cursor_at_start
+                    .as_ref()
+                    .is_some_and(|s| !s.trim().is_empty())
+                    && !matches!(checkpoint_basis, CheckpointBasis::InventoryWithDeltaBridge)))
+        {
+            sync_result.checkpoint.sync_token_blocked = true;
+            sync_result.checkpoint.project(&mut sync_result.stats);
         }
 
         // Provider cursor safety is independent from transfer completion.
@@ -1611,6 +1850,80 @@ pub(crate) async fn run_cycle(
                 reason,
                 recovery: RecoveryAction::AwaitRetainedCheckpointEvidence,
             };
+        }
+
+        if indexing_reconciliation {
+            let mut qualified = false;
+            if matches!(
+                checkpoint_decision,
+                SourceCheckpointDecision::Advance { .. }
+            ) && !is_retry_failed
+                && !download_config.retry_only
+                && !indexing_hold_required
+                && indexing_finished
+                && sync_result.full_enumeration_ran
+                && library_completed_without_errors
+                && (!managed_indexing_recovery
+                    || (matches!(readiness_after, Some(Ok(true)))
+                        && download_config.recent.is_none()
+                        && download_config.skip_created_before.is_none()
+                        && download_config.skip_created_after.is_none()))
+                && let Some(db) = state_db
+            {
+                // Qualify coverage without adopting its cursor. Managed
+                // inventory queued no files, so retain separate full-work debt.
+                let mut obligations = vec![(replay_key.clone(), "1".to_owned())];
+                if managed_indexing_recovery {
+                    obligations.push((materialization_key.clone(), "1".to_owned()));
+                }
+                match db
+                    .commit_checkpoint_transition(state::CheckpointTransition {
+                        expected_metadata: zone_metadata_fence.clone(),
+                        legacy_preservation_proofs: Vec::new(),
+                        legacy_config_hash: None,
+                        sparse_identity_proofs: Vec::new(),
+                        metadata_updates: obligations,
+                        metadata_deletes: vec![indexing_key.clone()],
+                    })
+                    .await
+                {
+                    Ok(()) => qualified = true,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Failed to qualify indexing inventory; retaining recovery hold");
+                        sync_result.checkpoint.state_write_failures += 1;
+                        sync_result.stats.state_write_failures += 1;
+                    }
+                }
+            }
+            if matches!(
+                checkpoint_decision,
+                SourceCheckpointDecision::Advance { .. }
+            ) {
+                checkpoint_decision = SourceCheckpointDecision::Preserve {
+                    reason: CheckpointHoldReason::TokenProofIncomplete,
+                    recovery: RecoveryAction::ReplayFromPriorToken,
+                };
+            }
+            sync_result.checkpoint.sync_token_blocked = true;
+            sync_result.checkpoint.project(&mut sync_result.stats);
+            sync_result.stats.sync_token_blocked_reason = Some(if qualified {
+                "indexing_inventory_qualified"
+            } else {
+                "indexing_reconciliation_required"
+            });
+            sync_result.stats.sync_token_blocked_source = Some("kei");
+            sync_result.stats.sync_token_blocked_explanation = Some(
+                if qualified && managed_indexing_recovery {
+                    "managed inventory qualified; full protected materialization and retained-cursor replay are still required"
+                } else if qualified {
+                    "full inventory qualified; the old trusted cursor is retained for the next incremental cycle"
+                } else {
+                    "a complete non-retry inventory from a FINISHED plan is still required"
+                },
+            );
+            db_sync_token_advance_safe = false;
+            path_reconciliation_complete = false;
+            path_reconciliation_cycle_safe = false;
         }
 
         let mut legacy_proofs = Vec::new();
@@ -1745,6 +2058,9 @@ pub(crate) async fn run_cycle(
                                 metadata_deletes: vec![
                                     state::unresolved_identity_key(&lib_state.zone_name),
                                     retained_checkpoint_hold_key(&lib_state.zone_name),
+                                    indexing_key.clone(),
+                                    replay_key.clone(),
+                                    materialization_key.clone(),
                                 ],
                             })
                             .await
@@ -1955,6 +2271,9 @@ pub(crate) async fn run_cycle(
                 metadata_updates.push((lib_state.sync_token_key.clone(), token));
                 metadata_deletes.push(candidate_key);
                 metadata_deletes.push(state::unresolved_identity_key(&lib_state.zone_name));
+                metadata_deletes.push(indexing_reconciliation_key(&lib_state.zone_name));
+                metadata_deletes.push(indexing_replay_key(&lib_state.zone_name));
+                metadata_deletes.push(indexing_materialization_key(&lib_state.zone_name));
             }
             if db_sync_token_advance_safe {
                 metadata_updates.push((ENUM_CONFIG_HASH_KEY.to_owned(), enum_config_hash));

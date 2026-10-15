@@ -22,6 +22,21 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const ORIGINAL: &[u8] = b"\xff\xd8\xff\xe0original immutable bytes";
 const EDIT_ONE: &[u8] = b"\xff\xd8\xff\xe0first adjusted independent bytes";
 const EDIT_TWO: &[u8] = b"\xff\xd8\xff\xe0second adjusted independent bytes";
+mod indexing;
+
+#[derive(Clone)]
+struct IndexingOptions {
+    readiness: Arc<std::sync::Mutex<&'static str>>,
+    regress: bool,
+    cancel: CancellationToken,
+    interrupt: bool,
+    stale_plan: bool,
+    recent: Option<u32>,
+    retry_only: bool,
+    token: Option<&'static str>,
+    queries: Arc<AtomicUsize>,
+    cursors: Arc<std::sync::Mutex<Vec<String>>>,
+}
 fn provider_hash(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes))
 }
@@ -51,6 +66,7 @@ struct Session {
     quiet: bool,
     lookups: Arc<AtomicUsize>,
     current: Option<Arc<std::sync::Mutex<Vec<Value>>>>,
+    indexing: Option<IndexingOptions>,
 }
 #[async_trait::async_trait]
 impl PhotosSession for Session {
@@ -60,7 +76,21 @@ impl PhotosSession for Session {
         body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(
+                json!({"records":[{"fields":{"state":{"value":*self.indexing.as_ref().unwrap().readiness.lock().unwrap()}}}]}),
+            );
+        }
         if url.contains("/changes/zone?") {
+            if let Some(indexing) = &self.indexing {
+                indexing.cursors.lock().unwrap().push(
+                    request["zones"][0]["syncToken"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+            }
             return Ok(
                 json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"cycle-token","moreComing":false,"records":if self.quiet {vec![]} else {self.records.clone()}}]}),
             );
@@ -90,10 +120,19 @@ impl PhotosSession for Session {
         if url.contains("/records/query/batch?") || url.contains("/internal/records/query/batch") {
             let body: Value = serde_json::from_str(&body)?;
             return Ok(
-                json!({"batch":body["batch"].as_array().unwrap().iter().map(|_|json!({"records":[{"fields":{"itemCount":{"value":1}}}]})).collect::<Vec<_>>()}),
+                json!({"batch":body["batch"].as_array().unwrap().iter().map(|_|json!({"records":[{"fields":{"itemCount":{"value":if self.indexing.is_some() {self.records.len()/2} else {1}}}}]})).collect::<Vec<_>>()}),
             );
         }
         if url.contains("/records/query?") {
+            if let Some(indexing) = &self.indexing {
+                indexing.queries.fetch_add(1, Ordering::SeqCst);
+                if indexing.regress {
+                    *indexing.readiness.lock().unwrap() = "RUNNING";
+                }
+                if indexing.interrupt {
+                    indexing.cancel.cancel();
+                }
+            }
             let body: Value = serde_json::from_str(&body)?;
             let offset = body["query"]["filterBy"]
                 .as_array()
@@ -101,7 +140,7 @@ impl PhotosSession for Session {
                 .and_then(|i| i["fieldValue"]["value"].as_u64())
                 .unwrap_or(0);
             return Ok(
-                json!({"records":if offset==0 {self.records.clone()} else {vec![]},"syncToken":"query-token"}),
+                json!({"records":if offset==0 {self.records.clone()} else {vec![]},"syncToken":self.indexing.as_ref().map_or(Some("query-token"), |indexing| indexing.token)}),
             );
         }
         anyhow::bail!("unexpected synthetic provider endpoint: {url}")
@@ -145,6 +184,7 @@ async fn cycle_resolution(
     .await
 }
 struct CycleOptions {
+    indexing: Option<IndexingOptions>,
     refresh_metadata: bool,
     media_directory: &'static str,
     folder_structure: &'static str,
@@ -161,6 +201,7 @@ struct CycleOptions {
 impl Default for CycleOptions {
     fn default() -> Self {
         Self {
+            indexing: None,
             refresh_metadata: false,
             media_directory: "media",
             folder_structure: "",
@@ -183,6 +224,18 @@ async fn cycle_options(
     naming: EditedNaming,
     options: CycleOptions,
 ) -> (crate::sync_cycle::CycleResult, usize) {
+    try_cycle_options(root, records, quiet, naming, options)
+        .await
+        .unwrap()
+}
+
+async fn try_cycle_options(
+    root: &std::path::Path,
+    records: Vec<Value>,
+    quiet: bool,
+    naming: EditedNaming,
+    options: CycleOptions,
+) -> anyhow::Result<(crate::sync_cycle::CycleResult, usize)> {
     let resolution = options.resolution;
     let lookups = Arc::new(AtomicUsize::new(0));
     let provider = Session {
@@ -190,6 +243,7 @@ async fn cycle_options(
         quiet,
         lookups: lookups.clone(),
         current: options.current.clone(),
+        indexing: options.indexing.clone(),
     };
     let owner = state::db::account::AccountOwner::authenticated(
         "synthetic@example.invalid",
@@ -244,8 +298,20 @@ async fn cycle_options(
         "sync_token:PrimarySync",
         vec![pass],
     );
-    library.library =
-        crate::icloud::photos::PhotoLibrary::new_stub_with_zone(Box::new(provider), "PrimarySync");
+    library.library = if let Some(indexing) = &options.indexing {
+        library.plan_is_stale = indexing.stale_plan;
+        crate::icloud::photos::PhotoLibrary::new(
+            "https://example.com".into(),
+            Arc::default(),
+            Box::new(provider),
+            Arc::new(json!({"zoneName":"PrimarySync"})),
+            "private".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await?
+    } else {
+        crate::icloud::photos::PhotoLibrary::new_stub_with_zone(Box::new(provider), "PrimarySync")
+    };
     let db: Arc<dyn download::DownloadStore> = inner;
     let media = root.join(options.media_directory);
     // run_loop creates the configured root before entering run_cycle. Reproduce
@@ -258,6 +324,14 @@ async fn cycle_options(
         config.refresh_metadata = options.refresh_metadata;
         config.edited = true;
         config.edited_naming = naming;
+        config.recent = options
+            .indexing
+            .as_ref()
+            .and_then(|indexing| indexing.recent);
+        config.retry_only = options
+            .indexing
+            .as_ref()
+            .is_some_and(|indexing| indexing.retry_only);
         config.resolution = resolution;
         #[cfg(feature = "xmp")]
         {
@@ -286,6 +360,10 @@ async fn cycle_options(
     config.photos.live_photo_mov_filename_policy = options.mov_policy;
     config.photos.live_photo_mode = options.live_mode;
     let (_session_root, session) = make_shared_session_for_run_cycle().await;
+    let shutdown = options
+        .indexing
+        .as_ref()
+        .map_or_else(CancellationToken::new, |indexing| indexing.cancel.clone());
     let result = Box::pin(crate::sync_cycle::run_cycle(
         &[&library],
         &config,
@@ -294,13 +372,12 @@ async fn cycle_options(
         &build,
         options.controls,
         &session,
-        &CancellationToken::new(),
+        &shutdown,
     ))
-    .await
-    .unwrap();
+    .await?;
     drop(base);
     drop(db);
-    (result, lookups.load(Ordering::SeqCst))
+    Ok((result, lookups.load(Ordering::SeqCst)))
 }
 fn assert_bytes(path: &std::path::Path, bytes: &[u8]) {
     assert_eq!(std::fs::read(path).unwrap(), bytes, "{}", path.display());
