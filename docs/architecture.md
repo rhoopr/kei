@@ -165,6 +165,13 @@ of `download::pipeline::tests::<test_name>`. The owners are `adoption`,
 Test names and assertions are unchanged. Shared test fixtures stay in
 `src/download/pipeline/test_support.rs`.
 
+XMP Toolkit preparation checks movie box boundaries with bounded file reads before
+updating the temporary copy. Nested QuickTime `meta` boxes without a supported
+FullBox prefix are rejected because the toolkit can corrupt their existing child
+boxes. The optional four-byte zero terminator is accepted only at the end of a
+`udta` child list. Rejection preserves the original media and leaves embedded
+rewrite work pending through the existing retry owner.
+
 ## Main flows
 
 ### Container startup
