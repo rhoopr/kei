@@ -1017,6 +1017,9 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::layer::SubscriberExt;
 
+    // A worker may first register this callsite without our scoped subscriber.
+    // Keep a second dispatch alive so cold registration retains dynamic interest.
+    let _worker_callsite_registration = tracing::Dispatch::new(tracing_subscriber::registry());
     for bad_successor in ["", " "] {
         let server = wiremock::MockServer::start().await;
         for id in ["provisional", "omitted"] {
