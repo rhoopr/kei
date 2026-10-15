@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use base64::Engine;
@@ -90,6 +91,9 @@ fn log_fido_security_key_hint(http_err: &crate::icloud::photos::session::HttpSta
 }
 
 pub struct PhotoLibrary {
+    indexing_finished: Arc<AtomicBool>,
+    #[cfg(test)]
+    stub_indexing_finished: Option<bool>,
     pub(crate) shadow_capture: Option<super::inbox::ShadowCapture>,
     service_endpoint: Arc<str>,
     params: Arc<HashMap<String, Value>>,
@@ -103,6 +107,9 @@ impl Clone for PhotoLibrary {
     fn clone(&self) -> Self {
         Self {
             shadow_capture: self.shadow_capture.clone(),
+            indexing_finished: Arc::clone(&self.indexing_finished),
+            #[cfg(test)]
+            stub_indexing_finished: self.stub_indexing_finished,
             service_endpoint: Arc::clone(&self.service_endpoint),
             params: Arc::clone(&self.params),
             session: self.session.clone_box(),
@@ -123,7 +130,7 @@ impl std::fmt::Debug for PhotoLibrary {
 }
 
 impl PhotoLibrary {
-    /// Create a new `PhotoLibrary`, failing if indexing has not finished.
+    /// Create a library with explicit FINISHED or provisional RUNNING readiness.
     pub async fn new(
         service_endpoint: String,
         params: Arc<HashMap<String, Value>>,
@@ -132,24 +139,62 @@ impl PhotoLibrary {
         library_type: String,
         retry_config: RetryConfig,
     ) -> Result<Self, ICloudError> {
+        let library = Self {
+            indexing_finished: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            stub_indexing_finished: None,
+            shadow_capture: None,
+            service_endpoint: Arc::from(service_endpoint),
+            params,
+            session,
+            zone_id,
+            library_type: Arc::from(library_type),
+            retry_config,
+        };
+        if !library.check_indexing().await? {
+            tracing::warn!("Photo library indexing is RUNNING; listings may be incomplete");
+        }
+        Ok(library)
+    }
+
+    /// Remembered readiness is not checkpoint authority. False also retains
+    /// an earlier RUNNING observation across owner qualification. The cycle
+    /// persists that obligation before rechecking readiness.
+    pub(crate) fn last_indexing_finished(&self) -> bool {
+        self.indexing_finished.load(Ordering::Relaxed)
+    }
+
+    /// Qualification can replace a name-only library after another readiness
+    /// probe. Keep any earlier RUNNING observation until the cycle persists its
+    /// hold before checking readiness again.
+    pub(super) fn retain_provisional_readiness_from(&self, prior: &Self) {
+        if !prior.last_indexing_finished() {
+            self.indexing_finished.store(false, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) async fn check_indexing(&self) -> Result<bool, ICloudError> {
+        #[cfg(test)]
+        if let Some(finished) = self.stub_indexing_finished {
+            return Ok(finished);
+        }
+        self.indexing_finished.store(false, Ordering::Relaxed);
         let url = format!(
             "{}/records/query?{}",
-            service_endpoint,
-            encode_params(&params)
+            self.service_endpoint,
+            encode_params(&self.params)
         );
-        let service_endpoint: Arc<str> = Arc::from(service_endpoint);
-        let library_type: Arc<str> = Arc::from(library_type);
         let body = json!({
             "query": {"recordType": "CheckIndexingState"},
-            "zoneID": &*zone_id,
+            "zoneID": &*self.zone_id,
         });
 
         let response = super::session::retry_post(
-            session.as_ref(),
+            self.session.as_ref(),
             &url,
             &body.to_string(),
             &[("Content-type", "text/plain")],
-            &retry_config,
+            &self.retry_config,
         )
         .await
         .map_err(|e| map_library_init_error(&e))?;
@@ -167,24 +212,20 @@ impl PhotoLibrary {
                 "Apple did not report whether the photo library is fully indexed; results may be incomplete".into(),
             ));
         };
-        if indexing_state != "FINISHED" {
-            return Err(ICloudError::Connection(format!(
-                "Apple says the photo library is still indexing ({indexing_state}); wait until indexing is finished, then retry."
-            )));
-        }
-
-        Ok(Self {
-            shadow_capture: None,
-            service_endpoint,
-            params,
-            session,
-            zone_id,
-            library_type,
-            retry_config,
-        })
+        let finished = match indexing_state {
+            "FINISHED" => true,
+            "RUNNING" => false,
+            _ => return Err(ICloudError::Connection(
+                "Apple reported an unknown photo library indexing state; results may be incomplete"
+                    .into(),
+            )),
+        };
+        self.indexing_finished.store(finished, Ordering::Relaxed);
+        Ok(finished)
     }
 
-    /// Only the indexed private primary from validated discovery can be published.
+    /// Only the exact private primary from validated discovery can be published.
+    /// Readiness is retained separately and never grants checkpoint authority.
     pub(super) fn is_qualified_private_primary(&self) -> bool {
         self.library_type.as_ref() == "private"
             && self.zone_id.get("zoneName").and_then(Value::as_str) == Some(PRIMARY_ZONE_NAME)
@@ -416,6 +457,8 @@ impl PhotoLibrary {
     /// Test-only constructor that bypasses the indexing check.
     pub(crate) fn new_stub(session: Box<dyn PhotosSession>) -> Self {
         Self {
+            indexing_finished: Arc::new(AtomicBool::new(true)),
+            stub_indexing_finished: Some(true),
             shadow_capture: None,
             service_endpoint: Arc::from("https://stub.example.com"),
             params: Arc::new(HashMap::new()),
@@ -431,6 +474,8 @@ impl PhotoLibrary {
     /// exercise selector matching.
     pub(crate) fn new_stub_with_zone(session: Box<dyn PhotosSession>, zone_name: &str) -> Self {
         Self {
+            indexing_finished: Arc::new(AtomicBool::new(true)),
+            stub_indexing_finished: Some(true),
             shadow_capture: None,
             service_endpoint: Arc::from("https://stub.example.com"),
             params: Arc::new(HashMap::new()),
@@ -562,6 +607,8 @@ mod tests {
     /// Build a `PhotoLibrary` directly (bypassing `new()` which requires a live session).
     fn make_library(zone_id: Value) -> PhotoLibrary {
         PhotoLibrary {
+            indexing_finished: Arc::new(AtomicBool::new(true)),
+            stub_indexing_finished: Some(true),
             shadow_capture: None,
             service_endpoint: Arc::from("https://example.com"),
             params: Arc::new(HashMap::new()),
@@ -601,17 +648,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn indexing_state_running_fails_library_initialization() {
-        let err = new_library_with_indexing_response(json!({
+    async fn indexing_state_running_initializes_provisional_library() {
+        let library = new_library_with_indexing_response(json!({
             "records": [{"fields": {"state": {"value": "RUNNING"}}}]
         }))
         .await
-        .unwrap_err();
-
-        assert!(
-            err.to_string().contains("RUNNING") && err.to_string().contains("indexing is finished"),
-            "error should name observed and expected indexing states: {err}"
-        );
+        .unwrap();
+        assert!(!library.last_indexing_finished());
+        assert!(!library.check_indexing().await.unwrap());
     }
 
     #[tokio::test]
@@ -1081,6 +1125,8 @@ mod tests {
 
     fn make_library_with_session(session: Box<dyn PhotosSession>) -> PhotoLibrary {
         PhotoLibrary {
+            indexing_finished: Arc::new(AtomicBool::new(true)),
+            stub_indexing_finished: Some(true),
             shadow_capture: None,
             service_endpoint: Arc::from("https://example.com"),
             params: Arc::new(HashMap::new()),

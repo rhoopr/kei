@@ -293,7 +293,8 @@ pub(super) fn should_record_album_snapshots(
     config: &DownloadConfig,
     controls: DownloadControls,
 ) -> bool {
-    !controls.run_mode.is_dry_run()
+    !config.provisional
+        && !controls.run_mode.is_dry_run()
         && !controls.run_mode.only_print_filenames()
         && config.state_db.is_some()
         && config.recent.is_none()

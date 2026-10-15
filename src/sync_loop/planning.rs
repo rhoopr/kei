@@ -388,3 +388,44 @@ pub(super) async fn resolve_library_plans(
 
 #[cfg(test)]
 mod tests;
+
+/// Scope observed during RUNNING can download provisionally, but cannot prove
+/// recovery even when a later cycle probe reports FINISHED.
+pub(super) async fn refresh_indexing_library_plans(
+    photos_service: &mut crate::icloud::photos::PhotosService,
+    libraries: &[crate::icloud::photos::PhotoLibrary],
+    config: &config::Config,
+    state_db: Option<&dyn crate::download::DownloadStore>,
+    library_states: &mut Vec<LibraryState>,
+    collection_context: &mut CollectionContext,
+) -> anyhow::Result<()> {
+    let mut indexing_hold = false;
+    let mut finished_before_scope = true;
+    for library in library_states.iter() {
+        let (finished, hold) =
+            crate::sync_cycle::prepare_library_indexing(library, state_db, config.runtime.dry_run)
+                .await?;
+        indexing_hold |= hold.is_some();
+        if let Some(db) = state_db {
+            indexing_hold |= db
+                .get_metadata(&crate::sync_cycle::indexing_materialization_key(
+                    &library.zone_name,
+                ))
+                .await?
+                .is_some();
+        }
+        finished_before_scope &= finished;
+    }
+    if indexing_hold {
+        (*library_states, *collection_context) =
+            resolve_library_plans(photos_service, libraries, config).await?;
+        if !finished_before_scope {
+            for library in library_states {
+                // A fresh but provisional scope must not be certified by a
+                // subsequent FINISHED probe. The next wake rebuilds it again.
+                library.plan_is_stale = true;
+            }
+        }
+    }
+    Ok(())
+}

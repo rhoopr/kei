@@ -725,6 +725,33 @@ An owned private selection with real retained deferred debt also keeps the path
 transition pending after a successful bounded query and file-backed reopen.
 Ordinary bounded refresh queries remain part of the unchanged cycle.
 
+The `sync_loop::runner::tests::indexing` tests use file-backed SQLite reopened
+between cycles, pre-existing downloaded media, real local HTTP downloads, and
+production readiness requests. They cover RUNNING inventory that omits an
+existing file and a previously unseen asset, repeated provisional restarts,
+FINISHED recovery with an empty change feed, verified file reuse, and a steady
+incremental cycle. Failure cases retain the trusted cursor and durable hold after
+malformed inventory, interruption, checkpoint-write failure, readiness regression,
+and unknown readiness. A seeded complete album snapshot and pending row prove
+that provisional absence does not retire membership, retry state, or media,
+including FINISHED inventory that regresses during listing. A real relation
+tombstone is applied only in the later trusted replay after inventory
+qualification. Retry-only known failures cannot hide unqueued omitted assets;
+a RUNNING album-plan transition must rebuild the omitted album after FINISHED.
+File-backed replay debt also bypasses an otherwise quiet watch pre-check.
+
+`primary_layout::indexing` additionally starts with real managed files or an
+interrupted journal, reopens SQLite between phases, and proves RUNNING remains
+blocked under primary and recorded-layout suffix modes. FINISHED inventory is
+read-only with exact media/sidecar/journal/catalogue oracles; durable full
+materialization recovers previously unqueued assets with an empty change feed.
+Inventory faults cover regression, cancellation, bounds, stale planning, invalid
+identity, missing token and atomic transition failure. Publication faults retain
+full debt/cursor through failed transfers, checkpoint writes, cancellation,
+bounds and regression. Pending-only journals remain managed under suffix;
+local edits, foreign collisions and sidecars retain the normal protection owners.
+
+
 ## Running
 
 Choose the route by purpose:
@@ -1341,11 +1368,11 @@ Shared Library ownership.
 Primary discovery availability is covered by
 `primary_discovery_default_selection_does_not_initialize_unselected_private_libraries`:
 default selection and the selected library album query succeed with explicit
-primary ownership while an unrelated private zone is still indexing. The query
+primary ownership while an unrelated private zone reports unknown readiness. The query
 returns a synthetic named user album from the exact selected scope. A full-map
 request fails without publishing a
 partial map. The qualified primary survives that failure, and a later full-map
-request recovers when indexing finishes. The selected-primary indexing failure
+request recovers when readiness becomes known. The selected-primary indexing failure
 test separately proves that cached valid descriptors cannot publish ownership
 before the selected scope passes its own check. Malformed-list tests prove that
 invalid complete-list evidence is never cached. Existing queue admission tests
@@ -1445,3 +1472,19 @@ Persistent split and moving snapshot controls both retain the checkpoint and all
 stream fixture proves drainage order and missing order after drop. These are
 observational tests, not a new durable state transition or a proof of media
 idempotence. Existing checkpoint and L1 preservation controls remain applicable.
+
+
+### Indexing integration with newer main fixes
+
+`indexing_running_observation_survives_primary_owner_qualification` covers both
+explicit default and nondefault private-primary owners. The selected scope stays
+exact while an initial RUNNING observation survives a later FINISHED probe and a
+file-backed SQLite reopen. Unknown readiness still cannot publish ownership.
+
+`indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_successor`
+combines provisional downloads, FINISHED full recovery, missing/blank delta
+successors, and two reopened healthy cycles on a Hidden-only query. Independently
+seeded media stays unchanged, omitted media downloads once, and query tokens
+remain redacted diagnostic groups rather than source checkpoint authority.
+The existing `primary_discovery_`, `legacy_smart_only_`, `token_equivalence`, and
+managed `indexing_` controls qualify the other preserved main paths separately.

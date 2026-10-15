@@ -682,3 +682,45 @@ async fn pending_recent_selection_wakes_only_its_selected_zone_on_unchanged_prec
         Some("malformed legacy recovery receipt")
     );
 }
+
+#[tokio::test]
+async fn indexing_qualified_replay_bypasses_quiet_database_shortcut_across_reopen() {
+    for replay_key in [
+        crate::sync_cycle::indexing_replay_key("PrimarySync"),
+        crate::sync_cycle::indexing_materialization_key("PrimarySync"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let library = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope =
+            test_precheck_scope_for_states(std::slice::from_ref(&library), "indexing-replay");
+        {
+            let db = state::SqliteStateDb::open(&database).await.unwrap();
+            db.set_metadata(&replay_key, "future-version")
+                .await
+                .unwrap();
+            seed_scoped_db_token(&db, &scope, "trusted-database-before").await;
+        }
+        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        let mut service = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(crate::test_helpers::MockPhotosSession::new()),
+            Default::default(),
+        );
+        let precheck = check_changes_database(
+            Some(&db),
+            std::slice::from_ref(&library),
+            &mut service,
+            &scope,
+        )
+        .await;
+        assert_eq!(
+            precheck,
+            WatchPrecheck::proceed_all(),
+            "replay debt must wake the owner without consulting changes/database"
+        );
+        assert_eq!(
+            read_scoped_db_token(&db, &scope).await.unwrap().token,
+            "trusted-database-before"
+        );
+    }
+}
