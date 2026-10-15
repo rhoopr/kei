@@ -194,6 +194,12 @@ fn date_dir(zone: usize) -> String {
         .to_string()
 }
 
+#[derive(Clone, Copy)]
+enum SeedSource {
+    Unknown,
+    Verified,
+}
+
 async fn seed_file(
     db: &state::SqliteStateDb,
     zone: usize,
@@ -201,6 +207,7 @@ async fn seed_file(
     version: state::VersionSizeKey,
     target: &Path,
     bytes: &[u8],
+    source: SeedSource,
 ) {
     std::fs::create_dir_all(target.parent().unwrap()).unwrap();
     std::fs::write(target, bytes).unwrap();
@@ -230,16 +237,42 @@ async fn seed_file(
         .build();
     db.upsert_seen(&row).await.unwrap();
     let hash = local_hash(bytes);
-    db.mark_downloaded(
-        ZONES[zone],
-        id,
-        version.as_str(),
-        target,
-        &hash,
-        Some(&hash),
-    )
-    .await
+    match source {
+        SeedSource::Unknown => {
+            db.mark_downloaded(
+                ZONES[zone],
+                id,
+                version.as_str(),
+                target,
+                &hash,
+                Some(&hash),
+            )
+            .await
+        }
+        SeedSource::Verified => {
+            state::DownloadStateStore::mark_verified_download(
+                db,
+                ZONES[zone],
+                id,
+                version.as_str(),
+                target,
+                &hash,
+                Some(&hash),
+                false,
+            )
+            .await
+        }
+    }
     .unwrap();
+    let stored: Option<String> = db.acquire_lock("explicit fixture source provenance").unwrap()
+        .query_row("SELECT source_checksum FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4", rusqlite::params![ZONES[zone], id, version.as_str(), target.to_string_lossy()], |row| row.get(0)).unwrap();
+    assert_eq!(
+        stored,
+        match source {
+            SeedSource::Unknown => None,
+            SeedSource::Verified => Some(hash),
+        }
+    );
 }
 fn rows(database: &Path, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
     let conn = rusqlite::Connection::open(database).unwrap();
@@ -350,6 +383,7 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
                 state::VersionSizeKey::Original,
                 &legacy,
                 &bytes,
+                SeedSource::Unknown,
             )
             .await;
             let sidecar = legacy.with_extension("JPG.xmp");
@@ -373,7 +407,7 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
                     .await
                     .unwrap()
             );
-            // A current child is independently owned before this history starts;
+            // A current child has verified source before this history starts;
             // the legacy row and a later sibling must never absorb its receipt.
             let current = media.join(date_dir(zone)).join("photo-current-a-9.JPG");
             seed_file(
@@ -383,6 +417,7 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
                 state::VersionSizeKey::Original,
                 &current,
                 &bytes,
+                SeedSource::Verified,
             )
             .await;
             db.upsert_asset_master_mapping(name, "asset-owned-master", "owned-master")
@@ -427,7 +462,16 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
                     ),
                 ] {
                     let target = media.join(&album_name).join(filename);
-                    seed_file(&db, zone, "asset-owned-master", version, &target, content).await;
+                    seed_file(
+                        &db,
+                        zone,
+                        "asset-owned-master",
+                        version,
+                        &target,
+                        content,
+                        SeedSource::Unknown,
+                    )
+                    .await;
                 }
             }
             db.set_metadata(&format!("sync_token:{name}"), "before")
@@ -846,6 +890,7 @@ async fn mixed_numbered_album_mode_transition_repro() {
                     version,
                     &media.join(label).join(name),
                     content,
+                    SeedSource::Unknown,
                 )
                 .await;
             }
@@ -1005,6 +1050,11 @@ async fn mixed_legacy_reservation_blocks_preparation_repro() {
             state::VersionSizeKey::Original,
             &media.join(date_dir(0)).join(filename),
             STILL,
+            if id == "current-a" {
+                SeedSource::Verified
+            } else {
+                SeedSource::Unknown
+            },
         )
         .await;
     }

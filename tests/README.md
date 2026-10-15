@@ -239,6 +239,10 @@ fixtures use synthetic provider data and media, not a reporter-state replay.
 
 ### Mixed library provider response equivalence
 
+The current-child seed records verified source explicitly; historical legacy and
+other generic receipts keep unknown source. The fixture asserts these initial
+source facts before running its unchanged progress and preservation oracles.
+
 `mixed_library_provider_shapes` composes long-lived synthetic families in two
 zones with reused raw IDs, distinct dates and checksums, independent current
 children, unattributed legacy files, and numbered Live Photo publications in
