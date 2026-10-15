@@ -538,7 +538,11 @@ reseed. They cannot acknowledge omitted eligibility or old unresolved debt.
 Destination media completion requires an actual confined file fingerprint and
 independently verified selected source checksum. An exact active physical
 receipt can be reused across compatible passes after current selection and
-file verification; another path retains its own obligation. Imported generic
+file verification; another path retains its own obligation. Opaque provider
+signatures remain independent from source and local SHA-256. Fresh or legacy
+fallback publication requires a separately verified per-path source receipt;
+validated native reuse relies on its own lossless generation/destination receipt,
+including operation-owned prepared metadata output. Imported generic
 local checksums cannot establish source provenance. Metadata completion is
 separate and uses the existing option-aware rewrite owner with the exact native
 path, frozen grouping and writer flags. Disabled flags cannot finish older

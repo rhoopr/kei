@@ -232,7 +232,9 @@ a fresh verified download before certification and a quiet reopened cycle.
 `private_destination_opaque_mmcs_proofs_survive_reopen` covers native destination
 proof creation and validation through normal downloads, compatible destination
 reuse and reopened quiet cycles. Unix coverage includes a non-UTF-8 root;
-feature-gated sidecar coverage retains independent metadata completion. These
+feature-gated sidecar coverage retains independent metadata completion. Opaque
+native prepared-output recovery preserves a distinct lossy UTF-8 sibling and
+its legacy debt while retaining corrupt-proof and arbitrary-byte refusals. These
 fixtures use synthetic provider data and media, not a reporter-state replay.
 
 ### Mixed library provider response equivalence

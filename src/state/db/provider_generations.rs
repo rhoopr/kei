@@ -1823,6 +1823,13 @@ pub(super) fn record_layout_destination(
     Ok(())
 }
 
+enum VerifiedDestinationSource<'a> {
+    PathPublication(&'a str),
+    // Only the reuse owner constructs this after validating the retained
+    // native generation/decision and exact source, path and local fingerprint.
+    RetainedNative(&'a str),
+}
+
 pub(super) fn record_verified_destination(
     conn: &Connection,
     library: &str,
@@ -1832,6 +1839,30 @@ pub(super) fn record_verified_destination(
     local: &str,
     source: &str,
 ) -> Result<(), StateError> {
+    record_destination_source(
+        conn,
+        library,
+        asset,
+        version,
+        path,
+        local,
+        VerifiedDestinationSource::PathPublication(source),
+    )
+}
+
+fn record_destination_source(
+    conn: &Connection,
+    library: &str,
+    asset: &str,
+    version: &str,
+    path: &Path,
+    local: &str,
+    source: VerifiedDestinationSource<'_>,
+) -> Result<(), StateError> {
+    let (source, require_path_receipt) = match source {
+        VerifiedDestinationSource::PathPublication(source) => (source, true),
+        VerifiedDestinationSource::RetainedNative(source) => (source, false),
+    };
     validate_identity_decisions(conn, library, asset)?;
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND admitted=1)",params![library,asset,version],|r|r.get(0))?;
     if !exists {
@@ -1853,10 +1884,11 @@ pub(super) fn record_verified_destination(
     {
         return invalid();
     }
-    // Verified finalization wrote this separate source receipt in the same
-    // transaction. Bind the opaque provider generation through the catalogue,
-    // never by interpreting MMCS as a local content digest.
-    let rows:Vec<(String,String,String)>=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND admitted=1 AND EXISTS(SELECT 1 FROM assets a JOIN asset_metadata_paths p USING(library,id,version_size) WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND a.checksum=provider_active_destinations.checksum AND a.size_bytes=provider_active_destinations.size_bytes AND a.metadata_hash=provider_active_destinations.metadata_hash AND a.created_at IS provider_active_destinations.created_at AND a.added_at IS provider_active_destinations.added_at AND a.status='downloaded' AND a.is_deleted=0 AND p.provider_checksum=a.checksum AND p.local_path=provider_active_destinations.compat_path AND p.local_checksum=?5 AND p.source_checksum=?6)")?.query_map(params![library,asset,version,path,local,source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
+    // Fresh/fallback publication requires its independent per-path source.
+    // Validated native reuse has its own lossless receipt, including prepared
+    // rewrite outputs that must not update a lossy TEXT sibling's checksum.
+    // Bind MMCS as a provider generation, never as a local content digest.
+    let rows:Vec<(String,String,String)>=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND admitted=1 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND a.checksum=provider_active_destinations.checksum AND a.size_bytes=provider_active_destinations.size_bytes AND a.metadata_hash=provider_active_destinations.metadata_hash AND a.created_at IS provider_active_destinations.created_at AND a.added_at IS provider_active_destinations.added_at AND a.status='downloaded' AND a.is_deleted=0 AND (?7=0 OR EXISTS(SELECT 1 FROM asset_metadata_paths p WHERE p.library=a.library AND p.id=a.id AND p.version_size=a.version_size AND p.provider_checksum=a.checksum AND p.local_path=provider_active_destinations.compat_path AND p.local_checksum=?5 AND p.source_checksum=?6)))")?.query_map(params![library,asset,version,path,local,source,require_path_receipt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
     for (generation, key, child) in rows {
         let root = load_generation(conn, &generation)?;
         let manifest = load_decision(conn, &root, &key, &child)?;
@@ -1902,7 +1934,7 @@ impl SqliteStateDb {
                     let pending=metadata_receipt(&tx,&previous,&previous_key,&child,&selected.version_size,&path.key()?)?;
                     super::metadata::settle_selection_prepared_input(&tx,&pending,&(local.clone(),size))?;
                 }
-                record_verified_destination(&tx,root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,&selected.version_size,&native,&local,&source)?;
+                record_destination_source(&tx,root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::RetainedNative(&source))?;
                 tx.commit()?;return Ok(true)
             }
             let Some(text)=native.to_str() else {tx.commit()?;return Ok(false)};
