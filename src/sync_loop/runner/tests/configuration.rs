@@ -138,28 +138,28 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
 
 #[tokio::test]
 async fn issue765_cancel_pending_bridge_preserves_checkpoint_then_replays() {
-    cancelled_bridge_fixture(BridgeWait::Replay, false).await;
+    Box::pin(cancelled_bridge_fixture(BridgeWait::Replay, false)).await;
 }
 
 #[tokio::test]
 async fn issue958_cancel_identity_wait_preserves_checkpoint_then_replays() {
-    cancelled_bridge_fixture(BridgeWait::AssetIdentity, false).await;
+    Box::pin(cancelled_bridge_fixture(BridgeWait::AssetIdentity, false)).await;
 }
 
 #[tokio::test]
 async fn issue958_cancel_paired_wait_preserves_checkpoint_then_replays() {
-    cancelled_bridge_fixture(BridgeWait::PairedAsset, false).await;
+    Box::pin(cancelled_bridge_fixture(BridgeWait::PairedAsset, false)).await;
 }
 
 #[tokio::test]
 async fn issue958_cancel_relation_scan_preserves_checkpoint_then_replays() {
-    cancelled_bridge_fixture(BridgeWait::AlbumRelation, false).await;
+    Box::pin(cancelled_bridge_fixture(BridgeWait::AlbumRelation, false)).await;
 }
 
 #[tokio::test]
 async fn issue958_cancel_streaming_identity_wait_preserves_checkpoint_then_replays() {
     for wait in [BridgeWait::AssetIdentity, BridgeWait::PairedAsset] {
-        cancelled_bridge_fixture(wait, true).await;
+        Box::pin(cancelled_bridge_fixture(wait, true)).await;
     }
 }
 
@@ -271,7 +271,7 @@ async fn cancelled_bridge_fixture(wait: BridgeWait, streaming: bool) {
             BridgeWait::AssetIdentity => "asset_identity",
             BridgeWait::PairedAsset => "paired_asset",
             BridgeWait::AlbumRelation => "album_relation",
-            BridgeWait::Replay => unreachable!(),
+            BridgeWait::Replay => panic!("replay waits do not enter hydration"),
         };
         assert!(
             observations
