@@ -40,7 +40,7 @@ It handles the parts that make photo backups annoying: big libraries, shared lib
 Already have an `icloudpd` archive? Start with
 [Migrating from icloudpd](docs/migration-from-icloudpd.md), including the import
 preview and path checks, before pointing kei at it. For an existing kei install,
-read [Upgrade and compatibility](docs/v0.25.1-upgrade.md) before opening its state.
+read [Upgrade and compatibility](docs/v0.25.3-upgrade.md) before opening its state.
 
 ## Choose your installation route
 
@@ -185,7 +185,7 @@ formats, safe refusals, and explicit timestamp repair.
 ## Docs
 
 - [Install](https://github.com/rhoopr/kei/wiki/Install)
-- [Upgrade and compatibility](docs/v0.25.1-upgrade.md)
+- [Upgrade and compatibility](docs/v0.25.3-upgrade.md)
 - [Account state migration](docs/account-state-migration.md)
 - [Backup maintenance](docs/backup-maintenance.md)
 - [Metadata output](docs/metadata.md)

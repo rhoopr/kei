@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.25.3] - 2026-10-16
+
+### Fixed
+
+- Included v0.25.2 provisional indexing recovery on main: ordinary downloads can proceed during `RUNNING` while trusted checkpoints and reconciliation obligations survive restarts. Managed layouts wait for `FINISHED`, complete inventory and protected materialization before retained-cursor replay. Missing or unknown readiness still fails closed. ([#969](https://github.com/rhoopr/kei/pull/969))
+- Preserved explicit private-primary discovery ownership and replayed the zone delta alongside selected smart-folder queries. Pending legacy certification is reported as incomplete work; verified source receipts can certify eligible current downloads without mistaking provider generation signatures for file hashes. Unknown historical ownership remains held. ([#961](https://github.com/rhoopr/kei/pull/961), [#962](https://github.com/rhoopr/kei/pull/962), [#970](https://github.com/rhoopr/kei/pull/970))
+- Revalidated stale child-to-master mappings with one bounded additional lookup when a complete current pair is available in the same scope. Sparse, missing, malformed, foreign or changing pairs retain their checkpoint hold. ([#972](https://github.com/rhoopr/kei/pull/972))
+- Made incremental identity and album hydration waits cancellable. This does not add a universal shutdown deadline. ([#971](https://github.com/rhoopr/kei/pull/971))
+- Rejected demonstrated unsafe MOV metadata layouts before embedded rewrites can damage their existing structures. Supported layouts retain embedding; rejected writes remain pending. Existing damage is not repaired, and support for every MOV layout is not established. ([#948](https://github.com/rhoopr/kei/pull/948), thanks [@te&#104;-hippo](https://github.com/teh-hippo))
+- Preserved exact floating-point metadata when reopening primary-layout journals, avoiding the demonstrated `planned member identity cannot change` failure without weakening identity or receipt checks. ([#974](https://github.com/rhoopr/kei/pull/974))
+- Retained the locked Rustls 0.23.46 security update from v0.25.2 for RUSTSEC-2026-0346 through RUSTSEC-2026-0349.
+
+### Changed
+
+- Added bounded, privacy-safe token-equivalence and missing-parent-reference evidence to support history and `support-export`. Diagnostics preserve existing refusals; they do not select a trusted token or establish missing ownership. ([#967](https://github.com/rhoopr/kei/pull/967), [#973](https://github.com/rhoopr/kei/pull/973))
+- SQLite schema remains 35. This does not guarantee downgrade compatibility: older binaries can ignore indexing recovery obligations or decode journal floats differently. Stop all writers and retain a matched cold backup of configuration/state, SQLite companions and media/sidecars. See [v0.25.3 upgrade guidance](https://github.com/rhoopr/kei/blob/v0.25.3/docs/v0.25.3-upgrade.md).
+
+### Known limitations
+
+- Sparse former-library references, token agreement/proof, missing-parent attribution and metadata ownership remain unresolved in [#953](https://github.com/rhoopr/kei/issues/953) and [#954](https://github.com/rhoopr/kei/issues/954). These fixes do not establish complete recovery of either account or every Shared Photo Library identity case.
+- The separate session-lock test issue [#968](https://github.com/rhoopr/kei/issues/968) remains unresolved. Physical NFS/NAS behavior, representative HEIF memory bounds, historical completeness and downstream media-library pairing remain separately unqualified. Existing duplicates and damaged files are not automatically repaired.
+
+## [0.25.2] - 2026-10-15
+
+### Fixed
+
+- Downloads can progress when iCloud Photos reports `RUNNING` indexing. These runs remain provisional: kei preserves trusted sync tokens, retains a per-library reconciliation requirement across restarts, and suppresses deletion and membership decisions from provisional listings. After `FINISHED`, a complete inventory and final readiness check qualify recovery without moving the trusted cursor; the next trusted cycle replays that retained cursor before advancing it. Existing verified downloads are reused. ([#951](https://github.com/rhoopr/kei/issues/951#issuecomment-6173266761))
+
+- Managed layouts retain the RUNNING guard, qualify FINISHED inventory without local writes, then require full protected materialization and retained-cursor replay across restarts.
+- Updated locked Rustls to 0.23.46 for RUSTSEC-2026-0346 through RUSTSEC-2026-0349. Existing audit policy is unchanged.
+
+### Known limitations
+
+- Missing or unknown indexing responses fail closed. Bounded, interrupted, failed, or uncommitted reconciliation keeps the hold. Managed layouts wait during RUNNING; full selected coverage and successful protected materialization are required after FINISHED. See [v0.25.2 upgrade guidance](docs/v0.25.2-upgrade.md).
+
 ## [0.25.1] - 2026-10-13
 
 ### Added
