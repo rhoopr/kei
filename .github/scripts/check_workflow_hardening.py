@@ -70,6 +70,8 @@ def check_docker_publish(errors: list[str]) -> None:
         errors.append("docker.yml: publishing workflow must not accept arbitrary manual refs")
     if "packages: write" not in text:
         errors.append("docker.yml: publishing workflow must keep explicit packages: write permission")
+    if "tags:" in text.split("concurrency:", maxsplit=1)[0] or "value=latest" in text:
+        errors.append("docker.yml: release publication must go through release qualification")
     if "push: true" not in text:
         errors.append("docker.yml: publishing workflow must still publish images")
 
@@ -91,8 +93,15 @@ def check_release(errors: list[str]) -> None:
     before_jobs = text.split("jobs:", maxsplit=1)[0]
     if "permissions:\n  contents: read\n" not in before_jobs:
         errors.append("release.yml: missing top-level read-only token permissions")
-    if "cargo build --locked --release --target ${{ matrix.target }}" not in text:
+    if "cargo build --locked --release --target ${{ matrix.target }}" not in workflow_text("artifacts.yml"):
         errors.append("release.yml: release builds must use cargo build --locked")
+    for needle in ("needs: qualification", "needs: [qualification, release]", "needs: [release, containers]",
+                   "scripts/ci/local_release.py check", "uses: ./.github/workflows/qualification.yml",
+                   "python3 scripts/ci/artifact.py verify", "docker load --input"):
+        if needle not in text:
+            errors.append(f"release.yml: missing qualification guard: {needle}")
+    if text.count("if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')") != 2:
+        errors.append("release.yml: release and containers must both be tag-only")
     if 'curl -fsSL "$BASE/SHA256SUMS.txt"' not in text:
         errors.append("release.yml: Homebrew updater must download SHA256SUMS.txt fail-fast")
     if 'curl -fsSL "$BASE/$file"' not in text:

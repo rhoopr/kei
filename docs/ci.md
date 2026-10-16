@@ -42,3 +42,31 @@ only after that evidence exists. Record cold and warm timings separately.
 Release publication must consume the artifacts that passed qualification.
 GitHub release assets, GHCR version/latest tags, and Homebrew updates all depend
 on that result. Nightly and manual rehearsals have no publishing permissions.
+
+## Local release prerequisites
+
+A release request authorizes planning, not unattended use of credentials or
+changes to an existing service. Confirm the isolated test account, selected
+fixtures, and host-service prerequisites before running live checks. Never use
+an existing media/state tree as disposable test data.
+
+1. Check out the final release commit with a clean worktree. Do not change it
+   after qualification starts.
+2. Run `KEI_FULL_TEST_REAL_SERVICE=1 just full-test` on the prepared Linux host.
+   This requires working credentials, Docker, the pinned tools, and an unused
+   user-service slot. Retain the finalized report and private logs.
+3. Run `python3 scripts/ci/local_release.py record --repo rhoopr/kei --sha COMMIT --report REPORT`.
+   The validator rejects missing, skipped, rate-limited, failed, or dirty-head
+   evidence. All discovered shell suites and the real host-service phase must
+   pass. Cross-zone testing remains an explicit fixture-dependent extension.
+4. Post only the redacted summary and report digest to the release PR. Do not
+   upload private logs, credentials, provider identifiers, or local account paths.
+5. Repeat the record command with `--publish --evidence-url COMMENT_URL` after
+   approval to publish the attestation. The release gate accepts only the latest
+   repository-owner status for that exact commit, no older than seven days.
+6. Start the release only after those prerequisites pass. A tag starts heavy
+   qualification; manual dispatch of Release rehearses it without publication.
+
+The attestation is a maintainer trust boundary, not independent proof that local
+commands ran. Keep the underlying evidence. A new commit requires a new run.
+Nightly results do not replace this requirement.

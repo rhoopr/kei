@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,6 +26,7 @@ jobs:
       - uses: taiki-e/install-action@b7d831ec1a6ef0d81d27cf61932d92140b2271d4 # cargo-audit
 
       - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push'
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           CARGO_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -34,6 +36,7 @@ jobs:
           fi
 
       - name: Verify CHANGELOG has entry for this version
+        if: github.event_name == 'push'
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           if ! grep -q "^## \[$VERSION\]" CHANGELOG.md; then
@@ -44,96 +47,19 @@ jobs:
       - name: Security audit
         run: cargo audit --deny warnings
 
-  build:
-    needs: validate
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: kei-linux-x86_64
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: kei-linux-aarch64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: kei-macos-x86_64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: kei-macos-aarch64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: kei-windows-x86_64
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ github.ref }}
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
-          targets: ${{ matrix.target }}
-
-      - name: Install system dependencies (Linux x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev
-
-      - name: Install system dependencies (Linux aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo dpkg --add-architecture arm64
-          # Pin existing sources to amd64 only (handles both .list and .sources formats)
-          sudo sed -i 's|^deb http|deb [arch=amd64] http|g' /etc/apt/sources.list.d/*.list 2>/dev/null || true
-          sudo sed -i '/^Architectures:/d; /^Types:/a Architectures: amd64' /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-          # Add arm64 from ports
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs) main restricted universe" | sudo tee /etc/apt/sources.list.d/arm64.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs)-updates main restricted universe" | sudo tee -a /etc/apt/sources.list.d/arm64.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs)-security main restricted universe" | sudo tee -a /etc/apt/sources.list.d/arm64.list
-          sudo apt-get update
-          # g++-aarch64-linux-gnu is required for xmp_toolkit, which vendors
-          # Adobe's XMP Toolkit C++ source and compiles it via the `cc` crate.
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libdbus-1-dev:arm64
-
-      - name: Build
-        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Require exact-commit local prerequisites before a release
+        if: github.event_name == 'push'
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_CXX: aarch64-linux-gnu-g++
-          PKG_CONFIG_ALLOW_CROSS: 1
-          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/local_release.py check --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA"
 
-      - name: Package (Unix)
-        if: matrix.os != 'windows-latest'
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czvf ../../../${{ matrix.name }}.tar.gz kei
-          cd -
-
-      - name: Package (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.name }}.zip kei.exe
-          cd -
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ${{ matrix.name }}
-          path: |
-            ${{ matrix.name }}.tar.gz
-            ${{ matrix.name }}.zip
+  qualification:
+    needs: validate
+    uses: ./.github/workflows/qualification.yml
 
   release:
-    needs: build
+    needs: qualification
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -147,15 +73,16 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          path: artifacts
+          pattern: candidate-*
+          path: candidate
+          merge-multiple: true
 
+      - name: Reverify candidates before publication
+        run: python3 scripts/ci/artifact.py verify
       - name: Generate checksums
         run: |
-          cd artifacts
-          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} . \;
+          cd candidate
           sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-          cd -
 
       - name: Generate release notes
         id: release_notes
@@ -185,14 +112,56 @@ jobs:
         with:
           body: ${{ steps.release_notes.outputs.notes }}
           files: |
-            artifacts/*.tar.gz
-            artifacts/*.zip
-            artifacts/SHA256SUMS.txt
+            candidate/*.tar.gz
+            candidate/*.zip
+            candidate/SHA256SUMS.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  containers:
+    needs: [qualification, release]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: candidate-*
+          path: candidate
+          merge-multiple: true
+      - name: Reverify the qualified bytes
+        run: python3 scripts/ci/artifact.py verify
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the tested image IDs without rebuilding
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          version="${GITHUB_REF_NAME#v}"
+          for arch in amd64 arm64; do
+            docker load --input "candidate/container-$arch.tar"
+            id=$(jq -er .image_id "candidate/container-$arch.json")
+            test "$(docker image inspect kei:candidate --format '{{.Id}}')" = "$id"
+            docker tag "$id" "$image:$version-$arch"
+            docker push "$image:$version-$arch"
+          done
+          docker buildx imagetools create -t "$image:$version" "$image:$version-amd64" "$image:$version-arm64"
+          # Do not move stable aliases for a prerelease.
+          if [[ "$version" != *-* ]]; then
+            docker buildx imagetools create -t "$image:${version%.*}" -t "$image:latest" "$image:$version"
+          fi
+
   homebrew:
-    needs: release
+    needs: [release, containers]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout tap
