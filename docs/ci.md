@@ -68,10 +68,12 @@ on that result. Nightly and manual rehearsals have no publishing permissions.
 
 ## Local release prerequisites
 
-A release request authorizes planning, not unattended use of credentials or
-changes to an existing service. Confirm the isolated test account, selected
-fixtures, and host-service prerequisites before running live checks. Never use
-an existing media/state tree as disposable test data.
+When a maintainer explicitly requests a release, run these local prerequisites
+before starting release CI. Verify the configured isolated test account, selected
+fixtures, and an unused host-service slot. Ask for input if those prerequisites
+are unavailable or ambiguous. Never use an existing media/state tree as
+disposable test data, and never replace an existing service. An ordinary PR or
+CI rehearsal does not authorize credential-bearing checks.
 
 1. Check out the final release commit with a clean worktree. Do not change it
    after qualification starts.
@@ -86,8 +88,8 @@ an existing media/state tree as disposable test data.
    pass. Cross-zone testing remains an explicit fixture-dependent extension.
 4. Post only the redacted summary and report digest to the release PR. Do not
    upload private logs, credentials, provider identifiers, or local account paths.
-5. Repeat the record command with `--publish --evidence-url COMMENT_URL` after
-   approval to publish the attestation. The release gate accepts only the latest
+5. As part of the authorized release, repeat the record command with
+   `--publish --evidence-url COMMENT_URL`. The release gate accepts only the latest
    repository-owner status for that exact commit, no older than seven days.
 6. Start the release only after those prerequisites pass. A tag starts heavy
    qualification; manual dispatch of Release rehearses it without publication.
