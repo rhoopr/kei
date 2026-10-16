@@ -63,6 +63,41 @@ they run shared helper tests; `import_existing_live` also checks fixture
 isolation, command construction, and rejection of a removed CLI flag. These
 offline tests run in `just test offline` and `just gate` without credentials.
 
+## Copies metadata stress routing
+
+Ordinary `cargo test`, `just gate`, coverage, and their all-feature and
+no-default-feature runs exclude the ignored 300-photo stress case. The
+three-photo fixture still checks two source reseeds, two quiet SQLite reopens,
+unchanged media and sidecar timestamps, logical obligations, and preserved
+proof. A separate three-photo, single-cycle test uses a task-scoped test-only
+budget of four writers, crossing the same priority/remaining scheduling branch
+with a reserve of two. The scheduler owner separately asserts the production
+250-current/500-total limits. The small test retains the physical-writer versus
+logical-alias assertions on every code PR with XMP enabled; the full 300-photo
+case crosses the real default limits. The override cannot affect parallel tests
+or production builds.
+
+Run `just test stress` (or `bash scripts/test-copies-stress.sh`) for the full
+300-photo, five-cycle proof. The runner requires exactly one ignored test in
+the catalog and one passing execution; `--check` validates only the catalog.
+The regular Linux CI test job checks this catalog so a rename, lost ignore
+marker, or feature change cannot silently remove the stress proof.
+
+`Copies stress` runs once with all features on Linux for relevant PR changes
+(download, selected commands, state, Photos provider, sync, configuration,
+shared account/retry/filesystem/types/selection, media fixtures, dependencies, or CI), every
+push to main, Monday at 04:23 UTC, and manual Rust CI dispatches. Unrelated
+code and docs-only PRs skip it. Scheduled/manual runs skip the regular test
+matrix; the aggregate `CI` check requires the stress job when selected. The
+release tag workflow builds artifacts without a test suite; main CI and the
+explicit stress command provide the stress route before release. Run the
+explicit command alongside `just full-test` for local release qualification.
+CI coverage and `just cov patch` explicitly skip the test on head and base,
+including an older base
+that has not marked it ignored. The no-default build lacks XMP and does not
+repeat either XMP fixture; the regular all-feature matrix retains platform
+coverage for the small and boundary cases.
+
 ## Focused scenario slices
 
 Named scenario slices group existing Rust tests by risk so a change can run

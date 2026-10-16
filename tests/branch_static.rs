@@ -1550,6 +1550,167 @@ fn rust_ci_runs_on_main_push_without_pr_only_coverage() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn copies_stress_routes_relevant_changes_and_explicit_events() {
+    let ci = repo_file(".github/workflows/ci.yml");
+    let detect = ci.split_once("      - id: filter\n").unwrap().1;
+    let body = shell_block(detect, "        run: |\n", "          ");
+    let temp = tempfile::tempdir().unwrap();
+    write_executable(
+        &temp.path().join("git"),
+        "#!/bin/bash\nprintf '%s\\n' \"$CHANGED_FILES\"\n",
+    );
+    let cases = [
+        (
+            "pull_request",
+            "src/download/orchestration/generation.rs",
+            true,
+            true,
+        ),
+        ("pull_request", "src/state/db/metadata.rs", true, true),
+        ("pull_request", "src/icloud/photos/mod.rs", true, true),
+        ("pull_request", "src/commands/service.rs", true, true),
+        ("pull_request", "src/config.rs", true, true),
+        ("pull_request", "src/account.rs", true, true),
+        ("pull_request", "src/retry.rs", true, true),
+        ("pull_request", "tests/data/media/pattern.jpg", true, true),
+        ("pull_request", "Cargo.lock", true, true),
+        ("pull_request", ".github/workflows/ci.yml", true, true),
+        ("pull_request", "scripts/test-copies-stress.sh", true, true),
+        ("pull_request", "justfile", true, true),
+        ("pull_request", "src/auth/session.rs", true, false),
+        ("pull_request", "src/service/linux.rs", true, false),
+        ("pull_request", "tests/cli.rs", true, false),
+        (
+            "pull_request",
+            "README.md\ndocs/architecture.md",
+            false,
+            false,
+        ),
+        ("pull_request", "", false, false),
+        ("push", "README.md", true, true),
+        ("schedule", "", false, true),
+        ("workflow_dispatch", "", false, true),
+    ];
+    for (event, files, code, stress) in cases {
+        let output_path = temp.path().join("outputs");
+        std::fs::write(&output_path, "").unwrap();
+        let result = Command::new("bash")
+            .args(["-c", &body])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    temp.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("EVENT_NAME", event)
+            .env("BASE_SHA", "base")
+            .env("CHANGED_FILES", files)
+            .env("GITHUB_OUTPUT", &output_path)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{event} {files}: {result:?}");
+        let outputs = std::fs::read_to_string(&output_path).unwrap();
+        assert!(
+            outputs
+                .lines()
+                .any(|line| line == format!("stress={stress}")),
+            "{event} {files}: {outputs}"
+        );
+        assert!(
+            outputs.lines().any(|line| line == format!("code={code}")),
+            "{event} {files}: {outputs}"
+        );
+    }
+    let stress_job = ci
+        .split_once("  copies-stress:\n")
+        .unwrap()
+        .1
+        .split_once("  # Ensures")
+        .unwrap()
+        .0;
+    assert!(stress_job.contains("if: needs.detect.outputs.stress == 'true'"));
+    assert!(stress_job.contains("runs-on: ubuntu-latest"));
+    assert!(!stress_job.contains("matrix:"));
+    assert!(stress_job.contains("bash scripts/test-copies-stress.sh"));
+    assert!(
+        ci.split_once("  ci:\n")
+            .unwrap()
+            .1
+            .contains("      - copies-stress\n")
+    );
+    assert!(ci.contains("  schedule:\n"));
+    assert!(ci.contains("  workflow_dispatch:\n"));
+    assert_eq!(
+        repo_file("justfile")
+            .matches(" -- --skip download::orchestration::queue_projection::tests::private_300_")
+            .count(),
+        2
+    );
+    assert_eq!(
+        ci.matches(
+            "--no-report -- --skip download::orchestration::queue_projection::tests::private_300_"
+        )
+        .count(),
+        2
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn copies_stress_runner_rejects_missing_ignored_tests_and_zero_execution() {
+    let temp = tempfile::tempdir().unwrap();
+    let cargo = temp.path().join("cargo");
+    write_executable(
+        &cargo,
+        r#"#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$CALL_LOG"
+if [[ " $* " == *" --list "* ]]; then
+    if [[ "$MODE" != missing ]]; then printf '%s: test\n' "$5"; fi
+    exit 0
+fi
+case "$MODE" in
+    fail) exit 23 ;;
+    zero) echo 'test result: ok. 0 passed; 0 failed; 0 ignored;' ;;
+    *) echo 'test result: ok. 1 passed; 0 failed; 0 ignored;' ;;
+esac
+"#,
+    );
+    let runner = repo_path("scripts/test-copies-stress.sh");
+    for (mode, check_only, success, calls) in [
+        ("missing", true, false, 1),
+        ("missing", false, false, 1),
+        ("ok", true, true, 1),
+        ("ok", false, true, 2),
+        ("zero", false, false, 2),
+        ("fail", false, false, 2),
+    ] {
+        let log = temp.path().join("calls");
+        std::fs::write(&log, "").unwrap();
+        let mut command = Command::new("bash");
+        command
+            .arg(&runner)
+            .env("CARGO", &cargo)
+            .env("MODE", mode)
+            .env("CALL_LOG", &log);
+        if check_only {
+            command.arg("--check");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.success(), success, "{mode}: {output:?}");
+        let actual = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(actual.lines().count(), calls, "{mode}: {actual}");
+        for call in actual.lines() {
+            assert!(call.starts_with("test --locked --all-features --lib download::orchestration::queue_projection::tests::private_300_"));
+            assert!(call.contains(" -- --ignored --exact "));
+        }
+    }
+}
+
 #[test]
 fn release_homebrew_downloads_fail_fast_and_verify_checksums() {
     let release = repo_file(".github/workflows/release.yml");

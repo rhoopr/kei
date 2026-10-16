@@ -4859,19 +4859,31 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
+#[ignore = "300-photo stress coverage: scripts/test-copies-stress.sh"]
 async fn private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes()
  {
-    Box::pin(current_writers_reseed_fixture(300)).await;
+    Box::pin(current_writers_reseed_fixture(300, 5)).await;
 }
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn private_unchanged_sidecar_packets_survive_reseeds_and_two_quiet_reopens() {
-    Box::pin(current_writers_reseed_fixture(3)).await;
+    Box::pin(current_writers_reseed_fixture(3, 5)).await;
+}
+
+// Cross the same priority/remaining scheduling branch with three writers.
+// The owner separately pins production's 250-current/500-total limits; the
+// full stress case crosses those real limits without the test-only override.
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn private_current_writers_cross_priority_reserve_with_small_budget() {
+    crate::download::orchestration::generation::TEST_METADATA_WRITER_BUDGET
+        .scope(4, Box::pin(current_writers_reseed_fixture(3, 1)))
+        .await;
 }
 
 #[cfg(feature = "xmp")]
-async fn current_writers_reseed_fixture(writers: usize) {
+async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4892,7 +4904,7 @@ async fn current_writers_reseed_fixture(writers: usize) {
         pair[0]["fields"]["resOriginalRes"]["value"]=json!({"downloadURL":format!("{}/many-owned-current",server.uri()),"size":media.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))});pair
     }).collect();
     let mut stable = None;
-    for cycle in 0..5 {
+    for cycle in 0..cycles {
         if cycle > 0 {
             f = reopen_destination_fixture(f).await;
         }
@@ -4928,7 +4940,7 @@ async fn current_writers_reseed_fixture(writers: usize) {
                 )
                 .unwrap(),
                 0,
-                "current lane and remaining budget cannot strand the 51st writer"
+                "current lane and remaining budget must finish every physical writer"
             );
         }
         let files: Vec<_> = (0..writers)

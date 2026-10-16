@@ -4,6 +4,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
 
 # Cancel an in-flight CI run when a new push lands on the same PR.
 # Only the latest commit matters; older runs would just burn minutes.
@@ -33,6 +36,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
       cargo: ${{ steps.filter.outputs.cargo }}
+      stress: ${{ steps.filter.outputs.stress }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -44,11 +48,19 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Scheduled/manual runs exercise the stress route without repeating
+          # the regular matrix. Main pushes run both routes.
+          if [[ "$EVENT_NAME" == "schedule" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            printf 'code=false\ncargo=false\nstress=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [[ "$EVENT_NAME" != "pull_request" ]]; then
             echo "$EVENT_NAME event -> running all non-PR-only jobs"
             {
               echo "code=true"
               echo "cargo=true"
+              echo "stress=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -68,18 +80,23 @@ jobs:
             {
               echo "code=true"
               echo "cargo=true"
+              echo "stress=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          code=false; cargo=false
-          if printf '%s\n' "${files[@]}" | grep -qE '^(src/|tests/|build\.rs$|Cargo\.toml$|Cargo\.lock$)'; then
+          code=false; cargo=false; stress=false
+          if printf '%s\n' "${files[@]}" | grep -qE '^(src/|tests/|build\.rs$|Cargo\.toml$|Cargo\.lock$|scripts/test-copies-stress\.sh$|justfile$)'; then
             code=true
           fi
           if printf '%s\n' "${files[@]}" | grep -qE '^(Cargo\.toml$|Cargo\.lock$|\.cargo/audit\.toml$)'; then
             cargo=true
           fi
+          if printf '%s\n' "${files[@]}" | grep -E '^(src/(commands/|download/|state/|icloud/|sync_loop(\.rs|/)|sync_cycle\.rs$|config(\.rs|/)|types\.rs$|account\.rs$|retry\.rs$|selection\.rs$|fs_util\.rs$|lib\.rs$|test_helpers\.rs$)|tests/data/|build\.rs$|Cargo\.(toml|lock)$|scripts/test-copies-stress\.sh$|justfile$)' > /dev/null; then
+            stress=true
+          fi
           {
+            echo "stress=$stress"
             echo "code=$code"
             echo "cargo=$cargo"
           } >> "$GITHUB_OUTPUT"
@@ -193,6 +210,25 @@ jobs:
           # Requiring it where it is installed stops a failed install quietly
           # retiring that coverage.
           KEI_REQUIRE_HEIF_ORACLE: ${{ runner.os == 'Linux' && '1' || '' }}
+      - name: Check ignored stress test remains selectable
+        if: runner.os == 'Linux'
+        run: bash scripts/test-copies-stress.sh --check
+
+  # One full scale run, independent of the regular platform/feature matrices.
+  copies-stress:
+    name: Copies stress
+    needs: detect
+    if: needs.detect.outputs.stress == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: bash scripts/test-copies-stress.sh
 
   # Ensures documentation builds without warnings
   # Important for maintaining quality docs, especially for published crates
@@ -276,7 +312,7 @@ jobs:
             just = "1.50.0"
       - name: Run coverage
         run: |
-          cargo llvm-cov --all-features --no-report
+          cargo llvm-cov --all-features --no-report -- --skip download::orchestration::queue_projection::tests::private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes
           # Human-readable report for the Actions log
           cargo llvm-cov report
           # Structured data for parsing - cargo-llvm-cov's text format is
@@ -324,7 +360,7 @@ jobs:
             just = "1.50.0"
       - name: Run coverage
         run: |
-          cargo llvm-cov --all-features --no-report
+          cargo llvm-cov --all-features --no-report -- --skip download::orchestration::queue_projection::tests::private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes
           cargo llvm-cov report --json --output-path base_coverage.json
           cargo llvm-cov report --lcov --output-path base_coverage.lcov
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -591,6 +627,7 @@ jobs:
       - roundtrip
       - clippy
       - test_no_default
+      - copies-stress
       - test
       - docs
       - unused-deps

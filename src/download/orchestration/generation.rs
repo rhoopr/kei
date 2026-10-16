@@ -993,6 +993,29 @@ pub(super) async fn inventory(
     Ok(result)
 }
 
+const METADATA_WRITER_BUDGET: usize = 500;
+
+#[cfg(test)]
+tokio::task_local! {
+    // Scoped to one fixture future, so parallel tests retain production limits.
+    pub(super) static TEST_METADATA_WRITER_BUDGET: usize;
+}
+
+fn metadata_writer_limits() -> (usize, usize) {
+    let budget = METADATA_WRITER_BUDGET;
+    #[cfg(test)]
+    let budget = TEST_METADATA_WRITER_BUDGET
+        .try_with(|budget| *budget)
+        .unwrap_or(budget);
+    (budget / 2, budget)
+}
+
+#[cfg(test)]
+#[test]
+fn metadata_writer_default_limits_reserve_250_within_500() {
+    assert_eq!(metadata_writer_limits(), (250, 500));
+}
+
 /// Keep the existing 500-row writer budget while rotating past retained failed
 /// or option-disabled physical writers. This cursor schedules retries only;
 /// debt/progress remain in the exact publication and metadata receipts.
@@ -1017,10 +1040,15 @@ async fn metadata_tail(
     // Reserve at most half the existing 500-row budget for current exact
     // destinations. Older failed work cannot occupy this lane, and repeated
     // inventory never resets the independent retained/legacy continuation.
+    let (current_reserve, budget) = metadata_writer_limits();
     let current = context
         .capture
         .db
-        .pending_selection_metadata(context.capture.owner.clone(), generation.to_owned(), 250)
+        .pending_selection_metadata(
+            context.capture.owner.clone(),
+            generation.to_owned(),
+            current_reserve,
+        )
         .await?;
     let priority = crate::download::metadata_rewrite::run_pending_rows(
         db.as_ref(),
@@ -1031,7 +1059,7 @@ async fn metadata_tail(
         current,
     )
     .await;
-    let remaining = 500_usize.saturating_sub(priority.fetched);
+    let remaining = budget.saturating_sub(priority.fetched);
     let original = offset;
     let mut result = crate::download::metadata_rewrite::run_pending_budget(
         db.as_ref(),

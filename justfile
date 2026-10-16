@@ -186,7 +186,7 @@ check-contracts:
 release-smoke:
     scripts/full-test/run_release_regression_smoke.sh
 
-# Test dispatcher: offline | fast | scenario NAME | scenarios | live | live-smoke | live-shell | packaging | docker-full | service | host-service | PATTERN.
+# Test dispatcher: offline | fast | stress | scenario NAME | scenarios | live | live-smoke | live-shell | packaging | docker-full | service | host-service | PATTERN.
 test MODE="" *ARGS="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -228,6 +228,9 @@ test MODE="" *ARGS="":
     case "$mode" in
         "")
             cargo test --all-features
+            ;;
+        stress)
+            bash scripts/test-copies-stress.sh
             ;;
         fast)
             cargo test --lib -- --test-threads=1
@@ -347,12 +350,12 @@ cov MODE="" BASE="main":
             cargo llvm-cov report --summary-only
             ;;
         patch)
-            cargo llvm-cov --all-features --lcov --output-path head.lcov
+            cargo llvm-cov --all-features --lcov --output-path head.lcov -- --skip download::orchestration::queue_projection::tests::private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes
             # --detach so the base worktree doesn't collide with any
             # existing checkout of the base branch (e.g. the main repo
             # already sitting on main).
             git worktree add --detach ../.kei-cov-base "{{BASE}}" >/dev/null
-            (cd ../.kei-cov-base && cargo llvm-cov --all-features --lcov --output-path "$OLDPWD/base.lcov")
+            (cd ../.kei-cov-base && cargo llvm-cov --all-features --lcov --output-path "$OLDPWD/base.lcov" -- --skip download::orchestration::queue_projection::tests::private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes)
             git worktree remove ../.kei-cov-base >/dev/null
             python3 .github/scripts/patch_coverage.py \
                 --lcov head.lcov \
