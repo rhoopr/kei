@@ -133,7 +133,7 @@ impl PhotosSession for CrossZoneSession {
 
 fn make_cross_zone_album(
     zone_name: &str,
-    session: CrossZoneSession,
+    session: impl PhotosSession + 'static,
     container_id: Option<Arc<str>>,
     cross_zone_sources: Vec<PhotoAlbum>,
 ) -> PhotoAlbum {
@@ -325,7 +325,9 @@ async fn hydrate_matching_assets_from_changes_stops_after_all_targets_match() {
         changes_master("master-1"),
         changes_asset("asset-1", "master-1"),
     ];
-    let mock = MockPhotosSession::new().ok(canned_changes_page(&records, "token-page1", true));
+    let mock = MockPhotosSession::new()
+        .ok(json!({"records":[]}))
+        .ok(canned_changes_page(&records, "token-page1", true));
     let album = make_album_with_session(100, Box::new(mock));
     let mut missing = FxHashSet::default();
     missing.insert("asset-1".to_string());
@@ -438,4 +440,268 @@ async fn hydrate_matching_master_assets_scans_later_sibling_pages() {
         asset_record_names,
         FxHashSet::from_iter(["asset-target-a", "asset-target-b"])
     );
+}
+
+#[derive(Clone, Copy)]
+enum HydrationLookupReply {
+    Complete,
+    MissingMaster,
+    ForeignOwner,
+    ChangedPair,
+    Deleted,
+    Omitted,
+    Authentication,
+}
+
+#[derive(Clone)]
+struct HydrationLookupSession {
+    catalog: Arc<HashMap<String, Value>>,
+    reply: HydrationLookupReply,
+    requests: Arc<std::sync::Mutex<Vec<Value>>>,
+    scans: Arc<std::sync::atomic::AtomicUsize>,
+    scan_catalog: bool,
+}
+impl HydrationLookupSession {
+    fn new(reply: HydrationLookupReply, masters: usize) -> Self {
+        let mut catalog = HashMap::new();
+        for i in 0..masters {
+            for record in test_records(&format!("master-{i}")) {
+                catalog.insert(record["recordName"].as_str().unwrap().to_owned(), record);
+            }
+        }
+        Self {
+            catalog: Arc::new(catalog),
+            reply,
+            requests: Arc::default(),
+            scans: Arc::default(),
+            scan_catalog: false,
+        }
+    }
+}
+#[async_trait::async_trait]
+impl PhotosSession for HydrationLookupSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        let body: Value = serde_json::from_str(&body)?;
+        if url.contains("/records/lookup?") {
+            self.requests.lock().unwrap().push(body.clone());
+            if matches!(self.reply, HydrationLookupReply::Authentication) {
+                return Err(crate::icloud::photos::session::HttpStatusError {
+                    status: 401,
+                    url: "https://example.invalid".to_owned(),
+                    retry_after: None,
+                    body: None,
+                }
+                .into());
+            }
+            let names = body["records"].as_array().unwrap();
+            assert!(names.len() <= 200);
+            let mut records = Vec::new();
+            for name in names {
+                let id = name["recordName"].as_str().unwrap();
+                if matches!(self.reply, HydrationLookupReply::Omitted)
+                    || (matches!(self.reply, HydrationLookupReply::MissingMaster)
+                        && !id.starts_with("asset-"))
+                {
+                    continue;
+                }
+                if let Some(record) = self.catalog.get(id) {
+                    let mut record = record.clone();
+                    if matches!(self.reply, HydrationLookupReply::ForeignOwner) {
+                        record["zoneID"] =
+                            json!({"zoneName":"PrimarySync","ownerRecordName":"foreign-owner"});
+                    }
+                    if matches!(self.reply, HydrationLookupReply::ChangedPair)
+                        && names.len() > 1
+                        && id.starts_with("asset-")
+                    {
+                        record["fields"]["masterRef"]["value"]["recordName"] =
+                            json!("changed-master");
+                    }
+                    if matches!(self.reply, HydrationLookupReply::Deleted) {
+                        record = json!({"recordName":id,"serverErrorCode":"UNKNOWN_ITEM"});
+                    }
+                    records.push(record);
+                }
+            }
+            return Ok(json!({"records":records}));
+        }
+        assert!(url.contains("/changes/zone?"));
+        self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(
+            json!({"zones":[{"zoneID":body["zones"][0]["zoneID"],"syncToken":"scan-eof","moreComing":false,"records":if self.scan_catalog {self.catalog.values().cloned().collect::<Vec<_>>()} else {Vec::new()}}]}),
+        )
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn issue958_direct_relation_hydration_requires_complete_scoped_pairs() {
+    use std::sync::atomic::Ordering;
+    for reply in [
+        HydrationLookupReply::Complete,
+        HydrationLookupReply::MissingMaster,
+        HydrationLookupReply::ForeignOwner,
+        HydrationLookupReply::ChangedPair,
+        HydrationLookupReply::Deleted,
+        HydrationLookupReply::Omitted,
+    ] {
+        let session = HydrationLookupSession::new(reply, 1);
+        let album = make_album_with_session(100, Box::new(session.clone()));
+        let mut missing = FxHashSet::from_iter(["asset-master-0".to_owned()]);
+        let assets = album
+            .hydrate_matching_assets_from_changes(&mut missing)
+            .await
+            .unwrap();
+        let complete = matches!(reply, HydrationLookupReply::Complete);
+        assert_eq!(assets.len(), usize::from(complete));
+        assert_eq!(missing.is_empty(), complete);
+        assert_eq!(session.scans.load(Ordering::SeqCst), usize::from(!complete));
+        let requests = session.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            if matches!(
+                reply,
+                HydrationLookupReply::Complete
+                    | HydrationLookupReply::MissingMaster
+                    | HydrationLookupReply::ChangedPair
+            ) {
+                2
+            } else {
+                1
+            }
+        );
+        if complete {
+            assert_eq!(assets[0].asset_record_name(), "asset-master-0");
+            assert_eq!(assets[0].source_zone(), Some("PrimarySync"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue958_direct_relation_hydration_batches_and_keeps_missing_targets() {
+    use std::sync::atomic::Ordering;
+    let session = HydrationLookupSession::new(HydrationLookupReply::Complete, 201);
+    let album = make_album_with_session(100, Box::new(session.clone()));
+    let mut missing: FxHashSet<_> = (0..201).map(|i| format!("asset-master-{i}")).collect();
+    missing.insert("asset-omitted".to_owned());
+    let assets = album
+        .hydrate_matching_assets_from_changes(&mut missing)
+        .await
+        .unwrap();
+    assert_eq!(assets.len(), 201);
+    assert_eq!(missing, FxHashSet::from_iter(["asset-omitted".to_owned()]));
+    assert_eq!(session.requests.lock().unwrap().len(), 6);
+    assert_eq!(session.scans.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn issue958_direct_cross_zone_lookup_preserves_source_priority() {
+    use std::sync::atomic::Ordering;
+    let owner = HydrationLookupSession::new(HydrationLookupReply::Omitted, 0);
+    let mut source = HydrationLookupSession::new(HydrationLookupReply::Complete, 1);
+    let mut catalog = (*source.catalog).clone();
+    catalog.get_mut("asset-master-0").unwrap()["fields"]["masterRef"]["value"]["zoneID"]["zoneName"] =
+        json!("SharedSync-synthetic");
+    source.catalog = Arc::new(catalog);
+    let source_album =
+        make_cross_zone_album("SharedSync-synthetic", source.clone(), None, Vec::new());
+    let album = make_album_with_session(100, Box::new(owner.clone()))
+        .with_cross_zone_sources(vec![source_album]);
+    let mut missing = FxHashSet::from_iter(["asset-master-0".to_owned()]);
+    let assets = album
+        .hydrate_matching_assets_from_changes(&mut missing)
+        .await
+        .unwrap();
+    assert!(missing.is_empty());
+    assert_eq!(assets.len(), 1);
+    assert_eq!(assets[0].source_zone(), Some("SharedSync-synthetic"));
+    assert_eq!(owner.requests.lock().unwrap().len(), 1);
+    assert_eq!(source.requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        owner.scans.load(Ordering::SeqCst) + source.scans.load(Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test]
+async fn issue958_direct_relation_auth_failure_stops_without_scanning() {
+    use std::sync::atomic::Ordering;
+    let session = HydrationLookupSession::new(HydrationLookupReply::Authentication, 1);
+    let album = make_album_with_session(100, Box::new(session.clone()));
+    let mut missing = FxHashSet::from_iter(["asset-master-0".to_owned()]);
+    let error = album
+        .hydrate_matching_assets_from_changes(&mut missing)
+        .await
+        .unwrap_err();
+    assert!(crate::icloud::photos::session::is_session_error(&error));
+    assert_eq!(missing.len(), 1);
+    assert_eq!(session.requests.lock().unwrap().len(), 1);
+    assert_eq!(session.scans.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn issue958_hydration_sharing_requires_request_context_and_complete_scope() {
+    let album = make_album_with_session(
+        100,
+        Box::new(HydrationLookupSession::new(
+            HydrationLookupReply::Omitted,
+            0,
+        )),
+    );
+    let mut other = album.clone_for_task_without_sources();
+    assert!(album.shares_hydration_sources_with(&other));
+    other.params = Arc::new((*album.params).clone());
+    assert!(!album.shares_hydration_sources_with(&other));
+    other = album.clone_for_task_without_sources();
+    other.zone_id = Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"foreign-owner"}));
+    assert!(!album.shares_hydration_sources_with(&other));
+    other = album.clone_for_task_without_sources();
+    other.service_endpoint = Arc::from("https://example.invalid/shared");
+    assert!(!album.shares_hydration_sources_with(&other));
+    other = album.clone_for_task_without_sources();
+    other
+        .cross_zone_sources
+        .push(album.clone_for_task_without_sources());
+    assert!(!album.shares_hydration_sources_with(&other));
+    let mut first = album.clone_for_task_without_sources();
+    let mut source_a = album.clone_for_task_without_sources();
+    source_a.zone_id = Arc::new(json!({"zoneName":"SharedSync-a"}));
+    let mut source_b = album.clone_for_task_without_sources();
+    source_b.zone_id = Arc::new(json!({"zoneName":"SharedSync-b"}));
+    let mut reversed = album.clone_for_task_without_sources();
+    reversed.cross_zone_sources = vec![
+        source_b.clone_for_task_without_sources(),
+        source_a.clone_for_task_without_sources(),
+    ];
+    first.cross_zone_sources = vec![source_a, source_b];
+    assert!(!first.shares_hydration_sources_with(&reversed));
+}
+
+#[tokio::test]
+async fn issue958_inconclusive_owner_lookup_cannot_prefer_cross_zone_namesake() {
+    let mut owner = HydrationLookupSession::new(HydrationLookupReply::Omitted, 1);
+    owner.scan_catalog = true;
+    let source = HydrationLookupSession::new(HydrationLookupReply::Complete, 1);
+    let album =
+        make_album_with_session(100, Box::new(owner.clone())).with_cross_zone_sources(vec![
+            make_cross_zone_album("SharedSync-synthetic", source.clone(), None, Vec::new()),
+        ]);
+    let mut missing = FxHashSet::from_iter(["asset-master-0".to_owned()]);
+    let assets = album
+        .hydrate_matching_assets_from_changes(&mut missing)
+        .await
+        .unwrap();
+    assert!(missing.is_empty());
+    assert_eq!(assets.len(), 1);
+    assert_eq!(assets[0].source_zone(), Some("PrimarySync"));
+    assert_eq!(owner.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(source.requests.lock().unwrap().is_empty());
+    assert_eq!(source.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

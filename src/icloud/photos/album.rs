@@ -478,6 +478,24 @@ impl PhotoAlbum {
         )
     }
 
+    /// Share one read only inside a library sync whose albums retain the same
+    /// request context, full zone/owner scope and ordered fallback sources.
+    /// Separate contexts remain separate even when their parameter values match.
+    pub(crate) fn shares_hydration_sources_with(&self, other: &Self) -> bool {
+        let same_source = |left: &Self, right: &Self| {
+            Arc::ptr_eq(&left.params, &right.params)
+                && left.service_endpoint == right.service_endpoint
+                && left.zone_id == right.zone_id
+        };
+        same_source(self, other)
+            && self.cross_zone_sources.len() == other.cross_zone_sources.len()
+            && self
+                .cross_zone_sources
+                .iter()
+                .zip(&other.cross_zone_sources)
+                .all(|(left, right)| same_source(left, right))
+    }
+
     pub(crate) async fn hydrate_matching_assets_from_changes(
         &self,
         missing_asset_record_names: &mut FxHashSet<String>,

@@ -1,7 +1,7 @@
 //! Named-album and durable-identity hydration across source zones.
 
 use super::planning::PhotoStreamProfile;
-use super::{PhotoAlbum, PhotoStream};
+use super::{PhotoAlbum, PhotoStream, ProviderRecordId, RecordLookupRequest, RecordResolution};
 use crate::icloud::photos::asset::{ChangeEvent, DeltaRecordBuffer, PhotoAsset};
 use rustc_hash::FxHashSet;
 use serde_json::Value;
@@ -199,19 +199,68 @@ impl PhotoAlbum {
         &self,
         missing_asset_record_names: &mut FxHashSet<String>,
     ) -> anyhow::Result<Vec<PhotoAsset>> {
-        let mut matched = self
-            .clone_for_task_without_sources()
-            .matching_assets_from_changes(missing_asset_record_names)
-            .await?;
-        for source in self.cross_zone_sources_for_task() {
+        let sources: Vec<_> = std::iter::once(self.clone_for_task_without_sources())
+            .chain(self.cross_zone_sources_for_task())
+            .collect();
+        let mut matched = Vec::new();
+        // Preserve source priority: an inconclusive owner lookup still needs its
+        // fallback before an equal record name in another source can match.
+        for source in &sources {
             if missing_asset_record_names.is_empty() {
                 break;
             }
             matched.extend(
                 source
-                    .matching_assets_from_changes(missing_asset_record_names)
+                    .matching_assets_from_lookup(missing_asset_record_names)
                     .await?,
             );
+            if !missing_asset_record_names.is_empty() {
+                matched.extend(
+                    source
+                        .matching_assets_from_changes(missing_asset_record_names)
+                        .await?,
+                );
+            }
+        }
+        Ok(matched)
+    }
+
+    async fn matching_assets_from_lookup(
+        &self,
+        missing: &mut FxHashSet<String>,
+    ) -> anyhow::Result<Vec<PhotoAsset>> {
+        let mut ids: Vec<_> = missing.iter().collect();
+        ids.sort_unstable();
+        let requests: Vec<_> = ids
+            .into_iter()
+            .map(|id| RecordLookupRequest::asset_only(ProviderRecordId::new(id.as_str())))
+            .collect();
+        let mut pairs = Vec::new();
+        for (child, resolution) in self.resolve_records(&requests).await.results {
+            match resolution {
+                RecordResolution::AssetPresent { master_record_name } => {
+                    pairs.push(RecordLookupRequest::paired(
+                        child.clone(),
+                        master_record_name,
+                        child,
+                    ));
+                }
+                RecordResolution::TransientFailure(error) => return Err(error.into()),
+                _ => {} // Absence or incomplete identity is not hydration proof.
+            }
+        }
+        let mut matched = Vec::new();
+        for (child, resolution) in self.resolve_records(&pairs).await.results {
+            match resolution {
+                RecordResolution::Present(asset)
+                    if asset.asset_record_name() == child.as_str()
+                        && missing.remove(child.as_str()) =>
+                {
+                    matched.push(asset.with_source_zone(Arc::from(self.zone_name())));
+                }
+                RecordResolution::TransientFailure(error) => return Err(error.into()),
+                _ => {}
+            }
         }
         Ok(matched)
     }
