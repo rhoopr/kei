@@ -804,7 +804,8 @@ No owner or record value is emitted.
 
 A paired lookup can retain an inconclusive changed-master hint from a live,
 scoped child. Incremental asset hydration makes at most one additional paired
-lookup in that same scope. Only a complete current pair may update the mapping
+lookup in that same scope during a normal download run. Dry-run and filename-only
+modes retain their prior held behavior. Only a complete current pair may update the mapping
 through the existing state owner. A missing or deleted redirected master,
 foreign scope, another relationship change, cancellation or failed write holds
 the checkpoint. Other lookup consumers keep the hint unresolved. Sparse share

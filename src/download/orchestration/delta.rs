@@ -1233,7 +1233,9 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                         );
                     }
                 }
-                RecordResolution::MasterChanged { master_record_name } if attempt == 0 => {
+                RecordResolution::MasterChanged { master_record_name }
+                    if attempt == 0 && run_mode.downloads_files() =>
+                {
                     // The old pair remains unconfirmed. Only a complete second pair
                     // may update mappings through the ordinary successful path.
                     changed_masters.push((

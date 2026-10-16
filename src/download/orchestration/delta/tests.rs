@@ -1974,6 +1974,8 @@ async fn issue956_changed_master_confirmation_is_bounded_and_retains_unproven_ma
         "malformed_date",
         "mapping_write",
         "cancel",
+        "dry_run",
+        "print_filenames",
     ] {
         let directory = TempDir::new().unwrap();
         let database = directory.path().join("state.db");
@@ -2008,7 +2010,7 @@ async fn issue956_changed_master_confirmation_is_bounded_and_retains_unproven_ma
                     .remove("assetDate");
                 json!({"records":records})
             }
-            "cancel" => json!({"records":records}),
+            "cancel" | "dry_run" | "print_filenames" => json!({"records":records}),
             "mapping_write" => {
                 db.acquire_lock("injected mapping failure").unwrap().execute_batch(
                     "CREATE TRIGGER reject_mapping BEFORE UPDATE ON asset_master_mappings BEGIN SELECT RAISE(ABORT,'synthetic mapping failure'); END;"
@@ -2034,6 +2036,11 @@ async fn issue956_changed_master_confirmation_is_bounded_and_retains_unproven_ma
         let mut config = test_config();
         config.state_db = Some(db.clone() as Arc<dyn DownloadStore>);
         let mut summary = IncrementalDeltaSummary::default();
+        let mode = match fault {
+            "dry_run" => DownloadRunMode::DryRun,
+            "print_filenames" => DownloadRunMode::PrintFilenames,
+            _ => DownloadRunMode::Download,
+        };
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             hydrate_unpaired_created_asset_deltas(
@@ -2041,13 +2048,17 @@ async fn issue956_changed_master_confirmation_is_bounded_and_retains_unproven_ma
                 Some(&pass),
                 &config,
                 &mut summary,
-                DownloadRunMode::Download,
+                mode,
                 &shutdown,
             ),
         )
         .await
         .expect("cancelled provider confirmation must drain");
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "{fault}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            if mode.downloads_files() { 2 } else { 1 },
+            "{fault}"
+        );
         assert!(
             summary.identity_incomplete || summary.state_transition_failures > 0,
             "{fault}"
@@ -2074,7 +2085,7 @@ async fn issue956_changed_master_confirmation_is_bounded_and_retains_unproven_ma
                 .await
                 .unwrap()
                 .as_deref(),
-            (fault != "mapping_write").then_some("1"),
+            (fault != "mapping_write" && mode.downloads_files()).then_some("1"),
             "{fault}"
         );
     }

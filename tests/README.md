@@ -1528,7 +1528,9 @@ records or qualify sparse cross-zone links.
 
 `issue956_changed_master_confirmation_is_bounded_and_retains_unproven_mapping`
 checks omitted/deleted masters, another relationship change, foreign ownership,
-invalid capture dates and failed mapping writes. It asserts at most two provider
+invalid capture dates, failed mapping writes and cancellation of the second read.
+Dry-run and filename-only controls assert one read and no durable mutation.
+The fixture asserts at most two provider
 reads and the original mapping after reopening. Lookup and support-history
 controls distinguish missing/malformed references, actual different-master
 references and provider errors without exposing identifiers. Existing explicit
