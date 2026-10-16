@@ -24,6 +24,7 @@ class HardeningTests(unittest.TestCase):
                 ("qualification.yml", "needs: [quality, artifacts, service, specialized]", "needs: [quality]", "missing qualification guard"),
                 ("qualification.yml", "cargo fetch --locked", "echo missing bootstrap", "missing qualification guard"),
                 ("release.yml", "needs: qualification", "needs: validate", "missing qualification guard"),
+                ("service-smoke.yml", "service-smoke-${{ github.workflow }}-", "service-smoke-${{ github.workflow }}-${{ github.run_id }}-", "cancel obsolete runs"),
                 ("nightly.yml", "contents: read", "contents: write", "publication credentials"),
             ]:
                 path = work / ".github/workflows" / name

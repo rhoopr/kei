@@ -151,6 +151,8 @@ def check_qualification(errors: list[str]) -> None:
 
 def check_service_smoke_paths(errors: list[str]) -> None:
     text = workflow_text("service-smoke.yml")
+    if "group: service-smoke-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}" not in text:
+        errors.append("service-smoke.yml: cancel obsolete runs without cancelling another caller")
     for path in (
         "src/service/**",
         "src/commands/service.rs",
