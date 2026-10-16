@@ -1274,6 +1274,9 @@ fn live_records(
     page[0]["fields"]["resOriginalFileType"] = json!({"value":"public.heic"});
     page[0]["fields"]["resOriginalVidComplRes"] = resource(uri, "live-original-motion", motion);
     page[0]["fields"]["resOriginalVidComplFileType"] = json!({"value":"com.apple.quicktime-movie"});
+    page[1]["fields"]["duration"] = json!({"value":0.0});
+    page[1]["fields"]["vidComplDurValue"] = json!({"value":1160});
+    page[1]["fields"]["vidComplDurScale"] = json!({"value":600});
     if let Some((still, motion)) = edit {
         page[1]["fields"]["resJPEGFullRes"] = resource(uri, "live-edited-still", still);
         page[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.heic"});
@@ -1330,6 +1333,32 @@ async fn primary_layout_real_live_photo_pair_edits_reverts_and_reopens() {
             ..CycleOptions::default()
         };
         let original = live_records(&server.uri(), original_still, original_motion, None);
+        let db_path = root.path().join("state.db");
+        drop(state::SqliteStateDb::open(&db_path).await.unwrap());
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_float_commit BEFORE INSERT ON primary_layout_bindings BEGIN SELECT RAISE(FAIL,'injected float journal interruption'); END").unwrap();
+        let (blocked, _) = cycle_options(
+            root.path(),
+            original.clone(),
+            false,
+            EditedNaming::Primary,
+            options(),
+        )
+        .await;
+        assert!(!blocked.db_sync_token_advance_safe);
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations WHERE phase='publishing'"
+            ),
+            1
+        );
+        assert_bytes(&media.join("IMG_0501.HEIC"), original_still);
+        assert_bytes(&media.join(current_motion), original_motion);
+        conn.execute_batch("DROP TRIGGER fail_float_commit")
+            .unwrap();
+        drop(conn);
+        let requests = server.received_requests().await.unwrap().len();
         let (initial, _) = cycle_options(
             root.path(),
             original.clone(),
@@ -1342,6 +1371,17 @@ async fn primary_layout_real_live_photo_pair_edits_reverts_and_reopens() {
         assert!(initial.db_sync_token_advance_safe);
         assert_bytes(&media.join("IMG_0501.HEIC"), original_still);
         assert_bytes(&media.join(current_motion), original_motion);
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let duration: f64 = conn
+            .query_row(
+                "SELECT duration_secs FROM assets WHERE version_size='live_original'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(duration.to_bits(), (1160.0_f64 / 600.0).to_bits());
+        drop(conn);
         let edited = live_records(
             &server.uri(),
             original_still,

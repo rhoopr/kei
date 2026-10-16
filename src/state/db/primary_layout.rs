@@ -487,9 +487,9 @@ mod tests {
             source: Some(Arc::from("icloud")),
             is_favorite: true,
             rating: Some(5),
-            latitude: Some(12.25),
-            longitude: Some(-45.5),
-            altitude: Some(300.25),
+            latitude: Some(51.248178375505404),
+            longitude: Some(-93.31137037688033),
+            altitude: Some(97.45365320034685),
             orientation: Some(6),
             duration_secs: Some(2.5),
             timezone_offset: Some(12600),
@@ -597,6 +597,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn primary_layout_legacy_float_journal_reopens_saves_and_commits_exactly() {
+        for text in ["1.9333333333333333", "1.9333333333333331"] {
+            let root = tempfile::tempdir().unwrap();
+            let db_path = root.path().join("state.db");
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            let seed = fixture(root.path());
+            db.begin_primary_layout(seed.clone()).await.unwrap();
+            // Literal evidence uses the pre-fix writer's JSON format, without
+            // passing the reported decimal through the decoder under test.
+            let legacy = String::from_utf8(encode(&seed.members[0]).unwrap())
+                .unwrap()
+                .replace(
+                    "\"duration_secs\":2.5",
+                    &format!("\"duration_secs\":{text}"),
+                );
+            db.with_conn("seed_legacy_layout", move |conn| {
+                conn.execute(
+                    "UPDATE primary_layout_members SET evidence=?1",
+                    [legacy.into_bytes()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            drop(db);
+            let duration: f64 = text.parse().unwrap();
+            let mut op = seed;
+            Arc::make_mut(&mut op.members[0].record.as_mut().unwrap().metadata).duration_secs =
+                Some(duration);
+            let mut file = op.members[0].old.clone().unwrap();
+            file.version = "adjusted".into();
+            file.provider_checksum = "new-provider-checksum".into();
+            for phase in ["planned", "prepared", "preserved", "publishing"] {
+                let db = SqliteStateDb::open(&db_path).await.unwrap();
+                let mut loaded = db
+                    .primary_layout_operations(op.source_library.clone())
+                    .await
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+                db.save_primary_layout(loaded.clone()).await.unwrap();
+                let metadata = &loaded.members[0].record.as_ref().unwrap().metadata;
+                assert_eq!(
+                    metadata.duration_secs.unwrap().to_bits(),
+                    duration.to_bits()
+                );
+                assert_eq!(encode(&loaded).unwrap(), encode(&op).unwrap());
+                let mut changed = loaded.clone();
+                Arc::make_mut(&mut changed.members[0].record.as_mut().unwrap().metadata)
+                    .duration_secs = Some(f64::from_bits(duration.to_bits() ^ 1));
+                assert!(db.save_primary_layout(changed).await.is_err());
+                loaded.phase = phase.into();
+                if phase != "planned" {
+                    loaded.members[0].prepared = Some(file.clone());
+                }
+                if matches!(phase, "preserved" | "publishing") {
+                    loaded.members[0].preserved = loaded.members[0].old.clone();
+                }
+                db.save_primary_layout(loaded.clone()).await.unwrap();
+                op = loaded;
+            }
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            op = db
+                .primary_layout_operations(op.source_library.clone())
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            op.members[0].installed = Some(file);
+            db.save_primary_layout(op.clone()).await.unwrap();
+            drop(db);
+            let db = SqliteStateDb::open(&db_path).await.unwrap();
+            op = db
+                .primary_layout_operations(op.source_library.clone())
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            db.commit_primary_layout(op.clone()).await.unwrap();
+            assert!(
+                db.primary_layout_operations(op.source_library.clone())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                db.primary_layout_binding(op.family)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .generation,
+                1
+            );
+            drop(db);
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let persisted: f64 = conn
+                .query_row("SELECT duration_secs FROM assets", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(persisted.to_bits(), duration.to_bits());
+        }
+    }
+
+    #[tokio::test]
     async fn primary_layout_journal_reopen_fences_membership_and_receipt_mutation() {
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("state.db");
@@ -612,9 +715,55 @@ mod tests {
         let mut wrong = op.clone();
         wrong.phase = "publishing".into();
         assert!(db.save_primary_layout(wrong).await.is_err());
+        for field in [
+            "child",
+            "destination",
+            "stage",
+            "title",
+            "hash",
+            "old_bytes",
+            "sidecar",
+        ] {
+            let mut wrong = op.clone();
+            let member = &mut wrong.members[0];
+            match field {
+                "child" => member.record.as_mut().unwrap().id = "other-child".into(),
+                "destination" => {
+                    member.destination = Some(SelectionPath::from_path(&root.path().join("other")))
+                }
+                "stage" => {
+                    member.stage = Some(SelectionPath::from_path(&root.path().join("other")))
+                }
+                "title" => {
+                    Arc::make_mut(&mut member.record.as_mut().unwrap().metadata).title =
+                        Some("changed".into())
+                }
+                "hash" => {
+                    Arc::make_mut(&mut member.record.as_mut().unwrap().metadata).metadata_hash =
+                        Some("changed".into())
+                }
+                "old_bytes" => member.old.as_mut().unwrap().fingerprint.sha256 = [8; 32],
+                "sidecar" => member.old.as_mut().unwrap().sidecar.as_mut().unwrap().size += 1,
+                _ => unreachable!(),
+            }
+            assert!(db.save_primary_layout(wrong).await.is_err(), "{field}");
+        }
         let old = op.members[0].old.clone().unwrap();
         op.members[0].prepared = Some(old.clone());
+        op.members[0].preserved = Some(old.clone());
+        op.members[0].installed = Some(old.clone());
         db.save_primary_layout(op.clone()).await.unwrap();
+        for field in ["preserved", "installed"] {
+            let mut wrong = op.clone();
+            let member = &mut wrong.members[0];
+            let file = if field == "preserved" {
+                &mut member.preserved
+            } else {
+                &mut member.installed
+            };
+            file.as_mut().unwrap().fingerprint.sha256 = [9; 32];
+            assert!(db.save_primary_layout(wrong).await.is_err(), "{field}");
+        }
         let mut wrong = op.clone();
         wrong.members[0]
             .prepared

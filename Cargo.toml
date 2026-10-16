@@ -50,7 +50,8 @@ async-speed-limit = "0.4"
 
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
+# Durable JSON evidence must retain float bits for exact identity checks.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "1"
 
 # Crypto (SRP auth)
