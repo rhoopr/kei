@@ -19,6 +19,12 @@ class NightlyTests(unittest.TestCase):
                      [{**run, "created_at": (now - timedelta(hours=37)).isoformat()}]):
             self.assertFalse(nightly.health(runs, now)[0])
 
+    @patch.object(nightly.subprocess, "check_output", return_value=b"{}")
+    def test_issue_updates_use_patch(self, output):
+        nightly.api("repos/example/repo/issues/1", method="PATCH", state="closed")
+        self.assertEqual(output.call_args.args[0], ["gh", "api", "--method", "PATCH",
+                         "repos/example/repo/issues/1", "-f", "state=closed"])
+
     @patch.object(nightly, "api")
     @patch.object(nightly.subprocess, "check_output")
     def test_only_failure_and_recovery_mutate_issues(self, output, api):
@@ -34,7 +40,7 @@ class NightlyTests(unittest.TestCase):
         api.assert_not_called()
         nightly.notify("example/repo", True, "recovered", "url")
         self.assertEqual(api.call_count, 2)
-        self.assertEqual(api.call_args.kwargs, {"state": "closed"})
+        self.assertEqual(api.call_args.kwargs, {"method": "PATCH", "state": "closed"})
 
 
 if __name__ == "__main__":

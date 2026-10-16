@@ -32,7 +32,8 @@ class LocalRunnerTests(unittest.TestCase):
                 (scripts / name).chmod(0o755)
             shutil.copyfile(ROOT / "scripts/ci/local_release.py", root / "scripts/ci/local_release.py")
             for name in ("cargo", "docker", "just"):
-                executable(root / "bin" / name, 'printf "%s %s\\n" "$(basename "$0")" "$*" >> "$CALLS"\n')
+                executable(root / "bin" / name, 'printf "%s %s\\n" "$(basename "$0")" "$*" >> "$CALLS"\necho "test result: ok. 1 passed; 0 failed; 0 ignored;"\n')
+            executable(scripts / "check_prereqs.sh", ":\n")
             executable(scripts / "run_shell_suites.sh", ":\n")
             executable(scripts / "run_live_import_rehearsal.sh", ":\n")
             executable(scripts / "run_live_smokes.sh", "\n".join(

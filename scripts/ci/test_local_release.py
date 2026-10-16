@@ -10,7 +10,7 @@ class LocalReleaseTests(unittest.TestCase):
     def record(self):
         phases = local_release.BASE_PHASES | local_release.LIVE_COMMANDS | {"test_shell_cli_flags"}
         return {"head": "a" * 40, "end_head": "a" * 40, "start_worktree_clean": True,
-                "end_worktree_clean": True, "phases": {p: {"status": "pass", "exit": 0} for p in phases}}
+                "end_worktree_clean": True, "phases": {p: {"status": "pass", "exit": 0, "tests": 1} for p in phases}}
 
     def test_complete_record(self):
         local_release.validate_record(self.record(), "a" * 40, ["cli-flags"])
@@ -26,6 +26,13 @@ class LocalReleaseTests(unittest.TestCase):
             record = self.record()
             record[field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):
+                local_release.validate_record(record, "a" * 40, ["cli-flags"])
+
+    def test_zero_selected_live_tests_are_rejected(self):
+        for name in ("live_provider", "test_shell_cli_flags"):
+            record = self.record()
+            record["phases"][name]["tests"] = 0
+            with self.assertRaises(ValueError):
                 local_release.validate_record(record, "a" * 40, ["cli-flags"])
 
     def test_latest_owner_attestation_only(self):

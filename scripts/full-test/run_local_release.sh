@@ -25,6 +25,11 @@ if [[ -f .env ]]; then
     source .env
     set +a
 fi
+scripts/full-test/check_prereqs.sh
+[[ ! -e "$KEI_FULL_TEST_RUNS_DIR/.live-skipped" ]] || {
+    echo "local release prerequisites are unavailable; no qualification recorded" >&2
+    exit 1
+}
 export ICLOUD_TEST_COOKIE_DIR="$repo_root/.test-cookies"
 export KEI_DOCKER_IMAGE="${KEI_DOCKER_IMAGE:-kei:local-release}"
 phase() { scripts/full-test/time_phase.sh "$@"; }

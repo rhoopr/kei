@@ -33,6 +33,9 @@ def validate_record(record: dict, sha: str, shell_suites: list[str]) -> None:
         result = phases.get(phase, {})
         if result.get("status") != "pass" or result.get("exit") != 0:
             raise ValueError(f"local release prerequisite did not pass: {phase}")
+    for name in {"live_provider"} | {f"test_shell_{suite.replace('-', '_')}" for suite in shell_suites}:
+        if phases[name].get("tests", 0) <= 0:
+            raise ValueError(f"local prerequisite selected no tests: {name}")
     for name, phase in phases.items():
         if phase.get("status") != "pass" or phase.get("exit") != 0:
             raise ValueError(f"local qualification contains non-passing phase: {name}")

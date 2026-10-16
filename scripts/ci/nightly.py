@@ -11,8 +11,8 @@ MARKER = "<!-- kei-nightly-qualification -->"
 MAX_AGE = timedelta(hours=36)
 
 
-def api(path: str, **fields):
-    command = ["gh", "api", path]
+def api(path: str, *, method: str | None = None, **fields):
+    command = ["gh", "api", "--method", method or ("POST" if fields else "GET"), path]
     for key, value in fields.items():
         command.extend(["-f", f"{key}={value}"])
     return json.loads(subprocess.check_output(command))
@@ -38,7 +38,7 @@ def notify(repo: str, healthy: bool, message: str, url: str) -> None:
     body = f"{message}\n\n{url}\n\nRelease qualification remains independent and must pass on the release commit."
     if healthy and incident:
         api(f"repos/{repo}/issues/{incident['number']}/comments", body=body)
-        api(f"repos/{repo}/issues/{incident['number']}", state="closed")
+        api(f"repos/{repo}/issues/{incident['number']}", method="PATCH", state="closed")
     elif not healthy and not incident:
         api(f"repos/{repo}/issues", title="Nightly qualification needs attention", body=f"{MARKER}\n{body}")
     print(message)

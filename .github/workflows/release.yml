@@ -21,6 +21,9 @@ jobs:
   # Catches version mismatches, missing CHANGELOG, and new advisories
   # before burning 15+ minutes of build time.
   validate:
+    permissions:
+      contents: read
+      statuses: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

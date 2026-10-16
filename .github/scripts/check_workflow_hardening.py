@@ -95,7 +95,7 @@ def check_release(errors: list[str]) -> None:
         errors.append("release.yml: missing top-level read-only token permissions")
     if "cargo build --locked --release --target ${{ matrix.target }}" not in workflow_text("artifacts.yml"):
         errors.append("release.yml: release builds must use cargo build --locked")
-    for needle in ("needs: qualification", "needs: [qualification, release]", "needs: [release, containers]",
+    for needle in ("statuses: read", "needs: qualification", "needs: [qualification, release]", "needs: [release, containers]",
                    "scripts/ci/local_release.py check", "uses: ./.github/workflows/qualification.yml",
                    "python3 scripts/ci/artifact.py verify", "docker load --input"):
         if needle not in text:
