@@ -337,3 +337,37 @@ fn hydration_wait_contract_retains_only_fixed_phases_outcomes_and_unsigned_time(
             .is_empty()
     );
 }
+
+#[test]
+fn missing_reference_contract_rejects_private_and_numeric_categories() {
+    let expected = json!({"record_history":"replacement", "prior_reference":"present",
+        "sparse_marker":"true", "linkage":"all_fields", "lookup_outcome":"live_reference", "lookup_family":"candidate"});
+    assert_eq!(
+        serde_json::Value::Object(
+            privacy::diagnostic(
+                "support_missing_reference_v1",
+                expected.as_object().unwrap()
+            )
+            .unwrap()
+        ),
+        expected
+    );
+    for value in [
+        json!(42),
+        json!("private-provider-value"),
+        json!({"nested":"private"}),
+        json!(null),
+    ] {
+        let fields = expected
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| (key.clone(), value.clone()))
+            .collect();
+        assert!(
+            privacy::diagnostic("support_missing_reference_v1", &fields)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}

@@ -2092,6 +2092,14 @@ cycles or accounts. The recovery snapshot repeats the initial evidence so histor
 retention cannot silently sever cross-round relationships. This evidence has no
 consumer in enumeration, recovery or checkpoint policy.
 
+`photos/album/preservation_proof/missing_reference.rs` owns observation-only
+lookup at the first missing-parent inventory refusal. A bounded side table records
+raw arrival shape before compaction without changing inventory byte accounting.
+`PhotosSession::post_diagnostic` uses a dedicated 64 KiB transport with fixed errors,
+no request dumps, error-body logging or retries. The caller owns cancellation and
+a five-second deadline. Its response never enters inventory or proof construction;
+only fixed categories enter support history and export.
+
 Random process-local aliases are bounded and renumbered at collection time.
 Counts are scoped observations and must not be added as unique asset counts.
 SQL observations before transaction commit are explicitly identified as attempts.

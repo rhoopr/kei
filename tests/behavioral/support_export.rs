@@ -365,6 +365,13 @@ fn support_export_owner_provenance_roundtrip_preserves_old_unavailable_fields() 
             json!({"phase":"primary_publication","database":"private","zone_class":"primary",
             "owner":"private_default","owner_type":"string","selected_indexing":true,"qualification_published":true}),
         ),
+        diagnostic(
+            "support_missing_reference_v1",
+            json!({
+            "record_history":"replacement", "prior_reference":"present", "sparse_marker":"true",
+            "linkage":"partial_fields", "lookup_outcome":"live_reference", "lookup_family":"candidate",
+            "raw_reference":"PRIVATE_REFERENCE_CANARY"}),
+        ),
     ]);
     let old = cycle(vec![
         diagnostic(
@@ -420,6 +427,11 @@ fn support_export_owner_provenance_roundtrip_preserves_old_unavailable_fields() 
     assert_eq!(events[4]["fields"]["primary_eligibility"], "eligible");
     assert_eq!(events[5]["fields"]["zone_class"], "other");
     assert_eq!(events[6]["fields"]["phase"], "primary_publication");
+    assert_eq!(
+        events[7]["fields"],
+        json!({"record_history":"replacement", "prior_reference":"present",
+        "sparse_marker":"true", "linkage":"partial_fields", "lookup_outcome":"live_reference", "lookup_family":"candidate"})
+    );
     // Missing historical fields remain unavailable. They are never synthesized
     // into an observed absent owner or a false primary-publication decision.
     for key in [

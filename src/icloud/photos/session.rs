@@ -36,6 +36,18 @@ async fn dump_body(dir: &std::path::Path, id: usize, kind: &str, body: &str) {
     }
 }
 
+/// Fixed diagnostic failures contain no URL, body, credentials or provider text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticLookupError {
+    Unavailable,
+    Request,
+    HttpStatus,
+    TooLarge,
+    Malformed,
+}
+
+const DIAGNOSTIC_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// Async HTTP session trait for the photos service.
 ///
 /// Abstracted as a trait so album/library code can be tested with stubs
@@ -48,6 +60,17 @@ pub trait PhotosSession: Send + Sync {
         body: String,
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value>;
+
+    /// Optional diagnostic transport: no retries, body dumps or error-body logs.
+    /// Adapters must opt in; falling back to ordinary post can expose secrets.
+    async fn post_diagnostic(
+        &self,
+        _url: &str,
+        _body: String,
+        _headers: &[(&str, &str)],
+    ) -> Result<Value, DiagnosticLookupError> {
+        Err(DiagnosticLookupError::Unavailable)
+    }
 
     /// Bounded original changes response. Value-based test/session adapters can
     /// use the default; live reqwest and SharedSession preserve original bytes.
@@ -90,6 +113,43 @@ impl PhotosSession for reqwest::Client {
             dump_body(dir, *id, "res", &json.to_string()).await;
         }
         Ok(json)
+    }
+
+    async fn post_diagnostic(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> Result<Value, DiagnosticLookupError> {
+        let mut builder = self.post(url).body(body);
+        for &(key, value) in headers {
+            builder = builder.header(key, value);
+        }
+        let mut response = builder
+            .send()
+            .await
+            .map_err(|_private_error| DiagnosticLookupError::Request)?;
+        if !response.status().is_success() {
+            return Err(DiagnosticLookupError::HttpStatus);
+        }
+        if response
+            .content_length()
+            .is_some_and(|n| n > DIAGNOSTIC_RESPONSE_BYTES as u64)
+        {
+            return Err(DiagnosticLookupError::TooLarge);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_private_error| DiagnosticLookupError::Request)?
+        {
+            if chunk.len() > DIAGNOSTIC_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+                return Err(DiagnosticLookupError::TooLarge);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_private_error| DiagnosticLookupError::Malformed)
     }
 
     async fn post_changes_body(
@@ -220,6 +280,16 @@ impl PhotosSession for crate::auth::SharedSession {
     ) -> anyhow::Result<Value> {
         let client = self.read().await.http_client().clone();
         PhotosSession::post(&client, url, body, headers).await
+    }
+
+    async fn post_diagnostic(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> Result<Value, DiagnosticLookupError> {
+        let client = self.read().await.http_client().clone();
+        PhotosSession::post_diagnostic(&client, url, body, headers).await
     }
 
     async fn post_changes_body(
@@ -641,6 +711,100 @@ pub fn check_changes_zone_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_reference_transport_bounds_and_redacts_real_http_failures() {
+        use crate::test_helpers::TracingCapture;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let (capture, _guard) = TracingCapture::install();
+        let server = MockServer::start().await;
+        for (route, status, body, expected) in [
+            ("valid", 200, "{}".to_owned(), Ok(serde_json::json!({}))),
+            (
+                "private-url",
+                421,
+                "private-response-token".to_owned(),
+                Err(DiagnosticLookupError::HttpStatus),
+            ),
+            (
+                "malformed",
+                200,
+                "private-invalid-json".to_owned(),
+                Err(DiagnosticLookupError::Malformed),
+            ),
+            (
+                "oversize",
+                200,
+                "x".repeat(DIAGNOSTIC_RESPONSE_BYTES + 1),
+                Err(DiagnosticLookupError::TooLarge),
+            ),
+        ] {
+            Mock::given(method("POST"))
+                .and(path(format!("/{route}")))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert_eq!(
+                PhotosSession::post_diagnostic(
+                    &reqwest::Client::new(),
+                    &format!("{}/{route}?token=private-query-token", server.uri()),
+                    "private-request-token".into(),
+                    &[]
+                )
+                .await,
+                expected
+            );
+        }
+        for event in capture.events() {
+            assert!(
+                event
+                    .fields
+                    .values()
+                    .all(|value| !value.contains("private-"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_reference_transport_bounds_chunked_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let chunk = vec![b'x'; 4096];
+            for _ in 0..17 {
+                if socket.write_all(b"1000\r\n").await.is_err()
+                    || socket.write_all(&chunk).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+        assert_eq!(
+            PhotosSession::post_diagnostic(
+                &reqwest::Client::new(),
+                &format!("http://{address}"),
+                "{}".into(),
+                &[]
+            )
+            .await,
+            Err(DiagnosticLookupError::TooLarge)
+        );
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn normal_photos_transport_retains_decode_error_retry_classification() {

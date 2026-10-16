@@ -541,3 +541,41 @@ fn issue956_pair_reference_reasons_survive_history_reopen_without_private_fields
             .contains("PRIVATE_RECORD_CANARY")
     );
 }
+
+#[test]
+fn missing_reference_history_survives_restart_and_revalidates_export() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("support.json");
+    let mut history = History {
+        schema_version: 1,
+        ..History::default()
+    };
+    apply(&mut history, Message::Begin(json!({})));
+    let fields = json!({"record_history":"replacement", "prior_reference":"unavailable",
+        "sparse_marker":"not_recorded", "linkage":"not_recorded", "lookup_outcome":"http_error", "lookup_family":"not_established"});
+    add(
+        &mut history,
+        "support_missing_reference_v1",
+        fields.as_object().unwrap().clone(),
+    );
+    apply(
+        &mut history,
+        Message::Complete(json!({}), "partial_failure"),
+    );
+    save(&path, &mut history).unwrap();
+    let (reopened, status) = read(&path);
+    assert_eq!(status, "available");
+    let diagnostic = &reopened.cycles[0].diagnostics[0];
+    assert_eq!(diagnostic.kind, "support_missing_reference_v1");
+    assert_eq!(serde_json::Value::Object(diagnostic.fields.clone()), fields);
+    let mut poisoned: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    poisoned["cycles"][0]["diagnostics"][0]["fields"]["lookup_family"] =
+        json!("private-provider-id");
+    std::fs::write(&path, serde_json::to_vec(&poisoned).unwrap()).unwrap();
+    assert!(
+        !serde_json::to_string(&read(&path).0)
+            .unwrap()
+            .contains("private-provider-id")
+    );
+}

@@ -166,3 +166,24 @@ A null means drainage was not observed. `passes_omitted`, `rows_rejected`
 and `rows_unavailable`, together with the existing history/queue omission counts,
 identify partial evidence. Older exports have no such record, and cannot recover
 these relationships retroactively. Unanimity and checkpoint holds are unchanged.
+
+### Missing parent-reference observations
+
+When a legacy preservation inventory refuses a live child with no parent
+reference, `support_missing_reference_v1` describes the first refusal in that
+inventory attempt. One exact scoped lookup may observe the child's current
+reference. It has no retries, a five-second deadline and a 64 KiB response cap.
+Cancellation ends the lookup. Collection itself remains offline.
+
+Only fixed categories are retained: first-seen versus replacement, the immediately
+retained prior reference shape, sparse-marker shape, linkage-field presence and
+lookup outcome. Tracking is capped at 64 missing-reference identities of at most
+512 bytes each; unavailable observations are explicit. Compacted tombstones do
+not establish the prior reference shape. Linkage-field presence does not prove
+valid linkage. No names, references, owners, tokens, URLs or error bodies are saved.
+
+A candidate/noncandidate family comparison requires explicit matching child and
+reference scopes in the lookup response. It describes that later lookup, not
+membership at the inventory cursor. The original inventory refusal, proof and
+checkpoint hold remain unchanged even when a current parent is found. A missing
+observation in an older export is not evidence that the condition was absent.
