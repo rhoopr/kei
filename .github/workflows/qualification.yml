@@ -1,0 +1,103 @@
+name: Heavy qualification
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+    with:
+      heavy: true
+
+  artifacts:
+    uses: ./.github/workflows/artifacts.yml
+
+  service:
+    uses: ./.github/workflows/service-smoke.yml
+
+  specialized:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.94.1"
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          toolchain: "nightly-2026-05-15"
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libimage-exiftool-perl
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: qualification-specialized
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.10
+          sha256: 1f5e8795d24073904ef20ba70c1250ad6389d8c5672226d152e0ed24909ba72f
+          mise_toml: |
+            [tools]
+            just = "1.50.0"
+      - name: Install bounded fuzz runner
+        run: cargo +1.94.1 install --locked cargo-fuzz --version 0.13.1
+      - name: Fuzz every registered target with checked-in seeds
+        run: |
+          set -euo pipefail
+          cargo +nightly-2026-05-15 fuzz build
+          mapfile -t targets < <(cargo +nightly-2026-05-15 fuzz list)
+          test "${#targets[@]}" -gt 0
+          for target in "${targets[@]}"; do
+            mkdir -p "fuzz/corpus/$target"
+            seeds=()
+            if [[ -d "fuzz/seeds/$target" ]]; then seeds+=("fuzz/seeds/$target"); fi
+            cargo +nightly-2026-05-15 fuzz run "$target" "fuzz/corpus/$target" "${seeds[@]}" -- -max_total_time=10 -timeout=10
+          done
+      - name: Source-package and optimized regressions
+        run: |
+          set -euo pipefail
+          rustup default 1.94.1
+          just test packaging
+          cargo test --locked --release --all-features --lib
+      - name: Record the ignored-test inventory without running live tests
+        run: cargo test --locked --all-features -- --ignored --list > ignored-tests.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qualification-inventory
+          path: ignored-tests.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  qualified:
+    name: Heavy qualification result
+    if: always()
+    needs: [quality, artifacts, service, specialized]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Require every qualification result
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci/gate.py quality artifacts service specialized
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: candidate-*
+          path: candidate
+          merge-multiple: true
+      - name: Validate the complete artifact set and write qualification receipt
+        run: python3 scripts/ci/artifact.py verify
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qualification-receipt
+          path: candidate/qualification.json
+          if-no-files-found: error
+          retention-days: 14

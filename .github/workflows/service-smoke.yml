@@ -21,6 +21,7 @@ name: Service smoke
 # against the kei-test album.
 
 on:
+  workflow_call:
   pull_request:
     paths:
       - 'src/service/**'
@@ -35,7 +36,7 @@ on:
       - '.github/workflows/service-smoke.yml'
 
 concurrency:
-  group: service-smoke-${{ github.event.pull_request.number || github.ref }}
+  group: service-smoke-${{ github.workflow }}-${{ github.run_id }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:

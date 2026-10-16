@@ -1,0 +1,108 @@
+name: Candidate artifacts
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  RUST_STABLE_TOOLCHAIN: "1.94.1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  archive:
+    name: Archive (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            name: kei-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            name: kei-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            name: kei-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-15
+            name: kei-macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: kei-windows-x86_64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libimage-exiftool-perl
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: archive-${{ matrix.target }}
+      - name: Build the candidate
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package and test the extracted binary
+        run: python3 scripts/ci/artifact.py package "${{ matrix.target }}" "${{ matrix.name }}"
+      - name: Optimized CLI and media regressions
+        run: cargo test --locked --release --all-features --test cli --test media_fixtures --test service_cli
+        env:
+          KEI_REQUIRE_HEIF_ORACLE: ${{ runner.os == 'Linux' && '1' || '' }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: candidate-${{ matrix.name }}
+          path: candidate/*
+          if-no-files-found: error
+          retention-days: 14
+
+  container:
+    name: Container (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-24.04
+          - arch: arm64
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          push: false
+          tags: kei:candidate
+          cache-from: type=gha,scope=qualified-${{ matrix.arch }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,mode=max,scope=qualified-{0}', matrix.arch) || '' }}
+      - name: Test the image that will be published
+        env:
+          KEI_DOCKER_IMAGE: kei:candidate
+        run: |
+          set -euo pipefail
+          docker run --rm kei:candidate --version
+          docker run --rm kei:candidate --help
+          bash scripts/full-test/run_docker_puid_smoke.sh
+          python3 scripts/ci/artifact.py container "${{ matrix.arch }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: candidate-container-${{ matrix.arch }}
+          path: candidate/*
+          if-no-files-found: error
+          retention-days: 14

@@ -1,6 +1,11 @@
 name: Rust CI
 
 on:
+  workflow_call:
+    inputs:
+      heavy:
+        type: boolean
+        default: false
   pull_request:
   push:
     branches: [main]
@@ -12,7 +17,7 @@ on:
 # Only the latest commit matters; older runs would just burn minutes.
 concurrency:
   # Partial stress runs must not cancel a complete main CI run.
-  group: ci-${{ github.event.pull_request.number || github.ref }}${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '-stress' || '' }}
+  group: ci-${{ inputs.heavy && format('qualification-{0}-', github.run_id) || '' }}${{ github.event.pull_request.number || github.ref }}${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '-stress' || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -46,8 +51,14 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           EVENT_NAME: ${{ github.event_name }}
+          HEAVY: ${{ inputs.heavy }}
         run: |
           set -euo pipefail
+
+          if [[ "${HEAVY:-false}" == "true" ]]; then
+            printf 'code=true\ncargo=true\nstress=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # Scheduled/manual runs exercise the stress route without repeating
           # the regular matrix. Main pushes run both routes.
@@ -290,7 +301,7 @@ jobs:
   coverage-head:
     name: Coverage (head)
     needs: detect
-    if: github.event_name == 'pull_request' && needs.detect.outputs.code == 'true'
+    if: inputs.heavy || (github.event_name == 'pull_request' && needs.detect.outputs.code == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -380,7 +391,7 @@ jobs:
     name: Coverage
     runs-on: ubuntu-latest
     needs: [coverage-head, coverage-base]
-    if: always() && needs.coverage-head.result == 'success'
+    if: always() && github.event_name == 'pull_request' && needs.coverage-head.result == 'success'
     permissions:
       contents: read
     steps:
@@ -620,7 +631,7 @@ jobs:
   # out) count as success; only real failures or cancellations block.
   # The branch ruleset should require this name and nothing else.
   ci:
-    name: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'Stress CI' || 'CI' }}
+    name: ${{ inputs.heavy && 'Qualification checks' || (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'Stress CI' || 'CI' }}
     if: always()
     needs:
       - detect
@@ -633,6 +644,7 @@ jobs:
       - docs
       - unused-deps
       - lockfile
+      - coverage-head
       - coverage
       - security
       - workflow-hardening

@@ -1644,8 +1644,8 @@ fn copies_stress_routes_relevant_changes_and_explicit_events() {
     );
     assert!(ci.contains("  schedule:\n"));
     assert!(ci.contains("  workflow_dispatch:\n"));
-    assert!(ci.contains("group: ci-${{ github.event.pull_request.number || github.ref }}${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '-stress' || '' }}"));
-    assert!(ci.split_once("  ci:\n").unwrap().1.contains("name: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'Stress CI' || 'CI' }}"));
+    assert!(ci.contains("group: ci-${{ inputs.heavy && format('qualification-{0}-', github.run_id) || '' }}${{ github.event.pull_request.number || github.ref }}${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '-stress' || '' }}"));
+    assert!(ci.split_once("  ci:\n").unwrap().1.contains("name: ${{ inputs.heavy && 'Qualification checks' || (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'Stress CI' || 'CI' }}"));
     assert_eq!(
         repo_file("justfile")
             .matches(" -- --skip download::orchestration::queue_projection::tests::private_300_")

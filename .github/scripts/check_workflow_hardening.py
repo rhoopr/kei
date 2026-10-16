@@ -30,6 +30,11 @@ def check_action_refs(errors: list[str]) -> None:
                 continue
 
             ref = match.group(1)
+            # Local reusable workflows resolve at the caller's exact commit.
+            if re.fullmatch(r"\./\.github/workflows/[a-z0-9_-]+\.yml", ref):
+                if not Path(ref).is_file():
+                    errors.append(f"{path}:{line_no}: missing reusable workflow: {ref}")
+                continue
             parts = ref.rsplit("@", maxsplit=1)
             if len(parts) != 2:
                 errors.append(f"{path}:{line_no}: action ref is missing @: {ref}")
