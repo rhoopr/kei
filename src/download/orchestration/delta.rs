@@ -1323,8 +1323,22 @@ pub(super) async fn hydrate_missing_selected_relation_assets(
             .entry(relation.asset_record_name.to_string())
             .or_default()
             .extend(pass_indices.iter().copied());
+        let Some(pass) = passes.get(pass_index) else {
+            continue;
+        };
+        // Union targets before reading. There is no cached absence result:
+        // interrupted/erroring reads cannot suppress another cycle's work.
+        let hydrator = missing_by_hydrator
+            .keys()
+            .copied()
+            .find(|index| {
+                passes.get(*index).is_some_and(|existing| {
+                    pass.album.shares_hydration_sources_with(&existing.album)
+                })
+            })
+            .unwrap_or(pass_index);
         missing_by_hydrator
-            .entry(pass_index)
+            .entry(hydrator)
             .or_default()
             .insert(relation.asset_record_name.to_string());
     }
@@ -1362,7 +1376,7 @@ pub(super) async fn hydrate_missing_selected_relation_assets(
             Err(e) => {
                 tracing::warn!(
                     pass_index,
-                    error = %e,
+                    session_error = is_provider_session_error(&e),
                     "Failed to hydrate missing selected album relation assets"
                 );
                 delta_summary.record_provider_error(e);
