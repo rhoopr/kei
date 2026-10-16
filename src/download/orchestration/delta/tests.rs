@@ -2015,7 +2015,7 @@ async fn issue956_changed_master_confirmation_is_bounded_and_retains_unproven_ma
                 ).unwrap();
                 json!({"records":records})
             }
-            _ => unreachable!(),
+            _ => panic!("unexpected synthetic fault: {fault}"),
         };
         let calls = Arc::new(AtomicUsize::new(0));
         let shutdown = CancellationToken::new();

@@ -800,7 +800,7 @@ async fn issue956_pair_rejections_distinguish_hints_from_missing_references_and_
             "soft_deleted" => child["fields"]["isDeleted"] = json!({"value":1,"type":"INT64"}),
             "wrong_type" => child["recordType"] = json!("CPLAlbum"),
             "different" => {}
-            _ => unreachable!(),
+            _ => panic!("unexpected synthetic fault: {fault}"),
         }
         let request = lookup_request("child", "master", "child");
         assert_eq!(
