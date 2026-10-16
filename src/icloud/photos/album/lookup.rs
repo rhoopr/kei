@@ -498,7 +498,13 @@ impl PhotoAlbum {
                     RecordResolution::Unknown
                 } else if !pair_matches {
                     asset
-                        .filter(|record| record.get("serverErrorCode").is_none_or(Value::is_null))
+                        .filter(|record| {
+                            !primary_deleted
+                                && master.is_none_or(|master| {
+                                    master.get("serverErrorCode").is_none_or(Value::is_null)
+                                })
+                                && record.get("serverErrorCode").is_none_or(Value::is_null)
+                        })
                         .and_then(|record| {
                             serde_json::from_value::<cloudkit::Record>(record.clone()).ok()
                         })

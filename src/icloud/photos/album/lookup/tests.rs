@@ -778,11 +778,13 @@ async fn issue956_pair_rejections_distinguish_hints_from_missing_references_and_
         ("malformed", "master_reference_malformed"),
         ("blank", "master_reference_malformed"),
         ("provider_error", "record_provider_error"),
+        ("master_error", "record_provider_error"),
+        ("master_deleted", "child_master_mismatch"),
         ("sparse", "master_reference_missing"),
         ("soft_deleted", "child_master_mismatch"),
         ("wrong_type", "child_master_mismatch"),
     ] {
-        let master = test_master_record("master");
+        let mut master = test_master_record("master");
         let mut child = test_asset_record_for("child", "other-master");
         match fault {
             "missing" | "provider_error" => {
@@ -797,6 +799,8 @@ async fn issue956_pair_rejections_distinguish_hints_from_missing_references_and_
                 child["fields"] =
                     crate::test_helpers::sparse_shared_asset_record()["fields"].clone()
             }
+            "master_error" => master["serverErrorCode"] = json!("ACCESS_DENIED"),
+            "master_deleted" => master["deleted"] = json!(true),
             "soft_deleted" => child["fields"]["isDeleted"] = json!({"value":1,"type":"INT64"}),
             "wrong_type" => child["recordType"] = json!("CPLAlbum"),
             "different" => {}
