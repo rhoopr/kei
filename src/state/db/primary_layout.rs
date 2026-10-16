@@ -744,7 +744,7 @@ mod tests {
                 }
                 "old_bytes" => member.old.as_mut().unwrap().fingerprint.sha256 = [8; 32],
                 "sidecar" => member.old.as_mut().unwrap().sidecar.as_mut().unwrap().size += 1,
-                _ => unreachable!(),
+                _ => panic!("unexpected journal mutation: {field}"),
             }
             assert!(db.save_primary_layout(wrong).await.is_err(), "{field}");
         }
