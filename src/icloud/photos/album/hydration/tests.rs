@@ -670,6 +670,18 @@ fn issue958_hydration_sharing_requires_request_context_and_complete_scope() {
         .cross_zone_sources
         .push(album.clone_for_task_without_sources());
     assert!(!album.shares_hydration_sources_with(&other));
+    let mut first = album.clone_for_task_without_sources();
+    let mut source_a = album.clone_for_task_without_sources();
+    source_a.zone_id = Arc::new(json!({"zoneName":"SharedSync-a"}));
+    let mut source_b = album.clone_for_task_without_sources();
+    source_b.zone_id = Arc::new(json!({"zoneName":"SharedSync-b"}));
+    let mut reversed = album.clone_for_task_without_sources();
+    reversed.cross_zone_sources = vec![
+        source_b.clone_for_task_without_sources(),
+        source_a.clone_for_task_without_sources(),
+    ];
+    first.cross_zone_sources = vec![source_a, source_b];
+    assert!(!first.shares_hydration_sources_with(&reversed));
 }
 
 #[tokio::test]

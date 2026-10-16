@@ -2098,6 +2098,7 @@ type AlbumScanCalls = Vec<(String, Option<String>)>;
 struct AlbumScanProbe {
     params: Arc<std::collections::HashMap<String, Value>>,
     lookup_calls: Arc<AtomicUsize>,
+    lookup_ids: Arc<std::sync::Mutex<Vec<String>>>,
     lookup_error: Option<u16>,
     calls: Arc<std::sync::Mutex<AlbumScanCalls>>,
     pages: usize,
@@ -2116,6 +2117,14 @@ impl PhotosSession for AlbumScanProbe {
     ) -> anyhow::Result<Value> {
         if url.contains("/records/lookup?") {
             self.lookup_calls.fetch_add(1, Ordering::SeqCst);
+            let request: Value = serde_json::from_str(&body)?;
+            self.lookup_ids.lock().unwrap().extend(
+                request["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|record| record["recordName"].as_str().unwrap().to_owned()),
+            );
             if let Some(status) = self.lookup_error {
                 return Err(crate::icloud::photos::session::HttpStatusError {
                     status,
@@ -2202,6 +2211,7 @@ async fn issue958_scan_target_position_and_absence_measure_pages() {
         let probe = AlbumScanProbe {
             params: Arc::default(),
             lookup_calls: Arc::default(),
+            lookup_ids: Arc::default(),
             lookup_error: None,
             calls: Arc::default(),
             pages: 3,
@@ -2229,18 +2239,21 @@ async fn issue958_scan_target_position_and_absence_measure_pages() {
 async fn issue958_album_groups_share_one_fallback_per_source() {
     use super::super::context::LegacyOwnerClaimMode;
     use super::super::selection::IncrementalPassRouting;
-    for (cross_zone, groups, target_page, lookup_error) in [
-        (false, 2, None, None),
-        (true, 2, None, None),
-        (false, 25, None, None),
-        (true, 25, None, None),
-        (false, 2, Some(1), None),
-        (false, 2, None, Some(401)),
+    for (cross_zone, groups, target_page, lookup_error, distinct_targets) in [
+        (false, 2, None, None, false),
+        (true, 2, None, None, false),
+        (false, 25, None, None, false),
+        (true, 25, None, None, false),
+        (false, 2, Some(1), None, false),
+        (false, 2, None, Some(401), false),
+        (false, 2, None, None, true),
+        (true, 2, None, None, true),
     ] {
         let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let probe = AlbumScanProbe {
             params: Arc::default(),
             lookup_calls: Arc::default(),
+            lookup_ids: Arc::default(),
             lookup_error,
             calls: Arc::default(),
             pages: 3,
@@ -2278,6 +2291,8 @@ async fn issue958_album_groups_share_one_fallback_per_source() {
                     c,
                     if target_page.is_some() {
                         "asset-MATCH"
+                    } else if distinct_targets {
+                        c
                     } else {
                         "asset-MISSING"
                     },
@@ -2329,6 +2344,27 @@ async fn issue958_album_groups_share_one_fallback_per_source() {
             );
             continue;
         }
+        let expected_ids: rustc_hash::FxHashSet<String> = if distinct_targets {
+            containers.iter().cloned().collect()
+        } else {
+            [if target_page.is_some() {
+                "asset-MATCH".to_owned()
+            } else {
+                "asset-MISSING".to_owned()
+            }]
+            .into_iter()
+            .collect()
+        };
+        assert_eq!(
+            probe
+                .lookup_ids
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<rustc_hash::FxHashSet<_>>(),
+            expected_ids
+        );
         assert_eq!(started.elapsed().as_secs(), calls.len() as u64);
         let scans = if target_page.is_some() {
             1
@@ -2363,6 +2399,7 @@ async fn issue958_cross_zone_hydration_preserves_source_and_stops_at_match() {
     let probe = AlbumScanProbe {
         params: Arc::default(),
         lookup_calls: Arc::default(),
+        lookup_ids: Arc::default(),
         lookup_error: None,
         calls: Arc::default(),
         pages: 3,
@@ -2402,6 +2439,7 @@ async fn issue958_cancel_paged_scan_explains_orphan_buffer_warning() {
     let probe = AlbumScanProbe {
         params: Arc::default(),
         lookup_calls: Arc::default(),
+        lookup_ids: Arc::default(),
         lookup_error: None,
         calls: Arc::default(),
         pages: 3,
