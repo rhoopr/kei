@@ -236,6 +236,10 @@ async fn asset_identity_diagnostics_use_only_bounded_redacted_labels() {
             std::fs::File::create(&log_path).unwrap(),
         ))
         .finish();
+    // Keep two dispatchers registered: tracing-core's single-dispatcher fast
+    // path can otherwise cache this callsite as disabled when another test
+    // thread first registers it without a thread-local subscriber.
+    let _parallel_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let _guard = tracing::subscriber::set_default(subscriber);
     let zone = json!({"zoneName": "PrimarySync"});
     let mut missing = test_asset_record_for("private-child", "private-master");
