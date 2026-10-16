@@ -720,6 +720,7 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     Mock::given(method("GET"))
         .and(path("/expired-hydrated.jpg"))
         .respond_with(ResponseTemplate::new(410))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -729,9 +730,10 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
         .and(path("/fresh-hydrated.jpg"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_bytes(body)
+                .set_body_bytes(body.clone())
                 .insert_header("content-type", "image/jpeg"),
         )
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -750,13 +752,21 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
         )]
     };
 
-    let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+    let dir = TempDir::new().expect("temp dir");
+    let database = dir.path().join("state.db");
+    let sentinel = dir.path().join("existing.jpg");
+    std::fs::write(&sentinel, b"existing synthetic media").unwrap();
+    let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
     seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
-    let album_session = SharedChangesZoneSession::new(vec![
-        changes_zone_response(relation_records(), "zone-token-next"),
-        changes_zone_response(stale_records, "zone-token-next"),
-        changes_zone_response(fresh_records, "zone-token-next"),
-    ]);
+    // The first two lookups hydrate the relation with a stale URL. Only the
+    // expiry-recovery child/pair lookups observe the later fresh URL.
+    let lookup_calls = Arc::new(AtomicUsize::new(0));
+    let album_session = AssetOnlyExpiredUrlSession {
+        delta_records: Arc::new(relation_records()),
+        lookup_records: Arc::new(stale_records),
+        hydration_records: Arc::new(fresh_records),
+        lookup_calls: lookup_calls.clone(),
+    };
     let passes = vec![AlbumPass {
         kind: PassKind::Album,
         album: album_with_session_and_container(
@@ -769,7 +779,6 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     }];
 
     let mut config = test_config();
-    let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
     config.concurrent_downloads = 1;
     config.folder_structure_albums = Arc::from("{album}");
@@ -781,7 +790,7 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     let result = download_photos_with_sync(
         &Client::new(),
         &passes,
-        Arc::new(config),
+        Arc::new(config.clone()),
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
@@ -799,6 +808,77 @@ async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
     let summary = db.get_summary().await.expect("summary");
     assert_eq!(summary.downloaded, 1);
     assert_eq!(summary.failed, 0);
+    assert_eq!(lookup_calls.load(Ordering::SeqCst), 4);
+    config.state_db = None;
+    drop(db);
+    let reopened = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+    let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id.as_ref(), "asset-MASTER_HYDRATED");
+    assert_eq!(
+        std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+        body
+    );
+    config.state_db = Some(reopened);
+    let replayed_relation = download_photos_with_sync(
+        &Client::new(),
+        &passes,
+        Arc::new(config.clone()),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        replayed_relation.outcome,
+        DownloadOutcome::Success
+    ));
+    assert_eq!(replayed_relation.stats.downloaded, 0);
+    assert_eq!(
+        lookup_calls.load(Ordering::SeqCst),
+        6,
+        "a replayed relation is revalidated without downloading again"
+    );
+    let quiet_session = AssetOnlyExpiredUrlSession {
+        delta_records: Arc::new(Vec::new()),
+        lookup_records: Arc::new(Vec::new()),
+        hydration_records: Arc::new(Vec::new()),
+        lookup_calls: lookup_calls.clone(),
+    };
+    let quiet_passes = vec![AlbumPass {
+        kind: PassKind::Album,
+        album: album_with_session_and_container(
+            "PrimarySync",
+            "Vacation",
+            Some("container-vacation"),
+            Box::new(quiet_session),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    }];
+    let quiet = download_photos_with_sync(
+        &Client::new(),
+        &quiet_passes,
+        Arc::new(config),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(quiet.outcome, DownloadOutcome::Success));
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(
+        lookup_calls.load(Ordering::SeqCst),
+        6,
+        "an empty reopened feed does not repeat hydration"
+    );
+    assert_eq!(
+        std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+        body
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"existing synthetic media"
+    );
 }
 
 #[tokio::test]

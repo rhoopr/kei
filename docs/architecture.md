@@ -132,8 +132,8 @@ including the ignored live lookup test. Shared fixtures stay in
 `src/icloud/photos/album/test_support.rs`. Album tracing keeps the
 `kei::icloud::photos::album` target.
 
-Album-owner dependencies are one-way: hydration uses enumeration and change
-scans; enumeration uses planning, fetching, and completion; fetching uses
+Album-owner dependencies are one-way: hydration uses enumeration, lookup and
+change scans; enumeration uses planning, fetching, and completion; fetching uses
 planning types and completion evidence. Lookup, counts, planning, completion,
 and changes do not call sibling owners. The facade retains stream routing and
 public entry points. No album child owns durable checkpoint policy.
@@ -722,6 +722,18 @@ Returned means the read returned, including errors; it does not certify replay,
 identity, or a checkpoint. Interrupted hydration retains the existing checkpoint
 and pending configuration. These waits have no new overall time limit and do
 not establish a universal shutdown deadline.
+
+Selected relation targets use bounded child lookups followed by complete-pair
+validation before a full-zone fallback scan in each configured source.
+Omitted, deleted, changed-pair or foreign-scope results remain unresolved;
+lookup absence does not authorize deletion. Authentication and request failures
+propagate to the checkpoint hold. Sources retain their existing priority.
+Within one library sync, relation targets from album passes share a read only
+when the request context, endpoint, full zone/owner and ordered fallback sources
+match. Targets are combined before reading; no absence cache survives an error,
+interruption or cycle boundary. A remaining unresolved target still blocks the
+checkpoint through the existing relation gate. A fallback scan can still take
+multiple pages and has no new overall deadline.
 
 Legacy-master hydration scans all current visible and hidden children before
 metadata-capture repair or pending-download recovery selects an owner. Hidden

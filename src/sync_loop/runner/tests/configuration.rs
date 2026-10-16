@@ -25,6 +25,7 @@ enum BridgeWait {
     AssetIdentity,
     PairedAsset,
     AlbumRelation,
+    AlbumRelationLookup,
 }
 
 #[derive(Clone)]
@@ -33,6 +34,7 @@ struct ConfigBridgeSession {
     inventory_token: Arc<str>,
     bridge_token: Arc<str>,
     wait: BridgeWait,
+    hydration_pages: usize,
     gate_active: Arc<std::sync::atomic::AtomicBool>,
     bridge_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     calls: Arc<Mutex<Vec<(&'static str, String)>>>,
@@ -45,6 +47,7 @@ impl ConfigBridgeSession {
             inventory_token: Arc::from(inventory_token),
             bridge_token: Arc::from(bridge_token),
             wait: BridgeWait::Replay,
+            hydration_pages: 0,
             gate_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             bridge_gate: None,
             calls: Arc::new(Mutex::new(Vec::new())),
@@ -80,7 +83,20 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
                     .to_owned(),
             ));
             let active = self.gate_active.load(std::sync::atomic::Ordering::SeqCst);
-            let scan = !request["zones"][0]["syncToken"].is_string();
+            let cursor = request["zones"][0]["syncToken"].as_str();
+            let scan =
+                cursor.is_none() || cursor.is_some_and(|s| s.starts_with("synthetic-hydration-"));
+            let page = cursor
+                .and_then(|s| s.strip_prefix("synthetic-hydration-"))
+                .map(|s| s.parse::<usize>().unwrap())
+                .unwrap_or(0);
+            if active && scan && page < self.hydration_pages {
+                return Ok(
+                    serde_json::json!({"zones":[{"zoneID":{"zoneName":self.zone.as_ref()},
+                    "syncToken":format!("synthetic-hydration-{}",page+1), "moreComing":true,
+                    "records":(0..200).map(|i|serde_json::json!({"recordName":format!("synthetic-master-{page}-{i}"),"recordType":"CPLMaster","fields":{}})).collect::<Vec<_>>()}]}),
+                );
+            }
             if active
                 && (self.wait == BridgeWait::Replay || scan)
                 && let Some((requested, release)) = &self.bridge_gate
@@ -101,11 +117,13 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
                         }
                         vec![asset]
                     }
-                    BridgeWait::AlbumRelation => vec![serde_json::json!({
-                        "recordName": "WAIT_RELATION", "recordType": "CPLContainerRelation",
-                        "fields": {"containerId": {"value": "synthetic-album"},
-                                   "itemId": {"value": "WAIT_CHILD"}}
-                    })],
+                    BridgeWait::AlbumRelation | BridgeWait::AlbumRelationLookup => {
+                        vec![serde_json::json!({
+                            "recordName": "WAIT_RELATION", "recordType": "CPLContainerRelation",
+                            "fields": {"containerId": {"value": "synthetic-album"},
+                                       "itemId": {"value": "WAIT_CHILD"}}
+                        })]
+                    }
                 }
             } else {
                 Vec::new()
@@ -121,7 +139,8 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
         }
         if url.contains("/records/lookup?") {
             self.calls.lock().unwrap().push(("lookup", String::new()));
-            if self.gate_active.load(std::sync::atomic::Ordering::SeqCst)
+            if self.wait != BridgeWait::AlbumRelation
+                && self.gate_active.load(std::sync::atomic::Ordering::SeqCst)
                 && let Some((requested, release)) = &self.bridge_gate
             {
                 requested.notify_one();
@@ -163,7 +182,34 @@ async fn issue958_cancel_streaming_identity_wait_preserves_checkpoint_then_repla
     }
 }
 
+#[tokio::test]
+async fn issue958_cancel_after_paged_relation_scan_preserves_then_replays() {
+    Box::pin(cancelled_bridge_fixture_with_pages(
+        BridgeWait::AlbumRelation,
+        false,
+        2,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn issue958_cancel_relation_lookup_preserves_checkpoint_then_replays() {
+    Box::pin(cancelled_bridge_fixture(
+        BridgeWait::AlbumRelationLookup,
+        false,
+    ))
+    .await;
+}
+
 async fn cancelled_bridge_fixture(wait: BridgeWait, streaming: bool) {
+    Box::pin(cancelled_bridge_fixture_with_pages(wait, streaming, 0)).await;
+}
+
+async fn cancelled_bridge_fixture_with_pages(
+    wait: BridgeWait,
+    streaming: bool,
+    hydration_pages: usize,
+) {
     use std::time::Duration;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -189,6 +235,7 @@ async fn cancelled_bridge_fixture(wait: BridgeWait, streaming: bool) {
     let mut session = ConfigBridgeSession::new("PrimarySync", "inventory-token", "bridge-token");
     session.bridge_gate = Some((requested.clone(), release.clone()));
     session.wait = wait;
+    session.hydration_pages = hydration_pages;
     let gate_active = session.gate_active.clone();
     let calls = session.calls.clone();
     let album = crate::icloud::photos::PhotoAlbum::new(
@@ -270,7 +317,7 @@ async fn cancelled_bridge_fixture(wait: BridgeWait, streaming: bool) {
         let phase = match wait {
             BridgeWait::AssetIdentity => "asset_identity",
             BridgeWait::PairedAsset => "paired_asset",
-            BridgeWait::AlbumRelation => "album_relation",
+            BridgeWait::AlbumRelation | BridgeWait::AlbumRelationLookup => "album_relation",
             BridgeWait::Replay => panic!("replay waits do not enter hydration"),
         };
         assert!(
@@ -339,7 +386,9 @@ async fn cancelled_bridge_fixture(wait: BridgeWait, streaming: bool) {
     assert_eq!(
         initial_calls
             .iter()
-            .filter(|(kind, cursor)| *kind == "changes" && !cursor.is_empty())
+            .filter(|(kind, cursor)| *kind == "changes"
+                && !cursor.is_empty()
+                && !cursor.starts_with("synthetic-hydration-"))
             .map(|(_, cursor)| cursor.as_str())
             .collect::<Vec<_>>(),
         ["prior-token"]
@@ -349,6 +398,16 @@ async fn cancelled_bridge_fixture(wait: BridgeWait, streaming: bool) {
         .filter(|(kind, _)| *kind == "query")
         .count();
     assert!(inventory_queries > 0);
+    if hydration_pages > 0 {
+        assert_eq!(
+            initial_calls
+                .iter()
+                .filter(|(kind, cursor)| *kind == "changes"
+                    && cursor.starts_with("synthetic-hydration-"))
+                .count(),
+            hydration_pages
+        );
+    }
     gate_active.store(false, std::sync::atomic::Ordering::SeqCst);
     let initial_lookups = initial_calls
         .iter()
@@ -358,7 +417,10 @@ async fn cancelled_bridge_fixture(wait: BridgeWait, streaming: bool) {
         initial_lookups,
         usize::from(matches!(
             wait,
-            BridgeWait::AssetIdentity | BridgeWait::PairedAsset
+            BridgeWait::AssetIdentity
+                | BridgeWait::PairedAsset
+                | BridgeWait::AlbumRelation
+                | BridgeWait::AlbumRelationLookup
         ))
     );
     drop(db);
@@ -429,7 +491,11 @@ async fn cancelled_bridge_fixture(wait: BridgeWait, streaming: bool) {
         }
         let cursors: Vec<_> = observed
             .iter()
-            .filter(|(kind, cursor)| *kind == "changes" && !cursor.is_empty())
+            .filter(|(kind, cursor)| {
+                *kind == "changes"
+                    && !cursor.is_empty()
+                    && !cursor.starts_with("synthetic-hydration-")
+            })
             .map(|(_, cursor)| cursor.as_str())
             .collect();
         let expected = if replay == 0 {

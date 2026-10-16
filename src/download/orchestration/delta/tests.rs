@@ -2090,3 +2090,400 @@ async fn issue956_changed_master_confirmation_is_bounded_and_retains_unproven_ma
         );
     }
 }
+
+// Synthetic page-count and cancellation regressions for #958.
+type AlbumScanCalls = Vec<(String, Option<String>)>;
+
+#[derive(Clone)]
+struct AlbumScanProbe {
+    params: Arc<std::collections::HashMap<String, Value>>,
+    lookup_calls: Arc<AtomicUsize>,
+    lookup_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    lookup_error: Option<u16>,
+    calls: Arc<std::sync::Mutex<AlbumScanCalls>>,
+    pages: usize,
+    target_zone: &'static str,
+    target_page: Option<usize>,
+    gate: Option<(usize, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for AlbumScanProbe {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        if url.contains("/records/lookup?") {
+            self.lookup_calls.fetch_add(1, Ordering::SeqCst);
+            let request: Value = serde_json::from_str(&body)?;
+            self.lookup_ids.lock().unwrap().extend(
+                request["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|record| record["recordName"].as_str().unwrap().to_owned()),
+            );
+            if let Some(status) = self.lookup_error {
+                return Err(crate::icloud::photos::session::HttpStatusError {
+                    status,
+                    url: "https://example.invalid/?private-provider-value".to_owned(),
+                    retry_after: None,
+                    body: None,
+                }
+                .into());
+            }
+            return Ok(json!({"records":[]}));
+        }
+        assert!(url.contains("/changes/zone?"));
+        let request: Value = serde_json::from_str(&body)?;
+        let entry = &request["zones"][0];
+        assert_eq!(entry["resultsLimit"], 200);
+        assert_eq!(
+            entry.as_object().unwrap().len(),
+            if entry["syncToken"].is_string() { 3 } else { 2 }
+        );
+        let zone = entry["zoneID"]["zoneName"].as_str().unwrap();
+        let cursor = entry["syncToken"].as_str();
+        self.calls
+            .lock()
+            .unwrap()
+            .push((zone.to_owned(), cursor.map(str::to_owned)));
+        let page = cursor
+            .map(|s| s.rsplit('-').next().unwrap().parse::<usize>().unwrap())
+            .unwrap_or(0);
+        assert!(page < self.pages);
+        if let Some((at, requested, release)) = &self.gate
+            && page == *at
+        {
+            requested.notify_one();
+            release.notified().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let mut records: Vec<_> = (0..200)
+            .map(|i| {
+                json!({
+                    "recordName": format!("unrelated-{zone}-{page}-{i}"),
+                    "recordType": "CPLMaster", "fields": {}
+                })
+            })
+            .collect();
+        if zone == self.target_zone && self.target_page == Some(page) {
+            records.truncate(198);
+            records.extend(incremental_photo_records("MATCH"));
+        }
+        Ok(json!({"zones":[{"zoneID":entry["zoneID"],
+            "syncToken":format!("scan-{zone}-{}", page + 1),
+            "moreComing":page + 1 < self.pages,"records":records}]}))
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+fn scan_probe_album(
+    zone: &str,
+    container: Option<&str>,
+    probe: &AlbumScanProbe,
+) -> crate::icloud::photos::PhotoAlbum {
+    crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: probe.params.clone(),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from("Synthetic scan"),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":zone})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: container.map(Arc::from),
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(probe.clone()),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue958_scan_target_position_and_absence_measure_pages() {
+    for (target_page, expected_pages) in [(Some(0), 1), (Some(2), 3), (None, 3)] {
+        let probe = AlbumScanProbe {
+            params: Arc::default(),
+            lookup_calls: Arc::default(),
+            lookup_ids: Arc::default(),
+            lookup_error: None,
+            calls: Arc::default(),
+            pages: 3,
+            target_zone: "PrimarySync",
+            target_page,
+            gate: None,
+        };
+        let album = scan_probe_album("PrimarySync", None, &probe);
+        let mut missing = FxHashSet::from_iter(["asset-MATCH".to_owned()]);
+        let started = tokio::time::Instant::now();
+        let assets = album
+            .hydrate_matching_assets_from_changes(&mut missing)
+            .await
+            .unwrap();
+        let calls = probe.calls.lock().unwrap();
+        assert_eq!(calls.len(), expected_pages);
+        assert!(calls[0].1.is_none());
+        assert_eq!(assets.len(), usize::from(target_page.is_some()));
+        assert_eq!(missing.is_empty(), target_page.is_some());
+        assert_eq!(started.elapsed().as_secs(), expected_pages as u64);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue958_album_groups_share_one_fallback_per_source() {
+    use super::super::context::LegacyOwnerClaimMode;
+    use super::super::selection::IncrementalPassRouting;
+    for (cross_zone, groups, target_page, lookup_error, distinct_targets) in [
+        (false, 2, None, None, false),
+        (true, 2, None, None, false),
+        (false, 25, None, None, false),
+        (true, 25, None, None, false),
+        (false, 2, Some(1), None, false),
+        (false, 2, None, Some(401), false),
+        (false, 2, None, None, true),
+        (true, 2, None, None, true),
+    ] {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+        let probe = AlbumScanProbe {
+            params: Arc::default(),
+            lookup_calls: Arc::default(),
+            lookup_ids: Arc::default(),
+            lookup_error,
+            calls: Arc::default(),
+            pages: 3,
+            target_zone: if cross_zone {
+                "SharedSync-synthetic"
+            } else {
+                "PrimarySync"
+            },
+            target_page,
+            gate: None,
+        };
+        let containers: Vec<_> = (0..groups).map(|i| format!("album-{i}")).collect();
+        let passes: Vec<_> = containers
+            .iter()
+            .map(|container| {
+                let mut album = scan_probe_album("PrimarySync", Some(container.as_str()), &probe);
+                if cross_zone {
+                    album = album.with_cross_zone_sources(vec![scan_probe_album(
+                        "SharedSync-synthetic",
+                        None,
+                        &probe,
+                    )]);
+                }
+                AlbumPass {
+                    kind: PassKind::Album,
+                    album,
+                    exclude_ids: Arc::default(),
+                }
+            })
+            .collect();
+        let records: Vec<_> = containers
+            .iter()
+            .map(|c| {
+                relation_delta_record(
+                    c,
+                    if target_page.is_some() {
+                        "asset-MATCH"
+                    } else if distinct_targets {
+                        c
+                    } else {
+                        "asset-MISSING"
+                    },
+                )
+            })
+            .collect();
+        let mut buffer = crate::icloud::photos::asset::DeltaRecordBuffer::new();
+        let events = buffer.process_records(serde_json::from_value(Value::Array(records)).unwrap());
+        let routing = IncrementalPassRouting::from_passes(&passes);
+        let config = test_config();
+        let mut mapping = Default::default();
+        let mut complete = Vec::new();
+        let mut downloads = Vec::new();
+        let mut claims = Default::default();
+        let pass_configs: Vec<_> = passes.iter().map(|_| Arc::new(test_config())).collect();
+        let mut context = super::IncrementalAssetHydrationContext {
+            asset_to_master: &mut mapping,
+            complete_delta_assets: &mut complete,
+            downloadable_assets: &mut downloads,
+            download_ctx: None,
+            claimed_legacy_master_states: &mut claims,
+            claim_mode: LegacyOwnerClaimMode::ReadOnly,
+            pass_configs: &pass_configs,
+        };
+        let mut summary = IncrementalDeltaSummary::default();
+        let started = tokio::time::Instant::now();
+        super::hydrate_missing_selected_relation_assets(
+            &events,
+            &passes,
+            &config,
+            &routing,
+            &mut context,
+            &mut summary,
+            &CancellationToken::new(),
+        )
+        .await;
+        let calls = probe.calls.lock().unwrap();
+        if lookup_error.is_some() {
+            assert!(calls.is_empty());
+            assert_eq!(summary.auth_errors, 1);
+            assert!(summary.token_unsafe_reason.is_some());
+            assert!(mapping.is_empty() && complete.is_empty() && downloads.is_empty());
+            assert!(
+                !capture
+                    .events()
+                    .iter()
+                    .flat_map(|event| event.fields.values())
+                    .any(|value| value.contains("private-provider-value"))
+            );
+            continue;
+        }
+        let expected_ids: rustc_hash::FxHashSet<String> = if distinct_targets {
+            containers.iter().cloned().collect()
+        } else {
+            [if target_page.is_some() {
+                "asset-MATCH".to_owned()
+            } else {
+                "asset-MISSING".to_owned()
+            }]
+            .into_iter()
+            .collect()
+        };
+        assert_eq!(
+            probe
+                .lookup_ids
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<rustc_hash::FxHashSet<_>>(),
+            expected_ids
+        );
+        assert_eq!(started.elapsed().as_secs(), calls.len() as u64);
+        let scans = if target_page.is_some() {
+            1
+        } else if cross_zone {
+            2
+        } else {
+            1
+        };
+        assert_eq!(
+            probe.lookup_calls.load(Ordering::SeqCst),
+            if cross_zone { 2 } else { 1 }
+        );
+        assert_eq!(
+            calls.len(),
+            if target_page.is_some() { 2 } else { scans * 3 }
+        );
+        assert_eq!(
+            calls.iter().filter(|(_, cursor)| cursor.is_none()).count(),
+            scans
+        );
+        assert_eq!(mapping.len(), usize::from(target_page.is_some()));
+        assert_eq!(complete.len(), usize::from(target_page.is_some()));
+        assert_eq!(
+            downloads.len(),
+            if target_page.is_some() { groups } else { 0 }
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue958_cross_zone_hydration_preserves_source_and_stops_at_match() {
+    let probe = AlbumScanProbe {
+        params: Arc::default(),
+        lookup_calls: Arc::default(),
+        lookup_ids: Arc::default(),
+        lookup_error: None,
+        calls: Arc::default(),
+        pages: 3,
+        target_zone: "SharedSync-synthetic",
+        target_page: Some(1),
+        gate: None,
+    };
+    let album = scan_probe_album("PrimarySync", None, &probe)
+        .with_cross_zone_sources(vec![scan_probe_album("SharedSync-synthetic", None, &probe)]);
+    let mut missing = FxHashSet::from_iter(["asset-MATCH".to_owned()]);
+    let assets = album
+        .hydrate_matching_assets_from_changes(&mut missing)
+        .await
+        .unwrap();
+    assert!(missing.is_empty());
+    assert_eq!(assets.len(), 1);
+    assert_eq!(assets[0].source_zone(), Some("SharedSync-synthetic"));
+    let calls = probe.calls.lock().unwrap();
+    assert_eq!(calls.len(), 5);
+    assert_eq!(
+        calls.iter().map(|(z, _)| z.as_str()).collect::<Vec<_>>(),
+        [
+            "PrimarySync",
+            "PrimarySync",
+            "PrimarySync",
+            "SharedSync-synthetic",
+            "SharedSync-synthetic"
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue958_cancel_paged_scan_explains_orphan_buffer_warning() {
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+    let requested = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let probe = AlbumScanProbe {
+        params: Arc::default(),
+        lookup_calls: Arc::default(),
+        lookup_ids: Arc::default(),
+        lookup_error: None,
+        calls: Arc::default(),
+        pages: 3,
+        target_zone: "PrimarySync",
+        target_page: None,
+        gate: Some((2, requested.clone(), release.clone())),
+    };
+    let album = scan_probe_album("PrimarySync", None, &probe);
+    let mut missing = FxHashSet::from_iter(["asset-MISSING".to_owned()]);
+    let cancel = CancellationToken::new();
+    let started = tokio::time::Instant::now();
+    let mut read = Box::pin(super::wait_for_hydration_read(
+        album.hydrate_matching_assets_from_changes(&mut missing),
+        "album_relation",
+        &cancel,
+    ));
+    tokio::select! { ()=requested.notified()=>{}, result=read.as_mut()=>panic!("scan returned before gate: {result:?}") }
+    tokio::time::advance(std::time::Duration::from_secs(1179) - started.elapsed()).await;
+    tokio::select! { biased; result=read.as_mut()=>panic!("held scan returned: {result:?}"), ()=tokio::task::yield_now()=>{} }
+    cancel.cancel();
+    assert!(read.as_mut().await.is_none());
+    drop(read);
+    assert_eq!(probe.calls.lock().unwrap().len(), 3);
+    assert_eq!(missing.len(), 1);
+    release.notify_one();
+    assert!(
+        album
+            .hydrate_matching_assets_from_changes(&mut missing)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        probe.calls.lock().unwrap().len(),
+        6,
+        "cancelled scan must be retried from the beginning"
+    );
+    assert_eq!(probe.lookup_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(missing.len(), 1);
+    assert!(capture.contains_event(
+        |e| e.field("outcome") == Some("cancelled") && e.field("elapsed_secs") == Some("1179")
+    ));
+    assert!(
+        capture.contains_event(|e| e.field("orphaned_masters") == Some("400")
+            && e.field("orphaned_assets") == Some("0"))
+    );
+}
