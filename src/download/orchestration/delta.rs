@@ -1119,6 +1119,7 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                     master_family: true,
                     ..
                 }
+                | RecordResolution::MasterChanged { .. }
                 | RecordResolution::Unknown => {
                     summary.block_identity();
                     tracing::debug!(
@@ -1147,104 +1148,129 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
     if pending.is_empty() || summary.auth_errors > 0 {
         return;
     }
-    let requests: Vec<RecordLookupRequest> = pending
-        .iter()
-        .map(|(_, record_name, master)| {
-            RecordLookupRequest::paired(
-                ProviderRecordId::new(record_name.as_str()),
-                ProviderRecordId::new(master.as_str()),
-                ProviderRecordId::new(record_name.as_str()),
-            )
-        })
-        .collect();
-    let event_by_record_name: FxHashMap<String, (usize, String)> = pending
-        .iter()
-        .map(|(index, record_name, master)| (record_name.clone(), (*index, master.clone())))
-        .collect();
-    let Some(resolutions) = wait_for_hydration_read(
-        pass.album.resolve_records(&requests),
-        "paired_asset",
-        shutdown_token,
-    )
-    .await
-    else {
-        summary.block_identity();
-        return;
-    };
-    for (state_id, resolution) in resolutions.results {
-        let Some((index, master_record_name)) = event_by_record_name.get(state_id.as_str()) else {
+    // A current same-scope child may have moved away from its saved master.
+    // Bound revalidation to one additional complete pair, without following shares.
+    for attempt in 0..2 {
+        let requests: Vec<RecordLookupRequest> = pending
+            .iter()
+            .map(|(_, record_name, master)| {
+                RecordLookupRequest::paired(
+                    ProviderRecordId::new(record_name.as_str()),
+                    ProviderRecordId::new(master.as_str()),
+                    ProviderRecordId::new(record_name.as_str()),
+                )
+            })
+            .collect();
+        let event_by_record_name: FxHashMap<String, (usize, String)> = pending
+            .iter()
+            .map(|(index, record_name, master)| (record_name.clone(), (*index, master.clone())))
+            .collect();
+        let Some(resolutions) = wait_for_hydration_read(
+            pass.album.resolve_records(&requests),
+            "paired_asset",
+            shutdown_token,
+        )
+        .await
+        else {
             summary.block_identity();
-            continue;
+            return;
         };
-        let Some(event) = events.get_mut(*index) else {
-            summary.block_identity();
-            continue;
-        };
-        match resolution {
-            RecordResolution::Present(asset)
-                if asset.asset_record_name() == event.record_name.as_ref() =>
-            {
-                summary
-                    .persist_asset_mapping_for_asset(&asset, config)
-                    .await;
-                event.asset = Some(asset);
-            }
-            RecordResolution::Deleted {
-                deleted_at,
-                master_family,
-            } => {
-                retry.prove(state_id.as_str(), summary);
-                if let Some(db) = &config.state_db {
-                    let update = SourceStateUpdate::SoftDeleted { deleted_at };
-                    let (result, state_key) = if master_family {
-                        let state_key = SourceStateTransitionKey {
-                            record_name: Cow::Borrowed(master_record_name),
-                            record_type: Some("CPLMaster"),
-                            unresolved_identity: false,
+        let mut changed_masters = Vec::new();
+        for (state_id, resolution) in resolutions.results {
+            let Some((index, master_record_name)) = event_by_record_name.get(state_id.as_str())
+            else {
+                summary.block_identity();
+                continue;
+            };
+            let Some(event) = events.get_mut(*index) else {
+                summary.block_identity();
+                continue;
+            };
+            match resolution {
+                RecordResolution::Present(asset)
+                    if asset.asset_record_name() == event.record_name.as_ref() =>
+                {
+                    summary
+                        .persist_asset_mapping_for_asset(&asset, config)
+                        .await;
+                    event.asset = Some(asset);
+                }
+                RecordResolution::Deleted { .. } if attempt > 0 => {
+                    // A redirected master is not yet a durable family mapping.
+                    // Its absence cannot delete the original source or family.
+                    summary.block_identity();
+                }
+                RecordResolution::Deleted {
+                    deleted_at,
+                    master_family,
+                } => {
+                    retry.prove(state_id.as_str(), summary);
+                    if let Some(db) = &config.state_db {
+                        let update = SourceStateUpdate::SoftDeleted { deleted_at };
+                        let (result, state_key) = if master_family {
+                            let state_key = SourceStateTransitionKey {
+                                record_name: Cow::Borrowed(master_record_name),
+                                record_type: Some("CPLMaster"),
+                                unresolved_identity: false,
+                            };
+                            let result = db
+                                .resolve_master_family_source_deleted_affected(
+                                    &config.library,
+                                    master_record_name,
+                                    deleted_at,
+                                )
+                                .await;
+                            (result, state_key)
+                        } else {
+                            apply_source_state_update(db.as_ref(), config, event, update).await
                         };
-                        let result = db
-                            .resolve_master_family_source_deleted_affected(
-                                &config.library,
-                                master_record_name,
-                                deleted_at,
-                            )
-                            .await;
-                        (result, state_key)
-                    } else {
-                        apply_source_state_update(db.as_ref(), config, event, update).await
-                    };
-                    record_incremental_state_transition_result(
-                        result,
-                        update.transition(),
-                        state_key,
-                        &mut summary.state_transition_failures,
-                        &mut summary.token_unsafe_reason,
+                        record_incremental_state_transition_result(
+                            result,
+                            update.transition(),
+                            state_key,
+                            &mut summary.state_transition_failures,
+                            &mut summary.token_unsafe_reason,
+                        );
+                    }
+                }
+                RecordResolution::MasterChanged { master_record_name } if attempt == 0 => {
+                    // The old pair remains unconfirmed. Only a complete second pair
+                    // may update mappings through the ordinary successful path.
+                    changed_masters.push((
+                        *index,
+                        event.record_name.to_string(),
+                        master_record_name.as_str().to_owned(),
+                    ));
+                }
+                RecordResolution::TransientFailure(error) => {
+                    summary.block_identity();
+                    tracing::warn!(
+                        diagnostic = error.diagnostic(),
+                        "Provider lookup could not hydrate an asset-only delta"
+                    );
+                    summary.record_provider_error(error.into());
+                }
+                RecordResolution::Present(_)
+                | RecordResolution::AssetPresent { .. }
+                | RecordResolution::MasterPresent
+                | RecordResolution::SparseShareUnresolved(_)
+                | RecordResolution::MasterChanged { .. }
+                | RecordResolution::Unknown => {
+                    summary.block_identity();
+                    tracing::warn!(
+                        diagnostic = "incomplete_record_pair",
+                        "Could not hydrate a complete asset-only delta"
                     );
                 }
             }
-            RecordResolution::TransientFailure(error) => {
-                summary.block_identity();
-                tracing::warn!(
-                    diagnostic = error.diagnostic(),
-                    "Provider lookup could not hydrate an asset-only delta"
-                );
-                summary.record_provider_error(error.into());
-            }
-            RecordResolution::Present(_)
-            | RecordResolution::AssetPresent { .. }
-            | RecordResolution::MasterPresent
-            | RecordResolution::SparseShareUnresolved(_)
-            | RecordResolution::Unknown => {
-                summary.block_identity();
-                tracing::warn!(
-                    diagnostic = "incomplete_record_pair",
-                    "Could not hydrate a complete asset-only delta"
-                );
-            }
         }
-    }
-    if !resolutions.complete {
-        summary.block_identity();
+        if !resolutions.complete && changed_masters.is_empty() {
+            summary.block_identity();
+        }
+        if changed_masters.is_empty() {
+            return;
+        }
+        pending = changed_masters;
     }
 }
 

@@ -2,7 +2,9 @@
 
 use super::PhotoAlbum;
 use crate::icloud::photos::asset::SparseShareEvidence;
-use crate::icloud::photos::asset::{PhotoAsset, RequiredAssetFields, extract_master_ref};
+use crate::icloud::photos::asset::{
+    PhotoAsset, RequiredAssetFields, classify_change_reason, extract_master_ref,
+};
 use crate::icloud::photos::cloudkit;
 use crate::icloud::photos::queries::IDENTITY_LOOKUP_KEYS_VALUES;
 use crate::icloud::photos::queries::encode_params;
@@ -177,6 +179,11 @@ pub(crate) enum RecordResolution {
         master_record_name: ProviderRecordId,
     },
     MasterPresent,
+    /// A live, scoped child names another master. The requested pair is still
+    /// unresolved; callers need a fresh complete pair before using this hint.
+    MasterChanged {
+        master_record_name: ProviderRecordId,
+    },
     SparseShareUnresolved(SparseShareEvidence),
     Deleted {
         deleted_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -215,6 +222,7 @@ fn resolution_evidence(resolution: &RecordResolution) -> ResolutionEvidence {
             ..
         } => ResolutionEvidence::MasterDeleted,
         RecordResolution::SparseShareUnresolved(_)
+        | RecordResolution::MasterChanged { .. }
         | RecordResolution::Unknown
         | RecordResolution::TransientFailure(_) => ResolutionEvidence::Inconclusive,
         RecordResolution::Deleted {
@@ -305,14 +313,27 @@ fn lookup_rejection(
             }
         }
     }
-    if !pair_matches {
-        ("child_master_mismatch", "pairing")
-    } else if master.into_iter().chain(asset).any(|record| {
+    if master.into_iter().chain(asset).any(|record| {
         record
             .get("serverErrorCode")
             .is_some_and(|code| !code.is_null())
     }) {
         ("record_provider_error", "record_error")
+    } else if !pair_matches {
+        let reference = asset.and_then(|record| record.pointer("/fields/masterRef/value"));
+        let reason = match reference {
+            None => "master_reference_missing",
+            Some(reference)
+                if reference
+                    .get("recordName")
+                    .and_then(Value::as_str)
+                    .is_none_or(|name| name.trim().is_empty()) =>
+            {
+                "master_reference_malformed"
+            }
+            Some(_) => "child_master_mismatch",
+        };
+        (reason, "pairing")
     } else if master.is_none() {
         (
             if request.target == RecordLookupTarget::Asset {
@@ -473,8 +494,26 @@ impl PhotoAlbum {
                             .and_then(Value::as_str)
                             == Some(request.master_record_name.as_str())
                     });
-                let resolution = if !scoped(master) || !scoped(asset) || !pair_matches {
+                let resolution = if !scoped(master) || !scoped(asset) {
                     RecordResolution::Unknown
+                } else if !pair_matches {
+                    asset
+                        .filter(|record| record.get("serverErrorCode").is_none_or(Value::is_null))
+                        .and_then(|record| {
+                            serde_json::from_value::<cloudkit::Record>(record.clone()).ok()
+                        })
+                        .filter(|record| {
+                            record.record_type == "CPLAsset"
+                                && classify_change_reason(record)
+                                    == crate::types::ChangeReason::Created
+                        })
+                        .and_then(|record| extract_master_ref(&record.fields))
+                        .filter(|name| !name.trim().is_empty())
+                        .map_or(RecordResolution::Unknown, |master_record_name| {
+                            RecordResolution::MasterChanged {
+                                master_record_name: ProviderRecordId::new(master_record_name),
+                            }
+                        })
                 } else if primary_deleted || asset_deleted {
                     RecordResolution::Deleted {
                         deleted_at,
@@ -552,7 +591,10 @@ impl PhotoAlbum {
                 } else {
                     RecordResolution::Unknown
                 };
-                if matches!(resolution, RecordResolution::Unknown) {
+                if matches!(
+                    resolution,
+                    RecordResolution::Unknown | RecordResolution::MasterChanged { .. }
+                ) {
                     let (reason, stage) =
                         lookup_rejection(master, asset, request, &self.zone_id, pair_matches);
                     let target = match request.target {
@@ -579,9 +621,9 @@ impl PhotoAlbum {
                     RecordResolution::AssetPresent { .. } => "asset_present",
                     RecordResolution::MasterPresent => "master_present_unpaired",
                     RecordResolution::Deleted { .. } => "deleted",
-                    RecordResolution::SparseShareUnresolved(_) | RecordResolution::Unknown => {
-                        "unknown"
-                    }
+                    RecordResolution::SparseShareUnresolved(_)
+                    | RecordResolution::MasterChanged { .. }
+                    | RecordResolution::Unknown => "unknown",
                     RecordResolution::TransientFailure(_) => "transient_failure",
                 };
                 if matches!(resolution, RecordResolution::Present(_)) {

@@ -497,3 +497,47 @@ fn older_history_observation_accounting_is_explicitly_unavailable() {
     assert!(read.cycles[0].observations_shown.is_none());
     assert!(read.cycles[0].observations_omitted.is_none());
 }
+
+#[test]
+fn issue956_pair_reference_reasons_survive_history_reopen_without_private_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.json");
+    let mut history = History {
+        schema_version: 1,
+        ..History::default()
+    };
+    apply(&mut history, Message::Begin(json!({})));
+    let reasons = [
+        "master_reference_missing",
+        "master_reference_malformed",
+        "child_master_mismatch",
+        "record_provider_error",
+    ];
+    for reason in reasons {
+        add(
+            &mut history,
+            "exact_lookup_rejection_v1",
+            json!({
+                "reason":reason,"target":"paired","stage":"pairing","rejected_requests":1,
+                "recordName":"PRIVATE_RECORD_CANARY"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+    }
+    save(&path, &mut history).unwrap();
+    let (reopened, status) = read(&path);
+    assert_eq!(status, "available");
+    let saved: Vec<_> = reopened.cycles[0]
+        .diagnostics
+        .iter()
+        .map(|observation| observation.fields["reason"].as_str().unwrap())
+        .collect();
+    assert_eq!(saved, reasons);
+    assert!(
+        !serde_json::to_string(&reopened)
+            .unwrap()
+            .contains("PRIVATE_RECORD_CANARY")
+    );
+}

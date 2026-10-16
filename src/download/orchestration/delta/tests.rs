@@ -762,12 +762,14 @@ async fn asset_only_delta_recovers_identity_refreshes_metadata_and_advances_toke
     enum IdentitySource {
         Delta,
         State,
+        StaleState,
         ProviderLookup,
     }
 
     for (identity_source, sparse) in [
         IdentitySource::Delta,
         IdentitySource::State,
+        IdentitySource::StaleState,
         IdentitySource::ProviderLookup,
     ]
     .into_iter()
@@ -796,8 +798,16 @@ async fn asset_only_delta_recovers_identity_refreshes_metadata_and_advances_toke
                 .expect("asset fields")
                 .remove("masterRef");
         }
-        if matches!(identity_source, IdentitySource::State) {
-            db.upsert_asset_master_mapping("PrimarySync", "asset-ASSET_ONLY", "ASSET_ONLY")
+        if matches!(
+            identity_source,
+            IdentitySource::State | IdentitySource::StaleState
+        ) {
+            let master = if matches!(identity_source, IdentitySource::StaleState) {
+                "PREVIOUS_MASTER"
+            } else {
+                "ASSET_ONLY"
+            };
+            db.upsert_asset_master_mapping("PrimarySync", "asset-ASSET_ONLY", master)
                 .await
                 .expect("seed durable mapping");
         }
@@ -837,7 +847,7 @@ async fn asset_only_delta_recovers_identity_refreshes_metadata_and_advances_toke
         assert_eq!(
             session_probe.records_query_count(),
             match identity_source {
-                IdentitySource::ProviderLookup => 2,
+                IdentitySource::ProviderLookup | IdentitySource::StaleState => 2,
                 IdentitySource::Delta | IdentitySource::State => 1,
             },
             "{identity_source:?}"
@@ -1920,4 +1930,152 @@ async fn issue958_hydration_wait_reports_progress_and_terminal_outcomes_without_
     )
     .await;
     assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn issue956_changed_master_confirmation_is_bounded_and_retains_unproven_mapping() {
+    use crate::icloud::photos::asset::DeltaRecordBuffer;
+    use crate::test_helpers::MockPhotosSession;
+
+    #[derive(Clone)]
+    struct BoundedConfirmation {
+        inner: Arc<MockPhotosSession>,
+        calls: Arc<AtomicUsize>,
+        cancel_on_second: Option<CancellationToken>,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for BoundedConfirmation {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(call < 2, "confirmation must stop after two requests");
+            if call == 1
+                && let Some(cancel) = &self.cancel_on_second
+            {
+                cancel.cancel();
+                std::future::pending::<()>().await;
+            }
+            self.inner.post(url, body, headers).await
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    for fault in [
+        "omitted",
+        "deleted",
+        "changed_again",
+        "foreign",
+        "malformed_date",
+        "mapping_write",
+        "cancel",
+    ] {
+        let directory = TempDir::new().unwrap();
+        let database = directory.path().join("state.db");
+        let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+        db.upsert_asset_master_mapping("PrimarySync", "asset-CURRENT", "PREVIOUS")
+            .await
+            .unwrap();
+        let mut records = incremental_photo_records("CURRENT");
+        let mut delta = records[1].clone();
+        delta["fields"].as_object_mut().unwrap().remove("masterRef");
+        let mut buffer = DeltaRecordBuffer::new();
+        let mut events = buffer.process_records(vec![serde_json::from_value(delta).unwrap()]);
+        let first = json!({"records":[records[1].clone()]});
+        let second = match fault {
+            "omitted" => json!({"records":[records[1].clone()]}),
+            "deleted" => {
+                json!({"records":[{"recordName":"CURRENT","serverErrorCode":"NOT_FOUND"},records[1].clone()]})
+            }
+            "changed_again" => {
+                records[1]["fields"]["masterRef"]["value"]["recordName"] = json!("THIRD");
+                json!({"records":records})
+            }
+            "foreign" => {
+                records[1]["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+                    json!("FOREIGN_OWNER");
+                json!({"records":records})
+            }
+            "malformed_date" => {
+                records[1]["fields"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("assetDate");
+                json!({"records":records})
+            }
+            "cancel" => json!({"records":records}),
+            "mapping_write" => {
+                db.acquire_lock("injected mapping failure").unwrap().execute_batch(
+                    "CREATE TRIGGER reject_mapping BEFORE UPDATE ON asset_master_mappings BEGIN SELECT RAISE(ABORT,'synthetic mapping failure'); END;"
+                ).unwrap();
+                json!({"records":records})
+            }
+            _ => unreachable!(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album(
+                "",
+                BoundedConfirmation {
+                    inner: Arc::new(MockPhotosSession::new().ok(first).ok(second)),
+                    calls: calls.clone(),
+                    cancel_on_second: (fault == "cancel").then(|| shutdown.clone()),
+                },
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.state_db = Some(db.clone() as Arc<dyn DownloadStore>);
+        let mut summary = IncrementalDeltaSummary::default();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            hydrate_unpaired_created_asset_deltas(
+                &mut events,
+                Some(&pass),
+                &config,
+                &mut summary,
+                DownloadRunMode::Download,
+                &shutdown,
+            ),
+        )
+        .await
+        .expect("cancelled provider confirmation must drain");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "{fault}");
+        assert!(
+            summary.identity_incomplete || summary.state_transition_failures > 0,
+            "{fault}"
+        );
+        assert!(summary.token_unsafe_reason.is_some(), "{fault}");
+        if fault != "mapping_write" {
+            assert!(events[0].asset.is_none(), "{fault}");
+        }
+        drop(config);
+        drop(db);
+        let reopened = SqliteStateDb::open(&database).await.unwrap();
+        assert_eq!(
+            reopened
+                .get_master_record_name_for_asset("PrimarySync", "asset-CURRENT")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("PREVIOUS"),
+            "{fault}"
+        );
+        assert_eq!(
+            reopened
+                .get_metadata(&crate::state::unresolved_identity_key("PrimarySync"))
+                .await
+                .unwrap()
+                .as_deref(),
+            (fault != "mapping_write").then_some("1"),
+            "{fault}"
+        );
+    }
 }

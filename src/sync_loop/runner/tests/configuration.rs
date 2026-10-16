@@ -2691,3 +2691,199 @@ async fn retained_checkpoint_candidate_changed_at_promotion_preserves_concurrent
 
 #[cfg(target_os = "linux")]
 mod late_io;
+
+#[tokio::test]
+async fn issue956_stale_mapping_confirms_current_pair_then_commits_and_reopens_quietly() {
+    use crate::icloud::photos::{PhotoAsset, PhotosSession};
+    use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct CurrentPair {
+        records: Vec<Value>,
+        lookups: Arc<AtomicUsize>,
+        queries: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for CurrentPair {
+        async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+            let request: Value = serde_json::from_str(&body)?;
+            if url.contains("/records/lookup?") {
+                assert!(self.lookups.fetch_add(1, Ordering::SeqCst) < 2);
+                let wanted = request["records"].as_array().unwrap();
+                let records: Vec<_> = self
+                    .records
+                    .iter()
+                    .filter(|record| {
+                        wanted
+                            .iter()
+                            .any(|item| item["recordName"] == record["recordName"])
+                    })
+                    .cloned()
+                    .collect();
+                return Ok(json!({"records":records}));
+            }
+            if url.contains("/changes/zone?") {
+                let mut child = self.records[1].clone();
+                child["fields"].as_object_mut().unwrap().remove("masterRef");
+                let records = if request["zones"][0]["syncToken"] == "prior-token" {
+                    vec![child]
+                } else {
+                    Vec::new()
+                };
+                return Ok(
+                    json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+                    "syncToken":"current-token","moreComing":false,"records":records}]}),
+                );
+            }
+            if url.contains("/internal/records/query/batch") {
+                return Ok(album_count_response(1));
+            }
+            assert!(url.contains("/records/query?"));
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"records":[],"syncToken":"inventory-token"}))
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("state.db");
+    let media = directory.path().join("media");
+    let kept = media.join("2023/11/14/photo.JPG");
+    std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+    let original = vec![0u8; 1024];
+    std::fs::write(&kept, &original).unwrap();
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(original.clone()))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let download_url = format!("{}/unexpected-download", server.uri());
+    let mut records = full_album_page_with_download(
+        "PrimarySync",
+        "CURRENT",
+        "inventory-token",
+        &download_url,
+        original.len() as u64,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    )["records"]
+        .as_array()
+        .unwrap()
+        .clone();
+    records[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+    let photo = PhotoAsset::new(records[0].clone(), records[1].clone());
+    let config = make_run_cycle_config();
+    let hash = download::compute_config_hash(&config);
+    let marker = state::unresolved_identity_key("PrimarySync");
+    {
+        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("asset-CURRENT")
+            .filename("photo.JPG")
+            .size(1024)
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .created_at(photo.created())
+            .added_at(photo.added_date())
+            .metadata(photo.metadata().clone())
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        let checksum = download::file::compute_sha256(&kept).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "asset-CURRENT",
+            "original",
+            &kept,
+            &checksum,
+            Some(&checksum),
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-CURRENT", "PREVIOUS")
+            .await
+            .unwrap();
+        db.set_metadata(ENUM_CONFIG_HASH_KEY, &hash).await.unwrap();
+        db.set_metadata("sync_token:PrimarySync", "prior-token")
+            .await
+            .unwrap();
+        db.set_metadata(&marker, "1").await.unwrap();
+    }
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let queries = Arc::new(AtomicUsize::new(0));
+    let album = make_full_album_with_boxed_session(
+        "PrimarySync",
+        Box::new(CurrentPair {
+            records,
+            lookups: lookups.clone(),
+            queries: queries.clone(),
+        }),
+    );
+    let library =
+        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    for cycle in 0..2 {
+        let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let builder = make_run_cycle_download_config_builder(&media, db.clone());
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_cycle(
+                &[&library],
+                &config,
+                Some(db.as_ref()),
+                false,
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &shared_session,
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("synthetic cycle must finish within its bound")
+        .unwrap();
+        assert!(
+            outcome.can_advance_database_checkpoint(),
+            "cycle {cycle}, lookups={}, queries={}: {outcome:?}",
+            lookups.load(Ordering::SeqCst),
+            queries.load(Ordering::SeqCst)
+        );
+        assert_eq!(outcome.stats.downloaded, 0, "existing media must be reused");
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            2,
+            "quiet reopen must not repeat identity work"
+        );
+        assert_eq!(
+            queries.load(Ordering::SeqCst),
+            0,
+            "recovery must not require inventory"
+        );
+        assert_eq!(
+            db.get_master_record_name_for_asset("PrimarySync", "asset-CURRENT")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("CURRENT")
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("current-token")
+        );
+        assert_eq!(
+            db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(hash.as_str())
+        );
+        assert_eq!(
+            db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY).await.unwrap(),
+            None
+        );
+        assert_eq!(db.get_metadata(&marker).await.unwrap(), None);
+        assert_eq!(std::fs::read(&kept).unwrap(), original);
+    }
+}

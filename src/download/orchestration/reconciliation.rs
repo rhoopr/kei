@@ -472,6 +472,7 @@ pub(crate) async fn reconcile_catalog_paths_with_client(
             RecordResolution::AssetPresent { .. }
             | RecordResolution::MasterPresent
             | RecordResolution::SparseShareUnresolved(_)
+            | RecordResolution::MasterChanged { .. }
             | RecordResolution::Unknown
             | RecordResolution::TransientFailure(_) => {}
         }

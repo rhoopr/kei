@@ -363,6 +363,7 @@ async fn collect_metadata_capture_repair(
             }
             RecordResolution::AssetPresent { .. }
             | RecordResolution::SparseShareUnresolved(_)
+            | RecordResolution::MasterChanged { .. }
             | RecordResolution::Unknown => {
                 record_metadata_capture_failure(
                     db.as_ref(),

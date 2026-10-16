@@ -768,6 +768,8 @@ const LABELS: &[&str] = &[
     "owner_conflict",
     "scope_component_conflict",
     "child_master_mismatch",
+    "master_reference_missing",
+    "master_reference_malformed",
     "record_provider_error",
     "child_record_omitted",
     "master_record_omitted",

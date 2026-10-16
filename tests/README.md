@@ -1515,3 +1515,21 @@ seeded media stays unchanged, omitted media downloads once, and query tokens
 remain redacted diagnostic groups rather than source checkpoint authority.
 The existing `primary_discovery_`, `legacy_smart_only_`, `token_equivalence`, and
 managed `indexing_` controls qualify the other preserved main paths separately.
+
+### Active shared-library identity qualification (#956)
+
+`issue956_stale_mapping_confirms_current_pair_then_commits_and_reopens_quietly`
+pre-seeds file-backed SQLite, an old source/master mapping, a retained checkpoint
+and existing media. The normal cycle confirms a same-scope current pair before
+updating the mapping and committing the checkpoint. Reopening the database and
+running an unchanged cycle must preserve the media and avoid inventory and
+identity lookup work. This synthetic shape does not reproduce Leonard's private
+records or qualify sparse cross-zone links.
+
+`issue956_changed_master_confirmation_is_bounded_and_retains_unproven_mapping`
+checks omitted/deleted masters, another relationship change, foreign ownership,
+invalid capture dates and failed mapping writes. It asserts at most two provider
+reads and the original mapping after reopening. Lookup and support-history
+controls distinguish missing/malformed references, actual different-master
+references and provider errors without exposing identifiers. Existing explicit
+non-default owner discovery and cancellation fixtures remain separate controls.

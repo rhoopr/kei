@@ -289,7 +289,11 @@ async fn exact_refresh_diagnostics_pair_and_record_scope_rejections() {
             ProviderRecordId::new("asset-PRIVATE_MASTER_ID_CANARY"),
         )];
         let (batch, log) = capture(album.resolve_records(&requests)).await;
-        assert!(matches!(batch.results[0].1, RecordResolution::Unknown));
+        assert!(!batch.complete);
+        assert!(matches!(
+            batch.results[0].1,
+            RecordResolution::Unknown | RecordResolution::MasterChanged { .. }
+        ));
         assert!(log.contains("exact_lookup_rejection_v1"));
         assert!(log.contains(&format!("reason=\"{reason}\"")));
         assert!(log.contains(&format!("stage=\"{stage}\"")));

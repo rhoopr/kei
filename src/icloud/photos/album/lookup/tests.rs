@@ -661,10 +661,18 @@ async fn targeted_lookup_rejects_conflicting_scope_and_child_master_pair() {
             .resolve_records(&[lookup_request("master", "master", "child")])
             .await;
         assert!(!result.complete, "{fault}");
-        assert!(
-            matches!(result.results[0].1, RecordResolution::Unknown),
-            "{fault}"
-        );
+        if fault == "master_pair" {
+            assert!(matches!(
+                &result.results[0].1,
+                RecordResolution::MasterChanged { master_record_name }
+                    if master_record_name.as_str() == "other-master"
+            ));
+        } else {
+            assert!(
+                matches!(result.results[0].1, RecordResolution::Unknown),
+                "{fault}"
+            );
+        }
     }
 }
 
@@ -758,6 +766,65 @@ fn support_owner_morphology_preserves_guard_and_never_exports_owner_value() {
         assert_eq!(
             super::supplied_owner_shape(None, Some(&record), "master_reference_scope", &qualified),
             ("absent", "absent")
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue956_pair_rejections_distinguish_hints_from_missing_references_and_errors() {
+    for (fault, reason) in [
+        ("different", "child_master_mismatch"),
+        ("missing", "master_reference_missing"),
+        ("malformed", "master_reference_malformed"),
+        ("blank", "master_reference_malformed"),
+        ("provider_error", "record_provider_error"),
+        ("sparse", "master_reference_missing"),
+        ("soft_deleted", "child_master_mismatch"),
+        ("wrong_type", "child_master_mismatch"),
+    ] {
+        let master = test_master_record("master");
+        let mut child = test_asset_record_for("child", "other-master");
+        match fault {
+            "missing" | "provider_error" => {
+                child["fields"].as_object_mut().unwrap().remove("masterRef");
+                if fault == "provider_error" {
+                    child["serverErrorCode"] = json!("ACCESS_DENIED");
+                }
+            }
+            "malformed" => child["fields"]["masterRef"]["value"]["recordName"] = json!(42),
+            "blank" => child["fields"]["masterRef"]["value"]["recordName"] = json!(" "),
+            "sparse" => {
+                child["fields"] =
+                    crate::test_helpers::sparse_shared_asset_record()["fields"].clone()
+            }
+            "soft_deleted" => child["fields"]["isDeleted"] = json!({"value":1,"type":"INT64"}),
+            "wrong_type" => child["recordType"] = json!("CPLAlbum"),
+            "different" => {}
+            _ => unreachable!(),
+        }
+        let request = lookup_request("child", "master", "child");
+        assert_eq!(
+            super::lookup_rejection(
+                Some(&master),
+                Some(&child),
+                &request,
+                &default_zone(),
+                false
+            )
+            .0,
+            reason,
+            "{fault}"
+        );
+        let album = make_album_with_session(
+            100,
+            Box::new(MockPhotosSession::new().ok(json!({"records":[master,child]}))),
+        );
+        let result = album.resolve_records(&[request]).await;
+        assert!(!result.complete, "a hint cannot confirm a pair: {fault}");
+        assert_eq!(
+            matches!(result.results[0].1, RecordResolution::MasterChanged { .. }),
+            fault == "different",
+            "{fault}"
         );
     }
 }

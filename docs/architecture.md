@@ -798,7 +798,17 @@ observations do not authorize identity guesses or cross-zone retries.
 `exact_lookup_rejection_v1` describes a rejected lookup request with fixed
 scope/pairing/presence labels and an expected-owner category. It applies the
 existing scope matcher; the older reference-zone JSON-equality classification
-alone does not establish rejection. No owner or record value is emitted.
+alone does not establish rejection. Missing or malformed master references and
+record errors are distinguished from an explicit different-master reference.
+No owner or record value is emitted.
+
+A paired lookup can retain an inconclusive changed-master hint from a live,
+scoped child. Incremental asset hydration makes at most one additional paired
+lookup in that same scope. Only a complete current pair may update the mapping
+through the existing state owner. A missing or deleted redirected master,
+foreign scope, another relationship change, cancellation or failed write holds
+the checkpoint. Other lookup consumers keep the hint unresolved. Sparse share
+links do not authorize this retry and are never followed.
 
 Unpaired asset deltas retain typed sparse-share evidence from
 `isSparsePrivateRecord` and the `linkedShare*` fields. The marker accepts exact
