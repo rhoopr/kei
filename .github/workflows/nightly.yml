@@ -1,0 +1,35 @@
+name: Nightly qualification
+
+on:
+  schedule:
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-qualification
+  cancel-in-progress: false
+
+jobs:
+  heavy:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/qualification.yml
+
+  notify:
+    if: always() && github.ref == 'refs/heads/main'
+    needs: heavy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Notify only on failure or recovery transitions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ needs.heavy.result }}
+        run: python3 scripts/ci/nightly.py report

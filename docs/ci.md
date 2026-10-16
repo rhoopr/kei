@@ -70,3 +70,21 @@ an existing media/state tree as disposable test data.
 The attestation is a maintainer trust boundary, not independent proof that local
 commands ran. Keep the underlying evidence. A new commit requires a new run.
 Nightly results do not replace this requirement.
+
+## Nightly operation
+
+`Nightly qualification` runs on main at 07:23 UTC each day (03:23 EDT or
+02:23 EST). It runs even when the commit is unchanged, since dependencies and
+runner images can change. It has no publication permission. Manual dispatch on
+main uses the same route; manual Heavy qualification can test a feature branch
+without publishing or posting notifications.
+
+`Nightly freshness` checks at 19:23 UTC. A missing, failed, cancelled, or stale
+completed run opens one incident issue. Repeated failures do not add comments.
+Recovery adds a comment and closes the incident. A completed run must have
+started within 36 hours. Scheduled Actions can be delayed or disabled; this
+second schedule detects missing qualification runs but is not an external
+availability monitor for GitHub itself.
+
+Reports and candidate artifacts are retained for 14 days. PR, nightly, and
+release concurrency groups are separate. Nightly work cannot cancel a release.

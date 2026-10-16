@@ -1,0 +1,30 @@
+name: Nightly freshness
+
+on:
+  schedule:
+    - cron: "23 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-health
+  cancel-in-progress: false
+
+jobs:
+  freshness:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Detect missing, stale, or failed qualification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/nightly.py health
