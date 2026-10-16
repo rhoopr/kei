@@ -110,11 +110,14 @@ def check_rust_ci(errors: list[str]) -> None:
     text = workflow_text("ci.yml")
     for needle in (
         "push:\n    branches: [main]",
-        'if [[ "$EVENT_NAME" != "pull_request" ]]; then',
-        "github.event_name == 'pull_request' && needs.detect.outputs.code == 'true'",
+        "run: python3 scripts/ci/policy.py",
+        "LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}",
+        "if: needs.detect.outputs.coverage == 'true'",
+        "      - coverage-head\n",
+        "check(json.loads(os.environ[\"NEEDS\"]), required)",
     ):
         if needle not in text:
-            errors.append(f"ci.yml: missing push/main or PR-only coverage guard: {needle}")
+            errors.append(f"ci.yml: missing required routing/gate guard: {needle}")
 
 
 def check_service_smoke_paths(errors: list[str]) -> None:

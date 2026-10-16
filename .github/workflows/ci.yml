@@ -7,17 +7,16 @@ on:
         type: boolean
         default: false
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
   push:
     branches: [main]
-  schedule:
-    - cron: "23 4 * * 1"
   workflow_dispatch:
 
 # Cancel an in-flight CI run when a new push lands on the same PR.
 # Only the latest commit matters; older runs would just burn minutes.
 concurrency:
   # Partial stress runs must not cancel a complete main CI run.
-  group: ci-${{ inputs.heavy && format('qualification-{0}-', github.run_id) || '' }}${{ github.event.pull_request.number || github.ref }}${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '-stress' || '' }}
+  group: ci-${{ inputs.heavy && format('qualification-{0}-', github.run_id) || '' }}${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -43,6 +42,10 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
       cargo: ${{ steps.filter.outputs.cargo }}
       stress: ${{ steps.filter.outputs.stress }}
+      platform: ${{ steps.filter.outputs.platform }}
+      coverage: ${{ steps.filter.outputs.coverage }}
+      unused: ${{ steps.filter.outputs.unused }}
+      required: ${{ steps.filter.outputs.required }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -52,66 +55,9 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           EVENT_NAME: ${{ github.event_name }}
           HEAVY: ${{ inputs.heavy }}
-        run: |
-          set -euo pipefail
-
-          if [[ "${HEAVY:-false}" == "true" ]]; then
-            printf 'code=true\ncargo=true\nstress=true\n' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Scheduled/manual runs exercise the stress route without repeating
-          # the regular matrix. Main pushes run both routes.
-          if [[ "$EVENT_NAME" == "schedule" || "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            printf 'code=false\ncargo=false\nstress=true\n' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [[ "$EVENT_NAME" != "pull_request" ]]; then
-            echo "$EVENT_NAME event -> running all non-PR-only jobs"
-            {
-              echo "code=true"
-              echo "cargo=true"
-              echo "stress=true"
-            } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          files_path=$(mktemp)
-          trap 'rm -f "$files_path"' EXIT
-          git diff --name-only "${BASE_SHA}"...HEAD > "$files_path"
-          mapfile -t files < "$files_path"
-          rm -f "$files_path"
-          trap - EXIT
-          echo "Changed files:"
-          printf '  %s\n' "${files[@]}"
-          echo
-
-          if printf '%s\n' "${files[@]}" | grep -qE '^\.github/(workflows/|scripts/)'; then
-            echo "Workflow / scripts change detected -> running all jobs"
-            {
-              echo "code=true"
-              echo "cargo=true"
-              echo "stress=true"
-            } >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          code=false; cargo=false; stress=false
-          if printf '%s\n' "${files[@]}" | grep -qE '^(src/|tests/|build\.rs$|Cargo\.toml$|Cargo\.lock$|scripts/test-copies-stress\.sh$|justfile$)'; then
-            code=true
-          fi
-          if printf '%s\n' "${files[@]}" | grep -qE '^(Cargo\.toml$|Cargo\.lock$|\.cargo/audit\.toml$)'; then
-            cargo=true
-          fi
-          if printf '%s\n' "${files[@]}" | grep -E '^(src/(commands/|download/|state/|icloud/|sync_loop(\.rs|/)|sync_cycle\.rs$|config(\.rs|/)|types\.rs$|account\.rs$|retry\.rs$|selection\.rs$|fs_util\.rs$|lib\.rs$|test_helpers\.rs$)|tests/data/|build\.rs$|Cargo\.(toml|lock)$|scripts/test-copies-stress\.sh$|justfile$)' > /dev/null; then
-            stress=true
-          fi
-          {
-            echo "stress=$stress"
-            echo "code=$code"
-            echo "cargo=$cargo"
-          } >> "$GITHUB_OUTPUT"
+          LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}
+          FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+        run: python3 scripts/ci/policy.py
 
   # Enforces consistent code style across the project
   # Fails if any code isn't formatted with rustfmt
@@ -216,12 +162,17 @@ jobs:
           mise_toml: |
             [tools]
             just = "1.50.0"
-      - run: cargo test --all-features
+      - name: Complete offline suite
+        if: runner.os == 'Linux' || needs.detect.outputs.platform == 'true'
+        run: cargo test --locked --all-features
         env:
           # ExifTool is the independent reader for the HEIF item-map writer.
           # Requiring it where it is installed stops a failed install quietly
           # retiring that coverage.
           KEI_REQUIRE_HEIF_ORACLE: ${{ runner.os == 'Linux' && '1' || '' }}
+      - name: Platform build and smoke
+        if: runner.os != 'Linux' && needs.detect.outputs.platform != 'true'
+        run: cargo test --locked --all-features --test cli --test media_fixtures --test service_cli --test service_linux --test service_macos --test service_windows --test service_status
       - name: Check ignored stress test remains selectable
         if: runner.os == 'Linux'
         run: bash scripts/test-copies-stress.sh --check
@@ -265,13 +216,31 @@ jobs:
           scripts/check-wiki-commands.sh target/debug/kei /tmp/kei-wiki
       - run: cargo doc --no-deps --all-features
 
+  catalogs:
+    name: Safety contracts and scenario catalogs
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: |
+          scripts/check-contracts
+          python3 scripts/fixtures/check_live_selection.py
+          bash scripts/test-scenarios/check.sh
+          python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+
   # Detects dependencies declared in Cargo.toml but not actually used
   # Keeps the dependency tree lean and reduces compile times
   # Requires nightly because cargo-udeps uses unstable features
   unused-deps:
     name: Unused Dependencies
     needs: detect
-    if: needs.detect.outputs.code == 'true'
+    if: needs.detect.outputs.unused == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -280,7 +249,7 @@ jobs:
           toolchain: ${{ env.RUST_NIGHTLY_TOOLCHAIN }}
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: taiki-e/install-action@7170fe35ac006b4d8f0bcdfba8168cf5c431a122 # cargo-udeps
-      - run: cargo +nightly udeps --all-targets
+      - run: cargo +"${RUST_NIGHTLY_TOOLCHAIN}" udeps --all-targets
 
   # Verifies Cargo.lock is committed and in sync with Cargo.toml
   # Ensures reproducible builds and prevents "works on my machine" issues
@@ -301,7 +270,7 @@ jobs:
   coverage-head:
     name: Coverage (head)
     needs: detect
-    if: inputs.heavy || (github.event_name == 'pull_request' && needs.detect.outputs.code == 'true')
+    if: needs.detect.outputs.coverage == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -346,7 +315,7 @@ jobs:
   coverage-base:
     name: Coverage (base)
     needs: detect
-    if: github.event_name == 'pull_request' && needs.detect.outputs.code == 'true'
+    if: github.event_name == 'pull_request' && needs.detect.outputs.coverage == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -581,6 +550,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - run: python3 .github/scripts/check_workflow_hardening.py
+      - run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
       - run: |
           mkdir -p /tmp/codex/kei/pycache
           PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile .github/scripts/*.py
@@ -627,11 +597,10 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: crate-ci/typos@5374cbf686e897b15713110e233094e2874de7ef # master
 
-  # Single required check that gates merging. Skipped jobs (path-filtered
-  # out) count as success; only real failures or cancellations block.
+  # Single required check. Only explicitly unrouted jobs may be skipped.
   # The branch ruleset should require this name and nothing else.
   ci:
-    name: ${{ inputs.heavy && 'Qualification checks' || (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'Stress CI' || 'CI' }}
+    name: ${{ inputs.heavy && 'Qualification checks' || 'CI' }}
     if: always()
     needs:
       - detect
@@ -642,25 +611,30 @@ jobs:
       - copies-stress
       - test
       - docs
+      - catalogs
       - unused-deps
       - lockfile
       - coverage-head
-      - coverage
       - security
       - workflow-hardening
       - script-lint
       - typos
     runs-on: ubuntu-latest
     steps:
-      - name: Verify all required jobs passed or were skipped
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Require every routed check
         env:
           NEEDS: ${{ toJSON(needs) }}
+          REQUIRED: ${{ needs.detect.outputs.required }}
         run: |
-          set -euo pipefail
-          echo "$NEEDS" | jq .
-          if echo "$NEEDS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' > /dev/null; then
-            echo "All required jobs passed or were skipped."
-          else
-            echo "One or more required jobs failed or were cancelled." >&2
-            exit 1
-          fi
+          python3 - <<'PYTHON'
+          import json, os, sys
+          sys.path.insert(0, "scripts/ci")
+          from gate import check
+          required = json.loads(os.environ["REQUIRED"])
+          if not required:
+              raise SystemExit("missing required-check policy")
+          check(json.loads(os.environ["NEEDS"]), required)
+          PYTHON
