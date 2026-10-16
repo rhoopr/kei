@@ -205,6 +205,14 @@ jobs:
           mise_toml: |
             [tools]
             just = "1.50.0"
+      - name: Place Windows test temporaries on the runner data volume
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $testTemp = Join-Path $env:RUNNER_TEMP 'kei-test-temp'
+          New-Item -ItemType Directory -Force $testTemp | Out-Null
+          "TEMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$testTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - run: cargo test --all-features
         env:
           # ExifTool is the independent reader for the HEIF item-map writer.
