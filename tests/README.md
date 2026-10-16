@@ -88,7 +88,8 @@ marker, or feature change cannot silently remove the stress proof.
 shared account/retry/filesystem/types/selection, media fixtures, dependencies, or CI), every
 push to main, Monday at 04:23 UTC, and manual Rust CI dispatches. Unrelated
 code and docs-only PRs skip it. Scheduled/manual runs skip the regular test
-matrix; the aggregate `CI` check requires the stress job when selected. The
+matrix and use a distinct `Stress CI` aggregate and concurrency group, so a
+partial run cannot replace or cancel the required full `CI` gate. PR/main `CI` requires stress when selected. The
 release tag workflow builds artifacts without a test suite; main CI and the
 explicit stress command provide the stress route before release. Run the
 explicit command alongside `just full-test` for local release qualification.

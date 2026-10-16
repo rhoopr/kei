@@ -11,7 +11,8 @@ on:
 # Cancel an in-flight CI run when a new push lands on the same PR.
 # Only the latest commit matters; older runs would just burn minutes.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  # Partial stress runs must not cancel a complete main CI run.
+  group: ci-${{ github.event.pull_request.number || github.ref }}${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '-stress' || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -619,7 +620,7 @@ jobs:
   # out) count as success; only real failures or cancellations block.
   # The branch ruleset should require this name and nothing else.
   ci:
-    name: CI
+    name: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'Stress CI' || 'CI' }}
     if: always()
     needs:
       - detect
