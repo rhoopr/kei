@@ -127,3 +127,11 @@ runs one child per case and checks the actual syscall marker plus filesystem
 and reopened SQLite outcomes. Environment variables are supplied to the child
 without mutating the multithreaded parent's environment. No production Rust
 unsafe block or stronger power-loss/storage promise is introduced.
+
+## Test-only allocation high-water regression
+
+`src/test_helpers/allocation.rs` wraps `System` only in library test builds. Each unsafe allocator call forwards the caller's original pointer,
+layout and size unchanged, without dereferencing or retaining pointers.
+Const thread-local counters allocate nothing and isolate synchronous production
+path measurements from parallel tests. The evidence measures net live Rust heap
+growth and individual allocation sizes, not RSS or the C++ toolkit's heap.

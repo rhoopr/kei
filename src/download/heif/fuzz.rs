@@ -47,7 +47,8 @@ pub(crate) fn fuzz_rewrite_xmp_preserves(input: &[u8]) {
 #[cfg(feature = "__fuzz_internals")]
 fn fuzz_extract_xmp(bytes: &[u8]) -> Option<Vec<u8>> {
     let (_, iinf, iloc, iref, primary_item_id, _) = find_meta_layout(bytes).ok()?;
-    let (location, _, _, _, _, _, _) = locate_xmp(bytes, iinf, iloc, iref, primary_item_id).ok()?;
+    let (location, _, _, _, _, _, _) =
+        locate_xmp(bytes, iinf, iloc, iref, primary_item_id, bytes.len()).ok()?;
     let location = location?;
     let end = location.extent_start.checked_add(location.extent_length)?;
     bytes.get(location.extent_start..end).map(<[u8]>::to_vec)

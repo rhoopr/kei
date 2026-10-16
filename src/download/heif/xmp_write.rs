@@ -1,18 +1,18 @@
 //! Byte-preserving insertion and replacement of the selected XMP packet.
 
-use super::boxes::{
-    RawBox, box_with_body, extent_is_within_mdat_payload, find_meta_layout, is_heif_content,
-    patch_box_size, scan_raw_boxes,
-};
+use super::boxes::{RawBox, box_with_body, find_meta_layout};
 use super::items::{
     append_iinf_entry, append_iloc_entry, item_extent_is_shared, parse_iinf, parse_iloc,
-    reject_meta_overlapping_items, resolve_item_extents, rewrite_existing_iloc,
+    reject_meta_overlapping_items, rewrite_existing_iloc,
 };
 use super::relationships::{
     append_cdsc_reference, insertion_described_item_ids, select_xmp_item_id, synthesise_cdsc_iref,
 };
+use super::stream::FileLayout;
 use super::{HeifError, invalid_layout};
+#[cfg(any(test, feature = "__fuzz_internals"))]
 use std::io::Write;
+use std::io::{Read, Seek};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct XmpLocation {
@@ -21,29 +21,13 @@ pub(super) struct XmpLocation {
     pub(super) extent_length: usize,
 }
 
-fn ensure_insertion_layout(bytes: &[u8]) -> Result<(), HeifError> {
-    let top = scan_raw_boxes(bytes, 0, bytes.len())?;
-    for atom in top {
-        let allowed = atom.kind == *b"ftyp"
-            || atom.kind == *b"meta"
-            || atom.kind == *b"mdat"
-            || atom.kind == *b"free"
-            || atom.kind == *b"wide";
-        if !allowed {
-            return Err(invalid_layout(
-                "HEIC insertion refuses top-level boxes with unhandled file offsets",
-            ));
-        }
-    }
-    Ok(())
-}
-
 pub(super) fn locate_xmp(
     bytes: &[u8],
     iinf: RawBox,
     iloc: RawBox,
     iref: Option<RawBox>,
     primary_item_id: u32,
+    file_len: usize,
 ) -> Result<
     (
         Option<XmpLocation>,
@@ -77,7 +61,7 @@ pub(super) fn locate_xmp(
                 let start = usize::try_from(start).ok()?;
                 let length = usize::try_from(extent.length).ok()?;
                 let end = start.checked_add(length)?;
-                if item.construction_method == 0 && end <= bytes.len() {
+                if item.construction_method == 0 && end <= file_len {
                     Some(XmpLocation {
                         item_id,
                         extent_start: start,
@@ -108,21 +92,38 @@ pub(super) fn locate_xmp(
 ///
 /// Insertion is limited to files whose top-level boxes have no unhandled
 /// absolute offsets. Existing-XMP updates do not grow `meta` and can append
-/// after otherwise unsupported top-level boxes. The complete rewritten file
-/// is materialised before it is written to `writer`.
+/// after otherwise unsupported top-level boxes. Unchanged ranges stream to
+/// `writer` through a fixed-size buffer.
 #[allow(
     clippy::indexing_slicing,
     reason = "All rewrite ranges come from validated box boundaries and checked XMP extent arithmetic."
 )]
+#[cfg(any(test, feature = "__fuzz_internals"))]
 pub(crate) fn rewrite_xmp<W: Write>(
     input: &[u8],
     xmp: &[u8],
     mut writer: W,
 ) -> Result<(), HeifError> {
-    if !is_heif_content(input) {
-        return Err(invalid_layout("input is not a HEIF-family file"));
-    }
-    let (meta, iinf, iloc, iref, primary_item_id, prefix_size) = find_meta_layout(input)?;
+    let mut source = std::io::Cursor::new(input);
+    let layout = FileLayout::read(&mut source, input.len() as u64)?;
+    let patches = plan_xmp(&layout, &mut source, xmp)?;
+    layout.write(&mut source, &patches, &mut writer)
+}
+
+/// Plan bounded control-data replacements; media ranges stay on disk.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "Ranges come from validated control boxes and checked extent arithmetic."
+)]
+pub(super) fn plan_xmp<R: Read + Seek>(
+    layout: &FileLayout,
+    source: &mut R,
+    xmp: &[u8],
+) -> Result<Vec<super::stream::Patch>, HeifError> {
+    use super::stream::Patch;
+    let input = layout.control_bytes.as_slice();
+    let file_len = layout.len;
+    let (_, iinf, iloc, iref, primary_item_id, _) = find_meta_layout(input)?;
     let iloc_layout = parse_iloc(input, iloc)?;
     let (
         existing,
@@ -132,12 +133,12 @@ pub(crate) fn rewrite_xmp<W: Write>(
         iinf_count_pos,
         iinf_count_size,
         iinf_item_ids,
-    ) = locate_xmp(input, iinf, iloc, iref, primary_item_id)?;
+    ) = locate_xmp(input, iinf, iloc, iref, primary_item_id, file_len)?;
 
-    reject_meta_overlapping_items(&iloc_layout, meta)?;
+    reject_meta_overlapping_items(&iloc_layout, layout.meta_box)?;
     for item in &iloc_layout.items {
         if item.construction_method == 0 {
-            let _ = resolve_item_extents(input, item)?;
+            let _ = layout.extents(item)?;
         }
     }
 
@@ -154,7 +155,7 @@ pub(crate) fn rewrite_xmp<W: Write>(
             .extent_start
             .checked_add(location.extent_length)
             .ok_or_else(|| invalid_layout("existing XMP extent overflows"))?;
-        if end > input.len() {
+        if end > file_len {
             return Err(invalid_layout("existing XMP extent is outside the file"));
         }
         let shared = item_extent_is_shared(
@@ -165,16 +166,20 @@ pub(crate) fn rewrite_xmp<W: Write>(
             u64::try_from(location.extent_length)
                 .map_err(|_| invalid_layout("existing XMP length overflows"))?,
         );
-        let in_mdat =
-            extent_is_within_mdat_payload(input, location.extent_start, location.extent_length)?;
-        if xmp.len() <= location.extent_length && !shared && in_mdat {
-            let mut output = input.to_vec();
-            output[location.extent_start..location.extent_start + xmp.len()].copy_from_slice(xmp);
-            output[location.extent_start + xmp.len()..end].fill(b' ');
-            writer.write_all(&output)?;
-            return Ok(());
+        let in_mdat = layout.in_mdat(source, location.extent_start, location.extent_length)?;
+        if xmp.len() <= location.extent_length
+            && location.extent_length <= super::stream::MAX_RETAINED_DATA_BYTES
+            && !shared
+            && in_mdat
+        {
+            let mut packet = xmp.to_vec();
+            packet.resize(location.extent_length, b' ');
+            return Ok(vec![Patch {
+                range: location.extent_start..end,
+                bytes: packet,
+            }]);
         }
-        let new_data_offset = u64::try_from(input.len())
+        let new_data_offset = u64::try_from(file_len)
             .ok()
             .and_then(|len| len.checked_add(8))
             .ok_or_else(|| invalid_layout("new XMP offset overflows"))?;
@@ -186,13 +191,13 @@ pub(crate) fn rewrite_xmp<W: Write>(
             new_data_offset,
             u64::try_from(xmp.len()).map_err(|_| invalid_layout("XMP packet is too large"))?,
         )?;
-        let mut output = Vec::new();
-        output.extend_from_slice(&input[..iloc.start]);
-        output.extend_from_slice(&new_iloc);
-        output.extend_from_slice(&input[iloc.end()..]);
-        output.extend_from_slice(&box_with_body(*b"mdat", xmp)?);
-        writer.write_all(&output)?;
-        return Ok(());
+        return Ok(vec![
+            layout.meta_patch(iloc.start..iloc.end(), new_iloc)?,
+            Patch {
+                range: file_len..file_len,
+                bytes: box_with_body(*b"mdat", xmp)?,
+            },
+        ]);
     }
 
     if xmp_item_id.is_some() {
@@ -200,7 +205,7 @@ pub(crate) fn rewrite_xmp<W: Write>(
             "existing XMP item uses an unsupported iloc layout",
         ));
     }
-    ensure_insertion_layout(input)?;
+    layout.ensure_insertion()?;
     let iinf_layout = parse_iinf(input, iinf)?;
     let described_item_ids =
         insertion_described_item_ids(input, iref, primary_item_id, &iinf_layout)?;
@@ -229,7 +234,7 @@ pub(crate) fn rewrite_xmp<W: Write>(
             0,
         ),
     };
-    let old_meta_len = meta.size;
+    let old_meta_len = layout.meta_box.size;
     let xmp_length =
         u64::try_from(xmp.len()).map_err(|_| invalid_layout("XMP packet is too large"))?;
     let placeholder_iloc = append_iloc_entry(
@@ -237,13 +242,14 @@ pub(crate) fn rewrite_xmp<W: Write>(
         iloc,
         &iloc_layout,
         new_item_id,
-        u64::try_from(input.len())
+        u64::try_from(file_len)
             .ok()
             .and_then(|len| len.checked_add(8))
             .ok_or_else(|| invalid_layout("new XMP offset overflows"))?,
         xmp_length,
         0,
-        u64::try_from(meta.end()).map_err(|_| invalid_layout("HEIC meta offset overflows"))?,
+        u64::try_from(layout.meta_box.end())
+            .map_err(|_| invalid_layout("HEIC meta offset overflows"))?,
     )?;
     let new_meta_len = old_meta_len
         .checked_add(new_iinf.len())
@@ -261,7 +267,7 @@ pub(crate) fn rewrite_xmp<W: Write>(
                 .and_then(|old_len| new_len.checked_sub(old_len))
         })
         .ok_or_else(|| invalid_layout("new HEIC meta size is invalid"))?;
-    let data_offset = u64::try_from(input.len())
+    let data_offset = u64::try_from(file_len)
         .ok()
         .and_then(|len| len.checked_add(delta))
         .and_then(|len| len.checked_add(8))
@@ -274,7 +280,8 @@ pub(crate) fn rewrite_xmp<W: Write>(
         data_offset,
         xmp_length,
         delta,
-        u64::try_from(meta.end()).map_err(|_| invalid_layout("HEIC meta offset overflows"))?,
+        u64::try_from(layout.meta_box.end())
+            .map_err(|_| invalid_layout("HEIC meta offset overflows"))?,
     )?;
     let new_meta_len = old_meta_len
         .checked_add(new_iinf.len())
@@ -284,34 +291,33 @@ pub(crate) fn rewrite_xmp<W: Write>(
         .and_then(|len| len.checked_add(new_iloc.len()))
         .and_then(|len| len.checked_sub(iloc.size))
         .ok_or_else(|| invalid_layout("new HEIC meta size overflows"))?;
-    let mut meta_bytes = Vec::with_capacity(new_meta_len);
-    meta_bytes.extend_from_slice(&input[meta.start..meta.body_start() + prefix_size]);
-    let children = scan_raw_boxes(input, meta.body_start() + prefix_size, meta.end())?;
-    for child in children {
-        if child.start == iinf.start {
-            meta_bytes.extend_from_slice(&new_iinf);
-            if iref.is_none() {
-                meta_bytes.extend_from_slice(&new_iref);
-            }
-        } else if iref.is_some_and(|existing| existing.start == child.start) {
-            meta_bytes.extend_from_slice(&new_iref);
-        } else if child.start == iloc.start {
-            meta_bytes.extend_from_slice(&new_iloc);
-        } else {
-            meta_bytes.extend_from_slice(&input[child.start..child.end()]);
+    let new_size = u32::try_from(new_meta_len)
+        .map_err(|_| invalid_layout("rewritten ISO-BMFF box is too large"))?;
+    let mut iinf_bytes = new_iinf;
+    let iref_patch = match iref {
+        Some(iref) => Some(layout.meta_patch(iref.start..iref.end(), new_iref)?),
+        None => {
+            iinf_bytes.extend_from_slice(&new_iref);
+            None
         }
+    };
+    let mut patches = vec![
+        Patch {
+            range: layout.meta_box.start..layout.meta_box.start + 4,
+            bytes: new_size.to_be_bytes().to_vec(),
+        },
+        layout.meta_patch(iinf.start..iinf.end(), iinf_bytes)?,
+        layout.meta_patch(iloc.start..iloc.end(), new_iloc)?,
+        Patch {
+            range: file_len..file_len,
+            bytes: box_with_body(*b"mdat", xmp)?,
+        },
+    ];
+    if let Some(patch) = iref_patch {
+        patches.push(patch);
     }
-    patch_box_size(&mut meta_bytes)?;
-    if meta_bytes.len() != new_meta_len {
-        return Err(invalid_layout("rewritten HEIC meta size is inconsistent"));
-    }
-    let mut output = Vec::new();
-    output.extend_from_slice(&input[..meta.start]);
-    output.extend_from_slice(&meta_bytes);
-    output.extend_from_slice(&input[meta.end()..]);
-    output.extend_from_slice(&box_with_body(*b"mdat", xmp)?);
-    writer.write_all(&output)?;
-    Ok(())
+    patches.sort_by_key(|patch| patch.range.start);
+    Ok(patches)
 }
 
 #[cfg(test)]
@@ -441,7 +447,7 @@ mod tests {
             include_bytes!("../../../tests/data/heif-rewrite/replacement-fits").to_vec();
         let (_, iinf, iloc, iref, primary_item_id, _) = find_meta_layout(&input).unwrap();
         let (location, xmp_item_id, _, _, _, _, _) =
-            locate_xmp(&input, iinf, iloc, iref, primary_item_id).unwrap();
+            locate_xmp(&input, iinf, iloc, iref, primary_item_id, input.len()).unwrap();
         let location = location.expect("seed XMP location");
         let layout = parse_iloc(&input, iloc).unwrap();
         let item = layout
@@ -1321,7 +1327,7 @@ mod tests {
             .find(|child| child.kind == *b"iprp")
             .expect("sample HEIC iprp");
         let (_, xmp_item_id, _, _, _, _, _) =
-            locate_xmp(&input, iinf, iloc, iref, primary_item_id).unwrap();
+            locate_xmp(&input, iinf, iloc, iref, primary_item_id, input.len()).unwrap();
         let layout = parse_iloc(&input, iloc).unwrap();
         let xmp_item = layout
             .items

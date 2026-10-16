@@ -18,6 +18,32 @@ pub(super) fn prepare_metadata_native(
     temp_suffix: &str,
     expected_fingerprint: Option<crate::download::file::ExistingFileFingerprint>,
 ) -> Result<PreparedMetadataFile> {
+    // Unsupported HEIF must not reach the native JPEG/TIFF whole-file reader,
+    // including when an approved fingerprint bypassed early format routing.
+    use std::io::Read;
+    let mut source = std::fs::File::open(path)
+        .with_context(|| format!("Could not open {} for native EXIF update", path.display()))?;
+    let mut head = [0; 12];
+    let count = source.read(&mut head)?;
+    if crate::download::file::is_heif_content(head.get(..count).unwrap_or(&[])) {
+        if let Some(approved) = expected_fingerprint {
+            // An unreadable or changing approved source must not become an
+            // ordinary metadata failure followed by media publication.
+            if super::prepared::fingerprint_open_file(&mut source, path).ok() != Some(approved) {
+                return Err(
+                    crate::download::file::ConditionalPublishTargetChanged::AfterPlanning {
+                        path: path.to_path_buf(),
+                    }
+                    .into(),
+                );
+            }
+        }
+        anyhow::bail!(
+            "Native EXIF writer does not support embedded HEIF metadata in {}",
+            path.display()
+        );
+    }
+    drop(source);
     let input = std::fs::read(path)
         .with_context(|| format!("Could not read {} for native EXIF update", path.display()))?;
     let expected = fingerprint_bytes(&input)?;

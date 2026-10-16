@@ -3,6 +3,8 @@
 //! Provides ergonomic builders for commonly constructed test objects
 //! and reusable mock implementations of core traits.
 
+pub(crate) mod allocation;
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 

@@ -77,6 +77,9 @@ pub(in crate::download) fn read_source_gps_from_file(
             Err(heif::HeifExifError::Malformed) => {
                 return Ok(SourceGpsMetadata::default());
             }
+            Err(heif::HeifExifError::ResourceUnsupported(error)) => {
+                return Err(error.into());
+            }
             Err(heif::HeifExifError::Io(error)) => {
                 return Err(error).with_context(|| {
                     format!("Could not read {} for source GPS metadata", path.display())

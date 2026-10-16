@@ -140,7 +140,7 @@ fn fingerprint_file_snapshot_blocking(path: &Path) -> anyhow::Result<ExistingFil
     fingerprint_open_file_snapshot_blocking(&mut file, path)
 }
 
-pub(super) fn fingerprint_open_file_snapshot_blocking(
+pub(in crate::download) fn fingerprint_open_file_snapshot_blocking(
     file: &mut std::fs::File,
     path: &Path,
 ) -> anyhow::Result<ExistingFileSnapshot> {

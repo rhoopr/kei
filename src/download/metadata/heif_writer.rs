@@ -1,8 +1,6 @@
 //! HEIF-family metadata preparation with media-preservation checks.
 
-use super::prepared::{
-    PreparedMetadataFile, TmpGuard, create_unique_embed_temp, fingerprint_bytes,
-};
+use super::prepared::{PreparedMetadataFile, TmpGuard, create_unique_embed_temp};
 use super::values::MetadataWrite;
 use super::xmp_fields::{apply_to_xmp, ensure_initialized};
 use crate::download::heif;
@@ -12,13 +10,20 @@ use little_exif::metadata::Metadata;
 use std::path::Path;
 use xmp_toolkit::XmpMeta;
 
+#[cfg(test)]
+type StreamWriteHook = Box<dyn FnOnce(&Path, &Path)>;
+#[cfg(test)]
+thread_local! {
+    static AFTER_STREAM_WRITE: std::cell::RefCell<Option<StreamWriteHook>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(super) fn prepare_metadata_heif(
     path: &Path,
     write: &MetadataWrite,
     temp_suffix: &str,
     expected_fingerprint: Option<crate::download::file::ExistingFileFingerprint>,
 ) -> Result<PreparedMetadataFile> {
-    use std::io::Read;
+    let _admission = super::prepared::admit_heif_metadata();
 
     // CONTRACT: HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT
     ensure_initialized();
@@ -28,11 +33,7 @@ pub(super) fn prepare_metadata_heif(
         .metadata()
         .with_context(|| format!("Could not inspect permissions of {}", path.display()))?
         .permissions();
-    let mut input = Vec::new();
-    source
-        .read_to_end(&mut input)
-        .with_context(|| format!("Could not read {} for HEIC XMP update", path.display()))?;
-    let expected = fingerprint_bytes(&input)?;
+    let expected = super::prepared::fingerprint_open_file(&mut source, path)?;
     if expected_fingerprint.is_some_and(|approved| approved != expected) {
         return Err(
             crate::download::file::ConditionalPublishTargetChanged::AfterPlanning {
@@ -41,156 +42,165 @@ pub(super) fn prepare_metadata_heif(
             .into(),
         );
     }
-    let existing = heif::extract_xmp_strict(&input)
-        .with_context(|| format!("Could not inspect existing XMP in {}", path.display()))?;
-    let mut meta = match existing.as_deref() {
-        Some(bytes) => {
-            let text = std::str::from_utf8(bytes)
-                .with_context(|| format!("Existing HEIC XMP in {} is not UTF-8", path.display()))?;
-            text.parse::<XmpMeta>().with_context(|| {
-                format!("Existing HEIC XMP in {} is not valid XMP", path.display())
-            })?
-        }
-        None => XmpMeta::new().context("Could not create XMP metadata")?,
-    };
-    apply_to_xmp(&mut meta, write)?;
-    let xmp = meta.to_string().into_bytes();
-    let native_input = if write.require_native_heif_capture_time {
-        heif::validate_capture_repair_item_ownership(&input).with_context(|| {
-            format!(
-                "Could not prove HEIC capture metadata belongs only to the primary image in {}",
-                path.display()
-            )
-        })?;
-        let (Some(datetime), Some(offset)) = (
-            write.datetime.as_deref(),
-            write.offset_time_original.as_deref(),
-        ) else {
-            anyhow::bail!(
-                "HEIC capture timestamp repair has no complete timestamp pair for {}",
-                path.display()
-            );
+    let result = (|| {
+        let layout = heif::FileLayout::read(&mut source, expected.size)?;
+        let existing = layout
+            .xmp(&mut source)
+            .with_context(|| format!("Could not inspect existing XMP in {}", path.display()))?;
+        let mut meta = match existing.as_deref() {
+            Some(bytes) => {
+                let text = std::str::from_utf8(bytes).with_context(|| {
+                    format!("Existing HEIC XMP in {} is not UTF-8", path.display())
+                })?;
+                text.parse::<XmpMeta>().with_context(|| {
+                    format!("Existing HEIC XMP in {} is not valid XMP", path.display())
+                })?
+            }
+            None => XmpMeta::new().context("Could not create XMP metadata")?,
         };
-        heif::rewrite_exif_capture_time(
-            &input,
-            datetime,
-            offset,
-            write.datetime_subseconds.as_deref(),
-        )
-        .with_context(|| {
-            format!(
-                "Could not update native HEIC Exif capture time in {}",
-                path.display()
-            )
-        })?
-    } else {
-        None
-    };
-    if write.require_native_heif_capture_time && native_input.is_none() {
-        anyhow::bail!(
-            "HEIC capture timestamp repair could not update a native Exif timestamp pair in {}",
-            path.display()
-        );
-    }
-    let rewrite_input = native_input.as_deref().unwrap_or(&input);
+        apply_to_xmp(&mut meta, write)?;
+        let xmp = meta.to_string().into_bytes();
+        // Neither the parsed source packet nor its toolkit graph is needed
+        // during streaming or independent output validation.
+        drop(meta);
+        drop(existing);
+        let capture = if write.require_native_heif_capture_time {
+            let (Some(datetime), Some(offset)) = (
+                write.datetime.as_deref(),
+                write.offset_time_original.as_deref(),
+            ) else {
+                anyhow::bail!(
+                    "HEIC capture timestamp repair has no complete timestamp pair for {}",
+                    path.display()
+                );
+            };
+            Some((datetime, offset, write.datetime_subseconds.as_deref()))
+        } else {
+            None
+        };
 
-    let (file, tmp_path) = create_unique_embed_temp(path, temp_suffix)?;
-    let cleanup_permissions = file
-        .metadata()
-        .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
-        .permissions();
-    let guard = TmpGuard::with_cleanup_permissions(&tmp_path, cleanup_permissions);
-    let mut writer = std::io::BufWriter::new(file);
-    heif::rewrite_xmp(rewrite_input, &xmp, &mut writer)
-        .with_context(|| format!("Could not update XMP in {}", path.display()))?;
-    let file = writer
-        .into_inner()
-        .with_context(|| format!("Could not flush {}", tmp_path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("Could not fsync {}", tmp_path.display()))?;
-    let mut file = file;
-    validate_heif_post_rewrite(&mut file, &tmp_path)?;
-    let rewritten = std::fs::read(&tmp_path)
-        .with_context(|| format!("Could not validate {}", tmp_path.display()))?;
-    let rewritten_fingerprint = fingerprint_bytes(&rewritten)?;
-    heif::validate_rewrite_preserves_non_xmp_items(rewrite_input, &rewritten).with_context(
-        || {
-            format!(
-                "HEIC metadata rewrite changed non-XMP media data in {}",
-                tmp_path.display()
-            )
-        },
-    )?;
-    if native_input.is_some() {
-        let native_tiff = heif::extract_exif_tiff_bytes(&rewritten)
+        let (file, tmp_path) = create_unique_embed_temp(path, temp_suffix)?;
+        let cleanup_permissions = file
+            .metadata()
+            .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
+            .permissions();
+        let guard = TmpGuard::with_cleanup_permissions(&tmp_path, cleanup_permissions);
+        let mut writer = std::io::BufWriter::new(file);
+        layout
+            .rewrite(&mut source, &xmp, capture, &mut writer)
+            .with_context(|| format!("Could not update XMP in {}", path.display()))?;
+        let file = writer
+            .into_inner()
+            .with_context(|| format!("Could not flush {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Could not fsync {}", tmp_path.display()))?;
+        let mut file = file;
+        #[cfg(test)]
+        AFTER_STREAM_WRITE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook(path, &tmp_path);
+            }
+        });
+        validate_heif_post_rewrite(&mut file, &tmp_path)?;
+        let rewritten_fingerprint = super::prepared::fingerprint_open_file(&mut file, &tmp_path)?;
+        let rewritten = heif::FileLayout::read(&mut file, rewritten_fingerprint.size)?;
+        layout
+            .validate(&mut source, &rewritten, &mut file, capture)
             .with_context(|| {
                 format!(
-                    "Could not inspect rewritten native HEIC Exif in {}",
-                    tmp_path.display()
-                )
-            })?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Rewritten HEIC lost its native Exif item: {}",
+                    "HEIC metadata rewrite changed non-XMP media data in {}",
                     tmp_path.display()
                 )
             })?;
-        Metadata::new_from_vec(&native_tiff, FileExtension::TIFF).with_context(|| {
-            format!(
-                "Could not parse rewritten native HEIC Exif in {}",
-                tmp_path.display()
-            )
-        })?;
-        let native_probe = heif::extract_exif_capture_time(&rewritten)?
-            .ok_or_else(|| anyhow::anyhow!("Rewritten HEIC lost its native capture time"))?;
-        if native_probe.datetime_original.as_deref() != write.datetime.as_deref()
-            || native_probe.offset_time_original.as_deref() != write.offset_time_original.as_deref()
-            || native_probe.subseconds_original.as_deref() != write.datetime_subseconds.as_deref()
-        {
+        if capture.is_some() {
+            let native_tiff = rewritten
+                .tiff(&mut file)
+                .with_context(|| {
+                    format!(
+                        "Could not inspect rewritten native HEIC Exif in {}",
+                        tmp_path.display()
+                    )
+                })?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Rewritten HEIC lost its native Exif item: {}",
+                        tmp_path.display()
+                    )
+                })?;
+            Metadata::new_from_vec(&native_tiff, FileExtension::TIFF).with_context(|| {
+                format!(
+                    "Could not parse rewritten native HEIC Exif in {}",
+                    tmp_path.display()
+                )
+            })?;
+            drop(native_tiff);
+            let native_probe = rewritten
+                .capture_time(&mut file)?
+                .ok_or_else(|| anyhow::anyhow!("Rewritten HEIC lost its native capture time"))?;
+            if native_probe.datetime_original.as_deref() != write.datetime.as_deref()
+                || native_probe.offset_time_original.as_deref()
+                    != write.offset_time_original.as_deref()
+                || native_probe.subseconds_original.as_deref()
+                    != write.datetime_subseconds.as_deref()
+            {
+                anyhow::bail!(
+                    "Rewritten HEIC native Exif does not contain the requested capture timestamp and offset: {}",
+                    tmp_path.display()
+                );
+            }
+        }
+        let Some(rewritten_xmp) = rewritten.xmp(&mut file).with_context(|| {
+            format!("Could not inspect rewritten XMP in {}", tmp_path.display())
+        })?
+        else {
             anyhow::bail!(
-                "Rewritten HEIC native Exif does not contain the requested capture timestamp and offset: {}",
+                "HEIC XMP rewrite produced no XMP item: {}",
                 tmp_path.display()
             );
+        };
+        std::str::from_utf8(&rewritten_xmp)
+            .with_context(|| format!("Rewritten HEIC XMP is not UTF-8: {}", tmp_path.display()))?
+            .parse::<XmpMeta>()
+            .with_context(|| format!("Rewritten HEIC XMP is invalid: {}", tmp_path.display()))?;
+        // A multi-image HEIC holds one XMP packet per image, so reader and writer
+        // must resolve the same item or a merge moves an auxiliary image's metadata
+        // onto the photograph. Replacing in place leaves the extent length alone and
+        // pads the tail with spaces, so the written packet is a prefix rather than
+        // the whole extent.
+        let resolves_to_written_packet = rewritten_xmp
+            .split_at_checked(xmp.len())
+            .is_some_and(|(written, padding)| written == xmp && padding.iter().all(|b| *b == b' '));
+        if !resolves_to_written_packet {
+            anyhow::bail!(
+                "HEIC XMP rewrite resolved a different item than it wrote in {}: wrote {} bytes, read back {} bytes. Refusing to replace the user's file.",
+                tmp_path.display(),
+                xmp.len(),
+                rewritten_xmp.len()
+            );
         }
-    }
-    let Some(rewritten_xmp) = heif::extract_xmp_strict(&rewritten)
-        .with_context(|| format!("Could not inspect rewritten XMP in {}", tmp_path.display()))?
-    else {
-        anyhow::bail!(
-            "HEIC XMP rewrite produced no XMP item: {}",
-            tmp_path.display()
-        );
-    };
-    std::str::from_utf8(&rewritten_xmp)
-        .with_context(|| format!("Rewritten HEIC XMP is not UTF-8: {}", tmp_path.display()))?
-        .parse::<XmpMeta>()
-        .with_context(|| format!("Rewritten HEIC XMP is invalid: {}", tmp_path.display()))?;
-    // A multi-image HEIC holds one XMP packet per image, so reader and writer
-    // must resolve the same item or a merge moves an auxiliary image's metadata
-    // onto the photograph. Replacing in place leaves the extent length alone and
-    // pads the tail with spaces, so the written packet is a prefix rather than
-    // the whole extent.
-    let resolves_to_written_packet = rewritten_xmp
-        .split_at_checked(xmp.len())
-        .is_some_and(|(written, padding)| written == xmp && padding.iter().all(|b| *b == b' '));
-    if !resolves_to_written_packet {
-        anyhow::bail!(
-            "HEIC XMP rewrite resolved a different item than it wrote in {}: wrote {} bytes, read back {} bytes. Refusing to replace the user's file.",
-            tmp_path.display(),
-            xmp.len(),
-            rewritten_xmp.len()
+        file.set_permissions(source_permissions)
+            .with_context(|| format!("Could not preserve permissions on {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Could not fsync permissions on {}", tmp_path.display()))?;
+        drop(file);
+        Ok(PreparedMetadataFile {
+            guard,
+            expected_input: expected,
+            expected_output: rewritten_fingerprint,
+        })
+    })();
+    // Even validation/error paths must report source drift as InputChanged:
+    // the download pipeline may publish verified .part media after an ordinary
+    // metadata failure, but must never publish media whose bytes changed.
+    if super::prepared::fingerprint_open_file(&mut source, path).ok() != Some(expected) {
+        return Err(
+            crate::download::file::ConditionalPublishTargetChanged::AfterPlanning {
+                path: path.to_path_buf(),
+            }
+            .into(),
         );
     }
-    file.set_permissions(source_permissions)
-        .with_context(|| format!("Could not preserve permissions on {}", tmp_path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("Could not fsync permissions on {}", tmp_path.display()))?;
-    drop(file);
-    Ok(PreparedMetadataFile {
-        guard,
-        expected_input: expected,
-        expected_output: rewritten_fingerprint,
-    })
+    result
 }
 
 /// Read the first 12 bytes of `file` and verify it starts with an
@@ -1252,5 +1262,149 @@ mod tests {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod streaming_failure_tests {
+    use super::{AFTER_STREAM_WRITE, prepare_metadata_heif};
+    use crate::download::metadata::MetadataWrite;
+    use crate::download::metadata::test_support::embed_temp_entries;
+    use std::io::{Seek, SeekFrom, Write};
+
+    #[test]
+    fn source_mutation_during_streaming_is_input_changed_and_owned_temp_is_cleaned() {
+        for append in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("synthetic.heic");
+            let bytes = crate::download::heif::apple_multi_exif_heic(
+                &crate::test_helpers::minimal_tiff_with_source_gps(),
+            );
+            std::fs::write(&path, &bytes).unwrap();
+            AFTER_STREAM_WRITE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |source, _temp| {
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(source)
+                        .unwrap();
+                    if append {
+                        file.seek(SeekFrom::End(0)).unwrap();
+                    } else {
+                        // Overwrite the final protected auxiliary Exif payload.
+                        // This makes preservation validation fail before success.
+                        file.seek(SeekFrom::End(-1)).unwrap();
+                    }
+                    file.write_all(b"changed concurrently").unwrap();
+                }));
+            });
+            let error = prepare_metadata_heif(
+                &path,
+                &MetadataWrite {
+                    rating: Some(4),
+                    ..MetadataWrite::default()
+                },
+                ".meta-tmp",
+                None,
+            )
+            .err()
+            .expect("source drift must refuse preparation");
+            assert!(
+                crate::download::file::classify_conditional_publish_error(&error).target_changed,
+                "the pipeline must abort .part publication for {error:#}"
+            );
+            assert!(
+                std::fs::read(&path)
+                    .unwrap()
+                    .ends_with(b"changed concurrently")
+            );
+            assert!(embed_temp_entries(directory.path(), ".meta-tmp").is_empty());
+        }
+    }
+
+    #[test]
+    fn corrupt_streamed_output_is_refused_and_owned_temp_is_cleaned() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synthetic.heic");
+        let bytes = crate::download::heif::apple_multi_exif_heic(
+            &crate::test_helpers::minimal_tiff_with_source_gps(),
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        AFTER_STREAM_WRITE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|_source, temp| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(temp)
+                    .unwrap()
+                    .set_len(12)
+                    .unwrap();
+            }));
+        });
+        assert!(
+            prepare_metadata_heif(
+                &path,
+                &MetadataWrite {
+                    rating: Some(4),
+                    ..MetadataWrite::default()
+                },
+                ".meta-tmp",
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(embed_temp_entries(directory.path(), ".meta-tmp").is_empty());
+        // Failed validation releases admission for a successful retry.
+        drop(
+            prepare_metadata_heif(
+                &path,
+                &MetadataWrite {
+                    rating: Some(4),
+                    ..MetadataWrite::default()
+                },
+                ".meta-tmp",
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(embed_temp_entries(directory.path(), ".meta-tmp").is_empty());
+    }
+    #[test]
+    fn panicked_preparation_releases_admission_and_owned_temporary_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synthetic.heic");
+        let bytes = crate::download::heif::apple_multi_exif_heic(
+            &crate::test_helpers::minimal_tiff_with_source_gps(),
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        AFTER_STREAM_WRITE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|_, _| panic!("injected preparation panic")));
+        });
+        let panicked = std::panic::catch_unwind(|| {
+            let _ = prepare_metadata_heif(
+                &path,
+                &MetadataWrite {
+                    rating: Some(4),
+                    ..MetadataWrite::default()
+                },
+                ".meta-tmp",
+                None,
+            );
+        });
+        assert!(panicked.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(embed_temp_entries(directory.path(), ".meta-tmp").is_empty());
+        drop(
+            prepare_metadata_heif(
+                &path,
+                &MetadataWrite {
+                    rating: Some(4),
+                    ..MetadataWrite::default()
+                },
+                ".meta-tmp",
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(embed_temp_entries(directory.path(), ".meta-tmp").is_empty());
     }
 }

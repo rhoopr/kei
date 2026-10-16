@@ -310,3 +310,149 @@ mod native_tests {
         );
     }
 }
+
+// Probe and preparation execute in blocking tasks. One process-wide lane bounds
+// control-data/parser allocations independently of up to 64 download workers.
+// No media-sized allocations remain; oversized metadata is refused before read.
+#[cfg(feature = "xmp")]
+static HEIF_METADATA_ADMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "xmp")]
+pub(super) fn admit_heif_metadata() -> HeifMetadataAdmission {
+    // This lock protects only admission, not shared parser state. A panicking
+    // writer drops its owned buffers/temp; poison must not disable future work.
+    let guard = HEIF_METADATA_ADMISSION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(test)]
+    {
+        let active = HEIF_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        HEIF_PEAK.fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+    }
+    HeifMetadataAdmission { _guard: guard }
+}
+
+#[cfg(feature = "xmp")]
+#[must_use]
+pub(super) struct HeifMetadataAdmission {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(test, feature = "xmp"))]
+static HEIF_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(test, feature = "xmp"))]
+static HEIF_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(test, feature = "xmp"))]
+impl Drop for HeifMetadataAdmission {
+    fn drop(&mut self) {
+        HEIF_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub(super) fn fingerprint_open_file(
+    file: &mut std::fs::File,
+    path: &Path,
+) -> anyhow::Result<crate::download::file::ExistingFileFingerprint> {
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))?;
+    Ok(crate::download::file::fingerprint_open_file_snapshot_blocking(file, path)?.fingerprint)
+}
+
+#[cfg(all(test, feature = "xmp"))]
+mod heif_admission_tests {
+    use super::{HEIF_PEAK, admit_heif_metadata};
+    use crate::download::metadata::MetadataWrite;
+    use crate::download::metadata::heif_writer::prepare_metadata_heif;
+    use crate::download::metadata::probe::probe_exif;
+    use crate::download::metadata::test_support::embed_temp_entries;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn heif_admission_bounds_actual_probe_and_prepare_at_download_concurrency() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("synthetic.heic");
+        // A generated file, with no live account or provider access.
+        let bytes = crate::download::heif::apple_multi_exif_heic(
+            &crate::test_helpers::minimal_tiff_with_source_gps(),
+        );
+        std::fs::write(&source, bytes).unwrap();
+        let missing = directory.path().join("missing.heic");
+        for concurrency in [10, 64] {
+            let barrier = std::sync::Barrier::new(concurrency);
+            std::thread::scope(|scope| {
+                for _ in 0..concurrency {
+                    let barrier = &barrier;
+                    let source = &source;
+                    let missing = &missing;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let _ = probe_exif(source).unwrap();
+                        assert!(
+                            prepare_metadata_heif(
+                                missing,
+                                &MetadataWrite::default(),
+                                ".meta-tmp",
+                                None
+                            )
+                            .is_err()
+                        );
+                        let prepared = prepare_metadata_heif(
+                            source,
+                            &MetadataWrite {
+                                rating: Some(4),
+                                ..MetadataWrite::default()
+                            },
+                            ".meta-tmp",
+                            None,
+                        )
+                        .unwrap();
+                        // Cancellation after preparation owns and cleans its temp.
+                        drop(prepared);
+                    });
+                }
+            });
+            assert!(embed_temp_entries(directory.path(), ".meta-tmp").is_empty());
+            assert_eq!(HEIF_PEAK.load(Ordering::SeqCst), 1);
+        }
+        // The same lane remains usable after all failure and dropped-output paths.
+        assert!(probe_exif(&source).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_blocking_waiter_finishes_and_releases_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("synthetic.heic");
+        let bytes = crate::download::heif::apple_multi_exif_heic(
+            &crate::test_helpers::minimal_tiff_with_source_gps(),
+        );
+        std::fs::write(&source, bytes).unwrap();
+        let lane = admit_heif_metadata();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let worker_source = source.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let result = prepare_metadata_heif(
+                &worker_source,
+                &MetadataWrite {
+                    rating: Some(4),
+                    ..MetadataWrite::default()
+                },
+                ".meta-tmp",
+                None,
+            );
+            let succeeded = result.is_ok();
+            drop(result);
+            let _ = finished_tx.send(succeeded);
+        });
+        started_rx.recv().unwrap();
+        // Tokio cannot stop an executing blocking closure. Its result is still
+        // dropped, and the admission/temporary-file guards must be released.
+        worker.abort();
+        drop(lane);
+        assert!(finished_rx.await.unwrap());
+        assert!(embed_temp_entries(directory.path(), ".meta-tmp").is_empty());
+        assert!(probe_exif(&source).is_ok());
+    }
+}

@@ -624,7 +624,8 @@ pub(super) fn resolve_item_data(bytes: &[u8], item_id: u32) -> Vec<u8> {
 /// covered too.
 pub(super) fn extract_xmp_raw(bytes: &[u8]) -> Option<Vec<u8>> {
     let (_, iinf, iloc, iref, primary_item_id, _) = find_meta_layout(bytes).ok()?;
-    let (location, _, _, _, _, _, _) = locate_xmp(bytes, iinf, iloc, iref, primary_item_id).ok()?;
+    let (location, _, _, _, _, _, _) =
+        locate_xmp(bytes, iinf, iloc, iref, primary_item_id, bytes.len()).ok()?;
     let location = location?;
     Some(bytes[location.extent_start..location.extent_start + location.extent_length].to_vec())
 }
@@ -968,4 +969,27 @@ pub(super) fn heic_with_exif_items(
         idat: None,
         iref_children,
     })
+}
+
+/// Move one generated cm0 item's sole extent into a separately written sparse
+/// mdat. This fixture family uses four-byte base, offset and length fields.
+pub(crate) fn set_test_file_item_extent(bytes: &mut [u8], item_id: u32, start: u32, length: u32) {
+    let (_, _, iloc, _, _, _) = find_meta_layout(bytes).expect("meta layout");
+    let layout = parse_iloc(bytes, iloc).expect("iloc");
+    assert_eq!(layout.base_offset_size, 4);
+    assert_eq!(layout.offset_size, 4);
+    assert_eq!(bytes[iloc.body_start() + 4] & 0x0f, 4);
+    let item = layout
+        .items
+        .iter()
+        .find(|item| item.item_id == item_id)
+        .expect("item");
+    assert_eq!(item.construction_method, 0);
+    assert_eq!(item.extents.len(), 1);
+    // The parser reports field positions relative to the iloc body.
+    let base = iloc.body_start() + item.base_offset_pos.expect("base offset field");
+    let offset = iloc.body_start() + item.extents[0].offset_pos.expect("extent offset field");
+    bytes[base..base + 4].copy_from_slice(&start.to_be_bytes());
+    bytes[offset..offset + 4].copy_from_slice(&0_u32.to_be_bytes());
+    bytes[offset + 4..offset + 8].copy_from_slice(&length.to_be_bytes());
 }

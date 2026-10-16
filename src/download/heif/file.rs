@@ -23,7 +23,7 @@ struct FileItemIds {
     exif: HashSet<u32>,
 }
 
-const MAX_FILE_META_BODY_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_FILE_META_CONTROL_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) fn locate_exif_tiff<R: std::io::Read + std::io::Seek>(
     source: &mut R,
@@ -43,11 +43,25 @@ pub(crate) fn locate_exif_tiff<R: std::io::Read + std::io::Seek>(
     let Some(meta) = meta else {
         return Ok(None);
     };
-    if meta.end - meta.body_start > MAX_FILE_META_BODY_BYTES {
-        return Err(HeifExifError::Malformed);
-    }
-
     let controls = locate_meta_control_atoms(source, meta)?;
+    // Image-bearing idat and opaque properties are scanned, never retained.
+    // Preserve the existing allowance only for tables that drive allocations.
+    let retained = [controls.pitm, controls.iinf, controls.iloc, controls.iref]
+        .into_iter()
+        .flatten()
+        .try_fold(0u64, |total, atom| {
+            total.checked_add(atom.end - atom.body_start)
+        })
+        .ok_or(HeifExifError::Malformed)?;
+    if retained > MAX_FILE_META_CONTROL_BYTES as u64 {
+        return Err(HeifExifError::ResourceUnsupported(
+            super::HeifError::MetadataLimit {
+                kind: "file-backed Exif lookup controls",
+                bytes: retained,
+                budget: MAX_FILE_META_CONTROL_BYTES,
+            },
+        ));
+    }
     let (Some(iinf), Some(iloc)) = (controls.iinf, controls.iloc) else {
         return Ok(None);
     };

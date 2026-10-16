@@ -91,8 +91,9 @@ changing behavior.
 | HEIF layout | `src/download/heif/boxes.rs`, `src/download/heif/items.rs` | Owns box boundaries, item tables, extent resolution, and item-location encoding. |
 | HEIF metadata relationships | `src/download/heif/relationships.rs` | Resolves primary-image metadata ownership and encodes item references. Ambiguous ownership fails closed. |
 | HEIF native Exif | `src/download/heif/exif.rs` | Extracts native Exif and repairs capture timestamps, offsets, and paired subseconds within existing TIFF storage. Unsafe or insufficient storage leaves repair pending; native values are verified before publication. |
-| HEIF XMP | `src/download/heif/xmp_read.rs`, `src/download/heif/xmp_write.rs` | Reads, inserts, and replaces the selected XMP packet without re-encoding image payloads. |
-| HEIF preservation checks | `src/download/heif/preservation.rs` | Validates non-XMP item payloads and opaque metadata after a rewrite. |
+| HEIF XMP | `src/download/heif/stream.rs`, `src/download/heif/xmp_write.rs` | Reads the selected packet and plans bounded item-map replacements without re-encoding image payloads. The in-memory `xmp_read` remains a test and fuzz oracle. |
+| HEIF streaming | `src/download/heif/stream.rs` | Reads bounded control data and metadata packets, streams unchanged file ranges, and compares protected payloads with fixed buffers. |
+| HEIF preservation checks | `src/download/heif/stream.rs`, `src/download/heif/preservation.rs` | Streams production checks of non-XMP payloads and opaque metadata; the in-memory validator remains a test and fuzz oracle. |
 | Metadata rewrite facade and immediate execution | `src/download/metadata_rewrite.rs`, `src/download/metadata_rewrite/immediate.rs` | Preserves rewrite entry points and coordinates download-time metadata writes. The pipeline retains media publication and state finalization. |
 | Metadata write planning | `src/download/metadata_rewrite/planning.rs` | Owns opt-in flags and embedded field decisions shared by immediate and queued execution. |
 | Metadata write execution | `src/download/metadata_rewrite/embedded.rs`, `src/download/metadata_rewrite/sidecar.rs` | Coordinates fingerprint-guarded embedded writes and source-aware sidecar writes through the metadata owners. |
@@ -1590,6 +1591,37 @@ each prepared capture-repair receipt against its own rendition's incoming hash.
 An individual upsert guards the affected rendition and provider checksum without
 invalidating another rendition's prepared receipt.
 Failed receipt validation or state writes preserve checkpoint failure evidence.
+HEIF probes and embedded preparation share one process-wide blocking admission
+lane, independent of download concurrency. This conservative admission bounds
+simultaneous retained parser work; it is not needed for shared parser state and
+also serializes file I/O. Concurrency may be widened only with measured resource
+evidence.
+Production keeps a compact view of the `pitm`, `iinf`, `iloc`, and `iref` controls.
+Other `meta` children, including image-bearing `idat`, stay as file ranges.
+The separate file-backed source-GPS locator also budgets its required control
+tables rather than the complete `meta` body.
+Headers are scanned without a growing top-level or opaque-box inventory.
+Preparation patches changed controls and streams all unchanged ranges with
+64 KiB buffers; preservation checks compare original file ranges with fixed
+buffers. A large `meta` or `idat` payload alone is not a resource refusal.
+The retained-control view, selected XMP packet, complete native Exif item, and
+replacement XMP packet each have an 8 MiB materialization allowance. This reuses
+the prior writer's 8 MiB whole-`meta` allowance for the data still materialized;
+the selected Exif/XMP allowances are new operation restrictions, not format limits
+or a claim about all valid assets. Complete native TIFF parsing/alias validation
+and the XMP toolkit graph still require materialization. Larger operations return
+an explicit resource-unsupported error naming the required bytes and allowance,
+preserve the original, and retain truthful metadata retry work. The allowance is
+not a total-process RSS bound: C++ graphs, parsed structures, source/output control
+views, and fixed stack buffers also consume memory. Existing fixture sizes do not
+establish a representative camera/iCloud metadata distribution.
+Source fingerprints are checked before and after preparation, and guarded
+publication rechecks both source and output. Errors, panics, and dropped prepared
+work release admission and the existing temporary-file guard removes owned output.
+Native-only builds identify unsupported HEIF before the generic JPEG/TIFF probe
+or preparation can read the whole file; approved-input checks still use streaming
+fingerprints before preparation reports unsupported.
+
 HEIF-family embedded XMP updates use the byte-preserving item-map writer and
 reject layouts that cannot be changed without re-encoding unknown item-graph
 data. A file may hold one XMP item per image, so probe and write both resolve

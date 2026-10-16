@@ -1,7 +1,10 @@
 //! Native Exif extraction and in-place TIFF capture timestamp repair.
 
+#[cfg(test)]
 use super::boxes::{extent_is_within_mdat_payload, find_meta_layout};
+#[cfg(test)]
 use super::items::{item_extent_is_shared, parse_iinf, parse_iloc, resolve_item_extents};
+#[cfg(test)]
 use super::relationships::select_exif_item_id;
 use super::{ExifCaptureTime, HeifError, invalid_layout};
 use std::collections::HashSet;
@@ -13,6 +16,7 @@ use std::ops::Range;
 /// HEIF prefixes an Exif item with a four-byte big-endian offset from the end
 /// of that field to the TIFF header. Only construction-method-0 items are
 /// supported because their extents address file bytes directly.
+#[cfg(test)]
 pub(crate) fn extract_exif_tiff_bytes(bytes: &[u8]) -> Result<Option<Vec<u8>>, HeifError> {
     let (_, iinf, iloc, iref, primary_item_id, _) = find_meta_layout(bytes)?;
     let iinf_layout = parse_iinf(bytes, iinf)?;
@@ -449,35 +453,40 @@ fn tiff_ascii_value(tiff: &[u8], entry: TiffEntry) -> Result<String, HeifError> 
     Ok(value)
 }
 
+#[cfg(test)]
 pub(crate) fn extract_exif_capture_time(
     bytes: &[u8],
 ) -> Result<Option<ExifCaptureTime>, HeifError> {
     let Some(tiff) = extract_exif_tiff_bytes(bytes)? else {
         return Ok(None);
     };
-    let (endian, _, exif_ifd_offset) = tiff_capture_ifd_offsets(&tiff)?;
+    extract_tiff_capture_time(&tiff).map(Some)
+}
+
+pub(super) fn extract_tiff_capture_time(tiff: &[u8]) -> Result<ExifCaptureTime, HeifError> {
+    let (endian, _, exif_ifd_offset) = tiff_capture_ifd_offsets(tiff)?;
     let Some(exif_ifd_offset) = exif_ifd_offset else {
-        return Ok(Some(ExifCaptureTime {
+        return Ok(ExifCaptureTime {
             datetime_original: None,
             subseconds_original: None,
             offset_time_original: None,
-        }));
+        });
     };
-    let datetime_original = find_tiff_entry(&tiff, exif_ifd_offset, 0x9003, endian)?
-        .map(|entry| tiff_ascii_value(&tiff, entry))
+    let datetime_original = find_tiff_entry(tiff, exif_ifd_offset, 0x9003, endian)?
+        .map(|entry| tiff_ascii_value(tiff, entry))
         .transpose()?;
-    let offset_time_original = find_tiff_entry(&tiff, exif_ifd_offset, 0x9011, endian)?
-        .map(|entry| tiff_ascii_value(&tiff, entry))
+    let offset_time_original = find_tiff_entry(tiff, exif_ifd_offset, 0x9011, endian)?
+        .map(|entry| tiff_ascii_value(tiff, entry))
         .transpose()?;
-    let subseconds_original = find_tiff_entry(&tiff, exif_ifd_offset, 0x9291, endian)?
-        .map(|entry| tiff_ascii_value(&tiff, entry))
+    let subseconds_original = find_tiff_entry(tiff, exif_ifd_offset, 0x9291, endian)?
+        .map(|entry| tiff_ascii_value(tiff, entry))
         .transpose()?
         .filter(|value| !value.is_empty());
-    Ok(Some(ExifCaptureTime {
+    Ok(ExifCaptureTime {
         datetime_original,
         subseconds_original,
         offset_time_original,
-    }))
+    })
 }
 
 fn replace_tiff_ascii(tiff: &mut [u8], range: Range<usize>, value: &str) -> Result<(), HeifError> {
@@ -502,6 +511,7 @@ fn replace_tiff_ascii(tiff: &mut [u8], range: Range<usize>, value: &str) -> Resu
 /// `DateTimeOriginal` need no native repair. A native timestamp without a
 /// safely writable paired offset or requested subsecond storage is rejected
 /// so its durable marker remains. Existing subseconds are cleared for whole seconds.
+#[cfg(test)]
 pub(crate) fn rewrite_exif_capture_time(
     bytes: &[u8],
     datetime: &str,
@@ -597,40 +607,8 @@ pub(crate) fn rewrite_exif_capture_time(
         .get(tiff_start..extent_end)
         .ok_or_else(|| invalid_layout("HEIF Exif TIFF data is truncated"))?
         .to_vec();
-    let (endian, ifd0_offset, exif_ifd_offset) = tiff_capture_ifd_offsets(&tiff)?;
-    let Some(exif_ifd_offset) = exif_ifd_offset else {
+    if !rewrite_tiff_capture_time(&mut tiff, datetime, offset, subseconds)? {
         return Ok(None);
-    };
-    let Some(datetime_original) = find_tiff_entry(&tiff, exif_ifd_offset, 0x9003, endian)? else {
-        return Ok(None);
-    };
-    let offset_time_original = find_tiff_entry(&tiff, exif_ifd_offset, 0x9011, endian)?
-        .ok_or_else(|| invalid_layout("HEIF Exif timestamp has no writable paired offset"))?;
-
-    let datetime_original_range = tiff_ascii_range(&tiff, datetime_original)?;
-    let offset_time_original_range = tiff_ascii_range(&tiff, offset_time_original)?;
-
-    let mut targets = vec![
-        (datetime_original, datetime_original_range.clone()),
-        (offset_time_original, offset_time_original_range.clone()),
-    ];
-    let subsecond_entry = find_tiff_entry(&tiff, exif_ifd_offset, 0x9291, endian)?;
-    let subsecond_range = subsecond_entry
-        .map(|entry| tiff_ascii_range(&tiff, entry))
-        .transpose()?;
-    if let (Some(entry), Some(range)) = (subsecond_entry, &subsecond_range) {
-        targets.push((entry, range.clone()));
-    } else if subseconds.is_some() {
-        return Err(invalid_layout(
-            "HEIF Exif timestamp has no writable paired subseconds",
-        ));
-    }
-    validate_tiff_patch_ranges(&tiff, endian, ifd0_offset, &targets)?;
-
-    replace_tiff_ascii(&mut tiff, datetime_original_range, datetime)?;
-    replace_tiff_ascii(&mut tiff, offset_time_original_range, offset)?;
-    if let Some(range) = subsecond_range {
-        replace_tiff_ascii(&mut tiff, range, subseconds.unwrap_or(""))?;
     }
 
     let mut output = bytes.to_vec();
@@ -639,6 +617,61 @@ pub(crate) fn rewrite_exif_capture_time(
         .ok_or_else(|| invalid_layout("HEIF Exif TIFF data is truncated"))?
         .copy_from_slice(&tiff);
     Ok(Some(output))
+}
+
+pub(super) fn rewrite_tiff_capture_time(
+    tiff: &mut [u8],
+    datetime: &str,
+    offset: &str,
+    subseconds: Option<&str>,
+) -> Result<bool, HeifError> {
+    if datetime.len() != 19
+        || offset.len() != 6
+        || subseconds.is_some_and(|value| {
+            value.is_empty() || value.len() > 9 || !value.bytes().all(|b| b.is_ascii_digit())
+        })
+    {
+        return Err(invalid_layout(
+            "replacement HEIF Exif capture time is invalid",
+        ));
+    }
+    let (endian, ifd0_offset, exif_ifd_offset) = tiff_capture_ifd_offsets(tiff)?;
+    let Some(exif_ifd_offset) = exif_ifd_offset else {
+        return Ok(false);
+    };
+    let Some(datetime_original) = find_tiff_entry(tiff, exif_ifd_offset, 0x9003, endian)? else {
+        return Ok(false);
+    };
+    let offset_time_original = find_tiff_entry(tiff, exif_ifd_offset, 0x9011, endian)?
+        .ok_or_else(|| invalid_layout("HEIF Exif timestamp has no writable paired offset"))?;
+
+    let datetime_original_range = tiff_ascii_range(tiff, datetime_original)?;
+    let offset_time_original_range = tiff_ascii_range(tiff, offset_time_original)?;
+
+    let mut targets = vec![
+        (datetime_original, datetime_original_range.clone()),
+        (offset_time_original, offset_time_original_range.clone()),
+    ];
+    let subsecond_entry = find_tiff_entry(tiff, exif_ifd_offset, 0x9291, endian)?;
+    let subsecond_range = subsecond_entry
+        .map(|entry| tiff_ascii_range(tiff, entry))
+        .transpose()?;
+    if let (Some(entry), Some(range)) = (subsecond_entry, &subsecond_range) {
+        targets.push((entry, range.clone()));
+    } else if subseconds.is_some() {
+        return Err(invalid_layout(
+            "HEIF Exif timestamp has no writable paired subseconds",
+        ));
+    }
+    validate_tiff_patch_ranges(tiff, endian, ifd0_offset, &targets)?;
+
+    replace_tiff_ascii(tiff, datetime_original_range, datetime)?;
+    replace_tiff_ascii(tiff, offset_time_original_range, offset)?;
+    if let Some(range) = subsecond_range {
+        replace_tiff_ascii(tiff, range, subseconds.unwrap_or(""))?;
+    }
+
+    Ok(true)
 }
 
 #[cfg(test)]

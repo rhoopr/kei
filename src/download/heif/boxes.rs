@@ -20,40 +20,7 @@ pub(crate) fn is_heif_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether `bytes` starts with an ISO-BMFF `ftyp` box whose major brand is
-/// in the HEIF family. Robust to part-file naming where the path extension
-/// has been replaced by a temp suffix — the byte signature is the only
-/// reliable way to dispatch HEIF vs the formats XMP Toolkit can sniff
-/// itself (JPEG/PNG/TIFF/MP4/MOV).
-///
-/// Brands per ISO/IEC 23008-12 §A.6 (HEIF) and AV1 Image File Format
-/// (`avif`/`avis`). Only the first 12 bytes are inspected: 4-byte size,
-/// `ftyp` fourCC, then 4-byte major brand.
-pub(crate) fn is_heif_content(bytes: &[u8]) -> bool {
-    let Some(box_type) = bytes.get(4..8) else {
-        return false;
-    };
-    if box_type != b"ftyp" {
-        return false;
-    }
-    let Some(brand) = bytes.get(8..12) else {
-        return false;
-    };
-    matches!(
-        brand,
-        b"heic"
-            | b"heix"
-            | b"heim"
-            | b"heis"
-            | b"hevc"
-            | b"hevm"
-            | b"hevs"
-            | b"mif1"
-            | b"msf1"
-            | b"avif"
-            | b"avis"
-    )
-}
+pub(crate) use crate::download::file::is_heif_content;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RawBox {
@@ -216,12 +183,9 @@ pub(super) fn find_meta_layout(
         "HEIC has no top-level meta box",
         "HEIC has multiple top-level meta boxes",
     )?;
-    const MAX_REWRITE_META_BYTES: usize = 8 * 1024 * 1024;
-    if meta.size > MAX_REWRITE_META_BYTES {
-        return Err(invalid_layout(
-            "HEIC meta box is too large to rewrite safely",
-        ));
-    }
+    // Parsing proves syntax and coordinates. Production retained-data
+    // allowances belong to the file-backed operation before allocation;
+    // a large meta may hold valid image data in idat.
     if meta.header_size != 8 {
         return Err(invalid_layout("large-size meta boxes are unsupported"));
     }
@@ -299,6 +263,7 @@ fn parse_primary_item_id(bytes: &[u8], pitm: RawBox) -> Result<u32, HeifError> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn extent_is_within_mdat_payload(
     bytes: &[u8],
     extent_start: usize,

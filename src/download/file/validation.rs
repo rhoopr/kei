@@ -11,6 +11,41 @@ use crate::download::error::DownloadError;
 
 use super::fingerprint::compute_sha256;
 
+/// Whether `bytes` starts with an ISO-BMFF `ftyp` box whose major brand is
+/// in the HEIF family. Robust to part-file naming where the path extension
+/// has been replaced by a temp suffix — the byte signature is the only
+/// reliable way to dispatch HEIF vs the formats XMP Toolkit can sniff
+/// itself (JPEG/PNG/TIFF/MP4/MOV).
+///
+/// Brands per ISO/IEC 23008-12 §A.6 (HEIF) and AV1 Image File Format
+/// (`avif`/`avis`). Only the first 12 bytes are inspected: 4-byte size,
+/// `ftyp` fourCC, then 4-byte major brand.
+pub(crate) fn is_heif_content(bytes: &[u8]) -> bool {
+    let Some(box_type) = bytes.get(4..8) else {
+        return false;
+    };
+    if box_type != b"ftyp" {
+        return false;
+    }
+    let Some(brand) = bytes.get(8..12) else {
+        return false;
+    };
+    matches!(
+        brand,
+        b"heic"
+            | b"heix"
+            | b"heim"
+            | b"heis"
+            | b"hevc"
+            | b"hevm"
+            | b"hevs"
+            | b"mif1"
+            | b"msf1"
+            | b"avif"
+            | b"avis"
+    )
+}
+
 /// The provider-size relationship required before a local file can be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalFileSizeExpectation {

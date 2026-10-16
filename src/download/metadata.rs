@@ -25,6 +25,8 @@
 
 mod embedded;
 mod formats;
+#[cfg(all(test, feature = "xmp"))]
+mod heif_memory_tests;
 #[cfg(feature = "xmp")]
 mod heif_writer;
 #[cfg(not(feature = "xmp"))]

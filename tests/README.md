@@ -70,6 +70,37 @@ they run shared helper tests; `import_existing_live` also checks fixture
 isolation, command construction, and rejection of a removed CLI flag. These
 offline tests run in `just test offline` and `just gate` without credentials.
 
+## HEIF streaming allocation regression
+
+`cargo test --lib heif_sparse_ -- --nocapture` exercises the production probe,
+preparation, native Exif repair, XMP insertion/replacement, temporary validation,
+and guarded publication on generated 1 MiB and 128 MiB sparse HEIF containers.
+A test-only `System` allocator wrapper measures per-thread net live Rust heap
+growth and the largest actual allocation. Both remain below fixed byte limits,
+and the larger input may add at most 64 KiB of peak heap growth. This proof has no
+wall-clock threshold and does not claim RSS or C++ toolkit allocation coverage.
+Streaming fingerprint checks and markers across the copy-buffer boundary, hole,
+and tail independently verify retained media ranges. A stale approved source
+must preserve the changed source and leave no temporary metadata file.
+`run_pending_heif_metadata_limit_retains_debt_then_recovers_across_reopens`
+checks that a sparse 9 MiB native Exif operation refusal cannot complete an empty metadata
+plan. Two reopened failures preserve retry debt, checksums, hashes and media;
+a changed source stays held until explicit download admission, then recovery
+and two quiet reopens preserve the accepted source and leave no temporary file.
+`heif_valid_avif_` derives independently encoded AV1 data and properties from the
+public libavif fixture, moves the coded item into `idat` with construction method
+1, and adds 1 MiB/16 MiB sparse `idat` or opaque storage. These valid large-`meta`
+containers exercise production probe, insertion, replacement, validation, and
+publication with bounded allocation growth. Independent hashes verify the codec,
+image properties, and all opaque payload bytes. Late file corruption must be
+rejected even after both layouts were read. A separate case covers more than
+65,536 top-level boxes without a growing inventory. Set
+`KEI_HEIF_STREAM_INSPECT_DIR` to an existing task output directory to retain large
+inputs and outputs for an independent decoder audit.
+The earlier sparse HEIC containers validate metadata and ISO-BMFF preservation,
+not codec playback or authenticated account behavior. The tests run in the ordinary XMP
+library suite and need no credentials or stored media fixtures.
+
 ## Copies metadata stress routing
 
 Ordinary `cargo test`, `just gate`, coverage, and their all-feature and

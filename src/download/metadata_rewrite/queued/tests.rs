@@ -3252,3 +3252,165 @@ async fn drain_reaches_newer_marker_after_retained_batch() {
         "retained older markers must not prevent newer work from completing"
     );
 }
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn run_pending_heif_metadata_limit_retains_debt_then_recovers_across_reopens() {
+    use crate::state::SqliteStateDb;
+    use crate::state::types::AssetMetadata;
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bounded.heic");
+    let db_path = dir.path().join("state.db");
+    // A valid synthetic container has a sparse, selected native Exif item
+    // beyond the materialized TIFF-operation allowance. The large opaque
+    // tail is not a format error; this operation must retain resource debt.
+    let mut prefix = crate::download::heif::apple_multi_exif_heic(
+        &crate::test_helpers::minimal_tiff_with_source_gps(),
+    );
+    let item_len = 9_u32 * 1024 * 1024;
+    let item_start = u32::try_from(prefix.len() + 8).unwrap();
+    crate::download::heif::set_test_file_item_extent(&mut prefix, 6, item_start, item_len);
+    let mut source = std::fs::File::create(&path).unwrap();
+    source.write_all(&prefix).unwrap();
+    source.write_all(&(item_len + 8).to_be_bytes()).unwrap();
+    source.write_all(b"mdat").unwrap();
+    source.write_all(&0u32.to_be_bytes()).unwrap();
+    source
+        .write_all(&crate::test_helpers::minimal_tiff_with_source_gps())
+        .unwrap();
+    source
+        .set_len(u64::from(item_start) + u64::from(item_len))
+        .unwrap();
+    drop(source);
+    let error = crate::download::metadata::probe_exif(&path).unwrap_err();
+    assert!(crate::download::heif::classify_heif_metadata_limit(&error));
+    let original_checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+    let original_size = std::fs::metadata(&path).unwrap().len();
+    let original_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let db = SqliteStateDb::open(&db_path).await.unwrap();
+    seed_downloaded_marker(
+        &db,
+        "HEIF_LIMIT",
+        "bounded.heic",
+        &path,
+        &original_checksum,
+        AssetMetadata {
+            metadata_hash: Some("bounded-metadata-hash".into()),
+            ..AssetMetadata::default()
+        },
+        None,
+    )
+    .await;
+    let original_checksums = stored_checksums(&db).await;
+    let hashes = db.get_downloaded_metadata_hashes().await.unwrap();
+    drop(db);
+    // Empty payload deliberately reaches the NoWrite shortcut if a bounded
+    // probe refusal is substituted with an empty/default probe.
+    let flags = MetadataFlags::EMBED_XMP;
+    let assert_no_temp = || {
+        assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".kei-metadata-")
+        }));
+    };
+    for _ in 0..2 {
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let result = run_pending(
+            &db,
+            flags,
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!((result.fetched, result.applied, result.failed), (1, 0, 1));
+        let pending = db.get_pending_metadata_rewrites(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id.as_ref(), "HEIF_LIMIT");
+        assert_eq!(stored_checksums(&db).await, original_checksums);
+        assert_eq!(db.get_downloaded_metadata_hashes().await.unwrap(), hashes);
+        assert_eq!(db.get_summary().await.unwrap().downloaded, 1);
+        assert_eq!(
+            crate::download::file::compute_sha256(&path).await.unwrap(),
+            original_checksum
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), original_size);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            original_modified
+        );
+        assert_no_temp();
+    }
+
+    let valid = crate::download::heif::apple_multi_exif_heic(
+        &crate::test_helpers::minimal_tiff_with_source_gps(),
+    );
+    std::fs::write(&path, &valid).unwrap();
+    let recovered_checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+    let db = SqliteStateDb::open(&db_path).await.unwrap();
+    let drifted = run_pending(
+        &db,
+        flags,
+        Arc::from(".meta-tmp"),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(
+        (drifted.fetched, drifted.applied, drifted.failed),
+        (1, 0, 1)
+    );
+    assert_eq!(stored_checksums(&db).await, original_checksums);
+    assert_eq!(std::fs::read(&path).unwrap(), valid);
+    // Explicitly admit the replacement as a completed synthetic download;
+    // retry itself must never bless the externally changed source checksum.
+    db.mark_downloaded(
+        "PrimarySync",
+        "HEIF_LIMIT",
+        "original",
+        &path,
+        &recovered_checksum,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
+    drop(db);
+
+    let valid_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    for expected_fetched in [1, 0, 0] {
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let result = run_pending(
+            &db,
+            flags,
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            (result.fetched, result.applied, result.failed),
+            (expected_fetched, expected_fetched, 0)
+        );
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            stored_checksums(&db).await,
+            (Some(recovered_checksum.clone()), None)
+        );
+        assert_eq!(db.get_downloaded_metadata_hashes().await.unwrap(), hashes);
+        assert_eq!(db.get_summary().await.unwrap().downloaded, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), valid);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            valid_modified
+        );
+        assert_no_temp();
+    }
+}

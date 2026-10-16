@@ -31,34 +31,43 @@ mod file;
 #[cfg(feature = "__fuzz_internals")]
 mod fuzz;
 mod items;
+#[cfg(any(test, feature = "__fuzz_internals"))]
 mod preservation;
 mod relationships;
+mod stream;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
 mod test_writer;
+#[cfg(any(test, feature = "__fuzz_internals"))]
 mod xmp_read;
 mod xmp_write;
 
+#[cfg(any(test, feature = "__fuzz_internals"))]
 use mp4_atom::FourCC;
 
 pub(crate) use boxes::{is_heif_content, is_heif_path};
-pub(crate) use exif::{
-    extract_exif_capture_time, extract_exif_tiff_bytes, rewrite_exif_capture_time,
-};
+#[cfg(test)]
+pub(crate) use exif::{extract_exif_capture_time, extract_exif_tiff_bytes};
 pub(crate) use file::locate_exif_tiff;
 #[cfg(feature = "__fuzz_internals")]
 pub(crate) use fuzz::fuzz_rewrite_xmp_preserves;
+#[cfg(test)]
 pub(crate) use preservation::validate_rewrite_preserves_non_xmp_items;
-pub(crate) use relationships::validate_capture_repair_item_ownership;
+
+pub(crate) use stream::FileLayout;
 #[cfg(test)]
 pub(crate) use test_support::{
     apple_multi_exif_heic, apple_multi_xmp_heic, apple_tmap_conflicting_xmp_heic,
-    apple_tmap_insertion_heic,
+    apple_tmap_insertion_heic, set_test_file_item_extent,
 };
 #[cfg(test)]
 pub(crate) use test_writer::insert_xmp;
-pub(crate) use xmp_read::{extract_xmp_bytes, extract_xmp_strict};
+#[cfg(any(test, feature = "__fuzz_internals"))]
+pub(crate) use xmp_read::extract_xmp_bytes;
+#[cfg(test)]
+pub(crate) use xmp_read::extract_xmp_strict;
+#[cfg(test)]
 pub(crate) use xmp_write::rewrite_xmp;
 
 /// Typed failures from the HEIC writer. Each variant names the precise mode
@@ -71,6 +80,14 @@ pub(crate) use xmp_write::rewrite_xmp;
 /// while kei adds the byte offset / atom kind context.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum HeifError {
+    #[error(
+        "HEIF metadata operation unsupported within resource allowance: {kind} requires {bytes} bytes; materialized-data allowance is {budget} bytes (not a format limit)"
+    )]
+    MetadataLimit {
+        kind: &'static str,
+        bytes: u64,
+        budget: usize,
+    },
     #[cfg(test)]
     #[error("Could not read HEIC metadata at byte {offset} of {total}: {source}")]
     Decode {
@@ -86,6 +103,7 @@ pub(crate) enum HeifError {
     )]
     UnparsableTail { offset: u64, total: u64 },
 
+    #[cfg(any(test, feature = "__fuzz_internals"))]
     #[error("Could not read HEIC metadata box `{kind}`: {source}")]
     MetaSubBoxDecode {
         kind: FourCC,
@@ -115,9 +133,18 @@ pub(crate) enum HeifError {
     Io(#[from] std::io::Error),
 }
 
+/// Classify bounded metadata refusals through anyhow context at the owner boundary.
+#[must_use]
+pub(crate) fn classify_heif_metadata_limit(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<HeifError>()
+        .is_some_and(|error| matches!(error, HeifError::MetadataLimit { .. }))
+}
+
 #[derive(Debug)]
 pub(crate) enum HeifExifError {
     Io(std::io::Error),
+    ResourceUnsupported(HeifError),
     Malformed,
 }
 
@@ -149,5 +176,21 @@ mod tests {
         let io_err = std::io::Error::other("disk full");
         let err: HeifError = io_err.into();
         assert!(matches!(err, HeifError::Io(_)));
+    }
+    #[test]
+    fn classify_heif_metadata_limit_preserves_context_and_rejects_text_matches() {
+        let bounded = anyhow::Error::new(super::HeifError::MetadataLimit {
+            kind: "test packet",
+            bytes: 9 * 1024 * 1024,
+            budget: 8 * 1024 * 1024,
+        })
+        .context("probe context");
+        assert!(super::classify_heif_metadata_limit(&bounded));
+        assert!(!super::classify_heif_metadata_limit(&anyhow::anyhow!(
+            "HEIF metadata exceeds the bounded rewrite limits"
+        )));
+        assert!(!super::classify_heif_metadata_limit(&anyhow::Error::new(
+            super::invalid_layout("unsupported item map")
+        )));
     }
 }

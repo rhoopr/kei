@@ -406,6 +406,7 @@ pub(super) fn write_uint(
     Ok(())
 }
 
+#[cfg(any(test, feature = "__fuzz_internals"))]
 pub(super) fn resolve_item_extents<'a>(
     bytes: &'a [u8],
     item: &IlocItem,

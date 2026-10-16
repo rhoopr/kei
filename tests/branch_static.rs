@@ -2003,6 +2003,7 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_conditional_publish_error",
         "classify_download_task_error",
         "classify_exit_error",
+        "classify_heif_metadata_limit",
         "classify_incremental_error",
         "classify_legacy_file_error",
         "classify_legacy_inventory_error",
