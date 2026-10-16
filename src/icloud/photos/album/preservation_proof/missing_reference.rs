@@ -118,13 +118,11 @@ fn classify(
     let Some(records) = response.get("records").and_then(Value::as_array) else {
         return ("malformed_response", unknown);
     };
-    if records.is_empty() {
-        return ("omitted", unknown);
-    }
-    if records.len() != 1 {
-        return ("multiple_records", unknown);
-    }
-    let record = &records[0];
+    let record = match records.as_slice() {
+        [] => return ("omitted", unknown),
+        [record] => record,
+        _ => return ("multiple_records", unknown),
+    };
     if record.get("recordName").and_then(Value::as_str) != Some(child) {
         return ("unexpected_record", unknown);
     }
@@ -179,7 +177,7 @@ fn classify(
 }
 
 impl PhotoAlbum {
-    // One request at the existing first refusal, no retries, no paired fetch,
+    // One lookup operation at the first refusal, no application retries or paired fetch,
     // no returned record retention and no input to inventory/proof policy.
     pub(super) async fn observe_missing_reference(
         &self,

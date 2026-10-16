@@ -162,7 +162,7 @@ impl PhotosSession for Session {
     ) -> Result<Value, DiagnosticLookupError> {
         self.post(url, body, headers)
             .await
-            .map_err(|_| DiagnosticLookupError::Request)
+            .map_err(|_private_error| DiagnosticLookupError::Request)
     }
     fn clone_box(&self) -> Box<dyn PhotosSession> {
         Box::new(self.clone())

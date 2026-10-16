@@ -128,7 +128,7 @@ impl PhotosSession for reqwest::Client {
         let mut response = builder
             .send()
             .await
-            .map_err(|_| DiagnosticLookupError::Request)?;
+            .map_err(|_private_error| DiagnosticLookupError::Request)?;
         if !response.status().is_success() {
             return Err(DiagnosticLookupError::HttpStatus);
         }
@@ -142,14 +142,14 @@ impl PhotosSession for reqwest::Client {
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| DiagnosticLookupError::Request)?
+            .map_err(|_private_error| DiagnosticLookupError::Request)?
         {
             if chunk.len() > DIAGNOSTIC_RESPONSE_BYTES.saturating_sub(bytes.len()) {
                 return Err(DiagnosticLookupError::TooLarge);
             }
             bytes.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&bytes).map_err(|_| DiagnosticLookupError::Malformed)
+        serde_json::from_slice(&bytes).map_err(|_private_error| DiagnosticLookupError::Malformed)
     }
 
     async fn post_changes_body(
