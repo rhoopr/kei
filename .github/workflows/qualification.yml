@@ -64,6 +64,8 @@ jobs:
         run: |
           set -euo pipefail
           rustup default 1.94.1
+          # The source-package route is offline, including its dev dependencies.
+          cargo fetch --locked
           just test packaging
           cargo test --locked --release --all-features --lib
       - name: Record the ignored-test inventory without running live tests

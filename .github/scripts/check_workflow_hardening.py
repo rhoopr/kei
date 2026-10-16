@@ -134,8 +134,9 @@ def check_qualification(errors: list[str]) -> None:
                    "[\"plan\", \"qualification\" if mode == \"true\" else \"checks\"]"],
         "qualification.yml": ["needs: [quality, artifacts, service, specialized]",
                               "python3 scripts/ci/gate.py quality artifacts service specialized",
+                              "cargo fetch --locked\n          just test packaging",
                               "python3 scripts/ci/artifact.py verify"],
-        "artifacts.yml": ["push: false", "run_docker_packaging_smoke.sh", "run_docker_puid_smoke.sh"],
+        "artifacts.yml": ["push: false", "labels: ${{ steps.meta.outputs.labels }}", "run_docker_packaging_smoke.sh", "run_docker_puid_smoke.sh"],
     }
     for name, markers in guards.items():
         text = workflow_text(name)

@@ -22,6 +22,7 @@ class HardeningTests(unittest.TestCase):
                 ("ci.yml", "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5", "actions/checkout@main", "not pinned"),
                 ("ci.yml", "needs: [plan, checks, qualification]", "needs: [plan]", "missing qualification guard"),
                 ("qualification.yml", "needs: [quality, artifacts, service, specialized]", "needs: [quality]", "missing qualification guard"),
+                ("qualification.yml", "cargo fetch --locked", "echo missing bootstrap", "missing qualification guard"),
                 ("release.yml", "needs: qualification", "needs: validate", "missing qualification guard"),
                 ("nightly.yml", "contents: read", "contents: write", "publication credentials"),
             ]:
