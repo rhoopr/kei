@@ -245,6 +245,14 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "supplied_owner_type",
             "owner_provenance",
         ]),
+        "support_missing_reference_v1" => Some(&[
+            "record_history",
+            "prior_reference",
+            "sparse_marker",
+            "linkage",
+            "lookup_outcome",
+            "lookup_family",
+        ]),
         "legacy_inventory_failure_v2" => Some(&[
             "stage",
             "reason",
@@ -485,6 +493,52 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
 // Revalidate saved history as strictly as current producer observations.
 fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
     let label = value.as_str();
+    if kind == "support_missing_reference_v1" {
+        return match key {
+            "record_history" => {
+                matches!(label, Some("first_seen" | "replacement" | "not_recorded"))
+            }
+            "prior_reference" => matches!(
+                label,
+                Some("not_observed" | "missing" | "malformed" | "present" | "unavailable")
+            ),
+            "sparse_marker" => matches!(
+                label,
+                Some("absent" | "true" | "false" | "malformed" | "not_recorded")
+            ),
+            "linkage" => matches!(
+                label,
+                Some("none" | "partial_fields" | "all_fields" | "not_recorded")
+            ),
+            "lookup_family" => matches!(
+                label,
+                Some("not_established" | "candidate" | "noncandidate")
+            ),
+            "lookup_outcome" => matches!(
+                label,
+                Some(
+                    "transport_unavailable"
+                        | "http_error"
+                        | "cancelled"
+                        | "timeout"
+                        | "request_failed"
+                        | "oversized_response"
+                        | "malformed_response"
+                        | "omitted"
+                        | "multiple_records"
+                        | "unexpected_record"
+                        | "scope_unavailable"
+                        | "foreign_scope"
+                        | "provider_error"
+                        | "deleted"
+                        | "missing_reference"
+                        | "malformed_reference"
+                        | "live_reference"
+                )
+            ),
+            _ => false,
+        };
+    }
     if kind == "support_hydration_wait_v1" {
         return match key {
             "phase" => matches!(

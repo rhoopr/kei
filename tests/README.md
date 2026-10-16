@@ -1535,3 +1535,14 @@ reads and the original mapping after reopening. Lookup and support-history
 controls distinguish missing/malformed references, actual different-master
 references and provider errors without exposing identifiers. Existing explicit
 non-default owner discovery and cancellation fixtures remain separate controls.
+
+### Missing parent-reference diagnostics
+
+`preservation_proof::missing_reference::tests` exercises scoped response categories,
+first-seen/replacement history, timeout, cancellation and one-request limits through
+the inventory refusal. Useful lookup responses still return the original refusal
+and cannot construct complete inventory evidence. Photos session tests exercise
+real local HTTP error bodies and both declared and chunked response-size bounds.
+Support contract and history tests reject arbitrary category values and retain
+safe fields across restart and export revalidation. These tests use synthetic
+records and localhost only; no account or media operations are required.

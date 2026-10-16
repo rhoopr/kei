@@ -1,7 +1,10 @@
 //! A complete provider inventory is a prerequisite
 //! for legacy preservation, never permission to advance a checkpoint by itself.
 
+mod missing_reference;
+
 use anyhow::Context;
+use missing_reference::Observation;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 use std::sync::Arc;
@@ -269,6 +272,7 @@ impl PhotoAlbum {
         let mut cursor: Option<String> = None;
         let mut seen_cursors = FxHashSet::default();
         let mut latest = FxHashMap::<String, (Record, usize)>::default();
+        let mut observations = FxHashMap::<String, Observation>::default();
         for _ in 0..budget.pages {
             progress.phase = "request";
             let body =
@@ -409,6 +413,21 @@ impl PhotoAlbum {
                 InventoryFailureKind::RetainedBytes
             );
             for mut record in zone.records {
+                observations.remove(&record.record_name);
+                if record.record_type == "CPLAsset"
+                    && record.deleted != Some(true)
+                    && record.fields.pointer("/masterRef/value").is_none()
+                    && record.record_name.len() <= 512
+                    && observations.len() < 64
+                {
+                    observations.insert(
+                        record.record_name.clone(),
+                        Observation::new(
+                            &record,
+                            latest.get(&record.record_name).map(|(prior, _)| prior),
+                        ),
+                    );
+                }
                 compact_record(&mut record, masters);
                 let bytes = retained_record_bytes(&record)?;
                 // Replace, never accumulate versions of the same identity. Later
@@ -432,11 +451,9 @@ impl PhotoAlbum {
                 continue;
             }
             let mut expected = FxHashSet::default();
-            for record in latest
-                .values()
-                .map(|(record, _)| record)
-                .filter(|record| record.record_type == "CPLAsset" && record.deleted != Some(true))
-            {
+            for (record, _) in latest.values().filter(|(record, _)| {
+                record.record_type == "CPLAsset" && record.deleted != Some(true)
+            }) {
                 progress.phase = "child_reference";
                 // A later sparse child must not inherit a previous child's scope.
                 progress.scope_mismatch_component = "not_applicable";
@@ -449,13 +466,25 @@ impl PhotoAlbum {
                     .and_then(|field| field.get("value"))
                     .and_then(Value::as_i64)
                     == Some(1);
-                let reference = record
+                let Some(reference) = record
                     .fields
                     .get("masterRef")
                     .and_then(|field| field.get("value"))
-                    .context(InventoryFailureKind::Evidence(
-                        "child_master_reference_missing",
-                    ))?;
+                else {
+                    self.observe_missing_reference(
+                        record,
+                        observations
+                            .get(&record.record_name)
+                            .copied()
+                            .unwrap_or_else(Observation::unavailable),
+                        masters,
+                        cancel,
+                    )
+                    .await;
+                    anyhow::bail!(InventoryFailureKind::Evidence(
+                        "child_master_reference_missing"
+                    ));
+                };
                 let master = reference
                     .get("recordName")
                     .and_then(Value::as_str)
@@ -579,7 +608,7 @@ mod tests {
     use serde_json::{Value, json};
     use tokio_util::sync::CancellationToken;
 
-    const BUDGET: InventoryBudget = InventoryBudget {
+    pub(super) const BUDGET: InventoryBudget = InventoryBudget {
         pages: 5,
         records: 100,
         retained_bytes: 8192,
@@ -592,7 +621,7 @@ mod tests {
         }
         make_album_with_session(100, Box::new(session))
     }
-    fn masters() -> FxHashSet<String> {
+    pub(super) fn masters() -> FxHashSet<String> {
         FxHashSet::from_iter(["master".to_owned()])
     }
     fn records() -> Vec<Value> {
