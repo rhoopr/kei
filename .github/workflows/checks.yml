@@ -1,0 +1,627 @@
+name: Shared quality checks
+
+on:
+  workflow_call:
+    inputs:
+      heavy:
+        type: boolean
+        default: false
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_STABLE_TOOLCHAIN: "1.94.1"
+  RUST_NIGHTLY_TOOLCHAIN: "nightly-2026-05-15"
+  # Treat any compiler warning as an error to keep the codebase warning-free
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  # Detects which categories of files changed in the PR. Downstream jobs
+  # gate on these outputs to skip when irrelevant. Workflow or script
+  # changes flip every flag on - those touch CI itself, so re-run everything
+  # to validate the change doesn't break unrelated jobs.
+  # Pushes to main run all non-PR-only checks.
+  detect:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      cargo: ${{ steps.filter.outputs.cargo }}
+      stress: ${{ steps.filter.outputs.stress }}
+      platform: ${{ steps.filter.outputs.platform }}
+      coverage: ${{ steps.filter.outputs.coverage }}
+      unused: ${{ steps.filter.outputs.unused }}
+      required: ${{ steps.filter.outputs.required }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAVY: ${{ inputs.heavy }}
+          LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}
+          FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+        run: python3 scripts/ci/policy.py
+
+  # Enforces consistent code style across the project
+  # Fails if any code isn't formatted with rustfmt
+  fmt:
+    name: Format
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # Fails when a serializer changes in src/ without a corresponding
+  # round-trip test. Mirrors `just gate`'s check-roundtrip-gate.sh.
+  roundtrip:
+    name: Roundtrip gate
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - run: bash scripts/check-roundtrip-gate.sh
+
+  # Catches common mistakes, unidiomatic code, and potential bugs
+  # Acts as an additional layer of static analysis beyond the compiler
+  clippy:
+    name: Clippy
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+          components: clippy
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      # Caches compiled dependencies to speed up subsequent runs
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo clippy --all-targets --all-features
+
+  # Keeps the `--no-default-features` build honest so FreeBSD and any other
+  # platform without a working C++ toolchain for xmp_toolkit (see #256) can
+  # still build kei. Runs clippy + tests on the narrower surface; tests
+  # make sure we also catch runtime regressions, not just compile breaks.
+  test_no_default:
+    name: Test (no-default-features)
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+          components: clippy
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - name: Install just for executable dispatcher tests
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.10
+          sha256: 1f5e8795d24073904ef20ba70c1250ad6389d8c5672226d152e0ed24909ba72f
+          mise_toml: |
+            [tools]
+            just = "1.50.0"
+      - run: cargo test --no-default-features
+
+  # Runs the test suite on all major platforms to catch platform-specific bugs
+  # fail-fast: false ensures all platforms run even if one fails
+  test:
+    name: Test (${{ matrix.os }})
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libimage-exiftool-perl
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install just for executable dispatcher tests
+        if: runner.os == 'Linux'
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.10
+          sha256: 1f5e8795d24073904ef20ba70c1250ad6389d8c5672226d152e0ed24909ba72f
+          mise_toml: |
+            [tools]
+            just = "1.50.0"
+      - name: Complete offline suite
+        if: runner.os == 'Linux' || needs.detect.outputs.platform == 'true'
+        run: cargo test --locked --all-features
+        env:
+          # ExifTool is the independent reader for the HEIF item-map writer.
+          # Requiring it where it is installed stops a failed install quietly
+          # retiring that coverage.
+          KEI_REQUIRE_HEIF_ORACLE: ${{ runner.os == 'Linux' && '1' || '' }}
+      - name: Platform build and smoke
+        if: runner.os != 'Linux' && needs.detect.outputs.platform != 'true'
+        run: cargo test --locked --all-features --test cli --test media_fixtures --test service_cli --test service_linux --test service_macos --test service_windows --test service_status
+      - name: Check ignored stress test remains selectable
+        if: runner.os == 'Linux'
+        run: bash scripts/test-copies-stress.sh --check
+
+  # One full scale run, independent of the regular platform/feature matrices.
+  copies-stress:
+    name: Copies stress
+    needs: detect
+    if: needs.detect.outputs.stress == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: bash scripts/test-copies-stress.sh
+
+  # Ensures documentation builds without warnings
+  # Important for maintaining quality docs, especially for published crates
+  docs:
+    name: Docs
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-Dwarnings"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Check live wiki command documentation
+        run: |
+          git clone --depth=1 https://github.com/rhoopr/kei.wiki.git /tmp/kei-wiki
+          cargo build --bin kei
+          scripts/check-wiki-commands.sh target/debug/kei /tmp/kei-wiki
+      - run: cargo doc --no-deps --all-features
+
+  catalogs:
+    name: Safety contracts and scenario catalogs
+    needs: detect
+    if: needs.detect.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: |
+          scripts/check-contracts
+          python3 scripts/fixtures/check_live_selection.py
+          bash scripts/test-scenarios/check.sh
+          python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+
+  # Detects dependencies declared in Cargo.toml but not actually used
+  # Keeps the dependency tree lean and reduces compile times
+  # Requires nightly because cargo-udeps uses unstable features
+  unused-deps:
+    name: Unused Dependencies
+    needs: detect
+    if: needs.detect.outputs.unused == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          toolchain: ${{ env.RUST_NIGHTLY_TOOLCHAIN }}
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: taiki-e/install-action@7170fe35ac006b4d8f0bcdfba8168cf5c431a122 # cargo-udeps
+      - run: cargo +"${RUST_NIGHTLY_TOOLCHAIN}" udeps --all-targets
+
+  # Verifies Cargo.lock is committed and in sync with Cargo.toml
+  # Ensures reproducible builds and prevents "works on my machine" issues
+  lockfile:
+    name: Lockfile
+    needs: detect
+    if: needs.detect.outputs.cargo == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+      - run: cargo fetch --locked
+
+  # PR head coverage. Runs in parallel with coverage-base.
+  # Output artifact feeds into the Coverage aggregator job.
+  coverage-head:
+    name: Coverage (head)
+    needs: detect
+    if: needs.detect.outputs.coverage == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: coverage-head
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: taiki-e/install-action@9180ba819ebd9a5f78ccc0e64cb6b06f5917fdff # cargo-llvm-cov
+      - name: Install just for executable dispatcher tests
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.10
+          sha256: 1f5e8795d24073904ef20ba70c1250ad6389d8c5672226d152e0ed24909ba72f
+          mise_toml: |
+            [tools]
+            just = "1.50.0"
+      - name: Run coverage
+        run: |
+          cargo llvm-cov --all-features --no-report -- --skip download::orchestration::queue_projection::tests::private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes
+          # Human-readable report for the Actions log
+          cargo llvm-cov report
+          # Structured data for parsing - cargo-llvm-cov's text format is
+          # column-position-fragile and the test summary goes to stderr.
+          cargo llvm-cov report --json --output-path coverage.json
+          # Per-line hit counts for patch coverage computation.
+          cargo llvm-cov report --lcov --output-path coverage.lcov
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-head
+          path: |
+            coverage.json
+            coverage.lcov
+          retention-days: 14
+
+  # Base-branch coverage for the delta. Runs in parallel with coverage-head
+  # on a separate runner. continue-on-error so a broken main only suppresses
+  # the delta - it doesn't block the PR.
+  coverage-base:
+    name: Coverage (base)
+    needs: detect
+    if: github.event_name == 'pull_request' && needs.detect.outputs.coverage == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE_TOOLCHAIN }}
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: coverage-base
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+      - uses: taiki-e/install-action@9180ba819ebd9a5f78ccc0e64cb6b06f5917fdff # cargo-llvm-cov
+      - name: Install just for executable dispatcher tests
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.10
+          sha256: 1f5e8795d24073904ef20ba70c1250ad6389d8c5672226d152e0ed24909ba72f
+          mise_toml: |
+            [tools]
+            just = "1.50.0"
+      - name: Run coverage
+        run: |
+          cargo llvm-cov --all-features --no-report -- --skip download::orchestration::queue_projection::tests::private_300_current_writers_and_600_aliases_finish_through_reseeds_without_repeated_writes
+          cargo llvm-cov report --json --output-path base_coverage.json
+          cargo llvm-cov report --lcov --output-path base_coverage.lcov
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-base
+          path: |
+            base_coverage.json
+            base_coverage.lcov
+          retention-days: 14
+
+  # Aggregates head + base, computes patch coverage, and builds the sticky
+  # comment body. The comment is posted by a separate workflow triggered via
+  # workflow_run so cross-fork PRs (which run with a read-only GITHUB_TOKEN)
+  # can still get comments - this job only builds the artifact.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    needs: [coverage-head, coverage-base]
+    if: always() && github.event_name == 'pull_request' && needs.coverage-head.result == 'success'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Need full history for git diff against base in patch_coverage.py.
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: coverage-head
+      - name: Download base coverage
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: coverage-base
+        continue-on-error: true
+      - name: Compute patch coverage
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          args=(--base "$BASE_SHA" --lcov coverage.lcov --workspace .)
+          if [ -f base_coverage.lcov ]; then
+            args+=(--base-lcov base_coverage.lcov)
+          fi
+          python3 .github/scripts/patch_coverage.py "${args[@]}" > patch_coverage.json
+          cat patch_coverage.json
+      - name: Build coverage comment
+        env:
+          MARKER: "<!-- coverage-comment -->"
+        run: |
+          set -euo pipefail
+
+          # Strip absolute workspace prefix from filenames in JSON.
+          WORKSPACE="$(pwd)/"
+
+          # Reusable jq function defining 2-decimal percent formatting.
+          # The \(...) expressions belong to jq and must stay single-quoted.
+          # shellcheck disable=SC2016
+          PCT_DEF='def pct: (. * 100 | round) as $x | "\($x / 100 | floor).\($x % 100 | tostring | if length == 1 then "0\(.)" else . end)";'
+
+          # --- Build headline (line coverage % + delta + patch coverage) ---
+          HEAD_PCT=$(jq -r '.data[0].totals.lines.percent' coverage.json)
+          HEADLINE="**Line coverage:** $(printf '%.2f' "$HEAD_PCT")%"
+
+          if [ -f base_coverage.json ]; then
+            BASE_PCT=$(jq -r '.data[0].totals.lines.percent' base_coverage.json)
+            DELTA=$(awk "BEGIN { printf \"%+.2f\", ${HEAD_PCT} - ${BASE_PCT} }")
+            HEADLINE="${HEADLINE} (${DELTA}% from main)"
+          fi
+
+          PATCH_TOTAL=$(jq -r '.total_eligible' patch_coverage.json)
+          if [ "$PATCH_TOTAL" -gt 0 ]; then
+            PATCH_PCT=$(jq -r '.percent' patch_coverage.json)
+            PATCH_COVERED=$(jq -r '.total_covered' patch_coverage.json)
+            HEADLINE="${HEADLINE} · **Patch coverage:** $(printf '%.2f' "$PATCH_PCT")% (${PATCH_COVERED} / ${PATCH_TOTAL} changed lines)"
+          fi
+
+          # --- Build the comment ---
+          {
+            echo "$MARKER"
+            echo "## Coverage Report"
+            echo ""
+            echo "$HEADLINE"
+            echo ""
+
+            # Per-file patch coverage, if the PR touched any covered .rs lines.
+            # Patch column = % of changed lines covered.
+            # File column = whole-file coverage on PR head.
+            # Δ column = whole-file delta vs base (blank for new files).
+            if [ "$PATCH_TOTAL" -gt 0 ]; then
+              echo "| File | Patch | File Coverage | Δ from main |"
+              echo "|------|-------|---------------|-------------|"
+              jq -r "${PCT_DEF}"'
+                # Format a signed delta as +X.YY / -X.YY.
+                def signed: if . >= 0 then "+\(. | pct)" else "-\(-1 * . | pct)" end;
+                .files | sort_by(.percent) | .[] |
+                "| \(.file) | \(.percent | pct)% (\(.covered) / \(.total)) | " +
+                (if .file_percent_head == null then "—" else "\(.file_percent_head | pct)%" end) +
+                " | " +
+                (if .file_delta == null then (if .file_percent_head != null then "new" else "—" end) else "\(.file_delta | signed)%" end) +
+                " |"
+              ' patch_coverage.json
+              echo ""
+            fi
+
+            echo "### Project totals"
+            echo ""
+            echo "| Metric | Coverage | Covered / Total |"
+            echo "|--------|----------|-----------------|"
+            jq -r "${PCT_DEF}"'
+              .data[0].totals as $t |
+              [
+                ["Lines", $t.lines],
+                ["Functions", $t.functions],
+                ["Regions", $t.regions],
+                ["Branches", $t.branches]
+              ]
+              | map(select(.[1].count > 0))
+              | .[]
+              | "| \(.[0]) | \(.[1].percent | pct)% | \(.[1].covered) / \(.[1].count) |"
+            ' coverage.json
+            echo ""
+
+            # Lowest-covered files (line coverage ascending), excluding 100%.
+            LOWEST=$(jq -r --arg ws "$WORKSPACE" "${PCT_DEF}"'
+              .data[0].files
+              | map(select(.summary.lines.percent < 100))
+              | sort_by(.summary.lines.percent)
+              | .[:10]
+              | .[]
+              | "| \(.filename | sub($ws; "")) | \(.summary.lines.percent | pct)% | \(.summary.lines.covered) / \(.summary.lines.count) |"
+            ' coverage.json)
+            if [ -n "$LOWEST" ]; then
+              N=$(printf '%s\n' "$LOWEST" | wc -l)
+              echo "<details><summary>${N} lowest-covered files (line coverage, project-wide)</summary>"
+              echo ""
+              echo "| File | Lines | Covered / Total |"
+              echo "|------|-------|-----------------|"
+              printf '%s\n' "$LOWEST"
+              echo ""
+              echo "</details>"
+              echo ""
+            fi
+
+            # Files at 100% line coverage.
+            FULL=$(jq -r --arg ws "$WORKSPACE" '
+              .data[0].files
+              | map(select(.summary.lines.percent == 100))
+              | sort_by(.filename)
+              | .[]
+              | "- \(.filename | sub($ws; ""))"
+            ' coverage.json)
+            if [ -n "$FULL" ]; then
+              N=$(printf '%s\n' "$FULL" | wc -l)
+              echo "<details><summary>${N} files at 100% line coverage</summary>"
+              echo ""
+              printf '%s\n' "$FULL"
+              echo ""
+              echo "</details>"
+            fi
+          } > comment.md
+
+          # Mirror to the Actions step summary so the report is visible in the run UI.
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload coverage comment
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-comment
+          path: comment.md
+          retention-days: 14
+      # PR metadata for the coverage-comment workflow. workflow_run events
+      # don't carry PR context, and looking it up from the head SHA is
+      # unreliable for fork PRs, so we pass it via artifact.
+      - name: Record PR metadata
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf '%s\n' "$PR_NUMBER" > pr_number.txt
+          printf '%s\n' "$PR_HEAD_SHA" > pr_head_sha.txt
+      - name: Upload PR metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-comment-meta
+          path: |
+            pr_number.txt
+            pr_head_sha.txt
+          retention-days: 14
+
+  # Checks dependencies against the RustSec Advisory Database
+  # Catches known security vulnerabilities in your dependency tree
+  security:
+    name: Security Audit
+    needs: detect
+    if: needs.detect.outputs.cargo == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: taiki-e/install-action@b7d831ec1a6ef0d81d27cf61932d92140b2271d4 # cargo-audit
+      # Ignore list + rationale: .cargo/audit.toml.
+      - run: cargo audit --deny warnings
+
+  # Guards the Actions supply-chain hardening rules that keep PRs
+  # from reintroducing mutable action refs or privileged manual publishes.
+  workflow-hardening:
+    name: Workflow hardening
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - run: python3 .github/scripts/check_workflow_hardening.py
+      - run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+      - run: |
+          mkdir -p /tmp/codex/kei/pycache
+          PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile .github/scripts/*.py
+
+  # Keep local script and workflow lint authoritative in protected CI.
+  script-lint:
+    name: Script and workflow lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.10
+          sha256: 1f5e8795d24073904ef20ba70c1250ad6389d8c5672226d152e0ed24909ba72f
+          mise_toml: |
+            [tools]
+            actionlint = "1.7.12"
+            ruff = "0.16.3"
+            shellcheck = "0.11.0"
+            shfmt = "3.13.1"
+      - name: Check shell and Python helper syntax
+        run: |
+          set -euo pipefail
+          mapfile -t shell_files < <(find scripts tests/shell docker -maxdepth 3 -type f \( -name '*.sh' -o -name 'entrypoint.sh' \) -print | sort)
+          mapfile -t python_files < <(find scripts .github/scripts -maxdepth 3 -type f -name '*.py' -print | sort)
+          python_files+=(scripts/check-contracts)
+          for shell_file in "${shell_files[@]}"; do
+            bash -n "$shell_file"
+          done
+          mkdir -p /tmp/codex/kei/pycache
+          PYTHONPYCACHEPREFIX=/tmp/codex/kei/pycache python3 -m py_compile "${python_files[@]}"
+          shellcheck -x -P tests/shell:scripts:scripts/full-test "${shell_files[@]}"
+          shfmt -d "${shell_files[@]}"
+          ruff check "${python_files[@]}"
+          actionlint .github/workflows/*.yml
+
+  # Catches spelling mistakes in code, comments, and documentation
+  # Small thing but helps maintain a professional codebase. Always runs
+  # since typos can land in any kind of file.
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: crate-ci/typos@5374cbf686e897b15713110e233094e2874de7ef # master
+
+  # Single required check. Only explicitly unrouted jobs may be skipped.
+  # The branch ruleset should require this name and nothing else.
+  ci:
+    name: Shared checks result
+    if: always()
+    needs:
+      - detect
+      - fmt
+      - roundtrip
+      - clippy
+      - test_no_default
+      - copies-stress
+      - test
+      - docs
+      - catalogs
+      - unused-deps
+      - lockfile
+      - coverage-head
+      - security
+      - workflow-hardening
+      - script-lint
+      - typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Require every routed check
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          REQUIRED: ${{ needs.detect.outputs.required }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, sys
+          sys.path.insert(0, "scripts/ci")
+          from gate import check
+          required = json.loads(os.environ["REQUIRED"])
+          if not required:
+              raise SystemExit("missing required-check policy")
+          check(json.loads(os.environ["NEEDS"]), required)
+          PYTHON

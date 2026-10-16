@@ -1,5 +1,12 @@
 # kei tests
 
+Local iteration uses focused tests. Hosted PR CI owns complete offline and
+platform validation; do not repeat those suites locally by default. Run live
+provider and real host-service checks only when relevant and authorized.
+`KEI_FULL_TEST_REAL_SERVICE=1 just release-local` collects the local release
+prerequisites without replaying hosted offline checks. `just full-test` remains
+available for an explicit complete local audit. See [CI qualification](../docs/ci.md).
+
 Everything under `tests/` is either a Rust integration target or a shell
 script that exercises scenarios easier to set up from shell than from
 Rust. The repo-root `justfile` is the entry point; the layout below
@@ -92,7 +99,7 @@ matrix and use a distinct `Stress CI` aggregate and concurrency group, so a
 partial run cannot replace or cancel the required full `CI` gate. PR/main `CI` requires stress when selected. The
 release tag workflow builds artifacts without a test suite; main CI and the
 explicit stress command provide the stress route before release. Run the
-explicit command alongside `just full-test` for local release qualification.
+explicit command for local scale diagnosis. Hosted heavy qualification runs it for releases.
 CI coverage and `just cov patch` explicitly skip the test on head and base,
 including an older base
 that has not marked it ignored. The no-default build lacks XMP and does not
@@ -822,8 +829,8 @@ Choose the route by purpose:
 | Purpose | Command | Proof |
 |---------|---------|-------|
 | Focused iteration | `just test scenario NAME`, `just test fast`, or `just test PATTERN` | Relevant tests with default features; not a complete gate |
-| Complete offline gate | `just gate` | Static checks, all-feature and no-default suites, and focused-filter catalog checks |
-| Release and live validation | `just full-test` | The offline gate's checks plus nightly tools, package, Docker, live provider, release-binary, and service phases |
+| Optional local offline gate | `just gate` | Static checks, all-feature and no-default suites, and focused-filter catalog checks |
+| Optional combined local battery | `just full-test` | The offline gate's checks plus nightly tools, package, Docker, live provider, release-binary, and service phases |
 
 `just test offline` runs the behavior and catalog portion of `just gate`.
 `just test` runs only the all-feature suite. Existing focused, packaging,
@@ -897,7 +904,8 @@ just test PATTERN               # passes through to cargo test PATTERN
 just static-checks              # fmt, clippy, docs, audit, lint, contracts, typos
 just gate                       # static checks + offline behavior tests
 just release-smoke              # fast offline release regression smoke
-just full-test                  # grouped full battery with logs, live skips, metrics
+just release-local              # authorized local release provider/host prerequisites
+just full-test                  # optional combined battery with logs, live skips, metrics
 ```
 
 Without `just`, run the raw commands directly:

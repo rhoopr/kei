@@ -18,6 +18,9 @@ jobs:
     uses: ./.github/workflows/qualification.yml
 
   notify:
+    concurrency:
+      group: nightly-incident
+      cancel-in-progress: false
     if: always() && github.ref == 'refs/heads/main'
     needs: heavy
     runs-on: ubuntu-latest

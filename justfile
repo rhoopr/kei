@@ -25,7 +25,7 @@ static-checks:
     bash scripts/check-roundtrip-gate.sh
     python3 scripts/fixtures/check_live_selection.py
 
-# Pre-push gate: static checks + offline behavior tests.
+# Optional local offline gate for diagnosis or work without hosted CI.
 gate:
     just static-checks
     just test offline
@@ -75,6 +75,10 @@ lint-scripts:
     else
         echo "lint-scripts: ruff not installed; skipping optional Python lint" >&2
     fi
+
+# Live provider and real host-service evidence. Requires explicit service authorization.
+release-local:
+    bash scripts/full-test/run_local_release.sh
 
 # Pre-release battery with phase logs, metrics, Docker smokes, and live smokes.
 # Stops on first failure. Keeps a /tmp/codex/kei/full-test/logs/kei-full-test-*.log only when failing.

@@ -61,7 +61,11 @@ download pipeline does not parse CloudKit records.
 
 - Follow the testing contract in `CONTRIBUTING.md`; investigate every failure
   before changing product code or calling it unrelated.
-- Run focused tests while iterating and `just gate` for PR-ready work.
+- Run focused tests while iterating. Hosted PR CI owns the complete offline
+  gate; do not replay it locally by default. Run `just gate` for offline
+  diagnosis or when hosted CI is unavailable.
+- Local live-provider and real host-service checks are relevance-based and
+  explicitly authorized. For release prerequisites, read `docs/ci.md`.
 - Finish with `cargo fmt --all --check` and
   `cargo clippy --all-targets --all-features -- -D warnings`.
 - Run live tests single-threaded only when needed; follow `tests/README.md`.

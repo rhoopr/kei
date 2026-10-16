@@ -116,9 +116,8 @@ def check_release(errors: list[str]) -> None:
 
 
 def check_rust_ci(errors: list[str]) -> None:
-    text = workflow_text("ci.yml")
+    text = workflow_text("checks.yml")
     for needle in (
-        "push:\n    branches: [main]",
         "run: python3 scripts/ci/policy.py",
         "LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}",
         "if: needs.detect.outputs.coverage == 'true'",
@@ -126,7 +125,27 @@ def check_rust_ci(errors: list[str]) -> None:
         "check(json.loads(os.environ[\"NEEDS\"]), required)",
     ):
         if needle not in text:
-            errors.append(f"ci.yml: missing required routing/gate guard: {needle}")
+            errors.append(f"checks.yml: missing required routing/gate guard: {needle}")
+
+
+def check_qualification(errors: list[str]) -> None:
+    guards = {
+        "ci.yml": ["needs: [plan, checks, qualification]", "mode not in {\"true\", \"false\"}",
+                   "[\"plan\", \"qualification\" if mode == \"true\" else \"checks\"]"],
+        "qualification.yml": ["needs: [quality, artifacts, service, specialized]",
+                              "python3 scripts/ci/gate.py quality artifacts service specialized",
+                              "python3 scripts/ci/artifact.py verify"],
+        "artifacts.yml": ["push: false", "run_docker_packaging_smoke.sh", "run_docker_puid_smoke.sh"],
+    }
+    for name, markers in guards.items():
+        text = workflow_text(name)
+        for marker in markers:
+            if marker not in text:
+                errors.append(f"{name}: missing qualification guard: {marker}")
+    for name in ("ci.yml", "checks.yml", "qualification.yml", "artifacts.yml", "nightly.yml", "nightly-health.yml"):
+        text = workflow_text(name)
+        if re.search(r"(?:contents|packages): write|push: true|secrets: inherit", text):
+            errors.append(f"{name}: qualification must not receive publication credentials")
 
 
 def check_service_smoke_paths(errors: list[str]) -> None:
@@ -167,6 +186,7 @@ def main() -> int:
     check_docker_test(errors)
     check_release(errors)
     check_rust_ci(errors)
+    check_qualification(errors)
     check_service_smoke_paths(errors)
     check_coverage_comment(errors)
     check_windows_stack_link_arg(errors)

@@ -33,11 +33,34 @@ The local `just gate` and `just full-test` commands retain their existing
 contracts. CI reuses their owners and test routes; it does not claim that an
 offline workflow performed live provider or real host-service validation.
 
+## Local work
+
+Before opening a PR, run focused tests for the changed behavior plus formatting
+and lint checks. Do not replay the complete offline gate locally. PR CI owns
+that evidence. Use local live-provider and real service checks only when the
+change needs them and the isolated fixtures are approved. `just gate` remains
+available for diagnosis or work without hosted CI.
+
+## PR routing
+
+The required check stays `CI`. A failed, cancelled, missing, or unexpectedly
+skipped required job fails that check. The `ci:full` label runs full
+qualification. Workflow, script, Cargo, build, fuzz, container-build, and unknown
+input changes also select full qualification. Ordinary code changes keep Linux
+all-feature and no-default tests, with macOS/Windows build and CLI/media/service
+smoke. Filesystem, state, configuration, and service changes select complete
+platform tests. Sync, provider, download, state, and retry changes select the
+large copies stress test. Docs-only PRs retain workflow/script lint and typos.
+
 ## Rollout
 
 Keep the existing PR workload until the replacement qualification route,
 publication guards, and nightly run have passed. Activate lighter PR routing
-only after that evidence exists. Record cold and warm timings separately.
+only after that evidence exists. `CI_LIGHT_PR_ENABLED` defaults to unset, which
+retains the broad PR checks. After merge, run Nightly qualification on main,
+verify its complete artifact receipt, then enable the variable with value
+`true`. Observe the first scheduled run and freshness check. Record cold and
+warm timings separately. Clear the variable to restore broad PR checks.
 
 Release publication must consume the artifacts that passed qualification.
 GitHub release assets, GHCR version/latest tags, and Homebrew updates all depend
@@ -52,8 +75,10 @@ an existing media/state tree as disposable test data.
 
 1. Check out the final release commit with a clean worktree. Do not change it
    after qualification starts.
-2. Run `KEI_FULL_TEST_REAL_SERVICE=1 just full-test` on the prepared Linux host.
-   This requires working credentials, Docker, the pinned tools, and an unused
+2. Run `KEI_FULL_TEST_REAL_SERVICE=1 just release-local` on the prepared Linux host.
+   This builds the live CLI/container fixtures, then runs provider, shell,
+   release-binary, import, and real service checks. It does not repeat the
+   hosted offline suite. It requires working credentials, Docker, and an unused
    user-service slot. Retain the finalized report and private logs.
 3. Run `python3 scripts/ci/local_release.py record --repo rhoopr/kei --sha COMMIT --report REPORT`.
    The validator rejects missing, skipped, rate-limited, failed, or dirty-head

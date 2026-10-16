@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Report nightly failures once and close the incident after recovery."""
 
-from datetime import datetime, timedelta, timezone
 import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 
 MARKER = "<!-- kei-nightly-qualification -->"
 MAX_AGE = timedelta(hours=36)

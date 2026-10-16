@@ -62,7 +62,9 @@ review covered only one lens, such as scale.
    Report the required evidence or a concrete reason the proof does not apply.
 4. For schema, primary-key, sentinel, durable-key, or serialization changes,
    search every old literal and prove migration and round-trip behavior.
-5. Run `just gate`.
+5. Run focused tests, formatting, and lint checks. Use exact-head hosted PR CI
+   for the complete offline/platform gate. Run `just gate` locally only for
+   diagnosis or when hosted CI is unavailable. Report pending CI as pending.
 6. Investigate every failure. Use bounded output and
    `just agent-failure-summary` when a retained full-test log is relevant.
 

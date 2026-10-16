@@ -1400,7 +1400,7 @@ fi
 #[test]
 fn local_gate_includes_script_and_workflow_lint_recipes() {
     let justfile = repo_file("justfile");
-    let ci = repo_file(".github/workflows/ci.yml");
+    let ci = repo_file(".github/workflows/checks.yml");
     let gate = shell_block(&justfile, "\ngate:\n", "    ");
     let static_checks = shell_block(&justfile, "\nstatic-checks:\n", "    ");
     let scripts = shell_block(&justfile, "\nlint-scripts:\n", "    ");
@@ -1504,7 +1504,7 @@ fn local_gate_includes_script_and_workflow_lint_recipes() {
 
 #[test]
 fn aggregate_ci_depends_on_no_default_feature_gate() {
-    let ci = repo_file(".github/workflows/ci.yml");
+    let ci = repo_file(".github/workflows/checks.yml");
     assert!(
         ci.contains("  test_no_default:\n"),
         "CI workflow must keep the no-default-features job"
@@ -1522,13 +1522,18 @@ fn aggregate_ci_depends_on_no_default_feature_gate() {
 
 #[test]
 fn rust_ci_runs_on_main_push_without_pr_only_coverage() {
-    let ci = repo_file(".github/workflows/ci.yml");
-    assert!(ci.contains("  push:\n    branches: [main]"));
+    let ci = repo_file(".github/workflows/checks.yml");
+    assert!(repo_file(".github/workflows/ci.yml").contains("  push:\n    branches: [main]"));
     assert!(ci.contains("  workflow_call:"));
     assert!(ci.contains("LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}"));
     assert!(ci.contains("if: needs.detect.outputs.coverage == 'true'"));
     assert!(ci.contains("      - coverage-head\n"));
-    assert!(!ci.split_once("  ci:\n").unwrap().1.contains("      - coverage\n"));
+    assert!(
+        !ci.split_once("  ci:\n")
+            .unwrap()
+            .1
+            .contains("      - coverage\n")
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1537,19 +1542,38 @@ fn copies_stress_routes_relevant_changes_and_explicit_events() {
     // Exercise the real routing and fail-closed gate owners, including CLI
     // invocation, rather than duplicating their policy in this harness.
     let output = Command::new("python3")
-        .args(["-m", "unittest", "discover", "-s", "scripts/ci", "-p", "test_*.py"])
+        .args([
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "scripts/ci",
+            "-p",
+            "test_*.py",
+        ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-    let ci = repo_file(".github/workflows/ci.yml");
+    let ci = repo_file(".github/workflows/checks.yml");
     assert!(ci.contains("run: python3 scripts/ci/policy.py"));
     assert!(ci.contains("if: needs.detect.outputs.stress == 'true'"));
     assert!(ci.contains("      - copies-stress\n"));
-    assert!(ci.contains("  workflow_dispatch:\n"));
+    assert!(repo_file(".github/workflows/ci.yml").contains("  workflow_dispatch:\n"));
     assert!(!ci.contains("  schedule:\n"));
-    assert_eq!(repo_file("justfile").matches(" -- --skip download::orchestration::queue_projection::tests::private_300_").count(), 2);
-    assert_eq!(ci.matches("--no-report -- --skip download::orchestration::queue_projection::tests::private_300_").count(), 2);
+    assert_eq!(
+        repo_file("justfile")
+            .matches(" -- --skip download::orchestration::queue_projection::tests::private_300_")
+            .count(),
+        2
+    );
+    assert_eq!(
+        ci.matches(
+            "--no-report -- --skip download::orchestration::queue_projection::tests::private_300_"
+        )
+        .count(),
+        2
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1562,8 +1586,12 @@ fn copies_stress_runner_rejects_missing_ignored_tests_and_zero_execution() {
         r#"#!/bin/bash
 set -euo pipefail
 printf '%s\n' "$*" >> "$CALL_LOG"
+if [[ " $* " == *" --no-run "* ]]; then
+    printf '{"reason":"compiler-artifact","profile":{"test":true},"target":{"kind":["lib"]},"executable":"%s"}\n' "$0"
+    exit 0
+fi
 if [[ " $* " == *" --list "* ]]; then
-    if [[ "$MODE" != missing ]]; then printf '%s: test\n' "$5"; fi
+    if [[ "$MODE" != missing ]]; then printf '%s: test\n' "$1"; fi
     exit 0
 fi
 case "$MODE" in
@@ -1575,12 +1603,12 @@ esac
     );
     let runner = repo_path("scripts/test-copies-stress.sh");
     for (mode, check_only, success, calls) in [
-        ("missing", true, false, 1),
-        ("missing", false, false, 1),
-        ("ok", true, true, 1),
-        ("ok", false, true, 2),
-        ("zero", false, false, 2),
-        ("fail", false, false, 2),
+        ("missing", true, false, 2),
+        ("missing", false, false, 2),
+        ("ok", true, true, 2),
+        ("ok", false, true, 3),
+        ("zero", false, false, 3),
+        ("fail", false, false, 3),
     ] {
         let log = temp.path().join("calls");
         std::fs::write(&log, "").unwrap();
@@ -1597,9 +1625,16 @@ esac
         assert_eq!(output.status.success(), success, "{mode}: {output:?}");
         let actual = std::fs::read_to_string(&log).unwrap();
         assert_eq!(actual.lines().count(), calls, "{mode}: {actual}");
-        for call in actual.lines() {
-            assert!(call.starts_with("test --locked --all-features --lib download::orchestration::queue_projection::tests::private_300_"));
-            assert!(call.contains(" -- --ignored --exact "));
+        let mut invocations = actual.lines();
+        assert_eq!(
+            invocations.next(),
+            Some("test --locked --all-features --lib --no-run --message-format=json")
+        );
+        for call in invocations {
+            assert!(
+                call.starts_with("download::orchestration::queue_projection::tests::private_300_")
+            );
+            assert!(call.contains(" --ignored --exact "));
         }
     }
 }

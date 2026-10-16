@@ -2025,6 +2025,12 @@ Stable IDs connect safety rules to production owners and focused tests.
   the optimized extracted-source-package check. Tests do not fetch media.
 - Shell suites cover crash, concurrency, state-machine, and container behavior.
 - Fuzz targets cover parser and metadata trust boundaries.
+- `scripts/ci/policy.py` owns PR routing. `checks.yml` owns shared quality
+  checks; `qualification.yml` composes heavy checks and tested artifacts.
+  `scripts/ci/artifact.py` binds archive/container evidence to one commit.
+  `local_release.py` validates local live/host-service attestations.
+  Release publication depends on both local evidence and hosted qualification;
+  nightly runs cannot publish. See [CI qualification](ci.md).
 - `justfile` owns local script and workflow lint commands. Protected CI runs
   the same shellcheck, shfmt, ruff, and actionlint checks with pinned versions.
 

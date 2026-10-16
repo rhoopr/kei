@@ -1,11 +1,11 @@
 """Executable gate and artifact contract tests. Run with unittest discovery."""
 
-from contextlib import contextmanager
 import json
 import os
-from pathlib import Path
 import tempfile
 import unittest
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch
 
 import artifact
@@ -44,7 +44,8 @@ class ArtifactTests(unittest.TestCase):
             suffix = ".tar" if name in artifact.CONTAINERS else (".zip" if "windows" in name else ".tar.gz")
             file = artifact.OUT / (name + suffix)
             file.write_bytes(b"verified candidate")
-            artifact.record(name, target, file)
+            extra = {"image_id": "sha256:" + "a" * 64} if name in artifact.CONTAINERS else {}
+            artifact.record(name, target, file, **extra)
 
     @patch.object(artifact, "identity", return_value=("a" * 40, "1.2.3"))
     def test_complete_set_and_each_missing_artifact(self, _identity):
@@ -76,6 +77,17 @@ class ArtifactTests(unittest.TestCase):
             (artifact.OUT / original["file"]).write_bytes(b"changed after qualification")
             with self.assertRaises(ValueError):
                 artifact.verify()
+
+    @patch.object(artifact, "identity", return_value=("a" * 40, "1.2.3"))
+    def test_container_identity_is_required_before_publication(self, _identity):
+        with workspace():
+            self.seed()
+            path = artifact.OUT / "container-amd64.json"
+            item = json.loads(path.read_text())
+            for value in ("", "wrong", "sha256:short"):
+                path.write_text(json.dumps({**item, "image_id": value}))
+                with self.assertRaises(ValueError):
+                    artifact.verify()
 
     @patch.object(artifact, "identity", return_value=("a" * 40, "1.2.3"))
     def test_packages_and_executes_extracted_unix_binary(self, _identity):

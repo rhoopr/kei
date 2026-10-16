@@ -12,6 +12,10 @@ env:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # Fast sanity checks before the expensive 5-target build matrix.
   # Catches version mismatches, missing CHANGELOG, and new advisories

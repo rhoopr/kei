@@ -99,6 +99,13 @@ jobs:
           docker run --rm kei:candidate --version
           docker run --rm kei:candidate --help
           bash scripts/full-test/run_docker_puid_smoke.sh
+          bash scripts/full-test/run_docker_packaging_smoke.sh
+          set +e
+          timeout 8 docker run --rm -e ICLOUD_USERNAME=dummy@example.invalid kei:candidate
+          rc=$?
+          set -e
+          # A missing cookie is expected. Parse errors and Docker failures are not.
+          [[ $rc -eq 1 || $rc -eq 3 || $rc -eq 4 || $rc -eq 124 ]]
           python3 scripts/ci/artifact.py container "${{ matrix.arch }}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

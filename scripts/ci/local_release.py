@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Validate local full-test evidence and attest it for one release commit.
+"""Validate local provider and host-service evidence and attest it for one release commit.
 
 Publishing is explicit. Only phase status and a report digest leave the host.
 Release CI accepts the latest repository-owner attestation, never PR artifacts.
 """
 
 import argparse
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
-from pathlib import Path
+import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 CONTEXT = "Release local qualification"
 MAX_AGE = timedelta(days=7)
-BASE_PHASES = {"static_checks", "offline_core", "nightly_tools", "package", "docker_full",
-               "live_provider", "live_import_rehearsal", "service", "host_service"}
+BASE_PHASES = {"build_release", "build_live_container", "live_provider", "live_import_rehearsal", "host_service"}
 LIVE_COMMANDS = {"live_status", "live_libraries", "live_albums", "live_dryrun", "live_config_show",
                  "live_verify", "live_reconcile_dryrun", "live_password_backend", "live_import_dryrun"}
 
@@ -56,7 +56,7 @@ def validate_statuses(statuses: list[dict], owner: str, now: datetime) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["record", "check"])
+    parser.add_argument("mode", choices=["record", "check", "finalize"])
     parser.add_argument("--repo", required=True)
     parser.add_argument("--sha", required=True)
     parser.add_argument("--report", type=Path)
@@ -76,9 +76,27 @@ def main() -> None:
         raise ValueError("check out the exact release commit before attesting")
     if subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=all"], text=True).strip():
         raise ValueError("worktree must still be clean")
-    record = json.loads(args.report.read_text())
+    if args.mode == "finalize":
+        directory = Path(os.environ["KEI_FULL_TEST_RUNS_DIR"])
+        phases = {}
+        for line in (directory / ".current.jsonl").read_text().splitlines():
+            item = json.loads(line)
+            name = item.pop("phase")
+            if name in phases:
+                raise ValueError(f"duplicate local qualification phase: {name}")
+            phases[name] = item
+        record = {"head": (directory / ".run-start-head").read_text().strip(),
+                  "end_head": args.sha,
+                  "start_worktree_clean": (directory / ".run-start-worktree-clean").read_text().strip() == "true",
+                  "end_worktree_clean": True, "phases": phases}
+    else:
+        record = json.loads(args.report.read_text())
     suites = [p.stem for p in Path("tests/shell").glob("*.sh") if p.stem != "lib"]
     validate_record(record, args.sha, suites)
+    if args.mode == "finalize":
+        args.report.write_text(json.dumps(record, indent=2) + "\n")
+        (directory / ".current.jsonl").unlink()
+        print(f"local release evidence: {args.report}")
     digest = hashlib.sha256(args.report.read_bytes()).hexdigest()
     summary = {"sha": args.sha, "report_sha256": digest, "phases": sorted(record["phases"])}
     print(json.dumps(summary, indent=2))

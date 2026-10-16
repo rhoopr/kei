@@ -33,7 +33,7 @@ kei_preflight_selection
 
 binary=$(kei_release_bin)
 cookies=$(kei_cookie_dir)
-work=$(mktemp -d "${TMPDIR:-/tmp/codex/kei/full-test/tmp}/kei-real-service-XXXXX")
+work=""
 service_uninstalled=0
 pre_linger=$(loginctl show-user "$(id -un)" -p Linger 2>/dev/null || true)
 
@@ -46,8 +46,6 @@ cleanup() {
     fi
     rm -rf "$work" 2>/dev/null || true
 }
-trap cleanup EXIT
-
 pre_enabled=$(systemctl --user is-enabled kei.service 2>/dev/null || true)
 pre_active=$(systemctl --user is-active kei.service 2>/dev/null || true)
 echo "pre_enabled=$pre_enabled"
@@ -57,6 +55,9 @@ if [[ "$pre_enabled" != "not-found" || "$pre_active" != "inactive" ]]; then
     echo "run_real_service_lifecycle: kei.service already exists or is active; refusing to mutate it" >&2
     exit 1
 fi
+work=$(mktemp -d "${TMPDIR:-/tmp/codex/kei/full-test/tmp}/kei-real-service-XXXXX")
+# Cleanup may uninstall only after proving that no existing service is present.
+trap cleanup EXIT
 
 data="$work/data"
 photos="$work/photos"

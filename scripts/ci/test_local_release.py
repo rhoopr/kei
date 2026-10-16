@@ -1,7 +1,7 @@
 """Release attestation rejects incomplete, stale, and wrong-commit evidence."""
 
-from datetime import datetime, timedelta, timezone
 import unittest
+from datetime import datetime, timedelta, timezone
 
 import local_release
 

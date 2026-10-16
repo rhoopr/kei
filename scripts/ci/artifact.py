@@ -4,13 +4,15 @@
 import hashlib
 import json
 import os
-from pathlib import Path
+import re
 import subprocess
 import sys
 import tarfile
 import tempfile
-import tomllib
 import zipfile
+from pathlib import Path
+
+import tomllib
 
 ARCHIVES = {
     "kei-linux-x86_64": "x86_64-unknown-linux-gnu",
@@ -110,6 +112,8 @@ def verify(directory: Path = OUT) -> dict:
             raise ValueError(f"invalid candidate identity: {name}")
         if item.get("sha256") != digest(directory / filename):
             raise ValueError(f"candidate checksum mismatch: {name}")
+        if name in CONTAINERS and not re.fullmatch(r"sha256:[0-9a-f]{64}", item.get("image_id", "")):
+            raise ValueError(f"invalid container image ID: {name}")
         records.append(item)
     receipt = {"sha": sha, "version": version, "artifacts": records}
     (directory / "qualification.json").write_text(json.dumps(receipt, indent=2) + "\n")

@@ -69,17 +69,16 @@ must cover interruption, retry, partial completion, and stale configuration.
 5. Run the changed command or user flow when practical.
 6. Review the diff for unrelated changes, unnecessary complexity, missed
    consumers, and incomplete docs.
-7. Run the pre-push gate:
-
-   ```sh
-   just gate
-   ```
-
-   The [gate recipes](justfile) define the checks and commands. They include
-   static checks and offline tests with all features and without default
-   features. The gate stops on the first failure. Read
-   [the test guide](tests/README.md#running) for other test entry points.
-   CI tool versions are pinned in [.github/workflows/ci.yml](.github/workflows/ci.yml).
+7. Run focused tests for the changed behavior, formatting, and lint checks.
+   Hosted PR CI owns the complete offline suites, platform checks, and routed
+   stress checks. Do not run the complete local gate merely to repeat it in CI.
+   Use `just gate` when diagnosing a failure or working without hosted CI.
+   The [recipes](justfile) define the commands. See the
+   [test entry points](tests/README.md#running) for focused checks.
+   Live-provider and real host-service tests belong on an explicitly approved,
+   isolated local fixture when the change needs them, not on every PR.
+   Read [CI qualification](docs/ci.md) for routing and release prerequisites.
+   Tool versions are pinned in [.github/workflows/checks.yml](.github/workflows/checks.yml).
 
 8. Open a pull request against `main`.
 

@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   quality:
-    uses: ./.github/workflows/ci.yml
+    uses: ./.github/workflows/checks.yml
     with:
       heavy: true
 

@@ -2,10 +2,10 @@
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 
 from policy import route
 
@@ -17,9 +17,14 @@ class PolicyTests(unittest.TestCase):
             (["src/auth/session.rs"], True, False, False),
             (["src/download/file/publication.rs"], True, True, True),
             (["src/state/db.rs"], True, True, True),
+            (["src/lib.rs"], True, True, True),
+            (["src/types.rs"], True, True, True),
+            (["src/fs_util.rs"], True, True, True),
             (["src/service/windows.rs"], True, True, False),
             (["src/icloud/photos/asset.rs"], True, False, True),
             (["Cargo.lock"], True, True, True),
+            ([".dockerignore"], True, True, True),
+            ([".gitignore"], True, True, True),
             ([".github/workflows/ci.yml"], True, True, True),
             (["scripts/check-contracts"], True, True, True),
             (["unrecognized-input"], True, True, True),
@@ -70,7 +75,7 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(values["platform"], "false")
             self.assertIn("test_no_default", json.loads(values["required"]))
             failed = subprocess.run(["python3", str(script)], cwd=root, env={**os.environ,
-                "EVENT_NAME": "pull_request", "BASE_SHA": "invalid", "GITHUB_OUTPUT": str(root / "missing")}, capture_output=True)
+                "EVENT_NAME": "pull_request", "BASE_SHA": "invalid", "GITHUB_OUTPUT": str(root / "missing")}, capture_output=True, check=False)
             self.assertNotEqual(failed.returncode, 0)
             self.assertFalse((root / "missing").exists())
 
