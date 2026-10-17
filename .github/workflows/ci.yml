@@ -2,7 +2,7 @@ name: Rust CI
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
   push:
     branches: [main]
   workflow_dispatch:
@@ -16,6 +16,7 @@ concurrency:
 
 jobs:
   plan:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     outputs:
       qualification: ${{ steps.route.outputs.qualification }}
@@ -48,6 +49,13 @@ jobs:
     needs: [plan, checks, qualification]
     runs-on: ubuntu-latest
     steps:
+      # A skipped required check counts as success. Keep a failing marker on
+      # drafts; ready_for_review starts fresh validation at the event's SHA.
+      - name: Defer validation for draft PRs
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft
+        run: |
+          echo "Draft PR: mark ready for review to run CI."
+          exit 1
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false

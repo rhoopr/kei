@@ -43,6 +43,22 @@ available for diagnosis or work without hosted CI.
 
 ## PR routing
 
+Draft PR events skip routing, quality checks, qualification, and direct Service
+smoke builds, including when labeled `ci:full`. The required `CI` job still runs
+as a small failing marker: skipped required checks count as success on GitHub.
+Marking the PR ready for review starts validation for that event's exact merge
+commit, even if the head has not changed. A new head starts a new run.
+
+Converting a ready PR back to draft starts the failing marker and uses the
+existing PR concurrency group to supersede the older run. Marking it ready again
+requires a fresh successful `CI`; draft skips never satisfy that check. Service
+smoke retains its path filters and also handles both draft transitions. Main
+pushes, manual qualification, nightly runs, and releases keep their existing
+routes. The repository does not currently enable a merge queue.
+GitHub does not guarantee concurrency ordering during rapid transitions. If a
+ready run is superseded, retrigger validation for the current head; cancelled or
+missing work cannot pass the required check.
+
 The required check stays `CI`. A failed, cancelled, missing, or unexpectedly
 skipped required job fails that check. The `ci:full` label runs full
 qualification. Workflow, script, Cargo, build, fuzz, container-build, and unknown
