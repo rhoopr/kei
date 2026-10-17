@@ -141,6 +141,7 @@ growth and individual allocation sizes, not RSS or the C++ toolkit's heap.
 The test-only `auth::session::lock_inheritance::Holder` forks a descriptor
 holder. Its child uses only open, flock, close, poll, read, write and _exit
 with preallocated storage. It never allocates, acquires Rust locks or runs
-destructors after fork. The parent uses bounded socket I/O and reaps its child.
+destructors after fork. Every protocol exit explicitly unlocks only locks that
+the child acquired. The parent uses bounded socket I/O and reaps its child.
 Only synthetic sessions are used; diagnostics contain process and descriptor
 numbers, probe operations and outcomes, without account identifiers or paths.

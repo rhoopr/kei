@@ -1667,5 +1667,5 @@ Exclusion must persist until the writer completes; runtime shutdown then proves
 the new durable generation and lock availability. No SQLite, media or provider
 state changes are involved.
 The fixtures use no sleeps, retries, live credentials or provider requests.
-They demonstrate fork inheritance; it does not attribute the original parallel
+They demonstrate fork inheritance; they do not attribute the original parallel
 gate failure, whose conflicting descriptor was not captured.
