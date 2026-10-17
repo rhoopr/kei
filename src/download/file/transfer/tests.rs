@@ -2699,8 +2699,13 @@ async fn tactical_bandwidth_cancel_then_resume_reuses_refunded_limiter() {
     ));
     assert_eq!(std::fs::read(&part).unwrap(), initial);
     assert!(!final_path.exists());
+    assert_eq!(
+        limiter.total_bytes_consumed(),
+        0,
+        "cancelled chunk must refund its reservation before resuming"
+    );
     let resumed = tokio::time::timeout(
-        std::time::Duration::from_millis(1500),
+        std::time::Duration::from_secs(30),
         attempt_download(
             &client,
             "http://stub",
@@ -2715,10 +2720,11 @@ async fn tactical_bandwidth_cancel_then_resume_reuses_refunded_limiter() {
     .await;
     assert_eq!(
         resumed
-            .expect("cancelled reservation must be refunded before resuming")
+            .expect("resumed transfer must complete within the watchdog")
             .unwrap(),
         128
     );
+    assert_eq!(limiter.total_bytes_consumed(), 124);
     let mut expected = initial.to_vec();
     expected.resize(128, 0);
     assert_eq!(std::fs::read(&final_path).unwrap(), expected);

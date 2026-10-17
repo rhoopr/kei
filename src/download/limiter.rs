@@ -54,6 +54,11 @@ impl BandwidthLimiter {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn total_bytes_consumed(&self) -> usize {
+        self.inner.total_bytes_consumed()
+    }
+
     pub(crate) fn bytes_per_sec(&self) -> u64 {
         #[allow(
             clippy::cast_possible_truncation,
