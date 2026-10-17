@@ -7,13 +7,18 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
+      mode:
+        description: Review one PR or send one fixed free-only API test
+        type: choice
+        default: review
+        options: [review, api_smoke]
       pr_number:
         description: Existing PR number to review once
-        required: true
+        required: false
         type: string
 
 concurrency:
-  group: opencode-go-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  group: opencode-go-review-${{ inputs.mode == 'api_smoke' && 'api-smoke' || github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: true
 
 permissions: {}
@@ -22,7 +27,7 @@ jobs:
   review:
     if: >-
       (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false) ||
-      (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'review' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -58,6 +63,25 @@ jobs:
     outputs:
       prepared: ${{ steps.prepare.outputs.prepared }}
       head: ${{ steps.prepare.outputs.head }}
+
+  api-smoke:
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.mode == 'api_smoke' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+      - name: Send one fixed free-only API test
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: python3 -I scripts/ci/opencode_review.py smoke
 
   publish:
     needs: review

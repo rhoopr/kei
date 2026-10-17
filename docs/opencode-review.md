@@ -57,6 +57,25 @@ workflow changes themselves. For installation or replacement:
    an old run uses its original trusted workflow commit; after a script fix,
    dispatch a new run from the updated default branch instead.
 
+For a single API connectivity test instead of a PR review, dispatch:
+
+```sh
+gh workflow run opencode-review.yml --repo rhoopr/kei --ref main -f mode=api_smoke
+```
+
+This sends exactly one non-streaming `glm-5.3-flash-free` request containing only
+user text `test`, capped at 64 output tokens and a 16 KiB response. It has no Go
+fallback or retry, even on quota/availability errors. It uses the existing
+Actions secret only inside a separate read-only job. It sends no PR context,
+performs no publication, and creates no artifact. Logs show only fixed route,
+numeric HTTP status when available, and whether a completed text response was
+accepted. Response bodies and credentials are never printed. Truncated/invalid
+responses fail explicitly even if the endpoint accepted the HTTP request.
+The mode must first be merged into the trusted default branch; it cannot be
+safely executed from this PR's branch. A free-model success proves endpoint
+acceptance, not that the key has Go access, because free models can allow
+unauthenticated calls.
+
 Manual PR numbers must be positive canonical integers. The read-only preparation
 step resolves the PR through GitHub and records its exact head as a job output.
 Publication receives that head, validates the artifact's repository/number/SHA,

@@ -30,6 +30,7 @@ FINDING = {"path": FILE["filename"], "line": 2, "title": "Incorrect retry result
 class FakeHTTP:
     def __init__(self):
         self.calls = []
+        self.last_status = 200
         self.prs = []
         self.files = [copy.deepcopy(FILE)]
         self.reviews = []
@@ -582,8 +583,90 @@ class TransportTests(unittest.TestCase):
         client = review.HTTP()
         for raw, bound in ((b"x" * 100, 2), (b"not json", 100)):
             response = io.BytesIO(raw)
+            response.status = 200
             with patch.object(client.opener, "open", return_value=response), self.assertRaises(review.ReviewError):
                 client.request("GET", "https://api.github.com/test", KEY, limit=bound)
+
+
+class ApiSmokeTests(unittest.TestCase):
+    def test_one_free_test_prompt_only_and_no_response_body_output(self):
+        http = FakeHTTP()
+        http.completion["choices"][0]["message"]["content"] = KEY + " sensitive response body"
+        output = io.StringIO()
+        with redirect_stdout(output):
+            review.api_smoke(http, KEY, "fixture-session")
+        self.assertEqual(len(http.calls), 1)
+        method, url, _, args = http.calls[0]
+        self.assertEqual((method, url), ("POST", review.FREE_URL))
+        self.assertEqual(args["payload"], {"model": review.FREE_MODEL,
+                         "messages": [{"role": "user", "content": "test"}],
+                         "stream": False, "max_tokens": 64})
+        self.assertEqual(args["limit"], 16 * 1024)
+        self.assertEqual(output.getvalue(), "OpenCode free HTTP 200; test response accepted.\n")
+        self.assertNotIn(KEY, output.getvalue())
+
+    def test_api_test_never_falls_back_or_retries(self):
+        for status in (400, 401, 403, 404, 429, 500, 502, 503, 504):
+            http = FakeHTTP()
+            with patch.object(http, "request", side_effect=review.ProviderHTTPError(status)) as request, \
+                 self.assertRaises(review.ProviderHTTPError):
+                review.api_smoke(http, KEY, "fixture")
+            self.assertEqual(request.call_count, 1)
+            self.assertEqual(request.call_args.args[1], review.FREE_URL)
+        http = FakeHTTP()
+        with self.assertRaisesRegex(review.ReviewError, "missing"):
+            review.api_smoke(http, "", "fixture")
+        self.assertEqual(http.calls, [])
+
+    def test_api_test_rejects_bad_or_truncated_completions_without_logging_body(self):
+        for response in ({}, {"choices": [None]}, {"choices": [None, None]},
+                         {"choices": [{"finish_reason": "length", "message": {
+                             "role": "assistant", "content": KEY}}]},
+                         {"choices": [{"finish_reason": "stop", "message": {
+                             "role": "assistant", "content": KEY, "tool_calls": [{}]}}]}):
+            http = FakeHTTP()
+            http.completion = response
+            output = io.StringIO()
+            with redirect_stdout(output), self.assertRaises(review.ReviewError):
+                review.api_smoke(http, KEY, "fixture")
+            self.assertEqual(output.getvalue(), "OpenCode free HTTP 200; test response rejected.\n")
+            self.assertEqual(len(http.calls), 1)
+
+    def test_api_test_reports_http_status_for_invalid_json_and_transport_uncertainty(self):
+        http = FakeHTTP()
+        for status, expected in ((200, "free HTTP 200; test response rejected"),
+                                 (None, "status unavailable")):
+            http.last_status = status
+            with patch.object(http, "request", side_effect=review.ReviewError("raw diagnostic excluded")), \
+                 self.assertRaisesRegex(review.ReviewError, expected):
+                review.api_smoke(http, KEY, "fixture")
+
+    def test_smoke_cli_requires_trusted_dispatch_and_writes_no_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            os.chdir(tmp)
+            try:
+                event = {"inputs": {"mode": "api_smoke"},
+                         "repository": {"full_name": REPO, "default_branch": "main"}}
+                Path("event.json").write_text(json.dumps(event))
+                env = {"GITHUB_EVENT_PATH": str(Path("event.json").resolve()),
+                       "GITHUB_REPOSITORY": REPO, "GITHUB_EVENT_NAME": "workflow_dispatch",
+                       "GITHUB_REF": "refs/heads/main", "GITHUB_RUN_ID": "1234", "OPENCODE_API_KEY": KEY,
+                       "OPENCODE_GO_NO_OVERAGE_CONFIRMED": "true"}
+                http = FakeHTTP()
+                with patch.dict(os.environ, env, clear=True), patch.object(review, "HTTP", return_value=http), \
+                     patch("sys.argv", ["review", "smoke"]), redirect_stdout(io.StringIO()):
+                    review.main()
+                self.assertEqual(len(http.calls), 1)
+                self.assertEqual(list(Path('.').iterdir()), [Path('event.json')])
+                http = FakeHTTP()
+                with patch.dict(os.environ, dict(env, GITHUB_REF="refs/heads/feature"), clear=True), \
+                     patch.object(review, "HTTP", return_value=http), \
+                     patch("sys.argv", ["review", "smoke"]), self.assertRaises(review.ReviewError):
+                    review.main()
+                self.assertEqual(http.calls, [])
+            finally:
+                os.chdir(previous)
 
 
 class WorkflowTests(unittest.TestCase):
@@ -598,11 +681,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)", text)
         self.assertIn("github.event.pull_request.number || inputs.pr_number", text)
         self.assertIn("EXPECTED_HEAD_SHA: ${{ needs.review.outputs.head }}", text)
-        self.assertEqual(text.count("ref: ${{ github.workflow_sha }}"), 2)
-        self.assertEqual(text.count("persist-credentials: false"), 2)
+        self.assertEqual(text.count("ref: ${{ github.workflow_sha }}"), 3)
+        self.assertEqual(text.count("persist-credentials: false"), 3)
         read_job, write_job = text.split("  publish:\n")
         self.assertNotIn("pull-requests: write", read_job)
         self.assertNotIn("OPENCODE_API_KEY", write_job)
+        smoke_job = read_job.split("  api-smoke:")[1]
+        self.assertIn("contents: read", smoke_job)
+        self.assertNotIn("GH_TOKEN", smoke_job)
+        self.assertNotIn("OPENCODE_GO_", smoke_job)
+        self.assertNotIn("pull-requests:", smoke_job)
+        self.assertNotIn("upload-artifact", smoke_job)
+        self.assertIn("python3 -I scripts/ci/opencode_review.py smoke", smoke_job)
         self.assertNotIn("pull_request.head", text)
         self.assertNotIn("secrets: inherit", text)
         self.assertIn("path: review-result.json", text)

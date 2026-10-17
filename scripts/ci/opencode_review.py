@@ -105,12 +105,14 @@ class HTTP:
         # Do not inherit proxy credentials or redirect Authorization to another host.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         self.calls = 0
+        self.last_status = None
 
     def request(self, method, url, token, *, payload=None, limit=1024 * 1024,
                 provider=False, session=None):
         require(urllib.parse.urlsplit(url).netloc in {"api.github.com", "opencode.ai"}
                 and url.startswith("https://"), "Unapproved API destination.")
         self.calls += 1
+        self.last_status = None
         require(self.calls <= 150, "HTTP request budget exhausted.")
         headers = {"Authorization": f"Bearer {token}", "User-Agent": "kei-advisory-review/1.0",
                    "Accept": "application/json", "Content-Type": "application/json"}
@@ -126,6 +128,7 @@ class HTTP:
                                              headers=headers, method=method)
             try:
                 with self.opener.open(request, timeout=90 if provider else 20) as response:
+                    self.last_status = response.status
                     data = response.read(limit + 1)
                 require(len(data) <= limit, "API response exceeded its size limit.")
                 return json.loads(data)
@@ -388,15 +391,52 @@ def load_json(path, limit):
     return json.loads(raw)
 
 
+def require_default_dispatch(event):
+    require(os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch", "Manual dispatch required.")
+    repository = event["repository"]
+    require(repository["full_name"] == os.environ["GITHUB_REPOSITORY"], "Dispatch repository mismatch.")
+    require(os.environ["GITHUB_REF"] == f"refs/heads/{repository['default_branch']}",
+            "Manual review must run from the default branch.")
+
+
+def api_smoke(http, key, session):
+    """One free-only, fixed-prompt request; no PR data, fallback, artifact, or body logs."""
+    require(bool(key), "OPENCODE_API_KEY is missing; no API test completed.")
+    try:
+        response = http.request("POST", FREE_URL, key, provider=True, session=session, limit=16 * 1024,
+                                payload={"model": FREE_MODEL,
+                                         "messages": [{"role": "user", "content": "test"}],
+                                         "stream": False, "max_tokens": 64})
+    except ProviderHTTPError:
+        raise
+    except ReviewError:
+        status = http.last_status
+        if type(status) is int and 100 <= status <= 599:
+            raise ReviewError(f"OpenCode free HTTP {status}; test response rejected.") from None
+        raise ReviewError("OpenCode free HTTP status unavailable; test request failed.") from None
+    status = http.last_status
+    require(type(status) is int and 100 <= status <= 599, "API test status unavailable.")
+    choices = response.get("choices") if isinstance(response, dict) else None
+    choice = choices[0] if isinstance(choices, list) and len(choices) == 1 else {}
+    choice = choice if isinstance(choice, dict) else {}
+    message = choice.get("message")
+    message = message if isinstance(message, dict) else {}
+    content = message.get("content")
+    accepted = (200 <= status < 300 and choice.get("finish_reason") == "stop"
+                and message.get("role") == "assistant" and isinstance(content, str) and bool(content.strip())
+                and not message.get("tool_calls") and not message.get("function_call")
+                and not message.get("refusal"))
+    print(f"OpenCode free HTTP {status}; test response {'accepted' if accepted else 'rejected'}.")
+    require(accepted, "Free-only API test did not produce a completed text response.")
+
+
 def review_target(http, event, mode):
     """Resolve one PR from trusted event metadata; freeze manual head at prepare."""
     repo = os.environ["GITHUB_REPOSITORY"]
     event_name = os.environ["GITHUB_EVENT_NAME"]
     if event_name == "workflow_dispatch":
-        repository = event["repository"]
-        require(repository["full_name"] == repo, "Dispatch repository mismatch.")
-        require(os.environ["GITHUB_REF"] == f"refs/heads/{repository['default_branch']}",
-                "Manual review must run from the default branch.")
+        require_default_dispatch(event)
+        require(event.get("inputs", {}).get("mode", "review") == "review", "PR review mode required.")
         number_text = event.get("inputs", {}).get("pr_number")
         require(isinstance(number_text, str) and re.fullmatch(r"[1-9][0-9]{0,8}", number_text),
                 "Manual PR number must be a positive canonical integer.")
@@ -419,6 +459,13 @@ def main():
     # Paths/commands come only from literal base workflow steps, never PR data.
     mode = sys.argv[1]
     http = HTTP()
+    if mode == "smoke":
+        event = load_json(os.environ["GITHUB_EVENT_PATH"], 2 * 1024 * 1024)
+        require_default_dispatch(event)
+        require(event.get("inputs", {}).get("mode") == "api_smoke", "API test mode required.")
+        session = hashlib.sha256(f"api-smoke:{os.environ['GITHUB_REPOSITORY']}:{os.environ['GITHUB_RUN_ID']}".encode()).hexdigest()
+        api_smoke(http, os.environ.get("OPENCODE_API_KEY", ""), session)
+        return
     if mode == "infer":
         prepared = load_json("review-input.json", MAX_PROMPT + MAX_CONTEXT)
         # JSON object keys are strings. Restore validated integer line locations.
