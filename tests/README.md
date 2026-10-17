@@ -1661,6 +1661,11 @@ the owner lives, availability after drop, explicit release/reacquire, released
 guard drop and reset-generation rejection. The service principal-replacement
 test holds the same fixture across changed/missing principal and wrong-realm
 rejections and still asserts the original principal and session marker.
-The fixture uses no sleeps, retries, live credentials or provider requests.
-It demonstrates fork inheritance; it does not attribute the original parallel
+The canceled-generation-write test queues the production writer behind a
+synchronized blocking task, cancels its caller and drops the foreground owner.
+Exclusion must persist until the writer completes; runtime shutdown then proves
+the new durable generation and lock availability. No SQLite, media or provider
+state changes are involved.
+The fixtures use no sleeps, retries, live credentials or provider requests.
+They demonstrate fork inheritance; it does not attribute the original parallel
 gate failure, whose conflicting descriptor was not captured.

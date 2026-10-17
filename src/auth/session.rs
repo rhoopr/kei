@@ -133,7 +133,11 @@ fn write_lock_generation(file: &std::fs::File, generation: u64) -> Result<()> {
 }
 
 impl SessionStateGuard {
-    pub(crate) async fn acquire(cookie_dir: &Path, username: &str, realm: &str) -> Result<Self> {
+    pub(crate) async fn acquire(
+        cookie_dir: &Path,
+        username: &str,
+        realm: &str,
+    ) -> Result<Arc<Self>> {
         Self::acquire_with_generation(cookie_dir, username, realm, None).await
     }
 
@@ -142,7 +146,7 @@ impl SessionStateGuard {
         username: &str,
         realm: &str,
         expected_generation: Option<SessionGeneration>,
-    ) -> Result<Self> {
+    ) -> Result<Arc<Self>> {
         let cookie_dir = cookie_dir.to_path_buf();
         fs::create_dir_all(&cookie_dir).await.with_context(|| {
             format!("Could not create cookie directory {}", cookie_dir.display())
@@ -183,7 +187,7 @@ impl SessionStateGuard {
                 return Err(crate::auth::error::AuthError::SessionReset.into());
             }
             guard.generation.store(generation, Ordering::Release);
-            Ok::<_, anyhow::Error>(guard)
+            Ok::<_, anyhow::Error>(Arc::new(guard))
         })
         .await?
     }
@@ -206,7 +210,7 @@ impl SessionStateGuard {
         SessionGeneration(self.generation.load(Ordering::Acquire))
     }
 
-    pub(crate) async fn discard(&self) -> Result<Vec<PathBuf>> {
+    pub(crate) async fn discard(self: &Arc<Self>) -> Result<Vec<PathBuf>> {
         anyhow::ensure!(
             self.locked.load(Ordering::Acquire),
             "Cannot discard iCloud authentication state without the account lock"
@@ -216,8 +220,10 @@ impl SessionStateGuard {
             .load(Ordering::Acquire)
             .checked_add(1)
             .context("Session lock generation overflow")?;
-        let lock_file = self.lock_file.try_clone()?;
-        tokio::task::spawn_blocking(move || write_lock_generation(&lock_file, generation))
+        // A canceled caller must not unlock while this noncancelable writer
+        // still modifies the generation. Retain the owner, not just its file.
+        let guard = Arc::clone(self);
+        tokio::task::spawn_blocking(move || write_lock_generation(&guard.lock_file, generation))
             .await??;
         self.generation.store(generation, Ordering::Release);
 
@@ -503,7 +509,7 @@ pub struct Session {
     home_endpoint: String,
     /// API client timeout (preserved for `reset_http_clients`).
     api_timeout: Duration,
-    state_guard: SessionStateGuard,
+    state_guard: Arc<SessionStateGuard>,
     loaded_persisted_auth: bool,
     principal: Option<String>,
 }
@@ -606,7 +612,7 @@ impl Session {
         sanitized: &str,
         home_endpoint: &str,
         timeout_secs: Option<u64>,
-        state_guard: SessionStateGuard,
+        state_guard: Arc<SessionStateGuard>,
         loaded_persisted_auth: bool,
     ) -> Result<Self> {
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(30));
@@ -1090,7 +1096,8 @@ pub(crate) mod lock_inheritance {
                 unsafe {
                     libc::close(parent.as_raw_fd());
                     let mut request = [0_u8];
-                    loop {
+                    let mut child_owned = false;
+                    let code = loop {
                         let mut poll = libc::pollfd {
                             fd: socket,
                             events: libc::POLLIN,
@@ -1099,18 +1106,21 @@ pub(crate) mod lock_inheritance {
                         if libc::poll(&raw mut poll, 1, 30_000) != 1
                             || libc::read(socket, request.as_mut_ptr().cast(), 1) != 1
                         {
-                            libc::_exit(1);
+                            break 1;
                         }
                         if request[0] == b'Q' {
-                            libc::_exit(0);
+                            break 0;
                         }
                         let probe = libc::open(path.as_ptr(), libc::O_RDWR);
                         if probe < 0 {
-                            libc::_exit(2);
+                            break 2;
                         }
                         let target = if request[0] == b'L' { fd } else { probe };
                         let result = libc::flock(target, libc::LOCK_EX | libc::LOCK_NB);
                         let error = *libc::__errno_location();
+                        if request[0] == b'L' && result == 0 {
+                            child_owned = true;
+                        }
                         let response = [if result == 0 {
                             1
                         } else if error == libc::EWOULDBLOCK {
@@ -1120,9 +1130,15 @@ pub(crate) mod lock_inheritance {
                         }];
                         libc::close(probe);
                         if libc::write(socket, response.as_ptr().cast(), 1) != 1 {
-                            libc::_exit(3);
+                            break 3;
                         }
+                    };
+                    // Another concurrent fork can inherit the parent's released
+                    // descriptor. Release only a lock this child acquired.
+                    if child_owned && libc::flock(fd, libc::LOCK_UN) != 0 {
+                        libc::_exit(4);
                     }
+                    libc::_exit(code);
                 }
             }
             drop(child);
@@ -1362,6 +1378,67 @@ mod tests {
             child.probe(),
             "generation rejection must leave the lock available"
         );
+    }
+
+    #[test]
+    fn canceled_session_generation_write_retains_lock_until_completion() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let directory = tempfile::tempdir().unwrap();
+        let lock_path = directory.path().join(format!(
+            "{}.lock",
+            crate::account::namespace("synthetic@example.invalid", "com")
+        ));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let guard =
+                SessionStateGuard::acquire(directory.path(), "synthetic@example.invalid", "com")
+                    .await
+                    .unwrap();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            });
+            entered_rx.await.unwrap();
+            // Queue the production writer behind the synchronized blocker,
+            // then cancel its caller before it can write the generation.
+            let mut discard = Box::pin(guard.discard());
+            poll_fn(|cx| {
+                assert!(discard.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(discard);
+            drop(guard);
+            let contender = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            assert!(
+                !contender.try_lock_exclusive().unwrap(),
+                "cancellation must retain exclusion for the queued writer"
+            );
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+        });
+        // Runtime shutdown waits for the noncancelable blocking writer.
+        drop(runtime);
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        assert!(contender.try_lock_exclusive().unwrap());
+        assert_eq!(read_lock_generation(&contender).unwrap(), 1);
+        FileExt::unlock(&contender).unwrap();
     }
 
     #[tokio::test]

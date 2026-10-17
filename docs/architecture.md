@@ -258,7 +258,9 @@ gap also wins. The session guard explicitly unlocks on drop, including failed
 generation validation and rejected principal replacements. Closing only its own
 descriptor would leave a forked child's copy holding the shared lock until
 exec or exit. An explicitly released guard does not unlock again on drop;
-generation checks and independent-process exclusion remain in force.
+generation checks and independent-process exclusion remain in force. Blocking
+generation writes retain the shared guard until completion even if their caller
+is canceled, so cleanup cannot unlock while a generation write is pending.
 
 ### Account ownership and legacy adoption
 
