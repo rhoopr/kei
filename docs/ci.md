@@ -145,3 +145,9 @@ availability monitor for GitHub itself.
 
 Reports and candidate artifacts are retained for 14 days. PR, nightly, and
 release concurrency groups are separate. Nightly work cannot cancel a release.
+
+## Advisory OpenCode review
+
+[OpenCode advisory review](opencode-review.md) documents the optional bot review,
+secret setup, provider data transmission, limits, and security boundary. It is
+advisory and does not contribute to the required CI gate.

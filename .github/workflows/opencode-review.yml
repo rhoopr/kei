@@ -1,0 +1,74 @@
+name: OpenCode advisory review
+
+# Both workflow and executable scripts come from the trusted target commit.
+# PR files are API data only. Never change this checkout to the PR head/merge ref.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: opencode-go-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  review:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+      - name: Collect bounded PR data
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I scripts/ci/opencode_review.py prepare
+      - name: Review data with GLM Flash Free first
+        if: steps.prepare.outputs.prepared == 'true'
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_GO_MODEL: ${{ vars.OPENCODE_GO_MODEL }}
+          # Set true only after confirming Console Use balance is disabled.
+          OPENCODE_GO_NO_OVERAGE_CONFIRMED: ${{ vars.OPENCODE_GO_NO_OVERAGE_CONFIRMED }}
+        run: python3 -I scripts/ci/opencode_review.py infer
+      - name: Save validated findings only
+        if: steps.prepare.outputs.prepared == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: opencode-go-findings
+          path: review-result.json
+          if-no-files-found: error
+          retention-days: 1
+    outputs:
+      prepared: ${{ steps.prepare.outputs.prepared }}
+
+  publish:
+    needs: review
+    if: needs.review.outputs.prepared == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: opencode-go-findings
+          path: result
+      - name: Validate and publish advisory review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I scripts/ci/opencode_review.py publish
