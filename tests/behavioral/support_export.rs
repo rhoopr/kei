@@ -370,6 +370,7 @@ fn support_export_owner_provenance_roundtrip_preserves_old_unavailable_fields() 
             json!({
             "record_history":"replacement", "prior_reference":"present", "sparse_marker":"true",
             "linkage":"partial_fields", "lookup_outcome":"live_reference", "lookup_family":"candidate",
+            "lookup_scope":"matched", "lookup_shape":"live_reference",
             "raw_reference":"PRIVATE_REFERENCE_CANARY"}),
         ),
     ]);
@@ -382,6 +383,10 @@ fn support_export_owner_provenance_roundtrip_preserves_old_unavailable_fields() 
             "support_discovery_v1",
             json!({"phase":"selected_qualified_indexing","database":"private","owner":"other","selected_indexing":true,"qualification_published":true}),
         ),
+        diagnostic(
+            "support_missing_reference_v1",
+            json!({"record_history":"not_recorded", "lookup_outcome":"scope_unavailable", "lookup_family":"not_established"}),
+        ),
     ]);
     let malicious = cycle(vec![
         diagnostic(
@@ -393,6 +398,10 @@ fn support_export_owner_provenance_roundtrip_preserves_old_unavailable_fields() 
             "support_discovery_v1",
             json!({"owner":123456789,"owner_type":"PRIVATE_TYPE_CANARY","zone_class":"PRIVATE_ZONE_CANARY",
             "primary_eligibility":"success","private_payload":"https://PRIVATE_PROVIDER_CANARY","listing_validated":true}),
+        ),
+        diagnostic(
+            "support_missing_reference_v1",
+            json!({"record_history":"first_seen", "lookup_scope":"PRIVATE_SCOPE_CANARY", "lookup_shape":123456789}),
         ),
     ]);
     let history = json!({"schema_version":1,"cycles_evicted":0,"queue_dropped":0,"groups_omitted":0,"previous_history_unavailable":false,"cycles":[current,old,malicious]});
@@ -430,7 +439,8 @@ fn support_export_owner_provenance_roundtrip_preserves_old_unavailable_fields() 
     assert_eq!(
         events[7]["fields"],
         json!({"record_history":"replacement", "prior_reference":"present",
-        "sparse_marker":"true", "linkage":"partial_fields", "lookup_outcome":"live_reference", "lookup_family":"candidate"})
+        "sparse_marker":"true", "linkage":"partial_fields", "lookup_outcome":"live_reference", "lookup_family":"candidate",
+        "lookup_scope":"matched", "lookup_shape":"live_reference"})
     );
     // Missing historical fields remain unavailable. They are never synthesized
     // into an observed absent owner or a false primary-publication decision.
@@ -451,6 +461,13 @@ fn support_export_owner_provenance_roundtrip_preserves_old_unavailable_fields() 
         assert!(cycles[1]["diagnostics"][1]["fields"].get(key).is_none());
     }
     assert_eq!(cycles[1]["diagnostics"][1]["fields"]["owner"], "other");
+    for key in ["lookup_scope", "lookup_shape"] {
+        assert!(cycles[1]["diagnostics"][2]["fields"].get(key).is_none());
+    }
+    assert_eq!(
+        cycles[2]["diagnostics"][2]["fields"],
+        json!({"record_history":"first_seen"})
+    );
     assert_eq!(cycles[1]["observations_total"], Value::Null);
     assert_eq!(cycles[2]["diagnostics"][0]["fields"], json!({"pages":17}));
     assert_eq!(

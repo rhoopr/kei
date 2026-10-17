@@ -552,7 +552,7 @@ fn missing_reference_history_survives_restart_and_revalidates_export() {
     };
     apply(&mut history, Message::Begin(json!({})));
     let fields = json!({"record_history":"replacement", "prior_reference":"unavailable",
-        "sparse_marker":"not_recorded", "linkage":"not_recorded", "lookup_outcome":"http_error", "lookup_family":"not_established"});
+        "sparse_marker":"not_recorded", "linkage":"not_recorded", "lookup_outcome":"scope_unavailable", "lookup_family":"not_established", "lookup_scope":"child_unavailable", "lookup_shape":"provider_error"});
     add(
         &mut history,
         "support_missing_reference_v1",
@@ -570,8 +570,9 @@ fn missing_reference_history_survives_restart_and_revalidates_export() {
     assert_eq!(serde_json::Value::Object(diagnostic.fields.clone()), fields);
     let mut poisoned: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    poisoned["cycles"][0]["diagnostics"][0]["fields"]["lookup_family"] =
-        json!("private-provider-id");
+    for key in ["lookup_family", "lookup_scope", "lookup_shape"] {
+        poisoned["cycles"][0]["diagnostics"][0]["fields"][key] = json!("private-provider-id");
+    }
     std::fs::write(&path, serde_json::to_vec(&poisoned).unwrap()).unwrap();
     assert!(
         !serde_json::to_string(&read(&path).0)

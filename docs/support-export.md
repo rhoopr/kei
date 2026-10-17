@@ -177,10 +177,23 @@ Cancellation ends the lookup. Collection itself remains offline.
 
 Only fixed categories are retained: first-seen versus replacement, the immediately
 retained prior reference shape, sparse-marker shape, linkage-field presence and
-lookup outcome. Tracking is capped at 64 missing-reference identities of at most
-512 bytes each; unavailable observations are explicit. Compacted tombstones do
-not establish the prior reference shape. Linkage-field presence does not prove
+lookup outcome. Each latest inventory record retains a fixed-size summary captured
+before compaction, within the existing inventory record and retained-byte budgets.
+EOF can select any child without losing its summary to a separate tracking or
+identity-length limit. Older builds can report unavailable observations. Compacted
+tombstones do not establish the prior reference shape. Linkage-field presence does not prove
 valid linkage. No names, references, owners, tokens, URLs or error bodies are saved.
+
+`lookup_shape` describes the matching response record independently of scope:
+provider error, deletion flag, malformed response/reference, missing reference or
+live reference. These are payload categories, not trusted identity or deletion
+proof. `lookup_scope` identifies unavailable expected, child or reference scope,
+foreign child/reference scope, or `matched`. `matched` requires matching child
+scope; a `live_reference` payload additionally requires matching reference scope
+before family classification. Error, deletion and malformed/missing-reference
+payloads do not require a reference-scope check. Without a single matching
+response record, both fields are `not_observed`. A scope check can still determine
+`lookup_outcome` while `lookup_shape` describes an error or deletion flag.
 
 A candidate/noncandidate family comparison requires explicit matching child and
 reference scopes in the lookup response. It describes that later lookup, not

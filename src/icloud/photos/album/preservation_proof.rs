@@ -149,7 +149,9 @@ fn retained_record_bytes(record: &Record) -> anyhow::Result<usize> {
         .len()
         .checked_mul(2)
         .and_then(|size| size.checked_add(record.record_type.len()))
-        .and_then(|size| size.checked_add(std::mem::size_of::<(String, Record, usize)>()))
+        .and_then(|size| {
+            size.checked_add(std::mem::size_of::<(String, Record, usize, Observation)>())
+        })
         .and_then(|size| size.checked_add(fields_bytes))
         .context("Preservation inventory byte count overflow")
 }
@@ -271,8 +273,7 @@ impl PhotoAlbum {
         );
         let mut cursor: Option<String> = None;
         let mut seen_cursors = FxHashSet::default();
-        let mut latest = FxHashMap::<String, (Record, usize)>::default();
-        let mut observations = FxHashMap::<String, Observation>::default();
+        let mut latest = FxHashMap::<String, (Record, usize, Observation)>::default();
         for _ in 0..budget.pages {
             progress.phase = "request";
             let body =
@@ -413,26 +414,25 @@ impl PhotoAlbum {
                 InventoryFailureKind::RetainedBytes
             );
             for mut record in zone.records {
-                observations.remove(&record.record_name);
-                if record.record_type == "CPLAsset"
+                // Keep fixed pre-compaction categories with every latest record,
+                // charged to the same byte budget as the record itself. EOF may
+                // select any child, regardless of arrival order or identity length.
+                let observation = if record.record_type == "CPLAsset"
                     && record.deleted != Some(true)
                     && record.fields.pointer("/masterRef/value").is_none()
-                    && record.record_name.len() <= 512
-                    && observations.len() < 64
                 {
-                    observations.insert(
-                        record.record_name.clone(),
-                        Observation::new(
-                            &record,
-                            latest.get(&record.record_name).map(|(prior, _)| prior),
-                        ),
-                    );
-                }
+                    Observation::new(
+                        &record,
+                        latest.get(&record.record_name).map(|(prior, _, _)| prior),
+                    )
+                } else {
+                    Observation::unavailable()
+                };
                 compact_record(&mut record, masters);
                 let bytes = retained_record_bytes(&record)?;
                 // Replace, never accumulate versions of the same identity. Later
                 // updates and tombstones also replace any earlier full family record.
-                if let Some((_, previous_bytes)) = latest.remove(&record.record_name) {
+                if let Some((_, previous_bytes, _)) = latest.remove(&record.record_name) {
                     progress.retained_bytes -= previous_bytes;
                 }
                 progress.retained_bytes = progress
@@ -443,7 +443,7 @@ impl PhotoAlbum {
                     progress.retained_bytes <= budget.retained_bytes,
                     InventoryFailureKind::RetainedBytes
                 );
-                latest.insert(record.record_name.clone(), (record, bytes));
+                latest.insert(record.record_name.clone(), (record, bytes, observation));
             }
             anyhow::ensure!(!cancel.is_cancelled(), InventoryFailureKind::Cancelled);
             cursor = Some(zone.sync_token);
@@ -451,7 +451,7 @@ impl PhotoAlbum {
                 continue;
             }
             let mut expected = FxHashSet::default();
-            for (record, _) in latest.values().filter(|(record, _)| {
+            for (record, _, observation) in latest.values().filter(|(record, _, _)| {
                 record.record_type == "CPLAsset" && record.deleted != Some(true)
             }) {
                 progress.phase = "child_reference";
@@ -471,16 +471,8 @@ impl PhotoAlbum {
                     .get("masterRef")
                     .and_then(|field| field.get("value"))
                 else {
-                    self.observe_missing_reference(
-                        record,
-                        observations
-                            .get(&record.record_name)
-                            .copied()
-                            .unwrap_or_else(Observation::unavailable),
-                        masters,
-                        cancel,
-                    )
-                    .await;
+                    self.observe_missing_reference(record, *observation, masters, cancel)
+                        .await;
                     anyhow::bail!(InventoryFailureKind::Evidence(
                         "child_master_reference_missing"
                     ));
@@ -549,7 +541,7 @@ impl PhotoAlbum {
             progress.scope_mismatch_component = "not_applicable";
             let family_records = latest
                 .into_values()
-                .map(|(record, _)| record)
+                .map(|(record, _, _)| record)
                 .filter(|record| {
                     (record.record_type == "CPLMaster" && masters.contains(&record.record_name))
                         || (record.record_type == "CPLAsset"

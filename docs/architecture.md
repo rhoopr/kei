@@ -2167,8 +2167,12 @@ retention cannot silently sever cross-round relationships. This evidence has no
 consumer in enumeration, recovery or checkpoint policy.
 
 `photos/album/preservation_proof/missing_reference.rs` owns observation-only
-lookup at the first missing-parent inventory refusal. A bounded side table records
-raw arrival shape before compaction without changing inventory byte accounting.
+lookup at the first missing-parent inventory refusal. Fixed pre-compaction shape
+categories live alongside every latest inventory record and count toward its
+retained-byte budget, without a separate identity/count sampling cap. Lookup
+payload shape is separate from scope availability. Scope `matched` means the
+child scope matched; reference scope is also required and checked for a
+`live_reference` payload before family classification.
 `PhotosSession::post_diagnostic` uses a dedicated 64 KiB transport with fixed errors,
 no request dumps, error-body logging or retries. The caller owns cancellation and
 a five-second deadline. Its response never enters inventory or proof construction;

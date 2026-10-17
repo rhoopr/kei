@@ -1,4 +1,4 @@
-use super::{Observation, RESPONSE_BYTES, classify};
+use super::{Observation, RESPONSE_BYTES, classify as lookup_observation};
 use crate::icloud::photos::album::preservation_proof::tests::{BUDGET, masters};
 use crate::icloud::photos::album::test_support::{
     canned_changes_page, changes_asset, changes_master, default_zone, make_album_with_session,
@@ -12,6 +12,16 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use tokio_util::sync::CancellationToken;
+
+fn classify(
+    response: &Value,
+    child: &str,
+    expected: &Value,
+    masters: &rustc_hash::FxHashSet<String>,
+) -> (&'static str, &'static str) {
+    let observation = lookup_observation(response, child, expected, masters);
+    (observation.outcome, observation.family)
+}
 
 fn child(master: &str) -> Value {
     let mut r = changes_asset("private-child", master);
@@ -178,6 +188,12 @@ async fn run_case(mode: &'static str, replacement: bool, reply: Value) -> (Value
         .remove("masterRef");
     sparse["fields"]["isSparsePrivateRecord"] = json!({"value":1});
     sparse["fields"]["linkedShareRecordName"] = json!({"value":"private-link"});
+    if mode == "linked_sparse" {
+        sparse["fields"]["linkedShareZoneName"] =
+            json!({"value":"SharedSync-private","type":"STRING"});
+        sparse["fields"]["linkedShareZoneOwner"] =
+            json!({"value":{"recordName":"private-owner"},"type":"REFERENCE"});
+    }
     if mode == "long_identity" {
         sparse["recordName"] = json!("x".repeat(513));
     }
@@ -191,8 +207,8 @@ async fn run_case(mode: &'static str, replacement: bool, reply: Value) -> (Value
             })
             .collect();
         pages.push_back(canned_changes_page(&records, "private-cap-cursor", true));
-        // The 65th missing-reference identity is untracked; later tombstones
-        // remove the first 64 so iteration must reach the untracked one.
+        // Later tombstones remove the first 64 so EOF must observe the 65th
+        // missing-reference identity, including its pre-compaction shape.
         let mut records = vec![sparse.clone()];
         records.extend((0..64).map(|i| {
             let mut r = sparse.clone();
@@ -336,12 +352,13 @@ fn missing_reference_compacted_prior_is_unavailable() {
 }
 
 #[tokio::test]
-async fn missing_reference_tracking_limits_remain_explicit() {
+async fn missing_reference_regression_observations_cover_tracking_and_identity_limits() {
     for mode in ["long_identity", "tracking_limit"] {
         let (fields, calls) = run_case(mode, false, json!({"records":[]})).await;
         assert_eq!(calls, 1);
-        assert_eq!(fields["record_history"], "not_recorded");
-        assert_eq!(fields["sparse_marker"], "not_recorded");
+        assert_eq!(fields["record_history"], "first_seen");
+        assert_eq!(fields["sparse_marker"], "true");
+        assert_eq!(fields["linkage"], "partial_fields");
         assert_eq!(fields["lookup_outcome"], "omitted");
     }
 }
@@ -370,4 +387,179 @@ async fn missing_reference_precancelled_probe_starts_no_request() {
             .field("support_fields")
             .is_some_and(|value| value.contains("cancelled"))
     }));
+}
+
+#[test]
+fn issue845f_compaction_preserves_references_and_valid_sparse_link_is_not_membership() {
+    for master in ["master", "other"] {
+        for deleted in [0, 1] {
+            let mut raw = child(master);
+            raw["fields"]["isDeleted"] = json!({"value":deleted});
+            let mut record: super::Record = serde_json::from_value(raw).unwrap();
+            let before = record.fields["masterRef"].clone();
+            super::super::compact_record(&mut record, &masters());
+            assert_eq!(record.fields["masterRef"], before);
+        }
+    }
+    let mut sparse = child("master");
+    sparse["fields"]
+        .as_object_mut()
+        .unwrap()
+        .remove("masterRef");
+    sparse["fields"]["isSparsePrivateRecord"] = json!({"value":1,"type":"INT64"});
+    sparse["fields"]["linkedShareRecordName"] = json!({"value":"private-linked","type":"STRING"});
+    sparse["fields"]["linkedShareZoneName"] = json!({"value":"SharedSync-private","type":"STRING"});
+    sparse["fields"]["linkedShareZoneOwner"] =
+        json!({"value":{"recordName":"private-owner"},"type":"REFERENCE"});
+    assert!(matches!(
+        crate::icloud::photos::asset::SparseShareEvidence::from_fields(&sparse["fields"]),
+        Some(crate::icloud::photos::asset::SparseShareEvidence::Linked(_))
+    ));
+    let prior: super::Record = serde_json::from_value(child("master")).unwrap();
+    let mut current: super::Record = serde_json::from_value(sparse).unwrap();
+    let observation = Observation::new(&current, Some(&prior));
+    assert_eq!(observation.history, "replacement");
+    assert_eq!(observation.prior_reference, "present");
+    assert_eq!(observation.sparse_marker, "true");
+    assert_eq!(observation.linkage, "all_fields");
+    super::super::compact_record(&mut current, &masters());
+    assert!(current.fields.pointer("/masterRef/value").is_none());
+    assert!(current.fields.get("linkedShareRecordName").is_none());
+}
+
+#[tokio::test]
+async fn missing_reference_regression_observations_cover_every_live_eof_candidate() {
+    for seed in 0..8 {
+        let (capture, _guard) = TracingCapture::install();
+        let records: Vec<Value> = (0..128)
+            .map(|index| {
+                let mut record = child("master");
+                record["recordName"] = json!(format!("live-{seed}-{index}"));
+                record["fields"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("masterRef");
+                record["fields"]["isSparsePrivateRecord"] = json!({"value":1});
+                record["fields"]["linkedShareRecordName"] = json!({"value":"private-link"});
+                record
+            })
+            .collect();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let session = Session {
+            pages: Arc::new(Mutex::new(VecDeque::from([canned_changes_page(
+                &records, "final", false,
+            )]))),
+            reply: json!({"records":[child("master")]}),
+            mode: "ok",
+            calls: Arc::clone(&calls),
+            cancel: cancel.clone(),
+        };
+        let album = make_album_with_session(100, Box::new(session));
+        let error = album
+            .legacy_preservation_inventory(
+                &masters(),
+                &cancel,
+                super::super::InventoryBudget {
+                    records: 200,
+                    retained_bytes: 128 * 1024,
+                    ..BUDGET
+                },
+            )
+            .await
+            .unwrap_err();
+        let diagnostic = super::super::classify_legacy_inventory_error(&error).unwrap();
+        assert_eq!(diagnostic.subreason, "child_master_reference_missing");
+        assert!(diagnostic.eof_observed);
+        assert_eq!(diagnostic.records, 128);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let events = capture.events();
+        let event = events
+            .iter()
+            .find(|event| event.field("diagnostic") == Some("support_missing_reference_v1"))
+            .unwrap();
+        let fields: Value = serde_json::from_str(event.field("support_fields").unwrap()).unwrap();
+        assert_eq!(fields["record_history"], "first_seen");
+        assert_eq!(fields["sparse_marker"], "true");
+        assert_eq!(fields["linkage"], "partial_fields");
+    }
+}
+
+#[tokio::test]
+async fn missing_reference_regression_lookup_scope_and_shape_are_independent() {
+    for (site, expected_scope, expected_shape) in [
+        ("child", "child_unavailable", "live_reference"),
+        ("parent", "reference_unavailable", "live_reference"),
+        ("error", "child_unavailable", "provider_error"),
+        ("deleted", "child_unavailable", "deleted"),
+        ("missing", "child_unavailable", "missing_reference"),
+    ] {
+        let mut reply = child("master");
+        if site == "parent" {
+            reply["fields"]["masterRef"]["value"]
+                .as_object_mut()
+                .unwrap()
+                .remove("zoneID");
+        } else {
+            reply.as_object_mut().unwrap().remove("zoneID");
+            match site {
+                "error" => reply["serverErrorCode"] = json!("UNKNOWN_ITEM"),
+                "deleted" => reply["deleted"] = json!(true),
+                "missing" => {
+                    reply["fields"].as_object_mut().unwrap().remove("masterRef");
+                }
+                _ => {}
+            }
+        }
+        let (fields, calls) = run_case("ok", false, json!({"records":[reply]})).await;
+        assert_eq!(fields["lookup_scope"], expected_scope, "{site}");
+        assert_eq!(fields["lookup_shape"], expected_shape, "{site}");
+        assert_eq!(fields["lookup_outcome"], "scope_unavailable");
+        assert_eq!(fields["lookup_family"], "not_established");
+        assert_eq!(calls, 1);
+    }
+}
+
+#[tokio::test]
+async fn missing_reference_regression_sparse_replacement_never_inherits_or_repairs() {
+    let (fields, calls) =
+        run_case("linked_sparse", true, json!({"records":[child("master")]})).await;
+    assert_eq!(calls, 1);
+    assert_eq!(fields["record_history"], "replacement");
+    assert_eq!(fields["prior_reference"], "present");
+    assert_eq!(fields["sparse_marker"], "true");
+    assert_eq!(fields["linkage"], "all_fields");
+    assert_eq!(fields["lookup_family"], "candidate");
+}
+
+#[test]
+fn missing_reference_scope_sites_keep_untrusted_family_unknown() {
+    for site in ["expected", "child", "reference"] {
+        let mut expected = default_zone();
+        let mut record = child("master");
+        let scope = match site {
+            "expected" => {
+                expected.as_object_mut().unwrap().remove("ownerRecordName");
+                "expected_unavailable"
+            }
+            "child" => {
+                record["zoneID"]["ownerRecordName"] = json!("foreign");
+                "child_foreign"
+            }
+            _ => {
+                record["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+                    json!("foreign");
+                "reference_foreign"
+            }
+        };
+        let observation = lookup_observation(
+            &json!({"records":[record]}),
+            "private-child",
+            &expected,
+            &masters(),
+        );
+        assert_eq!(observation.scope, scope);
+        assert_eq!(observation.shape, "live_reference");
+        assert_eq!(observation.family, "not_established");
+    }
 }
