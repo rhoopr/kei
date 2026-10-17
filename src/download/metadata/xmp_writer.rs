@@ -1,6 +1,8 @@
 //! XMP Toolkit preparation for native format handlers.
 
-use super::prepared::{PreparedMetadataFile, TmpGuard, create_unique_embed_temp};
+use super::prepared::{
+    PreparedMetadataFile, TmpGuard, create_unique_embed_temp, keep_source_mtime,
+};
 use super::values::MetadataWrite;
 use super::xmp_fields::{apply_to_xmp, ensure_initialized};
 use anyhow::{Context, Result};
@@ -96,6 +98,7 @@ pub(super) fn prepare_metadata_xmp_toolkit(
                 tmp_path.display()
             )
         })?;
+    keep_source_mtime(&temp, path);
     temp.sync_all()
         .with_context(|| format!("Could not fsync {}", tmp_path.display()))?;
     drop(temp);
