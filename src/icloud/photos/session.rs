@@ -1,3 +1,4 @@
+use super::hydration_progress;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -598,11 +599,19 @@ pub async fn retry_post(
     // 503 / CAS_OP_LOCK and add noise without adding signal. Calling the
     // no-mode variant pins to Off; download retries (where the user is actively
     // watching) get the friendly framing via `retry_with_backoff_with_mode`.
-    retry::retry_with_backoff(retry_config, classify_api_error, || async {
-        let response = session.post(url, body.to_owned(), headers).await?;
-        check_cloudkit_errors(response)
+    hydration_progress::request_started();
+    let result = retry::retry_with_backoff(retry_config, classify_api_error, || async {
+        hydration_progress::attempt_started();
+        let result = session
+            .post(url, body.to_owned(), headers)
+            .await
+            .and_then(check_cloudkit_errors);
+        hydration_progress::attempt_finished();
+        result
     })
-    .await
+    .await;
+    hydration_progress::request_finished();
+    result
 }
 
 pub(crate) async fn retry_post_changes_body(
@@ -642,6 +651,7 @@ pub(crate) async fn retry_post_allowing_record_errors(
     retry_config: &RetryConfig,
 ) -> RetriedPostResponse {
     let rate_limit_observations = AtomicUsize::new(0);
+    hydration_progress::request_started();
     let response = retry::retry_with_backoff(
         retry_config,
         |error| {
@@ -650,9 +660,15 @@ pub(crate) async fn retry_post_allowing_record_errors(
             }
             classify_api_error(error)
         },
-        || async { session.post(url, body.to_owned(), headers).await },
+        || async {
+            hydration_progress::attempt_started();
+            let result = session.post(url, body.to_owned(), headers).await;
+            hydration_progress::attempt_finished();
+            result
+        },
     )
     .await;
+    hydration_progress::request_finished();
     RetriedPostResponse {
         response,
         rate_limit_observations: rate_limit_observations.load(Ordering::Relaxed),

@@ -139,6 +139,16 @@ planning types and completion evidence. Lookup, counts, planning, completion,
 and changes do not call sibling owners. The facade retains stream routing and
 public entry points. No album child owns durable checkpoint policy.
 
+Best-effort album identity hydration has task-scoped anonymous progress in
+`icloud/photos/hydration_progress.rs`. Every 30 seconds and on return or drop,
+it reports fixed phase labels, source ordinal/role (`owner` then `fallback`),
+aggregate received-page and
+record counts, request attempts/retries, and current-wait elapsed time. Counts
+are observations, not completeness or checkpoint evidence. The scope does not
+change request timeouts, retry policy, source priority, or identity acceptance;
+provider identifiers, cursors, request bodies and raw errors never enter its
+state. Other provider operations have no active diagnostic scope.
+
 File tests use `download::file::<owner>::tests::<test_name>` instead of
 `download::file::tests::<test_name>`. The owners are `transfer`, `validation`,
 `fingerprint`, `publication`, `replacement`, and `reconciliation`. HTTP tests
