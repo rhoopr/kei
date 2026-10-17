@@ -254,7 +254,13 @@ the existing lock file. A watch process that released its lock for idle sleep
 detects a changed generation when it wakes and stops before its old in-memory
 session can recreate reset credentials. Reauthentication handoffs carry their
 pre-release generation into replacement-session creation, so a reset in that
-gap also wins.
+gap also wins. The session guard explicitly unlocks on drop, including failed
+generation validation and rejected principal replacements. Closing only its own
+descriptor would leave a forked child's copy holding the shared lock until
+exec or exit. An explicitly released guard does not unlock again on drop;
+generation checks and independent-process exclusion remain in force. Blocking
+generation writes retain the shared guard until completion even if their caller
+is canceled, so cleanup cannot unlock while a generation write is pending.
 
 ### Account ownership and legacy adoption
 

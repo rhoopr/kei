@@ -1652,3 +1652,20 @@ real local HTTP error bodies and both declared and chunked response-size bounds.
 Support contract and history tests reject arbitrary category values and retain
 safe fields across restart and export revalidation. These tests use synthetic
 records and localhost only; no account or media operations are required.
+
+### Session-lock inheritance (#968)
+
+Linux `inherited_session_lock_` tests retain a production session descriptor
+in a synchronized forked child. Independent child opens prove exclusion while
+the owner lives, availability after drop, explicit release/reacquire, released
+guard drop and reset-generation rejection. The service principal-replacement
+test holds the same fixture across changed/missing principal and wrong-realm
+rejections and still asserts the original principal and session marker.
+The canceled-generation-write test queues the production writer behind a
+synchronized blocking task, cancels its caller and drops the foreground owner.
+Exclusion must persist until the writer completes; runtime shutdown then proves
+the new durable generation and lock availability. No SQLite, media or provider
+state changes are involved.
+The fixtures use no sleeps, retries, live credentials or provider requests.
+They demonstrate fork inheritance; they do not attribute the original parallel
+gate failure, whose conflicting descriptor was not captured.
