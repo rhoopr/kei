@@ -13,12 +13,22 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.client import HTTPException
 from pathlib import Path
 
 FREE_URL = "https://opencode.ai/inference/openai/v1/chat/completions"
 FREE_MODEL = "glm-5.3-flash-free"
 GO_URL = "https://opencode.ai/inference/go/openai/v1/chat/completions"
 DEFAULT_MODEL = "glm-5.3-flash"
+REVIEW_MODELS = (("free", FREE_URL, FREE_MODEL),
+                 ("free", FREE_URL, "deepseek-v4.1-flash-free"),
+                 ("go", GO_URL, DEFAULT_MODEL),
+                 ("go", GO_URL, "deepseek-v4.1-flash"))
+ALLOWED_MODELS = frozenset(model for _, _, model in REVIEW_MODELS)
+REVIEW_TOKENS = 16384
+SMOKE_TOKENS = 2048
+REVIEW_RESPONSE = 512 * 1024
+SMOKE_RESPONSE = 128 * 1024
 MAX_FILES = 40
 MAX_CHANGES = 2000
 MAX_DIFF = 128 * 1024
@@ -59,9 +69,19 @@ class ReviewError(Exception):
     """A fixed, safe diagnostic; never include remote content or credentials."""
 
 
-class ProviderHTTPError(ReviewError):
-    def __init__(self, status):
-        super().__init__("Provider rate limit or HTTP failure; no automatic POST retry.")
+class SecurityError(ReviewError):
+    """Trust or credential failure: never advance to another provider."""
+
+
+class ProviderError(ReviewError):
+    """One provider attempt failed; another allowlisted model may be attempted."""
+
+
+class ProviderHTTPError(ProviderError):
+    def __init__(self, status, route="free"):
+        require(type(status) is int and 100 <= status <= 599, "Invalid provider HTTP status.")
+        require(route in {"free", "go"}, "Invalid provider route label.")
+        super().__init__(f"OpenCode {route} HTTP {status}; no automatic POST retry.")
         self.status = status
 
 
@@ -89,8 +109,8 @@ def no_secrets(value: object, credentials: tuple[str, ...] = ()) -> None:
             no_secrets(item, credentials)
         return
     text = value if isinstance(value, str) else str(value)
-    require(not SECRET.search(text), "Potential credential material rejected; no review published.")
-    require(not any(key and key in text for key in credentials), "Credential material rejected.")
+    if SECRET.search(text) or any(key and key in text for key in credentials):
+        raise SecurityError("Potential credential material rejected; no review published.")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -103,12 +123,14 @@ class HTTP:
         # Do not inherit proxy credentials or redirect Authorization to another host.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         self.calls = 0
+        self.last_status = None
 
     def request(self, method, url, token, *, payload=None, limit=1024 * 1024,
                 provider=False, session=None):
         require(urllib.parse.urlsplit(url).netloc in {"api.github.com", "opencode.ai"}
                 and url.startswith("https://"), "Unapproved API destination.")
         self.calls += 1
+        self.last_status = None
         require(self.calls <= 150, "HTTP request budget exhausted.")
         headers = {"Authorization": f"Bearer {token}", "User-Agent": "kei-advisory-review/1.0",
                    "Accept": "application/json", "Content-Type": "application/json"}
@@ -124,25 +146,29 @@ class HTTP:
                                              headers=headers, method=method)
             try:
                 with self.opener.open(request, timeout=90 if provider else 20) as response:
+                    self.last_status = response.status
                     data = response.read(limit + 1)
-                require(len(data) <= limit, "API response exceeded its size limit.")
+                if len(data) > limit:
+                    raise (ProviderError if provider else ReviewError)("API response exceeded its size limit.")
                 return json.loads(data)
             except urllib.error.HTTPError as error:
                 status = error.code
+                self.last_status = status
                 error.close()
                 if method == "GET" and status in {429, 500, 502, 503, 504} and attempt < attempts - 1:
                     time.sleep(2 ** attempt)
                     continue
                 if provider:
-                    raise ProviderHTTPError(status) from None
+                    raise ProviderHTTPError(status, "free" if url == FREE_URL else "go") from None
                 raise ReviewError("API rate limit or HTTP failure; no automatic POST retry.") from None
-            except (urllib.error.URLError, TimeoutError, OSError):
+            except (urllib.error.URLError, TimeoutError, OSError, HTTPException):
                 if attempt < attempts - 1:
                     time.sleep(2 ** attempt)
                     continue
-                raise ReviewError("API transport failed; POST outcome may be uncertain.") from None
+                raise (ProviderError if provider else ReviewError)(
+                    "API transport failed; POST outcome may be uncertain.") from None
             except (ValueError, UnicodeError):
-                raise ReviewError("API returned malformed JSON.") from None
+                raise (ProviderError if provider else ReviewError)("API returned malformed JSON.") from None
         raise ReviewError("HTTP retry budget exhausted.")
 
 
@@ -281,8 +307,8 @@ def validate_findings(value, locations):
         require(isinstance(finding, dict) and set(finding) == {"path", "line", "title", "body"},
                 "Invalid finding fields.")
         path, line = finding["path"], finding["line"]
-        require(isinstance(path, str) and path in locations and type(line) is int
-                and line in locations[path], "Finding location is outside validated right-side diff.")
+        if not (isinstance(path, str) and path in locations and type(line) is int and line in locations[path]):
+            raise SecurityError("Finding location is outside validated right-side diff.")
         for key, bound in (("title", 160), ("body", 1200)):
             text = finding[key]
             require(isinstance(text, str) and 0 < len(text.strip()) <= bound
@@ -294,45 +320,100 @@ def validate_findings(value, locations):
     return findings
 
 
+def completion_text(response, limit):
+    require(isinstance(response, dict), "Invalid completion object.")
+    choices = response.get("choices")
+    require(isinstance(choices, list) and len(choices) == 1 and isinstance(choices[0], dict),
+            "Invalid completion choices.")
+    choice = choices[0]
+    require(choice.get("finish_reason") == "stop", "Incomplete completion rejected.")
+    message = choice.get("message")
+    require(isinstance(message, dict) and message.get("role") == "assistant"
+            and not message.get("tool_calls") and not message.get("function_call")
+            and not message.get("refusal"), "Non-text completion rejected.")
+    content = message.get("content")
+    require(isinstance(content, str) and bool(content.strip()) and len(content.encode()) <= limit,
+            "Invalid completion content.")
+    return content
+
+
+def attempt_metadata(http, route, model, outcome, response=None):
+    """Only fixed enums, booleans, and bounded integer counts may reach logs."""
+    require((route, model) in {(r, m) for r, _, m in REVIEW_MODELS}, "Invalid diagnostic model.")
+    require(outcome in {"http_error", "request_failed", "invalid_completion", "accepted", "security_rejected"},
+            "Invalid diagnostic outcome.")
+    data = {"route": route, "model": model, "outcome": outcome,
+            "http_status": http.last_status if type(http.last_status) is int
+            and 100 <= http.last_status <= 599 else None}
+    response = response if isinstance(response, dict) else {}
+    choices = response.get("choices")
+    choice = choices[0] if isinstance(choices, list) and len(choices) == 1 else None
+    choice = choice if isinstance(choice, dict) else {}
+    reason = choice.get("finish_reason")
+    reasons = {"stop", "length", "tool_calls", "function_call", "content_filter", "sensitive",
+               "model_context_window_exceeded", "network_error"}
+    data["finish_reason"] = reason if isinstance(reason, str) and reason in reasons else "unknown"
+    message = choice.get("message")
+    message = message if isinstance(message, dict) else {}
+    content = message.get("content")
+    data["assistant_role"] = message.get("role") == "assistant"
+    data["text_nonempty"] = isinstance(content, str) and bool(content.strip())
+    data["tool_or_refusal"] = bool(message.get("tool_calls") or message.get("function_call")
+                                   or message.get("refusal"))
+    usage = response.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    details = usage.get("completion_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    for name, value in (("prompt_tokens", usage.get("prompt_tokens")),
+                        ("completion_tokens", usage.get("completion_tokens")),
+                        ("total_tokens", usage.get("total_tokens")),
+                        ("reasoning_tokens", details.get("reasoning_tokens"))):
+        data[name] = value if type(value) is int and 0 <= value <= 10_000_000 else None
+    print("OpenCode attempt " + json_bytes(data).decode())
+
+
 def infer(http, prepared, key, model, *, go_no_overage_confirmed=False):
     require(bool(key), "OPENCODE_API_KEY is missing; no review completed.")
-    require(model == DEFAULT_MODEL, "Only glm-5.3-flash is allowed as the Go fallback model.")
+    # Keep the existing variable compatible, but it cannot reorder the fixed policy.
+    require(model == DEFAULT_MODEL, "OPENCODE_GO_MODEL must remain glm-5.3-flash; review order is fixed.")
     require(type(go_no_overage_confirmed) is bool, "Invalid no-overage confirmation.")
     no_secrets(prepared, (key,))
     prompt = json_bytes({"head_sha": prepared["head"], "files": prepared["files"]}).decode()
     require(len(prompt.encode()) <= MAX_PROMPT, "Prompt byte budget exceeded.")
     session = hashlib.sha256(f'{prepared["repo"]}:{prepared["number"]}:{prepared["head"]}'.encode()).hexdigest()
-    payload = {"model": FREE_MODEL, "messages": [
-        {"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
-        "stream": False, "max_tokens": 4096}
-    model_used = FREE_MODEL
-    try:
-        response = http.request("POST", FREE_URL, key, provider=True, session=session,
-                                limit=128 * 1024, payload=payload)
-    except ProviderHTTPError as error:
-        # Only explicit availability/quota status codes permit another request.
-        # Authentication, malformed input/output, and uncertain transport do not.
-        if error.status not in {404, 429, 500, 502, 503, 504}:
+    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}]
+    for route, url, model_used in REVIEW_MODELS:
+        require(route != "go" or go_no_overage_confirmed,
+                "Go fallback blocked until Use balance is confirmed disabled; no review completed.")
+        payload = {"model": model_used, "messages": messages, "stream": False, "max_tokens": REVIEW_TOKENS}
+        if model_used.startswith("glm-"):
+            payload["reasoning_effort"] = "low"
+        try:
+            response = http.request("POST", url, key, provider=True, session=session,
+                                    limit=REVIEW_RESPONSE, payload=payload)
+        except ProviderHTTPError as error:
+            http.last_status = error.status
+            attempt_metadata(http, route, model_used, "http_error")
+            continue
+        except ProviderError:
+            attempt_metadata(http, route, model_used, "request_failed")
+            continue
+        try:
+            # Check the whole response, including reasoning, before any diagnostics.
+            no_secrets(response, (key,))
+            content = completion_text(response, MAX_RESULT)
+            findings = validate_findings(json.loads(content), prepared["locations"])
+            no_secrets(findings, (key,))
+        except SecurityError:
+            attempt_metadata(http, route, model_used, "security_rejected")
             raise
-        require(go_no_overage_confirmed,
-                "Free model unavailable; Go fallback blocked until Use balance is confirmed disabled.")
-        model_used = model
-        response = http.request("POST", GO_URL, key, provider=True, session=session,
-                                limit=128 * 1024, payload={**payload, "model": model})
-    choices = response.get("choices")
-    require(isinstance(choices, list) and len(choices) == 1, "Invalid completion choices.")
-    choice = choices[0]
-    require(choice.get("finish_reason") == "stop", "Incomplete or tool-based completion rejected.")
-    message = choice.get("message", {})
-    require(message.get("role") == "assistant" and not message.get("tool_calls")
-            and not message.get("function_call") and not message.get("refusal"), "Non-text completion rejected.")
-    content = message.get("content")
-    require(isinstance(content, str) and len(content.encode()) <= MAX_RESULT, "Invalid completion content.")
-    no_secrets(content, (key,))
-    findings = validate_findings(json.loads(content), prepared["locations"])
-    no_secrets(findings, (key,))
-    return {"repo": prepared["repo"], "number": prepared["number"], "head": prepared["head"],
-            "model": model_used, "findings": findings}
+        except (ReviewError, ValueError, TypeError, RecursionError):
+            attempt_metadata(http, route, model_used, "invalid_completion", response)
+            continue
+        attempt_metadata(http, route, model_used, "accepted", response)
+        return {"repo": prepared["repo"], "number": prepared["number"], "head": prepared["head"],
+                "model": model_used, "findings": findings}
+    raise ReviewError("All four OpenCode models failed; no review completed or published.")
 
 
 def plain(text):
@@ -364,7 +445,7 @@ def publish(gh, result, head):
             "Invalid review artifact.")
     require(result["repo"] == gh.repo and result["number"] == gh.number and result["head"] == head,
             "Review artifact identity mismatch.")
-    require(result["model"] in {FREE_MODEL, DEFAULT_MODEL}, "Invalid artifact model.")
+    require(result["model"] in ALLOWED_MODELS, "Invalid artifact model.")
     gh.current(head)
     if gh.duplicate(head):
         raise Skip("Head already reviewed; duplicate discarded.")
@@ -385,10 +466,84 @@ def load_json(path, limit):
     return json.loads(raw)
 
 
+def require_default_dispatch(event):
+    require(os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch", "Manual dispatch required.")
+    repository = event["repository"]
+    require(repository["full_name"] == os.environ["GITHUB_REPOSITORY"], "Dispatch repository mismatch.")
+    require(os.environ["GITHUB_REF"] == f"refs/heads/{repository['default_branch']}",
+            "Manual review must run from the default branch.")
+
+
+def api_smoke(http, key, session, *, route="free", go_no_overage_confirmed=False):
+    """One allowlisted, fixed-prompt request; no PR data, fallback, artifact, or body logs."""
+    require(bool(key), "OPENCODE_API_KEY is missing; no API test completed.")
+    require(isinstance(route, str) and route in {"free", "go"}, "Invalid API test route.")
+    require(type(go_no_overage_confirmed) is bool, "Invalid no-overage confirmation.")
+    require(route != "go" or go_no_overage_confirmed,
+            "Go API test blocked until Use balance is confirmed disabled.")
+    url, model = (FREE_URL, FREE_MODEL) if route == "free" else (GO_URL, DEFAULT_MODEL)
+    payload = {"model": model, "messages": [{"role": "user", "content": "test"}],
+               "stream": False, "max_tokens": SMOKE_TOKENS, "reasoning_effort": "low"}
+    try:
+        response = http.request("POST", url, key, provider=True, session=session,
+                                limit=SMOKE_RESPONSE, payload=payload)
+    except ProviderHTTPError as error:
+        http.last_status = error.status
+        attempt_metadata(http, route, model, "http_error")
+        raise
+    except ProviderError:
+        attempt_metadata(http, route, model, "request_failed")
+        raise ReviewError("API test request failed; no automatic POST retry.") from None
+    try:
+        no_secrets(response, (key,))
+        completion_text(response, SMOKE_RESPONSE)
+    except SecurityError:
+        attempt_metadata(http, route, model, "security_rejected")
+        raise
+    except ReviewError:
+        attempt_metadata(http, route, model, "invalid_completion", response)
+        raise ReviewError("API test did not produce a completed text response.") from None
+    attempt_metadata(http, route, model, "accepted", response)
+
+
+def review_target(http, event, mode):
+    """Resolve one PR from trusted event metadata; freeze manual head at prepare."""
+    repo = os.environ["GITHUB_REPOSITORY"]
+    event_name = os.environ["GITHUB_EVENT_NAME"]
+    if event_name == "workflow_dispatch":
+        require_default_dispatch(event)
+        require(event.get("inputs", {}).get("mode", "review") == "review", "PR review mode required.")
+        number_text = event.get("inputs", {}).get("pr_number")
+        require(isinstance(number_text, str) and re.fullmatch(r"[1-9][0-9]{0,8}", number_text),
+                "Manual PR number must be a positive canonical integer.")
+        gh = GitHub(http, repo, int(number_text), os.environ["GH_TOKEN"])
+        head = (gh.api(gh.pull)["head"]["sha"] if mode == "prepare"
+                else os.environ.get("EXPECTED_HEAD_SHA", ""))
+    else:
+        require(event_name == "pull_request_target", "Unsupported review event.")
+        pr = event["pull_request"]
+        require(pr["base"]["repo"]["full_name"] == repo, "Event repository mismatch.")
+        if pr["draft"]:
+            raise Skip("Draft PR; no review completed.")
+        gh = GitHub(http, repo, event["number"], os.environ["GH_TOKEN"])
+        head = pr["head"]["sha"]
+    require(isinstance(head, str) and SHA.fullmatch(head), "Invalid head SHA.")
+    return gh, head
+
+
 def main():
     # Paths/commands come only from literal base workflow steps, never PR data.
     mode = sys.argv[1]
     http = HTTP()
+    if mode == "smoke":
+        event = load_json(os.environ["GITHUB_EVENT_PATH"], 2 * 1024 * 1024)
+        require_default_dispatch(event)
+        require(event.get("inputs", {}).get("mode") == "api_smoke", "API test mode required.")
+        session = hashlib.sha256(f"api-smoke:{os.environ['GITHUB_REPOSITORY']}:{os.environ['GITHUB_RUN_ID']}".encode()).hexdigest()
+        api_smoke(http, os.environ.get("OPENCODE_API_KEY", ""), session,
+                  route=event.get("inputs", {}).get("smoke_route", "free"),
+                  go_no_overage_confirmed=os.environ.get("OPENCODE_GO_NO_OVERAGE_CONFIRMED") == "true")
+        return
     if mode == "infer":
         prepared = load_json("review-input.json", MAX_PROMPT + MAX_CONTEXT)
         # JSON object keys are strings. Restore validated integer line locations.
@@ -400,16 +555,12 @@ def main():
                        os.environ.get("OPENCODE_GO_MODEL") or DEFAULT_MODEL,
                        go_no_overage_confirmed=confirmed == "true")
         Path("review-result.json").write_bytes(json_bytes(result))
-        print("Model output validated; publication remains pending.")
+        print(f"Model output validated for {result['model']}; publication remains pending.")
         return
     event = load_json(os.environ["GITHUB_EVENT_PATH"], 2 * 1024 * 1024)
-    pr = event["pull_request"]
-    repo, head, number = os.environ["GITHUB_REPOSITORY"], pr["head"]["sha"], event["number"]
-    require(isinstance(head, str) and SHA.fullmatch(head), "Invalid head SHA.")
-    require(pr["base"]["repo"]["full_name"] == repo, "Event repository mismatch.")
-    if pr["draft"]:
-        raise Skip("Draft PR; no review completed.")
-    gh = GitHub(http, repo, number, os.environ["GH_TOKEN"])
+    require(mode in {"prepare", "publish"}, "Unknown review mode.")
+    gh, head = review_target(http, event, mode)
+    repo, number = gh.repo, gh.number
     if mode == "prepare":
         gh.current(head)
         if gh.duplicate(head):
@@ -418,7 +569,7 @@ def main():
         prepared = {"repo": repo, "number": number, "head": head, "files": files, "locations": locations}
         Path("review-input.json").write_bytes(json_bytes(prepared))
         with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
-            output.write("prepared=true\n")
+            output.write(f"prepared=true\nhead={head}\n")
         print("Complete bounded diff prepared from exact head; no PR code executed.")
     elif mode == "publish":
         publish(gh, load_json("result/review-result.json", MAX_RESULT + 1024), head)
