@@ -7,6 +7,7 @@ mod changes_json;
 pub mod cloudkit;
 pub(crate) mod enc;
 pub mod error;
+mod hydration_progress;
 pub(crate) mod inbox;
 mod library;
 pub(crate) mod metadata;

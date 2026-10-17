@@ -2487,3 +2487,6 @@ async fn issue958_cancel_paged_scan_explains_orphan_buffer_warning() {
             && e.field("orphaned_assets") == Some("0"))
     );
 }
+
+#[path = "album_progress_tests.rs"]
+mod album_progress_tests;

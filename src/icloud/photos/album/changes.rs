@@ -15,6 +15,7 @@ use super::{ChangeStream, PhotoAlbum};
 use crate::icloud::photos::asset::{ChangeEvent, DeltaRecordBuffer};
 use crate::icloud::photos::cloudkit;
 use crate::icloud::photos::cloudkit::ChangesZoneResponse;
+use crate::icloud::photos::hydration_progress;
 use crate::icloud::photos::queries::{build_changes_zone_request, encode_params};
 use crate::icloud::photos::session;
 use crate::icloud::photos::session::check_changes_zone_error;
@@ -205,6 +206,7 @@ impl PhotoAlbum {
         let mut visited = FxHashSet::default();
 
         loop {
+            hydration_progress::page_started();
             let body = build_changes_zone_request(&self.zone_id, current_token.as_deref(), 200);
             let response = session::retry_post(
                 self.session.as_ref(),
@@ -218,6 +220,7 @@ impl PhotoAlbum {
             let zone_result = ValidatedChangesPage::parse(response, &self.zone_id)?;
             zone_result.check_continuation(&mut visited)?;
 
+            hydration_progress::page_received(zone_result.records.len());
             current_token = Some(zone_result.sync_token);
             let more_coming = zone_result.more_coming;
             for record in zone_result.records {

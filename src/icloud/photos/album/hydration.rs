@@ -3,6 +3,7 @@
 use super::planning::PhotoStreamProfile;
 use super::{PhotoAlbum, PhotoStream, ProviderRecordId, RecordLookupRequest, RecordResolution};
 use crate::icloud::photos::asset::{ChangeEvent, DeltaRecordBuffer, PhotoAsset};
+use crate::icloud::photos::hydration_progress::{self, Phase};
 use rustc_hash::FxHashSet;
 use serde_json::Value;
 use std::sync::Arc;
@@ -199,30 +200,34 @@ impl PhotoAlbum {
         &self,
         missing_asset_record_names: &mut FxHashSet<String>,
     ) -> anyhow::Result<Vec<PhotoAsset>> {
-        let sources: Vec<_> = std::iter::once(self.clone_for_task_without_sources())
-            .chain(self.cross_zone_sources_for_task())
-            .collect();
-        let mut matched = Vec::new();
-        // Preserve source priority: an inconclusive owner lookup still needs its
-        // fallback before an equal record name in another source can match.
-        for source in &sources {
-            if missing_asset_record_names.is_empty() {
-                break;
-            }
-            matched.extend(
-                source
-                    .matching_assets_from_lookup(missing_asset_record_names)
-                    .await?,
-            );
-            if !missing_asset_record_names.is_empty() {
+        hydration_progress::observe(async {
+            let sources: Vec<_> = std::iter::once(self.clone_for_task_without_sources())
+                .chain(self.cross_zone_sources_for_task())
+                .collect();
+            let mut matched = Vec::new();
+            // Preserve source priority: an inconclusive owner lookup still needs its
+            // fallback before an equal record name in another source can match.
+            for (index, source) in sources.iter().enumerate() {
+                if missing_asset_record_names.is_empty() {
+                    break;
+                }
+                hydration_progress::source(index + 1);
                 matched.extend(
                     source
-                        .matching_assets_from_changes(missing_asset_record_names)
+                        .matching_assets_from_lookup(missing_asset_record_names)
                         .await?,
                 );
+                if !missing_asset_record_names.is_empty() {
+                    matched.extend(
+                        source
+                            .matching_assets_from_changes(missing_asset_record_names)
+                            .await?,
+                    );
+                }
             }
-        }
-        Ok(matched)
+            Ok(matched)
+        })
+        .await
     }
 
     async fn matching_assets_from_lookup(
@@ -236,6 +241,7 @@ impl PhotoAlbum {
             .map(|id| RecordLookupRequest::asset_only(ProviderRecordId::new(id.as_str())))
             .collect();
         let mut pairs = Vec::new();
+        hydration_progress::phase(Phase::AssetLookup);
         for (child, resolution) in self.resolve_records(&requests).await.results {
             match resolution {
                 RecordResolution::AssetPresent { master_record_name } => {
@@ -250,6 +256,7 @@ impl PhotoAlbum {
             }
         }
         let mut matched = Vec::new();
+        hydration_progress::phase(Phase::PairedLookup);
         for (child, resolution) in self.resolve_records(&pairs).await.results {
             match resolution {
                 RecordResolution::Present(asset)
@@ -335,6 +342,7 @@ impl PhotoAlbum {
         &self,
         missing_asset_record_names: &mut FxHashSet<String>,
     ) -> anyhow::Result<Vec<PhotoAsset>> {
+        hydration_progress::phase(Phase::Changes);
         let source_zone: Arc<str> = Arc::from(self.zone_name());
         let mut buffer = DeltaRecordBuffer::new();
         let mut matched = Vec::new();
