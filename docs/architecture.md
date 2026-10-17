@@ -253,7 +253,9 @@ auth artifacts and encrypted credentials. Account-owner format version 1 is
 independent of the application schema version and must be checked before its
 migrations. Production connections require an owner expectation; unbound
 connection helpers are restricted to tests. All state commands, including
-read-only export and reset, enforce this boundary. Sync and import require a
+read-only export and reset, enforce this boundary. State reset checks ownership
+before confirmation and requires `--yes` when the process input mode cannot
+prompt. An absent database remains a successful no-op. Sync and import require a
 usable authenticated provider identity and pin it independently of filenames.
 Watch validation, replacement sessions and initialization retries retain that
 principal pin. Changed or missing authenticated identity stops before further

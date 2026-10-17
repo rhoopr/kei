@@ -252,13 +252,13 @@ fn reset_state_without_yes_does_not_delete() {
         let count_before = db_file_count(cookie_dir.as_path());
         assert!(count_before > 0, "expected .db file after sync");
 
-        // No --yes and no stdin — should not delete
-        // (stdin is /dev/null in subprocess, so read_line returns empty → "N")
+        // Non-terminal stdin requires explicit --yes and must preserve state.
         reset_state_cmd(&username, &cookie_dir)
             .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
             .assert()
-            .success()
-            .stdout(predicate::str::contains("Cancelled"));
+            .failure()
+            .stderr(predicate::str::contains("--yes"))
+            .stderr(predicate::str::contains("database was not deleted"));
 
         assert_eq!(
             db_file_count(cookie_dir.as_path()),

@@ -4,7 +4,7 @@ use super::{
     HELPER_SCHEMA_VERSION, clean_cmd, create_state_db, insert_asset, sanitize_username,
     write_sync_config,
 };
-use predicates::prelude::predicate;
+use predicates::prelude::{PredicateBooleanExt, predicate};
 use rusqlite::OptionalExtension;
 
 /// Pin the helper schema version against the binary's
@@ -59,13 +59,16 @@ fn verify_no_db() {
 #[test]
 fn reset_state_no_db() {
     let dir = tempfile::tempdir().unwrap();
-    clean_cmd()
-        .env("ICLOUD_USERNAME", "test@example.com")
-        .env("KEI_DATA_DIR", dir.path())
-        .args(["reset", "state", "--yes"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("No state database found"));
+    for args in [vec!["reset", "state"], vec!["reset", "state", "--yes"]] {
+        clean_cmd()
+            .env("ICLOUD_USERNAME", "test@example.com")
+            .env("KEI_DATA_DIR", dir.path())
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No state database found"));
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -277,12 +280,14 @@ fn reset_state_deletes_db() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
     let conn = create_state_db(dir.path(), username);
+    let media = dir.path().join("photo.jpg");
+    std::fs::write(&media, b"synthetic media").unwrap();
     insert_asset(
         &conn,
         "a1",
         "downloaded",
         "photo.jpg",
-        Some("/p/photo.jpg"),
+        Some(media.to_str().unwrap()),
         None,
         None,
     );
@@ -304,10 +309,19 @@ fn reset_state_deletes_db() {
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     assert!(!db_path.exists(), "DB file should be deleted after reset");
+    assert_eq!(std::fs::read(&media).unwrap(), b"synthetic media");
     assert!(
         stdout.contains("deleted"),
         "should print 'deleted', stdout: {stdout}"
     );
+    clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["reset", "state", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No state database found"));
+    assert_eq!(std::fs::read(&media).unwrap(), b"synthetic media");
 }
 
 #[test]
@@ -380,6 +394,15 @@ fn reset_sync_token_clears_tokens() {
 
 #[test]
 fn reset_state_without_yes_on_non_tty() {
+    assert_reset_state_requires_yes("");
+}
+
+#[test]
+fn reset_state_piped_confirmation_requires_yes() {
+    assert_reset_state_requires_yes("y\n");
+}
+
+fn assert_reset_state_requires_yes(input: &str) {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
     let conn = create_state_db(dir.path(), username);
@@ -397,22 +420,34 @@ fn reset_state_without_yes_on_non_tty() {
     let db_path = dir
         .path()
         .join(format!("{}.db", sanitize_username(username)));
+    let before = std::fs::read(&db_path).unwrap();
 
-    // Without --yes on a non-TTY, stdin.read_line returns empty/EOF -> "Cancelled"
-    let out = clean_cmd()
-        .env("ICLOUD_USERNAME", username)
-        .env("KEI_DATA_DIR", dir.path())
-        .args(["reset", "state"])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("Cancelled"),
-        "non-interactive should print 'Cancelled', stdout: {stdout}"
-    );
-    assert!(db_path.exists(), "DB should NOT be deleted without --yes");
+    // Both EOF and a piped confirmation must refuse, including on retry.
+    for _ in 0..2 {
+        clean_cmd()
+            .env("ICLOUD_USERNAME", username)
+            .env("KEI_DATA_DIR", dir.path())
+            .args(["reset", "state"])
+            .write_stdin(input)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--yes"))
+            .stderr(predicate::str::contains("database was not deleted"))
+            .stdout(predicate::str::contains("Are you sure?").not())
+            .stdout(predicate::str::contains("Cancelled").not());
+        assert_eq!(std::fs::read(&db_path).unwrap(), before);
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let status: String = conn
+            .query_row("SELECT status FROM assets WHERE id = 'a1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "downloaded");
+    }
 }
 
 #[test]

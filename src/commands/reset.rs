@@ -13,6 +13,7 @@ pub(crate) async fn run_reset_state(
     yes: bool,
     globals: &config::GlobalArgs,
     toml: Option<&config::TomlConfig>,
+    input_mode: crate::InputMode,
 ) -> anyhow::Result<()> {
     let db_path = super::super::get_db_path(globals, toml).await?;
 
@@ -30,6 +31,11 @@ pub(crate) async fn run_reset_state(
 
     if !yes {
         use std::io::Write;
+        if !input_mode.can_prompt() {
+            anyhow::bail!(
+                "`kei reset state` needs `--yes` when stdin is not a terminal. The state database was not deleted."
+            );
+        }
         println!("This will delete the state database at:");
         println!("  {}", db_path.display());
         println!();

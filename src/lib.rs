@@ -1022,7 +1022,7 @@ async fn dispatch_command(
         }
         Command::Reset { what } => match what {
             cli::ResetCommand::State { yes } => {
-                return run_reset_state(yes, globals, toml_config.as_ref()).await;
+                return run_reset_state(yes, globals, toml_config.as_ref(), input_mode).await;
             }
             cli::ResetCommand::SyncToken { yes } => {
                 return run_reset_sync_token(yes, globals, toml_config.as_ref(), input_mode).await;

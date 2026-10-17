@@ -502,7 +502,7 @@ pub enum PasswordAction {
 pub enum ResetCommand {
     /// Delete the state database and start fresh
     State {
-        /// Skip confirmation prompt
+        /// Skip confirmation prompt (required when stdin is not a terminal)
         #[arg(long, short = 'y')]
         yes: bool,
     },

@@ -371,11 +371,18 @@ async fn state_commands_refuse_misplaced_owned_database_before_reset_or_export()
         .await
         .is_err()
     );
-    assert!(
-        crate::commands::run_reset_state(true, &globals, None)
-            .await
-            .is_err()
-    );
+    for yes in [false, true] {
+        let error =
+            crate::commands::run_reset_state(yes, &globals, None, crate::InputMode::NoInput)
+                .await
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("account ownership does not match")
+        );
+        assert_eq!(before, std::fs::read(&path_b).unwrap());
+    }
     assert!(
         crate::commands::run_reset_sync_token(true, &globals, None, crate::InputMode::NoInput)
             .await
