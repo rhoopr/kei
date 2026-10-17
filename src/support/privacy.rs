@@ -252,6 +252,8 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "linkage",
             "lookup_outcome",
             "lookup_family",
+            "lookup_scope",
+            "lookup_shape",
         ]),
         "legacy_inventory_failure_v2" => Some(&[
             "stage",
@@ -526,6 +528,30 @@ fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
             "linkage" => matches!(
                 label,
                 Some("none" | "partial_fields" | "all_fields" | "not_recorded")
+            ),
+            "lookup_scope" => matches!(
+                label,
+                Some(
+                    "not_observed"
+                        | "matched"
+                        | "expected_unavailable"
+                        | "child_unavailable"
+                        | "child_foreign"
+                        | "reference_unavailable"
+                        | "reference_foreign"
+                )
+            ),
+            "lookup_shape" => matches!(
+                label,
+                Some(
+                    "not_observed"
+                        | "provider_error"
+                        | "deleted"
+                        | "malformed_response"
+                        | "missing_reference"
+                        | "malformed_reference"
+                        | "live_reference"
+                )
             ),
             "lookup_family" => matches!(
                 label,

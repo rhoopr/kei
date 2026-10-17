@@ -2,6 +2,7 @@
 use std::time::Duration;
 
 use rustc_hash::FxHashSet;
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -11,21 +12,62 @@ use crate::icloud::photos::session::DiagnosticLookupError;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_BYTES: usize = 64 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+enum RecordHistory {
+    NotRecorded,
+    FirstSeen,
+    Replacement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+enum ReferenceShape {
+    NotObserved,
+    Unavailable,
+    Missing,
+    Present,
+    Malformed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+enum SparseMarker {
+    NotRecorded,
+    Absent,
+    True,
+    False,
+    Malformed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+enum LinkageShape {
+    NotRecorded,
+    None,
+    PartialFields,
+    AllFields,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Observation {
-    history: &'static str,
-    prior_reference: &'static str,
-    sparse_marker: &'static str,
-    linkage: &'static str,
+    history: RecordHistory,
+    prior_reference: ReferenceShape,
+    sparse_marker: SparseMarker,
+    linkage: LinkageShape,
 }
 
 impl Observation {
     pub(super) fn unavailable() -> Self {
         Self {
-            history: "not_recorded",
-            prior_reference: "not_observed",
-            sparse_marker: "not_recorded",
-            linkage: "not_recorded",
+            history: RecordHistory::NotRecorded,
+            prior_reference: ReferenceShape::NotObserved,
+            sparse_marker: SparseMarker::NotRecorded,
+            linkage: LinkageShape::NotRecorded,
         }
     }
 
@@ -41,43 +83,45 @@ impl Observation {
         .count();
         Self {
             history: if prior.is_some() {
-                "replacement"
+                RecordHistory::Replacement
             } else {
-                "first_seen"
+                RecordHistory::FirstSeen
             },
-            prior_reference: prior.map_or("not_observed", |r| {
+            prior_reference: prior.map_or(ReferenceShape::NotObserved, |r| {
                 if r.deleted == Some(true) || r.record_type != "CPLAsset" {
-                    "unavailable"
+                    ReferenceShape::Unavailable
                 } else {
                     reference_shape(&r.fields)
                 }
             }),
             sparse_marker: match marker {
-                None => "absent",
-                Some(v) if v.as_bool() == Some(true) || v.as_i64() == Some(1) => "true",
-                Some(v) if v.as_bool() == Some(false) || v.as_i64() == Some(0) => "false",
-                Some(_) => "malformed",
+                None => SparseMarker::Absent,
+                Some(v) if v.as_bool() == Some(true) || v.as_i64() == Some(1) => SparseMarker::True,
+                Some(v) if v.as_bool() == Some(false) || v.as_i64() == Some(0) => {
+                    SparseMarker::False
+                }
+                Some(_) => SparseMarker::Malformed,
             },
             linkage: match linkage {
-                0 => "none",
-                3 => "all_fields",
-                _ => "partial_fields",
+                0 => LinkageShape::None,
+                3 => LinkageShape::AllFields,
+                _ => LinkageShape::PartialFields,
             },
         }
     }
 }
 
-fn reference_shape(fields: &Value) -> &'static str {
+fn reference_shape(fields: &Value) -> ReferenceShape {
     match fields.pointer("/masterRef/value") {
-        None => "missing",
+        None => ReferenceShape::Missing,
         Some(v)
             if v.get("recordName")
                 .and_then(Value::as_str)
                 .is_some_and(|s| !s.trim().is_empty()) =>
         {
-            "present"
+            ReferenceShape::Present
         }
-        Some(_) => "malformed",
+        Some(_) => ReferenceShape::Malformed,
     }
 }
 
@@ -105,75 +149,123 @@ fn scope(zone: Option<&Value>, expected: &Value) -> &'static str {
     "matched"
 }
 
-fn classify(
-    response: &Value,
-    child: &str,
-    expected: &Value,
-    masters: &FxHashSet<String>,
-) -> (&'static str, &'static str) {
-    let unknown = "not_established";
-    if serialized_bytes(response).map_or(true, |n| n > RESPONSE_BYTES) {
-        return ("oversized_response", unknown);
+#[derive(Debug)]
+struct LookupObservation {
+    outcome: &'static str,
+    family: &'static str,
+    scope: &'static str,
+    shape: &'static str,
+}
+
+impl LookupObservation {
+    fn unavailable(outcome: &'static str) -> Self {
+        Self {
+            outcome,
+            family: "not_established",
+            scope: "not_observed",
+            shape: "not_observed",
+        }
     }
-    let Some(records) = response.get("records").and_then(Value::as_array) else {
-        return ("malformed_response", unknown);
-    };
-    let record = match records.as_slice() {
-        [] => return ("omitted", unknown),
-        [record] => record,
-        _ => return ("multiple_records", unknown),
-    };
-    if record.get("recordName").and_then(Value::as_str) != Some(child) {
-        return ("unexpected_record", unknown);
-    }
-    let checked = scope(record.get("zoneID"), expected);
-    if checked != "matched" {
-        return (checked, unknown);
-    }
+}
+
+// Shape describes only the matching response payload. It never establishes scope
+// or family membership, even for a provider error or a deletion flag.
+fn record_shape(record: &Value) -> &'static str {
     if record.get("serverErrorCode").is_some_and(|v| !v.is_null()) {
-        return ("provider_error", unknown);
+        return "provider_error";
     }
     if record
         .get("deleted")
         .is_some_and(|value| !value.is_boolean())
     {
-        return ("malformed_response", unknown);
+        return "malformed_response";
     }
     if record.get("deleted") == Some(&Value::Bool(true)) {
-        return ("deleted", unknown);
+        return "deleted";
     }
     if record.get("recordType").and_then(Value::as_str) != Some("CPLAsset") {
-        return ("malformed_response", unknown);
+        return "malformed_response";
     }
     if let Some(deleted) = record.pointer("/fields/isDeleted") {
         match deleted.get("value").and_then(Value::as_i64) {
-            Some(1) => return ("deleted", unknown),
+            Some(1) => return "deleted",
             Some(0) => {}
-            _ => return ("malformed_response", unknown),
+            _ => return "malformed_response",
         }
     }
     let Some(reference) = record.pointer("/fields/masterRef/value") else {
-        return ("missing_reference", unknown);
+        return "missing_reference";
     };
-    let Some(master) = reference
+    if reference
         .get("recordName")
         .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-    else {
-        return ("malformed_reference", unknown);
-    };
-    let checked = scope(reference.get("zoneID"), expected);
-    if checked != "matched" {
-        return (checked, unknown);
+        .is_none_or(|s| s.trim().is_empty())
+    {
+        return "malformed_reference";
     }
-    (
-        "live_reference",
-        if masters.contains(master) {
-            "candidate"
+    "live_reference"
+}
+
+fn classify(
+    response: &Value,
+    child: &str,
+    expected: &Value,
+    masters: &FxHashSet<String>,
+) -> LookupObservation {
+    if serialized_bytes(response).map_or(true, |n| n > RESPONSE_BYTES) {
+        return LookupObservation::unavailable("oversized_response");
+    }
+    let Some(records) = response.get("records").and_then(Value::as_array) else {
+        return LookupObservation::unavailable("malformed_response");
+    };
+    let record = match records.as_slice() {
+        [] => return LookupObservation::unavailable("omitted"),
+        [record] => record,
+        _ => return LookupObservation::unavailable("multiple_records"),
+    };
+    if record.get("recordName").and_then(Value::as_str) != Some(child) {
+        return LookupObservation::unavailable("unexpected_record");
+    }
+    let shape = record_shape(record);
+    let mut observation = LookupObservation {
+        outcome: shape,
+        family: "not_established",
+        scope: "matched",
+        shape,
+    };
+    let checked = scope(record.get("zoneID"), expected);
+    if checked != "matched" {
+        observation.outcome = checked;
+        observation.scope = if scope(Some(expected), expected) != "matched" {
+            "expected_unavailable"
+        } else if checked == "foreign_scope" {
+            "child_foreign"
         } else {
-            "noncandidate"
-        },
-    )
+            "child_unavailable"
+        };
+        return observation;
+    }
+    if observation.shape != "live_reference" {
+        return observation;
+    }
+    if let Some(reference) = record.pointer("/fields/masterRef/value") {
+        let checked = scope(reference.get("zoneID"), expected);
+        if checked != "matched" {
+            observation.outcome = checked;
+            observation.scope = if checked == "foreign_scope" {
+                "reference_foreign"
+            } else {
+                "reference_unavailable"
+            };
+        } else if let Some(master) = reference.get("recordName").and_then(Value::as_str) {
+            observation.family = if masters.contains(master) {
+                "candidate"
+            } else {
+                "noncandidate"
+            };
+        }
+    }
+    observation
 }
 
 impl PhotoAlbum {
@@ -193,18 +285,18 @@ impl PhotoAlbum {
         );
         let body = json!({"zoneID":self.zone_id.as_ref(), "records":[{"recordName":record.record_name}],
             "desiredKeys":["masterRef","isDeleted","isSparsePrivateRecord","linkedShareRecordName","linkedShareZoneName","linkedShareZoneOwner"]}).to_string();
-        let (outcome, family) = tokio::select! {
+        let lookup = tokio::select! {
             biased;
-            () = cancel.cancelled() => ("cancelled", "not_established"),
+            () = cancel.cancelled() => LookupObservation::unavailable("cancelled"),
             response = tokio::time::timeout(LOOKUP_TIMEOUT, self.session.post_diagnostic(&url, body, &[("Content-type", "text/plain")])) => match response {
-                Err(_) => ("timeout", "not_established"),
-                Ok(Err(error)) => (match error {
+                Err(_) => LookupObservation::unavailable("timeout"),
+                Ok(Err(error)) => LookupObservation::unavailable(match error {
                     DiagnosticLookupError::Unavailable => "transport_unavailable",
                     DiagnosticLookupError::Request => "request_failed",
                     DiagnosticLookupError::HttpStatus => "http_error",
                     DiagnosticLookupError::TooLarge => "oversized_response",
                     DiagnosticLookupError::Malformed => "malformed_response",
-                }, "not_established"),
+                }),
                 Ok(Ok(value)) => classify(&value, &record.record_name, &self.zone_id, masters),
             },
         };
@@ -213,7 +305,8 @@ impl PhotoAlbum {
             json!({
                 "record_history":observation.history, "prior_reference":observation.prior_reference,
                 "sparse_marker":observation.sparse_marker, "linkage":observation.linkage,
-                "lookup_outcome":outcome, "lookup_family":family,
+                "lookup_outcome":lookup.outcome, "lookup_family":lookup.family,
+                "lookup_scope":lookup.scope, "lookup_shape":lookup.shape,
             }),
         );
     }
