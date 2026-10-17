@@ -124,8 +124,8 @@ This rule does not expand GPS speed/time or movie-field policy.
 ## Guarded publication
 
 Metadata writers create unique temporary files exclusively, validate stable
-inputs and approved replacement fingerprints, preserve permissions, and fsync
-before guarded publication. Media replacement uses atomic exchange where
+inputs and approved replacement fingerprints, preserve permissions and mtime, and
+fsync before guarded publication. Media replacement uses atomic exchange where
 supported. On Linux, filesystems such as NFS that reject exchange use a journaled
 fallback. This also applies to existing sidecars. It requires hard-link support
 and briefly leaves the final path absent. Interrupted replacements are recovered

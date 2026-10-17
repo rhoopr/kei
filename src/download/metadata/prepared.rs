@@ -20,6 +20,21 @@ pub(super) fn publish_prepared_embed(
     )
 }
 
+/// A metadata rewrite keeps the media's file date. Like the download mtime,
+/// failure only warns so it cannot block publication.
+pub(super) fn keep_source_mtime(temp: &std::fs::File, source: &Path) {
+    if let Err(error) = std::fs::metadata(source)
+        .and_then(|metadata| metadata.modified())
+        .and_then(|modified| temp.set_modified(modified))
+    {
+        tracing::warn!(target: "kei::download::metadata",
+            path = %source.display(),
+            %error,
+            "Could not keep the media modification time after a metadata rewrite"
+        );
+    }
+}
+
 pub(super) fn fingerprint_bytes(
     bytes: &[u8],
 ) -> Result<crate::download::file::ExistingFileFingerprint> {

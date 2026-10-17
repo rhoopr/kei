@@ -2836,3 +2836,126 @@ async fn recent_overflow_uses_current_inventory_and_preserves_checkpoint() {
         Some("saved-cursor")
     );
 }
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn first_album_sync_keeps_capture_mtime_after_embedded_metadata_rewrite() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use std::time::UNIX_EPOCH;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    const CAPTURE_SECS: u64 = 1_700_000_000;
+    let server = crate::start_wiremock_or_skip!();
+    let body = vec![
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+    ];
+    Mock::given(method("GET"))
+        .and(path("/plain.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut records = incremental_photo_records_with_url(
+        "PLAIN",
+        "plain.jpg",
+        &format!("{}/plain.jpg", server.uri()),
+        body.len() as u64,
+    );
+    records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+        json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body)));
+    let pass = || AlbumPass {
+        kind: PassKind::Album,
+        album: mock_album_with_container(
+            "Trip",
+            "trip",
+            MockPhotosFlow::new()
+                .album_count(1)
+                .query_page(records.clone(), Some("token-full"))
+                .build(),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+    let media_dir = dir.path().join("media");
+    let mut config = test_config();
+    config.directory = Arc::from(media_dir);
+    config.metadata.xmp_sidecar = true;
+    config.metadata.embed_xmp = true;
+    config.metadata.set_exif_datetime = true;
+    config.state_db = Some(db.clone());
+
+    assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
+    let first = download_photos_with_sync(
+        &Client::new(),
+        &[pass()],
+        Arc::new(config.clone()),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(first.outcome, DownloadOutcome::Success),
+        "{first:?}"
+    );
+    assert_eq!(first.stats.downloaded, 1);
+    let row = db.get_downloaded_page(0, 10).await.unwrap().remove(0);
+    let media = row.local_path.unwrap();
+    let first_bytes = tokio::fs::read(&media).await.unwrap();
+    let first_mtime = tokio::fs::metadata(&media)
+        .await
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_ne!(first_bytes, body);
+    assert_eq!(
+        first_mtime.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        CAPTURE_SECS
+    );
+    assert!(
+        db.get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    config.state_db = None;
+    drop(db);
+    let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+    config.state_db = Some(db.clone());
+    let steady = download_photos_with_sync(
+        &Client::new(),
+        &[pass()],
+        Arc::new(config),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(steady.outcome, DownloadOutcome::Success),
+        "{steady:?}"
+    );
+    assert_eq!(steady.stats.downloaded, 0);
+    assert_eq!(tokio::fs::read(&media).await.unwrap(), first_bytes);
+    assert_eq!(
+        tokio::fs::metadata(&media)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap(),
+        first_mtime
+    );
+    assert_eq!(db.get_downloaded_page(0, 10).await.unwrap().len(), 1);
+    assert!(
+        db.get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

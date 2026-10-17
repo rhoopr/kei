@@ -129,10 +129,44 @@ pub(in crate::download) fn prepare_metadata_with_expected_fingerprint(
 mod tests {
     #[cfg(feature = "xmp")]
     use super::super::test_support::{
-        apply_metadata_with_default_suffix, fresh_jpeg, test_tmp_dir,
+        apply_metadata_with_default_suffix, fresh_heic, fresh_jpeg, test_tmp_dir,
     };
     use super::super::values::MetadataWrite;
     use std::fs;
+
+    #[test]
+    fn apply_metadata_keeps_source_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let captured = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for path in [
+            fresh_jpeg(dir.path(), "dated.jpg"),
+            fresh_heic(dir.path(), "dated.heic"),
+        ] {
+            let before = fs::read(&path).unwrap();
+            // Windows needs a writable handle to set the fixture timestamp.
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(captured)
+                .unwrap();
+            apply_metadata_with_default_suffix(
+                &path,
+                &MetadataWrite {
+                    rating: Some(5),
+                    ..MetadataWrite::default()
+                },
+            )
+            .unwrap();
+            assert_ne!(fs::read(&path).unwrap(), before, "{}", path.display());
+            assert_eq!(
+                fs::metadata(&path).unwrap().modified().unwrap(),
+                captured,
+                "{}",
+                path.display()
+            );
+        }
+    }
 
     #[test]
     fn apply_metadata_noop_when_empty() {
