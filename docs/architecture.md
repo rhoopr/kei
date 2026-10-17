@@ -2107,6 +2107,9 @@ Stable IDs connect safety rules to production owners and focused tests.
   `local_release.py` validates local live/host-service attestations.
   Release publication depends on both local evidence and hosted qualification;
   nightly runs cannot publish. See [CI qualification](ci.md).
+- `scripts/ci/opencode_review.py` owns the bounded, data-only advisory review
+  client. `opencode-review.yml` executes trusted base code and separates read-only
+  inference from deterministic COMMENT publication. See [review security and setup](opencode-review.md).
 - `justfile` owns local script and workflow lint commands. Protected CI runs
   the same shellcheck, shfmt, ruff, and actionlint checks with pinned versions.
 
