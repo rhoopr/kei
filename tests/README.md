@@ -121,16 +121,21 @@ the catalog and one passing execution; `--check` validates only the catalog.
 The regular Linux CI test job checks this catalog so a rename, lost ignore
 marker, or feature change cannot silently remove the stress proof.
 
-`Copies stress` runs once with all features on Linux for relevant PR changes
-(download, selected commands, state, Photos provider, sync, configuration,
-shared account/retry/filesystem/types/selection, media fixtures, dependencies, or CI), every
-push to main, Monday at 04:23 UTC, and manual Rust CI dispatches. Unrelated
-code and docs-only PRs skip it. Scheduled/manual runs skip the regular test
-matrix and use a distinct `Stress CI` aggregate and concurrency group, so a
-partial run cannot replace or cancel the required full `CI` gate. PR/main `CI` requires stress when selected. The
-release tag workflow builds artifacts without a test suite; main CI and the
-explicit stress command provide the stress route before release. Run the
-explicit command for local scale diagnosis. Hosted heavy qualification runs it for releases.
+`Copies stress` runs once with all features on Linux for changes to its
+runtime owners: download, state, Photos provider, sync, configuration, retry,
+selection, filesystem/shared types, command service types, media fixtures,
+and the queue-projection fixture. Other unit-test modules and outer CLI,
+command, and authentication paths do not select the large case alone. Shared
+runtime files remain conservative: a diagnostic change in Photos session or
+hydration code still selects stress. The compact fixtures remain mandatory.
+See [PR routing](../docs/ci.md#pr-routing) for the filename tradeoff and actual
+#984/#985 regression cases.
+
+Main pushes, explicit full/heavy routes, manual qualification, and daily
+Nightly qualification retain stress regardless of paths. Release qualification
+also runs it before publication. The shared fail-closed `CI` gate requires
+stress whenever routing selects it; scheduled qualification uses its separate
+concurrency group. Run the explicit stress command for local scale diagnosis.
 CI coverage and `just cov patch` explicitly skip the test on head and base,
 including an older base
 that has not marked it ignored. The no-default build lacks XMP and does not
