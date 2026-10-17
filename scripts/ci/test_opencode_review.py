@@ -9,6 +9,7 @@ import tempfile
 import unittest
 import urllib.error
 from contextlib import redirect_stdout
+from http.client import IncompleteRead
 from pathlib import Path
 from unittest.mock import patch
 
@@ -113,8 +114,9 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(len(kwargs["session"]), 64)
         payload = kwargs["payload"]
         self.assertFalse(payload["stream"])
-        self.assertEqual(payload["max_tokens"], 4096)
-        self.assertEqual(set(payload), {"model", "messages", "stream", "max_tokens"})
+        self.assertEqual(payload["max_tokens"], 16384)
+        self.assertEqual(payload["reasoning_effort"], "low")
+        self.assertEqual(set(payload), {"model", "messages", "stream", "max_tokens", "reasoning_effort"})
         self.assertNotIn(KEY, json.dumps(payload))
         self.assertNotIn("fixture-github-token", json.dumps(payload))
         self.assertEqual(output["model"], review.FREE_MODEL)
@@ -122,55 +124,135 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(output["head"], HEAD)
         self.assertEqual(output["findings"], [FINDING])
 
-    def test_bounded_go_fallback_only_for_explicit_eligible_status(self):
-        for status in (404, 429, 500, 502, 503, 504):
+    def test_ordered_chain_stops_at_each_success_and_names_actual_model(self):
+        for accepted_at in range(4):
             http = FakeHTTP()
             data = prepared(http)
-            completion = copy.deepcopy(http.completion)
-            with patch.object(http, "request", side_effect=[review.ProviderHTTPError(status), completion]) as request:
-                output = review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
-                self.assertEqual(request.call_count, 2)
-                self.assertEqual(request.call_args_list[0].args[1], review.FREE_URL)
-                self.assertEqual(request.call_args_list[0].kwargs["payload"]["model"], review.FREE_MODEL)
-                self.assertEqual(request.call_args_list[1].args[1], review.GO_URL)
-                self.assertEqual(request.call_args_list[1].kwargs["payload"]["model"], review.DEFAULT_MODEL)
-                self.assertEqual(output["model"], review.DEFAULT_MODEL)
+            output = io.StringIO()
+            errors = [review.ProviderHTTPError(403)] * accepted_at
+            with patch.object(http, "request", side_effect=errors + [http.completion]) as request, \
+                 redirect_stdout(output):
+                result = review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=accepted_at >= 2)
+            expected = list(review.REVIEW_MODELS[:accepted_at + 1])
+            self.assertEqual(request.call_count, accepted_at + 1)
+            self.assertEqual([(c.args[1], c.kwargs["payload"]["model"]) for c in request.call_args_list],
+                             [(url, model) for _, url, model in expected])
+            self.assertEqual(result["model"], expected[-1][2])
+            sessions = {c.kwargs["session"] for c in request.call_args_list}
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(len(output.getvalue().splitlines()), accepted_at + 1)
+            for call in request.call_args_list:
+                self.assertEqual(call.kwargs["payload"]["max_tokens"], 16384)
+                self.assertEqual(call.kwargs["limit"], 512 * 1024)
+                self.assertEqual("reasoning_effort" in call.kwargs["payload"],
+                                 call.kwargs["payload"]["model"].startswith("glm-"))
+            publisher = FakeHTTP()
+            review.publish(gh(publisher), result, HEAD)
+            body = publisher.calls[-1][3]["payload"]["body"]
+            self.assertIn(f"using `{expected[-1][2]}`", body)
 
     def test_fallback_blocked_without_no_overage_confirmation(self):
         http = FakeHTTP()
         data = prepared(http)
-        with patch.object(http, "request", side_effect=review.ProviderHTTPError(429)) as request:
+        with patch.object(http, "request", side_effect=review.ProviderHTTPError(429)) as request, \
+             redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(review.ReviewError, "Use balance"):
                 review.infer(http, data, KEY, review.DEFAULT_MODEL)
-            self.assertEqual(request.call_count, 1)
+            self.assertEqual(request.call_count, 2)
+            self.assertTrue(all(c.args[1] == review.FREE_URL for c in request.call_args_list))
 
-    def test_auth_input_transport_errors_and_bad_output_never_fall_back(self):
+    def test_provider_failures_advance_once_and_all_failed_has_no_result(self):
         for failure in (review.ProviderHTTPError(400), review.ProviderHTTPError(401),
-                        review.ProviderHTTPError(403), review.ProviderHTTPError(422),
-                        review.ReviewError("uncertain transport")):
+                        review.ProviderHTTPError(403), review.ProviderHTTPError(429),
+                        review.ProviderHTTPError(503), review.ProviderError("uncertain transport"),
+                        review.ProviderError("malformed JSON"), review.ProviderError("response size")):
             http = FakeHTTP()
             data = prepared(http)
+            output = io.StringIO()
+            with patch.object(http, "request", side_effect=failure) as request, redirect_stdout(output), \
+                 self.assertRaisesRegex(review.ReviewError, "All four"):
+                review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
+            self.assertEqual(request.call_count, 4)
+            self.assertEqual([c.kwargs["payload"]["model"] for c in request.call_args_list],
+                             [m for _, _, m in review.REVIEW_MODELS])
+            self.assertEqual(len(output.getvalue().splitlines()), 4)
+            if isinstance(failure, review.ProviderHTTPError):
+                self.assertIn(f'"http_status":{failure.status}', output.getvalue())
+        http = FakeHTTP()
+        data = prepared(http)
+        broken = copy.deepcopy(http.completion)
+        broken["choices"][0]["finish_reason"] = "length"
+        broken["choices"][0]["message"]["content"] = ""
+        broken["usage"] = {"completion_tokens": 16384, "completion_tokens_details": {"reasoning_tokens": 16384}}
+        output = io.StringIO()
+        with patch.object(http, "request", side_effect=[{}, broken, ["bad"], http.completion]) as request, \
+             redirect_stdout(output):
+            result = review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
+        self.assertEqual(request.call_count, 4)
+        self.assertEqual(result["model"], "deepseek-v4.1-flash")
+        self.assertIn('"finish_reason":"length"', output.getvalue())
+        self.assertIn('"reasoning_tokens":16384', output.getvalue())
+        self.assertIn('"text_nonempty":false', output.getvalue())
+
+    def test_all_failed_cli_writes_no_findings_artifact(self):
+        http = FakeHTTP()
+        data = prepared(http)
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            os.chdir(tmp)
+            try:
+                Path("review-input.json").write_text(json.dumps(data))
+                with patch.dict(os.environ, {"OPENCODE_API_KEY": KEY,
+                                             "OPENCODE_GO_NO_OVERAGE_CONFIRMED": "true"}, clear=True), \
+                     patch.object(review, "HTTP", return_value=http), \
+                     patch.object(http, "request", side_effect=review.ProviderHTTPError(403)) as request, \
+                     patch("sys.argv", ["review", "infer"]), redirect_stdout(io.StringIO()), \
+                     self.assertRaisesRegex(review.ReviewError, "All four"):
+                    review.main()
+                self.assertEqual(request.call_count, 4)
+                self.assertEqual(list(Path('.').iterdir()), [Path("review-input.json")])
+            finally:
+                os.chdir(previous)
+
+    def test_security_and_local_failures_stop_without_fallback(self):
+        http = FakeHTTP()
+        data = prepared(http)
+        for failure in (review.ReviewError("host or input policy"), review.SecurityError("credential policy")):
             with patch.object(http, "request", side_effect=failure) as request, self.assertRaises(review.ReviewError):
                 review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
             self.assertEqual(request.call_count, 1)
-        http = FakeHTTP()
-        data = prepared(http)
-        http.completion["choices"][0]["message"]["content"] = "invalid JSON"
-        with self.assertRaises(ValueError):
-            review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
-        self.assertEqual(sum(call[0] == "POST" for call in http.calls), 1)
-
-    def test_go_exhaustion_stops_and_other_model_override_rejected(self):
-        http = FakeHTTP()
-        data = prepared(http)
-        with patch.object(http, "request", side_effect=review.ProviderHTTPError(429)) as request:
-            with self.assertRaises(review.ProviderHTTPError):
+        for mutate in (lambda r: r["choices"][0]["message"].update(reasoning_content=KEY),
+                       lambda r: r["choices"][0]["message"].update(content=json.dumps({"findings": [dict(FINDING, line=999)]})),
+                       lambda r: r["choices"][0]["message"].update(content=json.dumps({"findings": [dict(FINDING, body=KEY)]}))):
+            completion = copy.deepcopy(http.completion)
+            mutate(completion)
+            output = io.StringIO()
+            with patch.object(http, "request", return_value=completion) as request, redirect_stdout(output), \
+                 self.assertRaises(review.SecurityError):
                 review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
-            self.assertEqual(request.call_count, 2)
+            self.assertEqual(request.call_count, 1)
+            self.assertNotIn(KEY, output.getvalue())
         for model in ("glm-5.3", "gpt-6-luna", "glm-5.3-flash-free", "glm-5.3-flash "):
             with patch.object(http, "request") as request, self.assertRaises(review.ReviewError):
                 review.infer(http, data, KEY, model, go_no_overage_confirmed=True)
             request.assert_not_called()
+
+    def test_diagnostics_reject_untrusted_strings_and_unbounded_counts(self):
+        http = FakeHTTP()
+        response = {"choices": [{"finish_reason": "::error::" + KEY, "message": {
+            "role": KEY, "content": "not logged", "reasoning_content": "never logged"}}],
+            "usage": {"prompt_tokens": KEY, "completion_tokens": True, "total_tokens": 10**99,
+                      "completion_tokens_details": {"reasoning_tokens": -1}}}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            review.attempt_metadata(http, "free", review.FREE_MODEL, "invalid_completion", response)
+        metadata = json.loads(output.getvalue().removeprefix("OpenCode attempt "))
+        self.assertEqual(metadata["finish_reason"], "unknown")
+        self.assertFalse(metadata["assistant_role"])
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens"):
+            self.assertIsNone(metadata[field])
+        for text in (KEY, "not logged", "never logged", "::error::"):
+            self.assertNotIn(text, output.getvalue())
 
     def test_stable_session_per_head(self):
         http = FakeHTTP()
@@ -552,6 +634,30 @@ class TransportTests(unittest.TestCase):
             with self.assertRaises(review.ReviewError):
                 review.ProviderHTTPError(status, route)
 
+    def test_truncated_http_read_advances_to_next_model_without_retry(self):
+        class TruncatedResponse(io.BytesIO):
+            status = 200
+
+            def read(self, size=-1):
+                raise IncompleteRead(b"private partial body", 100)
+
+        client = review.HTTP()
+        fixture = FakeHTTP()
+        data = prepared(fixture)
+        valid = io.BytesIO(json.dumps(fixture.completion).encode())
+        valid.status = 200
+        output = io.StringIO()
+        with patch.object(client.opener, "open", side_effect=[TruncatedResponse(), valid]) as opened, \
+             redirect_stdout(output):
+            result = review.infer(client, data, KEY, review.DEFAULT_MODEL)
+        self.assertEqual(opened.call_count, 2)
+        self.assertEqual(result["model"], "deepseek-v4.1-flash-free")
+        self.assertEqual([json.loads(call.args[0].data)["model"] for call in opened.call_args_list],
+                         ["glm-5.3-flash-free", "deepseek-v4.1-flash-free"])
+        self.assertIn('"outcome":"request_failed"', output.getvalue())
+        self.assertNotIn("private partial body", output.getvalue())
+        self.assertNotIn(KEY, output.getvalue())
+
     def test_publication_uncertainty_is_not_retried(self):
         client = review.HTTP()
         with patch.object(client.opener, "open", side_effect=TimeoutError) as opened:
@@ -591,7 +697,7 @@ class TransportTests(unittest.TestCase):
 class ApiSmokeTests(unittest.TestCase):
     def test_one_free_test_prompt_only_and_no_response_body_output(self):
         http = FakeHTTP()
-        http.completion["choices"][0]["message"]["content"] = KEY + " sensitive response body"
+        http.completion["choices"][0]["message"]["content"] = "private response body"
         output = io.StringIO()
         with redirect_stdout(output):
             review.api_smoke(http, KEY, "fixture-session")
@@ -600,9 +706,11 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual((method, url), ("POST", review.FREE_URL))
         self.assertEqual(args["payload"], {"model": review.FREE_MODEL,
                          "messages": [{"role": "user", "content": "test"}],
-                         "stream": False, "max_tokens": 64})
-        self.assertEqual(args["limit"], 16 * 1024)
-        self.assertEqual(output.getvalue(), "OpenCode free HTTP 200; test response accepted.\n")
+                         "stream": False, "max_tokens": 2048, "reasoning_effort": "low"})
+        self.assertEqual(args["limit"], 128 * 1024)
+        metadata = json.loads(output.getvalue().removeprefix("OpenCode attempt "))
+        self.assertEqual((metadata["route"], metadata["http_status"], metadata["outcome"]), ("free", 200, "accepted"))
+        self.assertNotIn("private response body", output.getvalue())
         self.assertNotIn(KEY, output.getvalue())
 
     def test_one_go_request_uses_only_fixed_subscription_route_and_prompt(self):
@@ -615,9 +723,10 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual((method, url), ("POST", review.GO_URL))
         self.assertEqual(args["payload"], {"model": review.DEFAULT_MODEL,
                          "messages": [{"role": "user", "content": "test"}],
-                         "stream": False, "max_tokens": 64})
-        self.assertEqual(args["limit"], 16 * 1024)
-        self.assertEqual(output.getvalue(), "OpenCode go HTTP 200; test response accepted.\n")
+                         "stream": False, "max_tokens": 2048, "reasoning_effort": "low"})
+        self.assertEqual(args["limit"], 128 * 1024)
+        metadata = json.loads(output.getvalue().removeprefix("OpenCode attempt "))
+        self.assertEqual((metadata["route"], metadata["http_status"], metadata["outcome"]), ("go", 200, "accepted"))
 
     def test_go_gate_and_unknown_routes_fail_before_network(self):
         for route, confirmed in (("go", False), ("paid", True), ("https://evil.test", True),
@@ -652,25 +761,48 @@ class ApiSmokeTests(unittest.TestCase):
     def test_api_test_rejects_bad_or_truncated_completions_without_logging_body(self):
         for response in ({}, {"choices": [None]}, {"choices": [None, None]},
                          {"choices": [{"finish_reason": "length", "message": {
-                             "role": "assistant", "content": KEY}}]},
+                             "role": "assistant", "content": "private body"}}]},
                          {"choices": [{"finish_reason": "stop", "message": {
-                             "role": "assistant", "content": KEY, "tool_calls": [{}]}}]}):
+                             "role": "assistant", "content": "private body", "tool_calls": [{}]}}]}):
             http = FakeHTTP()
             http.completion = response
             output = io.StringIO()
             with redirect_stdout(output), self.assertRaises(review.ReviewError):
                 review.api_smoke(http, KEY, "fixture")
-            self.assertEqual(output.getvalue(), "OpenCode free HTTP 200; test response rejected.\n")
+            metadata = json.loads(output.getvalue().removeprefix("OpenCode attempt "))
+            self.assertEqual(metadata["outcome"], "invalid_completion")
+            self.assertNotIn("private body", output.getvalue())
             self.assertEqual(len(http.calls), 1)
 
-    def test_api_test_reports_http_status_for_invalid_json_and_transport_uncertainty(self):
-        http = FakeHTTP()
-        for status, expected in ((200, "free HTTP 200; test response rejected"),
-                                 (None, "status unavailable")):
+    def test_api_test_reports_safe_metadata_for_invalid_json_and_transport_uncertainty(self):
+        for status in (200, None):
+            http = FakeHTTP()
             http.last_status = status
-            with patch.object(http, "request", side_effect=review.ReviewError("raw diagnostic excluded")), \
-                 self.assertRaisesRegex(review.ReviewError, expected):
+            output = io.StringIO()
+            with patch.object(http, "request", side_effect=review.ProviderError("raw diagnostic excluded")), \
+                 redirect_stdout(output), self.assertRaises(review.ReviewError):
                 review.api_smoke(http, KEY, "fixture")
+            metadata = json.loads(output.getvalue().removeprefix("OpenCode attempt "))
+            self.assertEqual(metadata["http_status"], status)
+            self.assertEqual(metadata["outcome"], "request_failed")
+            self.assertNotIn("raw diagnostic", output.getvalue())
+
+    def test_api_test_reports_length_and_usage_without_body_or_reasoning(self):
+        http = FakeHTTP()
+        http.completion["choices"][0].update(finish_reason="length", message={
+            "role": "assistant", "content": "", "reasoning_content": "private reasoning"})
+        http.completion["usage"] = {"prompt_tokens": 2, "completion_tokens": 2048,
+                                    "total_tokens": 2050, "completion_tokens_details": {"reasoning_tokens": 2048}}
+        output = io.StringIO()
+        with redirect_stdout(output), self.assertRaises(review.ReviewError):
+            review.api_smoke(http, KEY, "fixture")
+        metadata = json.loads(output.getvalue().removeprefix("OpenCode attempt "))
+        self.assertEqual(metadata["finish_reason"], "length")
+        self.assertEqual(metadata["reasoning_tokens"], 2048)
+        self.assertEqual(metadata["completion_tokens"], 2048)
+        self.assertFalse(metadata["text_nonempty"])
+        self.assertNotIn("private reasoning", output.getvalue())
+        self.assertEqual(len(http.calls), 1)
 
     def test_smoke_cli_requires_trusted_dispatch_and_writes_no_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
