@@ -2099,7 +2099,9 @@ Stable IDs connect safety rules to production owners and focused tests.
   the optimized extracted-source-package check. Tests do not fetch media.
 - Shell suites cover crash, concurrency, state-machine, and container behavior.
 - Fuzz targets cover parser and metadata trust boundaries.
-- `scripts/ci/policy.py` owns PR routing. `checks.yml` owns shared quality
+- `ci.yml` defers draft PR work and keeps the required `CI` marker failing until
+  ready-for-review validation succeeds. `scripts/ci/policy.py` owns path routing.
+  `checks.yml` owns shared quality
   checks; `qualification.yml` composes heavy checks and tested artifacts.
   `scripts/ci/artifact.py` binds archive/container evidence to one commit.
   `local_release.py` validates local live/host-service attestations.

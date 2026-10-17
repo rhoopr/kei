@@ -23,6 +23,7 @@ name: Service smoke
 on:
   workflow_call:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
     paths:
       - 'src/service/**'
       - 'src/commands/service.rs'
@@ -52,6 +53,7 @@ env:
 
 jobs:
   smoke:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     name: Smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
