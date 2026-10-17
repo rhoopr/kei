@@ -60,8 +60,10 @@ class ReviewError(Exception):
 
 
 class ProviderHTTPError(ReviewError):
-    def __init__(self, status):
-        super().__init__("Provider rate limit or HTTP failure; no automatic POST retry.")
+    def __init__(self, status, route="free"):
+        require(type(status) is int and 100 <= status <= 599, "Invalid provider HTTP status.")
+        require(route in {"free", "go"}, "Invalid provider route label.")
+        super().__init__(f"OpenCode {route} HTTP {status}; no automatic POST retry.")
         self.status = status
 
 
@@ -134,7 +136,7 @@ class HTTP:
                     time.sleep(2 ** attempt)
                     continue
                 if provider:
-                    raise ProviderHTTPError(status) from None
+                    raise ProviderHTTPError(status, "free" if url == FREE_URL else "go") from None
                 raise ReviewError("API rate limit or HTTP failure; no automatic POST retry.") from None
             except (urllib.error.URLError, TimeoutError, OSError):
                 if attempt < attempts - 1:
@@ -315,7 +317,8 @@ def infer(http, prepared, key, model, *, go_no_overage_confirmed=False):
         if error.status not in {404, 429, 500, 502, 503, 504}:
             raise
         require(go_no_overage_confirmed,
-                "Free model unavailable; Go fallback blocked until Use balance is confirmed disabled.")
+                f"OpenCode free HTTP {error.status}; Go fallback blocked until Use balance is confirmed disabled.")
+        print(f"OpenCode free HTTP {error.status}; requesting the configured Go subscription fallback.")
         model_used = model
         response = http.request("POST", GO_URL, key, provider=True, session=session,
                                 limit=128 * 1024, payload={**payload, "model": model})
@@ -385,6 +388,33 @@ def load_json(path, limit):
     return json.loads(raw)
 
 
+def review_target(http, event, mode):
+    """Resolve one PR from trusted event metadata; freeze manual head at prepare."""
+    repo = os.environ["GITHUB_REPOSITORY"]
+    event_name = os.environ["GITHUB_EVENT_NAME"]
+    if event_name == "workflow_dispatch":
+        repository = event["repository"]
+        require(repository["full_name"] == repo, "Dispatch repository mismatch.")
+        require(os.environ["GITHUB_REF"] == f"refs/heads/{repository['default_branch']}",
+                "Manual review must run from the default branch.")
+        number_text = event.get("inputs", {}).get("pr_number")
+        require(isinstance(number_text, str) and re.fullmatch(r"[1-9][0-9]{0,8}", number_text),
+                "Manual PR number must be a positive canonical integer.")
+        gh = GitHub(http, repo, int(number_text), os.environ["GH_TOKEN"])
+        head = (gh.api(gh.pull)["head"]["sha"] if mode == "prepare"
+                else os.environ.get("EXPECTED_HEAD_SHA", ""))
+    else:
+        require(event_name == "pull_request_target", "Unsupported review event.")
+        pr = event["pull_request"]
+        require(pr["base"]["repo"]["full_name"] == repo, "Event repository mismatch.")
+        if pr["draft"]:
+            raise Skip("Draft PR; no review completed.")
+        gh = GitHub(http, repo, event["number"], os.environ["GH_TOKEN"])
+        head = pr["head"]["sha"]
+    require(isinstance(head, str) and SHA.fullmatch(head), "Invalid head SHA.")
+    return gh, head
+
+
 def main():
     # Paths/commands come only from literal base workflow steps, never PR data.
     mode = sys.argv[1]
@@ -400,16 +430,12 @@ def main():
                        os.environ.get("OPENCODE_GO_MODEL") or DEFAULT_MODEL,
                        go_no_overage_confirmed=confirmed == "true")
         Path("review-result.json").write_bytes(json_bytes(result))
-        print("Model output validated; publication remains pending.")
+        print(f"Model output validated for {result['model']}; publication remains pending.")
         return
     event = load_json(os.environ["GITHUB_EVENT_PATH"], 2 * 1024 * 1024)
-    pr = event["pull_request"]
-    repo, head, number = os.environ["GITHUB_REPOSITORY"], pr["head"]["sha"], event["number"]
-    require(isinstance(head, str) and SHA.fullmatch(head), "Invalid head SHA.")
-    require(pr["base"]["repo"]["full_name"] == repo, "Event repository mismatch.")
-    if pr["draft"]:
-        raise Skip("Draft PR; no review completed.")
-    gh = GitHub(http, repo, number, os.environ["GH_TOKEN"])
+    require(mode in {"prepare", "publish"}, "Unknown review mode.")
+    gh, head = review_target(http, event, mode)
+    repo, number = gh.repo, gh.number
     if mode == "prepare":
         gh.current(head)
         if gh.duplicate(head):
@@ -418,7 +444,7 @@ def main():
         prepared = {"repo": repo, "number": number, "head": head, "files": files, "locations": locations}
         Path("review-input.json").write_bytes(json_bytes(prepared))
         with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
-            output.write("prepared=true\n")
+            output.write(f"prepared=true\nhead={head}\n")
         print("Complete bounded diff prepared from exact head; no PR code executed.")
     elif mode == "publish":
         publish(gh, load_json("result/review-result.json", MAX_RESULT + 1024), head)

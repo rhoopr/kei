@@ -375,11 +375,12 @@ class ReviewTests(unittest.TestCase):
                 Path("event.json").write_text(json.dumps(event))
                 env = {"GITHUB_EVENT_PATH": str(Path("event.json").resolve()),
                        "GITHUB_REPOSITORY": REPO, "GITHUB_OUTPUT": "output",
+                       "GITHUB_EVENT_NAME": "pull_request_target",
                        "GH_TOKEN": "fixture-github-token"}
                 with patch.dict(os.environ, env, clear=True), patch.object(review, "HTTP", return_value=http), \
                      patch("sys.argv", ["review", "prepare"]), redirect_stdout(io.StringIO()):
                     review.main()
-                self.assertEqual(Path("output").read_text(), "prepared=true\n")
+                self.assertEqual(Path("output").read_text(), f"prepared=true\nhead={HEAD}\n")
                 self.assertTrue(Path("review-input.json").is_file())
                 with patch.dict(os.environ, {"OPENCODE_API_KEY": KEY}, clear=True), \
                      patch.object(review, "HTTP", return_value=http), \
@@ -397,6 +398,94 @@ class ReviewTests(unittest.TestCase):
                 self.assertEqual(http.calls[-1][3]["payload"]["event"], "COMMENT")
             finally:
                 os.chdir(previous)
+
+    def test_manual_dispatch_full_pipeline_preserves_prepared_head(self):
+        event = {"inputs": {"pr_number": "123"},
+                 "repository": {"full_name": REPO, "default_branch": "main"}}
+        http = FakeHTTP()
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            os.chdir(tmp)
+            try:
+                Path("event.json").write_text(json.dumps(event))
+                env = {"GITHUB_EVENT_PATH": str(Path("event.json").resolve()),
+                       "GITHUB_REPOSITORY": REPO, "GITHUB_OUTPUT": "output",
+                       "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main",
+                       "GH_TOKEN": "fixture-github-token"}
+                with patch.dict(os.environ, env, clear=True), patch.object(review, "HTTP", return_value=http), \
+                     patch("sys.argv", ["review", "prepare"]), redirect_stdout(io.StringIO()):
+                    review.main()
+                self.assertEqual(Path("output").read_text(), f"prepared=true\nhead={HEAD}\n")
+                with patch.dict(os.environ, {"OPENCODE_API_KEY": KEY}, clear=True), \
+                     patch.object(review, "HTTP", return_value=http), \
+                     patch("sys.argv", ["review", "infer"]), redirect_stdout(io.StringIO()):
+                    review.main()
+                Path("result").mkdir()
+                Path("review-result.json").rename("result/review-result.json")
+                with patch.dict(os.environ, dict(env, EXPECTED_HEAD_SHA=HEAD), clear=True), \
+                     patch.object(review, "HTTP", return_value=http), \
+                     patch("sys.argv", ["review", "publish"]), redirect_stdout(io.StringIO()):
+                    review.main()
+                self.assertEqual(http.calls[-1][3]["payload"]["commit_id"], HEAD)
+                self.assertEqual(http.calls[-1][3]["payload"]["event"], "COMMENT")
+            finally:
+                os.chdir(previous)
+
+    def test_dispatch_rejects_untrusted_ref_and_malformed_number_before_network(self):
+        for branch, number in (("refs/heads/fork-code", "123"), ("refs/tags/main", "123"),
+                               ("refs/pull/123/head", "123"), ("refs/heads/main", "0123"),
+                               ("refs/heads/main", "123; id"), ("refs/heads/main", "0"),
+                               ("refs/heads/main", "123\n"), ("refs/heads/main", 123)):
+            http = FakeHTTP()
+            event = {"inputs": {"pr_number": number},
+                     "repository": {"full_name": REPO, "default_branch": "main"}}
+            env = {"GITHUB_REPOSITORY": REPO, "GITHUB_EVENT_NAME": "workflow_dispatch",
+                   "GITHUB_REF": branch, "GH_TOKEN": "fixture-github-token"}
+            with patch.dict(os.environ, env, clear=True), self.assertRaises(review.ReviewError):
+                review.review_target(http, event, "prepare")
+            self.assertEqual(http.calls, [])
+
+    def test_manual_publish_requires_prepared_head_and_rejects_staleness(self):
+        event = {"inputs": {"pr_number": "123"},
+                 "repository": {"full_name": REPO, "default_branch": "main"}}
+        env = {"GITHUB_REPOSITORY": REPO, "GITHUB_EVENT_NAME": "workflow_dispatch",
+               "GITHUB_REF": "refs/heads/main", "GH_TOKEN": "fixture-github-token"}
+        for invalid in ("", "123", "a" * 39):
+            http = FakeHTTP()
+            with patch.dict(os.environ, dict(env, EXPECTED_HEAD_SHA=invalid), clear=True), \
+                 self.assertRaises(review.ReviewError):
+                review.review_target(http, event, "publish")
+            self.assertEqual(http.calls, [])
+        http = FakeHTTP()
+        stale = copy.deepcopy(PR)
+        stale["head"]["sha"] = OLD
+        http.prs = [stale]
+        with patch.dict(os.environ, dict(env, EXPECTED_HEAD_SHA=HEAD), clear=True):
+            target, head = review.review_target(http, event, "publish")
+            with self.assertRaises(review.Skip):
+                review.publish(target, result(), head)
+        self.assertFalse(any(c[0] == "POST" for c in http.calls))
+
+    def test_dispatch_draft_and_duplicate_still_skip(self):
+        event = {"inputs": {"pr_number": "123"},
+                 "repository": {"full_name": REPO, "default_branch": "main"}}
+        env = {"GITHUB_REPOSITORY": REPO, "GITHUB_EVENT_NAME": "workflow_dispatch",
+               "GITHUB_REF": "refs/heads/main", "GH_TOKEN": "fixture-github-token"}
+        for draft in (True, False):
+            http = FakeHTTP()
+            item = copy.deepcopy(PR)
+            item["draft"] = draft
+            http.prs = [item, item]
+            http.reviews = [bot_review()]
+            with patch.dict(os.environ, env, clear=True):
+                target, head = review.review_target(http, event, "prepare")
+                if draft:
+                    with self.assertRaises(review.Skip):
+                        target.current(head)
+                else:
+                    target.current(head)
+                    self.assertTrue(target.duplicate(head))
+            self.assertFalse(any(c[0] == "POST" for c in http.calls))
 
     def test_hunk_add_delete_and_multiple_counts(self):
         samples = [
@@ -424,6 +513,7 @@ class ReviewTests(unittest.TestCase):
                 event_path.write_text(json.dumps(event))
                 with patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(event_path),
                                              "GITHUB_REPOSITORY": REPO, "GITHUB_OUTPUT": str(out),
+                                             "GITHUB_EVENT_NAME": "pull_request_target",
                                              "GH_TOKEN": "fixture-github-token"}), \
                      patch.object(review, "HTTP", return_value=http), \
                      patch("sys.argv", ["opencode_review.py", "prepare"]), redirect_stdout(io.StringIO()), \
@@ -437,7 +527,7 @@ class TransportTests(unittest.TestCase):
         client = review.HTTP()
         with patch.object(client.opener, "open", side_effect=urllib.error.HTTPError(
                 review.GO_URL, 429, "untrusted sensitive error", {}, io.BytesIO(b"secret response"))) as opened:
-            with self.assertRaisesRegex(review.ReviewError, "rate limit"):
+            with self.assertRaisesRegex(review.ReviewError, "go HTTP 429"):
                 client.request("POST", review.GO_URL, KEY, provider=True, session="fixture", payload={})
             self.assertEqual(opened.call_count, 1)
             req = opened.call_args.args[0]
@@ -445,6 +535,21 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(req.get_header("User-agent"), "kei-advisory-review/1.0")
             self.assertEqual(req.get_header("X-opencode-session"), "fixture")
             self.assertEqual(opened.call_args.kwargs["timeout"], 90)
+
+    def test_provider_errors_expose_only_fixed_route_and_numeric_status(self):
+        for route, url, code in (("free", review.FREE_URL, 401), ("go", review.GO_URL, 429)):
+            client = review.HTTP()
+            failure = urllib.error.HTTPError(url, code, KEY, {"secret": KEY}, io.BytesIO(KEY.encode()))
+            with patch.object(client.opener, "open", side_effect=failure), \
+                 self.assertRaises(review.ProviderHTTPError) as caught:
+                client.request("POST", url, KEY, provider=True, session="fixture", payload={})
+            message = str(caught.exception)
+            self.assertEqual(message, f"OpenCode {route} HTTP {code}; no automatic POST retry.")
+            self.assertNotIn(KEY, message)
+            self.assertNotIn(url, message)
+        for status, route in (("401\nsecret", "free"), (401, KEY), (True, "go")):
+            with self.assertRaises(review.ReviewError):
+                review.ProviderHTTPError(status, route)
 
     def test_publication_uncertainty_is_not_retried(self):
         client = review.HTTP()
@@ -485,9 +590,14 @@ class WorkflowTests(unittest.TestCase):
     def test_workflow_security_contract(self):
         text = (Path(__file__).resolve().parents[2] / ".github/workflows/opencode-review.yml").read_text()
         self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", text)
-        self.assertIn("if: github.event.pull_request.draft == false", text)
+        self.assertIn("github.event.pull_request.draft == false", text)
         self.assertIn("cancel-in-progress: true", text)
         self.assertIn("permissions: {}", text)
+        self.assertIn("  workflow_dispatch:", text)
+        self.assertIn("      pr_number:", text)
+        self.assertIn("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)", text)
+        self.assertIn("github.event.pull_request.number || inputs.pr_number", text)
+        self.assertIn("EXPECTED_HEAD_SHA: ${{ needs.review.outputs.head }}", text)
         self.assertEqual(text.count("ref: ${{ github.workflow_sha }}"), 2)
         self.assertEqual(text.count("persist-credentials: false"), 2)
         read_job, write_job = text.split("  publish:\n")

@@ -7,7 +7,8 @@ The review is advisory: demonstrable defects, regressions, and concrete missing
 safety coverage. Humans verify findings and decide whether to merge. It never
 approves, requests changes, fixes code, pushes branches, or merges. Do not add
 this workflow to required branch-protection checks. There is no backfill or
-scheduled review of existing PRs.
+scheduled review of existing PRs. A manual dispatch reviews exactly one selected
+PR without changing its branch or PR state.
 
 ## Models, billing, and setup
 
@@ -32,9 +33,7 @@ clearly before sending any Go request.
 
 `OPENCODE_API_KEY` was confirmed present as a repository Actions secret using
 name-only metadata during setup. Its value was not read. A maintainer must merge
-the workflow PR themselves; there is no trusted execution path for this new
-workflow before it exists on the target branch. The first bounded live smoke
-review remains pending that merge. For installation or replacement:
+workflow changes themselves. For installation or replacement:
 
 1. In `rhoopr/kei`, open **Settings > Secrets and variables > Actions > Secrets**.
 2. Select **New repository secret**, name it `OPENCODE_API_KEY`, paste the
@@ -48,11 +47,21 @@ review remains pending that merge. For installation or replacement:
    It defaults to `glm-5.3-flash`. Only that exact value is accepted; another
    model requires an explicitly reviewed code change. Free primary routing is
    fixed and cannot be bypassed through a variable.
-5. Open or update one small non-draft PR after setup for the authorized live
-   smoke review. Adding a secret/variable does not trigger a run or broad backfill.
-   Re-running a failed run works if its head is still current. No real inference
-   was used to validate this implementation; the first run still needs to verify
-   provider acceptance of the existing key and completion behavior.
+5. After the workflow is merged, run one manual review from the default branch:
+   `gh workflow run opencode-review.yml --repo rhoopr/kei --ref main -f pr_number=989`.
+   Alternatively use Actions > OpenCode advisory review > Run workflow, choose
+   the default branch, and enter one PR number. This invokes only this workflow;
+   it does not update the PR or dispatch Rust CI. Other branch/tag refs are
+   rejected. Draft/closed PRs and already-reviewed heads still skip.
+   Adding a secret/variable does not trigger a run or broad backfill. Re-running
+   an old run uses its original trusted workflow commit; after a script fix,
+   dispatch a new run from the updated default branch instead.
+
+Manual PR numbers must be positive canonical integers. The read-only preparation
+step resolves the PR through GitHub and records its exact head as a job output.
+Publication receives that head, validates the artifact's repository/number/SHA,
+and rechecks current head as usual. Dispatch and PR events share the same per-PR
+concurrency group. There is no user-supplied checkout ref, endpoint, or code path.
 
 A missing key fails the inference step with `OPENCODE_API_KEY is missing; no
 review completed.` It does not publish a successful empty review. Draft, closed,
@@ -134,7 +143,10 @@ GitHub GETs have at most three attempts, 20-second socket timeouts, and 1/2-seco
 retry delays for rate limits/transient failures. Inference has a 90-second socket
 timeout; all requests have response-size limits and a 150-request operation
 budget. The read job has a 10-minute deadline and publication has five minutes.
-Provider errors and bodies never appear in diagnostics. Repeated pushes still
+Provider response/error bodies never appear in diagnostics. Failures include
+only a fixed `free`/`go` route label and numeric HTTP status. An eligible free
+failure logs its status before an authorized Go fallback, so the final route is
+unambiguous. Successful validation logs the accepted model ID. Repeated pushes still
 consume usage when requests have already reached the provider; this is not a
 repository-wide quota controller. Draft PRs defer inference.
 
@@ -183,5 +195,7 @@ missing secrets, malicious fork text and paths, complete/oversized diffs, contex
 limits, malformed/tool/truncated output, credentials, safe rendering, rate
 limits, uncertain publication, free success, eligible Go fallback, no-overage
 gating, Go exhaustion, forbidden model overrides, and the base-only workflow
-contract. They do not contact inference endpoints or execute Rust tests. The
+contract, default-branch dispatch, prepared-head propagation, invalid PR/ref
+rejection, and safe route/status diagnostics. They do not contact inference
+endpoints or execute Rust tests. The
 existing CI Python discovery already runs these fixtures.
