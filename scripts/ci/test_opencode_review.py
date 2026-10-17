@@ -605,6 +605,37 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "OpenCode free HTTP 200; test response accepted.\n")
         self.assertNotIn(KEY, output.getvalue())
 
+    def test_one_go_request_uses_only_fixed_subscription_route_and_prompt(self):
+        http = FakeHTTP()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            review.api_smoke(http, KEY, "fixture", route="go", go_no_overage_confirmed=True)
+        self.assertEqual(len(http.calls), 1)
+        method, url, _, args = http.calls[0]
+        self.assertEqual((method, url), ("POST", review.GO_URL))
+        self.assertEqual(args["payload"], {"model": review.DEFAULT_MODEL,
+                         "messages": [{"role": "user", "content": "test"}],
+                         "stream": False, "max_tokens": 64})
+        self.assertEqual(args["limit"], 16 * 1024)
+        self.assertEqual(output.getvalue(), "OpenCode go HTTP 200; test response accepted.\n")
+
+    def test_go_gate_and_unknown_routes_fail_before_network(self):
+        for route, confirmed in (("go", False), ("paid", True), ("https://evil.test", True),
+                                  ("glm-5.3-flash", True), ("GO", True), ("go", "true")):
+            http = FakeHTTP()
+            with self.assertRaises(review.ReviewError):
+                review.api_smoke(http, KEY, "fixture", route=route, go_no_overage_confirmed=confirmed)
+            self.assertEqual(http.calls, [])
+
+    def test_go_exhaustion_and_auth_errors_never_retry_or_change_route(self):
+        for status in (401, 403, 404, 429, 503):
+            http = FakeHTTP()
+            with patch.object(http, "request", side_effect=review.ProviderHTTPError(status, "go")) as request, \
+                 self.assertRaises(review.ProviderHTTPError):
+                review.api_smoke(http, KEY, "fixture", route="go", go_no_overage_confirmed=True)
+            self.assertEqual(request.call_count, 1)
+            self.assertEqual(request.call_args.args[1], review.GO_URL)
+
     def test_api_test_never_falls_back_or_retries(self):
         for status in (400, 401, 403, 404, 429, 500, 502, 503, 504):
             http = FakeHTTP()
@@ -659,6 +690,20 @@ class ApiSmokeTests(unittest.TestCase):
                     review.main()
                 self.assertEqual(len(http.calls), 1)
                 self.assertEqual(list(Path('.').iterdir()), [Path('event.json')])
+                event["inputs"]["smoke_route"] = "go"
+                Path("event.json").write_text(json.dumps(event))
+                http = FakeHTTP()
+                with patch.dict(os.environ, env, clear=True), patch.object(review, "HTTP", return_value=http), \
+                     patch("sys.argv", ["review", "smoke"]), redirect_stdout(io.StringIO()):
+                    review.main()
+                self.assertEqual(len(http.calls), 1)
+                self.assertEqual(http.calls[0][1], review.GO_URL)
+                http = FakeHTTP()
+                with patch.dict(os.environ, dict(env, OPENCODE_GO_NO_OVERAGE_CONFIRMED="false"), clear=True), \
+                     patch.object(review, "HTTP", return_value=http), \
+                     patch("sys.argv", ["review", "smoke"]), self.assertRaises(review.ReviewError):
+                    review.main()
+                self.assertEqual(http.calls, [])
                 http = FakeHTTP()
                 with patch.dict(os.environ, dict(env, GITHUB_REF="refs/heads/feature"), clear=True), \
                      patch.object(review, "HTTP", return_value=http), \
@@ -678,6 +723,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("permissions: {}", text)
         self.assertIn("  workflow_dispatch:", text)
         self.assertIn("      pr_number:", text)
+        self.assertIn("      smoke_route:", text)
+        self.assertIn("options: [free, go]", text)
+        self.assertIn("default: free", text)
         self.assertIn("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)", text)
         self.assertIn("github.event.pull_request.number || inputs.pr_number", text)
         self.assertIn("EXPECTED_HEAD_SHA: ${{ needs.review.outputs.head }}", text)
@@ -689,7 +737,8 @@ class WorkflowTests(unittest.TestCase):
         smoke_job = read_job.split("  api-smoke:")[1]
         self.assertIn("contents: read", smoke_job)
         self.assertNotIn("GH_TOKEN", smoke_job)
-        self.assertNotIn("OPENCODE_GO_", smoke_job)
+        self.assertNotIn("OPENCODE_GO_MODEL:", smoke_job)
+        self.assertIn("OPENCODE_GO_NO_OVERAGE_CONFIRMED:", smoke_job)
         self.assertNotIn("pull-requests:", smoke_job)
         self.assertNotIn("upload-artifact", smoke_job)
         self.assertIn("python3 -I scripts/ci/opencode_review.py smoke", smoke_job)

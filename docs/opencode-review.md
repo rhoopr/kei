@@ -63,9 +63,17 @@ For a single API connectivity test instead of a PR review, dispatch:
 gh workflow run opencode-review.yml --repo rhoopr/kei --ref main -f mode=api_smoke
 ```
 
-This sends exactly one non-streaming `glm-5.3-flash-free` request containing only
-user text `test`, capped at 64 output tokens and a 16 KiB response. It has no Go
-fallback or retry, even on quota/availability errors. It uses the existing
+The default route is `free`. To test only the Go subscription route after
+confirming Console **Use balance** is disabled and the no-overage variable is
+`true`, add `-f smoke_route=go`. This is a separate, explicit request; the smoke
+test never changes routes automatically.
+
+Each dispatch sends exactly one non-streaming request containing only user text
+`test`, capped at 64 output tokens and a 16 KiB response. The `free` choice fixes
+`glm-5.3-flash-free` and its standard endpoint; `go` fixes `glm-5.3-flash` and the
+Go subscription endpoint. Unknown routes are rejected, and unconfirmed Go setup
+blocks before network use. There is no fallback or retry, even on quota,
+authentication, or availability errors. It uses the existing
 Actions secret only inside a separate read-only job. It sends no PR context,
 performs no publication, and creates no artifact. Logs show only fixed route,
 numeric HTTP status when available, and whether a completed text response was

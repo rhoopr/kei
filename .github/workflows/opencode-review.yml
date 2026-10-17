@@ -8,10 +8,15 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Review one PR or send one fixed free-only API test
+        description: Review one PR or send one fixed API test
         type: choice
         default: review
         options: [review, api_smoke]
+      smoke_route:
+        description: API test route (Go requires confirmed no-overage setup)
+        type: choice
+        default: free
+        options: [free, go]
       pr_number:
         description: Existing PR number to review once
         required: false
@@ -78,9 +83,10 @@ jobs:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
           sparse-checkout: scripts/ci
-      - name: Send one fixed free-only API test
+      - name: Send one fixed API test
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_GO_NO_OVERAGE_CONFIRMED: ${{ vars.OPENCODE_GO_NO_OVERAGE_CONFIRMED }}
         run: python3 -I scripts/ci/opencode_review.py smoke
 
   publish:

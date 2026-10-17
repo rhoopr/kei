@@ -399,12 +399,17 @@ def require_default_dispatch(event):
             "Manual review must run from the default branch.")
 
 
-def api_smoke(http, key, session):
-    """One free-only, fixed-prompt request; no PR data, fallback, artifact, or body logs."""
+def api_smoke(http, key, session, *, route="free", go_no_overage_confirmed=False):
+    """One allowlisted, fixed-prompt request; no PR data, fallback, artifact, or body logs."""
     require(bool(key), "OPENCODE_API_KEY is missing; no API test completed.")
+    require(isinstance(route, str) and route in {"free", "go"}, "Invalid API test route.")
+    require(type(go_no_overage_confirmed) is bool, "Invalid no-overage confirmation.")
+    require(route != "go" or go_no_overage_confirmed,
+            "Go API test blocked until Use balance is confirmed disabled.")
+    url, model = (FREE_URL, FREE_MODEL) if route == "free" else (GO_URL, DEFAULT_MODEL)
     try:
-        response = http.request("POST", FREE_URL, key, provider=True, session=session, limit=16 * 1024,
-                                payload={"model": FREE_MODEL,
+        response = http.request("POST", url, key, provider=True, session=session, limit=16 * 1024,
+                                payload={"model": model,
                                          "messages": [{"role": "user", "content": "test"}],
                                          "stream": False, "max_tokens": 64})
     except ProviderHTTPError:
@@ -412,8 +417,8 @@ def api_smoke(http, key, session):
     except ReviewError:
         status = http.last_status
         if type(status) is int and 100 <= status <= 599:
-            raise ReviewError(f"OpenCode free HTTP {status}; test response rejected.") from None
-        raise ReviewError("OpenCode free HTTP status unavailable; test request failed.") from None
+            raise ReviewError(f"OpenCode {route} HTTP {status}; test response rejected.") from None
+        raise ReviewError(f"OpenCode {route} HTTP status unavailable; test request failed.") from None
     status = http.last_status
     require(type(status) is int and 100 <= status <= 599, "API test status unavailable.")
     choices = response.get("choices") if isinstance(response, dict) else None
@@ -426,8 +431,8 @@ def api_smoke(http, key, session):
                 and message.get("role") == "assistant" and isinstance(content, str) and bool(content.strip())
                 and not message.get("tool_calls") and not message.get("function_call")
                 and not message.get("refusal"))
-    print(f"OpenCode free HTTP {status}; test response {'accepted' if accepted else 'rejected'}.")
-    require(accepted, "Free-only API test did not produce a completed text response.")
+    print(f"OpenCode {route} HTTP {status}; test response {'accepted' if accepted else 'rejected'}.")
+    require(accepted, "API test did not produce a completed text response.")
 
 
 def review_target(http, event, mode):
@@ -464,7 +469,9 @@ def main():
         require_default_dispatch(event)
         require(event.get("inputs", {}).get("mode") == "api_smoke", "API test mode required.")
         session = hashlib.sha256(f"api-smoke:{os.environ['GITHUB_REPOSITORY']}:{os.environ['GITHUB_RUN_ID']}".encode()).hexdigest()
-        api_smoke(http, os.environ.get("OPENCODE_API_KEY", ""), session)
+        api_smoke(http, os.environ.get("OPENCODE_API_KEY", ""), session,
+                  route=event.get("inputs", {}).get("smoke_route", "free"),
+                  go_no_overage_confirmed=os.environ.get("OPENCODE_GO_NO_OVERAGE_CONFIRMED") == "true")
         return
     if mode == "infer":
         prepared = load_json("review-input.json", MAX_PROMPT + MAX_CONTEXT)
