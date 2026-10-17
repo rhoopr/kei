@@ -49,8 +49,22 @@ qualification. Workflow, script, Cargo, build, fuzz, container-build, and unknow
 input changes also select full qualification. Ordinary code changes keep Linux
 all-feature and no-default tests, with macOS/Windows build and CLI/media/service
 smoke. Filesystem, state, configuration, and service changes select complete
-platform tests. Sync, provider, download, state, and retry changes select the
-large copies stress test. Docs-only PRs retain workflow/script lint and typos.
+platform tests. The large copies stress test follows its runtime owners:
+download, state, Photos provider, sync, configuration, retry, selection,
+filesystem/shared types, command service types, media fixtures, and its own
+queue-projection fixture. CLI entrypoints, unrelated commands, authentication,
+and other unit-test modules do not select it by themselves. The compact
+copies/reseed fixtures remain in ordinary offline tests.
+
+Routing uses filenames, not PR descriptions or semantic diff parsing. Changes
+inside shared runtime files still select stress even when a particular change
+is diagnostic. For example, #984 retains stress because it changes Photos
+hydration and session code; #985's reset command and unrelated test modules
+skip stress while keeping the full platform tests selected by its entrypoints.
+New files within stress runtime owners select stress conservatively. Renames
+consider both old and new paths. Full/heavy overrides, unknown top-level
+inputs, main pushes, and scheduled qualification retain stress. Docs-only PRs
+retain workflow/script lint and typos.
 
 ## Rollout
 
