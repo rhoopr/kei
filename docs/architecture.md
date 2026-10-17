@@ -2167,8 +2167,8 @@ retention cannot silently sever cross-round relationships. This evidence has no
 consumer in enumeration, recovery or checkpoint policy.
 
 `photos/album/preservation_proof/missing_reference.rs` owns observation-only
-lookup at the first missing-parent inventory refusal. Fixed pre-compaction shape
-categories live alongside every latest inventory record and count toward its
+lookup at the first missing-parent inventory refusal. Four byte-sized typed
+pre-compaction categories live alongside every latest inventory record and count toward its
 retained-byte budget, without a separate identity/count sampling cap. Lookup
 payload shape is separate from scope availability. Scope `matched` means the
 child scope matched; reference scope is also required and checked for a

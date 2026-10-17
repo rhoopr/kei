@@ -2,6 +2,7 @@
 use std::time::Duration;
 
 use rustc_hash::FxHashSet;
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -11,21 +12,62 @@ use crate::icloud::photos::session::DiagnosticLookupError;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_BYTES: usize = 64 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+enum RecordHistory {
+    NotRecorded,
+    FirstSeen,
+    Replacement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+enum ReferenceShape {
+    NotObserved,
+    Unavailable,
+    Missing,
+    Present,
+    Malformed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+enum SparseMarker {
+    NotRecorded,
+    Absent,
+    True,
+    False,
+    Malformed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+enum LinkageShape {
+    NotRecorded,
+    None,
+    PartialFields,
+    AllFields,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Observation {
-    history: &'static str,
-    prior_reference: &'static str,
-    sparse_marker: &'static str,
-    linkage: &'static str,
+    history: RecordHistory,
+    prior_reference: ReferenceShape,
+    sparse_marker: SparseMarker,
+    linkage: LinkageShape,
 }
 
 impl Observation {
     pub(super) fn unavailable() -> Self {
         Self {
-            history: "not_recorded",
-            prior_reference: "not_observed",
-            sparse_marker: "not_recorded",
-            linkage: "not_recorded",
+            history: RecordHistory::NotRecorded,
+            prior_reference: ReferenceShape::NotObserved,
+            sparse_marker: SparseMarker::NotRecorded,
+            linkage: LinkageShape::NotRecorded,
         }
     }
 
@@ -41,43 +83,45 @@ impl Observation {
         .count();
         Self {
             history: if prior.is_some() {
-                "replacement"
+                RecordHistory::Replacement
             } else {
-                "first_seen"
+                RecordHistory::FirstSeen
             },
-            prior_reference: prior.map_or("not_observed", |r| {
+            prior_reference: prior.map_or(ReferenceShape::NotObserved, |r| {
                 if r.deleted == Some(true) || r.record_type != "CPLAsset" {
-                    "unavailable"
+                    ReferenceShape::Unavailable
                 } else {
                     reference_shape(&r.fields)
                 }
             }),
             sparse_marker: match marker {
-                None => "absent",
-                Some(v) if v.as_bool() == Some(true) || v.as_i64() == Some(1) => "true",
-                Some(v) if v.as_bool() == Some(false) || v.as_i64() == Some(0) => "false",
-                Some(_) => "malformed",
+                None => SparseMarker::Absent,
+                Some(v) if v.as_bool() == Some(true) || v.as_i64() == Some(1) => SparseMarker::True,
+                Some(v) if v.as_bool() == Some(false) || v.as_i64() == Some(0) => {
+                    SparseMarker::False
+                }
+                Some(_) => SparseMarker::Malformed,
             },
             linkage: match linkage {
-                0 => "none",
-                3 => "all_fields",
-                _ => "partial_fields",
+                0 => LinkageShape::None,
+                3 => LinkageShape::AllFields,
+                _ => LinkageShape::PartialFields,
             },
         }
     }
 }
 
-fn reference_shape(fields: &Value) -> &'static str {
+fn reference_shape(fields: &Value) -> ReferenceShape {
     match fields.pointer("/masterRef/value") {
-        None => "missing",
+        None => ReferenceShape::Missing,
         Some(v)
             if v.get("recordName")
                 .and_then(Value::as_str)
                 .is_some_and(|s| !s.trim().is_empty()) =>
         {
-            "present"
+            ReferenceShape::Present
         }
-        Some(_) => "malformed",
+        Some(_) => ReferenceShape::Malformed,
     }
 }
 

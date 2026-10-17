@@ -1,4 +1,7 @@
-use super::{Observation, RESPONSE_BYTES, classify as lookup_observation};
+use super::{
+    LinkageShape, Observation, RESPONSE_BYTES, RecordHistory, ReferenceShape, SparseMarker,
+    classify as lookup_observation,
+};
 use crate::icloud::photos::album::preservation_proof::tests::{BUDGET, masters};
 use crate::icloud::photos::album::test_support::{
     canned_changes_page, changes_asset, changes_master, default_zone, make_album_with_session,
@@ -311,20 +314,20 @@ fn missing_reference_observations_describe_only_immediate_retained_history() {
         .unwrap()
         .remove("masterRef");
     let o = Observation::new(&replacement, Some(&first));
-    assert_eq!(o.history, "replacement");
-    assert_eq!(o.prior_reference, "present");
+    assert_eq!(o.history, RecordHistory::Replacement);
+    assert_eq!(o.prior_reference, ReferenceShape::Present);
     first.fields["masterRef"] = json!({"value":null});
     assert_eq!(
         Observation::new(&replacement, Some(&first)).prior_reference,
-        "malformed"
+        ReferenceShape::Malformed
     );
     assert_eq!(
         Observation::new(&replacement, Some(&replacement)).prior_reference,
-        "missing"
+        ReferenceShape::Missing
     );
     assert_eq!(
         Observation::new(&replacement, None).prior_reference,
-        "not_observed"
+        ReferenceShape::NotObserved
     );
 }
 
@@ -346,9 +349,12 @@ fn missing_reference_compacted_prior_is_unavailable() {
     prior.fields = Value::Null;
     assert_eq!(
         Observation::new(&current, Some(&prior)).prior_reference,
-        "unavailable"
+        ReferenceShape::Unavailable
     );
-    assert_eq!(Observation::unavailable().history, "not_recorded");
+    assert_eq!(
+        Observation::unavailable().history,
+        RecordHistory::NotRecorded
+    );
 }
 
 #[tokio::test]
@@ -418,10 +424,10 @@ fn issue845f_compaction_preserves_references_and_valid_sparse_link_is_not_member
     let prior: super::Record = serde_json::from_value(child("master")).unwrap();
     let mut current: super::Record = serde_json::from_value(sparse).unwrap();
     let observation = Observation::new(&current, Some(&prior));
-    assert_eq!(observation.history, "replacement");
-    assert_eq!(observation.prior_reference, "present");
-    assert_eq!(observation.sparse_marker, "true");
-    assert_eq!(observation.linkage, "all_fields");
+    assert_eq!(observation.history, RecordHistory::Replacement);
+    assert_eq!(observation.prior_reference, ReferenceShape::Present);
+    assert_eq!(observation.sparse_marker, SparseMarker::True);
+    assert_eq!(observation.linkage, LinkageShape::AllFields);
     super::super::compact_record(&mut current, &masters());
     assert!(current.fields.pointer("/masterRef/value").is_none());
     assert!(current.fields.get("linkedShareRecordName").is_none());
@@ -562,4 +568,57 @@ fn missing_reference_scope_sites_keep_untrusted_family_unknown() {
         assert_eq!(observation.shape, "live_reference");
         assert_eq!(observation.family, "not_established");
     }
+}
+
+#[test]
+fn missing_reference_compact_categories_preserve_labels_and_layout() {
+    assert_eq!(
+        json!([
+            RecordHistory::NotRecorded,
+            RecordHistory::FirstSeen,
+            RecordHistory::Replacement
+        ]),
+        json!(["not_recorded", "first_seen", "replacement"])
+    );
+    assert_eq!(
+        json!([
+            ReferenceShape::NotObserved,
+            ReferenceShape::Unavailable,
+            ReferenceShape::Missing,
+            ReferenceShape::Present,
+            ReferenceShape::Malformed
+        ]),
+        json!([
+            "not_observed",
+            "unavailable",
+            "missing",
+            "present",
+            "malformed"
+        ])
+    );
+    assert_eq!(
+        json!([
+            SparseMarker::NotRecorded,
+            SparseMarker::Absent,
+            SparseMarker::True,
+            SparseMarker::False,
+            SparseMarker::Malformed
+        ]),
+        json!(["not_recorded", "absent", "true", "false", "malformed"])
+    );
+    assert_eq!(
+        json!([
+            LinkageShape::NotRecorded,
+            LinkageShape::None,
+            LinkageShape::PartialFields,
+            LinkageShape::AllFields
+        ]),
+        json!(["not_recorded", "none", "partial_fields", "all_fields"])
+    );
+    assert_eq!(std::mem::size_of::<Observation>(), 4);
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(
+        std::mem::size_of::<(String, super::Record, usize, Observation)>(),
+        std::mem::size_of::<(String, super::Record, usize)>() + 8
+    );
 }
