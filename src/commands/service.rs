@@ -1509,6 +1509,13 @@ mod tests {
             )
             .await
             .unwrap();
+            #[cfg(target_os = "linux")]
+            let mut child = auth::session::lock_inheritance::Holder::fork(&session);
+            #[cfg(target_os = "linux")]
+            assert!(
+                !child.probe(),
+                "replacement must exclude an independent child open"
+            );
             let result = super::replace_authenticated_session(
                 &mut current,
                 auth::AuthResult {
@@ -1522,6 +1529,11 @@ mod tests {
                     .unwrap_err()
                     .downcast_ref::<auth::error::AuthError>()
                     .is_some_and(auth::error::AuthError::is_account_identity_changed)
+            );
+            #[cfg(target_os = "linux")]
+            assert!(
+                child.probe(),
+                "rejected replacement must unlock while child lives"
             );
             assert_eq!(current.principal(), Some(pin.as_str()));
             assert_eq!(

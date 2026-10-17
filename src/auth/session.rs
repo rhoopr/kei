@@ -149,7 +149,7 @@ impl SessionStateGuard {
         })?;
         let sanitized_username = crate::account::namespace(username, realm);
         let lock_path = cookie_dir.join(format!("{sanitized_username}.lock"));
-        let (lock_file, generation) = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -169,20 +169,23 @@ impl SessionStateGuard {
                 ))
                 .into());
             }
-            let generation = read_lock_generation(&file)?;
-            Ok::<_, anyhow::Error>((file, generation))
+            // Own the acquired lock before fallible generation validation so
+            // rejected construction also explicitly unlocks inherited descriptors.
+            let guard = Self {
+                cookie_dir,
+                sanitized_username,
+                lock_file: file,
+                generation: AtomicU64::new(0),
+                locked: AtomicBool::new(true),
+            };
+            let generation = read_lock_generation(&guard.lock_file)?;
+            if expected_generation.is_some_and(|expected| expected.0 != generation) {
+                return Err(crate::auth::error::AuthError::SessionReset.into());
+            }
+            guard.generation.store(generation, Ordering::Release);
+            Ok::<_, anyhow::Error>(guard)
         })
-        .await??;
-        if expected_generation.is_some_and(|expected| expected.0 != generation) {
-            return Err(crate::auth::error::AuthError::SessionReset.into());
-        }
-        Ok(Self {
-            cookie_dir,
-            sanitized_username,
-            lock_file,
-            generation: AtomicU64::new(generation),
-            locked: AtomicBool::new(true),
-        })
+        .await?
     }
 
     pub(crate) fn files(&self) -> [PathBuf; 3] {
@@ -275,6 +278,16 @@ impl SessionStateGuard {
         }
         self.locked.store(true, Ordering::Release);
         Ok(())
+    }
+}
+
+impl Drop for SessionStateGuard {
+    fn drop(&mut self) {
+        // Closing our descriptor alone can leave a forked child's copy holding
+        // the shared open-file-description lock until exec or exit.
+        if let Err(error) = self.release() {
+            tracing::warn!(%error, "Could not release session lock on drop");
+        }
     }
 }
 
@@ -1037,6 +1050,138 @@ impl Session {
     }
 }
 
+// Linux fork fixture: only async-signal-safe syscalls run in the child.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod lock_inheritance {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    pub(crate) struct Holder {
+        pid: libc::pid_t,
+        channel: UnixStream,
+    }
+
+    impl Holder {
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "post-fork child is a single syscall-only protocol with no Rust cleanup"
+        )]
+        pub(crate) fn fork(session: &super::Session) -> Self {
+            let fd = session.state_guard.lock_file.as_raw_fd();
+            let path = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).unwrap();
+            let (parent, child) = UnixStream::pair().unwrap();
+            parent
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            parent
+                .set_write_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            // SAFETY: after fork the child uses only open/flock/close,
+            // read/write/poll and _exit with live preallocated storage.
+            // It never runs Rust destructors, allocates or takes Rust locks.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                let socket = child.as_raw_fd();
+                // SAFETY: descriptors and NUL-terminated path were prepared
+                // before fork; byte buffers and poll storage remain live.
+                unsafe {
+                    libc::close(parent.as_raw_fd());
+                    let mut request = [0_u8];
+                    loop {
+                        let mut poll = libc::pollfd {
+                            fd: socket,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        if libc::poll(&raw mut poll, 1, 30_000) != 1
+                            || libc::read(socket, request.as_mut_ptr().cast(), 1) != 1
+                        {
+                            libc::_exit(1);
+                        }
+                        if request[0] == b'Q' {
+                            libc::_exit(0);
+                        }
+                        let probe = libc::open(path.as_ptr(), libc::O_RDWR);
+                        if probe < 0 {
+                            libc::_exit(2);
+                        }
+                        let target = if request[0] == b'L' { fd } else { probe };
+                        let result = libc::flock(target, libc::LOCK_EX | libc::LOCK_NB);
+                        let error = *libc::__errno_location();
+                        let response = [if result == 0 {
+                            1
+                        } else if error == libc::EWOULDBLOCK {
+                            0
+                        } else {
+                            2
+                        }];
+                        libc::close(probe);
+                        if libc::write(socket, response.as_ptr().cast(), 1) != 1 {
+                            libc::_exit(3);
+                        }
+                    }
+                }
+            }
+            drop(child);
+            eprintln!("synthetic session-lock holder: child={pid}, inherited_fd={fd}");
+            Self {
+                pid,
+                channel: parent,
+            }
+        }
+
+        pub(crate) fn probe(&mut self) -> bool {
+            self.exchange(b'P')
+        }
+
+        pub(crate) fn lock_in_child(&mut self) {
+            assert!(
+                self.exchange(b'L'),
+                "child must acquire inherited description"
+            );
+        }
+
+        fn exchange(&mut self, request: u8) -> bool {
+            self.channel.write_all(&[request]).unwrap();
+            let mut response = [0];
+            self.channel.read_exact(&mut response).unwrap();
+            eprintln!(
+                "synthetic session-lock probe: child={}, request={}, acquired={}",
+                self.pid,
+                char::from(request),
+                response[0]
+            );
+            assert!(
+                response[0] <= 1,
+                "child flock failed without lock contention"
+            );
+            response == [1]
+        }
+    }
+
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            let _ = self.channel.write_all(b"Q");
+            let mut status = 0;
+            // SAFETY: pid is our unreaped child; status is writable storage.
+            let mut result = unsafe { libc::waitpid(self.pid, &raw mut status, 0) };
+            while result == -1
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                // SAFETY: retrying an interrupted wait still targets our child.
+                result = unsafe { libc::waitpid(self.pid, &raw mut status, 0) };
+            }
+            if !std::thread::panicking() {
+                assert_eq!(result, self.pid, "fork fixture must reap its child");
+                assert_eq!(status, 0, "fork fixture child must exit cleanly");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1096,6 +1241,127 @@ mod tests {
         let _s2 = Session::new(&dir, "user@test.com", "https://example.com", None)
             .await
             .expect("Lock should be released after drop");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn inherited_session_lock_drop_releases_while_child_lives() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = Session::new(
+            directory.path(),
+            "synthetic@example.invalid",
+            "https://www.icloud.com",
+            None,
+        )
+        .await
+        .unwrap();
+        let mut child = lock_inheritance::Holder::fork(&session);
+        assert!(
+            !child.probe(),
+            "independent child open must contend while owned"
+        );
+        drop(session);
+        assert!(
+            child.probe(),
+            "drop must unlock despite the inherited descriptor"
+        );
+        let _next = Session::new(
+            directory.path(),
+            "synthetic@example.invalid",
+            "https://www.icloud.com",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !child.probe(),
+            "a fresh production session must exclude the child"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn inherited_session_lock_release_reacquire_and_released_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = Session::new(
+            directory.path(),
+            "synthetic@example.invalid",
+            "https://www.icloud.com",
+            None,
+        )
+        .await
+        .unwrap();
+        let mut child = lock_inheritance::Holder::fork(&session);
+        session.release_lock().unwrap();
+        session.release_lock().unwrap();
+        assert!(child.probe());
+        session.reacquire_lock().unwrap();
+        assert!(!child.probe());
+        session.release_lock().unwrap();
+        child.lock_in_child();
+        drop(session);
+        assert!(
+            !child.probe(),
+            "released guard drop must not unlock the child's later lock"
+        );
+        drop(child);
+        let _next = Session::new(
+            directory.path(),
+            "synthetic@example.invalid",
+            "https://www.icloud.com",
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn inherited_session_lock_reset_preserves_generation_invalidation() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = Session::new(
+            directory.path(),
+            "synthetic@example.invalid",
+            "https://www.icloud.com",
+            None,
+        )
+        .await
+        .unwrap();
+        let generation = session.generation();
+        session.release_lock().unwrap();
+        let reset = Session::new_fresh(
+            directory.path(),
+            "synthetic@example.invalid",
+            "https://www.icloud.com",
+        )
+        .await
+        .unwrap();
+        let mut child = lock_inheritance::Holder::fork(&reset);
+        assert!(!child.probe());
+        drop(reset);
+        assert!(child.probe());
+        let error = session.reacquire_lock().unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<auth::error::AuthError>(),
+            Some(auth::error::AuthError::SessionReset)
+        ));
+        let error = Session::new_after_release(
+            directory.path(),
+            "synthetic@example.invalid",
+            "https://www.icloud.com",
+            None,
+            generation,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<auth::error::AuthError>(),
+            Some(auth::error::AuthError::SessionReset)
+        ));
+        assert!(
+            child.probe(),
+            "generation rejection must leave the lock available"
+        );
     }
 
     #[tokio::test]
