@@ -2,7 +2,7 @@
 
 use super::formats::native_file_type;
 use super::prepared::{
-    PreparedMetadataFile, TmpGuard, create_unique_embed_temp, fingerprint_bytes,
+    PreparedMetadataFile, TmpGuard, create_unique_embed_temp, fingerprint_bytes, keep_source_mtime,
 };
 use super::values::MetadataWrite;
 use anyhow::{Context, Result};
@@ -160,6 +160,7 @@ pub(super) fn prepare_metadata_native(
     let file = writer
         .into_inner()
         .with_context(|| format!("Could not flush {}", tmp_path.display()))?;
+    keep_source_mtime(&file, path);
     file.set_permissions(source_permissions)
         .with_context(|| format!("Could not preserve permissions on {}", tmp_path.display()))?;
     file.sync_all()
@@ -232,6 +233,14 @@ mod native_tests {
     fn native_apply_metadata_writes_jpeg_exif_without_xmp_feature() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_jpeg(dir.path(), "native.jpg");
+        let captured = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        // Windows needs a writable handle to set the fixture timestamp.
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(captured)
+            .unwrap();
 
         apply_metadata(
             &path,
@@ -273,6 +282,7 @@ mod native_tests {
             first_unknown_int16(&metadata, WINDOWS_RATING_PERCENT_TAG),
             Some(99)
         );
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), captured);
     }
 
     #[test]

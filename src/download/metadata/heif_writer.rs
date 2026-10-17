@@ -1,6 +1,8 @@
 //! HEIF-family metadata preparation with media-preservation checks.
 
-use super::prepared::{PreparedMetadataFile, TmpGuard, create_unique_embed_temp};
+use super::prepared::{
+    PreparedMetadataFile, TmpGuard, create_unique_embed_temp, keep_source_mtime,
+};
 use super::values::MetadataWrite;
 use super::xmp_fields::{apply_to_xmp, ensure_initialized};
 use crate::download::heif;
@@ -178,6 +180,7 @@ pub(super) fn prepare_metadata_heif(
                 rewritten_xmp.len()
             );
         }
+        keep_source_mtime(&file, path);
         file.set_permissions(source_permissions)
             .with_context(|| format!("Could not preserve permissions on {}", tmp_path.display()))?;
         file.sync_all()

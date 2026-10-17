@@ -1660,7 +1660,7 @@ files and links at candidate temporary paths remain untouched. Safe pre-exchange
 failures remove only the uniquely owned prepared file. Concurrent edits preserve
 the source and its catalogue checksum evidence, keep the durable rewrite marker,
 and leave any ambiguously displaced entry at its reported sibling path. The
-replacement file retains the source permissions.
+replacement file retains the source permissions and mtime.
 
 On Linux, filesystems that reject `RENAME_EXCHANGE` use a journaled fallback.
 An exclusively created, owner-only sibling directory holds a version-1 JSON
