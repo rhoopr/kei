@@ -1829,6 +1829,18 @@ valid current-work preservation proof. Original capture revision and retry histo
 remain stored. Advancing current sync does not claim a complete historical backup;
 backup safety remains false while attribution is unresolved.
 
+A missing selected receipt also emits `legacy_receipt_prerequisite_v1` with
+one fixed `prerequisite`: child readiness, absent rendition or scoped path receipt,
+binding mismatch, or missing/invalid verified source. This is a read-only snapshot
+after refusal, not acceptance evidence. A newly eligible snapshot reports
+`receipt_state_changed`; failed or unsupported inspection reports
+`diagnostic_unavailable`. Both retain the original `child_receipt_missing` hold.
+The lookup cannot grant qualification, retry work, write state or inspect media.
+It emits no child/library identifiers, paths, hashes or private database errors;
+support history retains only the enumerated prerequisite. One refusal does not
+establish how many families lack proof. Primary sparse-identity recovery remains
+independent.
+
 Automatic repair processes at most 500 stale assets per library in one sync
 cycle. When a clean batch makes progress and work remains, watch and service
 mode wait at most 60 seconds before the next cycle. A stalled or failed batch

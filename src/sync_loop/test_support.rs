@@ -512,6 +512,7 @@ pub(super) struct FailingMetadataSetDb {
     pub(super) fail_source_delete: bool,
     pub(super) fail_mark_downloaded: bool,
     omit_verified_source: bool,
+    receipt_diagnostic: Option<Result<state::db::LegacyChildReceiptRefusal, &'static str>>,
     pub(super) fail_refresh_downloaded_metadata: bool,
     /// Stands in for a concurrent pass: refreshes the row to this snapshot
     /// and marks it for rewrite in the window between the downloader
@@ -540,6 +541,14 @@ impl std::fmt::Debug for FailingMetadataSetDb {
 impl FailingMetadataSetDb {
     pub(super) fn with_unknown_download_source(mut self) -> Self {
         self.omit_verified_source = true;
+        self
+    }
+
+    pub(super) fn with_receipt_diagnostic(
+        mut self,
+        result: Result<state::db::LegacyChildReceiptRefusal, &'static str>,
+    ) -> Self {
+        self.receipt_diagnostic = Some(result);
         self
     }
 
@@ -602,6 +611,7 @@ impl FailingMetadataSetDb {
             fail_source_delete: false,
             fail_mark_downloaded: false,
             omit_verified_source: false,
+            receipt_diagnostic: None,
             fail_refresh_downloaded_metadata: false,
             refresh_on_mark_downloaded: None,
             drains: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1406,6 +1416,20 @@ impl state::MetadataRewriteStore for FailingMetadataSetDb {
         id: &str,
     ) -> Result<Vec<crate::state::AssetRecord>, crate::state::error::StateError> {
         self.inner.legacy_child_receipts(library, id).await
+    }
+    async fn legacy_child_receipt_refusal(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+    ) -> Result<state::db::LegacyChildReceiptRefusal, state::error::StateError> {
+        if let Some(result) = self.receipt_diagnostic {
+            return result
+                .map_err(|message| state::error::StateError::LockPoisoned(message.into()));
+        }
+        self.inner
+            .legacy_child_receipt_refusal(library, id, version_size)
+            .await
     }
     async fn legacy_preparation_snapshots(
         &self,

@@ -29,7 +29,8 @@ pub(crate) mod provider_inbox;
 pub(crate) mod provider_selection;
 pub(crate) mod provider_work;
 pub(crate) use legacy_preservation::{
-    LegacyActivationProof, LegacyFileEvidence, LegacyPreparationSnapshot, LegacyPreservation,
+    LegacyActivationProof, LegacyChildReceiptRefusal, LegacyFileEvidence,
+    LegacyPreparationSnapshot, LegacyPreservation,
 };
 pub(crate) mod primary_layout;
 mod reconciliation;

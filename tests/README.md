@@ -1572,6 +1572,22 @@ tokens retain the pending config until healthy query recovery. The query owns
 its local selection proof and inventory; delta evidence adds vetoes and supplies
 only the source successor.
 
+### Legacy receipt prerequisite diagnostics
+
+`legacy_receipt_prerequisites_are_read_only_after_reopen` uses verified file-backed
+SQLite receipts and 23 synthetic conditions, then reopens each database and runs
+the explanation twice on a query-only connection. It distinguishes readiness,
+missing rendition/path receipt, wrong scoped binding, unknown/invalid source and
+a now-eligible snapshot; qualification, SQLite change count and media stay intact.
+The existing historical-source and exact-binding matrices retain their acceptance
+oracles. Ordinary and Hidden production-cycle unknown-source controls retain the
+original checkpoint/proof/row/file checks and require the fixed prerequisite label.
+A production-cycle fallback control injects read failure, unavailable inspection
+and a changed snapshot while retaining unknown provenance and every checkpoint hold.
+Support-history round-trip coverage permits only the eight fixed labels and drops
+identifiers, paths, hashes, errors and unknown future labels. No reporter data,
+authenticated run, recovery action, migration or new acceptance rule is exercised.
+
 ## Token-equivalence diagnostics
 
 `cargo test --lib token_equivalence` covers invocation-local token groups,

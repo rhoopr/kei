@@ -464,6 +464,7 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "http_status",
             "interrupted",
         ]),
+        "legacy_receipt_prerequisite_v1" => Some(&["prerequisite"]),
         "legacy_preservation_hardlink_trust" => Some(&["stage", "reason", "affected_paths"]),
         "expired_url_refresh_failed" => Some(&[
             "failed_records",
@@ -493,6 +494,22 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
 // Revalidate saved history as strictly as current producer observations.
 fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
     let label = value.as_str();
+    if kind == "legacy_receipt_prerequisite_v1" {
+        return key == "prerequisite"
+            && matches!(
+                label,
+                Some(
+                    "child_not_ready"
+                        | "rendition_missing"
+                        | "path_receipt_missing"
+                        | "receipt_binding_mismatch"
+                        | "source_receipt_missing"
+                        | "source_receipt_invalid"
+                        | "receipt_state_changed"
+                        | "diagnostic_unavailable"
+                )
+            );
+    }
     if kind == "support_missing_reference_v1" {
         return match key {
             "record_history" => {

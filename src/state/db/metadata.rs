@@ -1398,6 +1398,14 @@ impl MetadataRewriteStore for SqliteStateDb {
     ) -> Result<Vec<crate::state::AssetRecord>, crate::state::error::StateError> {
         SqliteStateDb::legacy_child_receipts(self, library, id).await
     }
+    async fn legacy_child_receipt_refusal(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+    ) -> Result<super::LegacyChildReceiptRefusal, StateError> {
+        SqliteStateDb::legacy_child_receipt_refusal(self, library, id, version_size).await
+    }
     async fn legacy_preparation_snapshots(
         &self,
         library: &str,

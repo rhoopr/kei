@@ -579,3 +579,53 @@ fn missing_reference_history_survives_restart_and_revalidates_export() {
             .contains("private-provider-id")
     );
 }
+
+#[test]
+fn legacy_receipt_prerequisites_roundtrip_only_fixed_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("support.json");
+    let mut history = History {
+        schema_version: 1,
+        ..History::default()
+    };
+    apply(&mut history, Message::Begin(json!({})));
+    let labels = [
+        "child_not_ready",
+        "rendition_missing",
+        "path_receipt_missing",
+        "receipt_binding_mismatch",
+        "source_receipt_missing",
+        "source_receipt_invalid",
+        "receipt_state_changed",
+        "diagnostic_unavailable",
+    ];
+    for label in labels {
+        add(&mut history, "legacy_receipt_prerequisite_v1", json!({"prerequisite":label,"id":"private-id","path":"/private/path","checksum":"private-checksum","error":"private-error"}).as_object().unwrap().clone());
+    }
+    add(
+        &mut history,
+        "legacy_receipt_prerequisite_v1",
+        json!({"prerequisite":"private-new-label"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    save(&path, &mut history).unwrap();
+    let (reopened, status) = read(&path);
+    assert_eq!(status, "available");
+    let observed: Vec<_> = reopened.cycles[0]
+        .diagnostics
+        .iter()
+        .filter_map(|d| {
+            d.fields
+                .get("prerequisite")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    assert_eq!(observed, labels);
+    assert!(
+        !serde_json::to_string(&reopened)
+            .unwrap()
+            .contains("private")
+    );
+}

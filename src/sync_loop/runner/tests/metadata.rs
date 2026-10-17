@@ -3695,6 +3695,25 @@ async fn exercise_legacy_child_cycles_with_provenance(
     smart_only: bool,
     signature_bytes: Option<usize>,
 ) {
+    Box::pin(exercise_legacy_child_cycles_with_receipt_diagnostic(
+        fault,
+        child_counts,
+        hardlink_fault,
+        smart_only,
+        signature_bytes,
+        None,
+    ))
+    .await;
+}
+
+async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
+    fault: AmbiguousChildFault,
+    child_counts: &[usize],
+    hardlink_fault: Option<LegacyHardlinkFault>,
+    smart_only: bool,
+    signature_bytes: Option<usize>,
+    diagnostic: Option<Result<state::db::LegacyChildReceiptRefusal, &'static str>>,
+) {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -4174,13 +4193,15 @@ async fn exercise_legacy_child_cycles_with_provenance(
                 let cancel = CancellationToken::new();
                 let db: Arc<dyn download::DownloadStore> =
                     if matches!(fault, AmbiguousChildFault::PreserveUnknownSource) {
-                        Arc::new(
-                            FailingMetadataSetDb::without_set_failure(
-                                inner.clone(),
-                                "unknown source fixture",
-                            )
-                            .with_unknown_download_source(),
+                        let mut unknown = FailingMetadataSetDb::without_set_failure(
+                            inner.clone(),
+                            "unknown source fixture",
                         )
+                        .with_unknown_download_source();
+                        if let Some(result) = diagnostic {
+                            unknown = unknown.with_receipt_diagnostic(result);
+                        }
+                        Arc::new(unknown)
                     } else if cycle == 0
                         && matches!(
                             fault,
@@ -4685,6 +4706,17 @@ async fn exercise_legacy_child_cycles_with_provenance(
                     let warning = std::fs::read_to_string(&warning_path).unwrap();
                     assert!(warning.contains("legacy_certification_refusal_v1"));
                     assert!(warning.contains("child_receipt_missing"));
+                    assert!(warning.contains("legacy_receipt_prerequisite_v1"));
+                    let expected = if matches!(fault, AmbiguousChildFault::PreserveUnknownSource) {
+                        diagnostic
+                            .unwrap_or(Ok(state::db::LegacyChildReceiptRefusal::SourceMissing))
+                            .unwrap_or(state::db::LegacyChildReceiptRefusal::Unavailable)
+                            .label()
+                    } else {
+                        "child_not_ready"
+                    };
+                    assert!(warning.contains(&format!("prerequisite=\"{expected}\"")));
+                    assert!(!warning.contains("private receipt database failure"));
                     assert!(!warning.contains("child-0-unique"));
                 }
                 if activated {
@@ -5292,6 +5324,25 @@ async fn run_cycle_legacy_opaque_mmcs_unknown_source_stays_held() {
             None,
             smart_only,
             Some(21),
+        ))
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn run_cycle_legacy_receipt_diagnostic_never_grants_progress() {
+    for diagnostic in [
+        Err("private receipt database failure"),
+        Ok(state::db::LegacyChildReceiptRefusal::Unavailable),
+        Ok(state::db::LegacyChildReceiptRefusal::StateChanged),
+    ] {
+        Box::pin(exercise_legacy_child_cycles_with_receipt_diagnostic(
+            AmbiguousChildFault::PreserveUnknownSource,
+            &[1],
+            None,
+            true,
+            Some(21),
+            Some(diagnostic),
         ))
         .await;
     }

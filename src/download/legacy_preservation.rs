@@ -700,10 +700,29 @@ async fn qualify_family(
             .await
             .context(LegacyProofRefusal("child_receipt_read_failed"))?;
         for (version, checksum) in versions {
-            let receipt = receipts
+            let Some(receipt) = receipts
                 .iter()
                 .find(|receipt| receipt.version_size == version)
-                .context(LegacyProofRefusal("child_receipt_missing"))?;
+            else {
+                // This read only explains the refusal above. Never reuse its
+                // newer observations as acceptance evidence or retry the read.
+                let prerequisite = db
+                    .legacy_child_receipt_refusal(
+                        &record.library,
+                        child.asset_record_name(),
+                        version.as_str(),
+                    )
+                    .await
+                    .unwrap_or(crate::state::db::LegacyChildReceiptRefusal::Unavailable);
+                tracing::warn!(
+                    diagnostic = "legacy_receipt_prerequisite_v1",
+                    prerequisite = prerequisite.label(),
+                    "Required legacy current-child receipt is ineligible; retaining certification hold"
+                );
+                return Err(anyhow::Error::new(LegacyProofRefusal(
+                    "child_receipt_missing",
+                )));
+            };
             anyhow::ensure!(
                 receipt.checksum.as_ref() == checksum
                     && Some(receipt.created_at) == child.asset_date_evidence()

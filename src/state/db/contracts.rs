@@ -976,6 +976,17 @@ pub trait MetadataRewriteStore: Send + Sync {
             detail: "legacy preservation is unsupported by this store".into(),
         })
     }
+    /// Diagnostic-only explanation after a selected receipt was refused. This
+    /// cannot supply a receipt or authorize progress; unsupported stores retain
+    /// the ordinary refusal without requiring a new implementation.
+    async fn legacy_child_receipt_refusal(
+        &self,
+        _library: &str,
+        _id: &str,
+        _version_size: &str,
+    ) -> Result<super::LegacyChildReceiptRefusal, StateError> {
+        Ok(super::LegacyChildReceiptRefusal::Unavailable)
+    }
     async fn legacy_preparation_snapshots(
         &self,
         _library: &str,

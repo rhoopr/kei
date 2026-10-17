@@ -209,6 +209,39 @@ fn preparation_snapshot(
     }))
 }
 
+/// Diagnostic-only snapshot after an already refused selected receipt. It never
+/// grants qualification, even if another writer has since made the row eligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacyChildReceiptRefusal {
+    ChildNotReady,
+    RenditionMissing,
+    PathReceiptMissing,
+    BindingMismatch,
+    SourceMissing,
+    SourceInvalid,
+    StateChanged,
+    Unavailable,
+}
+
+impl LegacyChildReceiptRefusal {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ChildNotReady => "child_not_ready",
+            Self::RenditionMissing => "rendition_missing",
+            Self::PathReceiptMissing => "path_receipt_missing",
+            Self::BindingMismatch => "receipt_binding_mismatch",
+            Self::SourceMissing => "source_receipt_missing",
+            Self::SourceInvalid => "source_receipt_invalid",
+            Self::StateChanged => "receipt_state_changed",
+            Self::Unavailable => "diagnostic_unavailable",
+        }
+    }
+}
+
+fn child_receipts_ready(conn: &Connection, library: &str, id: &str) -> Result<bool, StateError> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id=?2 AND revision>=?3) AND NOT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND (status!='downloaded' OR is_deleted!=0 OR metadata_hash IS NULL OR metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND (metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL))", params![library, id, crate::state::METADATA_CAPTURE_REVISION], |row| row.get(0))?)
+}
+
 impl SqliteStateDb {
     /// Return only finalized current-child receipts with verified per-path source
     /// provenance for the exact provider generation and current local bytes.
@@ -223,7 +256,7 @@ impl SqliteStateDb {
         let library = library.to_owned();
         let id = id.to_owned();
         self.with_conn("legacy_child_receipts",move |conn| {
-            let ready:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id=?2 AND revision>=?3) AND NOT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND (status!='downloaded' OR is_deleted!=0 OR metadata_hash IS NULL OR metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND (metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL))",params![library,id,crate::state::METADATA_CAPTURE_REVISION],|r|r.get(0))?;
+            let ready = child_receipts_ready(conn, &library, &id)?;
             if !ready { return Ok(Vec::new()); }
             let mut stmt=conn.prepare(&format!("SELECT {} FROM assets WHERE library=?1 AND id=?2 AND EXISTS (
                 SELECT 1 FROM asset_metadata_paths p WHERE p.library=assets.library AND p.id=assets.id
@@ -232,6 +265,56 @@ impl SqliteStateDb {
                 AND length(p.source_checksum)=64 AND p.source_checksum NOT GLOB '*[^0-9a-f]*'
             ) ORDER BY version_size",super::rows::ASSET_COLUMNS))?;
             Ok(stmt.query_map(params![library,id],super::rows::row_to_asset_record)?.collect::<Result<Vec<_>,_>>()?)
+        }).await
+    }
+
+    /// Explain a missing selected receipt without writing state or changing the
+    /// acceptance query. These observations can differ from the preceding read.
+    pub(crate) async fn legacy_child_receipt_refusal(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+    ) -> Result<LegacyChildReceiptRefusal, StateError> {
+        let library = library.to_owned();
+        let id = id.to_owned();
+        let version_size = version_size.to_owned();
+        self.with_conn("legacy_child_receipt_refusal", move |conn| {
+            if !child_receipts_ready(conn, &library, &id)? {
+                return Ok(LegacyChildReceiptRefusal::ChildNotReady);
+            }
+            let rendition: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND version_size=?3)",
+                params![library, id, version_size], |row| row.get(0),
+            )?;
+            if !rendition {
+                return Ok(LegacyChildReceiptRefusal::RenditionMissing);
+            }
+            let receipt: Option<(bool, bool)> = conn.query_row(
+                "SELECT p.source_checksum IS NOT NULL,
+                        COALESCE(length(p.source_checksum)=64 AND p.source_checksum NOT GLOB '*[^0-9a-f]*', 0)
+                 FROM assets a JOIN asset_metadata_paths p ON p.library=a.library AND p.id=a.id
+                   AND p.version_size=a.version_size AND p.local_path=a.local_path
+                   AND p.provider_checksum=a.checksum AND p.local_checksum=a.local_checksum
+                 WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3",
+                params![library, id, version_size], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            Ok(match receipt {
+                Some((_, true)) => LegacyChildReceiptRefusal::StateChanged,
+                Some((false, false)) => LegacyChildReceiptRefusal::SourceMissing,
+                Some((true, false)) => LegacyChildReceiptRefusal::SourceInvalid,
+                None => {
+                    let scoped_path: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size=?3)",
+                        params![library, id, version_size], |row| row.get(0),
+                    )?;
+                    if scoped_path {
+                        LegacyChildReceiptRefusal::BindingMismatch
+                    } else {
+                        LegacyChildReceiptRefusal::PathReceiptMissing
+                    }
+                }
+            })
         }).await
     }
 
@@ -471,6 +554,169 @@ mod tests {
     };
     use crate::state::CheckpointTransition;
     use std::path::Path;
+
+    #[tokio::test]
+    async fn legacy_receipt_prerequisites_are_read_only_after_reopen() {
+        use super::LegacyChildReceiptRefusal;
+        for (fault, expected) in [
+            ("ready", LegacyChildReceiptRefusal::StateChanged),
+            ("missing_capture", LegacyChildReceiptRefusal::ChildNotReady),
+            ("stale_capture", LegacyChildReceiptRefusal::ChildNotReady),
+            ("pending", LegacyChildReceiptRefusal::ChildNotReady),
+            ("deleted", LegacyChildReceiptRefusal::ChildNotReady),
+            ("metadata", LegacyChildReceiptRefusal::ChildNotReady),
+            ("asset_debt", LegacyChildReceiptRefusal::ChildNotReady),
+            ("path_debt", LegacyChildReceiptRefusal::ChildNotReady),
+            ("prepared_debt", LegacyChildReceiptRefusal::ChildNotReady),
+            ("rendition", LegacyChildReceiptRefusal::RenditionMissing),
+            (
+                "path_receipt",
+                LegacyChildReceiptRefusal::PathReceiptMissing,
+            ),
+            (
+                "foreign_library",
+                LegacyChildReceiptRefusal::PathReceiptMissing,
+            ),
+            (
+                "foreign_child",
+                LegacyChildReceiptRefusal::PathReceiptMissing,
+            ),
+            (
+                "foreign_rendition",
+                LegacyChildReceiptRefusal::PathReceiptMissing,
+            ),
+            ("path", LegacyChildReceiptRefusal::BindingMismatch),
+            ("provider", LegacyChildReceiptRefusal::BindingMismatch),
+            ("local", LegacyChildReceiptRefusal::BindingMismatch),
+            ("null_local", LegacyChildReceiptRefusal::BindingMismatch),
+            ("source_missing", LegacyChildReceiptRefusal::SourceMissing),
+            ("source_empty", LegacyChildReceiptRefusal::SourceInvalid),
+            ("source_short", LegacyChildReceiptRefusal::SourceInvalid),
+            ("source_upper", LegacyChildReceiptRefusal::SourceInvalid),
+            ("source_nonhex", LegacyChildReceiptRefusal::SourceInvalid),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let database = dir.path().join("state.db");
+            let media = dir.path().join("private-current.jpg");
+            let bytes = b"independent verified source";
+            std::fs::write(&media, bytes).unwrap();
+            let hash = crate::download::file::compute_sha256(&media).await.unwrap();
+            let db = SqliteStateDb::open(&database).await.unwrap();
+            db.upsert_seen(&crate::test_helpers::TestAssetRecord::new("private-child").build())
+                .await
+                .unwrap();
+            crate::state::DownloadStateStore::mark_verified_download(
+                &db,
+                "PrimarySync",
+                "private-child",
+                "original",
+                &media,
+                &hash,
+                Some(&hash),
+                false,
+            )
+            .await
+            .unwrap();
+            {
+                let conn = db.acquire_lock("prerequisite fixture").unwrap();
+                let sql = match fault {
+                    "missing_capture" => "DELETE FROM asset_metadata_capture_revisions",
+                    "stale_capture" => "UPDATE asset_metadata_capture_revisions SET revision=0",
+                    "pending" => "UPDATE assets SET status='pending'",
+                    "deleted" => "UPDATE assets SET is_deleted=1",
+                    "metadata" => "UPDATE assets SET metadata_hash=NULL",
+                    "asset_debt" => "UPDATE assets SET metadata_write_failed_at=1",
+                    "path_debt" => {
+                        "UPDATE asset_metadata_paths SET capture_repair_metadata_hash='private-debt'"
+                    }
+                    "prepared_debt" => {
+                        "UPDATE asset_metadata_paths SET capture_repair_output_size=1"
+                    }
+                    "path_receipt" => "DELETE FROM asset_metadata_paths",
+                    "foreign_library" => {
+                        "UPDATE asset_metadata_paths SET library='private-foreign-library'"
+                    }
+                    "foreign_child" => "UPDATE asset_metadata_paths SET id='private-foreign-child'",
+                    "foreign_rendition" => {
+                        "UPDATE asset_metadata_paths SET version_size='adjusted'"
+                    }
+                    "path" => {
+                        "UPDATE asset_metadata_paths SET local_path=local_path || '.private-other'"
+                    }
+                    "provider" => {
+                        "UPDATE asset_metadata_paths SET provider_checksum='private-other-generation'"
+                    }
+                    "local" => {
+                        "UPDATE asset_metadata_paths SET local_checksum='private-other-bytes'"
+                    }
+                    "null_local" => "UPDATE asset_metadata_paths SET local_checksum=NULL",
+                    "source_missing" => "UPDATE asset_metadata_paths SET source_checksum=NULL",
+                    "source_empty" => "UPDATE asset_metadata_paths SET source_checksum=''",
+                    "source_short" => "UPDATE asset_metadata_paths SET source_checksum='abc'",
+                    "source_upper" => {
+                        "UPDATE asset_metadata_paths SET source_checksum=upper(source_checksum)"
+                    }
+                    "source_nonhex" => {
+                        "UPDATE asset_metadata_paths SET source_checksum=replace(source_checksum,substr(source_checksum,1,1),'z')"
+                    }
+                    _ => "SELECT 1",
+                };
+                conn.execute_batch(sql).unwrap();
+            }
+            drop(db);
+            let db = SqliteStateDb::open(&database).await.unwrap();
+            let version = if fault == "rendition" {
+                "adjusted"
+            } else {
+                "original"
+            };
+            let before = db
+                .legacy_child_receipts("PrimarySync", "private-child")
+                .await
+                .unwrap();
+            assert_eq!(
+                before
+                    .iter()
+                    .any(|row| row.version_size.as_str() == version),
+                fault == "ready",
+                "eligibility {fault}"
+            );
+            // Even diagnostic fallbacks must work on a query-only connection.
+            let changes: i64 = {
+                let conn = db.acquire_lock("query-only diagnostic").unwrap();
+                conn.pragma_update(None, "query_only", true).unwrap();
+                conn.query_row("SELECT total_changes()", [], |row| row.get(0))
+                    .unwrap()
+            };
+            for _ in 0..2 {
+                assert_eq!(
+                    db.legacy_child_receipt_refusal("PrimarySync", "private-child", version)
+                        .await
+                        .unwrap(),
+                    expected,
+                    "{fault}"
+                );
+            }
+            let after = db
+                .legacy_child_receipts("PrimarySync", "private-child")
+                .await
+                .unwrap();
+            assert_eq!(before.len(), after.len(), "qualification unchanged {fault}");
+            assert_eq!(
+                db.acquire_lock("unchanged diagnostic")
+                    .unwrap()
+                    .query_row::<i64, _, _>("SELECT total_changes()", [], |row| row.get(0))
+                    .unwrap(),
+                changes,
+                "no writes {fault}"
+            );
+            assert_eq!(
+                std::fs::read(&media).unwrap(),
+                bytes,
+                "media unchanged {fault}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn legacy_current_receipts_require_exact_verified_source_after_reopen() {
