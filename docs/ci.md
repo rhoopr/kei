@@ -13,7 +13,7 @@ refer to one exact commit. A skipped check is not a passing check.
 | Linux all-feature and no-default offline suites | Required for code changes | Required | Required |
 | Scenario catalogs and safety-contract checks | Required for applicable changes | Required | Required |
 | Windows/macOS builds and platform smoke | Required for code changes | Required | Required |
-| Full Windows/macOS offline suites | Not required | Required for platform-sensitive changes | Required |
+| Full Windows/macOS offline suites | Required when Rust tests change | Required for platform-sensitive changes | Required |
 | Compact copies/reseed safety fixture | Part of ordinary suite | Required | Required |
 | 300-writer copies stress | Not required | Required for scale-sensitive changes | Required |
 | Instrumented coverage | Not merge-critical | Available through full qualification | Required report, not a percentage threshold |
@@ -61,11 +61,20 @@ missing work cannot pass the required check.
 
 The required check stays `CI`. A failed, cancelled, missing, or unexpectedly
 skipped required job fails that check. The `ci:full` label runs full
-qualification. Workflow, script, Cargo, build, fuzz, container-build, and unknown
-input changes also select full qualification. Ordinary code changes keep Linux
-all-feature and no-default tests, with macOS/Windows build and CLI/media/service
-smoke. Filesystem, state, configuration, and service changes select complete
-platform tests. The large copies stress test follows its runtime owners:
+qualification. Cargo/build inputs, fuzz inputs, container code, artifact and
+qualification/release workflows, and unknown inputs also select it. Known
+notification/advisory clients and their workflows, routing/gate helpers, and
+`scripts/ci/test_*.py` keep the always-on Python tests, workflow hardening,
+script/workflow lint, and typos without building Rust. New unclassified helpers
+still select full qualification.
+
+Recognized Rust test files keep the Linux all-feature and no-default suites
+and full Windows/macOS offline suites. Other code changes keep Linux suites with
+macOS/Windows build and CLI/media/service smoke; filesystem, state,
+configuration, and service changes select full platform tests. Changes to Rust
+check workflows and scenario/contract/roundtrip runners keep
+the ordinary Rust matrix without selecting release artifacts or fuzzing.
+The large copies stress test follows its runtime owners:
 download, state, Photos provider, sync, configuration, retry, selection,
 filesystem/shared types, command service types, media fixtures, and its own
 queue-projection fixture. CLI entrypoints, unrelated commands, authentication,
@@ -79,8 +88,17 @@ hydration and session code; #985's reset command and unrelated test modules
 skip stress while keeping the full platform tests selected by its entrypoints.
 New files within stress runtime owners select stress conservatively. Renames
 consider both old and new paths. Full/heavy overrides, unknown top-level
-inputs, main pushes, and scheduled qualification retain stress. Docs-only PRs
-retain workflow/script lint and typos.
+inputs, main pushes, and scheduled qualification retain stress. Its runner and
+Rust check orchestration also select stress. The broad-PR rollout fallback adds
+platform suites, coverage and unused-dependency checks for Rust changes, but
+cannot make an unrelated unit-test module or notification script select stress.
+Docs-only PRs retain workflow/script lint and typos.
+
+For the exact file sets in #1000, #997 and #991, routing now selects ordinary
+Rust checks for #1000's Rust tests and only the always-on checks for the two
+advisory-only PRs. All three skip full qualification and copies stress. These
+path-matrix cases, positive build/runtime controls and missing/skipped aggregate
+controls are covered by `scripts/ci/test_policy.py` and `test_draft_pr.py`.
 
 ## Rollout
 

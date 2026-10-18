@@ -151,7 +151,10 @@ class DraftPRTests(unittest.TestCase):
         for files, heavy, light, full in [(['README.md'], False, True, False),
                                          (['src/auth/session.rs'], False, True, False),
                                          (['src/state/db.rs'], False, True, False),
-                                         (['README.md'], False, True, True)]:
+                                         (['README.md'], False, True, True),
+                                         (['scripts/ci/nightly.py'], False, True, False),
+                                         (['.github/workflows/opencode-review.yml'], False, True, False),
+                                         (['src/inventory_diagnostic/tests.rs'], False, True, False)]:
             result = route(files, 'pull_request', heavy, light, full)
             mode = json.dumps(result['qualification'])
             self.assertTrue(enabled(condition(self.plan), 'pull_request', False))

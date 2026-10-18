@@ -18,9 +18,9 @@ env:
 
 jobs:
   # Detects which categories of files changed in the PR. Downstream jobs
-  # gate on these outputs to skip when irrelevant. Workflow or script
-  # changes flip every flag on - those touch CI itself, so re-run everything
-  # to validate the change doesn't break unrelated jobs.
+  # gate on these outputs to skip when irrelevant. The policy separates
+  # Python/advisory maintenance, Rust check tooling, and qualification inputs.
+  # Always-on workflow and Python tests also cover script-only PRs.
   # Pushes to main run all non-PR-only checks.
   detect:
     name: Detect changes
