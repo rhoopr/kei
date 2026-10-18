@@ -389,13 +389,18 @@ class ReviewTests(unittest.TestCase):
         with self.assertRaises(review.ReviewError):
             review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
 
+    def test_negative_fixture_source_passes_collection_secret_scan(self):
+        review.no_secrets(Path(__file__).read_text())
+
     def test_credentials_never_reach_prompts_or_artifacts(self):
+        # Build the negative fixture at runtime so source context is safe to review.
+        private_key_parts = ("-----BEGIN", "PRIVATE", "KEY-----")
         for text in (KEY, "ghp_" + "x" * 36, 'api_key = "' + "x" * 30 + '"',
-                     "-----BEGIN PRIVATE KEY-----"):
+                     " ".join(private_key_parts)):
             http = FakeHTTP()
             data = prepared(http)
             data["files"][0]["patch"] += text
-            with self.assertRaises(review.ReviewError):
+            with self.assertRaises(review.SecurityError):
                 review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
             self.assertFalse(any(call[1] in {review.GO_URL} for call in http.calls))
         http = FakeHTTP()
