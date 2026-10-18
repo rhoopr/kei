@@ -21,3 +21,5 @@ mod mixed_delta;
 mod retained_recovery;
 
 mod indexing;
+
+mod trusted_legacy;

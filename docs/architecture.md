@@ -2215,3 +2215,25 @@ observations. The diagnostic performs no family hydration and returns no cursor
 or CompleteLegacyInventory proof. At most one later lookup is observational.
 Ordinary preservation retains its candidate, scope, date and completeness gates.
 See `docs/missing-reference-inventory.md` for bounds and supervision requirements.
+
+### Explicit trusted local bytes for legacy migration
+
+`commands/trusted_legacy.rs` owns the offline `reconcile trust-legacy-files plan/apply`
+interface and account lock. `download/trusted_legacy.rs` owns bounded plans,
+confined retained file handles and final byte validation.
+`state/db/trusted_legacy.rs` owns typed `TrustedLegacyFile` acceptances in
+versioned, content-addressed `metadata` keys. Apply installs prefix-scoped
+immutability guards in the acceptance transaction; no-acceptance catalogues are
+unchanged. Their account/provider identity,
+current-child generation, metadata/path and protected-family snapshots are
+rebuilt from current state at apply and receipt lookup. Apply commits all entries
+atomically after final file and cancellation checks. No source checksum is
+inferred or written.
+
+Only legacy current-child coverage consumes this alternate provenance. Its fresh
+inventory, readiness, ownership, file and checkpoint guards still run.
+Nonempty library-scoped acceptance rows extend the legacy dependency fence;
+provider evidence records `verified_source` or `trusted_legacy_file` explicitly.
+No-acceptance dependency serialization is unchanged. Native source verification,
+GPS and ordinary adoption retain their verified-source requirements. See
+[Trusted Legacy Files](trusted-legacy-files.md) for the command boundary.

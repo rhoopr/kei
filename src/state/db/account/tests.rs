@@ -364,7 +364,10 @@ async fn state_commands_refuse_misplaced_owned_database_before_reset_or_export()
     );
     assert!(
         crate::commands::reconcile::run_reconcile(
-            crate::cli::ReconcileArgs { dry_run: false },
+            crate::cli::ReconcileArgs {
+                dry_run: false,
+                action: None
+            },
             &globals,
             None
         )

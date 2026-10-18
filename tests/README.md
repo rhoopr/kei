@@ -1682,3 +1682,12 @@ budgets. Existing preservation and missing-reference lookup tests retain the
 ordinary fail-closed acceptance controls. No live account is used. Hard process
 supervision remains an external operational requirement, as documented in
 `docs/missing-reference-inventory.md`.
+
+`cargo test --lib trusted_legacy_files` exercises explicit local-byte acceptance
+through the real cycle owner using six synthetic historical renditions, four
+ready children and two mixed-owner families. It checks zero media GETs, unchanged
+source receipts and legacy rows/aliases, restart/idempotency, two quiet followups,
+atomic stale/cancelled/SQL-failed plans, and readiness/Primary bridge holds.
+Run it with default and `--no-default-features` profiles when changing trusted
+legacy receipts. Existing `legacy_preservation` tests retain the no-acceptance
+verified-source controls.

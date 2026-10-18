@@ -65,3 +65,4 @@ use orchestration::url_refresh::{
 pub(crate) use orchestration::{models::PassKey, reconciliation::PathReconciliationResult};
 
 pub(crate) mod legacy_preservation;
+pub(crate) mod trusted_legacy;

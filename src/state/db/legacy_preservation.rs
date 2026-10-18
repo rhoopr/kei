@@ -66,7 +66,7 @@ fn invalid() -> StateError {
 
 // Preserve SQLite values without lossy float/date formatting. Schema-versioned
 // column names and values are part of the receipt, not executable SQL input.
-fn snapshot_rows(
+pub(super) fn snapshot_rows(
     conn: &Connection,
     sql: &str,
     library: &str,
@@ -171,6 +171,10 @@ pub(super) fn dependencies(
         additional.push(snapshot_rows(conn, &format!("SELECT * FROM {table} WHERE library=?1 AND {key} IN (SELECT asset_record_name FROM asset_master_mappings WHERE library=?1 AND master_record_name=?2)"),library,id)?);
     }
     additional.push(snapshot_rows(conn,"SELECT library,asset_id,revision FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id IN (SELECT asset_record_name FROM asset_master_mappings WHERE library=?1 AND master_record_name=?2)",library,id)?);
+    let trusted = super::trusted_legacy::dependency_rows(conn, library)?;
+    if !trusted.is_empty() {
+        additional.push(json!({"trusted_legacy_files_v1":trusted}));
+    }
     Ok(json!([EVIDENCE_VERSION, children, mappings, owners, additional]).to_string())
 }
 
@@ -238,13 +242,17 @@ impl LegacyChildReceiptRefusal {
     }
 }
 
-fn child_receipts_ready(conn: &Connection, library: &str, id: &str) -> Result<bool, StateError> {
+pub(super) fn child_receipts_ready(
+    conn: &Connection,
+    library: &str,
+    id: &str,
+) -> Result<bool, StateError> {
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id=?2 AND revision>=?3) AND NOT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND (status!='downloaded' OR is_deleted!=0 OR metadata_hash IS NULL OR metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL)) AND NOT EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND (metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL))", params![library, id, crate::state::METADATA_CAPTURE_REVISION], |row| row.get(0))?)
 }
 
 impl SqliteStateDb {
-    /// Return only finalized current-child receipts with verified per-path source
-    /// provenance for the exact provider generation and current local bytes.
+    /// Return finalized current-child receipts with verified source provenance or
+    /// explicit Trusted Legacy File acceptance for this exact generation/binding.
     /// Reconciliation reservations are retained naming evidence, not pending
     /// work. They remain part of the dependency fence; the sync owner must
     /// independently prove reconciliation completed before certification.
@@ -255,17 +263,34 @@ impl SqliteStateDb {
     ) -> Result<Vec<crate::state::AssetRecord>, StateError> {
         let library = library.to_owned();
         let id = id.to_owned();
-        self.with_conn("legacy_child_receipts",move |conn| {
+        self.with_conn("legacy_child_receipts", move |conn| {
             let ready = child_receipts_ready(conn, &library, &id)?;
-            if !ready { return Ok(Vec::new()); }
-            let mut stmt=conn.prepare(&format!("SELECT {} FROM assets WHERE library=?1 AND id=?2 AND EXISTS (
-                SELECT 1 FROM asset_metadata_paths p WHERE p.library=assets.library AND p.id=assets.id
-                AND p.version_size=assets.version_size AND p.local_path=assets.local_path
-                AND p.provider_checksum=assets.checksum AND p.local_checksum=assets.local_checksum
-                AND length(p.source_checksum)=64 AND p.source_checksum NOT GLOB '*[^0-9a-f]*'
-            ) ORDER BY version_size",super::rows::ASSET_COLUMNS))?;
-            Ok(stmt.query_map(params![library,id],super::rows::row_to_asset_record)?.collect::<Result<Vec<_>,_>>()?)
-        }).await
+            if !ready {
+                return Ok(Vec::new());
+            }
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM assets WHERE library=?1 AND id=?2 ORDER BY version_size",
+                super::rows::ASSET_COLUMNS
+            ))?;
+            let rows = stmt
+                .query_map(params![library, id], super::rows::row_to_asset_record)?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut accepted = Vec::new();
+            for row in rows {
+                if super::trusted_legacy::provenance(
+                    conn,
+                    &library,
+                    &id,
+                    row.version_size.as_str(),
+                )?
+                .is_some()
+                {
+                    accepted.push(row);
+                }
+            }
+            Ok(accepted)
+        })
+        .await
     }
 
     /// Explain a missing selected receipt without writing state or changing the

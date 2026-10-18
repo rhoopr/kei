@@ -10,6 +10,7 @@ pub(crate) mod reconcile;
 mod reset;
 mod service;
 mod status;
+mod trusted_legacy;
 mod verify;
 
 pub(crate) use config_cmd::run_config_show;

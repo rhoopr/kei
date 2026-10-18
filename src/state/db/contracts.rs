@@ -963,9 +963,17 @@ pub trait MetadataRewriteStore: Send + Sync {
         Ok(())
     }
 
-    /// Finalized current-child rows whose exact path/provider generation and
-    /// local checksum have independent verified source provenance. Historical
-    /// download hashes alone do not qualify; pending metadata work must refuse.
+    /// Finalized current-child rows with verified source provenance or explicit
+    /// Trusted Legacy File acceptance for this exact binding. Historical download
+    /// hashes alone do not qualify; pending metadata work must refuse.
+    async fn legacy_child_provenance(
+        &self,
+        _library: &str,
+        _id: &str,
+        _rendition: &str,
+    ) -> Result<Option<super::trusted_legacy::LegacyReceiptProvenance>, StateError> {
+        Ok(None)
+    }
     async fn legacy_child_receipts(
         &self,
         _library: &str,

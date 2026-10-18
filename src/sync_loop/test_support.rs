@@ -1410,6 +1410,19 @@ impl state::MembershipStore for FailingMetadataSetDb {
 
 #[async_trait::async_trait]
 impl state::MetadataRewriteStore for FailingMetadataSetDb {
+    async fn legacy_child_provenance(
+        &self,
+        library: &str,
+        id: &str,
+        rendition: &str,
+    ) -> Result<
+        Option<crate::state::db::trusted_legacy::LegacyReceiptProvenance>,
+        crate::state::error::StateError,
+    > {
+        self.inner
+            .legacy_child_provenance(library, id, rendition)
+            .await
+    }
     async fn legacy_child_receipts(
         &self,
         library: &str,

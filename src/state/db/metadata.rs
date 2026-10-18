@@ -1391,6 +1391,17 @@ impl MetadataRewriteStore for SqliteStateDb {
         .await
     }
 
+    async fn legacy_child_provenance(
+        &self,
+        library: &str,
+        id: &str,
+        rendition: &str,
+    ) -> Result<
+        Option<crate::state::db::trusted_legacy::LegacyReceiptProvenance>,
+        crate::state::error::StateError,
+    > {
+        SqliteStateDb::legacy_child_provenance(self, library, id, rendition).await
+    }
     async fn legacy_child_receipts(
         &self,
         library: &str,

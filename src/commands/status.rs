@@ -41,6 +41,13 @@ pub(crate) async fn run_status(
     println!("  Policy excluded: {}", summary.policy_excluded);
     println!("  Failed:     {}", summary.failed);
     println!("  Source deleted: {}", summary.source_deleted);
+    let trusted = db.stored_trusted_legacy_file_count().await?;
+    if trusted > 0 {
+        println!(
+            "  Stored Trusted Legacy File acceptances: {trusted} (provider verification unknown)"
+        );
+    }
+
     println!(
         "  Awaiting provider verification: {}",
         summary.awaiting_provider_verification

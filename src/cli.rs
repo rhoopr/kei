@@ -458,6 +458,8 @@ pub struct VerifyArgs {
 /// Arguments for the reconcile command.
 #[derive(Parser, Debug, Clone)]
 pub struct ReconcileArgs {
+    #[command(subcommand)]
+    pub action: Option<ReconcileAction>,
     /// Show what would change without updating the state database.
     #[arg(long)]
     pub dry_run: bool,
@@ -2801,4 +2803,35 @@ mod read_only_entrypoint_tests {
             assert!(!super::is_early_read_only_invocation(arguments));
         }
     }
+}
+
+/// Bounded offline local-byte acceptance; source verification is unchanged.
+#[derive(Debug, Clone, clap::Args)]
+pub struct TrustedLegacyArgs {
+    #[command(subcommand)]
+    pub action: TrustedLegacyAction,
+}
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum TrustedLegacyAction {
+    /// Write a new reviewable JSON plan for one library (maximum 128 renditions)
+    Plan {
+        #[arg(long)]
+        library: String,
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
+    /// Accept exactly the unchanged files and catalogue bindings in a reviewed plan
+    Apply {
+        #[arg(long)]
+        plan: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum ReconcileAction {
+    /// Explicitly trust selected local files for preserved legacy migration (offline)
+    #[command(
+        after_help = "Documentation: https://github.com/rhoopr/kei/blob/main/docs/trusted-legacy-files.md"
+    )]
+    TrustLegacyFiles(TrustedLegacyArgs),
 }

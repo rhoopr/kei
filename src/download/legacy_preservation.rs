@@ -761,9 +761,9 @@ async fn qualify_family(
             )
             .await
             .context(LegacyProofRefusal("current_file_unavailable"))?;
-            // The store qualified separate verified source provenance for this
-            // exact child/rendition/provider generation/path. MMCS identifies a
-            // provider generation; it is never a local SHA-256 content hash.
+            // The store qualified separate source provenance or explicit local
+            // acceptance for this exact binding. MMCS identifies a provider
+            // generation; it is never a local SHA-256 content hash.
             anyhow::ensure!(
                 file.sha256 == receipt.local_checksum,
                 LegacyProofRefusal("child_content_unverified")
@@ -786,7 +786,15 @@ async fn qualify_family(
                 paths.insert(crate::fs_util::confined_path_key(&sidecar_file.path)?),
                 LegacyProofRefusal("sidecar_path_conflict")
             );
-            evidence.push(json!({"child":child.asset_record_name(),"version":version.as_str(),"provider_checksum":checksum,"created_at":child.asset_date_evidence(),"added_at":child.added_date_evidence(),"metadata_hash":metadata.compute_hash(),"files":[file,sidecar_file]}));
+            let provenance = db
+                .legacy_child_provenance(
+                    &record.library,
+                    child.asset_record_name(),
+                    version.as_str(),
+                )
+                .await?
+                .context(LegacyProofRefusal("child_provenance_missing"))?;
+            evidence.push(json!({"child":child.asset_record_name(),"version":version.as_str(),"provider_checksum":checksum,"created_at":child.asset_date_evidence(),"added_at":child.added_date_evidence(),"metadata_hash":metadata.compute_hash(),"provenance":provenance,"files":[file,sidecar_file]}));
         }
     }
     Ok(json!({"version":1,"library":inventory.library,"inventory_cursor":inventory.cursor,"master":record.asset_id,"children":evidence}).to_string())

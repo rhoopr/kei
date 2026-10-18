@@ -28,6 +28,7 @@ pub(crate) mod provider_generations;
 pub(crate) mod provider_inbox;
 pub(crate) mod provider_selection;
 pub(crate) mod provider_work;
+pub(crate) mod trusted_legacy;
 pub(crate) use legacy_preservation::{
     LegacyActivationProof, LegacyChildReceiptRefusal, LegacyFileEvidence,
     LegacyPreparationSnapshot, LegacyPreservation,
