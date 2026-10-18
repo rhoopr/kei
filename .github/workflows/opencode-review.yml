@@ -3,6 +3,8 @@ name: OpenCode advisory review
 # Both workflow and executable scripts come from the trusted target commit.
 # PR files are API data only. Never change this checkout to the PR head/merge ref.
 on:
+  issues:
+    types: [opened]
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
@@ -23,7 +25,7 @@ on:
         type: string
 
 concurrency:
-  group: opencode-go-review-${{ inputs.mode == 'api_smoke' && 'api-smoke' || github.event.pull_request.number || inputs.pr_number }}
+  group: opencode-go-review-${{ github.event_name == 'issues' && 'issue' || 'pr' }}-${{ inputs.mode == 'api_smoke' && 'api-smoke' || github.event.pull_request.number || inputs.pr_number || github.event.issue.number }}
   cancel-in-progress: true
 
 permissions: {}
@@ -112,3 +114,105 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_HEAD_SHA: ${{ needs.review.outputs.head }}
         run: python3 -I scripts/ci/opencode_review.py publish
+
+  # Pin identities once so both reviewers inspect the same issue and main.
+  issue-pin:
+    if: github.event_name == 'issues' && github.event.action == 'opened'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      prepared: ${{ steps.pin.outputs.prepared }}
+      head: ${{ steps.pin.outputs.head }}
+      snapshot: ${{ steps.pin.outputs.snapshot }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+      - id: pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I scripts/ci/opencode_review.py issue-pin
+
+  issue-review:
+    needs: issue-pin
+    if: needs.issue-pin.outputs.prepared == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [product, code]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+    env:
+      ISSUE_REVIEW_KIND: ${{ matrix.kind }}
+      EXPECTED_MAIN_SHA: ${{ needs.issue-pin.outputs.head }}
+      EXPECTED_ISSUE_SNAPSHOT: ${{ needs.issue-pin.outputs.snapshot }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+      - name: Collect bounded pinned issue evidence
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I scripts/ci/opencode_review.py issue-prepare
+      - name: Review issue evidence with ordered free and Go models
+        if: steps.prepare.outputs.prepared == 'true'
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_GO_MODEL: ${{ vars.OPENCODE_GO_MODEL }}
+          OPENCODE_GO_NO_OVERAGE_CONFIRMED: ${{ vars.OPENCODE_GO_NO_OVERAGE_CONFIRMED }}
+        run: python3 -I scripts/ci/opencode_review.py issue-infer
+      - name: Save only validated advisory result
+        if: steps.prepare.outputs.prepared == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: opencode-issue-${{ matrix.kind }}
+          path: issue-review-result.json
+          if-no-files-found: error
+          retention-days: 1
+
+  issue-publish:
+    needs: [issue-pin, issue-review]
+    # A failed sibling reviewer must not suppress a validated result.
+    if: >-
+      always() && !cancelled() && needs.issue-pin.outputs.prepared == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [product, code]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/ci
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        id: download
+        # Missing artifact means this reviewer failed or was already published.
+        continue-on-error: true
+        with:
+          name: opencode-issue-${{ matrix.kind }}
+          path: result
+      - name: Validate and publish one advisory issue comment
+        if: steps.download.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_REVIEW_KIND: ${{ matrix.kind }}
+          EXPECTED_MAIN_SHA: ${{ needs.issue-pin.outputs.head }}
+          EXPECTED_ISSUE_SNAPSHOT: ${{ needs.issue-pin.outputs.snapshot }}
+        run: python3 -I scripts/ci/opencode_review.py issue-publish

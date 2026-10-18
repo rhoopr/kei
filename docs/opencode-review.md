@@ -1,4 +1,4 @@
-# OpenCode advisory PR review
+# OpenCode advisory reviews
 
 The `OpenCode advisory review` workflow reviews non-draft pull requests on
 `opened`, `synchronize`, `reopened`, and `ready_for_review`. It publishes one
@@ -9,6 +9,84 @@ approves, requests changes, fixes code, pushes branches, or merges. Do not add
 this workflow to required branch-protection checks. There is no backfill or
 scheduled review of existing PRs. A manual dispatch reviews exactly one selected
 PR without changing its branch or PR state.
+
+
+## New issue intake
+
+After merge to main, the workflow also handles **issues.opened only**.
+Editing or reopening an issue
+does not trigger intake. There is no issue backfill, manual issue dispatch,
+schedule, or automatic retry after a stale result is discarded.
+
+Two independent reviews inspect the same pinned current-main SHA and issue
+content snapshot:
+
+- **Product Review** reads the complete docs/product-charter.md and
+  docs/architecture.md. It recommends address, defer, out_of_scope, or
+  needs_information, with direction, scope, invariant, and risk reasoning.
+  This recommendation does not validate the issue's technical claims.
+- **Code Validation** inspects selected main source and tests. It distinguishes
+  a statically confirmed defect, plausible_unverified behavior, and
+  insufficient_evidence. The not_reproduced status requires trusted execution;
+  this text-only workflow rejects that conclusion because no reproduction runs.
+  Comments explicitly state that static test inspection is not test execution.
+
+Each reviewer has its own inference call and ordered fallback chain from the
+model table below. Neither receives the other's output. Both use the same
+existing API key, endpoints, no-overage prerequisite, and fixed routing; there
+is no pay-as-you-go expansion. At most eight inference POSTs are made for an
+issue, four per reviewer. Missing credentials or invalid evidence fail closed.
+One failed reviewer does not cancel the other: the review and publication
+matrices disable fail-fast, and publication runs after a partial failure.
+Only an available, validated artifact can become a comment. Missing artifacts
+leave a visible download-step warning and never become an empty review.
+
+A read-only pin job resolves main once and records the issue content
+fingerprint. Each reviewer checks the issue and main before preparing context.
+The fingerprint includes the issue ID, number, title, body, creation time,
+state, and lock state. It excludes updated_at, which also changes on comments,
+so the two bot comments cannot invalidate each other. Title/body changes,
+closure, locking, or a changed main SHA discard pending results. An edit
+reverted to exactly the original content has the same content fingerprint.
+
+Product context contains the complete charter and architecture. Code context
+contains the charter, the first 135 architecture lines as an owner map, and
+at most ten source/test excerpts. Deterministic selection uses literal path
+mentions or path-word matches against issue title/body in the pinned main tree:
+up to six Rust/script source files and four matching test files. Regular
+executable files are eligible; symlinks are excluded. Files larger than 12 KiB
+use a whole-line window starting up to 25 lines before the strongest issue-word
+match. Start line, completeness and selection counts are supplied to the model. Each fetched file is capped at
+256 KiB, issue metadata at 32 KiB, and the full JSON prompt at 300 KiB.
+Missing owners, callers, later code, tests, logs, or reproduction inputs remain
+limitations. This is bounded static investigation, not a repository-wide
+audit. Citations must point to supplied lines at the pinned main SHA.
+
+All issue text and linked material are untrusted data. Links and attachments
+are not fetched. The workflow never executes issue-provided code, shell,
+dependencies, test commands, agent instructions, or plugins. It invokes the
+trusted workflow-commit Python client only. Issue content, selected main source
+and tests are sent to OpenCode; they are checked for known credential patterns
+and exact available tokens before inference. The existing secret-filter
+limitations apply. Prompts, source, issue bodies, raw responses and reasoning
+are not uploaded as artifacts or printed.
+
+Issue inference jobs have only contents: read and issues: read. Their
+collection steps have the GitHub token; only inference steps receive the
+OpenCode key. Publisher jobs have contents: read and issues: write, no
+inference credentials, and no model execution. They validate artifact identity,
+schema, citations and secrets again, check bot-authored per-reviewer/content
+dedup markers with bounded pagination, and recheck main and issue content
+immediately before the single comment POST. GitHub offers no atomic
+content/main-and-comment operation; each comment identifies both pinned
+snapshots if a change races the last check. Publication is never retried
+automatically after an uncertain POST.
+
+Each successful reviewer publishes a separate advisory issue comment. A rerun
+skips a comment already published for that reviewer and issue content, even if
+main has since advanced. Normal users cannot spoof bot identity for dedup.
+No labels, closures, branches, pull requests, or other issue mutations are
+authorized by this workflow. Maintainers decide what to do with the advice.
 
 ## Models, billing, and setup
 
@@ -259,7 +337,10 @@ actionlint .github/workflows/*.yml
 ruff check scripts/ci/opencode_review.py scripts/ci/test_opencode_review.py
 ```
 
-These exercise synthetic GitHub/provider responses, draft/stale/duplicate skips,
+These exercise issue opened-only admission, pinned main/content snapshots,
+independent review calls and partial failure, issue comment dedup/spoof resistance,
+static-only conclusions, issue artifact/citation validation, the real issue CLI
+pipeline, and synthetic GitHub/provider responses, draft/stale/duplicate skips,
 missing secrets, malicious fork text and paths, complete/oversized diffs, context
 limits, malformed/tool/truncated output, credentials, safe rendering, rate
 limits, uncertain publication, success at each of the four positions, HTTP/transport/invalid-completion fallback,
