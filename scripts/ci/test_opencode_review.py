@@ -891,6 +891,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)", text)
         self.assertIn("github.event.pull_request.number || inputs.pr_number", text)
         self.assertIn("EXPECTED_HEAD_SHA: ${{ needs.review.outputs.head }}", text)
+        text = text.split("  # Pin identities once", 1)[0]
         self.assertEqual(text.count("ref: ${{ github.workflow_sha }}"), 3)
         self.assertEqual(text.count("persist-credentials: false"), 3)
         read_job, write_job = text.split("  publish:\n")
@@ -909,6 +910,403 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("path: review-result.json", text)
         self.assertNotIn("path: review-input.json", text)
         self.assertNotIn("${{", "\n".join(line for line in text.splitlines() if "run:" in line))
+
+
+
+ISSUE = {"id": 42, "number": 123, "title": "Example retry loses state",
+         "body": "Reported in src/example.rs. tests/example.rs may cover it.",
+         "created_at": "2026-10-18T00:00:00Z", "state": "open", "locked": False}
+TREE = "d" * 40
+CHARTER = "docs/product-charter.md"
+ARCH = "docs/architecture.md"
+CODE = "src/example.rs"
+TEST = "tests/example.rs"
+
+
+def issue_report(kind):
+    report = {"summary": "The retry report needs investigation.",
+              "rationale": "Static inspection shows the retry path; no execution evidence is available.",
+              "evidence": [{"path": CHARTER if kind == "product" else CODE, "line": 2}]}
+    if kind == "product":
+        report.update(decision="address", risks="Preserve checkpoint safety.")
+    else:
+        report["status"] = "plausible_unverified"
+    return report
+
+
+class IssueHTTP(FakeHTTP):
+    def __init__(self):
+        super().__init__()
+        self.issue = copy.deepcopy(ISSUE)
+        self.head = HEAD
+        self.comments = []
+        self.issue_reads = []
+        self.main_reads = []
+        self.sources = {CHARTER: "charter\nreliability\n", ARCH: "architecture\nsafety\n",
+                        CODE: "fn retry() {\n    retain_pending();\n}\n",
+                        TEST: "fn retry_test() {\n    assert_pending();\n}\n"}
+        self.tree = {"sha": TREE, "truncated": False, "tree": [
+            {"path": path, "mode": "100644", "type": "blob", "size": len(text.encode())}
+            for path, text in self.sources.items()]}
+
+    def request(self, method, url, token, **kwargs):
+        self.calls.append((method, url, token, kwargs))
+        if url in {review.FREE_URL, review.GO_URL}:
+            return self.completion
+        if method == "POST":
+            body = kwargs["payload"]["body"]
+            self.comments.append({"user": {"login": "github-actions[bot]", "type": "Bot"}, "body": body})
+            return {"id": 1}
+        if "/comments?" in url:
+            return copy.deepcopy(self.comments)
+        if "/git/ref/heads/main" in url:
+            head = self.main_reads.pop(0) if self.main_reads else self.head
+            return {"object": {"type": "commit", "sha": head}}
+        if "/git/commits/" in url:
+            return {"sha": HEAD, "tree": {"sha": TREE}}
+        if "/git/trees/" in url:
+            return copy.deepcopy(self.tree)
+        if "/contents/" in url:
+            path = url.split("/contents/")[1].split("?ref=")[0]
+            text = self.sources[path].encode()
+            return {"type": "file", "encoding": "base64", "size": len(text),
+                    "content": base64.b64encode(text).decode()}
+        return copy.deepcopy(self.issue_reads.pop(0) if self.issue_reads else self.issue)
+
+
+def issue_prepared(http, kind):
+    return review.collect_issue(gh(http), HEAD, review.issue_snapshot(ISSUE), kind)
+
+
+def issue_result(kind):
+    return {"repo": REPO, "number": 123, "head": HEAD, "kind": kind,
+            "snapshot": review.issue_fingerprint(review.issue_snapshot(ISSUE)),
+            "model": review.DEFAULT_MODEL, "report": issue_report(kind)}
+
+
+class IssueReviewTests(unittest.TestCase):
+    def test_opened_only_and_repository_bound(self):
+        event = {"action": "opened", "issue": ISSUE,
+                 "repository": {"full_name": REPO, "default_branch": "main"}}
+        env = {"GITHUB_EVENT_NAME": "issues", "GITHUB_REPOSITORY": REPO, "GH_TOKEN": KEY}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(review.issue_target(IssueHTTP(), event)[1], review.issue_snapshot(ISSUE))
+            for action in ("reopened", "edited", "closed", None):
+                with self.subTest(action=action), self.assertRaises(review.ReviewError):
+                    review.issue_target(IssueHTTP(), {**event, "action": action})
+            for name in ("pull_request_target", "workflow_dispatch"):
+                with patch.dict(os.environ, {"GITHUB_EVENT_NAME": name}), self.assertRaises(review.ReviewError):
+                    review.issue_target(IssueHTTP(), event)
+            event["repository"]["full_name"] = "someone/else"
+            with self.assertRaises(review.ReviewError):
+                review.issue_target(IssueHTTP(), event)
+
+    def test_collect_pinned_read_only_independent_contexts(self):
+        for kind in review.ISSUE_KINDS:
+            http = IssueHTTP()
+            data = issue_prepared(http, kind)
+            self.assertEqual((data["head"], data["execution"], data["linked_material"]),
+                             (HEAD, "not_performed", "not_fetched"))
+            self.assertTrue(all(c[0] == "GET" for c in http.calls))
+            self.assertTrue(all(f"?ref={HEAD}" in c[1] for c in http.calls if "/contents/" in c[1]))
+            self.assertIn(CHARTER, data["context"])
+            if kind == "code":
+                self.assertIn(CODE, data["context"])
+                self.assertIn(TEST, data["context"])
+                self.assertTrue(any(f"/git/trees/{TREE}?" in c[1] for c in http.calls))
+            else:
+                self.assertEqual(set(data["context"]), {CHARTER, ARCH})
+
+    def test_context_byte_bounds_and_incomplete_excerpts(self):
+        http = IssueHTTP()
+        http.sources[CODE] = "line\n" * 4000
+        data = issue_prepared(http, "code")
+        self.assertFalse(data["context"][CODE]["complete"])
+        self.assertLessEqual(len(data["context"][CODE]["text"].encode()), review.ISSUE_EXCERPT)
+        self.assertLessEqual(len(review.json_bytes(data)), review.MAX_PROMPT)
+        http.tree["truncated"] = True
+        with self.assertRaises(review.ReviewError):
+            issue_prepared(http, "code")
+        http = IssueHTTP()
+        http.sources[ARCH] = "x" * (review.MAX_SOURCE + 1)
+        with self.assertRaises(review.ReviewError):
+            issue_prepared(http, "product")
+        with self.assertRaises(review.ReviewError):
+            review.issue_snapshot({**ISSUE, "body": "x" * review.ISSUE_LIMIT})
+
+    def test_executable_sources_and_tail_evidence_are_inspected(self):
+        http = IssueHTTP()
+        script = "scripts/example.py"
+        http.sources[script] = "def retry():\n    return False\n"
+        http.tree["tree"].append({"path": script, "mode": "100755", "type": "blob"})
+        http.tree["tree"].append({"path": "src/example_link.rs", "mode": "120000", "type": "blob"})
+        http.sources[CODE] = "unrelated\n" * 4000 + "fn retry_loses_state() {}\n"
+        data = issue_prepared(http, "code")
+        self.assertIn(script, data["selection"]["selected_files"])
+        self.assertNotIn("src/example_link.rs", data["context"])
+        excerpt = data["context"][CODE]
+        self.assertGreater(excerpt["first_line"], 1)
+        self.assertIn("retry_loses_state", excerpt["text"])
+        report = {**issue_report("code"), "status": "confirmed",
+                  "evidence": [{"path": CODE, "line": 4001}]}
+        review.validate_issue_report(report, data)
+        report["evidence"][0]["line"] = 1
+        with self.assertRaises(review.SecurityError):
+            review.validate_issue_report(report, data)
+
+    def test_independent_calls_fixed_routing_and_no_github_token(self):
+        sessions = set()
+        for kind in review.ISSUE_KINDS:
+            http = IssueHTTP()
+            data = issue_prepared(http, kind)
+            http.completion["choices"][0]["message"]["content"] = json.dumps(issue_report(kind))
+            with redirect_stdout(io.StringIO()):
+                result = review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind)
+            call = http.calls[-1]
+            self.assertEqual(call[:3], ("POST", review.FREE_URL, KEY))
+            self.assertEqual(call[3]["payload"]["model"], review.REVIEW_MODELS[0][2])
+            self.assertNotIn("fixture-github-token", json.dumps(call[3]["payload"]))
+            self.assertNotIn(KEY, json.dumps(call[3]["payload"]))
+            self.assertNotIn("tools", call[3]["payload"])
+            self.assertIn("UNTRUSTED DATA", call[3]["payload"]["messages"][0]["content"])
+            self.assertEqual(result["kind"], kind)
+            sessions.add(call[3]["session"])
+        self.assertEqual(len(sessions), 2)
+
+    def test_issue_routing_all_four_and_no_overage_gate(self):
+        for kind in review.ISSUE_KINDS:
+            http = IssueHTTP()
+            data = issue_prepared(http, kind)
+            http.completion["choices"][0]["message"]["content"] = json.dumps(issue_report(kind))
+            for accepted_at in range(4):
+                with patch.object(http, "request", side_effect=[review.ProviderHTTPError(403)] * accepted_at
+                                  + [http.completion]) as request, redirect_stdout(io.StringIO()):
+                    result = review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind,
+                                          go_no_overage_confirmed=accepted_at >= 2)
+                self.assertEqual(result["model"], review.REVIEW_MODELS[accepted_at][2])
+                self.assertEqual([c.kwargs["payload"]["model"] for c in request.call_args_list],
+                                 [m for _, _, m in review.REVIEW_MODELS[:accepted_at + 1]])
+            with patch.object(http, "request", side_effect=review.ProviderHTTPError(403)) as request, \
+                 redirect_stdout(io.StringIO()), self.assertRaisesRegex(review.ReviewError, "Use balance"):
+                review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind)
+            self.assertEqual(request.call_count, 2)
+
+    def test_schema_classifications_and_evidence(self):
+        for kind in review.ISSUE_KINDS:
+            data = issue_prepared(IssueHTTP(), kind)
+            report = issue_report(kind)
+            self.assertEqual(review.validate_issue_report(report, data), report)
+            for key, value in (("extra", "x"), ("summary", ""), ("rationale", "x\ninjected"),
+                               ("evidence", [{"path": CODE, "line": 9999}]),
+                               ("evidence", [{"path": "../escape", "line": 1}]),
+                               ("evidence", [{"path": CHARTER, "line": True}])):
+                bad = {**report, key: value}
+                with self.subTest(kind=kind, key=key, value=value), self.assertRaises(review.ReviewError):
+                    review.validate_issue_report(bad, data)
+        data = issue_prepared(IssueHTTP(), "code")
+        for status in ("confirmed", "plausible_unverified", "insufficient_evidence"):
+            self.assertEqual(review.validate_issue_report({**issue_report("code"), "status": status}, data)["status"],
+                             status)
+        for bad in ({**issue_report("code"), "status": "not_reproduced"},
+                    {**issue_report("code"), "status": "confirmed", "evidence": []}):
+            with self.assertRaises(review.ReviewError):
+                review.validate_issue_report(bad, data)
+
+    def test_secrets_fail_closed_before_inference_and_publication(self):
+        for kind in review.ISSUE_KINDS:
+            http = IssueHTTP()
+            data = issue_prepared(http, kind)
+            data["issue"]["body"] = KEY
+            before = len(http.calls)
+            with self.assertRaises(review.SecurityError):
+                review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind)
+            self.assertEqual(len(http.calls), before)
+            result = issue_result(kind)
+            result["report"]["summary"] = "fixture-github-token"
+            with self.assertRaises(review.SecurityError):
+                review.publish_issue(gh(http), review.issue_snapshot(ISSUE), result, HEAD, kind)
+            self.assertFalse(any(c[0] == "POST" for c in http.calls))
+
+    def test_model_secret_or_invalid_evidence_never_falls_back(self):
+        for change in ({"summary": KEY}, {"evidence": [{"path": "../escape", "line": 1}]}):
+            http = IssueHTTP()
+            data = issue_prepared(http, "code")
+            http.completion["choices"][0]["message"]["content"] = json.dumps({**issue_report("code"), **change})
+            before = len(http.calls)
+            with redirect_stdout(io.StringIO()), self.assertRaises(review.SecurityError):
+                review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind="code", go_no_overage_confirmed=True)
+            self.assertEqual(len(http.calls) - before, 1)
+
+    def test_stale_issue_closed_locked_main_and_last_moment_changes(self):
+        snapshot = review.issue_snapshot(ISSUE)
+        for field, value in (("title", "edited"), ("body", "edited"), ("state", "closed"), ("locked", True)):
+            http = IssueHTTP()
+            http.issue[field] = value
+            with self.subTest(field=field), self.assertRaises(review.Skip):
+                review.publish_issue(gh(http), snapshot, issue_result("product"), HEAD, "product")
+            self.assertFalse(any(c[0] == "POST" for c in http.calls))
+        http = IssueHTTP()
+        http.head = OLD
+        with self.assertRaises(review.Skip):
+            review.publish_issue(gh(http), snapshot, issue_result("product"), HEAD, "product")
+        http = IssueHTTP()
+        http.issue_reads = [ISSUE, ISSUE, {**ISSUE, "body": "changed at last read"}]
+        with self.assertRaises(review.Skip):
+            review.publish_issue(gh(http), snapshot, issue_result("product"), HEAD, "product")
+        self.assertFalse(any(c[0] == "POST" for c in http.calls))
+        http = IssueHTTP()
+        http.main_reads = [HEAD, HEAD, OLD]
+        with self.assertRaises(review.Skip):
+            review.publish_issue(gh(http), snapshot, issue_result("product"), HEAD, "product")
+
+    def test_success_separate_comments_and_rerun_dedup(self):
+        http = IssueHTTP()
+        snapshot = review.issue_snapshot(ISSUE)
+        for kind in review.ISSUE_KINDS:
+            review.publish_issue(gh(http), snapshot, issue_result(kind), HEAD, kind)
+            self.assertEqual(http.calls[-2][0], "GET")
+            self.assertTrue(http.calls[-2][1].endswith("/issues/123"))
+            self.assertTrue(http.calls[-1][1].endswith("/issues/123/comments"))
+            self.assertEqual(set(http.calls[-1][3]["payload"]), {"body"})
+        self.assertEqual(len(http.comments), 2)
+        for kind in review.ISSUE_KINDS:
+            with self.assertRaises(review.Skip):
+                review.publish_issue(gh(http), snapshot, issue_result(kind), HEAD, kind)
+        self.assertEqual(len(http.comments), 2)
+        # Timestamps and comments are not content; a sibling comment cannot stale it.
+        http.issue["updated_at"] = "2026-10-18T01:00:00Z"
+        review.current_issue(gh(http), snapshot)
+
+    def test_dedup_resists_user_spoof_and_bounds_history(self):
+        http = IssueHTTP()
+        fingerprint = review.issue_fingerprint(review.issue_snapshot(ISSUE))
+        marker = review.issue_marker("product", fingerprint)
+        for user in ({"login": "github-actions[bot]", "type": "User"}, {"login": "attacker", "type": "Bot"}):
+            http.comments = [{"user": user, "body": marker}]
+            self.assertFalse(review.issue_duplicate(gh(http), "product", fingerprint))
+        http.comments = [{"user": {"login": "github-actions[bot]", "type": "Bot"}, "body": marker}]
+        self.assertTrue(review.issue_duplicate(gh(http), "product", fingerprint))
+        self.assertFalse(review.issue_duplicate(gh(http), "code", fingerprint))
+        http.comments = [{"body": "unrelated", "user": {}}] * 100
+        with self.assertRaises(review.ReviewError):
+            review.issue_duplicate(gh(http), "product", fingerprint)
+
+    def test_artifact_identity_and_no_source_payload(self):
+        for key, value in (("repo", "other/repo"), ("number", True), ("head", OLD),
+                           ("snapshot", "0" * 64), ("kind", "code"), ("model", "paid-other")):
+            http = IssueHTTP()
+            with self.subTest(key=key), self.assertRaises(review.ReviewError):
+                review.publish_issue(gh(http), review.issue_snapshot(ISSUE),
+                                     {**issue_result("product"), key: value}, HEAD, "product")
+            self.assertEqual(http.calls, [])
+        body = review.issue_body(issue_result("code"))
+        self.assertIn("No tests or reproduction were run", body)
+        self.assertIn(f"/blob/{HEAD}/{CODE}#L2", body)
+        report = issue_result("product")
+        report["report"]["summary"] = "@everyone [click](https://evil.test) <script>"
+        body = review.issue_body(report)
+        self.assertNotIn("@everyone", body)
+        self.assertNotIn("<script>", body)
+        self.assertIn("&lt;script&gt;", body)
+
+    def test_failure_of_either_review_does_not_prevent_other_comment(self):
+        for failed_kind in review.ISSUE_KINDS:
+            http = IssueHTTP()
+            for kind in review.ISSUE_KINDS:
+                data = issue_prepared(http, kind)
+                if kind == failed_kind:
+                    with patch.object(http, "request", side_effect=review.ProviderHTTPError(503)), \
+                         redirect_stdout(io.StringIO()), self.assertRaises(review.ReviewError):
+                        review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind,
+                                     go_no_overage_confirmed=True)
+                else:
+                    http.completion["choices"][0]["message"]["content"] = json.dumps(issue_report(kind))
+                    with redirect_stdout(io.StringIO()):
+                        result = review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind)
+                    review.publish_issue(gh(http), review.issue_snapshot(ISSUE), result, HEAD, kind)
+            self.assertEqual(len(http.comments), 1)
+            self.assertNotIn(review.issue_marker(failed_kind, review.issue_fingerprint(review.issue_snapshot(ISSUE))),
+                             http.comments[0]["body"])
+
+    def test_uncertain_comment_post_is_not_retried(self):
+        http = IssueHTTP()
+        original = http.request
+        posts = []
+        def request(method, url, token, **kwargs):
+            if method == "POST":
+                posts.append(url)
+                raise review.ReviewError("Uncertain fixture POST.")
+            return original(method, url, token, **kwargs)
+        with patch.object(http, "request", side_effect=request), self.assertRaises(review.ReviewError):
+            review.publish_issue(gh(http), review.issue_snapshot(ISSUE), issue_result("code"), HEAD, "code")
+        self.assertEqual(len(posts), 1)
+
+    def test_real_cli_pin_prepare_infer_publish_and_failed_artifact(self):
+        for kind in review.ISSUE_KINDS:
+            http = IssueHTTP()
+            with tempfile.TemporaryDirectory() as tmp:
+                previous = Path.cwd()
+                os.chdir(tmp)
+                try:
+                    Path("event.json").write_text(json.dumps({"action": "opened", "issue": ISSUE,
+                        "repository": {"full_name": REPO, "default_branch": "main"}}))
+                    env = {"GITHUB_EVENT_PATH": str(Path("event.json").resolve()),
+                           "GITHUB_EVENT_NAME": "issues", "GITHUB_REPOSITORY": REPO,
+                           "GH_TOKEN": "fixture-github-token", "GITHUB_OUTPUT": "outputs",
+                           "ISSUE_REVIEW_KIND": kind, "OPENCODE_API_KEY": KEY,
+                           "EXPECTED_MAIN_SHA": HEAD,
+                           "EXPECTED_ISSUE_SNAPSHOT": review.issue_fingerprint(review.issue_snapshot(ISSUE))}
+                    with patch.dict(os.environ, env, clear=True), patch.object(review, "HTTP", return_value=http):
+                        for mode in ("issue-pin", "issue-prepare"):
+                            with patch("sys.argv", ["review", mode]):
+                                review.main()
+                        http.completion["choices"][0]["message"]["content"] = json.dumps(issue_report(kind))
+                        with patch("sys.argv", ["review", "issue-infer"]), redirect_stdout(io.StringIO()):
+                            review.main()
+                        result = json.loads(Path("issue-review-result.json").read_text())
+                        self.assertEqual(set(result), {"repo", "number", "head", "kind", "snapshot", "model", "report"})
+                        Path("result").mkdir()
+                        Path("issue-review-result.json").rename("result/issue-review-result.json")
+                        with patch("sys.argv", ["review", "issue-publish"]):
+                            review.main()
+                        self.assertEqual(len(http.comments), 1)
+                        with patch("sys.argv", ["review", "issue-infer"]), \
+                             patch.object(http, "request", side_effect=review.ProviderHTTPError(503)), \
+                             redirect_stdout(io.StringIO()), self.assertRaises(review.ReviewError):
+                            review.main()
+                        self.assertFalse(Path("issue-review-result.json").exists())
+                finally:
+                    os.chdir(previous)
+
+
+class IssueWorkflowTests(unittest.TestCase):
+    def test_independent_fail_safe_job_contract(self):
+        text = (Path(__file__).resolve().parents[2] / ".github/workflows/opencode-review.yml").read_text()
+        trigger = text.split("  issues:\n")[1].split("  pull_request_target:")[0]
+        self.assertEqual(trigger.strip(), "types: [opened]")
+        pin, reader = text.split("  issue-pin:\n")[1].split("  issue-review:\n")
+        reader, publisher = reader.split("  issue-publish:\n")
+        self.assertIn("github.event.action == 'opened'", pin)
+        self.assertIn("fail-fast: false", reader)
+        self.assertIn("fail-fast: false", publisher)
+        self.assertIn("kind: [product, code]", reader)
+        self.assertIn("always() && !cancelled()", publisher)
+        self.assertIn("needs: [issue-pin, issue-review]", publisher)
+        self.assertIn("continue-on-error: true", publisher)
+        self.assertIn("if: steps.download.outcome == 'success'", publisher)
+        self.assertIn("issues: read", reader)
+        self.assertNotIn("issues: write", pin + reader)
+        self.assertIn("issues: write", publisher)
+        self.assertNotIn("OPENCODE_API_KEY", publisher)
+        self.assertNotIn("pull-requests:", pin + reader + publisher)
+        inference = reader.split("      - name: Review issue evidence")[1].split("      - name: Save")[0]
+        self.assertNotIn("GH_TOKEN", inference)
+        self.assertIn("path: issue-review-result.json", reader)
+        self.assertNotIn("path: issue-review-input.json", text)
+        self.assertEqual(text.count("persist-credentials: false"), 6)
+        self.assertEqual(text.count("ref: " + "$" + "{{ github.workflow_sha }}"), 6)
+        self.assertIn("EXPECTED_ISSUE_SNAPSHOT:", reader + publisher)
+        self.assertIn("EXPECTED_MAIN_SHA:", reader + publisher)
 
 
 if __name__ == "__main__":
