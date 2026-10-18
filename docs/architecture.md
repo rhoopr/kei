@@ -7,6 +7,19 @@ boundaries that protect user data.
 Use it as a starting map. Read the owning module and its direct callers before
 changing behavior.
 
+## Navigation
+
+- [Owners](#owners): find the decision owner and its boundary.
+- [Command dispatch](#command-dispatch) and [container startup](#container-startup): find entry points.
+- [Sync and provider checkpoints](#sync-and-provider-checkpoints) and [enumeration](#full-and-incremental-enumeration): trace source progress.
+- [Download and publication](#download-and-publication), [durable pending retry](#durable-pending-retry), and [import-existing](#import-existing): trace local work.
+- [Account ownership](#account-ownership-and-legacy-adoption), [source catalog and replay](#transactional-source-catalog-and-replay), and [work admission](#current-provider-work-admission): trace durable source ownership.
+- [Selection generation](#selection-generation-shadow) and [private replay](#private-selection-and-destination-replay): trace selection and destination projections.
+- [Data-safety invariants](#data-safety-invariants) and [safety contracts](#safety-contract-catalog): find the required safety conditions.
+- [Change-impact traversal](#change-impact-traversal) and [checklist](#change-impact-checklist): find related owners and consumers before editing.
+- [Tests](#tests): find proof entry points and the test guide.
+- [Managed edited-primary layouts](#managed-edited-primary-layouts) and [support evidence](#support-evidence-boundary): trace specialized flows.
+
 ## Design rules
 
 - User media and metadata must not be lost, corrupted, truncated, overwritten,
@@ -17,6 +30,23 @@ changing behavior.
 - Path rendering does not decide whether an asset should sync.
 - SQLite transitions and provider checkpoints must survive interruption.
 - Prefer the smallest complete implementation in the owning module.
+
+### Wrong-layer traps
+
+- `src/commands/service.rs` plans provider libraries and collection passes.
+  Platform service installation and execution belong in `src/service/`.
+- `src/selection.rs` parses selectors. Live collection lookup and pass planning
+  belong in `src/commands/service.rs`; path rendering cannot resolve them.
+- `src/sync_loop/precheck.rs` handles the database change pre-check. Zone
+  checkpoint decisions belong in `src/sync_cycle.rs`, not in the Photos adapter
+  or file-transfer code.
+- Facades such as `src/download/mod.rs`, `src/download/file.rs`, and
+  `src/state/db.rs` expose entry points. Read the child owner in the table below
+  before adding behavior or looking for its tests.
+- Reports, health, metrics, and support diagnostics consume observations.
+  They do not supply provider completeness or checkpoint authority.
+- Build output, local session files, and retained investigation notes are not
+  source owners. Do not use release history as the architecture specification.
 
 ## Owners
 
@@ -2067,6 +2097,31 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs` | An existing XMP sidecar is replaced only when it parses and its bytes still match the writer's initial read. Failure preserves the sidecar and durable rewrite marker. |
 | `XMP_GPS_ACCURACY_REQUIRES_MATCHING_LOCATION` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs`, `src/state/db.rs` | Native horizontal accuracy requires valid native latitude and longitude equal to the exported provider coordinates, plus a matching verified-download source checksum. Recovered local or download checksums cannot establish native provenance. Readable missing, invalid, or mismatched evidence omits accuracy and clears only obsolete kei-owned values. Source I/O failure preserves unknown fields and durable retry evidence. |
 | `METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE` | `src/download/orchestration/maintenance.rs`, `src/state/db.rs` | Revision repair updates catalogue metadata and configured rewrite evidence before promotion, stays library-scoped, and preserves the provider checkpoint on unresolved work. |
+
+## Change-impact traversal
+
+Use these search anchors after finding the owner. The related owners are an
+impact set, not a claim that every run calls each one in sequence. Read direct
+callers and follow shared values through their consumers. Use the linked flow
+for behavior and safety details instead of a second call graph.
+
+| Change | Search anchors and related owners | Flow or invariant |
+|--------|-----------------------------------|-------------------|
+| Collection selection | `Selection` in `src/selection.rs`; `collection_libraries`, `pass_scope_for_zone`, and `resolve_passes_for_scope` in `src/commands/service.rs`; sync callers in `src/sync_loop/planning.rs` and import callers in `src/commands/import.rs` | [Sync scope](#sync-and-provider-checkpoints), [import](#import-existing) |
+| Provider progress | `check_changes_database` and `store_scoped_db_sync_token` in `src/sync_loop/precheck.rs`; cycle calls in `src/sync_loop/runner.rs`; `source_checkpoint_decision` in `src/sync_cycle.rs`; `commit_checkpoint_transition` in `src/state/db/checkpoints.rs` | [Checkpoint advancement](#checkpoint-advancement) |
+| Enumeration proof | `download_photos_with_sync` in `src/download/orchestration/dispatch.rs`; full/incremental owners in that directory; `src/icloud/photos/album/enumeration.rs`, `completion.rs`, and `changes.rs` | [Full and incremental enumeration](#full-and-incremental-enumeration) |
+| File landing and state | `TaskPlanner` in `src/download/planner.rs`; producer, consumer, task, and pass owners in `src/download/pipeline/`; `download_file_with_mode` and `publish_part_to_final` under `src/download/file/`; `finalize_downloaded_with_proof` in `src/download/finalize.rs`; `mark_downloaded` in `src/state/db/assets.rs` | [File landing](#file-landing), [managed layouts](#managed-edited-primary-layouts) |
+| Durable retry | `src/download/orchestration/recovery.rs`; `build_pending_retry_download_tasks` in `src/download/retry.rs`; targeted lookup in `src/icloud/photos/album/lookup.rs`; pending-state methods on `DownloadStateStore` | [Durable pending retry](#durable-pending-retry) |
+| Paths and import parity | `src/config/templates.rs`; `DownloadConfig::with_pass` in `src/download/orchestration/config.rs`; `src/download/paths.rs`; `expected_paths_for` in `src/download/filter/expected_paths.rs`; callers in `src/commands/import.rs`; local reconciliation in `src/download/orchestration/reconciliation.rs` | [Import-existing](#import-existing), [file landing](#file-landing) |
+| Metadata refresh and writes | `refresh_metadata` callers in `src/sync_loop/runner.rs` and `src/sync_cycle.rs`; capture repair in `src/download/orchestration/maintenance.rs`; immediate and queued owners in `src/download/metadata_rewrite/`; format and publication owners in `src/download/metadata/` | [Metadata](#metadata) |
+| Import adoption | `run_import_existing`, `import_assets`, and `StrictImportVerifier` in `src/commands/import.rs`; `ImportStateStore::import_adopt` and its SQLite implementation in `src/state/db/import.rs` | [Import-existing](#import-existing), [state and serialization](#state-and-serialization) |
+| Service execution | dispatch in `src/lib.rs`; install, status, uninstall, and platform owners in `src/service/`; `src/service/run.rs` enters `src/sync_loop.rs::run_sync` | [Command dispatch](#command-dispatch), [container startup](#container-startup) |
+
+For schema, durable keys, sentinels, serialized values, and shared types, search
+all readers and writers by the exact old name or value. Include report, status,
+manifest, migration, and test consumers. Use [the test guide](../tests/README.md)
+to choose focused proof; a diagnostic count or a source-only assertion does not
+replace production-path state-transition proof.
 
 ## Change-impact checklist
 
