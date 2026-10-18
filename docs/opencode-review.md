@@ -376,3 +376,53 @@ contract, default-branch dispatch, prepared-head propagation, invalid PR/ref
 rejection, and safe finish-reason/token/status diagnostics. They do not contact inference
 endpoints or execute Rust tests. The
 existing CI Python discovery already runs these fixtures.
+
+## Manual official CLI Free smoke
+
+The separate OpenCode CLI Free smoke workflow tests the genuine OpenCode CLI
+without changing production review routing. Once this workflow is merged to the
+default branch, run it manually from the Actions tab on that branch. It starts
+one independent CLI invocation for each of DeepSeek V4.1 Flash Free and GLM 5.3
+Flash Free. A failed model does not cancel its sibling.
+
+The workflow downloads official release v1.19.3 and checks the archive against
+its pinned GitHub release SHA-256 before extracting the CLI. It has no repository
+checkout, GitHub token permissions, publication, or uploaded artifacts. The
+existing OPENCODE_API_KEY repository secret is supplied only to the CLI step.
+The CLI uses documented account authentication through its OPENCODE_API_KEY
+runtime environment in an empty temporary directory, with fresh CLI
+home/config/data/cache/state directories. It inherits no GitHub token or other
+credentials. The key is never written into CLI config or an auth file by this
+workflow. A missing, malformed, or public placeholder key fails before launch.
+Only the selected Free model is allowlisted, including for lightweight tasks;
+there is no configured Go or paid-model fallback. All tools are denied.
+Session sharing, update checks, project config, external plugins, automatic
+compaction, and OpenTelemetry export are disabled.
+
+Each invocation has a 120-second deadline, an 8192-token output cap, and a 512 KiB
+stdout cap. The CLI can apply its own bounded transient-error retries; the
+workflow adds no retry loop. Logs contain only a fixed summary, a numeric error
+HTTP status when the CLI provides one, and TEST_OK when validated final text
+matches exactly and one terminal stop event is present. Raw CLI events,
+reasoning, errors, and temporary session files are not published. Temporary CLI
+state is removed when the runner exits.
+
+OpenCode documents [noninteractive automation](https://opencode.ai/docs/cli/#run)
+and [GitHub Actions](https://opencode.ai/docs/github/). Its
+[model catalog](https://opencode.ai/v2/docs/console/models/#free-models) describes
+these models as free on OpenCode for a limited time. This test measures actual
+runner eligibility; it does not guarantee availability or resolve the broad
+automation wording in the [service terms](https://opencode.ai/legal/terms-of-service).
+An access denial fails the test without switching clients or models.
+
+The initial public-access run returned FreeTierError (HTTP 403) for both models.
+That run did not test the existing account credential. This account-authenticated
+probe keeps the documented Free IDs and endpoint; it does not change CLI headers
+or assume that authentication will resolve eligibility. Source and the verified
+release binary generate the normal OpenCode client/session/request headers even
+with the plugin isolation flags.
+
+The offline test executes the exact inline workflow runner with a fake CLI.
+It checks configuration, runtime-only credential forwarding and redaction,
+missing-key rejection, terminal completion, errors,
+tool rejection, timeouts, and output limits without inference or Rust builds.
