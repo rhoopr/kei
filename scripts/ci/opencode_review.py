@@ -57,10 +57,13 @@ for a changed behavior. Prioritize media loss, durable state, checkpoint gates,
 interruption/retry and identity. Ignore style, speculative issues and praise.
 Do not claim to have run tests. Do not quote credentials or source secrets.
 Return ONLY JSON: {"findings":[{"path":"exact changed path","line":1,
-"title":"concrete defect","body":"trigger, incorrect result, and evidence"}]}.
+ "title":"concrete defect","body":"trigger, impact, evidence and smallest next step"}]}.
+Write each finding in 1-3 short sentences, about 75 words; preserve substantive
+defects rather than repeating background. Use plain characters, not HTML entities
+or Markdown; do not wrap identifiers in backticks.
 At most 5 findings. Each line must occur in the supplied right-side hunk context
 and head source. No finding is better than an unsupported finding. No markdown,
-links, mentions, instructions, summaries, approvals, or merge recommendations.
+links, mentions, summaries, approvals, or merge recommendations.
 """
 
 
@@ -427,24 +430,37 @@ def infer(http, prepared, key, model, *, go_no_overage_confirmed=False, issue_ki
 
 def plain(text):
     # Escape all Markdown and HTML; suppress mentions and autolinks in model text.
-    text = html.escape(text, quote=True).replace("@", "@\u200b").replace(":", ":\u200b").replace(".", ".\u200b")
+    # Quotes are safe in text nodes. Numeric apostrophe entities would be broken
+    # by the Markdown '#' escape below. Literal input entities remain literal.
+    text = html.escape(text, quote=False).replace("@", "@\u200b").replace(":", ":\u200b").replace(".", ".\u200b")
     return re.sub(r"([\\`*_{}\[\]()#+!|~>\-])", r"\\\1", text)
 
 
+def source_link(result, item):
+    path, line = item["path"], item["line"]
+    link = (f'https://github.com/{result["repo"]}/blob/{result["head"]}/'
+            f'{urllib.parse.quote(path, safe="/")}#L{line}')
+    return f"[{plain(path)}:{line}]({link})"
+
+
+def review_footer(result):
+    model = {"deepseek-v4.1-flash-free": "DeepSeek V4.1 Flash Free",
+             "glm-5.3-flash-free": "GLM 5.3 Flash Free",
+             "deepseek-v4.1-flash": "DeepSeek V4.1 Flash",
+             "glm-5.3-flash": "GLM 5.3 Flash"}[result["model"]]
+    label = "main" if result.get("kind") else "head"
+    link = f'https://github.com/{result["repo"]}/commit/{result["head"]}'
+    return f"Advisory · {model} · [{label} {result['head'][:7]}]({link})\n"
+
+
 def review_body(result):
-    head, repo = result["head"], result["repo"]
-    body = (f"{MARKER}{head} -->\n"
-            f"### OpenCode advisory review\n\n"
-            f"Bot-generated review of `{head}` using `{result['model']}`. "
-            "Findings require human verification. No tests were run by this bot.\n\n"
-            "Scope: complete bounded PR diff and limited head source context; "
-            "not a whole-repository audit.\n\n")
+    body = f"{MARKER}{result['head']} -->\n"
     for finding in result["findings"]:
-        link = f"https://github.com/{repo}/blob/{head}/{urllib.parse.quote(finding['path'], safe='/')}#L{finding['line']}"
-        body += (f"- **{plain(finding['title'])}** ([source]({link}))\n"
-                 f"  {plain(finding['path'])}:{finding['line']}: {plain(finding['body'])}\n")
+        body += (f"- **{plain(finding['title'])}** ({source_link(result, finding)})\n"
+                 f"  {plain(finding['body'])}\n")
     if not result["findings"]:
-        body += "No demonstrable findings in the supplied scope. This does not establish correctness.\n"
+        body += "No supported findings in the bounded diff.\n"
+    body += "\nStatic review; no tests run.\n\n" + review_footer(result)
     require(len(body.encode()) <= 60000, "Review body too large.")
     return body
 
@@ -557,17 +573,29 @@ fetch links, invent evidence, claim tests passed/failed, or claim reproduction.
 Review only the pinned main snapshot and supplied issue. Source coverage is
 bounded and may miss owners/callers. Missing excerpts are not evidence of absence.
 Return ONLY requested JSON. No extra fields, markdown, links or mentions.
-Evidence is at most 8 {"path":"supplied path","line":1} references to supplied
-lines. Use exact paths and line numbers. Do not quote secrets.
+Keep summary, rationale and next_step together around 60-90 words.
+Summary is one conclusion sentence (at most 240 characters);
+rationale is 1-2 sentences of decisive evidence and material uncertainty (at most
+600 characters); next_step is one actionable follow-up or "None needed" (at most
+240 characters). Put any material risk in rationale. Do not repeat the conclusion,
+quote long source passages, restate generic policy or add boilerplate. The
+renderer supplies attribution and the no-execution notice; do not repeat them.
+Use plain characters, not HTML entities or Markdown, including no backticks.
+Evidence is at most 3 {"path":"supplied path","line":1} references to the most
+useful supplied lines. Use exact paths and line numbers. Do not quote secrets.
 """
 ISSUE_SYSTEMS = {
     "product": """Product Review: assess whether kei should address this issue.
 Evaluate charter, product direction, reliability priorities, scope, non-goals
 and architectural/data-safety invariants. Explain tradeoffs and risks.
 Do not decide technical truth from the report alone or instruct maintainers.
+Do not assume a reported failure requires a new feature. If existing support is
+unknown and material to priority, choose needs_information and explain the scope
+conditionally: supported-behavior repair versus a new capability. The charter
+alone does not establish whether a report is a regression.
 Return {"decision":"address|defer|out_of_scope|needs_information",
 "summary":"brief conclusion","rationale":"direction, scope and invariant analysis",
-"risks":"risks or missing information","evidence":[...]}.
+"next_step":"smallest useful follow-up","evidence":[...]}.
 Select ONE decision. Cite charter/architecture evidence for the recommendation.
 """,
     "code": """Code Validation: investigate reported behavior using supplied
@@ -576,7 +604,7 @@ separate claims from evidence, name missing inputs/callers, and explain whether
 supplied tests cover the trigger. No test/reproduction has been executed.
 Return {"status":"confirmed|plausible_unverified|not_reproduced|insufficient_evidence",
 "summary":"brief conclusion","rationale":"code paths, static tests and limits",
-"evidence":[...]}. Select ONE status.
+"next_step":"smallest useful follow-up","evidence":[...]}. Select ONE status.
 Confirmed requires a demonstrable static code defect and source evidence.
 Plausible/unverified means the path supports the report but does not prove it.
 Insufficient evidence means supplied inputs/code cannot establish the report.
@@ -741,9 +769,7 @@ def validate_issue_report(value, prepared):
     kind = prepared["kind"]
     require(kind in ISSUE_KINDS and isinstance(value, dict), "Invalid issue report.")
     classification = "decision" if kind == "product" else "status"
-    fields = {classification, "summary", "rationale", "evidence"}
-    if kind == "product":
-        fields.add("risks")
+    fields = {classification, "summary", "rationale", "next_step", "evidence"}
     require(set(value) == fields, "Invalid issue report fields.")
     choices = ({"address", "defer", "out_of_scope", "needs_information"} if kind == "product"
                else {"confirmed", "plausible_unverified", "not_reproduced", "insufficient_evidence"})
@@ -753,10 +779,10 @@ def validate_issue_report(value, prepared):
         require(value["status"] != "not_reproduced", "No trusted reproduction was performed.")
     for key in fields - {classification, "evidence"}:
         text = value[key]
-        require(isinstance(text, str) and 0 < len(text.strip()) <= (400 if key == "summary" else 2400)
+        require(isinstance(text, str) and 0 < len(text.strip()) <= (600 if key == "rationale" else 240)
                 and not any(ord(c) < 32 or ord(c) == 127 for c in text), "Invalid issue report text.")
     evidence = value["evidence"]
-    require(isinstance(evidence, list) and len(evidence) <= 8, "Invalid issue evidence count.")
+    require(isinstance(evidence, list) and len(evidence) <= 3, "Invalid issue evidence count.")
     seen = set()
     for item in evidence:
         require(isinstance(item, dict) and set(item) == {"path", "line"}, "Invalid issue evidence.")
@@ -779,25 +805,18 @@ def validate_issue_report(value, prepared):
 def issue_body(result):
     kind, report = result["kind"], result["report"]
     title = "Product Review" if kind == "product" else "Code Validation"
-    classification = "decision" if kind == "product" else "status"
-    body = (f'{issue_marker(kind, result["snapshot"])}\n### OpenCode {title} (advisory)\n\n'
-            f'Main snapshot: {result["head"]}. Issue content fingerprint: {result["snapshot"]}.\n'
-            f'Bot-generated using {result["model"]}; human verification required.\n\n'
-            f'Conclusion: {plain(report[classification])}\n\n{plain(report["summary"])}\n\n'
-            f'{plain(report["rationale"])}\n\n')
-    if kind == "product":
-        body += f'Risks / missing information: {plain(report["risks"])}\n\n'
-        body += "Scope: supplied charter and architecture; this does not validate reported behavior.\n\n"
-    else:
-        body += ("Evidence mode: static source and test inspection only. No tests or reproduction were run. "
-                 "Confirmed means a static defect was identified; plausible/unverified remains unproven; "
-                 "not reproduced is not established without execution; insufficient evidence remains unresolved. "
-                 "Source selection uses bounded path matches and issue-word excerpts, so owners/callers may be missing. "
-                 "Linked material was not fetched. Absence of a finding does not establish correctness.\n\n")
-    for item in report["evidence"]:
-        link = (f'https://github.com/{result["repo"]}/blob/{result["head"]}/'
-                f'{urllib.parse.quote(item["path"], safe="/")}#L{item["line"]}')
-        body += f'- [source]({link}) {plain(item["path"])}:{item["line"]}\n'
+    verdict = report["decision" if kind == "product" else "status"]
+    classification = {"address": "Address", "defer": "Defer", "out_of_scope": "Out of scope",
+                      "needs_information": "Needs verification", "confirmed": "Confirmed by static evidence",
+                      "plausible_unverified": "Plausible, unverified",
+                      "insufficient_evidence": "Not confirmed"}[verdict]
+    notice = " No tests or reproduction were run." if kind == "code" else ""
+    body = (f'{issue_marker(kind, result["snapshot"])}\n'
+            f'**{title}: {classification}.** {plain(report["summary"])}\n\n'
+            f'{plain(report["rationale"])}{notice}\n\nNext: {plain(report["next_step"])}\n')
+    if report["evidence"]:
+        body += "\nEvidence: " + ", ".join(source_link(result, item) for item in report["evidence"]) + ".\n"
+    body += "\n" + review_footer(result)
     require(len(body.encode()) <= 60000, "Issue comment too large.")
     return body
 

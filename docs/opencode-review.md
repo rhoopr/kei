@@ -88,6 +88,33 @@ main has since advanced. Normal users cannot spoof bot identity for dedup.
 No labels, closures, branches, pull requests, or other issue mutations are
 authorized by this workflow. Maintainers decide what to do with the advice.
 
+## Comment format
+
+Issue comments use a short verdict, one evidence/uncertainty paragraph, an
+actionable next step, and up to three pinned source links. The usual target is
+60-90 words of review content. Product scope remains conditional when existing
+support is unknown; the charter alone cannot establish a regression. Code
+comments retain a fixed notice that no tests or reproduction ran.
+
+Both issue schemas require summary, rationale, next_step and evidence, plus
+decision or status. Summary and next_step each allow 240 characters; rationale
+allows 600. Oversized or malformed output is rejected for the existing fallback
+chain, never truncated into a published result. The issue fingerprint remains in
+the internal dedup marker rather than a visible preamble.
+
+PR reviews retain every validated finding and its pinned source link. The prompt
+asks for 1-3 short sentences per finding describing the trigger, impact, evidence
+and smallest next step. Existing finding count and size limits remain unchanged.
+An empty result says only that the bounded diff had no supported findings.
+
+A compact footer names the advisory status, actual model (with Free distinguished)
+and pinned main/head commit. Repeated headings, scope essays and generic
+disclaimers are omitted. Model text remains escaped plain text: quotes stay
+literal, angle brackets and ampersands are neutralized, and Markdown, mentions
+and autolinks remain inert. No HTML entities are broadly decoded; a source
+literal such as &lt; stays literal. This avoids the apostrophe entity/Markdown
+escape interaction visible in issue #1004 and older PR comments.
+
 ## Models, billing, and setup
 
 Review attempts use this fixed order and stop at the first validated result:
