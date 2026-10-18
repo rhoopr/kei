@@ -244,6 +244,8 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "supplied_owner",
             "supplied_owner_type",
             "owner_provenance",
+            "master_status",
+            "child_status",
         ]),
         "support_missing_reference_v1" => Some(&[
             "record_history",
@@ -604,6 +606,24 @@ fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
         };
     }
     match key {
+        "master_status" | "child_status" if kind == "exact_lookup_rejection_v1" => matches!(
+            label,
+            Some(
+                "not_requested"
+                    | "omitted"
+                    | "returned"
+                    | "tombstone"
+                    | "not_found"
+                    | "access_denied"
+                    | "authentication_failed"
+                    | "zone_not_found"
+                    | "retry_later"
+                    | "throttled"
+                    | "server_error"
+                    | "other_error"
+                    | "malformed_error"
+            )
+        ),
         "expected_owner" if kind == "exact_lookup_rejection_v1" => {
             label.is_some_and(|label| matches!(label, "absent" | "private_default" | "other"))
         }
@@ -685,6 +705,18 @@ pub(crate) fn fixed_label(value: &str) -> bool {
 }
 
 const LABELS: &[&str] = &[
+    // The tracing visitor checks this vocabulary before the diagnostic contract.
+    "not_requested",
+    "omitted",
+    "tombstone",
+    "access_denied",
+    "authentication_failed",
+    "zone_not_found",
+    "retry_later",
+    "throttled",
+    "server_error",
+    "other_error",
+    "malformed_error",
     "waiting",
     "started",
     "asset_identity",

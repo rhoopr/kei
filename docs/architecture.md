@@ -139,6 +139,13 @@ planning types and completion evidence. Lookup, counts, planning, completion,
 and changes do not call sibling owners. The facade retains stream routing and
 public entry points. No album child owns durable checkpoint policy.
 
+Targeted lookup rejections retain fixed `master_status` and `child_status`
+response categories in bounded support history. These distinguish omitted,
+not-requested, returned, tombstoned and provider-error members without storing
+raw codes, messages or identifiers. `returned` describes response presence,
+not owner, identity, resource or checkpoint proof. Lookup resolution and
+checkpoint policy do not consume these diagnostic categories.
+
 Best-effort album identity hydration has task-scoped anonymous progress in
 `icloud/photos/hydration_progress.rs`. Every 30 seconds and on return or drop,
 it reports fixed phase labels, source ordinal/role (`owner` then `fallback`),

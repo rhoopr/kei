@@ -14,7 +14,7 @@ use std::sync::Mutex;
 
 use super::{
     ProviderLookupError, ProviderRecordId, RecordLookupRequest, RecordResolution,
-    asset_identity_diagnostic, classify_provider_lookup_error,
+    asset_identity_diagnostic, classify_provider_lookup_error, lookup_record_status,
 };
 
 fn lookup_request(state_id: &str, master: &str, asset: &str) -> RecordLookupRequest {
@@ -835,4 +835,157 @@ async fn issue956_pair_rejections_distinguish_hints_from_missing_references_and_
             "{fault}"
         );
     }
+}
+
+#[test]
+fn issue956_lookup_record_status_is_bounded_response_evidence() {
+    for (code, expected) in [
+        (json!("UNKNOWN_ITEM"), "not_found"),
+        (json!("NOT_FOUND"), "not_found"),
+        (json!("ACCESS_DENIED"), "access_denied"),
+        (json!("AUTHENTICATION_REQUIRED"), "authentication_failed"),
+        (json!("AUTHENTICATION_FAILED"), "authentication_failed"),
+        (json!("ZONE_NOT_FOUND"), "zone_not_found"),
+        (json!("RETRY_LATER"), "retry_later"),
+        (json!("THROTTLED"), "throttled"),
+        (json!("SERVER_INTERNAL_ERROR"), "server_error"),
+        (json!("PRIVATE_ERROR_CANARY"), "other_error"),
+        (json!(42), "malformed_error"),
+        (json!({"private":"PRIVATE_ERROR_CANARY"}), "malformed_error"),
+        (json!(null), "returned"),
+    ] {
+        let record = json!({"serverErrorCode":code,"reason":"PRIVATE_REASON_CANARY"});
+        assert_eq!(lookup_record_status(Some(&record)), expected);
+    }
+    assert_eq!(lookup_record_status(None), "omitted");
+    assert_eq!(
+        lookup_record_status(Some(&json!({"deleted":true}))),
+        "tombstone"
+    );
+    // Returned means only no provider error/tombstone was observed.
+    assert_eq!(
+        lookup_record_status(Some(&json!({"recordType":"PRIVATE_TYPE"}))),
+        "returned"
+    );
+}
+
+#[tokio::test]
+async fn issue956_rejection_groups_distinguish_master_and_child_errors_without_private_values() {
+    let _parallel_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+    let mut records = Vec::new();
+    let mut requests = Vec::new();
+    let cases = [
+        ("ACCESS_DENIED", None, "access_denied", "returned", 2),
+        (
+            "",
+            Some("AUTHENTICATION_REQUIRED"),
+            "returned",
+            "authentication_failed",
+            1,
+        ),
+        (
+            "RETRY_LATER",
+            Some("THROTTLED"),
+            "retry_later",
+            "throttled",
+            1,
+        ),
+        ("PRIVATE_ERROR_CANARY", None, "other_error", "returned", 1),
+    ];
+    let mut serial = 0;
+    for (master_error, child_error, _, _, count) in cases {
+        for _ in 0..count {
+            serial += 1;
+            let master_name = format!("PRIVATE_MASTER_CANARY-{serial}");
+            let child_name = format!("PRIVATE_CHILD_CANARY-{serial}");
+            let mut master = test_master_record(&master_name);
+            let mut child = test_asset_record_for(&child_name, &master_name);
+            if !master_error.is_empty() {
+                master["serverErrorCode"] = json!(master_error);
+                master["reason"] =
+                    json!("PRIVATE_REASON_CANARY https://private.invalid?token=SECRET");
+            }
+            if let Some(code) = child_error {
+                child["serverErrorCode"] = json!(code);
+            }
+            records.extend([master, child]);
+            requests.push(lookup_request(&child_name, &master_name, &child_name));
+        }
+    }
+    // Error-free omission is different from a provider not-found reply.
+    requests.push(lookup_request(
+        "PRIVATE_STATE_CANARY",
+        "PRIVATE_OMITTED_MASTER",
+        "PRIVATE_OMITTED_CHILD",
+    ));
+    let album = make_album_with_session(
+        100,
+        Box::new(MockPhotosSession::new().ok(json!({"records":records}))),
+    );
+    let batch = album.resolve_records(&requests).await;
+    assert!(!batch.complete);
+    assert_eq!(batch.results.len(), 6);
+    assert!(
+        batch
+            .results
+            .iter()
+            .all(|(_, r)| matches!(r, RecordResolution::Unknown))
+    );
+    let events = capture.events();
+    let rejections: Vec<_> = events
+        .iter()
+        .filter(|event| event.field("diagnostic") == Some("exact_lookup_rejection_v1"))
+        .collect();
+    assert_eq!(rejections.len(), 5);
+    for (_, _, master_status, child_status, count) in cases {
+        assert!(
+            rejections
+                .iter()
+                .any(|event| event.field("master_status") == Some(master_status)
+                    && event.field("child_status") == Some(child_status)
+                    && event.field("rejected_requests") == Some(count.to_string().as_str()))
+        );
+    }
+    assert!(
+        rejections
+            .iter()
+            .any(|event| event.field("master_status") == Some("omitted")
+                && event.field("child_status") == Some("omitted"))
+    );
+    let diagnostic_text = format!("{rejections:?}");
+    for private in ["PRIVATE_", "private.invalid", "SECRET", "https://"] {
+        assert!(!diagnostic_text.contains(private), "leaked {private}");
+    }
+}
+
+#[tokio::test]
+async fn issue956_single_target_statuses_do_not_invent_the_other_record() {
+    let _parallel_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+    for request in [
+        RecordLookupRequest::asset_only(ProviderRecordId::new("PRIVATE_CHILD_CANARY")),
+        RecordLookupRequest::master_only(
+            ProviderRecordId::new("PRIVATE_STATE_CANARY"),
+            ProviderRecordId::new("PRIVATE_MASTER_CANARY"),
+        ),
+    ] {
+        let album = make_album_with_session(
+            100,
+            Box::new(MockPhotosSession::new().ok(json!({"records":[]}))),
+        );
+        let batch = album.resolve_records(&[request]).await;
+        assert!(!batch.complete);
+        assert!(matches!(batch.results[0].1, RecordResolution::Unknown));
+    }
+    assert!(
+        capture.contains_event(|event| event.field("target") == Some("child")
+            && event.field("master_status") == Some("not_requested")
+            && event.field("child_status") == Some("omitted"))
+    );
+    assert!(
+        capture.contains_event(|event| event.field("target") == Some("master")
+            && event.field("master_status") == Some("omitted")
+            && event.field("child_status") == Some("not_requested"))
+    );
 }

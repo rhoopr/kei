@@ -630,3 +630,140 @@ fn legacy_receipt_prerequisites_roundtrip_only_fixed_labels() {
             .contains("private")
     );
 }
+
+#[test]
+fn issue956_lookup_record_statuses_survive_reopen_and_reject_untrusted_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.json");
+    let mut history = History {
+        schema_version: 1,
+        ..History::default()
+    };
+    apply(&mut history, Message::Begin(json!({})));
+    for (master, child) in [("not_found", "returned"), ("returned", "access_denied")] {
+        add(
+            &mut history,
+            "exact_lookup_rejection_v1",
+            json!({
+                "target":"paired","stage":"record_error","reason":"record_provider_error",
+                "master_status":master,"child_status":child,"rejected_requests":3,
+                "serverErrorCode":"PRIVATE_ERROR_CANARY","recordName":"PRIVATE_RECORD_CANARY"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+    }
+    save(&path, &mut history).unwrap();
+    let (reopened, status) = read(&path);
+    assert_eq!(status, "available");
+    let events = &reopened.cycles[0].diagnostics;
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].fields["master_status"], "not_found");
+    assert_eq!(events[0].fields["child_status"], "returned");
+    assert_eq!(events[1].fields["master_status"], "returned");
+    assert_eq!(events[1].fields["child_status"], "access_denied");
+    assert!(
+        !serde_json::to_string(&reopened)
+            .unwrap()
+            .contains("PRIVATE_")
+    );
+
+    let mut untrusted = serde_json::to_value(&reopened).unwrap();
+    untrusted["cycles"][0]["diagnostics"][0]["fields"]["master_status"] =
+        json!("PRIVATE_STATUS_CANARY");
+    untrusted["cycles"][0]["diagnostics"][0]["fields"]["child_status"] = json!(401);
+    std::fs::write(&path, serde_json::to_vec(&untrusted).unwrap()).unwrap();
+    let (clean, status) = read(&path);
+    assert_eq!(status, "available");
+    assert!(
+        !clean.cycles[0].diagnostics[0]
+            .fields
+            .contains_key("master_status")
+    );
+    assert!(
+        !clean.cycles[0].diagnostics[0]
+            .fields
+            .contains_key("child_status")
+    );
+    assert_eq!(
+        clean.cycles[0].diagnostics[1].fields["child_status"],
+        "access_denied"
+    );
+    assert!(!serde_json::to_string(&clean).unwrap().contains("PRIVATE_"));
+}
+
+#[test]
+fn issue956_lookup_statuses_cross_the_production_tracing_recorder_and_reopen() {
+    let statuses = [
+        "not_requested",
+        "omitted",
+        "returned",
+        "tombstone",
+        "not_found",
+        "access_denied",
+        "authentication_failed",
+        "zone_not_found",
+        "retry_later",
+        "throttled",
+        "server_error",
+        "other_error",
+        "malformed_error",
+    ];
+    let _parallel_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let (recorder, drain) = super::test_layer();
+    let subscriber = tracing_subscriber::registry().with(recorder);
+    tracing::subscriber::with_default(subscriber, || {
+        for status in statuses {
+            tracing::info!(
+                diagnostic = "exact_lookup_rejection_v1",
+                target = "paired",
+                master_status = status,
+                child_status = status,
+                rejected_requests = 1u64,
+                record_name = "PRIVATE_RECORD_CANARY",
+                error = "PRIVATE_ERROR_CANARY",
+                "PRIVATE_MESSAGE_CANARY"
+            );
+        }
+        tracing::info!(
+            diagnostic = "exact_lookup_rejection_v1",
+            master_status = "PRIVATE_STATUS_CANARY",
+            child_status = 401u64,
+            rejected_requests = 2u64,
+            "untrusted categories"
+        );
+    });
+    let events = drain();
+    assert_eq!(events.len(), statuses.len() + 1);
+    for (event, status) in events.iter().zip(statuses) {
+        assert_eq!(event["fields"]["master_status"], status);
+        assert_eq!(event["fields"]["child_status"], status);
+    }
+    let last = events.last().unwrap()["fields"].as_object().unwrap();
+    assert_eq!(last.len(), 1);
+    assert_eq!(last["rejected_requests"], 2);
+    assert!(!serde_json::to_string(&events).unwrap().contains("PRIVATE_"));
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.json");
+    let mut history = History {
+        schema_version: 1,
+        ..History::default()
+    };
+    apply(&mut history, Message::Begin(json!({})));
+    for event in events {
+        add(
+            &mut history,
+            event["kind"].as_str().unwrap(),
+            event["fields"].as_object().unwrap().clone(),
+        );
+    }
+    save(&path, &mut history).unwrap();
+    let (reopened, status) = read(&path);
+    assert_eq!(status, "available");
+    for (event, status) in reopened.cycles[0].diagnostics.iter().zip(statuses) {
+        assert_eq!(event.fields["master_status"], status);
+        assert_eq!(event.fields["child_status"], status);
+    }
+}

@@ -15,6 +15,29 @@ use std::sync::Arc;
 
 const RECORD_LOOKUP_BATCH_SIZE: usize = 100;
 
+// Response presence/error shape only. A returned record is not proof of its
+// type, owner, relationship, resources, or deletion authority.
+fn lookup_record_status(record: Option<&Value>) -> &'static str {
+    let Some(record) = record else {
+        return "omitted";
+    };
+    match record.get("serverErrorCode").filter(|code| !code.is_null()) {
+        Some(code) => match code.as_str() {
+            Some("UNKNOWN_ITEM" | "NOT_FOUND") => "not_found",
+            Some("ACCESS_DENIED") => "access_denied",
+            Some("AUTHENTICATION_REQUIRED" | "AUTHENTICATION_FAILED") => "authentication_failed",
+            Some("ZONE_NOT_FOUND") => "zone_not_found",
+            Some("RETRY_LATER") => "retry_later",
+            Some("THROTTLED") => "throttled",
+            Some("SERVER_INTERNAL_ERROR") => "server_error",
+            Some(_) => "other_error",
+            None => "malformed_error",
+        },
+        None if record.get("deleted").and_then(Value::as_bool) == Some(true) => "tombstone",
+        None => "returned",
+    }
+}
+
 // Only fixed labels leave this trust boundary. Never log provider record types,
 // error messages, identifiers, reference values, or response bodies here.
 fn asset_identity_diagnostic(
@@ -612,8 +635,29 @@ impl PhotoAlbum {
                     };
                     let (supplied_owner, supplied_owner_type) =
                         supplied_owner_shape(master, asset, stage, &self.zone_id);
+                    let (master_status, child_status) = match request.target {
+                        RecordLookupTarget::Asset => {
+                            ("not_requested", lookup_record_status(master))
+                        }
+                        RecordLookupTarget::Master => (
+                            lookup_record_status(master),
+                            if request.asset_record_name.is_some() {
+                                lookup_record_status(asset)
+                            } else {
+                                "not_requested"
+                            },
+                        ),
+                    };
                     *rejection_diagnostics
-                        .entry((target, stage, reason, supplied_owner, supplied_owner_type))
+                        .entry((
+                            target,
+                            stage,
+                            reason,
+                            supplied_owner,
+                            supplied_owner_type,
+                            master_status,
+                            child_status,
+                        ))
                         .or_insert(0usize) += 1;
                 }
                 if request.target == RecordLookupTarget::Asset
@@ -652,12 +696,22 @@ impl PhotoAlbum {
             Some(owner) if owner.as_str() == Some("_defaultOwner") => "private_default",
             Some(_) => "other",
         };
-        for ((target, stage, reason, supplied_owner, supplied_owner_type), rejected_requests) in
-            rejection_diagnostics
+        for (
+            (
+                target,
+                stage,
+                reason,
+                supplied_owner,
+                supplied_owner_type,
+                master_status,
+                child_status,
+            ),
+            rejected_requests,
+        ) in rejection_diagnostics
         {
             tracing::info!(target: "kei::icloud::photos::album",
                 diagnostic = "exact_lookup_rejection_v1",
-                target, stage, reason, expected_owner, lookup_zone, rejected_requests, supplied_owner, supplied_owner_type, owner_provenance = "lookup_request",
+                target, stage, reason, expected_owner, lookup_zone, rejected_requests, supplied_owner, supplied_owner_type, master_status, child_status, owner_provenance = "lookup_request",
                 "Targeted identity lookup retained unresolved requests"
             );
         }

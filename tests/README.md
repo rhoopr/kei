@@ -1642,6 +1642,15 @@ controls distinguish missing/malformed references, actual different-master
 references and provider errors without exposing identifiers. Existing explicit
 non-default owner discovery and cancellation fixtures remain separate controls.
 
+The `issue956_lookup_record_status`, `issue956_rejection_groups` and
+`issue956_single_target_statuses` tests distinguish master/child provider
+errors and omissions through the real lookup path. Same-category responses
+aggregate, distinct failing members remain separate, and normal logs and
+retained history exclude private provider values. History reopen revalidates
+the fixed vocabulary and preserves older records with unavailable fields.
+These diagnostics make no additional provider requests and do not qualify
+sparse links or change lookup/checkpoint outcomes.
+
 ### Missing parent-reference diagnostics
 
 `preservation_proof::missing_reference::tests` exercises scoped response categories,
