@@ -119,6 +119,7 @@ def check_rust_ci(errors: list[str]) -> None:
     text = workflow_text("checks.yml")
     for needle in (
         "run: python3 scripts/ci/policy.py",
+        "run: python3 scripts/check-contracts",
         "LIGHT_ENABLED: ${{ vars.CI_LIGHT_PR_ENABLED }}",
         "if: needs.detect.outputs.coverage == 'true'",
         "      - coverage-head\n",
@@ -130,8 +131,10 @@ def check_rust_ci(errors: list[str]) -> None:
 
 def check_qualification(errors: list[str]) -> None:
     guards = {
-        "ci.yml": ["needs: [plan, checks, qualification]", "mode not in {\"true\", \"false\"}",
-                   "[\"plan\", \"qualification\" if mode == \"true\" else \"checks\"]"],
+        "ci.yml": ["needs: [plan, checks, service, qualification]", "mode not in {\"true\", \"false\"}",
+                   "[\"plan\", \"qualification\" if mode == \"true\" else \"checks\"]",
+                   "missing service route", "required += [\"service\"]",
+                   "uses: ./.github/workflows/service-smoke.yml"],
         "qualification.yml": ["needs: [quality, artifacts, service, specialized]",
                               "python3 scripts/ci/gate.py quality artifacts service specialized",
                               "cargo fetch --locked\n          just test packaging",
@@ -149,21 +152,12 @@ def check_qualification(errors: list[str]) -> None:
             errors.append(f"{name}: qualification must not receive publication credentials")
 
 
-def check_service_smoke_paths(errors: list[str]) -> None:
+def check_service_smoke(errors: list[str]) -> None:
     text = workflow_text("service-smoke.yml")
     if "group: service-smoke-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}" not in text:
         errors.append("service-smoke.yml: cancel obsolete runs without cancelling another caller")
-    for path in (
-        "src/service/**",
-        "src/commands/service.rs",
-        "src/cli.rs",
-        "src/config.rs",
-        "src/config/**",
-        "src/lib.rs",
-        "src/commands/status.rs",
-    ):
-        if f"- '{path}'" not in text:
-            errors.append(f"service-smoke.yml: path filter must include {path}")
+    if "  workflow_call:" not in text or "  pull_request:" in text:
+        errors.append("service-smoke.yml: service smoke must be reusable only; CI owns routing")
 
 
 def check_coverage_comment(errors: list[str]) -> None:
@@ -190,7 +184,7 @@ def main() -> int:
     check_release(errors)
     check_rust_ci(errors)
     check_qualification(errors)
-    check_service_smoke_paths(errors)
+    check_service_smoke(errors)
     check_coverage_comment(errors)
     check_windows_stack_link_arg(errors)
 

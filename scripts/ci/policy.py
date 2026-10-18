@@ -15,6 +15,7 @@ CODE = ["fmt", "roundtrip", "clippy", "test_no_default", "test", "docs", "catalo
 MAINTENANCE_FILES = {
     "scripts/ci/nightly.py", "scripts/ci/opencode_review.py",
     "scripts/ci/policy.py", "scripts/ci/gate.py", "scripts/ci/local_release.py",
+    "scripts/check-contracts",
     ".github/scripts/check_workflow_hardening.py",
     ".github/workflows/opencode-review.yml", ".github/workflows/nightly-health.yml",
     ".github/workflows/coverage-comment.yml",
@@ -22,23 +23,28 @@ MAINTENANCE_FILES = {
 # These change Rust test/gate execution. Exercise the ordinary Rust matrix,
 # not release artifacts.
 RUST_CHECK_FILES = {
-    ".github/workflows/ci.yml", ".github/workflows/checks.yml",
-    "scripts/check-contracts",
     "scripts/check-roundtrip-gate.sh", "scripts/test-copies-stress.sh",
 }
 STRESS_CHECK_FILES = {
-    ".github/workflows/ci.yml", ".github/workflows/checks.yml",
     "scripts/test-copies-stress.sh",
 }
 QUALIFICATION_FILES = {
     "Cargo.toml", "Cargo.lock", "build.rs", "justfile", "Dockerfile",
     ".gitignore", ".dockerignore", "scripts/ci/artifact.py",
+    ".github/workflows/ci.yml", ".github/workflows/checks.yml",
     ".github/workflows/artifacts.yml", ".github/workflows/qualification.yml",
     ".github/workflows/release.yml", ".github/workflows/nightly.yml",
     ".github/workflows/service-smoke.yml", ".github/workflows/docker.yml",
     ".github/workflows/docker-test.yml",
 }
 QUALIFICATION_PREFIXES = (".cargo/", "fuzz/", "docker/")
+# One owner for the native service smoke previously selected by workflow paths.
+SERVICE_FILES = {
+    "src/service.rs", "src/commands/service.rs", "src/commands/status.rs",
+    "src/cli.rs", "src/config.rs", "src/lib.rs", "Cargo.toml", "Cargo.lock",
+    ".github/workflows/service-smoke.yml",
+}
+SERVICE_PREFIXES = ("src/service/", "src/commands/service/", "src/commands/status/", "src/config/")
 
 
 def maintenance_path(path: str) -> bool:
@@ -97,6 +103,8 @@ def route(files: list[str], event: str, heavy: bool, light_enabled: bool, full: 
     platform = code and (broad or shared or any(rust_test_path(p) for p in files) or any(p.startswith(("src/download/file", "src/download/paths", "src/download/metadata", "src/state/", "src/service", "src/config", "src/fs_util", "tests/service", "tests/behavioral", "docker/")) for p in files))
     stress = code and (heavy or full or event != "pull_request" or qualification_input or unknown
                        or any(p in STRESS_CHECK_FILES or copies_stress_path(p) for p in files))
+    service = heavy or full or qualification_input or unknown or any(
+        p in SERVICE_FILES or p.startswith(SERVICE_PREFIXES) for p in files)
     cargo = code or any(p in {"Cargo.toml", "Cargo.lock", ".cargo/audit.toml"} for p in files)
     coverage = heavy or (code and event == "pull_request" and (full or not light_enabled))
     required = ALWAYS + (CODE if code else []) + (["lockfile", "security"] if cargo else [])
@@ -106,7 +114,7 @@ def route(files: list[str], event: str, heavy: bool, light_enabled: bool, full: 
         required += ["unused-deps"]
     if coverage:
         required += ["coverage-head"]
-    return {"code": code, "cargo": cargo, "stress": stress, "platform": platform,
+    return {"code": code, "cargo": cargo, "stress": stress, "platform": platform, "service": service,
             "coverage": coverage, "unused": "unused-deps" in required, "required": required,
             "qualification": heavy or full or event == "workflow_dispatch" or qualification_input or unknown}
 

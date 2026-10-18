@@ -2100,9 +2100,12 @@ Stable IDs connect safety rules to production owners and focused tests.
 - Shell suites cover crash, concurrency, state-machine, and container behavior.
 - Fuzz targets cover parser and metadata trust boundaries.
 - `ci.yml` defers draft PR work and keeps the required `CI` marker failing until
-  ready-for-review validation succeeds. `scripts/ci/policy.py` owns path routing.
-  `checks.yml` owns shared quality
-  checks; `qualification.yml` composes heavy checks and tested artifacts.
+  ready-for-review validation succeeds. Ignored PR metadata has a separate
+  concurrency key and check name; base retargets and full-label transitions
+  revalidate. `scripts/ci/policy.py` owns path and native-service routing.
+  `ci.yml` requires selected native smoke once, or delegates it to qualification.
+  `checks.yml` owns shared quality and always-on safety-contract validation;
+  `qualification.yml` composes heavy checks and tested artifacts.
   `scripts/ci/artifact.py` binds archive/container evidence to one commit.
   `local_release.py` validates local live/host-service attestations.
   Release publication depends on both local evidence and hosted qualification;

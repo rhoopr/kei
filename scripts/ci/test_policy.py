@@ -28,7 +28,7 @@ class PolicyTests(unittest.TestCase):
             ([".dockerignore"], True, True, True),
             ([".gitignore"], True, True, True),
             ([".github/workflows/ci.yml"], True, True, True),
-            (["scripts/check-contracts"], True, True, False),
+            (["scripts/check-contracts"], False, False, False),
             (["unrecognized-input"], True, True, True),
             (["tests/cli.rs"], True, True, False),
         ]
@@ -41,12 +41,16 @@ class PolicyTests(unittest.TestCase):
                 self.assertEqual("test_no_default" in result["required"], code)
 
     def test_notification_and_advisory_prs_keep_only_relevant_checks(self):
-        # Exact GitHub file sets at 6e32a20 (#1000), 4f1dbc8 (#997), f555e9a (#991).
+        # Exact GitHub file sets at 6e32a20 (#1000), 4f1dbc8 (#997),
+        # f555e9a (#991) and fbda631 (#1001).
         cases = [
             (1000, ["docs/ci.md", "scripts/ci/nightly.py", "scripts/ci/test_nightly.py",
                     "src/inventory_diagnostic/tests.rs"], True),
             (997, ["docs/opencode-review.md", "scripts/ci/opencode_review.py",
                    "scripts/ci/test_opencode_review.py"], False),
+            (1001, [".github/workflows/opencode-review.yml", "docs/architecture.md",
+                    "docs/opencode-review.md", "scripts/ci/opencode_review.py",
+                    "scripts/ci/test_opencode_review.py"], False),
             (991, [".github/workflows/opencode-review.yml", "docs/architecture.md",
                    "docs/ci.md", "docs/opencode-review.md", "scripts/ci/opencode_review.py",
                    "scripts/ci/test_opencode_review.py"], False),
@@ -78,6 +82,7 @@ class PolicyTests(unittest.TestCase):
         maintenance = ["scripts/ci/nightly.py", "scripts/ci/opencode_review.py",
                        "scripts/ci/policy.py", "scripts/ci/gate.py", "scripts/ci/local_release.py",
                        "scripts/ci/test_qualification.py", "scripts/ci/test_new_notification.py",
+                       "scripts/check-contracts",
                        ".github/scripts/check_workflow_hardening.py",
                        ".github/workflows/opencode-review.yml", ".github/workflows/nightly-health.yml",
                        ".github/workflows/coverage-comment.yml"]
@@ -87,9 +92,7 @@ class PolicyTests(unittest.TestCase):
                 self.assertEqual(result["required"], ALWAYS)
                 for key in ("code", "platform", "stress", "qualification", "coverage", "unused"):
                     self.assertFalse(result[key], key)
-        rust_tools = [".github/workflows/ci.yml", ".github/workflows/checks.yml",
-                      "scripts/check-contracts",
-                      "scripts/check-roundtrip-gate.sh", "scripts/test-scenarios/check.sh",
+        rust_tools = ["scripts/check-roundtrip-gate.sh", "scripts/test-scenarios/check.sh",
                       "scripts/test-copies-stress.sh"]
         for path in rust_tools:
             with self.subTest(path=path):
@@ -98,10 +101,10 @@ class PolicyTests(unittest.TestCase):
                 self.assertTrue(result["platform"])
                 self.assertFalse(result["qualification"])
                 self.assertEqual(result["stress"], path in {
-                    ".github/workflows/checks.yml", ".github/workflows/ci.yml", "scripts/test-copies-stress.sh"})
+                    "scripts/test-copies-stress.sh"})
 
     def test_build_fuzz_and_unknown_inputs_still_qualify(self):
-        for path in ("Cargo.toml", "Cargo.lock", "build.rs", "justfile", ".cargo/config.toml",
+        for path in (".github/workflows/ci.yml", ".github/workflows/checks.yml", "Cargo.toml", "Cargo.lock", "build.rs", "justfile", ".cargo/config.toml",
                      "Dockerfile", "docker/entrypoint.sh", ".gitignore", ".dockerignore",
                      "fuzz/fuzz_targets/auth_responses.rs", "fuzz/seeds/cloudkit_json/record.json",
                      "scripts/ci/artifact.py", "scripts/fixtures/check_source_package.sh",
@@ -124,6 +127,29 @@ class PolicyTests(unittest.TestCase):
                 result = route(files, "pull_request", heavy, True, full)
                 for key in ("code", "cargo", "stress", "platform", "coverage", "unused", "qualification"):
                     self.assertTrue(result[key], (files, key))
+
+    def test_native_service_routes_cover_dispatch_and_skip_unrelated_changes(self):
+        selected = ["src/service/linux.rs", "src/service/new_platform.rs",
+                    "src/commands/service.rs", "src/commands/service/types.rs",
+                    "src/commands/status.rs", "src/commands/status/display.rs",
+                    "src/cli.rs", "src/config.rs", "src/config/new_owner.rs", "src/lib.rs"]
+        for path in selected:
+            with self.subTest(path=path):
+                result = route([path], "pull_request", False, True, False)
+                self.assertTrue(result["service"])
+                self.assertFalse(result["qualification"])
+        for path in ["README.md", "docs/architecture.md", "scripts/check-contracts",
+                     "src/auth/session.rs", "src/download/file/publication.rs",
+                     "src/inventory_diagnostic/tests.rs", "scripts/ci/nightly.py"]:
+            self.assertFalse(route([path], "pull_request", False, True, False)["service"], path)
+        for path in ["Cargo.toml", ".github/workflows/service-smoke.yml", "unknown-input"]:
+            result = route([path], "pull_request", False, True, False)
+            self.assertTrue(result["service"])
+            self.assertTrue(result["qualification"])
+        # Main push keeps its existing broad quality route; full/native service
+        # qualification remains independently required by nightly and release.
+        self.assertFalse(route([], "push", False, True, False)["service"])
+        self.assertTrue(route([], "push", True, True, False)["service"])
 
     def test_actual_pr_file_sets_keep_required_checks(self):
         # Exact GitHub file lists at heads 88ea35d (#984) and 30fe0e4 (#985).
@@ -231,6 +257,39 @@ class PolicyTests(unittest.TestCase):
                 self.assertTrue(result[key], (event, key))
             self.assertIn("catalogs", result["required"])
             self.assertIn("coverage-head", result["required"])
+
+    def test_cli_event_merge_keeps_deleted_owner_and_excludes_base_only_input(self):
+        script = Path(__file__).with_name("policy.py").resolve()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def git(*args):
+                return subprocess.check_output(["git", *args], cwd=root, text=True).strip()
+            git("init", "-q", "-b", "main")
+            git("config", "user.name", "CI Test")
+            git("config", "user.email", "ci@example.invalid")
+            writer = root / "src/download/file/old.rs"
+            writer.parent.mkdir(parents=True)
+            writer.write_text("// synthetic writer owner\n")
+            git("add", "src/download/file/old.rs")
+            git("commit", "-qm", "base")
+            git("checkout", "-qb", "topic")
+            git("rm", "-q", "src/download/file/old.rs")
+            (root / "README.md").write_text("synthetic topic docs\n")
+            git("add", "README.md")
+            git("commit", "-qm", "delete writer")
+            git("checkout", "-q", "main")
+            (root / "unknown-base-input").write_text("base-only input\n")
+            git("add", "unknown-base-input")
+            git("commit", "-qm", "advance base")
+            base = git("rev-parse", "HEAD")
+            git("merge", "--no-ff", "-qm", "synthetic event merge", "topic")
+            output = root / "outputs"
+            subprocess.run(["python3", str(script)], cwd=root, env={**os.environ,
+                "EVENT_NAME": "pull_request", "BASE_SHA": base, "LIGHT_ENABLED": "true",
+                "HEAVY": "false", "FULL": "false", "GITHUB_OUTPUT": str(output)}, check=True)
+            values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            self.assertEqual(values["stress"], "true")
+            self.assertEqual(values["qualification"], "false")
 
     def test_cli_reads_real_git_diff(self):
         script = Path(__file__).with_name("policy.py").resolve()

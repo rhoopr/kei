@@ -22,19 +22,6 @@ name: Service smoke
 
 on:
   workflow_call:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
-    paths:
-      - 'src/service/**'
-      - 'src/commands/service.rs'
-      - 'src/cli.rs'
-      - 'src/config.rs'
-      - 'src/config/**'
-      - 'src/lib.rs'
-      - 'src/commands/status.rs'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/service-smoke.yml'
 
 concurrency:
   group: service-smoke-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
