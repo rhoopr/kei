@@ -303,8 +303,8 @@ class ReviewTests(unittest.TestCase):
         with patch.object(review, "MAX_DIFF", 4), self.assertRaises(review.ReviewError):
             prepared(FakeHTTP())
 
-    def test_oversized_source_context_prompt(self):
-        for constant in ("MAX_SOURCE", "MAX_TOTAL_SOURCE", "MAX_CONTEXT"):
+    def test_oversized_source_or_prompt(self):
+        for constant in ("MAX_SOURCE", "MAX_TOTAL_SOURCE"):
             with patch.object(review, constant, 1), self.assertRaises(review.ReviewError):
                 prepared(FakeHTTP())
         http = FakeHTTP()
@@ -312,6 +312,32 @@ class ReviewTests(unittest.TestCase):
         with patch.object(review, "MAX_PROMPT", 1), self.assertRaises(review.ReviewError):
             review.infer(http, data, KEY, review.DEFAULT_MODEL)
         self.assertFalse(any(call[1] in {review.FREE_URL, review.GO_URL} for call in http.calls))
+
+    def test_context_above_128k_reaches_mocked_inference_below_prompt_limit(self):
+        http = FakeHTTP()
+        source = SOURCE + ("x" * 12000 + "\n").encode() * 12
+        http.source.update(size=len(source), content=base64.b64encode(source).decode())
+        data = prepared(http)
+        context = data["files"][0]["head_context"]
+        self.assertGreater(len(review.json_bytes(context)), 128 * 1024)
+        self.assertEqual(len(context), 15)
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            os.chdir(tmp)
+            try:
+                Path("review-input.json").write_bytes(review.json_bytes(data))
+                with patch.dict(os.environ, {"OPENCODE_API_KEY": KEY}, clear=True), \
+                     patch.object(review, "HTTP", return_value=http), \
+                     patch("sys.argv", ["review", "infer"]), redirect_stdout(io.StringIO()):
+                    review.main()
+                self.assertEqual(json.loads(Path("review-result.json").read_text())["findings"], [FINDING])
+            finally:
+                os.chdir(previous)
+        payload = http.calls[-1][3]["payload"]
+        prompt = payload["messages"][1]["content"]
+        self.assertLess(len(prompt.encode()), review.MAX_PROMPT)
+        self.assertEqual(json.loads(prompt)["files"][0]["head_context"], context)
+        self.assertEqual(sum(call[0] == "POST" for call in http.calls), 1)
 
     def test_source_mismatch_and_binary_rejected(self):
         for change in ({"sha": OLD}, {"type": "symlink"}, {"content": "!!!!"},
