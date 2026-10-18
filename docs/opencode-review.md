@@ -16,10 +16,10 @@ Review attempts use this fixed order and stop at the first validated result:
 
 | Order | Model ID | Route |
 | --- | --- | --- |
-| 1 | `glm-5.3-flash-free` | Free standard endpoint |
-| 2 | `deepseek-v4.1-flash-free` | Free standard endpoint |
-| 3 | `glm-5.3-flash` | Go subscription endpoint |
-| 4 | `deepseek-v4.1-flash` | Go subscription endpoint |
+| 1 | `deepseek-v4.1-flash-free` | Free standard endpoint |
+| 2 | `glm-5.3-flash-free` | Free standard endpoint |
+| 3 | `deepseek-v4.1-flash` | Go subscription endpoint |
+| 4 | `glm-5.3-flash` | Go subscription endpoint |
 
 The free endpoint is
 `https://opencode.ai/inference/openai/v1/chat/completions`. The subscription
@@ -152,10 +152,12 @@ be recreated on a later run. Human judgment remains necessary.
 ## Bounds, failures, and usage
 
 The client accepts at most 40 changed files, 2,000 added/deleted lines, 128 KiB of
-patch text, 256 KiB per fetched source, 1 MiB total fetched source, 128 KiB of
-head context, and a 300 KiB JSON user prompt. Context includes up to 12 lines
-around each right-side hunk line. Hunk counts, file totals, PR totals, and exact
-head source must agree. Binary files, omitted/truncated patches, unsupported
+patch text, 256 KiB per fetched source, 1 MiB total fetched source, and a 300 KiB
+JSON user prompt. Head context has no separate byte cap; it remains part of the
+bounded total prompt. The local prepared-file reader retains its 428 KiB limit
+for the prompt data and validated source locations. Context includes up to 12
+lines around each right-side hunk line. Hunk counts, file totals, PR totals, and
+exact head source must agree. Binary files, omitted/truncated patches, unsupported
 source, missing patches for pure renames, and oversized data fail the whole
 review clearly. It never calls a partial diff a complete review. An empty
 findings list means only that no supported finding was produced within this scope.

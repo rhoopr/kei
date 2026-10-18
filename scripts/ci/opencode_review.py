@@ -20,10 +20,10 @@ FREE_URL = "https://opencode.ai/inference/openai/v1/chat/completions"
 FREE_MODEL = "glm-5.3-flash-free"
 GO_URL = "https://opencode.ai/inference/go/openai/v1/chat/completions"
 DEFAULT_MODEL = "glm-5.3-flash"
-REVIEW_MODELS = (("free", FREE_URL, FREE_MODEL),
-                 ("free", FREE_URL, "deepseek-v4.1-flash-free"),
-                 ("go", GO_URL, DEFAULT_MODEL),
-                 ("go", GO_URL, "deepseek-v4.1-flash"))
+REVIEW_MODELS = (("free", FREE_URL, "deepseek-v4.1-flash-free"),
+                 ("free", FREE_URL, FREE_MODEL),
+                 ("go", GO_URL, "deepseek-v4.1-flash"),
+                 ("go", GO_URL, DEFAULT_MODEL))
 ALLOWED_MODELS = frozenset(model for _, _, model in REVIEW_MODELS)
 REVIEW_TOKENS = 16384
 SMOKE_TOKENS = 2048
@@ -32,7 +32,6 @@ SMOKE_RESPONSE = 128 * 1024
 MAX_FILES = 40
 MAX_CHANGES = 2000
 MAX_DIFF = 128 * 1024
-MAX_CONTEXT = 128 * 1024
 MAX_PROMPT = 300 * 1024
 MAX_SOURCE = 256 * 1024
 MAX_TOTAL_SOURCE = 1024 * 1024
@@ -260,7 +259,7 @@ def collect(gh, head, *, context):
     require(sum(f["additions"] for f in files) == pr["additions"]
             and sum(f["deletions"] for f in files) == pr["deletions"], "Diff changed during collection.")
     data, locations = [], {}
-    diff_bytes = source_bytes = context_bytes = 0
+    diff_bytes = source_bytes = 0
     for file in files:
         path = file["filename"]
         require(isinstance(path, str) and 0 < len(path) <= 512
@@ -290,8 +289,6 @@ def collect(gh, head, *, context):
             for n in right:
                 selected.update(range(max(1, n - 12), min(len(lines), n + 12) + 1))
             item["head_context"] = [{"line": n, "text": lines[n - 1]} for n in sorted(selected)]
-            context_bytes += len(json_bytes(item["head_context"]))
-            require(context_bytes <= MAX_CONTEXT, "Context budget exceeded; review refused.")
         data.append(item)
     gh.current(head)
     no_secrets(data, (gh.token,))
@@ -545,7 +542,7 @@ def main():
                   go_no_overage_confirmed=os.environ.get("OPENCODE_GO_NO_OVERAGE_CONFIRMED") == "true")
         return
     if mode == "infer":
-        prepared = load_json("review-input.json", MAX_PROMPT + MAX_CONTEXT)
+        prepared = load_json("review-input.json", MAX_PROMPT + MAX_DIFF)
         # JSON object keys are strings. Restore validated integer line locations.
         prepared["locations"] = {p: {int(n): t for n, t in v.items()}
                                  for p, v in prepared["locations"].items()}

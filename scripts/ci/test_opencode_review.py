@@ -115,12 +115,12 @@ class ReviewTests(unittest.TestCase):
         payload = kwargs["payload"]
         self.assertFalse(payload["stream"])
         self.assertEqual(payload["max_tokens"], 16384)
-        self.assertEqual(payload["reasoning_effort"], "low")
-        self.assertEqual(set(payload), {"model", "messages", "stream", "max_tokens", "reasoning_effort"})
+        self.assertNotIn("reasoning_effort", payload)
+        self.assertEqual(set(payload), {"model", "messages", "stream", "max_tokens"})
         self.assertNotIn(KEY, json.dumps(payload))
         self.assertNotIn("fixture-github-token", json.dumps(payload))
-        self.assertEqual(output["model"], review.FREE_MODEL)
-        self.assertEqual(payload["model"], review.FREE_MODEL)
+        self.assertEqual(output["model"], "deepseek-v4.1-flash-free")
+        self.assertEqual(payload["model"], "deepseek-v4.1-flash-free")
         self.assertEqual(output["head"], HEAD)
         self.assertEqual(output["findings"], [FINDING])
 
@@ -133,7 +133,11 @@ class ReviewTests(unittest.TestCase):
             with patch.object(http, "request", side_effect=errors + [http.completion]) as request, \
                  redirect_stdout(output):
                 result = review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=accepted_at >= 2)
-            expected = list(review.REVIEW_MODELS[:accepted_at + 1])
+            order = [("free", review.FREE_URL, "deepseek-v4.1-flash-free"),
+                     ("free", review.FREE_URL, "glm-5.3-flash-free"),
+                     ("go", review.GO_URL, "deepseek-v4.1-flash"),
+                     ("go", review.GO_URL, "glm-5.3-flash")]
+            expected = order[:accepted_at + 1]
             self.assertEqual(request.call_count, accepted_at + 1)
             self.assertEqual([(c.args[1], c.kwargs["payload"]["model"]) for c in request.call_args_list],
                              [(url, model) for _, url, model in expected])
@@ -189,7 +193,7 @@ class ReviewTests(unittest.TestCase):
              redirect_stdout(output):
             result = review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
         self.assertEqual(request.call_count, 4)
-        self.assertEqual(result["model"], "deepseek-v4.1-flash")
+        self.assertEqual(result["model"], "glm-5.3-flash")
         self.assertIn('"finish_reason":"length"', output.getvalue())
         self.assertIn('"reasoning_tokens":16384', output.getvalue())
         self.assertIn('"text_nonempty":false', output.getvalue())
@@ -303,8 +307,8 @@ class ReviewTests(unittest.TestCase):
         with patch.object(review, "MAX_DIFF", 4), self.assertRaises(review.ReviewError):
             prepared(FakeHTTP())
 
-    def test_oversized_source_context_prompt(self):
-        for constant in ("MAX_SOURCE", "MAX_TOTAL_SOURCE", "MAX_CONTEXT"):
+    def test_oversized_source_or_prompt(self):
+        for constant in ("MAX_SOURCE", "MAX_TOTAL_SOURCE"):
             with patch.object(review, constant, 1), self.assertRaises(review.ReviewError):
                 prepared(FakeHTTP())
         http = FakeHTTP()
@@ -312,6 +316,32 @@ class ReviewTests(unittest.TestCase):
         with patch.object(review, "MAX_PROMPT", 1), self.assertRaises(review.ReviewError):
             review.infer(http, data, KEY, review.DEFAULT_MODEL)
         self.assertFalse(any(call[1] in {review.FREE_URL, review.GO_URL} for call in http.calls))
+
+    def test_context_above_128k_reaches_mocked_inference_below_prompt_limit(self):
+        http = FakeHTTP()
+        source = SOURCE + ("x" * 12000 + "\n").encode() * 12
+        http.source.update(size=len(source), content=base64.b64encode(source).decode())
+        data = prepared(http)
+        context = data["files"][0]["head_context"]
+        self.assertGreater(len(review.json_bytes(context)), 128 * 1024)
+        self.assertEqual(len(context), 15)
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            os.chdir(tmp)
+            try:
+                Path("review-input.json").write_bytes(review.json_bytes(data))
+                with patch.dict(os.environ, {"OPENCODE_API_KEY": KEY}, clear=True), \
+                     patch.object(review, "HTTP", return_value=http), \
+                     patch("sys.argv", ["review", "infer"]), redirect_stdout(io.StringIO()):
+                    review.main()
+                self.assertEqual(json.loads(Path("review-result.json").read_text())["findings"], [FINDING])
+            finally:
+                os.chdir(previous)
+        payload = http.calls[-1][3]["payload"]
+        prompt = payload["messages"][1]["content"]
+        self.assertLess(len(prompt.encode()), review.MAX_PROMPT)
+        self.assertEqual(json.loads(prompt)["files"][0]["head_context"], context)
+        self.assertEqual(sum(call[0] == "POST" for call in http.calls), 1)
 
     def test_source_mismatch_and_binary_rejected(self):
         for change in ({"sha": OLD}, {"type": "symlink"}, {"content": "!!!!"},
@@ -651,9 +681,9 @@ class TransportTests(unittest.TestCase):
              redirect_stdout(output):
             result = review.infer(client, data, KEY, review.DEFAULT_MODEL)
         self.assertEqual(opened.call_count, 2)
-        self.assertEqual(result["model"], "deepseek-v4.1-flash-free")
+        self.assertEqual(result["model"], "glm-5.3-flash-free")
         self.assertEqual([json.loads(call.args[0].data)["model"] for call in opened.call_args_list],
-                         ["glm-5.3-flash-free", "deepseek-v4.1-flash-free"])
+                         ["deepseek-v4.1-flash-free", "glm-5.3-flash-free"])
         self.assertIn('"outcome":"request_failed"', output.getvalue())
         self.assertNotIn("private partial body", output.getvalue())
         self.assertNotIn(KEY, output.getvalue())
