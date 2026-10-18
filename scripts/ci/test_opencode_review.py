@@ -153,7 +153,9 @@ class ReviewTests(unittest.TestCase):
             publisher = FakeHTTP()
             review.publish(gh(publisher), result, HEAD)
             body = publisher.calls[-1][3]["payload"]["body"]
-            self.assertIn(f"using `{expected[-1][2]}`", body)
+            labels = ["DeepSeek V4.1 Flash Free", "GLM 5.3 Flash Free",
+                      "DeepSeek V4.1 Flash", "GLM 5.3 Flash"]
+            self.assertIn(f"Advisory · {labels[accepted_at]} ·", body)
 
     def test_fallback_blocked_without_no_overage_confirmation(self):
         http = FakeHTTP()
@@ -418,7 +420,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(kwargs["payload"]["commit_id"], HEAD)
         body = kwargs["payload"]["body"]
         self.assertIn(f"/blob/{HEAD}/src/example.rs#L2", body)
-        self.assertIn("No tests were run by this bot", body)
+        self.assertIn("no tests run", body)
         self.assertTrue(http.calls[-2][1].endswith("/pulls/123"))
         self.assertFalse(any(call[1] in {review.FREE_URL, review.GO_URL} for call in http.calls))
 
@@ -471,12 +473,12 @@ class ReviewTests(unittest.TestCase):
         self.assertNotIn("<img", body)
         self.assertNotIn("https://evil.test", body)
         self.assertNotIn("![x]", body)
-        self.assertIn("[source](https://github.com/", body)
+        self.assertIn(f"](https://github.com/{REPO}/blob/{HEAD}/", body)
 
     def test_empty_findings_scope_is_explicit(self):
         output = result()
         output["findings"] = []
-        self.assertIn("does not establish correctness", review.review_body(output))
+        self.assertIn("No supported findings in the bounded diff", review.review_body(output))
 
     def test_cli_end_to_end_with_mocked_apis(self):
         event = {"number": 123, "pull_request": copy.deepcopy(PR)}
@@ -876,6 +878,34 @@ class ApiSmokeTests(unittest.TestCase):
                 os.chdir(previous)
 
 
+
+class PlainTextRenderingTests(unittest.TestCase):
+    def test_apostrophes_from_live_issue_and_pr_reviews_remain_literal(self):
+        # #1004 product/code and PR #1000 rendered &#x27; after plain() escaped
+        # the '#' inside html.escape(quote=True)'s numeric apostrophe entity.
+        self.assertEqual(review.plain("charter's current focus"), "charter's current focus")
+        self.assertEqual(review.plain("clap's value_enum parsing"), "clap's value\\_enum parsing")
+        text = review.plain("'The whole-command deadline may expire before HTTP dispatch.'")
+        self.assertTrue(text.startswith("'The whole\\-command"))
+        self.assertTrue(text.endswith("\u200b'"))
+        self.assertNotIn("&#", text)
+        self.assertNotIn("&\\#", text)
+
+    def test_quotes_comparisons_and_ampersands_are_safe_text(self):
+        self.assertEqual(review.plain('user\'s value < 1 > 0 & "quoted"'),
+                         'user\'s value &lt; 1 &gt; 0 &amp; "quoted"')
+        self.assertEqual(review.plain("<script>"), "&lt;script&gt;")
+
+    def test_literal_entities_in_code_are_not_broadly_unescaped(self):
+        # A source literal containing entity syntax must remain that literal,
+        # while actual angle brackets are independently neutralized.
+        self.assertEqual(review.plain("&lt;script&gt;"), "&amp;lt;script&amp;gt;")
+        self.assertEqual(review.plain("&quot;"), "&amp;quot;")
+        self.assertEqual(review.plain("&#39;"), "&amp;\\#39;")
+        self.assertEqual(review.plain("&#x3c;script&#x3e;"),
+                         "&amp;\\#x3c;script&amp;\\#x3e;")
+
+
 class WorkflowTests(unittest.TestCase):
     def test_workflow_security_contract(self):
         text = (Path(__file__).resolve().parents[2] / ".github/workflows/opencode-review.yml").read_text()
@@ -926,9 +956,10 @@ TEST = "tests/example.rs"
 def issue_report(kind):
     report = {"summary": "The retry report needs investigation.",
               "rationale": "Static inspection shows the retry path; no execution evidence is available.",
+              "next_step": "Provide a minimal reproduction and the installed version.",
               "evidence": [{"path": CHARTER if kind == "product" else CODE, "line": 2}]}
     if kind == "product":
-        report.update(decision="address", risks="Preserve checkpoint safety.")
+        report.update(decision="address")
     else:
         report["status"] = "plausible_unverified"
     return report
@@ -1277,6 +1308,121 @@ class IssueReviewTests(unittest.TestCase):
                         self.assertFalse(Path("issue-review-result.json").exists())
                 finally:
                     os.chdir(previous)
+
+
+
+class ConciseReviewTests(unittest.TestCase):
+    def test_issue_examples_keep_verdict_evidence_next_step_and_short_footer(self):
+        reports = {
+            "product": {"decision": "needs_information",
+                        "summary": "Repairing supported CSV export fits reliability goals.",
+                        "rationale": "If this adds a new format, defer it until reliability work is complete. "
+                                     "Existing support is unverified.",
+                        "next_step": "Check existing support before deciding scope.",
+                        "evidence": [{"path": CHARTER, "line": 2}]},
+            "code": {"status": "insufficient_evidence",
+                     "summary": "Supplied main source already handles CSV output.",
+                     "rationale": "The parser definition is missing from the supplied excerpts.",
+                     "next_step": "Check the parser and reproduce the exact command on the reported version.",
+                     "evidence": [{"path": CODE, "line": 2}]},
+        }
+        for kind, report in reports.items():
+            data = issue_prepared(IssueHTTP(), kind)
+            review.validate_issue_report(report, data)
+            output = {**issue_result(kind), "report": report}
+            body = review.issue_body(output)
+            self.assertIn("Needs verification" if kind == "product" else "Not confirmed", body)
+            self.assertIn(review.plain(report["summary"]), body)
+            self.assertIn(review.plain(report["rationale"]), body)
+            self.assertIn(f"Next: {review.plain(report['next_step'])}", body)
+            self.assertIn(f"/blob/{HEAD}/{CHARTER if kind == 'product' else CODE}#L2", body)
+            self.assertIn(f"Advisory · GLM 5.3 Flash · [main {HEAD[:7]}]", body)
+            self.assertIn(f"/commit/{HEAD}", body)
+            self.assertEqual(body.count(output["snapshot"]), 1)  # internal marker only
+            self.assertEqual(body.count("Advisory"), 1)
+            self.assertEqual(body.count("Next:"), 1)
+            self.assertLess(len(body.split()), 110)
+            for repeated in ("###", "Conclusion:", "Scope:", "fingerprint:", "Risks / missing"):
+                self.assertNotIn(repeated, body)
+            if kind == "code":
+                self.assertEqual(body.count("No tests or reproduction were run."), 1)
+
+    def test_pr_example_preserves_every_substantive_finding_without_truncation(self):
+        findings = [{"path": f"src/file{n}.rs", "line": 2, "title": f"Retry defect {n}",
+                     "body": f"Trigger {n} retains the wrong retry identity. " + "Concrete evidence. " * 45
+                             + f"Next step {n}: retain the pending identity."}
+                    for n in range(5)]
+        locations = {item["path"]: {2: "source"} for item in findings}
+        review.validate_findings({"findings": findings}, locations)
+        body = review.review_body({**result(), "findings": findings})
+        for finding in findings:
+            self.assertIn(review.plain(finding["title"]), body)
+            self.assertIn(review.plain(finding["body"]), body)
+            self.assertIn(f"/blob/{HEAD}/{finding['path']}#L2", body)
+        self.assertEqual(body.count("- **Retry defect"), 5)
+        self.assertEqual(body.count("Static review; no tests run."), 1)
+        self.assertIn(f"Advisory · GLM 5.3 Flash · [head {HEAD[:7]}]", body)
+        self.assertNotIn("###", body)
+        self.assertNotIn("Bot-generated review", body)
+
+    def test_compact_issue_bounds_reject_instead_of_truncating(self):
+        data = issue_prepared(IssueHTTP(), "code")
+        for field, bound in (("summary", 240), ("rationale", 600), ("next_step", 240)):
+            report = {**issue_report("code"), field: "x" * bound}
+            self.assertEqual(review.validate_issue_report(report, data)[field], "x" * bound)
+            with self.assertRaises(review.ReviewError):
+                review.validate_issue_report({**report, field: "x" * (bound + 1)}, data)
+        report = {**issue_report("code"), "evidence": [{"path": CODE, "line": n} for n in (1, 2, 3)]}
+        self.assertEqual(len(review.validate_issue_report(report, data)["evidence"]), 3)
+        with self.assertRaises(review.ReviewError):
+            review.validate_issue_report({**report, "evidence": report["evidence"]
+                                          + [{"path": CHARTER, "line": 1}]}, data)
+        for legacy in ({**issue_report("product"), "risks": "old field"},
+                       {key: val for key, val in issue_report("code").items() if key != "next_step"}):
+            with self.assertRaises(review.ReviewError):
+                review.validate_issue_report(legacy, data)
+
+    def test_overlong_completion_uses_existing_fallback_and_keeps_valid_answer(self):
+        http = IssueHTTP()
+        data = issue_prepared(http, "code")
+        valid = {**http.completion, "choices": [{"finish_reason": "stop", "message": {
+            "role": "assistant", "content": json.dumps(issue_report("code"))}}]}
+        too_long = copy.deepcopy(valid)
+        report = {**issue_report("code"), "rationale": "x" * 601}
+        too_long["choices"][0]["message"]["content"] = json.dumps(report)
+        with patch.object(http, "request", side_effect=[too_long, valid]) as request, redirect_stdout(io.StringIO()):
+            output = review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind="code")
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(output["report"], issue_report("code"))
+        self.assertEqual(output["model"], "glm-5.3-flash-free")
+
+    def test_next_step_credentials_fail_closed(self):
+        http = IssueHTTP()
+        data = issue_prepared(http, "code")
+        report = {**issue_report("code"), "next_step": KEY}
+        http.completion["choices"][0]["message"]["content"] = json.dumps(report)
+        before = len(http.calls)
+        with redirect_stdout(io.StringIO()), self.assertRaises(review.SecurityError):
+            review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind="code", go_no_overage_confirmed=True)
+        self.assertEqual(len(http.calls) - before, 1)
+        http = IssueHTTP()
+        output = issue_result("code")
+        output["report"]["next_step"] = "fixture-github-token"
+        with self.assertRaises(review.SecurityError):
+            review.publish_issue(gh(http), review.issue_snapshot(ISSUE), output, HEAD, "code")
+        self.assertFalse(any(call[0] == "POST" for call in http.calls))
+
+    def test_pr_and_issue_quotes_from_live_reviews_share_safe_renderer(self):
+        for output in (result(), issue_result("product"), issue_result("code")):
+            if "report" in output:
+                output["report"]["summary"] = "charter's focus and clap's value_enum"
+                body = review.issue_body(output)
+            else:
+                output["findings"][0]["body"] = "'The whole-command deadline may expire before HTTP dispatch.'"
+                body = review.review_body(output)
+            self.assertNotIn("&#x27;", body)
+            self.assertNotIn("&\\#x27;", body)
+            self.assertIn("'", body)
 
 
 class IssueWorkflowTests(unittest.TestCase):
