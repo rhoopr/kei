@@ -16,10 +16,10 @@ Review attempts use this fixed order and stop at the first validated result:
 
 | Order | Model ID | Route |
 | --- | --- | --- |
-| 1 | `glm-5.3-flash-free` | Free standard endpoint |
-| 2 | `deepseek-v4.1-flash-free` | Free standard endpoint |
-| 3 | `glm-5.3-flash` | Go subscription endpoint |
-| 4 | `deepseek-v4.1-flash` | Go subscription endpoint |
+| 1 | `deepseek-v4.1-flash-free` | Free standard endpoint |
+| 2 | `glm-5.3-flash-free` | Free standard endpoint |
+| 3 | `deepseek-v4.1-flash` | Go subscription endpoint |
+| 4 | `glm-5.3-flash` | Go subscription endpoint |
 
 The free endpoint is
 `https://opencode.ai/inference/openai/v1/chat/completions`. The subscription

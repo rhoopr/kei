@@ -20,10 +20,10 @@ FREE_URL = "https://opencode.ai/inference/openai/v1/chat/completions"
 FREE_MODEL = "glm-5.3-flash-free"
 GO_URL = "https://opencode.ai/inference/go/openai/v1/chat/completions"
 DEFAULT_MODEL = "glm-5.3-flash"
-REVIEW_MODELS = (("free", FREE_URL, FREE_MODEL),
-                 ("free", FREE_URL, "deepseek-v4.1-flash-free"),
-                 ("go", GO_URL, DEFAULT_MODEL),
-                 ("go", GO_URL, "deepseek-v4.1-flash"))
+REVIEW_MODELS = (("free", FREE_URL, "deepseek-v4.1-flash-free"),
+                 ("free", FREE_URL, FREE_MODEL),
+                 ("go", GO_URL, "deepseek-v4.1-flash"),
+                 ("go", GO_URL, DEFAULT_MODEL))
 ALLOWED_MODELS = frozenset(model for _, _, model in REVIEW_MODELS)
 REVIEW_TOKENS = 16384
 SMOKE_TOKENS = 2048
