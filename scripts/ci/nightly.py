@@ -9,12 +9,17 @@ from datetime import datetime, timedelta, timezone
 
 MARKER = "<!-- kei-nightly-qualification -->"
 MAX_AGE = timedelta(hours=36)
+INCIDENT_LABELS = ("bug", "@infra", "@test", "nightly fail")
 
 
 def api(path: str, *, method: str | None = None, **fields):
     command = ["gh", "api", "--method", method or ("POST" if fields else "GET"), path]
     for key, value in fields.items():
-        command.extend(["-f", f"{key}={value}"])
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                command.extend(["-f", f"{key}[]={item}"])
+        else:
+            command.extend(["-f", f"{key}={value}"])
     return json.loads(subprocess.check_output(command))
 
 
@@ -32,6 +37,13 @@ def health(runs: list[dict], now: datetime) -> tuple[bool, str, str]:
     return True, "Nightly qualification is current and passed.", latest["html_url"]
 
 
+def ensure_nightly_label(repo: str) -> None:
+    pages = json.loads(subprocess.check_output(["gh", "api", "--paginate", "--slurp", f"repos/{repo}/labels?per_page=100"]))
+    if not any(label["name"] == "nightly fail" for page in pages for label in page):
+        api(f"repos/{repo}/labels", name="nightly fail", color="B60205",
+            description="Nightly qualification failed or became stale")
+
+
 def notify(repo: str, healthy: bool, message: str, url: str) -> None:
     pages = json.loads(subprocess.check_output(["gh", "api", "--paginate", "--slurp", f"repos/{repo}/issues?state=open&per_page=100"]))
     incident = next((i for page in pages for i in page if i.get("user", {}).get("login") == "github-actions[bot]" and (i.get("body") or "").startswith(MARKER)), None)
@@ -39,8 +51,16 @@ def notify(repo: str, healthy: bool, message: str, url: str) -> None:
     if healthy and incident:
         api(f"repos/{repo}/issues/{incident['number']}/comments", body=body)
         api(f"repos/{repo}/issues/{incident['number']}", method="PATCH", state="closed")
-    elif not healthy and not incident:
-        api(f"repos/{repo}/issues", title="Nightly qualification needs attention", body=f"{MARKER}\n{body}")
+    elif not healthy:
+        existing = {label["name"] for label in incident.get("labels", [])} if incident else set()
+        missing = [label for label in INCIDENT_LABELS if label not in existing]
+        if "nightly fail" in missing:
+            ensure_nightly_label(repo)
+        if not incident:
+            api(f"repos/{repo}/issues", title="Nightly qualification needs attention",
+                body=f"{MARKER}\n{body}", labels=missing)
+        elif missing:
+            api(f"repos/{repo}/issues/{incident['number']}/labels", labels=missing)
     print(message)
 
 
