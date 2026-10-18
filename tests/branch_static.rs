@@ -1673,29 +1673,14 @@ fn release_homebrew_downloads_fail_fast_and_verify_checksums() {
 }
 
 #[test]
-fn service_smoke_path_filters_cover_shared_dispatch() {
+fn service_smoke_is_routed_once_through_required_ci() {
     let service_smoke = repo_file(".github/workflows/service-smoke.yml");
-    let hardening = repo_file(".github/scripts/check_workflow_hardening.py");
-
-    for path in [
-        "src/service/**",
-        "src/commands/service.rs",
-        "src/cli.rs",
-        "src/config.rs",
-        "src/config/**",
-        "src/lib.rs",
-        "src/commands/status.rs",
-    ] {
-        let expected = format!("- '{path}'");
-        assert!(
-            service_smoke.contains(&expected),
-            "service-smoke path filter must include {path}"
-        );
-        assert!(
-            hardening.contains(path),
-            "workflow hardening script must enforce service-smoke path filter for {path}"
-        );
-    }
+    let ci = repo_file(".github/workflows/ci.yml");
+    assert!(service_smoke.contains("  workflow_call:"));
+    assert!(!service_smoke.contains("  pull_request:"));
+    assert!(ci.contains("needs: [plan, checks, service, qualification]"));
+    assert!(ci.contains("needs.plan.outputs.service == 'true'"));
+    assert!(ci.contains("required += [\"service\"]"));
 }
 
 #[test]

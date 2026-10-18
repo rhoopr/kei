@@ -18,9 +18,9 @@ env:
 
 jobs:
   # Detects which categories of files changed in the PR. Downstream jobs
-  # gate on these outputs to skip when irrelevant. Workflow or script
-  # changes flip every flag on - those touch CI itself, so re-run everything
-  # to validate the change doesn't break unrelated jobs.
+  # gate on these outputs to skip when irrelevant. The policy separates
+  # Python/advisory maintenance, Rust check tooling, and qualification inputs.
+  # Always-on workflow and Python tests also cover script-only PRs.
   # Pushes to main run all non-PR-only checks.
   detect:
     name: Detect changes
@@ -224,7 +224,6 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: |
-          scripts/check-contracts
           python3 scripts/fixtures/check_live_selection.py
           bash scripts/test-scenarios/check.sh
           python3 -m unittest discover -s scripts/ci -p 'test_*.py'
@@ -537,13 +536,15 @@ jobs:
       # Ignore list + rationale: .cargo/audit.toml.
       - run: cargo audit --deny warnings
 
-  # Guards the Actions supply-chain hardening rules that keep PRs
+  # Validate the contract catalog even on docs-only PRs. Guard the Actions
+  # supply-chain hardening rules that keep PRs
   # from reintroducing mutable action refs or privileged manual publishes.
   workflow-hardening:
     name: Workflow hardening
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - run: python3 scripts/check-contracts
       - run: python3 .github/scripts/check_workflow_hardening.py
       - run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
       - run: |

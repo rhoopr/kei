@@ -13,7 +13,7 @@ refer to one exact commit. A skipped check is not a passing check.
 | Linux all-feature and no-default offline suites | Required for code changes | Required | Required |
 | Scenario catalogs and safety-contract checks | Required for applicable changes | Required | Required |
 | Windows/macOS builds and platform smoke | Required for code changes | Required | Required |
-| Full Windows/macOS offline suites | Not required | Required for platform-sensitive changes | Required |
+| Full Windows/macOS offline suites | Required when Rust tests change | Required for platform-sensitive changes | Required |
 | Compact copies/reseed safety fixture | Part of ordinary suite | Required | Required |
 | 300-writer copies stress | Not required | Required for scale-sensitive changes | Required |
 | Instrumented coverage | Not merge-critical | Available through full qualification | Required report, not a percentage threshold |
@@ -43,16 +43,20 @@ available for diagnosis or work without hosted CI.
 
 ## PR routing
 
-Draft PR events skip routing, quality checks, qualification, and direct Service
-smoke builds, including when labeled `ci:full`. The required `CI` job still runs
+Draft validation events skip routing, quality checks, qualification, and native
+service smoke, including when labeled `ci:full`. The required `CI` job still runs
 as a small failing marker: skipped required checks count as success on GitHub.
 Marking the PR ready for review starts validation for that event's exact merge
 commit, even if the head has not changed. A new head starts a new run.
 
 Converting a ready PR back to draft starts the failing marker and uses the
 existing PR concurrency group to supersede the older run. Marking it ready again
-requires a fresh successful `CI`; draft skips never satisfy that check. Service
-smoke retains its path filters and also handles both draft transitions. Main
+requires a fresh successful `CI`; draft skips never satisfy that check.
+Unrelated label additions/removals and title/body edits use a run-specific
+concurrency group and a different check name, `CI metadata (ignored)`. They
+neither cancel active validation nor create a skipped or successful `CI`.
+Adding or removing `ci:full` and editing the base branch start validation in the
+normal PR group. Retargets use that event's base and merge commit. Main
 pushes, manual qualification, nightly runs, and releases keep their existing
 routes. The repository does not currently enable a merge queue.
 GitHub does not guarantee concurrency ordering during rapid transitions. If a
@@ -61,11 +65,23 @@ missing work cannot pass the required check.
 
 The required check stays `CI`. A failed, cancelled, missing, or unexpectedly
 skipped required job fails that check. The `ci:full` label runs full
-qualification. Workflow, script, Cargo, build, fuzz, container-build, and unknown
-input changes also select full qualification. Ordinary code changes keep Linux
-all-feature and no-default tests, with macOS/Windows build and CLI/media/service
-smoke. Filesystem, state, configuration, and service changes select complete
-platform tests. The large copies stress test follows its runtime owners:
+qualification. Cargo/build inputs, fuzz inputs, container code, artifact and
+qualification/release workflows, the core `ci.yml`/`checks.yml` orchestrators,
+and unknown inputs also select it. Their heavy branches need execution coverage.
+Known notification/advisory clients and their workflows, routing/gate helpers, and
+`scripts/ci/test_*.py` keep the always-on Python tests, workflow hardening,
+script/workflow lint, cheap safety-contract validation, and typos without
+building Rust. Architecture-only edits therefore validate the contract catalog.
+New unclassified helpers still select full qualification.
+
+Recognized Rust test files keep the Linux all-feature and no-default suites
+and full Windows/macOS offline suites. Other code changes keep Linux suites with
+macOS/Windows build and CLI/media/service smoke; filesystem, state,
+configuration, and service changes select full platform tests. Narrow
+scenario/roundtrip/stress runners keep the ordinary Rust matrix without
+selecting release artifacts or fuzzing. The contract checker itself runs in the
+always-on workflow-hardening job.
+The large copies stress test follows its runtime owners:
 download, state, Photos provider, sync, configuration, retry, selection,
 filesystem/shared types, command service types, media fixtures, and its own
 queue-projection fixture. CLI entrypoints, unrelated commands, authentication,
@@ -79,8 +95,24 @@ hydration and session code; #985's reset command and unrelated test modules
 skip stress while keeping the full platform tests selected by its entrypoints.
 New files within stress runtime owners select stress conservatively. Renames
 consider both old and new paths. Full/heavy overrides, unknown top-level
-inputs, main pushes, and scheduled qualification retain stress. Docs-only PRs
-retain workflow/script lint and typos.
+inputs, main pushes, and scheduled qualification retain stress. Its runner and
+Rust check orchestration also select stress. The broad-PR rollout fallback adds
+platform suites, coverage and unused-dependency checks for Rust changes, but
+cannot make an unrelated unit-test module or notification script select stress.
+Docs-only PRs retain workflow/script lint, safety-contract validation and typos.
+
+Native release-binary service smoke is routed through the required `CI` graph
+for service, service/status command, CLI, config and shared entrypoint changes.
+A selected missing, skipped, cancelled or failed smoke fails `CI`. Heavy
+qualification owns the same smoke internally; ordinary CI calls it only when
+qualification is off. The reusable service workflow has no independent PR
+trigger, so each validation runs its native smoke matrix at most once.
+
+For the exact file sets in #1000, #997, #991 and #1001, routing now selects
+ordinary Rust checks for #1000's Rust tests and only the always-on checks for the
+advisory-only PRs. All four skip full qualification and copies stress. These
+path-matrix cases, positive build/runtime controls and missing/skipped aggregate
+controls are covered by `scripts/ci/test_policy.py` and `test_draft_pr.py`.
 
 ## Rollout
 
