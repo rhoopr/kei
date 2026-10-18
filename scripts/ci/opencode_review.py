@@ -16,19 +16,13 @@ import urllib.request
 from http.client import HTTPException
 from pathlib import Path
 
-FREE_URL = "https://opencode.ai/inference/openai/v1/chat/completions"
-FREE_MODEL = "glm-5.3-flash-free"
 GO_URL = "https://opencode.ai/inference/go/openai/v1/chat/completions"
 DEFAULT_MODEL = "glm-5.3-flash"
-REVIEW_MODELS = (("free", FREE_URL, "deepseek-v4.1-flash-free"),
-                 ("free", FREE_URL, FREE_MODEL),
-                 ("go", GO_URL, "deepseek-v4.1-flash"),
+REVIEW_MODELS = (("go", GO_URL, "deepseek-v4.1-flash"),
                  ("go", GO_URL, DEFAULT_MODEL))
 ALLOWED_MODELS = frozenset(model for _, _, model in REVIEW_MODELS)
 REVIEW_TOKENS = 16384
-SMOKE_TOKENS = 2048
 REVIEW_RESPONSE = 512 * 1024
-SMOKE_RESPONSE = 128 * 1024
 MAX_FILES = 40
 MAX_CHANGES = 2000
 MAX_DIFF = 128 * 1024
@@ -80,9 +74,9 @@ class ProviderError(ReviewError):
 
 
 class ProviderHTTPError(ProviderError):
-    def __init__(self, status, route="free"):
+    def __init__(self, status, route="go"):
         require(type(status) is int and 100 <= status <= 599, "Invalid provider HTTP status.")
-        require(route in {"free", "go"}, "Invalid provider route label.")
+        require(route == "go", "Invalid provider route label.")
         super().__init__(f"OpenCode {route} HTTP {status}; no automatic POST retry.")
         self.status = status
 
@@ -131,6 +125,8 @@ class HTTP:
                 provider=False, session=None):
         require(urllib.parse.urlsplit(url).netloc in {"api.github.com", "opencode.ai"}
                 and url.startswith("https://"), "Unapproved API destination.")
+        require((provider and url == GO_URL) or (not provider and url.startswith("https://api.github.com/")),
+                "Credential destination does not match API role.")
         self.calls += 1
         self.last_status = None
         require(self.calls <= 150, "HTTP request budget exhausted.")
@@ -161,7 +157,7 @@ class HTTP:
                     time.sleep(2 ** attempt)
                     continue
                 if provider:
-                    raise ProviderHTTPError(status, "free" if url == FREE_URL else "go") from None
+                    raise ProviderHTTPError(status) from None
                 raise ReviewError("API rate limit or HTTP failure; no automatic POST retry.") from None
             except (urllib.error.URLError, TimeoutError, OSError, HTTPException):
                 if attempt < attempts - 1:
@@ -391,8 +387,8 @@ def infer(http, prepared, key, model, *, go_no_overage_confirmed=False, issue_ki
         session = hashlib.sha256(f'{session}:{issue_kind}:{prepared["snapshot"]}'.encode()).hexdigest()
     messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
     for route, url, model_used in REVIEW_MODELS:
-        require(route != "go" or go_no_overage_confirmed,
-                "Go fallback blocked until Use balance is confirmed disabled; no review completed.")
+        require(go_no_overage_confirmed,
+                "Go review blocked until Use balance is confirmed disabled; no review completed.")
         payload = {"model": model_used, "messages": messages, "stream": False, "max_tokens": REVIEW_TOKENS}
         if model_used.startswith("glm-"):
             payload["reasoning_effort"] = "low"
@@ -425,7 +421,7 @@ def infer(http, prepared, key, model, *, go_no_overage_confirmed=False, issue_ki
                     "snapshot": prepared["snapshot"], "kind": issue_kind, "model": model_used, "report": findings}
         return {"repo": prepared["repo"], "number": prepared["number"], "head": prepared["head"],
                 "model": model_used, "findings": findings}
-    raise ReviewError("All four OpenCode models failed; no review completed or published.")
+    raise ReviewError("Both OpenCode Go models failed; no review completed or published.")
 
 
 def plain(text):
@@ -444,9 +440,7 @@ def source_link(result, item):
 
 
 def review_footer(result):
-    model = {"deepseek-v4.1-flash-free": "DeepSeek V4.1 Flash Free",
-             "glm-5.3-flash-free": "GLM 5.3 Flash Free",
-             "deepseek-v4.1-flash": "DeepSeek V4.1 Flash",
+    model = {"deepseek-v4.1-flash": "DeepSeek V4.1 Flash",
              "glm-5.3-flash": "GLM 5.3 Flash"}[result["model"]]
     label = "main" if result.get("kind") else "head"
     link = f'https://github.com/{result["repo"]}/commit/{result["head"]}'
@@ -499,45 +493,12 @@ def require_default_dispatch(event):
             "Manual review must run from the default branch.")
 
 
-def api_smoke(http, key, session, *, route="free", go_no_overage_confirmed=False):
-    """One allowlisted, fixed-prompt request; no PR data, fallback, artifact, or body logs."""
-    require(bool(key), "OPENCODE_API_KEY is missing; no API test completed.")
-    require(isinstance(route, str) and route in {"free", "go"}, "Invalid API test route.")
-    require(type(go_no_overage_confirmed) is bool, "Invalid no-overage confirmation.")
-    require(route != "go" or go_no_overage_confirmed,
-            "Go API test blocked until Use balance is confirmed disabled.")
-    url, model = (FREE_URL, FREE_MODEL) if route == "free" else (GO_URL, DEFAULT_MODEL)
-    payload = {"model": model, "messages": [{"role": "user", "content": "test"}],
-               "stream": False, "max_tokens": SMOKE_TOKENS, "reasoning_effort": "low"}
-    try:
-        response = http.request("POST", url, key, provider=True, session=session,
-                                limit=SMOKE_RESPONSE, payload=payload)
-    except ProviderHTTPError as error:
-        http.last_status = error.status
-        attempt_metadata(http, route, model, "http_error")
-        raise
-    except ProviderError:
-        attempt_metadata(http, route, model, "request_failed")
-        raise ReviewError("API test request failed; no automatic POST retry.") from None
-    try:
-        no_secrets(response, (key,))
-        completion_text(response, SMOKE_RESPONSE)
-    except SecurityError:
-        attempt_metadata(http, route, model, "security_rejected")
-        raise
-    except ReviewError:
-        attempt_metadata(http, route, model, "invalid_completion", response)
-        raise ReviewError("API test did not produce a completed text response.") from None
-    attempt_metadata(http, route, model, "accepted", response)
-
-
 def review_target(http, event, mode):
     """Resolve one PR from trusted event metadata; freeze manual head at prepare."""
     repo = os.environ["GITHUB_REPOSITORY"]
     event_name = os.environ["GITHUB_EVENT_NAME"]
     if event_name == "workflow_dispatch":
         require_default_dispatch(event)
-        require(event.get("inputs", {}).get("mode", "review") == "review", "PR review mode required.")
         number_text = event.get("inputs", {}).get("pr_number")
         require(isinstance(number_text, str) and re.fullmatch(r"[1-9][0-9]{0,8}", number_text),
                 "Manual PR number must be a positive canonical integer.")
@@ -882,18 +843,11 @@ def issue_command(http, mode):
 def main():
     # Paths/commands come only from literal base workflow steps, never PR data.
     mode = sys.argv[1]
+    require(mode in {"prepare", "infer", "publish", "issue-pin", "issue-prepare",
+                     "issue-infer", "issue-publish"}, "Unknown review mode.")
     http = HTTP()
     if mode.startswith("issue-"):
         issue_command(http, mode)
-        return
-    if mode == "smoke":
-        event = load_json(os.environ["GITHUB_EVENT_PATH"], 2 * 1024 * 1024)
-        require_default_dispatch(event)
-        require(event.get("inputs", {}).get("mode") == "api_smoke", "API test mode required.")
-        session = hashlib.sha256(f"api-smoke:{os.environ['GITHUB_REPOSITORY']}:{os.environ['GITHUB_RUN_ID']}".encode()).hexdigest()
-        api_smoke(http, os.environ.get("OPENCODE_API_KEY", ""), session,
-                  route=event.get("inputs", {}).get("smoke_route", "free"),
-                  go_no_overage_confirmed=os.environ.get("OPENCODE_GO_NO_OVERAGE_CONFIRMED") == "true")
         return
     if mode == "infer":
         prepared = load_json("review-input.json", MAX_PROMPT + MAX_DIFF)

@@ -42,7 +42,7 @@ class FakeHTTP:
 
     def request(self, method, url, token, **kwargs):
         self.calls.append((method, url, token, kwargs))
-        if url in {review.FREE_URL, review.GO_URL}:
+        if url in {review.GO_URL}:
             return self.completion
         if method == "POST":
             return {"id": 1}
@@ -102,15 +102,15 @@ class ReviewTests(unittest.TestCase):
     def test_missing_secret_no_inference(self):
         http = FakeHTTP()
         with self.assertRaisesRegex(review.ReviewError, "missing"):
-            review.infer(http, {}, "", review.DEFAULT_MODEL)
+            review.infer(http, {}, "", review.DEFAULT_MODEL, go_no_overage_confirmed=True)
         self.assertEqual(http.calls, [])
 
     def test_provider_contract_and_token_separation(self):
         http = FakeHTTP()
         data = prepared(http)
-        output = review.infer(http, data, KEY, "glm-5.3-flash")
+        output = review.infer(http, data, KEY, "glm-5.3-flash", go_no_overage_confirmed=True)
         method, url, token, kwargs = http.calls[-1]
-        self.assertEqual((method, url, token), ("POST", review.FREE_URL, KEY))
+        self.assertEqual((method, url, token), ("POST", review.GO_URL, KEY))
         self.assertEqual(len(kwargs["session"]), 64)
         payload = kwargs["payload"]
         self.assertFalse(payload["stream"])
@@ -119,23 +119,21 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(set(payload), {"model", "messages", "stream", "max_tokens"})
         self.assertNotIn(KEY, json.dumps(payload))
         self.assertNotIn("fixture-github-token", json.dumps(payload))
-        self.assertEqual(output["model"], "deepseek-v4.1-flash-free")
-        self.assertEqual(payload["model"], "deepseek-v4.1-flash-free")
+        self.assertEqual(output["model"], "deepseek-v4.1-flash")
+        self.assertEqual(payload["model"], "deepseek-v4.1-flash")
         self.assertEqual(output["head"], HEAD)
         self.assertEqual(output["findings"], [FINDING])
 
     def test_ordered_chain_stops_at_each_success_and_names_actual_model(self):
-        for accepted_at in range(4):
+        for accepted_at in range(2):
             http = FakeHTTP()
             data = prepared(http)
             output = io.StringIO()
             errors = [review.ProviderHTTPError(403)] * accepted_at
             with patch.object(http, "request", side_effect=errors + [http.completion]) as request, \
                  redirect_stdout(output):
-                result = review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=accepted_at >= 2)
-            order = [("free", review.FREE_URL, "deepseek-v4.1-flash-free"),
-                     ("free", review.FREE_URL, "glm-5.3-flash-free"),
-                     ("go", review.GO_URL, "deepseek-v4.1-flash"),
+                result = review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
+            order = [("go", review.GO_URL, "deepseek-v4.1-flash"),
                      ("go", review.GO_URL, "glm-5.3-flash")]
             expected = order[:accepted_at + 1]
             self.assertEqual(request.call_count, accepted_at + 1)
@@ -153,19 +151,16 @@ class ReviewTests(unittest.TestCase):
             publisher = FakeHTTP()
             review.publish(gh(publisher), result, HEAD)
             body = publisher.calls[-1][3]["payload"]["body"]
-            labels = ["DeepSeek V4.1 Flash Free", "GLM 5.3 Flash Free",
-                      "DeepSeek V4.1 Flash", "GLM 5.3 Flash"]
+            labels = ["DeepSeek V4.1 Flash", "GLM 5.3 Flash"]
             self.assertIn(f"Advisory · {labels[accepted_at]} ·", body)
 
-    def test_fallback_blocked_without_no_overage_confirmation(self):
+    def test_go_review_blocked_before_first_request_without_no_overage_confirmation(self):
         http = FakeHTTP()
         data = prepared(http)
-        with patch.object(http, "request", side_effect=review.ProviderHTTPError(429)) as request, \
-             redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(review.ReviewError, "Use balance"):
-                review.infer(http, data, KEY, review.DEFAULT_MODEL)
-            self.assertEqual(request.call_count, 2)
-            self.assertTrue(all(c.args[1] == review.FREE_URL for c in request.call_args_list))
+        for options in ({}, {"go_no_overage_confirmed": False}):
+            with patch.object(http, "request") as request, self.assertRaisesRegex(review.ReviewError, "Use balance"):
+                review.infer(http, data, KEY, review.DEFAULT_MODEL, **options)
+            request.assert_not_called()
 
     def test_provider_failures_advance_once_and_all_failed_has_no_result(self):
         for failure in (review.ProviderHTTPError(400), review.ProviderHTTPError(401),
@@ -176,12 +171,12 @@ class ReviewTests(unittest.TestCase):
             data = prepared(http)
             output = io.StringIO()
             with patch.object(http, "request", side_effect=failure) as request, redirect_stdout(output), \
-                 self.assertRaisesRegex(review.ReviewError, "All four"):
+                 self.assertRaisesRegex(review.ReviewError, "Both OpenCode Go"):
                 review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
-            self.assertEqual(request.call_count, 4)
+            self.assertEqual(request.call_count, 2)
             self.assertEqual([c.kwargs["payload"]["model"] for c in request.call_args_list],
                              [m for _, _, m in review.REVIEW_MODELS])
-            self.assertEqual(len(output.getvalue().splitlines()), 4)
+            self.assertEqual(len(output.getvalue().splitlines()), 2)
             if isinstance(failure, review.ProviderHTTPError):
                 self.assertIn(f'"http_status":{failure.status}', output.getvalue())
         http = FakeHTTP()
@@ -190,15 +185,17 @@ class ReviewTests(unittest.TestCase):
         broken["choices"][0]["finish_reason"] = "length"
         broken["choices"][0]["message"]["content"] = ""
         broken["usage"] = {"completion_tokens": 16384, "completion_tokens_details": {"reasoning_tokens": 16384}}
-        output = io.StringIO()
-        with patch.object(http, "request", side_effect=[{}, broken, ["bad"], http.completion]) as request, \
-             redirect_stdout(output):
-            result = review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
-        self.assertEqual(request.call_count, 4)
-        self.assertEqual(result["model"], "glm-5.3-flash")
-        self.assertIn('"finish_reason":"length"', output.getvalue())
-        self.assertIn('"reasoning_tokens":16384', output.getvalue())
-        self.assertIn('"text_nonempty":false', output.getvalue())
+        for malformed in ({}, broken, ["bad"]):
+            output = io.StringIO()
+            with patch.object(http, "request", side_effect=[malformed, http.completion]) as request, \
+                 redirect_stdout(output):
+                result = review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
+            self.assertEqual(request.call_count, 2)
+            self.assertEqual(result["model"], "glm-5.3-flash")
+            if malformed is broken:
+                self.assertIn('"finish_reason":"length"', output.getvalue())
+                self.assertIn('"reasoning_tokens":16384', output.getvalue())
+                self.assertIn('"text_nonempty":false', output.getvalue())
 
     def test_all_failed_cli_writes_no_findings_artifact(self):
         http = FakeHTTP()
@@ -213,9 +210,9 @@ class ReviewTests(unittest.TestCase):
                      patch.object(review, "HTTP", return_value=http), \
                      patch.object(http, "request", side_effect=review.ProviderHTTPError(403)) as request, \
                      patch("sys.argv", ["review", "infer"]), redirect_stdout(io.StringIO()), \
-                     self.assertRaisesRegex(review.ReviewError, "All four"):
+                     self.assertRaisesRegex(review.ReviewError, "Both OpenCode Go"):
                     review.main()
-                self.assertEqual(request.call_count, 4)
+                self.assertEqual(request.call_count, 2)
                 self.assertEqual(list(Path('.').iterdir()), [Path("review-input.json")])
             finally:
                 os.chdir(previous)
@@ -251,7 +248,7 @@ class ReviewTests(unittest.TestCase):
                       "completion_tokens_details": {"reasoning_tokens": -1}}}
         output = io.StringIO()
         with redirect_stdout(output):
-            review.attempt_metadata(http, "free", review.FREE_MODEL, "invalid_completion", response)
+            review.attempt_metadata(http, "go", review.DEFAULT_MODEL, "invalid_completion", response)
         metadata = json.loads(output.getvalue().removeprefix("OpenCode attempt "))
         self.assertEqual(metadata["finish_reason"], "unknown")
         self.assertFalse(metadata["assistant_role"])
@@ -263,12 +260,12 @@ class ReviewTests(unittest.TestCase):
     def test_stable_session_per_head(self):
         http = FakeHTTP()
         data = prepared(http)
-        review.infer(http, data, KEY, review.DEFAULT_MODEL)
+        review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
         first = http.calls[-1][3]["session"]
-        review.infer(http, data, KEY, review.DEFAULT_MODEL)
+        review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
         self.assertEqual(first, http.calls[-1][3]["session"])
         data["head"] = OLD
-        review.infer(http, data, KEY, review.DEFAULT_MODEL)
+        review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
         self.assertNotEqual(first, http.calls[-1][3]["session"])
 
     def test_fork_injection_is_data_not_execution(self):
@@ -281,7 +278,7 @@ class ReviewTests(unittest.TestCase):
         http.completion["choices"][0]["message"]["content"] = '{"findings":[]}'
         with patch("os.system", side_effect=AssertionError("shell executed")):
             data = prepared(http)
-            output = review.infer(http, data, KEY, review.DEFAULT_MODEL)
+            output = review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
         request = http.calls[-1][3]["payload"]
         self.assertIn(injected, request["messages"][1]["content"])
         self.assertIn("UNTRUSTED DATA", request["messages"][0]["content"])
@@ -299,7 +296,7 @@ class ReviewTests(unittest.TestCase):
             mutate(http)
             with self.assertRaises(review.ReviewError):
                 prepared(http)
-            self.assertFalse(any(call[1] in {review.FREE_URL, review.GO_URL} for call in http.calls))
+            self.assertFalse(any(call[1] in {review.GO_URL} for call in http.calls))
         for change in ({"changed_files": review.MAX_FILES + 1},
                        {"additions": review.MAX_CHANGES + 1}):
             http = FakeHTTP()
@@ -316,8 +313,8 @@ class ReviewTests(unittest.TestCase):
         http = FakeHTTP()
         data = prepared(http)
         with patch.object(review, "MAX_PROMPT", 1), self.assertRaises(review.ReviewError):
-            review.infer(http, data, KEY, review.DEFAULT_MODEL)
-        self.assertFalse(any(call[1] in {review.FREE_URL, review.GO_URL} for call in http.calls))
+            review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
+        self.assertFalse(any(call[1] in {review.GO_URL} for call in http.calls))
 
     def test_context_above_128k_reaches_mocked_inference_below_prompt_limit(self):
         http = FakeHTTP()
@@ -332,7 +329,7 @@ class ReviewTests(unittest.TestCase):
             os.chdir(tmp)
             try:
                 Path("review-input.json").write_bytes(review.json_bytes(data))
-                with patch.dict(os.environ, {"OPENCODE_API_KEY": KEY}, clear=True), \
+                with patch.dict(os.environ, {"OPENCODE_API_KEY": KEY, "OPENCODE_GO_NO_OVERAGE_CONFIRMED": "true"}, clear=True), \
                      patch.object(review, "HTTP", return_value=http), \
                      patch("sys.argv", ["review", "infer"]), redirect_stdout(io.StringIO()):
                     review.main()
@@ -379,18 +376,18 @@ class ReviewTests(unittest.TestCase):
             data = prepared(http)
             http.completion["choices"][0]["message"]["content"] = content
             with self.assertRaises((review.ReviewError, ValueError)):
-                review.infer(http, data, KEY, review.DEFAULT_MODEL)
+                review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
         for reason in ("length", "tool_calls", "content_filter", None):
             http = FakeHTTP()
             data = prepared(http)
             http.completion["choices"][0]["finish_reason"] = reason
             with self.assertRaises(review.ReviewError):
-                review.infer(http, data, KEY, review.DEFAULT_MODEL)
+                review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
         http = FakeHTTP()
         data = prepared(http)
         http.completion["choices"][0]["message"]["tool_calls"] = [{"function": "shell"}]
         with self.assertRaises(review.ReviewError):
-            review.infer(http, data, KEY, review.DEFAULT_MODEL)
+            review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
 
     def test_credentials_never_reach_prompts_or_artifacts(self):
         for text in (KEY, "ghp_" + "x" * 36, 'api_key = "' + "x" * 30 + '"',
@@ -399,8 +396,8 @@ class ReviewTests(unittest.TestCase):
             data = prepared(http)
             data["files"][0]["patch"] += text
             with self.assertRaises(review.ReviewError):
-                review.infer(http, data, KEY, review.DEFAULT_MODEL)
-            self.assertFalse(any(call[1] in {review.FREE_URL, review.GO_URL} for call in http.calls))
+                review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
+            self.assertFalse(any(call[1] in {review.GO_URL} for call in http.calls))
         http = FakeHTTP()
         data = prepared(http)
         # Decode Unicode escapes before final secret checking, even for opaque keys.
@@ -408,7 +405,7 @@ class ReviewTests(unittest.TestCase):
         encoded = json.dumps({"findings": [finding]}).replace("fixture", "\\u0066ixture")
         http.completion["choices"][0]["message"]["content"] = encoded
         with self.assertRaises(review.ReviewError):
-            review.infer(http, data, KEY, review.DEFAULT_MODEL)
+            review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
 
     def test_safe_publish_comment_bound_to_head(self):
         http = FakeHTTP()
@@ -422,7 +419,7 @@ class ReviewTests(unittest.TestCase):
         self.assertIn(f"/blob/{HEAD}/src/example.rs#L2", body)
         self.assertIn("no tests run", body)
         self.assertTrue(http.calls[-2][1].endswith("/pulls/123"))
-        self.assertFalse(any(call[1] in {review.FREE_URL, review.GO_URL} for call in http.calls))
+        self.assertFalse(any(call[1] in {review.GO_URL} for call in http.calls))
 
     def test_stale_or_draft_final_publish_recheck(self):
         for mutate in (lambda pr: pr["head"].update(sha=OLD), lambda pr: pr.update(draft=True)):
@@ -497,7 +494,7 @@ class ReviewTests(unittest.TestCase):
                     review.main()
                 self.assertEqual(Path("output").read_text(), f"prepared=true\nhead={HEAD}\n")
                 self.assertTrue(Path("review-input.json").is_file())
-                with patch.dict(os.environ, {"OPENCODE_API_KEY": KEY}, clear=True), \
+                with patch.dict(os.environ, {"OPENCODE_API_KEY": KEY, "OPENCODE_GO_NO_OVERAGE_CONFIRMED": "true"}, clear=True), \
                      patch.object(review, "HTTP", return_value=http), \
                      patch("sys.argv", ["review", "infer"]), redirect_stdout(io.StringIO()):
                     review.main()
@@ -531,7 +528,7 @@ class ReviewTests(unittest.TestCase):
                      patch("sys.argv", ["review", "prepare"]), redirect_stdout(io.StringIO()):
                     review.main()
                 self.assertEqual(Path("output").read_text(), f"prepared=true\nhead={HEAD}\n")
-                with patch.dict(os.environ, {"OPENCODE_API_KEY": KEY}, clear=True), \
+                with patch.dict(os.environ, {"OPENCODE_API_KEY": KEY, "OPENCODE_GO_NO_OVERAGE_CONFIRMED": "true"}, clear=True), \
                      patch.object(review, "HTTP", return_value=http), \
                      patch("sys.argv", ["review", "infer"]), redirect_stdout(io.StringIO()):
                     review.main()
@@ -638,6 +635,32 @@ class ReviewTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_go_only_model_policy_and_credential_destinations(self):
+        self.assertEqual(review.REVIEW_MODELS, (
+            ("go", review.GO_URL, "deepseek-v4.1-flash"),
+            ("go", review.GO_URL, "glm-5.3-flash")))
+        self.assertEqual(review.ALLOWED_MODELS, {"deepseek-v4.1-flash", "glm-5.3-flash"})
+        client = review.HTTP()
+        for url, provider in (
+                ("https://opencode.ai/inference/openai/v1/chat/completions", True),
+                (review.GO_URL + "?route=free", True),
+                (review.GO_URL + "#free", True),
+                ("https://api.github.com/repos/rhoopr/kei", True),
+                (review.GO_URL, False)):
+            with self.subTest(url=url, provider=provider), patch.object(client.opener, "open") as opened, \
+                 self.assertRaises(review.ReviewError):
+                client.request("POST", url, KEY, provider=provider, payload={})
+            opened.assert_not_called()
+
+    def test_removed_probe_command_rejects_before_transport(self):
+        self.assertFalse(hasattr(review, "api_smoke"))
+        root = Path(__file__).resolve().parents[2]
+        self.assertFalse((root / ".github/workflows/opencode-cli-smoke.yml").exists())
+        with patch("sys.argv", ["review", "smoke"]), patch.object(review, "HTTP") as transport, \
+             self.assertRaises(review.ReviewError):
+            review.main()
+        transport.assert_not_called()
+
     def test_headers_timeouts_and_no_post_retry_on_rate_limit(self):
         client = review.HTTP()
         with patch.object(client.opener, "open", side_effect=urllib.error.HTTPError(
@@ -652,7 +675,7 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(opened.call_args.kwargs["timeout"], 90)
 
     def test_provider_errors_expose_only_fixed_route_and_numeric_status(self):
-        for route, url, code in (("free", review.FREE_URL, 401), ("go", review.GO_URL, 429)):
+        for route, url, code in (("go", review.GO_URL, 401), ("go", review.GO_URL, 429)):
             client = review.HTTP()
             failure = urllib.error.HTTPError(url, code, KEY, {"secret": KEY}, io.BytesIO(KEY.encode()))
             with patch.object(client.opener, "open", side_effect=failure), \
@@ -662,7 +685,7 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(message, f"OpenCode {route} HTTP {code}; no automatic POST retry.")
             self.assertNotIn(KEY, message)
             self.assertNotIn(url, message)
-        for status, route in (("401\nsecret", "free"), (401, KEY), (True, "go")):
+        for status, route in (("401\nsecret", "go"), (401, KEY), (True, "go")):
             with self.assertRaises(review.ReviewError):
                 review.ProviderHTTPError(status, route)
 
@@ -681,11 +704,11 @@ class TransportTests(unittest.TestCase):
         output = io.StringIO()
         with patch.object(client.opener, "open", side_effect=[TruncatedResponse(), valid]) as opened, \
              redirect_stdout(output):
-            result = review.infer(client, data, KEY, review.DEFAULT_MODEL)
+            result = review.infer(client, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
         self.assertEqual(opened.call_count, 2)
-        self.assertEqual(result["model"], "glm-5.3-flash-free")
+        self.assertEqual(result["model"], "glm-5.3-flash")
         self.assertEqual([json.loads(call.args[0].data)["model"] for call in opened.call_args_list],
-                         ["deepseek-v4.1-flash-free", "glm-5.3-flash-free"])
+                         ["deepseek-v4.1-flash", "glm-5.3-flash"])
         self.assertIn('"outcome":"request_failed"', output.getvalue())
         self.assertNotIn("private partial body", output.getvalue())
         self.assertNotIn(KEY, output.getvalue())
@@ -726,156 +749,6 @@ class TransportTests(unittest.TestCase):
                 client.request("GET", "https://api.github.com/test", KEY, limit=bound)
 
 
-class ApiSmokeTests(unittest.TestCase):
-    def test_one_free_test_prompt_only_and_no_response_body_output(self):
-        http = FakeHTTP()
-        http.completion["choices"][0]["message"]["content"] = "private response body"
-        output = io.StringIO()
-        with redirect_stdout(output):
-            review.api_smoke(http, KEY, "fixture-session")
-        self.assertEqual(len(http.calls), 1)
-        method, url, _, args = http.calls[0]
-        self.assertEqual((method, url), ("POST", review.FREE_URL))
-        self.assertEqual(args["payload"], {"model": review.FREE_MODEL,
-                         "messages": [{"role": "user", "content": "test"}],
-                         "stream": False, "max_tokens": 2048, "reasoning_effort": "low"})
-        self.assertEqual(args["limit"], 128 * 1024)
-        metadata = json.loads(output.getvalue().removeprefix("OpenCode attempt "))
-        self.assertEqual((metadata["route"], metadata["http_status"], metadata["outcome"]), ("free", 200, "accepted"))
-        self.assertNotIn("private response body", output.getvalue())
-        self.assertNotIn(KEY, output.getvalue())
-
-    def test_one_go_request_uses_only_fixed_subscription_route_and_prompt(self):
-        http = FakeHTTP()
-        output = io.StringIO()
-        with redirect_stdout(output):
-            review.api_smoke(http, KEY, "fixture", route="go", go_no_overage_confirmed=True)
-        self.assertEqual(len(http.calls), 1)
-        method, url, _, args = http.calls[0]
-        self.assertEqual((method, url), ("POST", review.GO_URL))
-        self.assertEqual(args["payload"], {"model": review.DEFAULT_MODEL,
-                         "messages": [{"role": "user", "content": "test"}],
-                         "stream": False, "max_tokens": 2048, "reasoning_effort": "low"})
-        self.assertEqual(args["limit"], 128 * 1024)
-        metadata = json.loads(output.getvalue().removeprefix("OpenCode attempt "))
-        self.assertEqual((metadata["route"], metadata["http_status"], metadata["outcome"]), ("go", 200, "accepted"))
-
-    def test_go_gate_and_unknown_routes_fail_before_network(self):
-        for route, confirmed in (("go", False), ("paid", True), ("https://evil.test", True),
-                                  ("glm-5.3-flash", True), ("GO", True), ("go", "true")):
-            http = FakeHTTP()
-            with self.assertRaises(review.ReviewError):
-                review.api_smoke(http, KEY, "fixture", route=route, go_no_overage_confirmed=confirmed)
-            self.assertEqual(http.calls, [])
-
-    def test_go_exhaustion_and_auth_errors_never_retry_or_change_route(self):
-        for status in (401, 403, 404, 429, 503):
-            http = FakeHTTP()
-            with patch.object(http, "request", side_effect=review.ProviderHTTPError(status, "go")) as request, \
-                 self.assertRaises(review.ProviderHTTPError):
-                review.api_smoke(http, KEY, "fixture", route="go", go_no_overage_confirmed=True)
-            self.assertEqual(request.call_count, 1)
-            self.assertEqual(request.call_args.args[1], review.GO_URL)
-
-    def test_api_test_never_falls_back_or_retries(self):
-        for status in (400, 401, 403, 404, 429, 500, 502, 503, 504):
-            http = FakeHTTP()
-            with patch.object(http, "request", side_effect=review.ProviderHTTPError(status)) as request, \
-                 self.assertRaises(review.ProviderHTTPError):
-                review.api_smoke(http, KEY, "fixture")
-            self.assertEqual(request.call_count, 1)
-            self.assertEqual(request.call_args.args[1], review.FREE_URL)
-        http = FakeHTTP()
-        with self.assertRaisesRegex(review.ReviewError, "missing"):
-            review.api_smoke(http, "", "fixture")
-        self.assertEqual(http.calls, [])
-
-    def test_api_test_rejects_bad_or_truncated_completions_without_logging_body(self):
-        for response in ({}, {"choices": [None]}, {"choices": [None, None]},
-                         {"choices": [{"finish_reason": "length", "message": {
-                             "role": "assistant", "content": "private body"}}]},
-                         {"choices": [{"finish_reason": "stop", "message": {
-                             "role": "assistant", "content": "private body", "tool_calls": [{}]}}]}):
-            http = FakeHTTP()
-            http.completion = response
-            output = io.StringIO()
-            with redirect_stdout(output), self.assertRaises(review.ReviewError):
-                review.api_smoke(http, KEY, "fixture")
-            metadata = json.loads(output.getvalue().removeprefix("OpenCode attempt "))
-            self.assertEqual(metadata["outcome"], "invalid_completion")
-            self.assertNotIn("private body", output.getvalue())
-            self.assertEqual(len(http.calls), 1)
-
-    def test_api_test_reports_safe_metadata_for_invalid_json_and_transport_uncertainty(self):
-        for status in (200, None):
-            http = FakeHTTP()
-            http.last_status = status
-            output = io.StringIO()
-            with patch.object(http, "request", side_effect=review.ProviderError("raw diagnostic excluded")), \
-                 redirect_stdout(output), self.assertRaises(review.ReviewError):
-                review.api_smoke(http, KEY, "fixture")
-            metadata = json.loads(output.getvalue().removeprefix("OpenCode attempt "))
-            self.assertEqual(metadata["http_status"], status)
-            self.assertEqual(metadata["outcome"], "request_failed")
-            self.assertNotIn("raw diagnostic", output.getvalue())
-
-    def test_api_test_reports_length_and_usage_without_body_or_reasoning(self):
-        http = FakeHTTP()
-        http.completion["choices"][0].update(finish_reason="length", message={
-            "role": "assistant", "content": "", "reasoning_content": "private reasoning"})
-        http.completion["usage"] = {"prompt_tokens": 2, "completion_tokens": 2048,
-                                    "total_tokens": 2050, "completion_tokens_details": {"reasoning_tokens": 2048}}
-        output = io.StringIO()
-        with redirect_stdout(output), self.assertRaises(review.ReviewError):
-            review.api_smoke(http, KEY, "fixture")
-        metadata = json.loads(output.getvalue().removeprefix("OpenCode attempt "))
-        self.assertEqual(metadata["finish_reason"], "length")
-        self.assertEqual(metadata["reasoning_tokens"], 2048)
-        self.assertEqual(metadata["completion_tokens"], 2048)
-        self.assertFalse(metadata["text_nonempty"])
-        self.assertNotIn("private reasoning", output.getvalue())
-        self.assertEqual(len(http.calls), 1)
-
-    def test_smoke_cli_requires_trusted_dispatch_and_writes_no_artifacts(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            previous = Path.cwd()
-            os.chdir(tmp)
-            try:
-                event = {"inputs": {"mode": "api_smoke"},
-                         "repository": {"full_name": REPO, "default_branch": "main"}}
-                Path("event.json").write_text(json.dumps(event))
-                env = {"GITHUB_EVENT_PATH": str(Path("event.json").resolve()),
-                       "GITHUB_REPOSITORY": REPO, "GITHUB_EVENT_NAME": "workflow_dispatch",
-                       "GITHUB_REF": "refs/heads/main", "GITHUB_RUN_ID": "1234", "OPENCODE_API_KEY": KEY,
-                       "OPENCODE_GO_NO_OVERAGE_CONFIRMED": "true"}
-                http = FakeHTTP()
-                with patch.dict(os.environ, env, clear=True), patch.object(review, "HTTP", return_value=http), \
-                     patch("sys.argv", ["review", "smoke"]), redirect_stdout(io.StringIO()):
-                    review.main()
-                self.assertEqual(len(http.calls), 1)
-                self.assertEqual(list(Path('.').iterdir()), [Path('event.json')])
-                event["inputs"]["smoke_route"] = "go"
-                Path("event.json").write_text(json.dumps(event))
-                http = FakeHTTP()
-                with patch.dict(os.environ, env, clear=True), patch.object(review, "HTTP", return_value=http), \
-                     patch("sys.argv", ["review", "smoke"]), redirect_stdout(io.StringIO()):
-                    review.main()
-                self.assertEqual(len(http.calls), 1)
-                self.assertEqual(http.calls[0][1], review.GO_URL)
-                http = FakeHTTP()
-                with patch.dict(os.environ, dict(env, OPENCODE_GO_NO_OVERAGE_CONFIRMED="false"), clear=True), \
-                     patch.object(review, "HTTP", return_value=http), \
-                     patch("sys.argv", ["review", "smoke"]), self.assertRaises(review.ReviewError):
-                    review.main()
-                self.assertEqual(http.calls, [])
-                http = FakeHTTP()
-                with patch.dict(os.environ, dict(env, GITHUB_REF="refs/heads/feature"), clear=True), \
-                     patch.object(review, "HTTP", return_value=http), \
-                     patch("sys.argv", ["review", "smoke"]), self.assertRaises(review.ReviewError):
-                    review.main()
-                self.assertEqual(http.calls, [])
-            finally:
-                os.chdir(previous)
 
 
 
@@ -915,26 +788,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("permissions: {}", text)
         self.assertIn("  workflow_dispatch:", text)
         self.assertIn("      pr_number:", text)
-        self.assertIn("      smoke_route:", text)
-        self.assertIn("options: [free, go]", text)
-        self.assertIn("default: free", text)
+        self.assertNotIn("api-smoke", text)
+        self.assertNotIn("smoke_route", text)
+        self.assertNotIn("inputs.mode", text)
         self.assertIn("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)", text)
         self.assertIn("github.event.pull_request.number || inputs.pr_number", text)
         self.assertIn("EXPECTED_HEAD_SHA: ${{ needs.review.outputs.head }}", text)
         text = text.split("  # Pin identities once", 1)[0]
-        self.assertEqual(text.count("ref: ${{ github.workflow_sha }}"), 3)
-        self.assertEqual(text.count("persist-credentials: false"), 3)
+        self.assertEqual(text.count("ref: ${{ github.workflow_sha }}"), 2)
+        self.assertEqual(text.count("persist-credentials: false"), 2)
         read_job, write_job = text.split("  publish:\n")
         self.assertNotIn("pull-requests: write", read_job)
         self.assertNotIn("OPENCODE_API_KEY", write_job)
-        smoke_job = read_job.split("  api-smoke:")[1]
-        self.assertIn("contents: read", smoke_job)
-        self.assertNotIn("GH_TOKEN", smoke_job)
-        self.assertNotIn("OPENCODE_GO_MODEL:", smoke_job)
-        self.assertIn("OPENCODE_GO_NO_OVERAGE_CONFIRMED:", smoke_job)
-        self.assertNotIn("pull-requests:", smoke_job)
-        self.assertNotIn("upload-artifact", smoke_job)
-        self.assertIn("python3 -I scripts/ci/opencode_review.py smoke", smoke_job)
         self.assertNotIn("pull_request.head", text)
         self.assertNotIn("secrets: inherit", text)
         self.assertIn("path: review-result.json", text)
@@ -982,7 +847,7 @@ class IssueHTTP(FakeHTTP):
 
     def request(self, method, url, token, **kwargs):
         self.calls.append((method, url, token, kwargs))
-        if url in {review.FREE_URL, review.GO_URL}:
+        if url in {review.GO_URL}:
             return self.completion
         if method == "POST":
             body = kwargs["payload"]["body"]
@@ -1092,9 +957,9 @@ class IssueReviewTests(unittest.TestCase):
             data = issue_prepared(http, kind)
             http.completion["choices"][0]["message"]["content"] = json.dumps(issue_report(kind))
             with redirect_stdout(io.StringIO()):
-                result = review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind)
+                result = review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind, go_no_overage_confirmed=True)
             call = http.calls[-1]
-            self.assertEqual(call[:3], ("POST", review.FREE_URL, KEY))
+            self.assertEqual(call[:3], ("POST", review.GO_URL, KEY))
             self.assertEqual(call[3]["payload"]["model"], review.REVIEW_MODELS[0][2])
             self.assertNotIn("fixture-github-token", json.dumps(call[3]["payload"]))
             self.assertNotIn(KEY, json.dumps(call[3]["payload"]))
@@ -1104,23 +969,23 @@ class IssueReviewTests(unittest.TestCase):
             sessions.add(call[3]["session"])
         self.assertEqual(len(sessions), 2)
 
-    def test_issue_routing_all_four_and_no_overage_gate(self):
+    def test_issue_routing_both_go_models_and_no_overage_gate(self):
         for kind in review.ISSUE_KINDS:
             http = IssueHTTP()
             data = issue_prepared(http, kind)
             http.completion["choices"][0]["message"]["content"] = json.dumps(issue_report(kind))
-            for accepted_at in range(4):
+            for accepted_at in range(2):
                 with patch.object(http, "request", side_effect=[review.ProviderHTTPError(403)] * accepted_at
                                   + [http.completion]) as request, redirect_stdout(io.StringIO()):
                     result = review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind,
-                                          go_no_overage_confirmed=accepted_at >= 2)
+                                          go_no_overage_confirmed=True)
                 self.assertEqual(result["model"], review.REVIEW_MODELS[accepted_at][2])
                 self.assertEqual([c.kwargs["payload"]["model"] for c in request.call_args_list],
                                  [m for _, _, m in review.REVIEW_MODELS[:accepted_at + 1]])
-            with patch.object(http, "request", side_effect=review.ProviderHTTPError(403)) as request, \
-                 redirect_stdout(io.StringIO()), self.assertRaisesRegex(review.ReviewError, "Use balance"):
-                review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind)
-            self.assertEqual(request.call_count, 2)
+            with patch.object(http, "request") as request, \
+                 self.assertRaisesRegex(review.ReviewError, "Use balance"):
+                review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind, go_no_overage_confirmed=False)
+            request.assert_not_called()
 
     def test_schema_classifications_and_evidence(self):
         for kind in review.ISSUE_KINDS:
@@ -1150,7 +1015,7 @@ class IssueReviewTests(unittest.TestCase):
             data["issue"]["body"] = KEY
             before = len(http.calls)
             with self.assertRaises(review.SecurityError):
-                review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind)
+                review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind, go_no_overage_confirmed=True)
             self.assertEqual(len(http.calls), before)
             result = issue_result(kind)
             result["report"]["summary"] = "fixture-github-token"
@@ -1253,7 +1118,7 @@ class IssueReviewTests(unittest.TestCase):
                 else:
                     http.completion["choices"][0]["message"]["content"] = json.dumps(issue_report(kind))
                     with redirect_stdout(io.StringIO()):
-                        result = review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind)
+                        result = review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind=kind, go_no_overage_confirmed=True)
                     review.publish_issue(gh(http), review.issue_snapshot(ISSUE), result, HEAD, kind)
             self.assertEqual(len(http.comments), 1)
             self.assertNotIn(review.issue_marker(failed_kind, review.issue_fingerprint(review.issue_snapshot(ISSUE))),
@@ -1286,7 +1151,7 @@ class IssueReviewTests(unittest.TestCase):
                            "GH_TOKEN": "fixture-github-token", "GITHUB_OUTPUT": "outputs",
                            "ISSUE_REVIEW_KIND": kind, "OPENCODE_API_KEY": KEY,
                            "EXPECTED_MAIN_SHA": HEAD,
-                           "EXPECTED_ISSUE_SNAPSHOT": review.issue_fingerprint(review.issue_snapshot(ISSUE))}
+                           "EXPECTED_ISSUE_SNAPSHOT": review.issue_fingerprint(review.issue_snapshot(ISSUE)), "OPENCODE_GO_NO_OVERAGE_CONFIRMED": "true"}
                     with patch.dict(os.environ, env, clear=True), patch.object(review, "HTTP", return_value=http):
                         for mode in ("issue-pin", "issue-prepare"):
                             with patch("sys.argv", ["review", mode]):
@@ -1391,10 +1256,10 @@ class ConciseReviewTests(unittest.TestCase):
         report = {**issue_report("code"), "rationale": "x" * 601}
         too_long["choices"][0]["message"]["content"] = json.dumps(report)
         with patch.object(http, "request", side_effect=[too_long, valid]) as request, redirect_stdout(io.StringIO()):
-            output = review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind="code")
+            output = review.infer(http, data, KEY, review.DEFAULT_MODEL, issue_kind="code", go_no_overage_confirmed=True)
         self.assertEqual(request.call_count, 2)
         self.assertEqual(output["report"], issue_report("code"))
-        self.assertEqual(output["model"], "glm-5.3-flash-free")
+        self.assertEqual(output["model"], "glm-5.3-flash")
 
     def test_next_step_credentials_fail_closed(self):
         http = IssueHTTP()
@@ -1449,8 +1314,8 @@ class IssueWorkflowTests(unittest.TestCase):
         self.assertNotIn("GH_TOKEN", inference)
         self.assertIn("path: issue-review-result.json", reader)
         self.assertNotIn("path: issue-review-input.json", text)
-        self.assertEqual(text.count("persist-credentials: false"), 6)
-        self.assertEqual(text.count("ref: " + "$" + "{{ github.workflow_sha }}"), 6)
+        self.assertEqual(text.count("persist-credentials: false"), 5)
+        self.assertEqual(text.count("ref: " + "$" + "{{ github.workflow_sha }}"), 5)
         self.assertIn("EXPECTED_ISSUE_SNAPSHOT:", reader + publisher)
         self.assertIn("EXPECTED_MAIN_SHA:", reader + publisher)
 

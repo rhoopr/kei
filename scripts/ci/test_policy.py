@@ -78,6 +78,22 @@ class PolicyTests(unittest.TestCase):
                         with self.subTest(required=required), self.assertRaises(ValueError):
                             check({**needs, required: {"result": "skipped"}}, result["required"])
 
+    def test_go_cleanup_and_retired_probe_deletion_stay_maintenance(self):
+        files = [".github/workflows/opencode-cli-smoke.yml",
+                 ".github/workflows/opencode-review.yml", "docs/architecture.md",
+                 "docs/opencode-review.md", "scripts/ci/opencode_review.py",
+                 "scripts/ci/policy.py", "scripts/ci/test_opencode_cli_smoke.py",
+                 "scripts/ci/test_opencode_review.py", "scripts/ci/test_policy.py"]
+        for light in (False, True):
+            with self.subTest(light=light):
+                result = route(files, "pull_request", False, light, False)
+                self.assertEqual(result["required"], ALWAYS)
+                for key in ("code", "cargo", "platform", "stress", "qualification", "coverage", "unused"):
+                    self.assertFalse(result[key], key)
+        # Unknown workflow changes still require full qualification.
+        self.assertTrue(route([".github/workflows/unknown.yml"], "pull_request", False, True, False)
+                        ["qualification"])
+
     def test_known_ci_maintenance_and_rust_check_tools(self):
         maintenance = ["scripts/ci/nightly.py", "scripts/ci/opencode_review.py",
                        "scripts/ci/policy.py", "scripts/ci/gate.py", "scripts/ci/local_release.py",

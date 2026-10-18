@@ -9,23 +9,13 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
-      mode:
-        description: Review one PR or send one fixed API test
-        type: choice
-        default: review
-        options: [review, api_smoke]
-      smoke_route:
-        description: API test route (Go requires confirmed no-overage setup)
-        type: choice
-        default: free
-        options: [free, go]
       pr_number:
         description: Existing PR number to review once
         required: false
         type: string
 
 concurrency:
-  group: opencode-go-review-${{ github.event_name == 'issues' && 'issue' || 'pr' }}-${{ inputs.mode == 'api_smoke' && 'api-smoke' || github.event.pull_request.number || inputs.pr_number || github.event.issue.number }}
+  group: opencode-go-review-${{ github.event_name == 'issues' && 'issue' || 'pr' }}-${{ github.event.pull_request.number || inputs.pr_number || github.event.issue.number }}
   cancel-in-progress: true
 
 permissions: {}
@@ -34,7 +24,7 @@ jobs:
   review:
     if: >-
       (github.event_name == 'pull_request_target' && github.event.pull_request.draft == false) ||
-      (github.event_name == 'workflow_dispatch' && inputs.mode == 'review' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+      (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -51,7 +41,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I scripts/ci/opencode_review.py prepare
-      - name: Review data with ordered free and Go models
+      - name: Review data with DeepSeek Go then GLM Go
         if: steps.prepare.outputs.prepared == 'true'
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
@@ -70,26 +60,6 @@ jobs:
     outputs:
       prepared: ${{ steps.prepare.outputs.prepared }}
       head: ${{ steps.prepare.outputs.head }}
-
-  api-smoke:
-    if: >-
-      github.event_name == 'workflow_dispatch' && inputs.mode == 'api_smoke' &&
-      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 4
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-          sparse-checkout: scripts/ci
-      - name: Send one fixed API test
-        env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          OPENCODE_GO_NO_OVERAGE_CONFIRMED: ${{ vars.OPENCODE_GO_NO_OVERAGE_CONFIRMED }}
-        run: python3 -I scripts/ci/opencode_review.py smoke
 
   publish:
     needs: review
@@ -165,7 +135,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I scripts/ci/opencode_review.py issue-prepare
-      - name: Review issue evidence with ordered free and Go models
+      - name: Review issue evidence with DeepSeek Go then GLM Go
         if: steps.prepare.outputs.prepared == 'true'
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}

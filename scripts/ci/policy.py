@@ -19,6 +19,8 @@ MAINTENANCE_FILES = {
     ".github/scripts/check_workflow_hardening.py",
     ".github/workflows/opencode-review.yml", ".github/workflows/nightly-health.yml",
     ".github/workflows/coverage-comment.yml",
+    # Retired probe: a deletion still belongs to Python/workflow maintenance.
+    ".github/workflows/opencode-cli-smoke.yml",
 }
 # These change Rust test/gate execution. Exercise the ordinary Rust matrix,
 # not release artifacts.

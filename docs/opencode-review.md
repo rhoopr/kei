@@ -33,9 +33,9 @@ content snapshot:
 
 Each reviewer has its own inference call and ordered fallback chain from the
 model table below. Neither receives the other's output. Both use the same
-existing API key, endpoints, no-overage prerequisite, and fixed routing; there
-is no pay-as-you-go expansion. At most eight inference POSTs are made for an
-issue, four per reviewer. Missing credentials or invalid evidence fail closed.
+existing API key, Go endpoint, no-overage prerequisite, and fixed routing; there
+is no pay-as-you-go expansion. At most four inference POSTs are made for an
+issue, two per reviewer. Missing credentials or invalid evidence fail closed.
 One failed reviewer does not cancel the other: the review and publication
 matrices disable fail-fast, and publication runs after a partial failure.
 Only an available, validated artifact can become a comment. Missing artifacts
@@ -107,7 +107,7 @@ asks for 1-3 short sentences per finding describing the trigger, impact, evidenc
 and smallest next step. Existing finding count and size limits remain unchanged.
 An empty result says only that the bounded diff had no supported findings.
 
-A compact footer names the advisory status, actual model (with Free distinguished)
+A compact footer names the advisory status, actual model (Go subscription models)
 and pinned main/head commit. Repeated headings, scope essays and generic
 disclaimers are omitted. Model text remains escaped plain text: quotes stay
 literal, angle brackets and ampersands are neutralized, and Markdown, mentions
@@ -121,29 +121,23 @@ Review attempts use this fixed order and stop at the first validated result:
 
 | Order | Model ID | Route |
 | --- | --- | --- |
-| 1 | `deepseek-v4.1-flash-free` | Free standard endpoint |
-| 2 | `glm-5.3-flash-free` | Free standard endpoint |
-| 3 | `deepseek-v4.1-flash` | Go subscription endpoint |
-| 4 | `glm-5.3-flash` | Go subscription endpoint |
+| 1 | `deepseek-v4.1-flash` | Go subscription endpoint |
+| 2 | `glm-5.3-flash` | Go subscription endpoint |
 
-The free endpoint is
-`https://opencode.ai/inference/openai/v1/chat/completions`. The subscription
-endpoint is `https://opencode.ai/inference/go/openai/v1/chat/completions`.
-The free model IDs are listed as free for input, output, and cached reads, for a
-limited time. Paid model IDs are sent only to the already-purchased Go route.
-The client never sends a paid model ID to the standard endpoint. Every public
+Both models use only
+`https://opencode.ai/inference/go/openai/v1/chat/completions`.
+The client permits no standard-endpoint or pay-as-you-go route. Every public
 review names the model used for its validated findings.
 
 **The Go URL alone does not prevent extra charges.** Official Go documentation
 says enabling Console **Use balance** makes exhausted Go allowance fall back to
 pay-as-you-go credits. The client has no documented request-level control to
-prevent that. Go fallback therefore remains blocked unless a maintainer has
+prevent that. Every inference request remains blocked unless a maintainer has
 confirmed **Use balance is disabled** and set repository variable
 `OPENCODE_GO_NO_OVERAGE_CONFIRMED=true`. Do not set that variable until the
 Console setting is verified; clear it if the account setting changes. This is
 an explicit setup prerequisite, not a server-verified billing guarantee.
-When both free requests fail and this confirmation is absent, the workflow fails
-clearly before sending any Go request.
+Without this confirmation, the workflow fails before its first inference request.
 
 `OPENCODE_API_KEY` was confirmed present as a repository Actions secret using
 name-only metadata during setup. Its value was not read. A maintainer must merge
@@ -154,12 +148,12 @@ workflow changes themselves. For installation or replacement:
    existing OpenCode key directly into GitHub, and select **Add secret**.
    Do not put the key in an issue, PR, chat, repository variable, or workflow file.
 3. Verify **Use balance** is disabled in OpenCode Console before enabling Go
-   fallback. Then use the repository's **Variables** tab to add
+   reviews. Then use the repository's **Variables** tab to add
    `OPENCODE_GO_NO_OVERAGE_CONFIRMED` with value `true`. Leaving it unset or
-   `false` permits free-model requests only. Other values fail configuration.
+   `false` blocks all inference requests. Other values fail configuration.
 4. The existing optional repository variable `OPENCODE_GO_MODEL` remains
    compatible when absent or set to `glm-5.3-flash`. Other values are rejected.
-   It cannot reorder or bypass the reviewed four-model policy. Changing the
+   It cannot reorder or bypass the reviewed two-model policy. Changing the
    model order requires a code change.
 5. After the workflow is merged, run one manual review from the default branch:
    `gh workflow run opencode-review.yml --repo rhoopr/kei --ref main -f pr_number=989`.
@@ -170,35 +164,6 @@ workflow changes themselves. For installation or replacement:
    Adding a secret/variable does not trigger a run or broad backfill. Re-running
    an old run uses its original trusted workflow commit; after a script fix,
    dispatch a new run from the updated default branch instead.
-
-For a single API connectivity test instead of a PR review, dispatch:
-
-```sh
-gh workflow run opencode-review.yml --repo rhoopr/kei --ref main -f mode=api_smoke
-```
-
-The default route is `free`. To test only the Go subscription route after
-confirming Console **Use balance** is disabled and the no-overage variable is
-`true`, add `-f smoke_route=go`. This is a separate, explicit request; the smoke
-test never changes routes automatically.
-
-Each dispatch sends exactly one non-streaming request containing only user text
-`test`, capped at 2,048 output tokens and a 128 KiB response. GLM requests use
-`reasoning_effort=low`; reasoning remains enabled. The `free` choice fixes
-`glm-5.3-flash-free` and its standard endpoint; `go` fixes `glm-5.3-flash` and the
-Go subscription endpoint. Unknown routes are rejected, and unconfirmed Go setup
-blocks before network use. There is no fallback or retry, even on quota,
-authentication, or availability errors. It uses the existing
-Actions secret only inside a separate read-only job. It sends no PR context,
-performs no publication, and creates no artifact. Logs show only fixed route,
-numeric HTTP status when available, fixed validation outcomes, finish reason,
-response-shape booleans, and bounded token counts when provided. Response bodies
-and credentials are never printed. Truncated/invalid
-responses fail explicitly even if the endpoint accepted the HTTP request.
-The mode must first be merged into the trusted default branch; it cannot be
-safely executed from this PR's branch. A free-model success proves endpoint
-acceptance, not that the key has Go access, because free models can allow
-unauthenticated calls.
 
 Manual PR numbers must be positive canonical integers. The read-only preparation
 step resolves the PR through GitHub and records its exact head as a job output.
@@ -228,7 +193,7 @@ AGENTS.md and workflow files in the diff are untrusted text for the model.
 
 Inference receives the OpenCode key only in its step environment, with no GitHub
 token in that environment or persisted by checkout. It sends a fixed system
-prompt and JSON data to fixed HTTPS endpoints, with no tools, agent runtime,
+prompt and JSON data to the fixed Go HTTPS endpoint, with no tools, agent runtime,
 shell access, or model-controlled requests. Redirects and environment proxies
 are disabled. Only schema-validated findings and fixed identity fields become
 a one-day artifact. Source context, prompts, raw responses, reasoning, and keys
@@ -267,13 +232,12 @@ source, missing patches for pure renames, and oversized data fail the whole
 review clearly. It never calls a partial diff a complete review. An empty
 findings list means only that no supported finding was produced within this scope.
 
-Each review run makes at most four inference POSTs, one per model in the table.
+Each review run makes at most two inference POSTs, one per model in the table.
 Any provider HTTP error (including 403, 429, or 503), transport failure, oversized
 response, malformed response, or invalid completion can advance to the next
 model. There are no repeat attempts for the same model. Transport uncertainty
-can mean an earlier request already consumed quota. Both Go attempts require
-the no-overage confirmation; without it, both free models may be tried, then
-review fails before any Go request. Failure of all four models produces no
+can mean an earlier request already consumed quota. Both attempts require
+the no-overage confirmation before the first request. Failure of both models produces no
 review artifact or public review.
 
 Missing secrets, invalid configuration, oversized/untrusted input, detected
@@ -283,13 +247,10 @@ fallback. Input is checked before the first attempt; security failures stop the
 chain immediately. Only a complete, validated result can reach publication.
 
 Each inference POST is capped at 16,384 output tokens and 512 KiB of HTTP response
-data, for at most 65,536 requested output tokens over the full chain. GLM uses
+data, for at most 32,768 requested output tokens over the full chain. GLM uses
 `reasoning_effort=low`; it cannot disable reasoning. DeepSeek uses its default
 reasoning settings. These caps allow reasoning and answer space but do not
-guarantee completion. The 64-token smoke request on 2026-10-17 returned HTTP 200
-without passing text validation; its original logs did not retain finish reason
-or usage, so the token cap is a plausible explanation, not a confirmed cause.
-Smoke tests now allow 2,048 output tokens and remain exactly one request.
+guarantee completion.
 
 Only one completed assistant text choice with `finish_reason=stop` is accepted;
 tool calls, truncation, malformed JSON, extra fields, invalid locations, and more
@@ -314,7 +275,6 @@ future run without saving a response body. Repeated pushes can consume usage
 when requests have already reached the provider; this is not a repository-wide
 quota controller. Draft PRs defer inference.
 
-Free model capacity and availability can change, and the offer is limited time.
 Go has model-specific rolling five-hour, weekly, and monthly allowances; check
 current usage in Console. The workflow transmits patches, selected head source,
 paths, and SHA to OpenCode and its serving provider. PR title/body are not sent.
@@ -325,11 +285,6 @@ validation limits output capabilities, not the correctness of its conclusions.
 
 Verified against official documentation and public catalogs on 2026-10-17:
 
-- [Console models](https://opencode.ai/v2/docs/console/models/) lists
-  `glm-5.3-flash-free` and `deepseek-v4.1-flash-free` with the standard
-  chat-completions endpoint, free pricing, and limited-time availability. Both
-  exact IDs also appear in the public
-  [inference catalog](https://opencode.ai/inference/v1/models).
 - [Go endpoints, client headers, limits, privacy, and Use balance](https://opencode.ai/v2/docs/console/go/)
   specify `glm-5.3-flash` and `deepseek-v4.1-flash` at the Go chat endpoint, a
   distinct `User-Agent`, and a stable `x-opencode-session`.
@@ -348,11 +303,9 @@ Verified against official documentation and public catalogs on 2026-10-17:
   [Chat Completions response shape](https://developers.openai.com/api/reference/resources/chat)
   (`choices[0].message.content` and `finish_reason`) and validates it strictly.
 
-The model documentation lists both free models as not used for training with
-zero retention. Go lists zero-day retention for GLM and DeepSeek; DeepSeek's ZDR
-agreement is renewed monthly, currently valid through October 31, 2026. Treat
-these as provider policies, not client-enforced guarantees. Verify current terms
-before sending sensitive code. A failed attempt can transmit the same bounded
+Consult the current Go documentation and serving-provider privacy terms before
+sending sensitive code. Retention and training policies are provider policies,
+not client-enforced guarantees. A failed attempt can transmit the same bounded
 PR context to the next listed model/provider.
 
 Run offline fixtures and existing CI policy checks with:
@@ -370,59 +323,9 @@ static-only conclusions, issue artifact/citation validation, the real issue CLI
 pipeline, and synthetic GitHub/provider responses, draft/stale/duplicate skips,
 missing secrets, malicious fork text and paths, complete/oversized diffs, context
 limits, malformed/tool/truncated output, credentials, safe rendering, rate
-limits, uncertain publication, success at each of the four positions, HTTP/transport/invalid-completion fallback,
+limits, uncertain publication, success at both model positions, HTTP/transport/invalid-completion fallback,
 no-overage gating, exhaustion of all models, forbidden model overrides, and the base-only workflow
 contract, default-branch dispatch, prepared-head propagation, invalid PR/ref
 rejection, and safe finish-reason/token/status diagnostics. They do not contact inference
 endpoints or execute Rust tests. The
 existing CI Python discovery already runs these fixtures.
-
-## Manual official CLI Free smoke
-
-The separate OpenCode CLI Free smoke workflow tests the genuine OpenCode CLI
-without changing production review routing. Once this workflow is merged to the
-default branch, run it manually from the Actions tab on that branch. It starts
-one independent CLI invocation for each of DeepSeek V4.1 Flash Free and GLM 5.3
-Flash Free. A failed model does not cancel its sibling.
-
-The workflow downloads official release v1.19.3 and checks the archive against
-its pinned GitHub release SHA-256 before extracting the CLI. It has no repository
-checkout, GitHub token permissions, publication, or uploaded artifacts. The
-existing OPENCODE_API_KEY repository secret is supplied only to the CLI step.
-The CLI uses documented account authentication through its OPENCODE_API_KEY
-runtime environment in an empty temporary directory, with fresh CLI
-home/config/data/cache/state directories. It inherits no GitHub token or other
-credentials. The key is never written into CLI config or an auth file by this
-workflow. A missing, malformed, or public placeholder key fails before launch.
-Only the selected Free model is allowlisted, including for lightweight tasks;
-there is no configured Go or paid-model fallback. All tools are denied.
-Session sharing, update checks, project config, external plugins, automatic
-compaction, and OpenTelemetry export are disabled.
-
-Each invocation has a 120-second deadline, an 8192-token output cap, and a 512 KiB
-stdout cap. The CLI can apply its own bounded transient-error retries; the
-workflow adds no retry loop. Logs contain only a fixed summary, a numeric error
-HTTP status when the CLI provides one, and TEST_OK when validated final text
-matches exactly and one terminal stop event is present. Raw CLI events,
-reasoning, errors, and temporary session files are not published. Temporary CLI
-state is removed when the runner exits.
-
-OpenCode documents [noninteractive automation](https://opencode.ai/docs/cli/#run)
-and [GitHub Actions](https://opencode.ai/docs/github/). Its
-[model catalog](https://opencode.ai/v2/docs/console/models/#free-models) describes
-these models as free on OpenCode for a limited time. This test measures actual
-runner eligibility; it does not guarantee availability or resolve the broad
-automation wording in the [service terms](https://opencode.ai/legal/terms-of-service).
-An access denial fails the test without switching clients or models.
-
-The initial public-access run returned FreeTierError (HTTP 403) for both models.
-That run did not test the existing account credential. This account-authenticated
-probe keeps the documented Free IDs and endpoint; it does not change CLI headers
-or assume that authentication will resolve eligibility. Source and the verified
-release binary generate the normal OpenCode client/session/request headers even
-with the plugin isolation flags.
-
-The offline test executes the exact inline workflow runner with a fake CLI.
-It checks configuration, runtime-only credential forwarding and redaction,
-missing-key rejection, terminal completion, errors,
-tool rejection, timeouts, and output limits without inference or Rust builds.
