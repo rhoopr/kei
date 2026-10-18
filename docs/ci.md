@@ -137,7 +137,9 @@ main uses the same route; manual Heavy qualification can test a feature branch
 without publishing or posting notifications.
 
 `Nightly freshness` checks at 19:23 UTC. A missing, failed, cancelled, or stale
-completed run opens one incident issue. Repeated failures do not add comments.
+completed run opens one incident issue. Incidents carry `bug`, `@infra`, `@test`,
+and `nightly fail` labels. Missing labels are added to an existing incident
+without replacing its other labels; the reporter creates `nightly fail` if needed. Repeated failures do not add comments.
 Recovery adds a comment and closes the incident. A completed run must have
 started within 36 hours. Scheduled Actions can be delayed or disabled; this
 second schedule detects missing qualification runs but is not an external
