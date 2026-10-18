@@ -30,8 +30,9 @@ jobs:
             https://github.com/anomalyco/opencode/releases/download/v1.19.3/opencode-linux-x64.tar.gz
           echo "13a8fb2978302071b86f9d7e00da9c8895f9cd846978379c3bdc6a5333536c9b  $archive" | sha256sum --check --status
           tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP/opencode-cli-bin" opencode
-      - name: Run one isolated Free-model CLI invocation
+      - name: Run one isolated account-authenticated Free-model CLI invocation
         env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           SMOKE_MODEL: ${{ matrix.model }}
           OPENCODE_BINARY: ${{ runner.temp }}/opencode-cli-bin/opencode
         shell: bash
@@ -68,7 +69,7 @@ jobs:
 
           def summarize(raw, model, exit_code, stopped=None):
               result = {"model": model, "cli_exit": exit_code, "outcome": stopped or "not_confirmed",
-                        "http_status": None, "final_text": None}
+                        "http_status": None, "final_text": None, "auth_mode": "account"}
               text, finishes, tools, errors = [], [], False, []
               try:
                   for line in raw.decode("utf-8").splitlines():
@@ -105,11 +106,17 @@ jobs:
           def smoke(binary, model):
               if model not in MODELS:
                   raise ValueError("Model is outside the two Free choices.")
+              key = os.environ.get("OPENCODE_API_KEY", "")
+              if (not key or key == "public" or key != key.strip() or len(key) > 4096
+                      or any(ord(char) < 32 or ord(char) == 127 for char in key)):
+                  return summarize(b"", model, None, "runtime_account_key_missing_or_invalid")
               with tempfile.TemporaryDirectory(prefix="kei-opencode-cli-") as name:
                   base = Path(name)
                   work = base / "work"
                   work.mkdir()
-                  env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "CI": "true"}
+                  # The sole inherited credential stays in the child environment, never config/files.
+                  env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "CI": "true",
+                         "OPENCODE_API_KEY": key}
                   for key, suffix in (("HOME", "home"), ("XDG_CONFIG_HOME", "config"),
                                       ("XDG_DATA_HOME", "data"), ("XDG_CACHE_HOME", "cache"),
                                       ("XDG_STATE_HOME", "state"), ("TMPDIR", "tmp")):
@@ -123,7 +130,7 @@ jobs:
                       "OPENCODE_DISABLE_MODELS_FETCH": "1", "OPENCODE_DISABLE_AUTOCOMPACT": "1",
                       "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": "8192", "OTEL_SDK_DISABLED": "true",
                   })
-                  # No repository checkout, inherited credentials, GitHub token, or custom client identity.
+                  # No checkout, GitHub token, other inherited credentials, or custom client identity.
                   command = [binary, "run", "--format", "json", "--model", "opencode/" + model,
                              "--agent", "smoke", "--title", "Free CLI smoke", "--log-level", "ERROR", "test"]
                   with subprocess.Popen(command, cwd=work, env=env, stdin=subprocess.DEVNULL,

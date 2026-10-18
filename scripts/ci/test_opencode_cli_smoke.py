@@ -27,12 +27,19 @@ def events(values):
 
 
 class SmokeTests(unittest.TestCase):
-    def test_only_manual_default_branch_no_checkout_secrets_or_write_token(self):
+    def setUp(self):
+        credential = patch.dict(os.environ, {"OPENCODE_API_KEY": "fixture-secret"})
+        credential.start()
+        self.addCleanup(credential.stop)
+
+    def test_only_manual_default_branch_no_checkout_or_write_token(self):
         self.assertIn("on:\n  workflow_dispatch:\n", TEXT)
         self.assertIn("permissions: {}", TEXT)
         self.assertIn("github.event.repository.default_branch", TEXT)
-        for forbidden in ("secrets.", "actions/checkout", "github.token", "id-token:", ": write", "@latest"):
+        for forbidden in ("actions/checkout", "github.token", "id-token:", ": write", "@latest"):
             self.assertNotIn(forbidden, TEXT)
+        self.assertEqual(TEXT.count("secrets."), 1)
+        self.assertIn("secrets.OPENCODE_API_KEY", TEXT)
         self.assertIn("fail-fast: false", TEXT)
         self.assertIn("sha256sum --check --status", TEXT)
 
@@ -48,7 +55,7 @@ class SmokeTests(unittest.TestCase):
             self.assertFalse(config["experimental"]["openTelemetry"])
             self.assertEqual(config["share"], "disabled")
 
-    def test_real_call_path_with_isolated_environment_and_no_credentials(self):
+    def test_real_call_path_with_only_runtime_inference_credential(self):
         with tempfile.TemporaryDirectory() as name:
             fake = Path(name) / "opencode"
             fake.write_text("#!/usr/bin/python3\n" + textwrap.dedent("""
@@ -57,7 +64,9 @@ class SmokeTests(unittest.TestCase):
                 assert not list(Path.cwd().iterdir())
                 assert sys.argv[1:5] == ["run", "--format", "json", "--model"]
                 assert sys.argv[-1] == "test"
-                assert not any(key in os.environ for key in ("GH_TOKEN", "GITHUB_TOKEN", "OPENCODE_API_KEY"))
+                assert not any(key in os.environ for key in ("GH_TOKEN", "GITHUB_TOKEN"))
+                assert os.environ["OPENCODE_API_KEY"] == "fixture-secret"
+                assert "fixture-secret" not in os.environ["OPENCODE_CONFIG_CONTENT"]
                 assert os.environ["OPENCODE_PURE"] == "1"
                 assert os.environ["OPENCODE_DISABLE_DEFAULT_PLUGINS"] == "1"
                 assert json.loads(os.environ["OPENCODE_CONFIG_CONTENT"])["permission"] == {"*": "deny"}
@@ -70,6 +79,16 @@ class SmokeTests(unittest.TestCase):
             self.assertEqual(result["outcome"], "usable_completion")
             self.assertNotIn("fixture-secret", json.dumps(result))
 
+    def test_missing_invalid_or_public_credential_never_launches_cli(self):
+        for key in ("", "public", "fixture-secret" + chr(10)):
+            with (patch.dict(os.environ, {"OPENCODE_API_KEY": key}),
+                  patch.object(runner.subprocess, "Popen", side_effect=AssertionError("Unexpected CLI launch")) as start):
+                result = runner.smoke("unused", MODEL)
+            start.assert_not_called()
+            self.assertEqual(result["outcome"], "runtime_account_key_missing_or_invalid")
+            self.assertEqual(result["auth_mode"], "account")
+            self.assertNotIn("fixture-secret", json.dumps(result))
+
     def test_nonterminal_tools_invalid_json_and_errors_fail_closed(self):
         for values in (EVENTS[:1], EVENTS + [{"type": "tool_use"}],
                        EVENTS + [{"type": "error", "error": {"data": {
@@ -77,6 +96,8 @@ class SmokeTests(unittest.TestCase):
             result = runner.summarize(events(values), MODEL, 0)
             self.assertNotEqual(result["outcome"], "usable_completion")
             self.assertNotIn("fixture-secret", json.dumps(result))
+        leaked_text = events([{"type": "text", "part": {"text": "fixture-secret"}}, EVENTS[1]])
+        self.assertNotIn("fixture-secret", json.dumps(runner.summarize(leaked_text, MODEL, 0)))
         self.assertEqual(runner.summarize(b"not JSON", MODEL, 0)["outcome"], "invalid_cli_events")
         self.assertNotEqual(runner.summarize(events(EVENTS), MODEL, 1)["outcome"], "usable_completion")
         with self.assertRaises(ValueError):

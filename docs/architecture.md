@@ -2116,8 +2116,9 @@ Stable IDs connect safety rules to production owners and focused tests.
 - `justfile` owns local script and workflow lint commands. Protected CI runs
   the same shellcheck, shfmt, ruff, and actionlint checks with pinned versions.
 - `opencode-cli-smoke.yml` is a separate default-branch manual probe of the
-  official CLI's two Free models. It has no checkout, credentials, GitHub
-  permissions, or publisher; its offline fixture executes the inline runner.
+  official CLI's two Free models with the existing runtime inference credential.
+  It has no checkout, GitHub permissions, or publisher; its offline fixture
+  executes the inline runner.
 
 See [the test guide](../tests/README.md) for the current suites and commands.
 

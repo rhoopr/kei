@@ -360,9 +360,13 @@ Flash Free. A failed model does not cancel its sibling.
 
 The workflow downloads official release v1.19.3 and checks the archive against
 its pinned GitHub release SHA-256 before extracting the CLI. It has no repository
-checkout, GitHub token permissions, secrets, publication, or uploaded artifacts.
-The CLI uses its built-in public Free access in an empty temporary directory,
-with fresh home/config/data/cache/state directories and no inherited credentials.
+checkout, GitHub token permissions, publication, or uploaded artifacts. The
+existing OPENCODE_API_KEY repository secret is supplied only to the CLI step.
+The CLI uses documented account authentication through its OPENCODE_API_KEY
+runtime environment in an empty temporary directory, with fresh CLI
+home/config/data/cache/state directories. It inherits no GitHub token or other
+credentials. The key is never written into CLI config or an auth file by this
+workflow. A missing, malformed, or public placeholder key fails before launch.
 Only the selected Free model is allowlisted, including for lightweight tasks;
 there is no configured Go or paid-model fallback. All tools are denied.
 Session sharing, update checks, project config, external plugins, automatic
@@ -384,6 +388,14 @@ runner eligibility; it does not guarantee availability or resolve the broad
 automation wording in the [service terms](https://opencode.ai/legal/terms-of-service).
 An access denial fails the test without switching clients or models.
 
+The initial public-access run returned FreeTierError (HTTP 403) for both models.
+That run did not test the existing account credential. This account-authenticated
+probe keeps the documented Free IDs and endpoint; it does not change CLI headers
+or assume that authentication will resolve eligibility. Source and the verified
+release binary generate the normal OpenCode client/session/request headers even
+with the plugin isolation flags.
+
 The offline test executes the exact inline workflow runner with a fake CLI.
-It checks configuration, credential isolation, terminal completion, errors,
+It checks configuration, runtime-only credential forwarding and redaction,
+missing-key rejection, terminal completion, errors,
 tool rejection, timeouts, and output limits without inference or Rust builds.
