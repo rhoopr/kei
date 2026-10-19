@@ -21,6 +21,7 @@ DEFAULT_MODEL = "glm-5.3-flash"
 REVIEW_MODELS = (("go", GO_URL, "deepseek-v4.1-flash"),
                  ("go", GO_URL, DEFAULT_MODEL))
 ALLOWED_MODELS = frozenset(model for _, _, model in REVIEW_MODELS)
+PROVIDER_FAILURES = frozenset({"timeout", "transport", "malformed_json", "response_too_large"})
 # Bound individual network responses, not review eligibility or Go usage.
 HTTP_RESPONSE_LIMIT = 16 * 1024 * 1024
 ISSUE_PROMPT_LIMIT = 300 * 1024
@@ -68,12 +69,17 @@ class SecurityError(ReviewError):
 class ProviderError(ReviewError):
     """One provider attempt failed; another allowlisted model may be attempted."""
 
+    def __init__(self, category):
+        require(category in PROVIDER_FAILURES, "Invalid provider failure category.")
+        super().__init__(f"OpenCode provider {category} failure; no automatic POST retry.")
+        self.category = category
+
 
 class ProviderHTTPError(ProviderError):
     def __init__(self, status, route="go"):
         require(type(status) is int and 100 <= status <= 599, "Invalid provider HTTP status.")
         require(route == "go", "Invalid provider route label.")
-        super().__init__(f"OpenCode {route} HTTP {status}; no automatic POST retry.")
+        ReviewError.__init__(self, f"OpenCode {route} HTTP {status}; no automatic POST retry.")
         self.status = status
 
 
@@ -110,6 +116,14 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise ReviewError("HTTP redirect refused.")
 
 
+def provider_failure_category(error):
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, urllib.error.URLError) and isinstance(error.reason, TimeoutError):
+        return "timeout"
+    return "transport"
+
+
 class HTTP:
     def __init__(self):
         # Do not inherit proxy credentials or redirect Authorization to another host.
@@ -137,11 +151,14 @@ class HTTP:
             request = urllib.request.Request(url, data=None if payload is None else json_bytes(payload),
                                              headers=headers, method=method)
             try:
-                with self.opener.open(request, timeout=240 if provider else 20) as response:
+                # Inference uses the CI job deadline, not a shorter socket cutoff.
+                with self.opener.open(request, timeout=None if provider else 20) as response:
                     self.last_status = response.status
                     data = response.read(limit + 1)
                 if len(data) > limit:
-                    raise (ProviderError if provider else ReviewError)("API response exceeded its size limit.")
+                    if provider:
+                        raise ProviderError("response_too_large")
+                    raise ReviewError("API response exceeded its size limit.")
                 return json.loads(data)
             except urllib.error.HTTPError as error:
                 status = error.code
@@ -155,14 +172,17 @@ class HTTP:
                 if provider:
                     raise ProviderHTTPError(status) from None
                 raise ReviewError("API rate limit or HTTP failure; no automatic POST retry.") from None
-            except (urllib.error.URLError, TimeoutError, OSError, HTTPException):
+            except (urllib.error.URLError, TimeoutError, OSError, HTTPException) as error:
                 if attempt < attempts - 1:
                     time.sleep(2 ** attempt)
                     continue
-                raise (ProviderError if provider else ReviewError)(
-                    "API transport failed; POST outcome may be uncertain.") from None
+                if provider:
+                    raise ProviderError(provider_failure_category(error)) from None
+                raise ReviewError("API transport failed; POST outcome may be uncertain.") from None
             except (ValueError, UnicodeError):
-                raise (ProviderError if provider else ReviewError)("API returned malformed JSON.") from None
+                if provider:
+                    raise ProviderError("malformed_json") from None
+                raise ReviewError("API returned malformed JSON.") from None
         raise ReviewError("HTTP retry budget exhausted.")
 
 
@@ -328,12 +348,14 @@ def completion_text(response, limit):
     return content
 
 
-def attempt_metadata(http, route, model, outcome, response=None):
+def attempt_metadata(http, route, model, outcome, response=None, *, failure=None):
     """Only fixed enums, booleans, and bounded integer counts may reach logs."""
     require((route, model) in {(r, m) for r, _, m in REVIEW_MODELS}, "Invalid diagnostic model.")
     require(outcome in {"http_error", "request_failed", "invalid_completion", "accepted", "security_rejected"},
             "Invalid diagnostic outcome.")
-    data = {"route": route, "model": model, "outcome": outcome,
+    require(failure is None or (outcome == "request_failed" and failure in PROVIDER_FAILURES),
+            "Invalid diagnostic failure category.")
+    data = {"route": route, "model": model, "outcome": outcome, "failure": failure,
             "http_status": http.last_status if type(http.last_status) is int
             and 100 <= http.last_status <= 599 else None}
     response = response if isinstance(response, dict) else {}
@@ -391,8 +413,8 @@ def infer(http, prepared, key, model, *, go_no_overage_confirmed=False, issue_ki
             http.last_status = error.status
             attempt_metadata(http, route, model_used, "http_error")
             continue
-        except ProviderError:
-            attempt_metadata(http, route, model_used, "request_failed")
+        except ProviderError as error:
+            attempt_metadata(http, route, model_used, "request_failed", failure=error.category)
             continue
         try:
             # Check the whole response, including reasoning, before any diagnostics.
