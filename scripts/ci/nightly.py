@@ -18,7 +18,9 @@ INCIDENT_AUTHOR = "github-actions[bot]"
 MISSING_IDENTITY = "missing completed run"
 RUN_RECORD = re.compile(r"^-\s*run (\d+) attempt (\d+)\s*$", re.MULTILINE)
 STALE_RECORD = re.compile(r"^-\s*stale run (\d+)\s*$", re.MULTILINE)
-MISSING_RECORD = re.compile(rf"^-\s*{re.escape(MISSING_IDENTITY)}\s*$", re.MULTILINE)
+MISSING_RECORD = re.compile(
+    rf"^-\s*({re.escape(MISSING_IDENTITY)}(?: after run \d+)?)\s*$", re.MULTILINE
+)
 RUN_URL = re.compile(r"/actions/runs/(\d+)(?:/attempts/(\d+))?")
 
 
@@ -55,7 +57,14 @@ def run_identity(run_id: int | str, attempt: int | str) -> str:
     return f"run {run_id} attempt {attempt}"
 
 
-def health(runs: list[dict], now: datetime) -> Finding:
+def missing_identity(last_completed: dict | None) -> str:
+    """Return the missing identity for the episode after the last completed run."""
+    if last_completed is None:
+        return MISSING_IDENTITY
+    return f"{MISSING_IDENTITY} after run {last_completed['id']}"
+
+
+def health(runs: list[dict], now: datetime, last_completed: dict | None = None) -> Finding:
     eligible = [
         run
         for run in runs
@@ -64,7 +73,9 @@ def health(runs: list[dict], now: datetime) -> Finding:
     ]
     completed = [run for run in eligible if run.get("status") == "completed"]
     if not completed:
-        return Finding("No completed nightly qualification is available.", "", MISSING_IDENTITY)
+        return Finding(
+            "No completed nightly qualification is available.", "", missing_identity(last_completed)
+        )
     latest = completed[0]
     started = datetime.fromisoformat(latest["created_at"].replace("Z", "+00:00"))
     if now - started > MAX_AGE or started > now:
@@ -86,8 +97,7 @@ def findings_in(body: str) -> set[str]:
     """Return the failure identities that a body records."""
     records = {run_identity(run_id, attempt) for run_id, attempt in RUN_RECORD.findall(body)}
     records |= {f"stale run {run_id}" for run_id in STALE_RECORD.findall(body)}
-    if MISSING_RECORD.search(body):
-        records.add(MISSING_IDENTITY)
+    records |= set(MISSING_RECORD.findall(body))
     if RECORDS_HEADER not in body:
         # Incidents created before findings were recorded carry only the run URL.
         records |= {run_identity(run_id, attempt or 1) for run_id, attempt in RUN_URL.findall(body)}
@@ -172,7 +182,19 @@ def main() -> None:
         raise ValueError("nightly notifications may only run from main")
     if sys.argv[1:] == ["health"]:
         path = f"repos/{repo}/actions/workflows/nightly.yml/runs?branch=main&per_page=30"
-        finding = health(api(path)["workflow_runs"], datetime.now(timezone.utc))
+        now = datetime.now(timezone.utc)
+        runs = api(path)["workflow_runs"]
+        finding = health(runs, now)
+        if finding.identity == MISSING_IDENTITY:
+            # Anchor a missing episode to the last completed run so a later
+            # episode after recovery is not suppressed by a closed incident.
+            completed_path = (
+                f"repos/{repo}/actions/workflows/nightly.yml/runs"
+                "?branch=main&status=completed&per_page=1"
+            )
+            completed = api(completed_path)["workflow_runs"]
+            if completed:
+                finding = health(runs, now, completed[0])
     elif sys.argv[1:] == ["report"]:
         run_id = os.environ["GITHUB_RUN_ID"]
         result = os.environ["RESULT"]

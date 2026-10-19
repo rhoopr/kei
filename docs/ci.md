@@ -184,6 +184,9 @@ only when a finding is missing, and repeated checks do not add comments.
 
 Missing and stale qualification have their own identities, separate from failed
 runs. Acknowledging an old failure does not clear a later freshness alert.
+After a qualification run has completed, the missing identity includes that run,
+so closing a missing incident before a later recovery does not hide a new
+missing episode.
 Suppression changes notifications only; the checks still report failure.
 Recovery adds a comment and closes the incident. A completed run must have
 started within 36 hours. Both notification jobs share the `nightly-incident`

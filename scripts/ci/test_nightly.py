@@ -73,11 +73,13 @@ class FakeGitHub:
         *,
         issues: tuple[dict, ...] = (),
         runs: tuple[dict, ...] = (),
+        completed_runs: tuple[dict, ...] = (),
         labels: tuple[str, ...] = nightly.INCIDENT_LABELS,
         page_size: int = 100,
     ):
         self.issues = list(issues)
         self.runs = list(runs)
+        self.completed_runs = list(completed_runs)
         self.labels = [{"name": name} for name in labels]
         self.page_size = page_size
         self.reads = []
@@ -100,6 +102,8 @@ class FakeGitHub:
     def api(self, path: str, *, method: str | None = None, **fields):
         if path == f"repos/{REPO}/actions/workflows/nightly.yml/runs?branch=main&per_page=30":
             return {"workflow_runs": self.runs}
+        if path == f"repos/{REPO}/actions/workflows/nightly.yml/runs?branch=main&status=completed&per_page=1":
+            return {"workflow_runs": self.completed_runs}
         if path == f"repos/{REPO}/labels":
             self.labels.append({"name": fields["name"]})
             return {}
@@ -329,6 +333,29 @@ class IncidentTests(NightlyCase):
         self.assertIn("- stale run 39125943231\n", stale[0]["body"])
         self.assertIn("Nightly qualification is stale", stale[0]["body"])
         self.assertNotEqual(stale[0]["number"], missing["number"])
+
+    def test_closed_missing_incident_does_not_suppress_a_later_missing_episode(self):
+        github = FakeGitHub(
+            runs=(),
+            completed_runs=(completed_run(39125943231, conclusion="success"),),
+        )
+        self.assertEqual(self.run_nightly(github, ["health"]), 1)
+        first = github.open_incidents()[0]
+        snapshot = json.dumps(github.issues)
+        self.assertEqual(self.run_nightly(github, ["health"]), 1)
+        self.assertEqual(json.dumps(github.issues), snapshot)
+        first["state"] = "closed"
+
+        github.runs = [completed_run(39168454114, conclusion="success")]
+        self.assertEqual(self.run_nightly(github, ["health"]), 0)
+
+        github.runs = []
+        github.completed_runs = [completed_run(39168454114, conclusion="success")]
+        self.assertEqual(self.run_nightly(github, ["health"]), 1)
+        opened = github.open_incidents()
+        self.assertEqual(len(opened), 1)
+        self.assertNotEqual(opened[0]["number"], first["number"])
+        self.assertIn("- missing completed run after run 39168454114\n", opened[0]["body"])
 
     def test_acknowledged_failure_does_not_suppress_a_later_stale_alert(self):
         github = FakeGitHub(runs=(completed_run(39125943231),))
