@@ -767,3 +767,80 @@ fn issue956_lookup_statuses_cross_the_production_tracing_recorder_and_reopen() {
         assert_eq!(event.fields["child_status"], status);
     }
 }
+
+#[test]
+fn issue956_child_reference_status_crosses_tracing_and_reopen_without_private_values() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let labels = [
+        "not_requested",
+        "omitted",
+        "unavailable",
+        "invalid_child",
+        "missing",
+        "malformed",
+        "sparse",
+        "matches_requested",
+        "different",
+    ];
+    let _parallel_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let (recorder, drain) = super::test_layer();
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(recorder), || {
+        for label in labels {
+            tracing::info!(
+                diagnostic = "exact_lookup_rejection_v1",
+                child_reference_status = label,
+                record_name = "PRIVATE_RECORD_CANARY",
+                "PRIVATE_MESSAGE_CANARY"
+            );
+        }
+    });
+    let events = drain();
+    assert_eq!(events.len(), labels.len());
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.json");
+    let mut history = History {
+        schema_version: 1,
+        ..History::default()
+    };
+    apply(&mut history, Message::Begin(json!({})));
+    for (event, label) in events.iter().zip(labels) {
+        assert_eq!(event["fields"]["child_reference_status"], label);
+        add(
+            &mut history,
+            "exact_lookup_rejection_v1",
+            event["fields"].as_object().unwrap().clone(),
+        );
+    }
+    save(&path, &mut history).unwrap();
+    let (reopened, status) = read(&path);
+    assert_eq!(status, "available");
+    assert_eq!(reopened.cycles[0].diagnostics.len(), labels.len());
+    for (event, label) in reopened.cycles[0].diagnostics.iter().zip(labels) {
+        assert_eq!(event.fields["child_reference_status"], label);
+    }
+    assert!(
+        !serde_json::to_string(&reopened)
+            .unwrap()
+            .contains("PRIVATE_")
+    );
+    let mut untrusted = serde_json::to_value(&reopened).unwrap();
+    for (index, invalid) in [json!("PRIVATE_REFERENCE_CANARY"), json!(42)]
+        .into_iter()
+        .enumerate()
+    {
+        untrusted["cycles"][0]["diagnostics"][index]["fields"]["child_reference_status"] = invalid;
+    }
+    std::fs::write(&path, serde_json::to_vec(&untrusted).unwrap()).unwrap();
+    let (clean, status) = read(&path);
+    assert_eq!(status, "available");
+    assert!(
+        clean.cycles[0].diagnostics[..2]
+            .iter()
+            .all(|event| !event.fields.contains_key("child_reference_status"))
+    );
+    assert_eq!(
+        clean.cycles[0].diagnostics[2].fields["child_reference_status"],
+        labels[2]
+    );
+    assert!(!serde_json::to_string(&clean).unwrap().contains("PRIVATE_"));
+}

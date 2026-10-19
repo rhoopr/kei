@@ -187,6 +187,10 @@ not-requested, returned, tombstoned and provider-error members without storing
 raw codes, messages or identifiers. `returned` describes response presence,
 not owner, identity, resource or checkpoint proof. Lookup resolution and
 checkpoint policy do not consume these diagnostic categories.
+`child_reference_status` separately describes a missing, malformed, sparse,
+matching or different reference, or an omitted, unavailable, invalid or
+unrequested child. These fixed labels expose no reference values and do not
+establish a usable pair.
 
 Best-effort album identity hydration has task-scoped anonymous progress in
 `icloud/photos/hydration_progress.rs`. Every 30 seconds and on return or drop,
@@ -889,7 +893,9 @@ record errors are distinguished from an explicit different-master reference.
 No owner or record value is emitted.
 
 A paired lookup can retain an inconclusive changed-master hint from a live,
-scoped child. Incremental asset hydration makes at most one additional paired
+scoped child, including when the old master explicitly returns `NOT_FOUND` or
+`UNKNOWN_ITEM`. An old-master tombstone or any other record error does not
+authorize a hint. Incremental asset hydration makes at most one additional paired
 lookup in that same scope during a normal download run. Dry-run and filename-only
 modes retain their prior held behavior. Only a complete current pair may update the mapping
 through the existing state owner. A missing or deleted redirected master,

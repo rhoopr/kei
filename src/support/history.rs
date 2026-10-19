@@ -644,7 +644,10 @@ impl Visit for Visitor {
             if privacy::contract(value).is_some() {
                 self.kind = Some(value.into());
             }
-        } else if privacy::fixed_label(value) {
+        } else if privacy::fixed_label(value)
+            || (field.name() == "child_reference_status"
+                && privacy::is_child_reference_status(value))
+        {
             self.fields.insert(field.name().into(), value.into());
         }
     }

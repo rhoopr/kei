@@ -1037,6 +1037,116 @@ async fn unresolved_asset_only_delta_preserves_incremental_token() {
 }
 
 #[tokio::test]
+async fn issue956_missing_old_master_keeps_changed_child_held_across_reopens() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("state.db");
+    let stored_records = incremental_photo_records("PREVIOUS");
+    let stored_asset = PhotoAsset::new(stored_records[0].clone(), stored_records[1].clone());
+    let mut current = incremental_photo_records("CURRENT");
+    // The retained delta/mapping points at PREVIOUS; the fresh child points at CURRENT.
+    current[1]["recordName"] = json!("asset-PREVIOUS");
+    let mut delta = current[1].clone();
+    delta["fields"].as_object_mut().unwrap().remove("masterRef");
+    let mut original_path = None;
+    let mut original_bytes = Vec::new();
+    for cycle in 0..2 {
+        let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+        let session = changes_zone_session_with_query_page(
+            Arc::new(AtomicUsize::new(0)),
+            vec![delta.clone()],
+            json!({"records":[{"recordName":"PREVIOUS", "serverErrorCode":"NOT_FOUND"}, current[1].clone()]}),
+            0,
+        );
+        let probe = session.clone();
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(directory.path());
+        config.state_db = Some(db.clone() as Arc<dyn DownloadStore>);
+        if cycle == 0 {
+            db.upsert_asset_master_mapping("PrimarySync", "asset-PREVIOUS", "PREVIOUS")
+                .await
+                .unwrap();
+            db.upsert_seen(&TestAssetRecord::new("pending-original").build())
+                .await
+                .unwrap();
+            let path =
+                seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
+            original_bytes = tokio::fs::read(&path).await.unwrap();
+            original_path = Some(path);
+        }
+        let result = download_photos_incremental(
+            &Client::new(),
+            std::slice::from_ref(&pass),
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        // Transfer success is not checkpoint proof: unresolved identity vetoes the token.
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token, None);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON)
+        );
+        assert!(result.stats.sync_token_blocked);
+        assert!(result.stats.identity_incomplete);
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(
+            probe.records_query_count(),
+            2,
+            "one confirmation is attempted, but its missing new master remains unproven"
+        );
+        drop(db);
+        let reopened = SqliteStateDb::open(&database).await.unwrap();
+        assert_eq!(
+            reopened
+                .get_metadata(&crate::state::unresolved_identity_key("PrimarySync"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            reopened
+                .get_master_record_name_for_asset("PrimarySync", "asset-PREVIOUS")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("PREVIOUS")
+        );
+        assert!(
+            reopened
+                .get_master_record_name_for_asset("PrimarySync", "asset-CURRENT")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let summary = reopened.get_summary().await.unwrap();
+        assert_eq!(summary.source_deleted, 0);
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.pending, 1);
+        assert_eq!(
+            reopened.get_pending().await.unwrap()[0].id.as_ref(),
+            "pending-original"
+        );
+        assert_eq!(
+            tokio::fs::read(original_path.as_ref().unwrap())
+                .await
+                .unwrap(),
+            original_bytes
+        );
+    }
+}
+
+#[tokio::test]
 async fn asset_only_delta_master_deletion_tombstones_entire_family() {
     let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
     for record_name in [
@@ -1988,7 +2098,7 @@ async fn issue956_changed_master_confirmation_is_bounded_and_retains_unproven_ma
         delta["fields"].as_object_mut().unwrap().remove("masterRef");
         let mut buffer = DeltaRecordBuffer::new();
         let mut events = buffer.process_records(vec![serde_json::from_value(delta).unwrap()]);
-        let first = json!({"records":[records[1].clone()]});
+        let first = json!({"records":[{"recordName":"PREVIOUS","serverErrorCode":"NOT_FOUND"}, records[1].clone()]});
         let second = match fault {
             "omitted" => json!({"records":[records[1].clone()]}),
             "deleted" => {

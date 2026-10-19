@@ -2760,6 +2760,20 @@ mod late_io;
 
 #[tokio::test]
 async fn issue956_stale_mapping_confirms_current_pair_then_commits_and_reopens_quietly() {
+    Box::pin(assert_issue956_pair_confirmation_reopens_quietly(None)).await;
+}
+
+#[tokio::test]
+async fn issue956_missing_old_master_confirms_current_pair_then_commits_and_reopens_quietly() {
+    for code in ["NOT_FOUND", "UNKNOWN_ITEM"] {
+        Box::pin(assert_issue956_pair_confirmation_reopens_quietly(Some(
+            code,
+        )))
+        .await;
+    }
+}
+
+async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Option<&'static str>) {
     use crate::icloud::photos::{PhotoAsset, PhotosSession};
     use serde_json::{Value, json};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2769,6 +2783,7 @@ async fn issue956_stale_mapping_confirms_current_pair_then_commits_and_reopens_q
         records: Vec<Value>,
         lookups: Arc<AtomicUsize>,
         queries: Arc<AtomicUsize>,
+        old_master_error: Option<&'static str>,
     }
     #[async_trait::async_trait]
     impl PhotosSession for CurrentPair {
@@ -2777,7 +2792,7 @@ async fn issue956_stale_mapping_confirms_current_pair_then_commits_and_reopens_q
             if url.contains("/records/lookup?") {
                 assert!(self.lookups.fetch_add(1, Ordering::SeqCst) < 2);
                 let wanted = request["records"].as_array().unwrap();
-                let records: Vec<_> = self
+                let mut records: Vec<_> = self
                     .records
                     .iter()
                     .filter(|record| {
@@ -2787,6 +2802,11 @@ async fn issue956_stale_mapping_confirms_current_pair_then_commits_and_reopens_q
                     })
                     .cloned()
                     .collect();
+                if let Some(code) = self.old_master_error
+                    && wanted.iter().any(|item| item["recordName"] == "PREVIOUS")
+                {
+                    records.push(json!({"recordName":"PREVIOUS", "serverErrorCode":code}));
+                }
                 return Ok(json!({"records":records}));
             }
             if url.contains("/changes/zone?") {
@@ -2883,6 +2903,7 @@ async fn issue956_stale_mapping_confirms_current_pair_then_commits_and_reopens_q
             records,
             lookups: lookups.clone(),
             queries: queries.clone(),
+            old_master_error,
         }),
     );
     let library =

@@ -870,6 +870,191 @@ fn issue956_lookup_record_status_is_bounded_response_evidence() {
 }
 
 #[tokio::test]
+async fn issue956_missing_master_returned_child_distinguishes_references() {
+    for fault in [
+        "matching",
+        "changed",
+        "missing",
+        "malformed",
+        "sparse",
+        "foreign_zone",
+        "foreign_owner",
+    ] {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+        let mut child = test_asset_record_for("child", "old-master");
+        let zone = json!({"zoneName":"PrimarySync", "ownerRecordName":"synthetic-owner"});
+        child["fields"]["masterRef"]["value"]["zoneID"] = zone.clone();
+        match fault {
+            "matching" => {}
+            "changed" => child["fields"]["masterRef"]["value"]["recordName"] = json!("new-master"),
+            "missing" => {
+                child["fields"].as_object_mut().unwrap().remove("masterRef");
+            }
+            "malformed" => child["fields"]["masterRef"]["value"]["recordName"] = json!(42),
+            "sparse" => {
+                child["fields"] =
+                    crate::test_helpers::sparse_shared_asset_record()["fields"].clone()
+            }
+            "foreign_zone" => child["zoneID"] = json!({"zoneName":"SharedSync-other"}),
+            "foreign_owner" => {
+                child["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+                    json!("foreign-owner")
+            }
+            _ => panic!("unexpected synthetic fault: {fault}"),
+        }
+        let mut album = make_album_with_session(
+            100,
+            Box::new(MockPhotosSession::new().ok(json!({
+                "records":[{"recordName":"old-master", "serverErrorCode":"NOT_FOUND"}, child]
+            }))),
+        );
+        album.zone_id = Arc::new(zone);
+        let result = album
+            .resolve_records(&[lookup_request("child", "old-master", "child")])
+            .await;
+        assert_eq!(result.results.len(), 1, "{fault}");
+        if fault == "matching" {
+            assert!(result.complete);
+            assert!(matches!(
+                result.results[0].1,
+                RecordResolution::Deleted {
+                    master_family: true,
+                    ..
+                }
+            ));
+        } else {
+            assert!(!result.complete, "{fault}");
+            if fault == "changed" {
+                assert!(
+                    matches!(&result.results[0].1, RecordResolution::MasterChanged { master_record_name }
+                    if master_record_name.as_str() == "new-master")
+                );
+            } else {
+                assert!(
+                    matches!(result.results[0].1, RecordResolution::Unknown),
+                    "{fault}"
+                );
+            }
+            let events = capture.events();
+            let rejection = events
+                .iter()
+                .find(|event| event.field("diagnostic") == Some("exact_lookup_rejection_v1"))
+                .unwrap();
+            assert_eq!(
+                rejection.field("master_status"),
+                Some("not_found"),
+                "{fault}"
+            );
+            assert_eq!(rejection.field("child_status"), Some("returned"), "{fault}");
+            assert_eq!(rejection.field("expected_owner"), Some("other"), "{fault}");
+            assert_eq!(
+                rejection.field("child_reference_status"),
+                Some(match fault {
+                    "changed" => "different",
+                    "foreign_zone" | "foreign_owner" => "matches_requested",
+                    "missing" => "missing",
+                    "malformed" => "malformed",
+                    "sparse" => "sparse",
+                    _ => panic!("unexpected fault: {fault}"),
+                }),
+                "{fault}"
+            );
+            if !fault.starts_with("foreign_") {
+                // Reference shape now distinguishes otherwise identical provider-error groups.
+                assert_eq!(
+                    rejection.field("reason"),
+                    Some("record_provider_error"),
+                    "{fault}"
+                );
+                assert_eq!(rejection.field("stage"), Some("record_error"), "{fault}");
+                assert_eq!(rejection.field("supplied_owner"), Some("absent"), "{fault}");
+            } else {
+                assert_ne!(rejection.field("stage"), Some("record_error"), "{fault}");
+            }
+        }
+    }
+}
+
+#[test]
+fn issue956_child_reference_shape_handles_unrequested_and_unusable_children() {
+    let paired = lookup_request("child", "old-master", "child");
+    assert_eq!(super::child_reference_status(None, &paired), "omitted");
+    let master_only = RecordLookupRequest::master_only(
+        ProviderRecordId::new("state"),
+        ProviderRecordId::new("old-master"),
+    );
+    assert_eq!(
+        super::child_reference_status(None, &master_only),
+        "not_requested"
+    );
+    for (record, expected) in [
+        (
+            json!({"serverErrorCode":"PRIVATE_ERROR_CANARY"}),
+            "unavailable",
+        ),
+        (json!({"deleted":true}), "unavailable"),
+        (json!({"recordType":"CPLAlbum"}), "invalid_child"),
+        (
+            json!({"recordType":"CPLAsset","fields":{"masterRef":{"value":null}}}),
+            "malformed",
+        ),
+        (
+            json!({"recordType":"CPLAsset","fields":{"masterRef":{"value":{"recordName":"   "}}}}),
+            "malformed",
+        ),
+    ] {
+        assert_eq!(
+            super::child_reference_status(Some(&record), &paired),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue956_missing_old_master_hint_rejects_other_errors_and_nonlive_children() {
+    for fault in [
+        "NOT_FOUND",
+        "UNKNOWN_ITEM",
+        "ACCESS_DENIED",
+        "AUTHENTICATION_REQUIRED",
+        "RETRY_LATER",
+        "tombstone",
+        "hidden",
+        "soft_deleted",
+        "wrong_type",
+    ] {
+        let mut master = json!({"recordName":"old-master", "serverErrorCode":"NOT_FOUND"});
+        let mut child = test_asset_record_for("child", "new-master");
+        match fault {
+            "tombstone" => master = json!({"recordName":"old-master", "deleted":true}),
+            "hidden" => child["fields"]["isHidden"] = json!({"value":1,"type":"INT64"}),
+            "soft_deleted" => child["fields"]["isDeleted"] = json!({"value":1,"type":"INT64"}),
+            "wrong_type" => child["recordType"] = json!("CPLAlbum"),
+            code => master["serverErrorCode"] = json!(code),
+        }
+        let album = make_album_with_session(
+            100,
+            Box::new(MockPhotosSession::new().ok(json!({"records":[master,child]}))),
+        );
+        let result = album
+            .resolve_records(&[lookup_request("child", "old-master", "child")])
+            .await;
+        assert!(!result.complete, "{fault}");
+        if matches!(fault, "NOT_FOUND" | "UNKNOWN_ITEM") {
+            assert!(
+                matches!(&result.results[0].1, RecordResolution::MasterChanged { master_record_name } if master_record_name.as_str() == "new-master"),
+                "{fault}"
+            );
+        } else {
+            assert!(
+                matches!(result.results[0].1, RecordResolution::Unknown),
+                "{fault}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn issue956_rejection_groups_distinguish_master_and_child_errors_without_private_values() {
     let _parallel_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let (capture, _guard) = crate::test_helpers::TracingCapture::install();
