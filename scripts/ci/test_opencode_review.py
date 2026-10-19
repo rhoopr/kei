@@ -356,6 +356,25 @@ class ReviewTests(unittest.TestCase):
              self.assertRaisesRegex(review.ReviewError, "Incomplete file list"):
             prepared(http)
 
+    def test_github_file_list_limit_rejects_oversized_pr_before_source_fetch(self):
+        http = FakeHTTP()
+        # GitHub exposes at most 3,000 PR files, even when metadata reports more.
+        files = [dict(FILE, filename=f"src/file{n}.rs") for n in range(3000)]
+        original = http.request
+        def request(method, url, token, **kwargs):
+            if "/files?" in url:
+                page = int(url.rsplit("page=", 1)[1])
+                return files[(page - 1) * 100:page * 100]
+            return original(method, url, token, **kwargs)
+        with patch.dict(PR, changed_files=10000, additions=10000, deletions=10000), \
+             patch.object(http, "request", side_effect=request) as calls, \
+             self.assertRaisesRegex(review.ReviewError, "Incomplete file list"):
+            prepared(http)
+        urls = [call.args[1] for call in calls.call_args_list]
+        self.assertEqual(sum("/files?" in url for url in urls), 31)
+        self.assertFalse(any("/contents/" in url for url in urls))
+        self.assertTrue(all(call.args[0] == "GET" for call in calls.call_args_list))
+
     def test_source_mismatch_and_binary_rejected(self):
         for change in ({"sha": OLD}, {"type": "symlink"}, {"content": "!!!!"},
                        {"content": base64.b64encode(b"other\n").decode()},
@@ -849,6 +868,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(text.count("ref: ${{ github.workflow_sha }}"), 2)
         self.assertEqual(text.count("persist-credentials: false"), 2)
         read_job, write_job = text.split("  publish:\n")
+        self.assertIn("    timeout-minutes: 15\n", read_job)
+        self.assertIn("    timeout-minutes: 5\n", write_job)
         self.assertNotIn("pull-requests: write", read_job)
         self.assertNotIn("OPENCODE_API_KEY", write_job)
         self.assertNotIn("pull_request.head", text)
@@ -1348,6 +1369,9 @@ class IssueWorkflowTests(unittest.TestCase):
         self.assertEqual(trigger.strip(), "types: [opened]")
         pin, reader = text.split("  issue-pin:\n")[1].split("  issue-review:\n")
         reader, publisher = reader.split("  issue-publish:\n")
+        self.assertIn("    timeout-minutes: 3\n", pin)
+        self.assertIn("    timeout-minutes: 15\n", reader)
+        self.assertIn("    timeout-minutes: 5\n", publisher)
         self.assertIn("github.event.action == 'opened'", pin)
         self.assertIn("fail-fast: false", reader)
         self.assertIn("fail-fast: false", publisher)
