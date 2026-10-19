@@ -8,7 +8,7 @@ import os
 import tempfile
 import unittest
 import urllib.error
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from http.client import IncompleteRead
 from pathlib import Path
 from unittest.mock import patch
@@ -72,6 +72,12 @@ def result():
 def bot_review():
     return {"user": {"login": "github-actions[bot]", "type": "Bot"}, "state": "COMMENTED",
             "commit_id": HEAD, "body": f"{review.MARKER}{HEAD} -->\nReview"}
+
+
+def ok_response(payload):
+    response = io.BytesIO(payload if isinstance(payload, bytes) else review.json_bytes(payload))
+    response.status = 200
+    return response
 
 
 class ReviewTests(unittest.TestCase):
@@ -164,8 +170,9 @@ class ReviewTests(unittest.TestCase):
     def test_provider_failures_advance_once_and_all_failed_has_no_result(self):
         for failure in (review.ProviderHTTPError(400), review.ProviderHTTPError(401),
                         review.ProviderHTTPError(403), review.ProviderHTTPError(429),
-                        review.ProviderHTTPError(503), review.ProviderError("uncertain transport"),
-                        review.ProviderError("malformed JSON"), review.ProviderError("response size")):
+                        review.ProviderHTTPError(503), review.ProviderError("timeout"),
+                        review.ProviderError("transport"), review.ProviderError("malformed_json"),
+                        review.ProviderError("response_too_large")):
             http = FakeHTTP()
             data = prepared(http)
             output = io.StringIO()
@@ -255,6 +262,13 @@ class ReviewTests(unittest.TestCase):
             self.assertIsNone(metadata[field])
         for text in (KEY, "not logged", "never logged", "::error::"):
             self.assertNotIn(text, output.getvalue())
+        for failure in (KEY, "http_error", "malformed JSON"):
+            with self.assertRaises(review.ReviewError):
+                review.attempt_metadata(http, "go", review.DEFAULT_MODEL, "request_failed",
+                                        failure=failure)
+        for category in (KEY, "malformed JSON", "response size"):
+            with self.assertRaises(review.ReviewError):
+                review.ProviderError(category)
 
     def test_stable_session_per_head(self):
         http = FakeHTTP()
@@ -710,7 +724,82 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(req.get_header("Authorization"), f"Bearer {KEY}")
             self.assertEqual(req.get_header("User-agent"), "kei-advisory-review/1.0")
             self.assertEqual(req.get_header("X-opencode-session"), "fixture")
-            self.assertEqual(opened.call_args.kwargs["timeout"], 240)
+            self.assertIsNone(opened.call_args.kwargs["timeout"])
+        with patch.object(client.opener, "open", return_value=ok_response({})) as opened:
+            self.assertEqual(client.request("GET", "https://api.github.com/test", KEY), {})
+            self.assertEqual(opened.call_args.kwargs["timeout"], 20)
+
+    def test_provider_failure_categories_reach_diagnostics_and_fallback(self):
+        fixture = FakeHTTP()
+        data = prepared(fixture)
+        private_body = "private-provider-body"
+        malformed = ok_response(private_body.encode())
+        oversized = ok_response(private_body.encode() + b"x" * 1025)
+        cases = (
+            ("timeout", TimeoutError(private_body)),
+            ("timeout", urllib.error.URLError(TimeoutError(private_body))),
+            ("transport", urllib.error.URLError(private_body)),
+            ("transport", OSError(private_body)),
+            ("transport", IncompleteRead(b"partial " + private_body.encode(), 100)),
+            ("malformed_json", malformed),
+            ("response_too_large", oversized),
+        )
+        for category, failure in cases:
+            with self.subTest(category=category, failure=type(failure).__name__):
+                client = review.HTTP()
+                output = io.StringIO()
+                with patch.object(client.opener, "open",
+                                  side_effect=[failure, ok_response(fixture.completion)]) as opened, \
+                     patch.object(review, "HTTP_RESPONSE_LIMIT", 1024), redirect_stdout(output):
+                    result = review.infer(client, data, KEY, review.DEFAULT_MODEL,
+                                          go_no_overage_confirmed=True)
+                self.assertEqual(opened.call_count, 2)
+                self.assertIsNone(opened.call_args.kwargs["timeout"])
+                self.assertEqual(result["model"], "glm-5.3-flash")
+                lines = [json.loads(line.removeprefix("OpenCode attempt "))
+                         for line in output.getvalue().splitlines()]
+                self.assertEqual([line["outcome"] for line in lines],
+                                 ["request_failed", "accepted"])
+                self.assertEqual([line["failure"] for line in lines], [category, None])
+                self.assertNotIn(private_body, output.getvalue())
+                self.assertNotIn(KEY, output.getvalue())
+
+    def test_both_provider_failures_via_real_request_write_no_artifact(self):
+        fixture = FakeHTTP()
+        data = prepared(fixture)
+        private_body = "private-provider-body"
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = Path.cwd()
+            os.chdir(tmp)
+            try:
+                Path("review-input.json").write_text(json.dumps(data))
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch.object(review.urllib.request, "build_opener") as build, \
+                     patch.object(review, "publish") as publish, \
+                     patch.dict(os.environ, {"OPENCODE_API_KEY": KEY,
+                                             "OPENCODE_GO_NO_OVERAGE_CONFIRMED": "true"}, clear=True), \
+                     patch("sys.argv", ["review", "infer"]), \
+                     redirect_stdout(stdout), redirect_stderr(stderr), \
+                     self.assertRaisesRegex(review.ReviewError, "Both OpenCode Go") as caught:
+                    build.return_value.open.side_effect = [
+                        urllib.error.URLError(TimeoutError(private_body)),
+                        urllib.error.URLError(private_body),
+                    ]
+                    review.main()
+                self.assertEqual(build.return_value.open.call_count, 2)
+                publish.assert_not_called()
+                self.assertEqual([path.name for path in Path(".").iterdir()],
+                                 ["review-input.json"])
+                self.assertEqual(str(caught.exception),
+                                 "Both OpenCode Go models failed; no review completed or published.")
+                lines = [json.loads(line.removeprefix("OpenCode attempt "))
+                         for line in stdout.getvalue().splitlines()]
+                self.assertEqual([line["failure"] for line in lines], ["timeout", "transport"])
+                combined = stdout.getvalue() + stderr.getvalue() + str(caught.exception)
+                self.assertNotIn(private_body, combined)
+                self.assertNotIn(KEY, combined)
+            finally:
+                os.chdir(previous)
 
     def test_provider_errors_expose_only_fixed_route_and_numeric_status(self):
         for route, url, code in (("go", review.GO_URL, 401), ("go", review.GO_URL, 429)):
