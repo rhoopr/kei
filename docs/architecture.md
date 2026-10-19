@@ -2207,7 +2207,8 @@ to read first.
   advisory comments with stale-state and dedup checks. Code validation is static
   inspection only. PR reviews submit the complete diff without local usage caps;
   model capacity and Go allowance govern inference. Transport/job safeguards and
-  publication validation remain. See [review security and setup](opencode-review.md).
+  publication validation remain. GitHub 403/429 responses stop the operation
+  without automatic retry. See [review security and setup](opencode-review.md).
 - `justfile` owns local script and workflow lint commands. Protected CI runs
   the same shellcheck, shfmt, ruff, and actionlint checks with pinned versions.
 

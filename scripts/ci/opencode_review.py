@@ -129,7 +129,8 @@ class HTTP:
             headers["x-opencode-session"] = session
         else:
             headers["X-GitHub-Api-Version"] = "2022-11-28"
-        # GETs can retry twice. Inference and publication are never retried:
+        # GET transport/server failures can retry twice, but GitHub 403/429 stop.
+        # Inference and publication are never retried:
         # a timed-out POST may already have consumed quota or published a review.
         attempts = 3 if method == "GET" else 1
         for attempt in range(attempts):
@@ -146,7 +147,9 @@ class HTTP:
                 status = error.code
                 self.last_status = status
                 error.close()
-                if method == "GET" and status in {429, 500, 502, 503, 504} and attempt < attempts - 1:
+                if not provider and status in {403, 429}:
+                    raise ReviewError("GitHub API access denied or rate limited; no automatic retry.") from None
+                if method == "GET" and status in {500, 502, 503, 504} and attempt < attempts - 1:
                     time.sleep(2 ** attempt)
                     continue
                 if provider:

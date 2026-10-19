@@ -739,14 +739,33 @@ class TransportTests(unittest.TestCase):
                 client.request("POST", "https://api.github.com/repos/rhoopr/kei/pulls/1/reviews", KEY, payload={})
             self.assertEqual(opened.call_count, 1)
 
-    def test_get_retry_rate_limit_without_cumulative_request_budget(self):
+    def test_github_access_denial_and_rate_limits_stop_collection_without_retry(self):
+        for status in (403, 429):
+            with self.subTest(status=status):
+                client = review.HTTP()
+                body = io.BytesIO(KEY.encode())
+                error = urllib.error.HTTPError("https://api.github.com", status, KEY,
+                                               {"Retry-After": "3600", "X-RateLimit-Remaining": "0"}, body)
+                with patch.object(client.opener, "open", side_effect=error) as opened, \
+                     patch("time.sleep") as sleep, \
+                     self.assertRaisesRegex(review.ReviewError, "GitHub API access denied or rate limited") as caught:
+                    review.collect(gh(client), HEAD, context=True)
+                self.assertEqual(opened.call_count, 1)
+                self.assertEqual(opened.call_args.args[0].get_method(), "GET")
+                sleep.assert_not_called()
+                self.assertTrue(body.closed)
+                self.assertNotIn(KEY, str(caught.exception))
+                self.assertIn("no automatic retry", str(caught.exception))
+
+    def test_get_transient_server_retries_without_cumulative_request_budget(self):
         client = review.HTTP()
-        def limited(*args, **kwargs):
-            raise urllib.error.HTTPError("https://api.github.com", 429, "sensitive", {}, None)
-        with patch.object(client.opener, "open", side_effect=limited) as opened, patch("time.sleep"):
-            with self.assertRaises(review.ReviewError):
+        for status in (500, 502, 503, 504):
+            error = urllib.error.HTTPError("https://api.github.com", status, "sensitive", {}, None)
+            with patch.object(client.opener, "open", side_effect=error) as opened, patch("time.sleep") as sleep, \
+                 self.assertRaises(review.ReviewError):
                 client.request("GET", "https://api.github.com/test", KEY)
             self.assertEqual(opened.call_count, 3)
+            self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
         with patch.object(client.opener, "open") as opened:
             opened.return_value.__enter__.return_value.read.return_value = b"{}"
             for _ in range(151):
