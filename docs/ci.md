@@ -171,11 +171,25 @@ without publishing or posting notifications.
 `Nightly freshness` checks at 19:23 UTC. A missing, failed, cancelled, or stale
 completed run opens one incident issue. Incidents carry `bug`, `@infra`, `@test`,
 and `nightly fail` labels. Missing labels are added to an existing incident
-without replacing its other labels; the reporter creates `nightly fail` if needed. Repeated failures do not add comments.
+without replacing its other labels; the reporter creates `nightly fail` if needed.
+
+A failure identity is the workflow run and its attempt. The reporter and the
+freshness check use the same identity, and message text does not identify a
+failure. An incident body records each observed finding. Both checks read open
+and closed bot incidents that start with the trusted marker. Closing an
+incident acknowledges its recorded findings, so the check does not refile them.
+Only one incident stays open. Later findings are recorded on it without a
+comment, and closing it acknowledges those findings too. An issue body changes
+only when a finding is missing, and repeated checks do not add comments.
+
+Missing and stale qualification have their own identities, separate from failed
+runs. Acknowledging an old failure does not clear a later freshness alert.
+Suppression changes notifications only; the checks still report failure.
 Recovery adds a comment and closes the incident. A completed run must have
-started within 36 hours. Scheduled Actions can be delayed or disabled; this
-second schedule detects missing qualification runs but is not an external
-availability monitor for GitHub itself.
+started within 36 hours. Both notification jobs share the `nightly-incident`
+concurrency group, so incident updates stay serialized. Scheduled Actions can be
+delayed or disabled; this second schedule detects missing qualification runs but
+is not an external availability monitor for GitHub itself.
 
 Reports and candidate artifacts are retained for 14 days. PR, nightly, and
 release concurrency groups are separate. Nightly work cannot cancel a release.
