@@ -1,4 +1,4 @@
-"""Bounded, data-only OpenCode reviews. Never execute PR or issue content."""
+"""Data-only OpenCode reviews. Never execute PR or issue content."""
 
 from __future__ import annotations
 
@@ -21,14 +21,10 @@ DEFAULT_MODEL = "glm-5.3-flash"
 REVIEW_MODELS = (("go", GO_URL, "deepseek-v4.1-flash"),
                  ("go", GO_URL, DEFAULT_MODEL))
 ALLOWED_MODELS = frozenset(model for _, _, model in REVIEW_MODELS)
-REVIEW_TOKENS = 16384
-REVIEW_RESPONSE = 512 * 1024
-MAX_FILES = 40
-MAX_CHANGES = 2000
-MAX_DIFF = 128 * 1024
-MAX_PROMPT = 300 * 1024
-MAX_SOURCE = 256 * 1024
-MAX_TOTAL_SOURCE = 1024 * 1024
+# Bound individual network responses, not review eligibility or Go usage.
+HTTP_RESPONSE_LIMIT = 16 * 1024 * 1024
+ISSUE_PROMPT_LIMIT = 300 * 1024
+ISSUE_SOURCE_LIMIT = 256 * 1024
 MAX_RESULT = 24 * 1024
 SHA = re.compile(r"[0-9a-f]{40}")
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -118,18 +114,15 @@ class HTTP:
     def __init__(self):
         # Do not inherit proxy credentials or redirect Authorization to another host.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        self.calls = 0
         self.last_status = None
 
-    def request(self, method, url, token, *, payload=None, limit=1024 * 1024,
+    def request(self, method, url, token, *, payload=None, limit=HTTP_RESPONSE_LIMIT,
                 provider=False, session=None):
         require(urllib.parse.urlsplit(url).netloc in {"api.github.com", "opencode.ai"}
                 and url.startswith("https://"), "Unapproved API destination.")
         require((provider and url == GO_URL) or (not provider and url.startswith("https://api.github.com/")),
                 "Credential destination does not match API role.")
-        self.calls += 1
         self.last_status = None
-        require(self.calls <= 150, "HTTP request budget exhausted.")
         headers = {"Authorization": f"Bearer {token}", "User-Agent": "kei-advisory-review/1.0",
                    "Accept": "application/json", "Content-Type": "application/json"}
         if provider:
@@ -143,7 +136,7 @@ class HTTP:
             request = urllib.request.Request(url, data=None if payload is None else json_bytes(payload),
                                              headers=headers, method=method)
             try:
-                with self.opener.open(request, timeout=90 if provider else 20) as response:
+                with self.opener.open(request, timeout=240 if provider else 20) as response:
                     self.last_status = response.status
                     data = response.read(limit + 1)
                 if len(data) > limit:
@@ -178,7 +171,7 @@ class GitHub:
         self.root = f"/repos/{repo}"
         self.pull = f"{self.root}/pulls/{number}"
 
-    def api(self, path, *, payload=None, limit=1024 * 1024):
+    def api(self, path, *, payload=None, limit=HTTP_RESPONSE_LIMIT):
         return self.http.request("GET" if payload is None else "POST",
                                  "https://api.github.com" + path, self.token,
                                  payload=payload, limit=limit)
@@ -250,15 +243,17 @@ def parse_patch(file):
 
 def collect(gh, head, *, context):
     pr = gh.current(head)
-    require(0 < pr["changed_files"] <= MAX_FILES, "Changed-file limit exceeded or empty diff.")
-    require(pr["additions"] + pr["deletions"] <= MAX_CHANGES, "Changed-line limit exceeded.")
-    files = gh.api(f"{gh.pull}/files?per_page=100", limit=2 * 1024 * 1024)
-    require(isinstance(files, list) and len(files) == pr["changed_files"],
-            "Incomplete file list; review refused.")
+    require(type(pr["changed_files"]) is int and pr["changed_files"] > 0, "Invalid or empty diff.")
+    files = []
+    while len(files) < pr["changed_files"]:
+        page = gh.api(f"{gh.pull}/files?per_page=100&page={len(files) // 100 + 1}")
+        require(isinstance(page, list) and 0 < len(page) <= 100
+                and len(files) + len(page) <= pr["changed_files"], "Incomplete file list; review refused.")
+        files.extend(page)
+        require(len(page) == 100 or len(files) == pr["changed_files"], "Incomplete file list; review refused.")
     require(sum(f["additions"] for f in files) == pr["additions"]
             and sum(f["deletions"] for f in files) == pr["deletions"], "Diff changed during collection.")
     data, locations = [], {}
-    diff_bytes = source_bytes = 0
     for file in files:
         path = file["filename"]
         require(isinstance(path, str) and 0 < len(path) <= 512
@@ -267,20 +262,17 @@ def collect(gh, head, *, context):
                 and path not in locations, "Invalid or duplicate diff path.")
         right = parse_patch(file)
         locations[path] = right
-        diff_bytes += len(file["patch"].encode())
-        require(diff_bytes <= MAX_DIFF, "Diff byte limit exceeded; review refused.")
         item = {"path": path, "status": file["status"], "patch": file["patch"]}
         if context and file["status"] != "removed":
             # Never use raw_url/download_url or any URL/ref supplied by PR content.
             quoted = urllib.parse.quote(path, safe="/")
-            source = gh.api(f"{gh.root}/contents/{quoted}?ref={head}", limit=512 * 1024)
+            source = gh.api(f"{gh.root}/contents/{quoted}?ref={head}")
             require(source.get("type") == "file" and source.get("encoding") == "base64"
-                    and source.get("sha") == file["sha"] and source.get("size", MAX_SOURCE + 1) <= MAX_SOURCE,
-                    "Head source is unavailable, oversized, or not a regular file.")
+                    and source.get("sha") == file["sha"]
+                    and type(source.get("size")) is int and source["size"] >= 0,
+                    "Head source is unavailable or not a regular file.")
             raw = base64.b64decode(source["content"].replace("\n", ""), validate=True)
-            require(len(raw) <= MAX_SOURCE and b"\0" not in raw, "Unsupported head source.")
-            source_bytes += len(raw)
-            require(source_bytes <= MAX_TOTAL_SOURCE, "Source byte budget exceeded.")
+            require(len(raw) == source["size"] and b"\0" not in raw, "Unsupported head source.")
             lines = raw.decode("utf-8").splitlines()
             require(all(0 < n <= len(lines) and lines[n - 1] == text for n, text in right.items()),
                     "Patch does not match exact head source.")
@@ -381,7 +373,6 @@ def infer(http, prepared, key, model, *, go_no_overage_confirmed=False, issue_ki
         require(issue_kind in ISSUE_KINDS and prepared["kind"] == issue_kind, "Invalid issue review kind.")
         prompt = json_bytes(prepared).decode()
         system = ISSUE_SYSTEM + ISSUE_SYSTEMS[issue_kind]
-    require(len(prompt.encode()) <= MAX_PROMPT, "Prompt byte budget exceeded.")
     session = hashlib.sha256(f'{prepared["repo"]}:{prepared["number"]}:{prepared["head"]}'.encode()).hexdigest()
     if issue_kind is not None:
         session = hashlib.sha256(f'{session}:{issue_kind}:{prepared["snapshot"]}'.encode()).hexdigest()
@@ -389,12 +380,10 @@ def infer(http, prepared, key, model, *, go_no_overage_confirmed=False, issue_ki
     for route, url, model_used in REVIEW_MODELS:
         require(go_no_overage_confirmed,
                 "Go review blocked until Use balance is confirmed disabled; no review completed.")
-        payload = {"model": model_used, "messages": messages, "stream": False, "max_tokens": REVIEW_TOKENS}
-        if model_used.startswith("glm-"):
-            payload["reasoning_effort"] = "low"
+        payload = {"model": model_used, "messages": messages, "stream": False}
         try:
             response = http.request("POST", url, key, provider=True, session=session,
-                                    limit=REVIEW_RESPONSE, payload=payload)
+                                    limit=HTTP_RESPONSE_LIMIT, payload=payload)
         except ProviderHTTPError as error:
             http.last_status = error.status
             attempt_metadata(http, route, model_used, "http_error")
@@ -453,7 +442,7 @@ def review_body(result):
         body += (f"- **{plain(finding['title'])}** ({source_link(result, finding)})\n"
                  f"  {plain(finding['body'])}\n")
     if not result["findings"]:
-        body += "No supported findings in the bounded diff.\n"
+        body += "No supported findings in the supplied diff.\n"
     body += "\nStatic review; no tests run.\n\n" + review_footer(result)
     require(len(body.encode()) <= 60000, "Review body too large.")
     return body
@@ -478,10 +467,11 @@ def publish(gh, result, head):
     gh.api(f"{gh.pull}/reviews", payload={"commit_id": head, "event": "COMMENT", "body": body})
 
 
-def load_json(path, limit):
+def load_json(path, limit=None):
+    # Only trusted, workflow-generated PR context is read without a size limit.
     with Path(path).open("rb") as stream:
-        raw = stream.read(limit + 1)
-    require(len(raw) <= limit, "Local input exceeds size limit.")
+        raw = stream.read() if limit is None else stream.read(limit + 1)
+    require(limit is None or len(raw) <= limit, "Local input exceeds size limit.")
     return json.loads(raw)
 
 
@@ -649,7 +639,7 @@ def issue_source(gh, head, path):
     quoted = urllib.parse.quote(path, safe="/")
     source = gh.api(f"{gh.root}/contents/{quoted}?ref={head}", limit=512 * 1024)
     require(source.get("type") == "file" and source.get("encoding") == "base64"
-            and type(source.get("size")) is int and 0 <= source["size"] <= MAX_SOURCE,
+            and type(source.get("size")) is int and 0 <= source["size"] <= ISSUE_SOURCE_LIMIT,
             "Issue source is unavailable, oversized or not a regular file.")
     raw = base64.b64decode(source["content"].replace("\n", ""), validate=True)
     require(len(raw) == source["size"] and b"\0" not in raw, "Unsupported issue source.")
@@ -720,7 +710,7 @@ def collect_issue(gh, head, snapshot, kind):
             "snapshot": issue_fingerprint(snapshot), "issue": snapshot, "context": context,
             "selection": selection, "execution": "not_performed", "linked_material": "not_fetched"}
     no_secrets(data, (gh.token,))
-    require(len(json_bytes(data)) <= MAX_PROMPT, "Issue context exceeds prompt byte limit.")
+    require(len(json_bytes(data)) <= ISSUE_PROMPT_LIMIT, "Issue context exceeds prompt byte limit.")
     current_issue(gh, snapshot)
     issue_main(gh, head)
     return data
@@ -805,7 +795,7 @@ def publish_issue(gh, snapshot, result, head, kind):
 
 def issue_command(http, mode):
     if mode == "issue-infer":
-        prepared = load_json("issue-review-input.json", MAX_PROMPT)
+        prepared = load_json("issue-review-input.json", ISSUE_PROMPT_LIMIT)
         confirmed = os.environ.get("OPENCODE_GO_NO_OVERAGE_CONFIRMED") or "false"
         require(confirmed in {"true", "false"}, "Invalid no-overage configuration.")
         result = infer(http, prepared, os.environ.get("OPENCODE_API_KEY", ""),
@@ -850,7 +840,7 @@ def main():
         issue_command(http, mode)
         return
     if mode == "infer":
-        prepared = load_json("review-input.json", MAX_PROMPT + MAX_DIFF)
+        prepared = load_json("review-input.json")
         # JSON object keys are strings. Restore validated integer line locations.
         prepared["locations"] = {p: {int(n): t for n, t in v.items()}
                                  for p, v in prepared["locations"].items()}
@@ -875,7 +865,7 @@ def main():
         Path("review-input.json").write_bytes(json_bytes(prepared))
         with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
             output.write(f"prepared=true\nhead={head}\n")
-        print("Complete bounded diff prepared from exact head; no PR code executed.")
+        print("Complete diff prepared from exact head; no PR code executed.")
     elif mode == "publish":
         publish(gh, load_json("result/review-result.json", MAX_RESULT + 1024), head)
         print("Advisory COMMENT review published for the exact head SHA.")

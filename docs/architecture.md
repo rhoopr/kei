@@ -2200,12 +2200,14 @@ to read first.
   `local_release.py` validates local live/host-service attestations.
   Release publication depends on both local evidence and hosted qualification;
   nightly runs cannot publish. See [CI qualification](ci.md).
-- `scripts/ci/opencode_review.py` owns the bounded, data-only advisory review
+- `scripts/ci/opencode_review.py` owns the data-only advisory review
   client. `opencode-review.yml` executes trusted base code and separates read-only
   inference from deterministic COMMENT publication. Issue-open intake pins main and
   issue content, runs independent product/code reviews, and publishes separate
   advisory comments with stale-state and dedup checks. Code validation is static
-  inspection only. See [review security and setup](opencode-review.md).
+  inspection only. PR reviews submit the complete diff without local usage caps;
+  model capacity and Go allowance govern inference. Transport/job safeguards and
+  publication validation remain. See [review security and setup](opencode-review.md).
 - `justfile` owns local script and workflow lint commands. Protected CI runs
   the same shellcheck, shfmt, ruff, and actionlint checks with pinned versions.
 

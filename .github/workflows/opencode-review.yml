@@ -36,7 +36,7 @@ jobs:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
           sparse-checkout: scripts/ci
-      - name: Collect bounded PR data
+      - name: Collect complete PR diff and head context
         id: prepare
         env:
           GH_TOKEN: ${{ github.token }}

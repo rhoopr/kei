@@ -114,9 +114,9 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(len(kwargs["session"]), 64)
         payload = kwargs["payload"]
         self.assertFalse(payload["stream"])
-        self.assertEqual(payload["max_tokens"], 16384)
+        self.assertNotIn("max_tokens", payload)
         self.assertNotIn("reasoning_effort", payload)
-        self.assertEqual(set(payload), {"model", "messages", "stream", "max_tokens"})
+        self.assertEqual(set(payload), {"model", "messages", "stream"})
         self.assertNotIn(KEY, json.dumps(payload))
         self.assertNotIn("fixture-github-token", json.dumps(payload))
         self.assertEqual(output["model"], "deepseek-v4.1-flash")
@@ -144,10 +144,9 @@ class ReviewTests(unittest.TestCase):
             self.assertEqual(len(sessions), 1)
             self.assertEqual(len(output.getvalue().splitlines()), accepted_at + 1)
             for call in request.call_args_list:
-                self.assertEqual(call.kwargs["payload"]["max_tokens"], 16384)
-                self.assertEqual(call.kwargs["limit"], 512 * 1024)
-                self.assertEqual("reasoning_effort" in call.kwargs["payload"],
-                                 call.kwargs["payload"]["model"].startswith("glm-"))
+                self.assertNotIn("max_tokens", call.kwargs["payload"])
+                self.assertEqual(call.kwargs["limit"], review.HTTP_RESPONSE_LIMIT)
+                self.assertNotIn("reasoning_effort", call.kwargs["payload"])
             publisher = FakeHTTP()
             review.publish(gh(publisher), result, HEAD)
             body = publisher.calls[-1][3]["payload"]["body"]
@@ -285,7 +284,7 @@ class ReviewTests(unittest.TestCase):
         self.assertNotIn("tools", request)
         self.assertEqual(output["findings"], [])
 
-    def test_large_or_incomplete_diff_fails_before_model(self):
+    def test_incomplete_diff_fails_before_model(self):
         mutations = [lambda h: h.files[0].pop("patch"),
                      lambda h: h.files[0].update(patch=FILE["patch"][:-6]),
                      lambda h: h.files[0].update(additions=2),
@@ -297,33 +296,23 @@ class ReviewTests(unittest.TestCase):
             with self.assertRaises(review.ReviewError):
                 prepared(http)
             self.assertFalse(any(call[1] in {review.GO_URL} for call in http.calls))
-        for change in ({"changed_files": review.MAX_FILES + 1},
-                       {"additions": review.MAX_CHANGES + 1}):
-            http = FakeHTTP()
-            http.prs = [dict(PR, **change)]
-            with self.assertRaises(review.ReviewError):
-                prepared(http)
-        with patch.object(review, "MAX_DIFF", 4), self.assertRaises(review.ReviewError):
-            prepared(FakeHTTP())
 
-    def test_oversized_source_or_prompt(self):
-        for constant in ("MAX_SOURCE", "MAX_TOTAL_SOURCE"):
-            with patch.object(review, constant, 1), self.assertRaises(review.ReviewError):
-                prepared(FakeHTTP())
+    def test_complete_review_above_former_source_diff_and_prompt_limits(self):
         http = FakeHTTP()
-        data = prepared(http)
-        with patch.object(review, "MAX_PROMPT", 1), self.assertRaises(review.ReviewError):
-            review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
-        self.assertFalse(any(call[1] in {review.GO_URL} for call in http.calls))
-
-    def test_context_above_128k_reaches_mocked_inference_below_prompt_limit(self):
-        http = FakeHTTP()
-        source = SOURCE + ("x" * 12000 + "\n").encode() * 12
+        source = (b"x" * 160 + b"\n") * 2100
         http.source.update(size=len(source), content=base64.b64encode(source).decode())
-        data = prepared(http)
+        diff = "@@ -0,0 +1,2100 @@\n" + "\n".join("+" + line for line in source.decode().splitlines())
+        http.files = [dict(FILE, filename=path, additions=2100, deletions=0, patch=diff)
+                      for path in (FILE["filename"], "src/two.rs", "src/three.rs", "src/four.rs")]
+        with patch.dict(PR, changed_files=4, additions=8400, deletions=0):
+            data = prepared(http)
+            review.publish(gh(http), result(), HEAD)
+        self.assertGreater(len(source), 256 * 1024)
+        self.assertGreater(len(source) * len(http.files), 1024 * 1024)
+        self.assertGreater(len(diff.encode()), 128 * 1024)
+        self.assertGreater(len(review.json_bytes(data)), 428 * 1024)
         context = data["files"][0]["head_context"]
-        self.assertGreater(len(review.json_bytes(context)), 128 * 1024)
-        self.assertEqual(len(context), 15)
+        self.assertEqual(len(context), 2100)
         with tempfile.TemporaryDirectory() as tmp:
             previous = Path.cwd()
             os.chdir(tmp)
@@ -338,9 +327,34 @@ class ReviewTests(unittest.TestCase):
                 os.chdir(previous)
         payload = http.calls[-1][3]["payload"]
         prompt = payload["messages"][1]["content"]
-        self.assertLess(len(prompt.encode()), review.MAX_PROMPT)
-        self.assertEqual(json.loads(prompt)["files"][0]["head_context"], context)
-        self.assertEqual(sum(call[0] == "POST" for call in http.calls), 1)
+        self.assertGreater(len(prompt.encode()), 300 * 1024)
+        self.assertEqual(json.loads(prompt)["files"], data["files"])
+        self.assertEqual(sum(call[1] == review.GO_URL for call in http.calls), 1)
+
+    def test_more_than_100_files_are_paginated_and_reviewed_together(self):
+        http = FakeHTTP()
+        files = [dict(FILE, filename=f"src/file{n}.rs") for n in range(101)]
+        original = http.request
+        def request(method, url, token, **kwargs):
+            if "/files?" in url:
+                page = int(url.rsplit("page=", 1)[1])
+                return files[(page - 1) * 100:page * 100]
+            return original(method, url, token, **kwargs)
+        with patch.dict(PR, changed_files=101, additions=101, deletions=101), \
+             patch.object(http, "request", side_effect=request) as calls:
+            data = prepared(http)
+        self.assertEqual([file["path"] for file in data["files"]], [file["filename"] for file in files])
+        self.assertEqual(sum("/files?" in call.args[1] for call in calls.call_args_list), 2)
+        http.completion["choices"][0]["message"]["content"] = '{"findings":[]}'
+        review.infer(http, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
+        self.assertEqual(json.loads(http.calls[-1][3]["payload"]["messages"][1]["content"])["files"], data["files"])
+
+    def test_missing_file_page_fails_without_partial_review(self):
+        http = FakeHTTP()
+        with patch.dict(PR, changed_files=101, additions=101, deletions=101), \
+             patch.object(http, "request", side_effect=[PR, [dict(FILE, filename=f"src/{n}.rs") for n in range(100)], []]), \
+             self.assertRaisesRegex(review.ReviewError, "Incomplete file list"):
+            prepared(http)
 
     def test_source_mismatch_and_binary_rejected(self):
         for change in ({"sha": OLD}, {"type": "symlink"}, {"content": "!!!!"},
@@ -480,7 +494,7 @@ class ReviewTests(unittest.TestCase):
     def test_empty_findings_scope_is_explicit(self):
         output = result()
         output["findings"] = []
-        self.assertIn("No supported findings in the bounded diff", review.review_body(output))
+        self.assertIn("No supported findings in the supplied diff", review.review_body(output))
 
     def test_cli_end_to_end_with_mocked_apis(self):
         event = {"number": 123, "pull_request": copy.deepcopy(PR)}
@@ -677,7 +691,7 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(req.get_header("Authorization"), f"Bearer {KEY}")
             self.assertEqual(req.get_header("User-agent"), "kei-advisory-review/1.0")
             self.assertEqual(req.get_header("X-opencode-session"), "fixture")
-            self.assertEqual(opened.call_args.kwargs["timeout"], 90)
+            self.assertEqual(opened.call_args.kwargs["timeout"], 240)
 
     def test_provider_errors_expose_only_fixed_route_and_numeric_status(self):
         for route, url, code in (("go", review.GO_URL, 401), ("go", review.GO_URL, 429)):
@@ -725,7 +739,7 @@ class TransportTests(unittest.TestCase):
                 client.request("POST", "https://api.github.com/repos/rhoopr/kei/pulls/1/reviews", KEY, payload={})
             self.assertEqual(opened.call_count, 1)
 
-    def test_get_retry_rate_limit_and_request_budget(self):
+    def test_get_retry_rate_limit_without_cumulative_request_budget(self):
         client = review.HTTP()
         def limited(*args, **kwargs):
             raise urllib.error.HTTPError("https://api.github.com", 429, "sensitive", {}, None)
@@ -733,9 +747,11 @@ class TransportTests(unittest.TestCase):
             with self.assertRaises(review.ReviewError):
                 client.request("GET", "https://api.github.com/test", KEY)
             self.assertEqual(opened.call_count, 3)
-        client.calls = 150
-        with self.assertRaisesRegex(review.ReviewError, "budget"):
-            client.request("GET", "https://api.github.com/test", KEY)
+        with patch.object(client.opener, "open") as opened:
+            opened.return_value.__enter__.return_value.read.return_value = b"{}"
+            for _ in range(151):
+                self.assertEqual(client.request("GET", "https://api.github.com/test", KEY), {})
+            self.assertEqual(opened.call_count, 151)
 
     def test_redirect_and_wrong_host_rejected(self):
         client = review.HTTP()
@@ -752,6 +768,17 @@ class TransportTests(unittest.TestCase):
             response.status = 200
             with patch.object(client.opener, "open", return_value=response), self.assertRaises(review.ReviewError):
                 client.request("GET", "https://api.github.com/test", KEY, limit=bound)
+
+    def test_reasoning_response_above_former_512k_limit_reaches_validation(self):
+        fixture = FakeHTTP()
+        data = prepared(fixture)
+        fixture.completion["choices"][0]["message"]["reasoning_content"] = "x" * (600 * 1024)
+        response = io.BytesIO(review.json_bytes(fixture.completion))
+        response.status = 200
+        client = review.HTTP()
+        with patch.object(client.opener, "open", return_value=response):
+            output = review.infer(client, data, KEY, review.DEFAULT_MODEL, go_no_overage_confirmed=True)
+        self.assertEqual(output["findings"], [FINDING])
 
 
 
@@ -924,12 +951,12 @@ class IssueReviewTests(unittest.TestCase):
         data = issue_prepared(http, "code")
         self.assertFalse(data["context"][CODE]["complete"])
         self.assertLessEqual(len(data["context"][CODE]["text"].encode()), review.ISSUE_EXCERPT)
-        self.assertLessEqual(len(review.json_bytes(data)), review.MAX_PROMPT)
+        self.assertLessEqual(len(review.json_bytes(data)), review.ISSUE_PROMPT_LIMIT)
         http.tree["truncated"] = True
         with self.assertRaises(review.ReviewError):
             issue_prepared(http, "code")
         http = IssueHTTP()
-        http.sources[ARCH] = "x" * (review.MAX_SOURCE + 1)
+        http.sources[ARCH] = "x" * (review.ISSUE_SOURCE_LIMIT + 1)
         with self.assertRaises(review.ReviewError):
             issue_prepared(http, "product")
         with self.assertRaises(review.ReviewError):

@@ -105,7 +105,7 @@ the internal dedup marker rather than a visible preamble.
 PR reviews retain every validated finding and its pinned source link. The prompt
 asks for 1-3 short sentences per finding describing the trigger, impact, evidence
 and smallest next step. Existing finding count and size limits remain unchanged.
-An empty result says only that the bounded diff had no supported findings.
+An empty result says only that the supplied diff had no supported findings.
 
 A compact footer names the advisory status, actual model (Go subscription models)
 and pinned main/head commit. Repeated headings, scope essays and generic
@@ -185,7 +185,7 @@ merge ref, branch, or artifact. The workflow must already exist on the target
 branch; changes to its script in a PR are not executed by this review workflow.
 
 The first job has only `contents: read` and `pull-requests: read`. Its collection
-step uses GitHub's API to fetch metadata, complete patches, and bounded source at
+step uses GitHub's API to fetch metadata, complete patches, and source at
 the exact head SHA. PR paths are URL-encoded data, never local filesystem paths
 or shell arguments. It does not fetch PR dependencies, execute PR code or hooks,
 build anything, or load agent instructions, plugins, or PR configuration. Even
@@ -219,18 +219,11 @@ atomic current-head-and-publish operation: a push can race the final check, but
 `commit_id` and the body always identify the reviewed SHA. A removed review can
 be recreated on a later run. Human judgment remains necessary.
 
-## Bounds, failures, and usage
+## Capacity, failures, and usage
 
-The client accepts at most 40 changed files, 2,000 added/deleted lines, 128 KiB of
-patch text, 256 KiB per fetched source, 1 MiB total fetched source, and a 300 KiB
-JSON user prompt. Head context has no separate byte cap; it remains part of the
-bounded total prompt. The local prepared-file reader retains its 428 KiB limit
-for the prompt data and validated source locations. Context includes up to 12
-lines around each right-side hunk line. Hunk counts, file totals, PR totals, and
-exact head source must agree. Binary files, omitted/truncated patches, unsupported
-source, missing patches for pure renames, and oversized data fail the whole
-review clearly. It never calls a partial diff a complete review. An empty
-findings list means only that no supported finding was produced within this scope.
+PR reviews have no local file-count, changed-line, aggregate-source, diff-byte or prompt-byte allowance. The client paginates the changed-file list and submits the complete diff with up to 12 lines of head context around each right-side hunk line. It does not truncate the review to conserve subscription usage. Hunk counts, file totals, PR totals, and exact head source must agree. Binary files, omitted/truncated patches, unsupported source and missing patches for pure renames still fail the whole review. GitHub API availability and the serving model's actual capacity still apply; there is no batching or partial-review fallback. An empty findings list means only that no supported finding was produced within the supplied context.
+
+The Go subscription allowance is the usage budget. Reviews may exhaust it; the client does not impose a smaller spending allowance. The required no-overage confirmation and Go-only route remain unchanged. Issue intake retains its separate deterministic context-selection limits described above.
 
 Each review run makes at most two inference POSTs, one per model in the table.
 Any provider HTTP error (including 403, 429, or 503), transport failure, oversized
@@ -240,17 +233,13 @@ can mean an earlier request already consumed quota. Both attempts require
 the no-overage confirmation before the first request. Failure of both models produces no
 review artifact or public review.
 
-Missing secrets, invalid configuration, oversized/untrusted input, detected
+Missing secrets, invalid configuration, invalid input, detected
 credential material (including reasoning or decoded findings), invalid finding
 source references, draft/stale heads, and duplicate reviews do not authorize
 fallback. Input is checked before the first attempt; security failures stop the
 chain immediately. Only a complete, validated result can reach publication.
 
-Each inference POST is capped at 16,384 output tokens and 512 KiB of HTTP response
-data, for at most 32,768 requested output tokens over the full chain. GLM uses
-`reasoning_effort=low`; it cannot disable reasoning. DeepSeek uses its default
-reasoning settings. These caps allow reasoning and answer space but do not
-guarantee completion.
+Inference requests omit `max_tokens` and `reasoning_effort`, leaving output length and reasoning effort to the serving provider's defaults. Those defaults and the model's context window can still prevent completion. Such failures follow the existing fallback policy and cannot become a successful empty review.
 
 Only one completed assistant text choice with `finish_reason=stop` is accepted;
 tool calls, truncation, malformed JSON, extra fields, invalid locations, and more
@@ -260,10 +249,7 @@ retried automatically. A timed-out publication has an uncertain outcome; inspect
 the PR before re-running. The duplicate check protects a subsequent run when
 the review exists.
 
-GitHub GETs have at most three attempts, 20-second socket timeouts, and 1/2-second
-retry delays for rate limits/transient failures. Inference has a 90-second socket
-timeout; all requests have response-size limits and a 150-request operation
-budget. The read job has a 10-minute deadline and publication has five minutes.
+GitHub GETs have at most three attempts, 20-second socket timeouts, and 1/2-second retry delays for rate limits/transient failures. Inference has a 240-second socket timeout; the read job retains its 10-minute deadline. Individual HTTP responses are limited to 16 MiB by default to protect runner memory, including reasoning returned by the provider. Endpoint-specific issue metadata/tree limits and publication artifact/body limits remain. There is no cumulative HTTP request allowance; changed-file pagination is tied to the PR's reported file count, and duplicate-history scans remain bounded. Publication has a five-minute deadline.
 Provider response/error bodies never appear in diagnostics. Each attempted
 model logs one fixed record: allowlisted route/model, numeric HTTP status or
 null, outcome, allowlisted finish reason or `unknown`, assistant/text/tool-or-refusal
@@ -290,8 +276,7 @@ Verified against official documentation and public catalogs on 2026-10-17:
   distinct `User-Agent`, and a stable `x-opencode-session`.
 - [GLM API reference](https://docs.z.ai/api-reference/llm/chat-completion)
   documents always-enabled reasoning for GLM-5.3-Flash, `low/high/max` effort,
-  `max_tokens`, finish reasons, and token usage. Its output limit is much higher
-  than this client's caps; these bounds are local usage policy, not model limits.
+  `max_tokens`, finish reasons, and token usage. The client leaves reasoning effort and output length unset rather than overriding the provider defaults.
 - [DeepSeek Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion/)
   documents `max_tokens`, the `length` finish reason for exhausted output/context,
   and optional `usage.completion_tokens_details.reasoning_tokens`. The client
@@ -305,7 +290,7 @@ Verified against official documentation and public catalogs on 2026-10-17:
 
 Consult the current Go documentation and serving-provider privacy terms before
 sending sensitive code. Retention and training policies are provider policies,
-not client-enforced guarantees. A failed attempt can transmit the same bounded
+not client-enforced guarantees. A failed attempt can transmit the same supplied
 PR context to the next listed model/provider.
 
 Run offline fixtures and existing CI policy checks with:
