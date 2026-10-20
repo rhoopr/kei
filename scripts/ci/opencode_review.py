@@ -509,7 +509,7 @@ def require_default_dispatch(event):
 
 
 def review_target(http, event, mode):
-    """Resolve one PR from trusted event metadata; freeze manual head at prepare."""
+    """Authorize one explicit request; pin the API-resolved head at preparation."""
     repo = os.environ["GITHUB_REPOSITORY"]
     event_name = os.environ["GITHUB_EVENT_NAME"]
     if event_name == "workflow_dispatch":
@@ -518,16 +518,29 @@ def review_target(http, event, mode):
         require(isinstance(number_text, str) and re.fullmatch(r"[1-9][0-9]{0,8}", number_text),
                 "Manual PR number must be a positive canonical integer.")
         gh = GitHub(http, repo, int(number_text), os.environ["GH_TOKEN"])
-        head = (gh.api(gh.pull)["head"]["sha"] if mode == "prepare"
-                else os.environ.get("EXPECTED_HEAD_SHA", ""))
     else:
-        require(event_name == "pull_request_target", "Unsupported review event.")
-        pr = event["pull_request"]
-        require(pr["base"]["repo"]["full_name"] == repo, "Event repository mismatch.")
-        if pr["draft"]:
-            raise Skip("Draft PR; no review completed.")
-        gh = GitHub(http, repo, event["number"], os.environ["GH_TOKEN"])
-        head = pr["head"]["sha"]
+        require(event_name == "issue_comment", "Unsupported review event.")
+        comment, issue = event.get("comment", {}), event.get("issue", {})
+        author = comment.get("user", {})
+        body = comment.get("body")
+        if (event.get("action") != "created" or not issue.get("pull_request")
+                or not isinstance(body, str) or body.strip() != "/opencode review"
+                or author.get("type") != "User"):
+            raise Skip("Not a human-created PR review command; no review requested.")
+        repository = event["repository"]
+        require(repository["full_name"] == repo, "Comment repository mismatch.")
+        require(os.environ["GITHUB_REF"] == f"refs/heads/{repository['default_branch']}",
+                "Comment review must run from the default branch.")
+        login = author.get("login")
+        require(isinstance(login, str) and re.fullmatch(r"[A-Za-z0-9-]{1,39}", login),
+                "Invalid comment author.")
+        gh = GitHub(http, repo, issue["number"], os.environ["GH_TOKEN"])
+        # Association is not authority. Check current repository access at both stages.
+        permission = gh.api(f"{gh.root}/collaborators/{login}/permission")
+        if permission.get("permission") not in {"write", "maintain", "admin"}:
+            raise Skip("Review command requires repository write permission.")
+    head = (gh.api(gh.pull)["head"]["sha"] if mode == "prepare"
+            else os.environ.get("EXPECTED_HEAD_SHA", ""))
     require(isinstance(head, str) and SHA.fullmatch(head), "Invalid head SHA.")
     return gh, head
 

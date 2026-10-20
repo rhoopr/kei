@@ -1,14 +1,10 @@
 # OpenCode advisory reviews
 
-The `OpenCode advisory review` workflow reviews non-draft pull requests on
-`opened`, `synchronize`, `reopened`, and `ready_for_review`. It publishes one
-`github-actions[bot]` COMMENT review for each successfully reviewed head SHA.
-The review is advisory: demonstrable defects, regressions, and concrete missing
-safety coverage. Humans verify findings and decide whether to merge. It never
-approves, requests changes, fixes code, pushes branches, or merges. Do not add
-this workflow to required branch-protection checks. There is no backfill or
-scheduled review of existing PRs. A manual dispatch reviews exactly one selected
-PR without changing its branch or PR state.
+The `OpenCode advisory review` workflow reviews a non-draft PR when a human with repository write, maintain, or admin access posts a new standalone `/opencode review` comment in its conversation. Leading and trailing whitespace are allowed; case changes, quoted commands, code blocks, extra text, edited comments, bots, and comments on issues do not request a review. The script checks the author's current repository permission through GitHub at preparation and publication; author association alone never grants access. A permission lookup failure stops the run before inference or publication.
+
+PR opens, pushes, rebases, reopening, and marking ready do not trigger reviews. Post a new command after the head changes or a failed request. A successfully reviewed head is skipped on repeated commands, duplicate events, reruns, and dispatches: at most one bot COMMENT review per head SHA while that review remains present. A removed review can be recreated on a later explicit request. Requests pin the current PR head when preparation starts, rather than the head at comment creation; stale results are discarded.
+
+The review is advisory: demonstrable defects, regressions, and concrete missing safety coverage. Humans verify findings and decide whether to merge. It never approves, requests changes, fixes code, pushes branches, or merges. Do not add this workflow to required branch-protection checks. There is no backfill or scheduled review of existing PRs. Default-branch manual dispatch remains an explicit escape hatch for one selected PR.
 
 
 ## New issue intake
@@ -155,21 +151,9 @@ workflow changes themselves. For installation or replacement:
    compatible when absent or set to `glm-5.3-flash`. Other values are rejected.
    It cannot reorder or bypass the reviewed two-model policy. Changing the
    model order requires a code change.
-5. After the workflow is merged, run one manual review from the default branch:
-   `gh workflow run opencode-review.yml --repo rhoopr/kei --ref main -f pr_number=989`.
-   Alternatively use Actions > OpenCode advisory review > Run workflow, choose
-   the default branch, and enter one PR number. This invokes only this workflow;
-   it does not update the PR or dispatch Rust CI. Other branch/tag refs are
-   rejected. Draft/closed PRs and already-reviewed heads still skip.
-   Adding a secret/variable does not trigger a run or broad backfill. Re-running
-   an old run uses its original trusted workflow commit; after a script fix,
-   dispatch a new run from the updated default branch instead.
+5. After merge, request a review by posting `/opencode review` as a new PR conversation comment. For manual dispatch, use `gh workflow run opencode-review.yml --repo rhoopr/kei --ref main -f pr_number=989` or Actions > OpenCode advisory review > Run workflow, select the default branch, and enter one PR number. This does not update the PR or dispatch Rust CI. Other branch/tag refs are rejected. Draft/closed PRs and already-reviewed heads still skip. Adding a secret/variable does not trigger a run or broad backfill. Re-running an old run uses its original trusted workflow commit; after a script fix, post a new command or dispatch from the updated default branch.
 
-Manual PR numbers must be positive canonical integers. The read-only preparation
-step resolves the PR through GitHub and records its exact head as a job output.
-Publication receives that head, validates the artifact's repository/number/SHA,
-and rechecks current head as usual. Dispatch and PR events share the same per-PR
-concurrency group. There is no user-supplied checkout ref, endpoint, or code path.
+Manual PR numbers must be positive canonical integers. The read-only preparation step resolves the PR through GitHub and records its exact head as a job output. Publication receives that head, validates the artifact's repository/number/SHA, and rechecks current head as usual. Comment requests and dispatches share a per-PR publication concurrency group. There is no user-supplied checkout ref, endpoint, or code path.
 
 A missing key fails the inference step with `OPENCODE_API_KEY is missing; no
 review completed.` It does not publish a successful empty review. Draft, closed,
@@ -178,11 +162,7 @@ API/schema/diff validation does not establish a completed review.
 
 ## Trust boundary and publication
 
-`pull_request_target` supplies a trusted base-side workflow. Both jobs check out
-only `github.workflow_sha`, disable persisted checkout credentials, and run the
-base-side Python script in isolated mode. Never replace that ref with a PR head,
-merge ref, branch, or artifact. The workflow must already exist on the target
-branch; changes to its script in a PR are not executed by this review workflow.
+The `issue_comment` event supplies the workflow from the default branch; dispatch is restricted to that branch. Both jobs check out only `github.workflow_sha`, disable persisted checkout credentials, and run the trusted Python script in isolated mode. Never replace that ref with a PR head, merge ref, branch, or artifact. The workflow must already exist on the default branch; changes to its script in a PR are not executed by this review workflow.
 
 The first job has only `contents: read` and `pull-requests: read`. Its collection
 step uses GitHub's API to fetch metadata, complete patches, and source at
@@ -211,13 +191,7 @@ suppresses mentions/autolinks, and generates source links itself at the reviewed
 SHA. Findings can reference only surviving right-side hunk lines, including
 hunk context. Deleted files have no valid right-side finding location.
 
-Concurrency cancels older runs for the same PR. Duplicate detection requires the
-bot identity, COMMENTED state, exact commit ID, and the head-specific marker;
-an author cannot spoof it with a normal comment. At most 1,000 historical reviews
-are scanned, failing closed if absence cannot be established. GitHub has no
-atomic current-head-and-publish operation: a push can race the final check, but
-`commit_id` and the body always identify the reviewed SHA. A removed review can
-be recreated on a later run. Human judgment remains necessary.
+Comment runs are grouped by comment ID, so unrelated or unauthorized comments cannot cancel an authorized review. PR runs do not cancel in-progress runs. Publication is serialized per PR across comments and dispatches, with the duplicate check inside that serialized job. GitHub concurrency can replace a pending publication with a newer one; it does not guarantee FIFO ordering. Duplicate detection requires the bot identity, COMMENTED state, exact commit ID, and the head-specific marker; an author cannot spoof it with a normal comment. At most 1,000 historical reviews are scanned, failing closed if absence cannot be established. GitHub has no atomic current-head-and-publish operation: a push can race the final check, but `commit_id` and the body always identify the reviewed SHA. A removed review can be recreated on a later run. Human judgment remains necessary.
 
 ## Capacity, failures, and usage
 
@@ -303,7 +277,9 @@ missing secrets, malicious fork text and paths, complete/oversized diffs, contex
 limits, malformed/tool/truncated output, credentials, safe rendering, rate
 limits, uncertain publication, success at both model positions, HTTP/transport/invalid-completion fallback,
 no-overage gating, exhaustion of all models, forbidden model overrides, and the base-only workflow
-contract, default-branch dispatch, prepared-head propagation, invalid PR/ref
+contract, exact created-comment admission, bot/quoted/edited/non-PR rejection,
+current repository permission authorization instead of association, denied permission lookups,
+comment/dispatch publication serialization, default-branch dispatch, prepared-head propagation, invalid PR/ref
 rejection, and safe finish-reason/token/status diagnostics. They do not contact inference
 endpoints or execute Rust tests. The
 existing CI Python discovery already runs these fixtures.
