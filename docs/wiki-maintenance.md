@@ -2,13 +2,13 @@
 
 The wiki is independent `rhoopr/kei.wiki.git`. This repository does not generate or publish it. Keep long procedures in repository guides and link to exact reviewed revisions from wiki gateways. Publishing a repository PR does not publish the wiki, and updating the wiki does not merge a repository PR.
 
-## Run the checks
+## Run the checks manually
 
 Use Python 3.11 or newer and a full source clone with the pinned commits available. No extra Python packages are required. Clone the wiki separately, or use an existing clean isolated wiki worktree:
 
 ```sh
-python3 -m unittest discover -s scripts/ci -p test_wiki_docs.py
-python3 scripts/ci/wiki_docs.py --wiki /path/to/kei-wiki
+python3 -m unittest discover -s scripts/docs -p test_wiki_docs.py
+python3 scripts/docs/wiki_docs.py --wiki /path/to/kei-wiki
 ```
 
 `docs/wiki-contract.json` declares the supported stable version, its code revision, the reviewed guide revision, the exact wiki snapshot, a compatibility baseline, development reference revision, historical exceptions and explicit command argv fixtures. Check a candidate in a worktree at the declared `wiki_revision`; uncommitted candidate edits are inspected too. The output records the wiki HEAD. Require a clean final worktree when recording publication evidence.
@@ -18,14 +18,14 @@ The checker reads commands and long flags from the pinned CLI source, checks nes
 For supplementary offline parser checks against an already-built binary:
 
 ```sh
-python3 scripts/ci/wiki_docs.py --wiki /path/to/kei-wiki --binary /absolute/path/to/kei
+python3 scripts/docs/wiki_docs.py --wiki /path/to/kei-wiki --binary /absolute/path/to/kei
 ```
 
 Only the explicit argv fixtures execute, always with `--help`, a temporary home/data directory and a clean environment. Their ledger records the effects that the corresponding command would have without help. Examples containing Docker, command substitutions, credentials or placeholders are never executed. The output records the binary SHA-256; a package version string does not prove its source revision. Record the build's provenance separately before treating it as a release-binary qualification.
 
 These are bounded documentation checks, not a replacement for Clap's entire grammar or config resolution. Source flag checks do not prove value ranges, every conflict/requirement, shell portability, authentication, filesystem effects or safety of running a procedure. TOML checks cover syntax, known leaf keys and basic dictionary types; resolver ranges/enums need focused executable tests when changed. Markdown handling covers maintained headings, inline/reference links and wiki syntax; verify moved headings against GitHub's actual rendered IDs. External availability and live rendering are separate bounded publication checks.
 
-The `Wiki documentation contracts` workflow runs the regression fixtures and checks the declared wiki commit on changes to this tooling/contract. It checks a reproducible snapshot instead of making every build depend on the moving live wiki. The existing Home/binary guard remains in the code documentation job. Neither workflow publishes anything. If this workflow is newly added in a draft PR, it becomes maintained CI only after merge; do not describe it as active enforcement beforehand.
+These tools run manually against the declared wiki snapshot. This change adds no GitHub Actions workflow, job, trigger or required merge check. The regression tests live under `scripts/docs`, outside the existing `scripts/ci` test discovery. Existing repository lint and the existing Home/binary CI guard keep their current behavior; no unrelated workflow is changed. The tools do not publish anything.
 
 ## Release checklist
 

@@ -144,7 +144,7 @@ Reviews prioritize:
 
 ## Wiki documentation
 
-The wiki is a separate repository. Follow the [wiki maintenance checklist](docs/wiki-maintenance.md) for version-scoped command/configuration checks, canonical-guide ownership, URL compatibility and publication evidence. Repository tooling changes do not publish wiki content.
+The wiki is a separate repository. Follow the [wiki maintenance checklist](docs/wiki-maintenance.md) for manual version-scoped command/configuration checks, canonical-guide ownership, URL compatibility and publication evidence. Repository tooling changes do not publish wiki content.
 
 ## Logs and config snippets
 
