@@ -1,11 +1,8 @@
 # Migrating from `icloudpd`
 
-> Last updated on 5-26-26 for v0.20.0.
+> This guide retains v0.20 option mappings and historical path examples. Current stable guidance targets v0.25.3; read [Upgrade and account compatibility](v0.25.3-upgrade.md) before opening existing Kei state. Preview import before syncing an existing media archive.
 
-This guide is for moving an existing
-[`icloud-photos-downloader`](https://github.com/icloud-photos-downloader/icloud_photos_downloader)
-(`icloudpd`) library to kei without downloading everything again. It matches
-kei v0.20.
+This guide moves an existing [`icloud-photos-downloader`](https://github.com/icloud-photos-downloader/icloud_photos_downloader) (`icloudpd`) library to Kei while reusing eligible local files. It follows the current stable route and retains named historical mappings.
 
 Before importing, stop other writers and keep an independent backup of the
 archive and any existing kei state. Do not start the setup wizard's immediate
@@ -23,13 +20,16 @@ sync against an existing archive.
 kei can't reuse Python's `~/.pyicloud` cookies, so the first run still needs a
 fresh Apple login and 2FA approval. Your local photo files can stay in place.
 
-For containers, use the Docker `:latest` image or pin `:0.20.0`.
+For containers, pin `ghcr.io/rhoopr/kei:0.25.3` for this stable route; `latest` and main can change independently.
 
 ## If you're coming from old `icloudpd-rs`
 
-Current kei releases don't auto-copy files from the old `icloudpd-rs` paths at
-startup. If you still have data there, copy only what you need before the first
-run:
+The commands in this subsection record the old path migration. Current account-bound state does not reuse those auth filenames. For v0.25.3, preserve the old source, use fresh login, and follow [account-state adoption](account-state-migration.md) for a legacy Kei database; do not copy or rename old auth files into the new namespace. The historical examples below are not the current authentication procedure.
+
+Current Kei releases preserve and ignore the legacy authentication namespace. Use fresh authentication and the adoption procedure above. For reference, pre-account-bound migrations used the following path-copy commands; do not run them as the current upgrade procedure:
+
+<details>
+<summary>Historical path-copy example</summary>
 
 ```sh
 mkdir -p ~/.config/kei/cookies
@@ -37,8 +37,9 @@ cp ~/.config/icloudpd-rs/config.toml ~/.config/kei/config.toml
 cp ~/.icloudpd-rs/* ~/.config/kei/cookies/
 ```
 
-Skip any command whose source path doesn't exist. The old files can stay in
-place until you're sure kei is working.
+</details>
+
+Keep the old files preserved until the matched upgrade and backup checks are complete. These examples do not establish ownership or authorize replacing a current config file.
 
 ## Step 1: import the existing tree
 
@@ -111,10 +112,7 @@ or use it for one run:
 kei import-existing --config ~/.config/kei/config.toml --strict
 ```
 
-Strict mode fetches a small prefix from iCloud and compares it with the local
-file before adopting a same-name, same-size match. Mismatches show up as
-`Strict refusals` in the import summary. `--dry-run --strict` runs the same
-check without writing state rows.
+Strict mode fetches a small prefix from iCloud and compares it with the local file before adopting a same-name, same-size match. Mismatches show up as `Strict refusals` in the import summary. `--dry-run --strict` runs the same check without writing adoption rows. Database opening and authentication can still create runtime artifacts or migrate owned state; take the backup first.
 
 ## Match Python's path layout
 
@@ -265,10 +263,7 @@ For the full TOML option dictionary with defaults and valid values, see
 [`example.config.toml`](../example.config.toml) and the wiki
 [Configuration](https://github.com/rhoopr/kei/wiki/Configuration) page.
 
-After the first 2FA approval, kei stores session state under `data_dir`
-(default `~/.config/kei`; `KEI_DATA_DIR` can override it for automation). Run
-`kei password set` or `kei sync --save-password` if you want kei to store the
-password for future runs.
+After the first 2FA approval, kei stores session state under `data_dir` (default `~/.config/kei`; `KEI_DATA_DIR` can override it for automation). Run `kei password set` to store a prompted password for future runs. `sync --save-password` only persists a direct CLI/environment password; prompted, file, command and already-stored sources warn and do not save through that flag.
 
 ## Common flag mapping
 
@@ -298,7 +293,7 @@ password for future runs.
 | `--watch-with-interval` | `[watch].interval`; Docker uses `kei service run` | Built-in watch mode moved to durable config and service commands. |
 | `--log-level` | `--log-level` or `log_level` | `debug`, `info`, `warn`, `error`. |
 | `--only-print-filenames` | `--only-print-filenames` | Per-run flag that prints paths and doesn't download. |
-| `--dry-run` | `--dry-run` | Per-run flag that doesn't modify local state or iCloud. |
+| `--dry-run` | `--dry-run` | Skips media/adoption changes as appropriate; still authenticates and initializes runtime artifacts. Import can open/migrate owned state. |
 | `--notification-script` | `[notifications].script` | kei sends `KEI_EVENT`, `KEI_MESSAGE`, `KEI_ICLOUD_USERNAME`, per-cycle `KEI_*` stats, and `KEI_REPORT_JSON` when `[report].json` is configured. |
 
 ## Python flags without a kei equivalent
@@ -326,9 +321,9 @@ the same way.
 | `kei config show` | Print resolved config as TOML. |
 | `--config <path>` | Use a TOML config file. |
 | `--password-file <path>` | Read the password from a file or Docker secret. |
-| `--password-command <cmd>` | Read the password from a shell command. |
+| `--password-command <cmd>` | Read the password from Unix `sh -c`; unsupported on native Windows. |
 | `kei password set` | Store the password in the OS keyring or encrypted file backend. |
-| `--save-password` | Save the password after a successful auth. |
+| `--save-password` | On sync/service-run, persists only direct CLI/environment password input after auth; use `password set` for prompted/file/command input. |
 | `[filters].libraries` | Select primary, shared, all, named, or excluded iCloud libraries. |
 | `[filters].smart_folders` | Sync Favorites, Screenshots, Hidden, Recently Deleted, and other Apple smart folders across visible libraries when explicitly set. |
 | `[filters].unfiled = false` | Disable the separate pass for photos not in any user album. |
@@ -361,7 +356,7 @@ v0.20 removed the remaining v0.13 compatibility aliases:
 
 ## Docker migration
 
-Use `ghcr.io/rhoopr/kei:latest` or pin `ghcr.io/rhoopr/kei:0.20.0`. It uses `/config` and
+For the current stable route, use `ghcr.io/rhoopr/kei:0.25.3`. It uses `/config` and
 `/photos` volumes. The image runs `kei service run --config /config/config.toml`
 by default, with `KEI_DATA_DIR=/config` as container runtime glue. Set
 `[download].directory = "/photos"` in the config file. `service run` uses a
@@ -372,7 +367,7 @@ A minimal compose file:
 ```yaml
 services:
   kei:
-    image: ghcr.io/rhoopr/kei:0.20.0
+    image: ghcr.io/rhoopr/kei:0.25.3
     container_name: kei
     restart: unless-stopped
     stop_grace_period: 30s
@@ -405,18 +400,21 @@ sync env vars such as `KEI_DOWNLOAD_DIR` but no mounted config file. Move those
 durable settings into `/config/config.toml` and keep env for secrets or runtime
 glue.
 
-For a one-shot import against an existing mounted tree:
+For a one-shot import, stop the worker first and preview against the existing mounted tree. Use the Compose project directory and the same config; review unmatched results before removing `--dry-run`:
 
 ```sh
-docker exec kei kei import-existing --config /config/config.toml
+docker compose stop kei
+docker compose run --rm -it kei import-existing --config /config/config.toml --dry-run
 ```
 
 For headless 2FA:
 
 ```sh
-docker exec --user $(id -u):$(id -g) kei kei login get-code
-docker exec --user $(id -u):$(id -g) kei kei login submit-code 123456
+docker exec --user UID:GID kei kei login get-code --config /config/config.toml
+docker exec --user UID:GID kei kei login submit-code 123456 --config /config/config.toml
 ```
+
+Replace `UID:GID` with the numeric config owner (configured PUID/PGID, or `0:0` for the root default), not necessarily the SSH operator's IDs. This exec flow targets a running worker awaiting 2FA; resume the Compose project after reviewing the import if it is still stopped.
 
 ## Known output differences
 

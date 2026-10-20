@@ -9,7 +9,7 @@ files, temporary siblings, or the state database to make a warning disappear.
 | --- | --- | --- |
 | Inspect recorded progress | `kei status` | No repair |
 | Check recorded bytes | `kei verify --checksums` | Integrity diagnostics, not restoration |
-| Preview missing/truncated state | `kei reconcile --dry-run` | No writes |
+| Preview missing/truncated state | `kei reconcile --dry-run` | No repair-row changes; owned-state opening can still migrate the database |
 | Queue missing/truncated files | `kei reconcile` | SQLite state, not media |
 | Replace a recorded truncated file | `kei sync --repair-truncated` | Verified media replacement with explicit consent |
 | Refresh provider metadata | `kei sync --refresh-metadata` | Catalogue plus configured local outputs |
@@ -79,9 +79,7 @@ kei reconcile
 kei sync --repair-truncated
 ```
 
-Reconcile checks recorded paths and metadata-aware sizes, then marks missing
-or truncated downloads for retry. It reads media but writes state unless
-`--dry-run` is set. Periodic watch reconciliation also writes state.
+Reconcile checks recorded paths and metadata-aware sizes, then marks missing or truncated downloads for retry. It reads media and writes repair rows unless `--dry-run` is set. Even a preview opens owned state through the migration-capable opener, so take the cold backup before inspection with a newer binary. The opt-in periodic full reconciliation walk only warns; a separate automatic bounded pre-cycle probe can mark missing/truncated rows failed.
 
 Only explicit repair may replace an existing recorded truncated file. It
 requires the durable truncation marker, verifies the new download and configured
@@ -187,14 +185,7 @@ or rendition evidence becomes eligible immediately. Status reports unresolved
 identities and deferred retries separately from failed repair attempts.
 Deferral keeps the capture revision and checkpoint pending; it is not recovery.
 
-This state uses schema 34. Even `kei status` can migrate the database. Stop
-all workers and take a matched cold backup of the complete configuration/state
-directory and media/sidecars before upgrading. Binaries that support only
-schema 33 or earlier cannot open the upgraded database. Rollback requires
-the matched old state and media with the retained old binary; switching only
-the binary or restoring only the database is unsafe. Do not reset state or
-lower its schema version to bypass this check. See the
-[upgrade guide](v0.25-upgrade.md).
+Stable v0.25.3 uses schema 35. Even `kei status` can migrate an owned database. Stop all workers and take a matched cold backup of the complete configuration/state directory and media/sidecars before upgrading. Binaries that support schema 34 or earlier cannot open schema 35; sharing schema 35 does not establish safe downgrade compatibility. Rollback requires the matched old state and media with the retained old binary; switching only the binary or restoring only the database is unsafe. Do not reset state or lower its schema version to bypass this check. See the [v0.25.3 upgrade guide](v0.25.3-upgrade.md).
 
 Kei marks unresolved asset identity cycles incomplete. Status
 remains unsafe across restarts and successful syncs in other libraries until

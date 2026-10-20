@@ -69,11 +69,7 @@ Inspect metadata failures, not only downloaded/failed counts. This safe writer
 prevents the old corruption path; it does not detect or restore every historically
 damaged container. Capture-timestamp repair is not general HEIF repair.
 
-The writer still buffers whole files and can amplify memory use under concurrent
-writes. No universal memory ceiling is claimed. See the
-[validation record](v0.24-validation.md) and issues
-[#761](https://github.com/rhoopr/kei/issues/761) and
-[#817](https://github.com/rhoopr/kei/issues/817).
+Released v0.25.3 still buffers whole files and can amplify memory use under concurrent writes. Main after [#978](https://github.com/rhoopr/kei/commit/8d6e04b725e9af3f8c95b5d4ba9d7c6c886592f2) streams unchanged HEIF ranges and bounds retained control data; this change is absent from v0.25.3. No universal process-memory ceiling or physical filesystem qualification is established by either description. Supported-layout, fingerprint and publication checks still apply. Historical [v0.24 validation](v0.24-validation.md) describes that release candidate only.
 
 ## Sidecar ownership and convergence
 
