@@ -8,9 +8,10 @@ import re
 import shlex
 import subprocess
 import tempfile
-import tomllib
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+
+import tomllib
 
 
 class ContractError(ValueError):
@@ -80,7 +81,7 @@ def links(text):
         if match[1] not in definitions:
             raise ContractError(f"undefined link reference: {match[1]}")
         yield definitions[match[1]]
-    if re.search(r"\[[^]\n]+\]\([^\n)]*$", text, re.M):
+    if re.search(r"\[[^]\n]+\]\([^\n)]*$", text, re.MULTILINE):
         raise ContractError("malformed Markdown link")
 
 
@@ -143,7 +144,7 @@ def check_toml(text, keys, types):
 
 
 def struct_fields(cli, name):
-    match = re.search(r"pub struct " + name + r"\s*\{(.*?)\n\}", cli, re.S)
+    match = re.search(r"pub struct " + name + r"\s*\{(.*?)\n\}", cli, re.DOTALL)
     if not match:
         raise ContractError(f"missing CLI structure {name}")
     fields = set()
@@ -151,7 +152,7 @@ def struct_fields(cli, name):
     for field in re.finditer(r"(?m)^    pub ([a-z_]+):", match[1]):
         attributes = match[1][previous:field.start()]
         previous = field.end()
-        for argument in re.findall(r"#\[arg\((.*?)\)\]", attributes, re.S):
+        for argument in re.findall(r"#\[arg\((.*?)\)\]", attributes, re.DOTALL):
             long = re.search(r'\blong(?:\s*=\s*"([^"\n]+)")?(?=\s*[,)]|\s*$)', argument)
             if long:
                 fields.add(long[1] or field[1].replace("_", "-"))
@@ -266,7 +267,7 @@ def validate(repo, wiki, contract, binary=None):
     surface = command_surface(cli)
     value_flags = set()
     for owner in re.findall(r"pub struct ([A-Za-z]+) \{", cli):
-        body = re.search(r"pub struct " + owner + r" \{(.*?)\n\}", cli, re.S)[1]
+        body = re.search(r"pub struct " + owner + r" \{(.*?)\n\}", cli, re.DOTALL)[1]
         for field, kind in re.findall(r"(?m)^    pub ([a-z_]+): ([^,\n]+)", body):
             if kind.strip() != "bool":
                 value_flags.add(field.replace("_", "-"))
@@ -275,7 +276,7 @@ def validate(repo, wiki, contract, binary=None):
                            "service": "ServiceAction", "reset": "ResetCommand"}.items():
         if command not in contract["actions"]:
             continue
-        body = re.search(r"pub enum " + owner + r" \{(.*?)\n\}", cli, re.S)
+        body = re.search(r"pub enum " + owner + r" \{(.*?)\n\}", cli, re.DOTALL)
         if not body:
             raise ContractError(f"missing action owner {owner}")
         actual = {re.sub(r"(?<!^)(?=[A-Z])", "-", name).lower()
@@ -307,9 +308,10 @@ def validate(repo, wiki, contract, binary=None):
         for name, text in pages.items():
             for target in links(text):
                 url = urlsplit(target)
-                if url.netloc == "github.com" and url.path.startswith("/rhoopr/kei/blob/"):
-                    if url.path.split("/")[-1] in guides and profile["guide_revision"] not in url.path:
-                        raise ContractError(f"{name}: stale canonical guide revision")
+                if (url.netloc == "github.com" and url.path.startswith("/rhoopr/kei/blob/")
+                        and url.path.split("/")[-1] in guides
+                        and profile["guide_revision"] not in url.path):
+                    raise ContractError(f"{name}: stale canonical guide revision")
     legacy = {name for name, text in pages.items()
               if name.startswith("CLI") and "removed in v0.20" in text}
     if legacy:
