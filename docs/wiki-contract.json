@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "stable": {
+    "version": "0.25.3",
+    "source_revision": "a2081bfd109993c76f34ac13b12ee15b48c86008",
+    "guide_revision": "2c59e9962ea926b810abc814ab34aeea3658d08a"
+  },
+  "wiki_revision": "c51f350bba04688b0d5f9abad1f469ea0bac5a59",
+  "compatibility_revision": "5e7decd371ff186d8ca87600e2efeaa6920a283b",
+  "development_revision": "1d6187e2b7899f4cd55d94e382056558cd524b16",
+  "actions": {
+    "login": [
+      "get-code",
+      "submit-code"
+    ],
+    "password": [
+      "set",
+      "clear",
+      "backend"
+    ],
+    "list": [
+      "albums",
+      "libraries"
+    ],
+    "config": [
+      "show",
+      "setup"
+    ],
+    "service": [
+      "run",
+      "status"
+    ],
+    "reset": [
+      "session",
+      "state",
+      "sync-token"
+    ]
+  },
+  "historical_examples": [
+    {
+      "page": "v0.22-Migration",
+      "line": "kei --config ~/.config/kei/config.toml",
+      "reason": "Historical named-version migration example; not current stable syntax."
+    },
+    {
+      "page": "v0.22-Migration",
+      "line": "kei sync --config ~/.config/kei/config.toml",
+      "reason": "Historical named-version migration example; not current stable syntax."
+    },
+    {
+      "page": "v0.20-Migration",
+      "line": "kei sync --size adjusted --size original --size alternative",
+      "reason": "Historical named-version migration example; not current stable syntax."
+    },
+    {
+      "page": "v0.20-Migration",
+      "line": "kei service run --config /config/config.toml",
+      "reason": "Historical named-version migration example; not current stable syntax."
+    }
+  ],
+  "command_fixtures": [
+    {
+      "page": "Sync",
+      "argv": [
+        "sync",
+        "--recent",
+        "10"
+      ],
+      "without_help_effects": "Authenticates and writes selected media/state without help."
+    },
+    {
+      "page": "CLI\u2011dry-run",
+      "argv": [
+        "sync",
+        "--dry-run"
+      ],
+      "without_help_effects": "Authenticates and may write runtime artifacts; skips media download."
+    },
+    {
+      "page": "Login",
+      "argv": [
+        "login",
+        "get-code"
+      ],
+      "without_help_effects": "Contacts Apple and updates session material without help."
+    },
+    {
+      "page": "Login",
+      "argv": [
+        "login",
+        "submit-code",
+        "123456"
+      ],
+      "without_help_effects": "Contacts Apple and updates session material without help."
+    },
+    {
+      "page": "Password",
+      "argv": [
+        "password",
+        "set"
+      ],
+      "without_help_effects": "Stores a credential without help."
+    },
+    {
+      "page": "List",
+      "argv": [
+        "list",
+        "albums"
+      ],
+      "without_help_effects": "Contacts Apple without help."
+    },
+    {
+      "page": "Status",
+      "argv": [
+        "status",
+        "--failed"
+      ],
+      "without_help_effects": "Owned-state opening can migrate without help."
+    },
+    {
+      "page": "Verify",
+      "argv": [
+        "verify",
+        "--checksums"
+      ],
+      "without_help_effects": "Reads media and opens migration-capable owned state without help."
+    },
+    {
+      "page": "Reconcile",
+      "argv": [
+        "reconcile",
+        "--dry-run"
+      ],
+      "without_help_effects": "No repair-row changes; owned-state opening can migrate without help."
+    },
+    {
+      "page": "Import-Existing",
+      "argv": [
+        "import-existing",
+        "--dry-run",
+        "--strict"
+      ],
+      "without_help_effects": "Authenticates, may migrate owned state and read cloud prefix without help."
+    },
+    {
+      "page": "Manifest",
+      "argv": [
+        "manifest",
+        "--format",
+        "csv"
+      ],
+      "without_help_effects": "Read-only state export; refuses older schema without help."
+    },
+    {
+      "page": "Support",
+      "argv": [
+        "support-export",
+        "--output",
+        "support.json"
+      ],
+      "without_help_effects": "Writes one new offline export without help."
+    },
+    {
+      "page": "Service",
+      "argv": [
+        "service",
+        "run",
+        "--recent",
+        "10"
+      ],
+      "without_help_effects": "Long-running worker without help."
+    },
+    {
+      "page": "Install",
+      "argv": [
+        "install",
+        "--dry-run"
+      ],
+      "without_help_effects": "Renders service artifacts without help."
+    },
+    {
+      "page": "Config",
+      "argv": [
+        "config",
+        "show"
+      ],
+      "without_help_effects": "Prints resolved config without help."
+    }
+  ]
+}

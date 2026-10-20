@@ -1,0 +1,45 @@
+name: Wiki documentation contracts
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/wiki-docs.yml'
+      - 'scripts/ci/wiki_docs.py'
+      - 'scripts/ci/test_wiki_docs.py'
+      - 'docs/wiki-contract.json'
+      - 'docs/wiki-maintenance.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wiki-docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          version: 2026.8.10
+          sha256: 1f5e8795d24073904ef20ba70c1250ad6389d8c5672226d152e0ed24909ba72f
+          mise_toml: |
+            [tools]
+            actionlint = "1.7.12"
+            ruff = "0.16.3"
+      - name: Lint documentation tooling
+        run: |
+          ruff check scripts/ci/wiki_docs.py scripts/ci/test_wiki_docs.py
+          actionlint .github/workflows/wiki-docs.yml
+      - name: Run documentation checker regression fixtures
+        run: python3 -m unittest discover -s scripts/ci -p test_wiki_docs.py
+      - name: Check the pinned wiki snapshot
+        run: |
+          set -euo pipefail
+          git clone --no-checkout https://github.com/rhoopr/kei.wiki.git /tmp/kei-wiki-contract
+          revision=$(python3 -c 'import json; print(json.load(open("docs/wiki-contract.json"))["wiki_revision"])')
+          git -C /tmp/kei-wiki-contract checkout --detach "$revision"
+          python3 scripts/ci/wiki_docs.py --wiki /tmp/kei-wiki-contract

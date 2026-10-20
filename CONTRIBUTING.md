@@ -142,6 +142,10 @@ Reviews prioritize:
 - Keep internal APIs `pub(crate)` unless a public surface or test-harness
   precedent requires `pub`
 
+## Wiki documentation
+
+The wiki is a separate repository. Follow the [wiki maintenance checklist](docs/wiki-maintenance.md) for version-scoped command/configuration checks, canonical-guide ownership, URL compatibility and publication evidence. Repository tooling changes do not publish wiki content.
+
 ## Logs and config snippets
 
 Code must not log Apple IDs, passwords, session cookies, bearer tokens, or
