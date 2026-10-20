@@ -26,7 +26,7 @@ For containers, pin `ghcr.io/rhoopr/kei:0.25.3` for this stable route; `latest` 
 
 The commands in this subsection record the old path migration. Current account-bound state does not reuse those auth filenames. For v0.25.3, preserve the old source, use fresh login, and follow [account-state adoption](account-state-migration.md) for a legacy Kei database; do not copy or rename old auth files into the new namespace. The historical examples below are not the current authentication procedure.
 
-Current Kei releases preserve and ignore the legacy authentication namespace. Use fresh authentication and the adoption procedure above. For reference, pre-account-bound migrations used the following path-copy commands; do not run them as the current upgrade procedure:
+Current Kei releases don't auto-copy files from the old `icloudpd-rs` paths; they preserve and ignore the legacy authentication namespace. Use fresh authentication and the adoption procedure above. For reference, pre-account-bound migrations used the following path-copy commands; do not run them as the current upgrade procedure:
 
 <details>
 <summary>Historical path-copy example</summary>
