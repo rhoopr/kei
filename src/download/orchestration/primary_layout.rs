@@ -1065,13 +1065,30 @@ pub(in crate::download) async fn finish(
                 .map(SelectionPath::to_path)
                 .into_iter()
                 .chain(member.old.as_ref().map(|old| old.path.to_path()))
+                .chain(member.preserved_path.as_ref().map(SelectionPath::to_path))
+                .chain(member.retirement.as_ref().map(SelectionPath::to_path))
         })
         .collect();
     paths.sort();
     paths.dedup();
     let mut guards = Vec::new();
-    for path in paths {
-        guards.push(file::lock_download_destination(&path, cancel).await?);
+    for path in &paths {
+        guards.push(file::lock_download_destination(path, cancel).await?);
+    }
+    let protected: rustc_hash::FxHashSet<_> =
+        crate::download::legacy_preservation::protected_replacement_paths(Some(db))
+            .await?
+            .iter()
+            .map(|path| crate::fs_util::confined_path_key(path))
+            .collect::<std::io::Result<_>>()?;
+    for path in &paths {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(".xmp");
+        anyhow::ensure!(
+            !protected.contains(&crate::fs_util::confined_path_key(path)?)
+                && !protected.contains(&crate::fs_util::confined_path_key(Path::new(&sidecar))?),
+            "Primary layout overlaps protected legacy originals"
+        );
     }
 
     // Preserve every member before the first visible change, including sidecars.
@@ -1559,4 +1576,202 @@ pub(super) async fn recover(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DownloadConfig, EditedNaming, LayoutOperation, LayoutOutcome, LayoutSession, decision,
+        digest, family, file_receipt, finish, plan, sidecar,
+    };
+    use crate::state::SqliteStateDb;
+    use crate::test_helpers::{TestAssetRecord, TestPhotoAsset};
+    use rusqlite::types::Value;
+    use std::path::Path;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    const PREPARED: &[u8] = b"prepared current rendition";
+    const LEGACY: &[u8] = b"ambiguous legacy original";
+
+    async fn prepared_layout(
+        db: &Arc<SqliteStateDb>,
+        root: &Path,
+        filename: &str,
+    ) -> LayoutOperation {
+        let asset = TestPhotoAsset::new(filename)
+            .filename(filename)
+            .orig_size(PREPARED.len() as u64)
+            .orig_checksum("synthetic-provider-checksum")
+            .build();
+        let config = DownloadConfig {
+            directory: Arc::from(root),
+            folder_structure: String::new(),
+            edited_naming: EditedNaming::Primary,
+            state_db: Some(db.clone()),
+            ..DownloadConfig::test_default()
+        };
+        let session = LayoutSession::load(db.as_ref()).await.unwrap();
+        let mut op = plan(
+            &asset,
+            &config,
+            &session,
+            None,
+            family(&asset, &config).unwrap(),
+            decision(&asset, &config).unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(op.members.len(), 1);
+        let member = &mut op.members[0];
+        let stage = member.stage.as_ref().unwrap().to_path();
+        tokio::fs::create_dir_all(stage.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&stage, PREPARED).await.unwrap();
+        member.prepared = Some(
+            file_receipt(
+                root,
+                &stage,
+                "original",
+                "synthetic-provider-checksum",
+                Some(digest(PREPARED)),
+            )
+            .await
+            .unwrap(),
+        );
+        op.phase = "prepared".into();
+        db.save_primary_layout(op.clone()).await.unwrap();
+        op
+    }
+
+    fn durable_state(db: &SqliteStateDb) -> Vec<Vec<Vec<Value>>> {
+        let conn = db
+            .acquire_lock("snapshot protected layout fixture")
+            .unwrap();
+        [
+            "assets",
+            "asset_metadata_paths",
+            "asset_master_mappings",
+            "metadata",
+            "primary_layout_operations",
+            "primary_layout_members",
+            "primary_layout_claims",
+            "primary_layout_preserved",
+            "primary_layout_bindings",
+            "primary_layout_superseded_paths",
+            "asset_metadata_capture_revisions",
+        ]
+        .iter()
+        .map(|table| {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let columns = stmt.column_count();
+            stmt.query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn primary_layout_finish_protected_overlap_preserves_state_and_independent_progress() {
+        for sidecar_collision in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let database = dir.path().join("state.db");
+            let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+            let op = prepared_layout(&db, dir.path(), "current.jpg").await;
+            let destination = op.members[0].destination.as_ref().unwrap().to_path();
+            let stage = op.members[0].stage.as_ref().unwrap().to_path();
+            let protected = if sidecar_collision {
+                sidecar(&destination)
+            } else {
+                destination.clone()
+            };
+            tokio::fs::write(&protected, LEGACY).await.unwrap();
+            db.upsert_seen(&TestAssetRecord::new("legacy-master").build())
+                .await
+                .unwrap();
+            for child in ["legacy-child-one", "legacy-child-two"] {
+                db.upsert_asset_master_mapping("PrimarySync", child, "legacy-master")
+                    .await
+                    .unwrap();
+            }
+            // Simulate a legacy original discovered after the layout was prepared.
+            db.acquire_lock("seed late protected overlap").unwrap().execute(
+                "UPDATE assets SET status='downloaded',local_path=?1,local_checksum=?2 WHERE id='legacy-master'",
+                rusqlite::params![protected.to_str().unwrap(), digest(LEGACY)],
+            ).unwrap();
+            db.set_metadata("sync_token:PrimarySync", "retained")
+                .await
+                .unwrap();
+            let before = durable_state(&db);
+            drop(db);
+
+            for _ in 0..2 {
+                let db = SqliteStateDb::open(&database).await.unwrap();
+                let mut pending = db
+                    .primary_layout_operations("PrimarySync".into())
+                    .await
+                    .unwrap();
+                assert_eq!(pending.len(), 1);
+                let mut outcome = LayoutOutcome::default();
+                let error = finish(
+                    &db,
+                    &mut pending[0],
+                    &CancellationToken::new(),
+                    &mut outcome,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(tokio::fs::read(&protected).await.unwrap(), LEGACY);
+                assert_eq!(tokio::fs::read(&stage).await.unwrap(), PREPARED);
+                assert_eq!(destination.exists(), !sidecar_collision);
+                assert_eq!(durable_state(&db), before);
+                assert_eq!(outcome.downloaded, 0);
+                assert_eq!(outcome.preserved, 0);
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Primary layout overlaps protected legacy originals")
+                );
+            }
+
+            let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+            let mut independent = prepared_layout(&db, dir.path(), "independent.jpg").await;
+            finish(
+                db.as_ref(),
+                &mut independent,
+                &CancellationToken::new(),
+                &mut LayoutOutcome::default(),
+            )
+            .await
+            .unwrap();
+            let independent_path = independent.members[0]
+                .destination
+                .as_ref()
+                .unwrap()
+                .to_path();
+            assert_eq!(tokio::fs::read(independent_path).await.unwrap(), PREPARED);
+            assert!(
+                db.primary_layout_binding(independent.family)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(tokio::fs::read(&protected).await.unwrap(), LEGACY);
+            assert_eq!(
+                db.primary_layout_operations("PrimarySync".into())
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
 }

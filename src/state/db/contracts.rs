@@ -600,6 +600,7 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<HashSet<(String, String, String)>, StateError> {
         Ok(HashSet::new())
     }
+    /// Deny set includes unprepared ambiguous masters; membership is not a preservation receipt.
     async fn get_protected_legacy_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
         Ok(HashSet::new())
     }
@@ -955,12 +956,34 @@ pub trait MembershipStore: Send + Sync {
     }
 }
 
+/// Owner of replacement recovery for a recorded catalog source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMetadataRecovery {
+    Ordinary,
+    ProtectedLegacy,
+    ManagedPrimary,
+}
+
 /// Metadata rewrite markers and hashes.
 #[async_trait]
 pub trait MetadataRewriteStore: Send + Sync {
-    /// Managed slots are rewritten only by their preservation-backed layout owner.
+    /// Original media and exact sidecars protected before or after preparation.
+    async fn protected_legacy_paths(&self) -> Result<Vec<PathBuf>, StateError> {
+        Ok(Vec::new())
+    }
+
+    /// Managed slots and ambiguous originals require their preservation owner.
     async fn guard_primary_writer(&self, _path: &Path) -> Result<(), StateError> {
         Ok(())
+    }
+
+    /// Classify recovery ownership without authorizing an ordinary writer.
+    async fn source_metadata_recovery(
+        &self,
+        path: &Path,
+    ) -> Result<SourceMetadataRecovery, StateError> {
+        self.guard_primary_writer(path).await?;
+        Ok(SourceMetadataRecovery::Ordinary)
     }
 
     /// Finalized current-child rows with verified source provenance or explicit

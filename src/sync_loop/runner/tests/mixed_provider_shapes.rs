@@ -1115,8 +1115,20 @@ async fn mixed_legacy_reservation_blocks_preparation_repro() {
         crate::download::reconcile_catalog_paths(&passes, config, CancellationToken::new())
             .await
             .unwrap();
-    assert!(!result.complete, "unattributed identity remains unresolved");
+    assert!(
+        result.complete,
+        "independent catalogue paths are reconciled"
+    );
     assert_eq!(result.stats.downloaded, 0, "independent receipt is reused");
+    assert_eq!(
+        rows(
+            &database,
+            "SELECT * FROM metadata_capture_retries WHERE asset_id='legacy-master'"
+        )
+        .len(),
+        1,
+        "path completion cannot clear the legacy capture hold"
+    );
     drop(build);
     drop(db);
     let reopened = state::SqliteStateDb::open(&database).await.unwrap();

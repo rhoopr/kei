@@ -64,6 +64,49 @@ fn invalid() -> StateError {
     }
 }
 
+// Identity ambiguity protects originals even when pending metadata work makes
+// them ineligible for preservation preparation.
+const AMBIGUOUS_MASTERS: &str = "SELECT library,master_record_name FROM asset_master_mappings m
+    WHERE NOT EXISTS(SELECT 1 FROM legacy_master_state_owners o
+        WHERE o.library=m.library AND o.master_record_name=m.master_record_name)
+    AND NOT EXISTS(SELECT 1 FROM asset_master_mappings child
+        WHERE child.library=m.library AND child.asset_record_name=m.master_record_name)
+    GROUP BY library,master_record_name HAVING COUNT(*)>=2";
+
+pub(super) fn protected_ids(
+    conn: &Connection,
+) -> Result<std::collections::HashSet<(String, String)>, StateError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT library,asset_id FROM unattributed_legacy UNION {AMBIGUOUS_MASTERS}"
+    ))?;
+    Ok(stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?)
+}
+
+mod path_cache;
+
+pub(super) fn protected_paths(conn: &Connection) -> Result<Vec<PathBuf>, StateError> {
+    path_cache::protected_paths(conn)
+}
+
+pub(super) fn path_is_protected(
+    conn: &Connection,
+    path: &std::path::Path,
+) -> Result<bool, StateError> {
+    path_cache::path_is_protected(conn, path)
+}
+
+pub(super) fn guard_writer(conn: &Connection, path: &std::path::Path) -> Result<(), StateError> {
+    if path_is_protected(conn, path)? {
+        return Err(StateError::Invariant {
+            operation: "legacy_preservation",
+            detail: "ambiguous legacy original requires preservation".into(),
+        });
+    }
+    Ok(())
+}
+
 // Preserve SQLite values without lossy float/date formatting. Schema-versioned
 // column names and values are part of the receipt, not executable SQL input.
 pub(super) fn snapshot_rows(
@@ -387,8 +430,7 @@ impl SqliteStateDb {
                     || file.sha256.is_some()!=file.size.is_some()
                     || file.sha256.as_ref().is_some_and(|hash| hash.len()!=64 || !hash.bytes().all(|c|c.is_ascii_hexdigit())) { return Err(invalid()); }
                 let key=crate::fs_util::confined_path_key(&file.path).map_err(|_private_error|invalid())?;
-                if !keys.insert(key.clone()) { return Err(invalid()); }
-                if foreign_paths.contains(&key) { return Err(invalid()); }
+                if !keys.insert(key) { return Err(invalid()); }
             }
             // Every media path and its exact sidecar name must be represented.
             let required: std::collections::HashSet<_>=expected.paths.iter().flat_map(|path| {
@@ -398,6 +440,14 @@ impl SqliteStateDb {
             }).collect();
             if files.len()!=required.len() || files.iter().any(|file| !required.contains(&file.path))
                 || expected.paths.iter().any(|path| !files.iter().any(|file| &file.path==path && file.sha256.is_some())) { return Err(invalid()); }
+            if keys.iter().any(|key| foreign_paths.contains(key)) {
+                tracing::warn!(
+                    stage = "preparation",
+                    reason = "catalog_path_conflict",
+                    "Legacy preservation path is claimed by another catalogue asset; retaining attribution checkpoint hold"
+                );
+                return Ok(false);
+            }
             let encoded=serde_json::to_string(&files).map_err(|_private_error|invalid())?;
             tx.execute("INSERT INTO unattributed_legacy(library,asset_id,evidence_version,original_evidence,files,prepared_at) VALUES (?1,?2,1,?3,?4,?5)",params![expected.library,expected.asset_id,expected.evidence,encoded,Utc::now().timestamp()])?;
             for file in files {
@@ -1047,6 +1097,195 @@ mod tests {
         ];
         (db, snapshot, files)
     }
+    #[tokio::test]
+    async fn legacy_preservation_path_conflict_defers_only_its_family_after_reopen() {
+        for claim in ["media", "metadata_sidecar"] {
+            let dir = tempfile::tempdir().unwrap();
+            let database = dir.path().join("state.db");
+            let (db, snapshot, mut files) = seed(&database).await;
+            let sidecar = dir.path().join("original.jpg.xmp");
+            std::fs::write(&sidecar, b"legacy sidecar").unwrap();
+            files[1].sha256 = Some(
+                crate::download::file::compute_sha256(&sidecar)
+                    .await
+                    .unwrap(),
+            );
+            files[1].size = Some(14);
+            db.upsert_seen(&crate::test_helpers::TestAssetRecord::new("child-a").build())
+                .await
+                .unwrap();
+            if claim == "media" {
+                db.mark_downloaded(
+                    "PrimarySync",
+                    "child-a",
+                    "original",
+                    &files[0].path,
+                    files[0].sha256.as_deref().unwrap(),
+                    None,
+                )
+                .await
+                .unwrap();
+            } else {
+                db.acquire_lock("seed_child_sidecar_claim").unwrap().execute(
+                    "INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum) VALUES ('PrimarySync','child-a','original',?1,'provider')",
+                    [sidecar.to_str().unwrap()],
+                ).unwrap();
+            }
+            let independent = dir.path().join("independent.jpg");
+            std::fs::write(&independent, b"independent bytes").unwrap();
+            let checksum = crate::download::file::compute_sha256(&independent)
+                .await
+                .unwrap();
+            db.upsert_seen(
+                &crate::test_helpers::TestAssetRecord::new("z-independent")
+                    .size(17)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                "z-independent",
+                "original",
+                &independent,
+                &checksum,
+                None,
+            )
+            .await
+            .unwrap();
+            db.set_metadata_capture_revision_for_test("PrimarySync", "z-independent", 0);
+            for child in ["independent-a", "independent-b"] {
+                db.upsert_asset_master_mapping("PrimarySync", child, "z-independent")
+                    .await
+                    .unwrap();
+            }
+            let candidate = db
+                .get_metadata_capture_candidates("PrimarySync", 1, 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.asset_id == "z-independent")
+                .unwrap();
+            assert!(
+                db.defer_metadata_capture_ambiguity(&candidate, 1)
+                    .await
+                    .unwrap()
+            );
+            let independent_files = vec![
+                LegacyFileEvidence {
+                    root: dir.path().into(),
+                    path: independent.clone(),
+                    sha256: Some(checksum),
+                    size: Some(17),
+                },
+                LegacyFileEvidence {
+                    root: dir.path().into(),
+                    path: dir.path().join("independent.jpg.xmp"),
+                    sha256: None,
+                    size: None,
+                },
+            ];
+            let durable_rows = |db: &SqliteStateDb| {
+                let conn = db.acquire_lock("snapshot_conflict_state").unwrap();
+                [
+                    "assets",
+                    "asset_metadata_paths",
+                    "asset_metadata_capture_revisions",
+                    "metadata_capture_retries",
+                    "asset_master_mappings",
+                    "legacy_master_state_owners",
+                    "metadata",
+                ]
+                .map(|table| {
+                    super::snapshot_rows(
+                        &conn,
+                        &format!("SELECT * FROM {table} WHERE ?1 IS NOT NULL AND ?2 IS NOT NULL"),
+                        "PrimarySync",
+                        "all",
+                    )
+                    .unwrap()
+                })
+            };
+            let before = durable_rows(&db);
+            // An expected path conflict must not hide invalid later evidence.
+            for fault in ["path", "hash", "size", "duplicate", "missing_sidecar"] {
+                let mut malformed = files.clone();
+                match fault {
+                    "path" => malformed[1].path = dir.path().join("../outside.xmp"),
+                    "hash" => malformed[1].sha256 = Some("invalid".into()),
+                    "size" => malformed[1].size = None,
+                    "duplicate" => malformed.push(files[0].clone()),
+                    "missing_sidecar" => {
+                        malformed.pop();
+                    }
+                    _ => panic!("unexpected evidence fault"),
+                }
+                assert!(
+                    db.prepare_legacy_preservation(&snapshot, &malformed)
+                        .await
+                        .is_err(),
+                    "{claim}/{fault}"
+                );
+            }
+            assert_eq!(durable_rows(&db), before);
+            assert!(
+                crate::state::MetadataRewriteStore::guard_primary_writer(&db, &files[0].path)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                crate::state::MetadataRewriteStore::guard_primary_writer(&db, &sidecar)
+                    .await
+                    .is_err()
+            );
+            drop(db);
+            for cycle in 0..2 {
+                let db = SqliteStateDb::open(&database).await.unwrap();
+                let candidates = db
+                    .legacy_preparation_snapshots("PrimarySync", 64)
+                    .await
+                    .unwrap();
+                assert_eq!(candidates.len(), if cycle == 0 { 2 } else { 1 });
+                for candidate in candidates {
+                    let conflicted = candidate.asset_id == "master";
+                    let evidence = if conflicted {
+                        &files
+                    } else {
+                        &independent_files
+                    };
+                    assert_eq!(
+                        db.prepare_legacy_preservation(&candidate, evidence)
+                            .await
+                            .unwrap(),
+                        !conflicted
+                    );
+                }
+                let preserved = db.legacy_preservations("PrimarySync").await.unwrap();
+                assert_eq!(preserved.len(), 1);
+                assert_eq!(preserved[0].asset_id, "z-independent");
+                assert_eq!(preserved[0].files, independent_files);
+                assert_eq!(preserved[0].active_generation, None);
+                assert_eq!(durable_rows(&db), before, "{claim}/cycle={cycle}");
+                assert_eq!(std::fs::read(&files[0].path).unwrap(), b"legacy bytes");
+                assert_eq!(std::fs::read(&sidecar).unwrap(), b"legacy sidecar");
+                assert_eq!(std::fs::read(&independent).unwrap(), b"independent bytes");
+                assert!(!dir.path().join("independent.jpg.xmp").exists());
+                let conn = db
+                    .acquire_lock("assert_no_conflicting_preservation_paths")
+                    .unwrap();
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM unattributed_legacy_paths WHERE asset_id='master'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                    0
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn legacy_preservation_retains_mixed_rendition_dates_without_attribution() {
         let dir = tempfile::tempdir().unwrap();

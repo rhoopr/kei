@@ -1686,6 +1686,208 @@ async fn primary_layout_root_template_transitions_cover_all_pass_kinds() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn primary_layout_root_drift_holds_recorded_media_and_exact_sidecar_journals() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let server = server().await;
+    for sidecar_journal in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let edited = records(&server, Some(("edit-one", EDIT_ONE)));
+        let options = |media_directory| CycleOptions {
+            media_directory,
+            #[cfg(feature = "xmp")]
+            sidecar: true,
+            ..CycleOptions::default()
+        };
+        let (initial, _) = cycle_options(
+            root.path(),
+            edited.clone(),
+            false,
+            EditedNaming::Primary,
+            options("media"),
+        )
+        .await;
+        assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+        assert!(initial.db_sync_token_advance_safe);
+        let current = root.path().join("media/IMG_0501.JPG");
+        let archive = root.path().join("media/IMG_0501_original.JPG");
+        let sidecar = current.with_file_name("IMG_0501.JPG.xmp");
+        let packet = std::fs::read(&sidecar).ok();
+        let target = if sidecar_journal { &sidecar } else { &current };
+        let journal = target.with_file_name(format!(
+            ".kei-replace-{}",
+            data_encoding::HEXLOWER.encode(&Sha256::digest(target.file_name().unwrap().as_bytes()))
+        ));
+        std::fs::create_dir(&journal).unwrap();
+        std::fs::write(
+            journal.join("manifest.json"),
+            b"retained replacement evidence",
+        )
+        .unwrap();
+        let operations = db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_operations",
+        );
+        let claims = || {
+            rusqlite::Connection::open(root.path().join("state.db")).unwrap()
+                .query_row("SELECT group_concat(path_key || ':' || COALESCE(local_checksum,''), '|') FROM (SELECT path_key,local_checksum FROM primary_layout_claims ORDER BY path_key)", [], |row| row.get::<_, String>(0)).unwrap()
+        };
+        let original_claims = claims();
+        let requests = server.received_requests().await.unwrap().len();
+        // Each cycle reopens SQLite and must preserve the same held generation.
+        for _ in 0..2 {
+            let (held, lookups) = cycle_options(
+                root.path(),
+                edited.clone(),
+                false,
+                EditedNaming::Primary,
+                options("new-root"),
+            )
+            .await;
+            assert!(held.failed_count > 0, "{:?}", held.stats);
+            assert!(!held.db_sync_token_advance_safe);
+            assert_eq!(
+                lookups, 0,
+                "source inspection must precede provider planning"
+            );
+            assert_bytes(&current, EDIT_ONE);
+            assert_bytes(&archive, ORIGINAL);
+            assert_eq!(std::fs::read(&sidecar).ok(), packet);
+            assert_eq!(
+                std::fs::read(journal.join("manifest.json")).unwrap(),
+                b"retained replacement evidence"
+            );
+            assert!(
+                std::fs::read_dir(root.path().join("new-root"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            assert_eq!(
+                db_count(
+                    root.path(),
+                    "SELECT COUNT(*) FROM primary_layout_operations"
+                ),
+                operations
+            );
+            assert_eq!(claims(), original_claims);
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        }
+        // Remove only this synthetic journal, then prove recovery and steady state.
+        std::fs::remove_dir_all(&journal).unwrap();
+        for quiet in [false, true] {
+            let (resumed, _) = cycle_options(
+                root.path(),
+                edited.clone(),
+                quiet,
+                EditedNaming::Primary,
+                options("new-root"),
+            )
+            .await;
+            assert_eq!(resumed.failed_count, 0, "{:?}", resumed.stats);
+            assert!(resumed.db_sync_token_advance_safe);
+            assert_bytes(&root.path().join("new-root/IMG_0501.JPG"), EDIT_ONE);
+            assert_bytes(
+                &root.path().join("new-root/IMG_0501_original.JPG"),
+                ORIGINAL,
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        }
+    }
+}
+
+#[tokio::test]
+async fn primary_layout_root_drift_after_old_parent_moves_redownloads_then_stays_quiet() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let edited = records(&server, Some(("edit-one", EDIT_ONE)));
+    let options = |media_directory| CycleOptions {
+        media_directory,
+        #[cfg(feature = "xmp")]
+        sidecar: true,
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
+        root.path(),
+        edited.clone(),
+        false,
+        EditedNaming::Primary,
+        options("media"),
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    assert!(initial.db_sync_token_advance_safe);
+    let old_family: String = rusqlite::Connection::open(root.path().join("state.db"))
+        .unwrap()
+        .query_row("SELECT family FROM primary_layout_bindings", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let old_claims = || {
+        rusqlite::Connection::open(root.path().join("state.db")).unwrap()
+            .query_row("SELECT group_concat(path_key || ':' || COALESCE(local_checksum,''), '|') FROM (SELECT path_key,local_checksum FROM primary_layout_claims WHERE family=?1 ORDER BY path_key)", [&old_family], |row| row.get::<_, String>(0)).unwrap()
+    };
+    let original_claims = old_claims();
+    let moved = root.path().join("moved-media");
+    let sidecar_name = "IMG_0501.JPG.xmp";
+    let packet = std::fs::read(root.path().join("media").join(sidecar_name)).ok();
+    std::fs::rename(root.path().join("media"), &moved).unwrap();
+    let requests = server.received_requests().await.unwrap().len();
+    let (changed, lookups) = cycle_options(
+        root.path(),
+        edited.clone(),
+        false,
+        EditedNaming::Primary,
+        options("new-root"),
+    )
+    .await;
+    assert_eq!(changed.failed_count, 0, "{:?}", changed.stats);
+    assert!(changed.db_sync_token_advance_safe);
+    assert!(lookups > 0, "missing sources must reach their layout owner");
+    assert!(changed.stats.downloaded > 0);
+    let resumed_requests = server.received_requests().await.unwrap().len();
+    assert!(
+        resumed_requests > requests,
+        "missing owned sources must be downloaded"
+    );
+    let operations = db_count(
+        root.path(),
+        "SELECT COUNT(*) FROM primary_layout_operations",
+    );
+    let (quiet, lookups) = cycle_options(
+        root.path(),
+        edited,
+        true,
+        EditedNaming::Primary,
+        options("new-root"),
+    )
+    .await;
+    assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+    assert!(quiet.db_sync_token_advance_safe);
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(lookups, 0);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        resumed_requests
+    );
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_operations"
+        ),
+        operations
+    );
+    assert_eq!(old_claims(), original_claims);
+    assert!(!root.path().join("media").exists());
+    for directory in [moved, root.path().join("new-root")] {
+        assert_bytes(&directory.join("IMG_0501.JPG"), EDIT_ONE);
+        assert_bytes(&directory.join("IMG_0501_original.JPG"), ORIGINAL);
+        assert_eq!(std::fs::read(directory.join(sidecar_name)).ok(), packet);
+    }
+}
+
 #[tokio::test]
 async fn primary_layout_stale_writers_and_downloaded_receipts_cannot_finalize_current_slots() {
     let server = server().await;

@@ -1995,6 +1995,7 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_legacy_proof_refusal",
         "classify_provider_lookup_error",
         "classify_rate_limit_error",
+        "classify_reconciliation_io_error",
         "classify_selection_confirmation_error",
         "classify_selection_incremental_error",
         "classify_shadow_page_error",

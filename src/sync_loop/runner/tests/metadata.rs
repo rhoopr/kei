@@ -4521,7 +4521,7 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     assert!(warning.contains("invalid_original_files=1"));
                     assert!(warning.contains("shared_file_links=1"));
                     assert!(warning.contains("no_current_child=0"));
-                    assert!(warning.contains("stale_candidates=0"));
+                    assert!(warning.contains("deferred_candidates=0"));
                     assert!(!warning.contains("legacy-master"));
                     assert!(!warning.contains("photo.jpg"));
                 }

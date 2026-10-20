@@ -2727,10 +2727,9 @@ mod wiremock_tests {
         )
         .await
         .unwrap();
-        assert_eq!(stats.matched, 1);
-        let rows = all_downloaded(db.as_ref()).await;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id.as_ref(), "child-913");
+        // Missing ownership evidence also prevents deriving the protected-path census.
+        assert_eq!(stats.matched, 0);
+        assert!(all_downloaded(db.as_ref()).await.is_empty());
         assert_eq!(
             db.get_pending().await.unwrap().len(),
             1,

@@ -49,7 +49,8 @@ mod temp_files;
 pub use contracts::{
     AlbumMembershipRecord, CaptureRepairReceipt, DownloadStateStore, ImportStateStore,
     ImportedRecord, MembershipStore, MetadataRewriteCompletion, MetadataRewriteQueue,
-    MetadataRewriteStore, PendingMetadataRewrite, ReportStateStore, SyncTokenStore,
+    MetadataRewriteStore, PendingMetadataRewrite, ReportStateStore, SourceMetadataRecovery,
+    SyncTokenStore,
 };
 pub(crate) use contracts::{
     AssetGroupingRows, AssetVerificationState, CheckpointTransition, DownloadContextStateStore,

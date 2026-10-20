@@ -22,19 +22,7 @@ pub(crate) async fn protected_replacement_paths(
     db: Option<&dyn DownloadStore>,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let Some(db) = db else { return Ok(Vec::new()) };
-    let libraries: FxHashSet<_> = db
-        .get_protected_legacy_ids()
-        .await?
-        .into_iter()
-        .map(|(library, _)| library)
-        .collect();
-    let mut paths = Vec::new();
-    for library in libraries {
-        for record in db.legacy_preservations(&library).await? {
-            paths.extend(record.files.into_iter().map(|file| file.path));
-        }
-    }
-    Ok(paths)
+    Ok(db.protected_legacy_paths().await?)
 }
 
 const INVENTORY_RETRY_SECONDS: i64 = 60 * 60;
@@ -327,7 +315,7 @@ impl LegacyCycle {
                     let mut no_current_child = 0usize;
                     let mut invalid_original_files = 0usize;
                     let mut shared_file_links = 0usize;
-                    let mut stale_candidates = 0usize;
+                    let mut deferred_candidates = 0usize;
                     for candidate in candidates {
                         if !inventory
                             .children
@@ -367,19 +355,19 @@ impl LegacyCycle {
                         }
                         if valid {
                             if !db.prepare_legacy_preservation(&candidate, &files).await? {
-                                stale_candidates += 1;
+                                deferred_candidates += 1;
                             }
                         } else {
                             invalid_original_files += 1;
                         }
                     }
-                    if no_current_child + invalid_original_files + stale_candidates > 0 {
+                    if no_current_child + invalid_original_files + deferred_candidates > 0 {
                         tracing::warn!(
                             stage = "preparation",
                             no_current_child,
                             invalid_original_files,
                             shared_file_links,
-                            stale_candidates,
+                            deferred_candidates,
                             "Legacy preservation candidates remain unresolved; retaining attribution checkpoint hold"
                         );
                     }

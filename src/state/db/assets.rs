@@ -1331,10 +1331,7 @@ impl DownloadStateStore for SqliteStateDb {
 
     async fn get_protected_legacy_ids(&self) -> Result<HashSet<(String, String)>, StateError> {
         self.with_conn("get_protected_legacy_ids", |conn| {
-            let mut stmt = conn.prepare("SELECT library,asset_id FROM unattributed_legacy")?;
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<Result<HashSet<_>, _>>()
-                .map_err(StateError::from)
+            super::legacy_preservation::protected_ids(conn)
         })
         .await
     }

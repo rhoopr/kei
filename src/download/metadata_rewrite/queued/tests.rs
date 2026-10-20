@@ -1751,6 +1751,197 @@ async fn sidecar_retry_recovers_exif_less_media_and_keeps_marker_for_unreadable_
     );
 }
 
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn run_pending_defers_unprepared_legacy_originals_and_keeps_independent_progress() {
+    use crate::state::db::LegacyFileEvidence;
+    use crate::state::types::AssetMetadata;
+    use crate::state::{DownloadStateStore, SqliteStateDb};
+
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("state.db");
+    let db = SqliteStateDb::open(&database).await.unwrap();
+    let original = dir.path().join("original.jpg");
+    let sidecar = dir.path().join("original.jpg.xmp");
+    let original_bytes = minimal_jpeg_bytes();
+    std::fs::write(&original, &original_bytes).unwrap();
+    std::fs::write(&sidecar, b"historical operator sidecar").unwrap();
+    let checksum = crate::download::file::compute_sha256(&original)
+        .await
+        .unwrap();
+    let metadata = AssetMetadata {
+        rating: Some(4),
+        metadata_hash: Some("fresh".into()),
+        ..AssetMetadata::default()
+    };
+    for id in ["master", "child-a"] {
+        db.upsert_seen(
+            &crate::test_helpers::TestAssetRecord::new(id)
+                .metadata(metadata.clone())
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.mark_downloaded("PrimarySync", id, "original", &original, &checksum, None)
+            .await
+            .unwrap();
+    }
+    db.set_metadata_capture_revision_for_test("PrimarySync", "master", 0);
+    for child in ["child-a", "child-b"] {
+        db.upsert_asset_master_mapping("PrimarySync", child, "master")
+            .await
+            .unwrap();
+    }
+    let candidate = db
+        .get_metadata_capture_candidates("PrimarySync", 1, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.asset_id == "master")
+        .unwrap();
+    assert!(
+        db.defer_metadata_capture_ambiguity(&candidate, 1)
+            .await
+            .unwrap()
+    );
+    db.set_metadata("sync_token:PrimarySync", "before")
+        .await
+        .unwrap();
+    let snapshot = db
+        .legacy_preparation_snapshots("PrimarySync", 64)
+        .await
+        .unwrap()
+        .remove(0);
+    let files = vec![
+        LegacyFileEvidence {
+            root: dir.path().into(),
+            path: original.clone(),
+            sha256: Some(checksum.clone()),
+            size: Some(original_bytes.len() as u64),
+        },
+        LegacyFileEvidence {
+            root: dir.path().into(),
+            path: sidecar.clone(),
+            sha256: Some(
+                crate::download::file::compute_sha256(&sidecar)
+                    .await
+                    .unwrap(),
+            ),
+            size: Some(b"historical operator sidecar".len() as u64),
+        },
+    ];
+    assert!(
+        !db.prepare_legacy_preservation(&snapshot, &files)
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.legacy_preservations("PrimarySync")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Both original and current-child debt must survive; preparation eligibility
+    // cannot define protection once these ordinary rewrite markers exist.
+    for id in ["master", "child-a"] {
+        db.record_metadata_write_failure("PrimarySync", id, "original")
+            .await
+            .unwrap();
+    }
+    let independent = dir.path().join("independent.jpg");
+    std::fs::write(&independent, minimal_jpeg_bytes()).unwrap();
+    let independent_checksum = crate::download::file::compute_sha256(&independent)
+        .await
+        .unwrap();
+    seed_downloaded_marker(
+        &db,
+        "independent",
+        "independent.jpg",
+        &independent,
+        &independent_checksum,
+        metadata,
+        None,
+    )
+    .await;
+    let original_state = |db: &SqliteStateDb| {
+        let conn = db.acquire_lock("original_rewrite_state").unwrap();
+        [
+            ("assets", "id"),
+            ("asset_metadata_paths", "id"),
+            ("metadata_capture_retries", "asset_id"),
+        ]
+        .map(|(table, id)| {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT * FROM {table} WHERE {id} IN ('master','child-a') ORDER BY 1,2,3"
+                ))
+                .unwrap();
+            let columns = stmt.column_count();
+            stmt.query_map([], |row| {
+                (0..columns)
+                    .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        })
+    };
+    let before = original_state(&db);
+    drop(db);
+    for cycle in 0..2 {
+        let db = SqliteStateDb::open(&database).await.unwrap();
+        let protected =
+            crate::download::legacy_preservation::protected_replacement_paths(Some(&db))
+                .await
+                .unwrap();
+        assert!(protected.contains(&original) && protected.contains(&sidecar));
+        let ids = db.get_protected_legacy_ids().await.unwrap();
+        assert!(ids.contains(&("PrimarySync".into(), "master".into())));
+        assert!(!ids.contains(&("PrimarySync".into(), "independent".into())));
+        let pass = run_pending(
+            &db,
+            MetadataFlags::RATING | MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR,
+            Arc::from(".meta-tmp"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            std::fs::read(&original).unwrap() == original_bytes,
+            "pending rewrite mutated ambiguous legacy media"
+        );
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            b"historical operator sidecar"
+        );
+        assert_eq!(pass.applied, usize::from(cycle == 0));
+        assert_eq!(pass.failed, 2);
+        let pending = db.get_pending_metadata_rewrites(10).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(
+            pending
+                .iter()
+                .all(|row| matches!(row.id.as_ref(), "master" | "child-a"))
+        );
+        assert_eq!(original_state(&db), before);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("before")
+        );
+        assert!(
+            db.legacy_preservations("PrimarySync")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_ne!(std::fs::read(&independent).unwrap(), original_bytes);
+        assert!(dir.path().join("independent.jpg.xmp").exists());
+    }
+}
+
 /// End-to-end test of the metadata-rewrite pass. Seeds a downloaded row
 /// with a `metadata_write_failed_at` marker, then proves the configured
 /// metadata is applied while durable download state remains coherent.

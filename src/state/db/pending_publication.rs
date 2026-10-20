@@ -80,6 +80,9 @@ fn owns_publication(
     proof: &PendingPublicationRecord,
 ) -> Result<bool, StateError> {
     let key = confined_key(&proof.local_path)?;
+    if super::legacy_preservation::path_is_protected(conn, &proof.local_path)? {
+        return Ok(false);
+    }
     let mut catalog = conn.prepare_cached(
         "SELECT library,id,version_size,local_path FROM assets WHERE local_path IS NOT NULL \
          UNION SELECT library,id,version_size,local_path FROM asset_metadata_paths",

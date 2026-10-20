@@ -27,6 +27,12 @@ pub(crate) struct PathReconciliationResult {
     pub(crate) stats: SyncStats,
 }
 
+fn classify_reconciliation_io_error(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
+    error
+        .downcast_ref::<std::io::Error>()
+        .map(std::io::Error::kind)
+}
+
 async fn requeue_missing_catalog_file(
     db: &dyn DownloadStore,
     task: &DownloadTask,
@@ -140,9 +146,76 @@ pub(crate) async fn reconcile_catalog_paths_with_client(
     // Root drift can leave interrupted media or sidecar transactions outside
     // the newly configured tree. Restore them before planning reads the source.
     for record in &records {
-        if let Some(path) = &record.local_path
-            && let Err(error) = file::recover_metadata_replacements(path).await
-        {
+        let Some(path) = &record.local_path else {
+            continue;
+        };
+        match db.source_metadata_recovery(path).await {
+            Ok(crate::state::db::SourceMetadataRecovery::ProtectedLegacy) => {
+                tracing::warn!(
+                    stage = "path_reconciliation",
+                    reason = "protected_legacy_source",
+                    "Deferring protected legacy source recovery"
+                );
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    stage = "path_reconciliation",
+                    reason = "source_writer_guard_failed",
+                    "Could not authorize recorded source recovery; keeping catalogue paths and checkpoints unchanged"
+                );
+                return Ok(PathReconciliationResult {
+                    stats: SyncStats {
+                        failed: 1,
+                        ..SyncStats::default()
+                    },
+                    ..PathReconciliationResult::default()
+                });
+            }
+            Ok(crate::state::db::SourceMetadataRecovery::ManagedPrimary) => {
+                // Committed layouts have no pending operation to recover old-root journals.
+                let inspection = async {
+                    let root = path
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("Recorded source has no parent"))?;
+                    let mut name = path
+                        .file_name()
+                        .ok_or_else(|| anyhow::anyhow!("Recorded source has no filename"))?
+                        .to_os_string();
+                    name.push(".xmp");
+                    let sidecar = path.with_file_name(name);
+                    for target in [path, &sidecar] {
+                        match file::has_replacement_journal(root, target).await {
+                            Ok(true) => return Ok(true),
+                            Ok(false) => {}
+                            // A moved old parent leaves no journal at this recorded path.
+                            Err(error)
+                                if classify_reconciliation_io_error(&error)
+                                    == Some(std::io::ErrorKind::NotFound) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    anyhow::Ok(false)
+                }
+                .await;
+                if !matches!(inspection, Ok(false)) {
+                    tracing::warn!(
+                        reason = "managed_source_replacement_pending",
+                        "Managed source replacement needs its layout owner; keeping catalogue paths and checkpoints unchanged"
+                    );
+                    return Ok(PathReconciliationResult {
+                        stats: SyncStats {
+                            failed: 1,
+                            ..SyncStats::default()
+                        },
+                        ..PathReconciliationResult::default()
+                    });
+                }
+                continue;
+            }
+            Ok(crate::state::db::SourceMetadataRecovery::Ordinary) => {}
+        }
+        if let Err(error) = file::recover_metadata_replacements(path).await {
             tracing::warn!(error = %format!("{error:#}"), "Could not recover recorded source; keeping catalogue paths and checkpoints unchanged");
             return Ok(PathReconciliationResult {
                 complete: false,

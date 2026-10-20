@@ -218,13 +218,19 @@ pub(super) fn guard_downloaded_checksum(
     Ok(())
 }
 
-pub(super) fn guard_writer(conn: &Connection, path: &std::path::Path) -> Result<(), StateError> {
-    let managed: bool = conn.query_row(
+pub(super) fn path_is_managed(
+    conn: &Connection,
+    path: &std::path::Path,
+) -> Result<bool, StateError> {
+    Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM primary_layout_claims WHERE path_key=?1)",
         [path_key(path)?],
         |r| r.get(0),
-    )?;
-    if managed {
+    )?)
+}
+
+pub(super) fn guard_writer(conn: &Connection, path: &std::path::Path) -> Result<(), StateError> {
+    if path_is_managed(conn, path)? {
         return Err(invalid(
             "managed primary slot requires its layout publication owner",
         ));

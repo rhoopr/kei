@@ -1798,8 +1798,17 @@ schema and never migrate it.
 
 Preparation protects the original catalogue rows, capture revisions, retry
 receipts, relationship history, media paths and sidecar presence. It preserves
-the old checkpoint. A complete unfiltered zone inventory must cover hidden
-children, all pages, an explicit completion marker and a nonblank final cursor.
+the old checkpoint. A valid original path already claimed by another catalogue
+asset defers that family without creating preservation receipts or changing its
+ownership, retries or checkpoint. Independent families in the same preparation
+scan can still progress; malformed evidence remains an error. Before preparation,
+unclaimed masters with multiple historical children already protect every
+catalogued original path and its exact `.xmp` sidecar across libraries. Pending
+metadata debt does not remove that protection. Ordinary writers, import adoption,
+publication proofs, layout handovers and replacement recovery share this path
+census; deferred originals retain their rewrite markers. A complete
+unfiltered zone inventory must cover hidden children, all pages, an explicit
+completion marker and a nonblank final cursor.
 Each scan is limited to 10,000 pages and 1,000,000 observed records. It retains
 compact latest identity/reference/deletion evidence for unrelated records and
 full latest records for candidate masters and children, then hydrates those
@@ -1885,6 +1894,15 @@ tombstones respect the protection before byte writes; SQL guards provide defense
 in depth. `reconcile` reports drift in protected originals without converting
 them into download retries. Verification and manifest export retain the original
 identities, dates, paths and history; download status does not establish ownership.
+Unprepared ambiguous originals use the same protection census, including supported
+relative paths and their exact sidecars. A connection-local SQLite TEMP cache
+indexes confined path keys; relevant identity and path changes invalidate it
+transactionally, and external commits, schema changes and working-directory
+changes require a fresh census. Ordinary writes and mapping timestamp refreshes
+do not rebuild it. This cache does not change durable preservation evidence.
+Source metadata recovery distinguishes protected legacy originals from healthy
+managed primary-layout sources. Managed sources continue through their layout
+owner; pending media or sidecar replacement journals still hold reconciliation.
 
 The final SQLite transaction compares the original snapshot, current child and
 family evidence, receipt generation, configuration metadata and prior cursor.
