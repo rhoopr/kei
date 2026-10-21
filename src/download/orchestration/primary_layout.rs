@@ -1774,4 +1774,54 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn primary_layout_recover_protected_overlap_keeps_later_operations_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("state.db");
+        let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+        for filename in ["first.jpg", "second.jpg"] {
+            let mut op = prepared_layout(&db, dir.path(), filename).await;
+            op.phase = "preserved".into();
+            db.save_primary_layout(op.clone()).await.unwrap();
+            op.phase = "publishing".into();
+            db.save_primary_layout(op).await.unwrap();
+        }
+        // Use the durable coordinator ordering, not assumed filename ordering.
+        let operations = db.primary_layout_operations("PrimarySync".into()).await.unwrap();
+        assert_eq!(operations.len(), 2);
+        let protected = operations[0].members[0].destination.as_ref().unwrap().to_path();
+        let later = operations[1].members[0].destination.as_ref().unwrap().to_path();
+        tokio::fs::write(&protected, LEGACY).await.unwrap();
+        db.upsert_seen(&TestAssetRecord::new("legacy-master").build()).await.unwrap();
+        for child in ["legacy-child-one", "legacy-child-two"] {
+            db.upsert_asset_master_mapping("PrimarySync", child, "legacy-master").await.unwrap();
+        }
+        db.acquire_lock("seed coordinator protected overlap").unwrap().execute(
+            "UPDATE assets SET status='downloaded',local_path=?1,local_checksum=?2 WHERE id='legacy-master'",
+            rusqlite::params![protected.to_str().unwrap(), digest(LEGACY)],
+        ).unwrap();
+        db.set_metadata("sync_token:PrimarySync", "retained").await.unwrap();
+        let before = durable_state(&db);
+        drop(db);
+        for _ in 0..2 {
+            let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+            let config = DownloadConfig {
+                directory: Arc::from(dir.path()),
+                state_db: Some(db.clone()),
+                ..DownloadConfig::test_default()
+            };
+            let error = super::recover(
+                &reqwest::Client::new(), &[], &config, &CancellationToken::new()
+            ).await.unwrap_err();
+            assert!(error.to_string().contains("Primary layout overlaps protected legacy originals"));
+            assert_eq!(durable_state(&db), before);
+            assert_eq!(tokio::fs::read(&protected).await.unwrap(), LEGACY);
+            assert!(!later.exists(), "the coordinator must not claim independent continuation");
+            for op in &operations {
+                let stage = op.members[0].stage.as_ref().unwrap().to_path();
+                assert_eq!(tokio::fs::read(stage).await.unwrap(), PREPARED);
+            }
+        }
+    }
+
 }

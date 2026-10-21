@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::commands::{AlbumPass, PassKind};
 use crate::download::{file, filter, paths};
 use crate::icloud::photos::{PhotoAsset, PhotosSession};
-use crate::state::{ReconciliationStateStore, SqliteStateDb, VersionSizeKey};
+use crate::state::{DownloadStateStore, ReconciliationStateStore, SqliteStateDb, VersionSizeKey};
 use crate::test_helpers::{
     MockPhotosFlow, TestAssetRecord, mock_photo_records_for_zone_with_filename,
 };
@@ -3181,3 +3181,64 @@ async fn path_reconciliation_copies_catalog_file_without_provider_inventory() {
 
 #[path = "issue_770_recovery.rs"]
 mod issue_770_recovery;
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn path_reconciliation_missing_protected_parents_preserve_debt_and_allow_independent_move() {
+    for protected_library in ["PrimarySync", "UnselectedShared"] {
+        let root = TempDir::new().unwrap();
+        let database = root.path().join("state.db");
+        let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+        let source = root.path().join("old/independent.jpg");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let bytes = vec![0u8; 1024];
+        std::fs::write(&source, &bytes).unwrap();
+        let checksum = file::compute_sha256(&source).await.unwrap();
+        db.upsert_seen(&TestAssetRecord::new("INDEPENDENT")
+            .filename("independent.jpg").checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .size(1024).build()).await.unwrap();
+        db.mark_downloaded("PrimarySync", "INDEPENDENT", "original", &source, &checksum, None).await.unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", "asset-INDEPENDENT", "INDEPENDENT").await.unwrap();
+        let missing = root.path().join("absent/old/protected.jpg");
+        db.upsert_seen(&TestAssetRecord::new("legacy-master").library(protected_library)
+            .filename("protected.jpg").size(1024).build()).await.unwrap();
+        db.mark_downloaded(protected_library, "legacy-master", "original", &missing, "preserved-checksum", None).await.unwrap();
+        for child in ["legacy-one", "legacy-two"] {
+            db.upsert_asset_master_mapping(protected_library, child, "legacy-master").await.unwrap();
+        }
+        db.set_metadata("sync_token:PrimarySync", "retained-primary").await.unwrap();
+        db.set_metadata("sync_token:UnselectedShared", "retained-shared").await.unwrap();
+        let records = mock_photo_records_for_zone_with_filename("INDEPENDENT", "PrimarySync", "independent.jpg");
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session("PrimarySync", "", Box::new(PendingLookupSession { records: Arc::new(records) })),
+            exclude_ids: Default::default(),
+        }];
+        let destination_root = root.path().join("new");
+        std::fs::create_dir_all(&destination_root).unwrap();
+        drop(db);
+        for cycle in 0..2 {
+            let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+            let mut config = test_config();
+            config.directory = Arc::from(destination_root.as_path());
+            config.state_db = Some(db.clone());
+            let result = reconcile_catalog_paths(&passes, Arc::new(config), CancellationToken::new()).await.unwrap();
+            assert!(result.complete);
+            assert_eq!(result.stats.failed, 0);
+            assert_eq!(result.stats.downloaded, usize::from(cycle == 0));
+            assert_eq!(std::fs::read(&source).unwrap(), bytes);
+            assert!(!missing.exists());
+            assert_eq!(db.get_metadata("sync_token:PrimarySync").await.unwrap().as_deref(), Some("retained-primary"));
+            assert_eq!(db.get_metadata("sync_token:UnselectedShared").await.unwrap().as_deref(), Some("retained-shared"));
+            assert!(db.get_protected_legacy_ids().await.unwrap().contains(&(protected_library.into(), "legacy-master".into())));
+            let rows = db.get_downloaded_page(0, 10).await.unwrap();
+            let historical = rows.iter().find(|row| row.id.as_ref() == "legacy-master").unwrap();
+            assert_eq!(historical.local_path.as_ref(), Some(&missing));
+            assert_eq!(historical.local_checksum.as_deref(), Some("preserved-checksum"));
+            let current = rows.iter().find(|row| row.id.as_ref() == "INDEPENDENT").unwrap();
+            let path = current.local_path.as_ref().unwrap();
+            assert!(path.starts_with(&destination_root));
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+}
