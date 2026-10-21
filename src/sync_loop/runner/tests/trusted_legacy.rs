@@ -464,6 +464,15 @@ impl Fixture {
         .await?;
         download::trusted_legacy::apply(&db, plan, &self.media, ".part", true, cancel).await
     }
+    async fn prepare_primary_hold(&self) {
+        let db = state::SqliteStateDb::open(&self.database).await.unwrap();
+        db.set_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY, "old-enum-hash")
+            .await
+            .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "primary-before")
+            .await
+            .unwrap();
+    }
     async fn cycle(
         &self,
         label: &str,
@@ -496,14 +505,6 @@ impl Fixture {
             Box::new(primary_provider),
             "PrimarySync",
         );
-        if primary_hold {
-            db.set_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY, "old-enum-hash")
-                .await
-                .unwrap();
-            db.set_metadata("sync_token:PrimarySync", "primary-before")
-                .await
-                .unwrap();
-        }
         let mut libraries = vec![&shared];
         if primary_hold {
             libraries.push(&primary);
@@ -693,6 +694,7 @@ async fn trusted_legacy_files_readiness_and_primary_bridge_still_hold() {
                     .is_empty()
             );
         } else {
+            f.prepare_primary_hold().await;
             let result = f
                 .cycle("primary-hold", CancellationToken::new(), true)
                 .await
@@ -943,6 +945,630 @@ async fn trusted_legacy_files_unaccepted_rendition_remains_held() {
     );
     assert_eq!(f.source_counts().await, (0, 5));
     assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
+    f.verify_old();
+}
+
+fn add_independent_child(f: &mut Fixture) -> (&'static str, String) {
+    let record_name = "ordinary-1";
+    let asset_id = "asset-ordinary-1";
+    let checksum = data_encoding::BASE64.encode(&Sha256::digest(&f.body));
+    let page = full_album_page_with_download(
+        ZONE,
+        record_name,
+        TOKEN,
+        &format!("{}/ordinary.jpg", f.server.uri()),
+        f.body.len() as u64,
+        &checksum,
+    );
+    f.provider.records.push(page["records"][0].clone());
+    f.provider.records.push(page["records"][1].clone());
+    (asset_id, checksum)
+}
+
+fn add_missing_parent_reference(f: &mut Fixture) -> String {
+    let mut orphan = f
+        .provider
+        .records
+        .iter()
+        .find(|record| {
+            record["recordType"] == "CPLAsset"
+                && record
+                    .pointer("/fields/masterRef/value/recordName")
+                    .is_some()
+        })
+        .expect("fixture child with a master reference")
+        .clone();
+    let record_name = "orphan-missing-parent-1".to_string();
+    orphan["recordName"] = json!(record_name);
+    orphan["fields"]
+        .as_object_mut()
+        .unwrap()
+        .remove("masterRef");
+    f.provider.records.push(orphan);
+    record_name
+}
+
+fn accepted_child_source_count(database: &Path, targets: &[(String, VersionSizeKey)]) -> i64 {
+    let predicates = vec!["(id=? AND version_size=?)"; targets.len()].join(" OR ");
+    let sql = format!(
+        "SELECT count(*) FROM asset_metadata_paths WHERE library=? AND source_checksum IS NOT NULL AND ({predicates})"
+    );
+    let mut params = vec![rusqlite::types::Value::Text(ZONE.into())];
+    for (id, version) in targets {
+        params.push(rusqlite::types::Value::Text(id.clone()));
+        params.push(rusqlite::types::Value::Text(version.as_str().into()));
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    conn.query_row(&sql, rusqlite::params_from_iter(params), |row| row.get(0))
+        .unwrap()
+}
+
+#[derive(Debug)]
+struct IndependentReceipt {
+    status: String,
+    local_path: String,
+    provider_checksum: Option<String>,
+    local_checksum: Option<String>,
+    source_checksum: Option<String>,
+}
+
+fn independent_receipts(database: &Path, asset_id: &str) -> Vec<IndependentReceipt> {
+    let conn =
+        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.status,a.local_path,p.provider_checksum,p.local_checksum,p.source_checksum \
+             FROM assets a JOIN asset_metadata_paths p \
+               ON p.library=a.library AND p.id=a.id AND p.version_size=a.version_size \
+              AND p.local_path=a.local_path \
+             WHERE a.library=?1 AND a.id=?2 AND a.version_size='original' \
+             ORDER BY p.local_path",
+        )
+        .unwrap();
+    stmt.query_map([ZONE, asset_id], |row| {
+        Ok(IndependentReceipt {
+            status: row.get(0)?,
+            local_path: row.get(1)?,
+            provider_checksum: row.get(2)?,
+            local_checksum: row.get(3)?,
+            source_checksum: row.get(4)?,
+        })
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+async fn assert_independent_download(f: &Fixture, asset_id: &str, provider_checksum: &str) {
+    let receipts = independent_receipts(&f.database, asset_id);
+    assert_eq!(
+        receipts.len(),
+        1,
+        "exact current-path receipt: {receipts:?}"
+    );
+    let receipt = &receipts[0];
+    assert_eq!(receipt.status, "downloaded", "{receipt:?}");
+    assert_eq!(std::fs::read(&receipt.local_path).unwrap(), f.body);
+    let actual = data_encoding::HEXLOWER.encode(&Sha256::digest(&f.body));
+    assert_eq!(
+        receipt.local_checksum.as_deref(),
+        Some(actual.as_str()),
+        "{receipt:?}"
+    );
+    assert_eq!(
+        receipt.source_checksum.as_deref(),
+        Some(actual.as_str()),
+        "{receipt:?}"
+    );
+    assert_eq!(
+        receipt.provider_checksum.as_deref(),
+        Some(provider_checksum),
+        "{receipt:?}"
+    );
+}
+
+#[tokio::test]
+async fn trusted_legacy_mixed_blocked_cohort_downloads_ready_child_and_holds() {
+    let mut f = Fixture::new("mixed-blocked").await;
+    f.cycle("baseline", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    // Introduce the ready child only after the trusted-legacy baseline so the
+    // measured transfer belongs to the mixed blocked cohort cycle below.
+    let (asset_id, provider_checksum) = add_independent_child(&mut f);
+    let mut plan = f.plan().await;
+    let unresolved = plan.targets.pop().unwrap();
+    assert_eq!(f.apply(plan, &CancellationToken::new()).await.unwrap(), 5);
+    assert_eq!(
+        f.source_counts().await,
+        (0, 5),
+        "five local receipts only; no VerifiedSource"
+    );
+    let first = f
+        .cycle("mixed-blocked", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(first.stats.downloaded, 1, "ready child transfers once");
+    assert!(
+        first.stats.sync_token_blocked,
+        "unresolved cohort keeps the checkpoint held"
+    );
+    assert!(!first.can_advance_database_checkpoint());
+    assert_independent_download(&f, asset_id, &provider_checksum).await;
+    assert_eq!(
+        accepted_child_source_count(&f.database, &f.targets),
+        0,
+        "accepted child bindings never claim source provenance"
+    );
+    assert_eq!(
+        rows(&f.database, "SELECT * FROM legacy_master_state_owners"),
+        json!([]),
+        "no fabricated ownership from the mixed cohort"
+    );
+    assert!(
+        state::SqliteStateDb::open(&f.database)
+            .await
+            .unwrap()
+            .legacy_child_provenance(ZONE, &unresolved.child, &unresolved.rendition)
+            .await
+            .unwrap()
+            .is_none(),
+        "unaccepted rendition remains unresolved"
+    );
+    f.verify_old();
+    let reopen = f
+        .cycle("mixed-blocked-reopen", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(reopen.stats.downloaded, 0, "no duplicate eligible transfer");
+    assert!(
+        reopen.stats.sync_token_blocked,
+        "refusal/held checkpoint survives reopen"
+    );
+    assert!(!reopen.can_advance_database_checkpoint());
+    assert_independent_download(&f, asset_id, &provider_checksum).await;
+    assert_eq!(
+        f.source_counts().await,
+        (1, 5),
+        "only the independent download has source provenance; five acceptances remain eligible"
+    );
+    assert_eq!(accepted_child_source_count(&f.database, &f.targets), 0);
+    f.verify_old();
+}
+
+#[tokio::test]
+async fn trusted_legacy_mixed_ready_control_completes_and_reopens_quietly() {
+    let mut f = Fixture::new("mixed-ready-control").await;
+    f.cycle("baseline", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    let (asset_id, provider_checksum) = add_independent_child(&mut f);
+    assert_eq!(
+        f.apply(f.plan().await, &CancellationToken::new())
+            .await
+            .unwrap(),
+        6
+    );
+    assert_eq!(f.source_counts().await, (0, 6));
+    let first = f
+        .cycle("mixed-ready-control", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(first.stats.downloaded, 1);
+    assert!(!first.stats.sync_token_blocked);
+    assert!(first.can_advance_database_checkpoint());
+    assert_independent_download(&f, asset_id, &provider_checksum).await;
+    assert_eq!(
+        accepted_child_source_count(&f.database, &f.targets),
+        0,
+        "six acceptances remain local-only"
+    );
+    f.verify_old();
+    let quiet = f
+        .cycle(
+            "mixed-ready-control-reopen",
+            CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert!(!quiet.stats.sync_token_blocked);
+    assert!(quiet.can_advance_database_checkpoint());
+    assert_eq!(quiet.stats.failed, 0);
+    assert_independent_download(&f, asset_id, &provider_checksum).await;
+    assert_eq!(
+        f.source_counts().await,
+        (1, 6),
+        "six acceptances remain eligible and only the independent download is source-backed"
+    );
+    assert_eq!(accepted_child_source_count(&f.database, &f.targets), 0);
+    f.verify_old();
+}
+
+#[tokio::test]
+async fn trusted_legacy_mixed_six_acceptance_survives_readiness_failure_and_reopens() {
+    let mut f = Fixture::new("mixed-readiness-failure").await;
+    f.cycle("baseline", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.apply(f.plan().await, &CancellationToken::new())
+            .await
+            .unwrap(),
+        6
+    );
+    assert_eq!(f.source_counts().await, (0, 6));
+    {
+        let conn = rusqlite::Connection::open(&f.database).unwrap();
+        conn.execute(
+            "UPDATE assets SET metadata_write_failed_at=1 WHERE library=?1 AND id='child-1-1'",
+            [ZONE],
+        )
+        .unwrap();
+    }
+    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    assert!(
+        db.legacy_child_receipts(ZONE, "child-1-1")
+            .await
+            .unwrap()
+            .is_empty(),
+        "existing readiness failure disqualifies the child receipt"
+    );
+    assert_eq!(db.stored_trusted_legacy_file_count().await.unwrap(), 6);
+    drop(db);
+    let (asset_id, provider_checksum) = add_independent_child(&mut f);
+    let first = f
+        .cycle("mixed-readiness", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.stats.downloaded, 1,
+        "independent child still transfers"
+    );
+    assert!(
+        first.stats.sync_token_blocked,
+        "disqualified child keeps the checkpoint held"
+    );
+    assert!(!first.can_advance_database_checkpoint());
+    let (rows_failed, rows_total): (i64, i64) = {
+        let conn = rusqlite::Connection::open(&f.database).unwrap();
+        conn.query_row(
+            "SELECT count(metadata_write_failed_at),count(*) FROM assets WHERE library=?1 AND id='child-1-1'",
+            [ZONE],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert!(rows_total > 0, "the controlled child has current rows");
+    assert_eq!(
+        rows_failed, rows_total,
+        "existing per-row readiness failure remains visible on every controlled child row"
+    );
+    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    assert_eq!(
+        db.stored_trusted_legacy_file_count().await.unwrap(),
+        6,
+        "six acceptances remain immutable"
+    );
+    assert!(
+        db.legacy_child_receipts(ZONE, "child-1-1")
+            .await
+            .unwrap()
+            .is_empty(),
+        "failed child is not reported ready"
+    );
+    drop(db);
+    assert_independent_download(&f, asset_id, &provider_checksum).await;
+    assert_eq!(
+        f.source_counts().await,
+        (1, 4),
+        "only the independent download is source-backed; the controlled child's two renditions are not eligible"
+    );
+    assert_eq!(
+        accepted_child_source_count(&f.database, &f.targets),
+        0,
+        "six local acceptances never become source receipts"
+    );
+    assert_eq!(
+        rows(&f.database, "SELECT * FROM legacy_master_state_owners"),
+        json!([]),
+        "no invented owners"
+    );
+    f.verify_old();
+    let reopen = f
+        .cycle("mixed-readiness-reopen", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(reopen.stats.downloaded, 0, "no duplicate transfer");
+    assert!(
+        reopen.stats.sync_token_blocked,
+        "readiness failure keeps the checkpoint held on reopen"
+    );
+    assert!(!reopen.can_advance_database_checkpoint());
+    assert_eq!(
+        reopen.stats.failed, 0,
+        "reopen remains quiet without new failures"
+    );
+    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    assert_eq!(
+        db.stored_trusted_legacy_file_count().await.unwrap(),
+        6,
+        "acceptances remain immutable across reopen"
+    );
+    assert!(
+        db.legacy_child_receipts(ZONE, "child-1-1")
+            .await
+            .unwrap()
+            .is_empty(),
+        "failed child remains not ready across reopen"
+    );
+    drop(db);
+    assert_independent_download(&f, asset_id, &provider_checksum).await;
+    assert_eq!(
+        f.source_counts().await,
+        (1, 4),
+        "acceptances remain immutable but the controlled child stays ineligible after reopen"
+    );
+    assert_eq!(accepted_child_source_count(&f.database, &f.targets), 0);
+    f.verify_old();
+}
+
+#[tokio::test]
+async fn trusted_legacy_mixed_six_acceptance_with_primary_hold_downloads_and_reopens() {
+    let mut f = Fixture::new("mixed-primary-hold").await;
+    f.cycle("baseline", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.apply(f.plan().await, &CancellationToken::new())
+            .await
+            .unwrap(),
+        6
+    );
+    assert_eq!(f.source_counts().await, (0, 6));
+    f.prepare_primary_hold().await;
+    let before = {
+        let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+        db.get_metadata("sync_token:PrimarySync").await.unwrap()
+    };
+    assert_eq!(before.as_deref(), Some("primary-before"));
+    let (asset_id, provider_checksum) = add_independent_child(&mut f);
+    let first = f
+        .cycle("mixed-primary-hold", CancellationToken::new(), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.stats.downloaded, 1,
+        "independent child download stays eligible while Primary is held"
+    );
+    assert!(first.stats.sync_token_blocked);
+    assert!(!first.can_advance_database_checkpoint());
+    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+        before,
+        "Primary cursor remains held at the prepared value"
+    );
+    assert_eq!(
+        db.stored_trusted_legacy_file_count().await.unwrap(),
+        6,
+        "six acceptances remain immutable"
+    );
+    drop(db);
+    assert_independent_download(&f, asset_id, &provider_checksum).await;
+    assert_eq!(
+        accepted_child_source_count(&f.database, &f.targets),
+        0,
+        "six accepted rows are not source receipts"
+    );
+    assert_eq!(f.source_counts().await, (1, 6));
+    assert_eq!(
+        rows(&f.database, "SELECT * FROM legacy_master_state_owners"),
+        json!([]),
+        "no invented owners"
+    );
+    f.verify_old();
+    let reopen = f
+        .cycle("mixed-primary-hold-reopen", CancellationToken::new(), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        reopen.stats.downloaded, 0,
+        "no duplicate transfer on reopen"
+    );
+    assert!(reopen.stats.sync_token_blocked);
+    assert!(!reopen.can_advance_database_checkpoint());
+    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+        before,
+        "reopen does not rewrite the held Primary cursor"
+    );
+    assert_eq!(db.stored_trusted_legacy_file_count().await.unwrap(), 6);
+    drop(db);
+    assert_independent_download(&f, asset_id, &provider_checksum).await;
+    assert_eq!(accepted_child_source_count(&f.database, &f.targets), 0);
+    assert_eq!(f.source_counts().await, (1, 6));
+    f.verify_old();
+}
+
+#[tokio::test]
+async fn trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances() {
+    let mut f = Fixture::new("mixed-missing-parent").await;
+    f.cycle("baseline", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.apply(f.plan().await, &CancellationToken::new())
+            .await
+            .unwrap(),
+        6,
+        "six trusted bindings are retained before the structural variant appears"
+    );
+    assert_eq!(f.source_counts().await, (0, 6));
+    let orphan = add_missing_parent_reference(&mut f);
+    let (asset_id, provider_checksum) = add_independent_child(&mut f);
+
+    // The synthetic orphan is a provider inventory structural variant only. It
+    // has no local mapping, receipt, or invented owner.
+    let orphan_mappings = {
+        let conn = rusqlite::Connection::open(&f.database).unwrap();
+        let mappings: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM asset_master_mappings WHERE library=?1 AND asset_record_name=?2",
+                [ZONE, orphan.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let assets: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM assets WHERE library=?1 AND id=?2",
+                [ZONE, orphan.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(assets, 0, "no invented asset row for the orphan");
+        mappings
+    };
+    assert_eq!(orphan_mappings, 0, "no matching mapping for the orphan");
+    let token_before = {
+        let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+        assert_eq!(db.stored_trusted_legacy_file_count().await.unwrap(), 6);
+        db.get_metadata(TOKEN).await.unwrap()
+    };
+
+    // Cancellation boundary: a pre-cancelled normal cycle must not consume the
+    // eligible child or alter originals, the checkpoint token, or acceptances.
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let interrupted = f
+        .cycle("mixed-missing-parent-cancelled", cancel, false)
+        .await
+        .unwrap();
+    assert_eq!(interrupted.stats.downloaded, 0);
+    assert!(
+        independent_receipts(&f.database, asset_id).is_empty(),
+        "pre-cancelled cycle transfers nothing"
+    );
+    assert_eq!(
+        f.source_counts().await,
+        (0, 6),
+        "acceptances remain eligible and no source receipt is fabricated"
+    );
+    {
+        let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+        assert_eq!(
+            db.get_metadata(TOKEN).await.unwrap(),
+            token_before,
+            "pre-cancelled cycle preserves the checkpoint token"
+        );
+        assert_eq!(
+            db.stored_trusted_legacy_file_count().await.unwrap(),
+            6,
+            "pre-cancelled cycle preserves six acceptances"
+        );
+    }
+    f.verify_old();
+
+    // A fresh cycle reaches the precise mixed state: the independent child
+    // transfers once, while the missing-parent reference withholds authority.
+    let first = f
+        .cycle("mixed-missing-parent", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.stats.downloaded, 1,
+        "eligible independent child still transfers with the orphan in inventory"
+    );
+    assert!(
+        first.stats.sync_token_blocked,
+        "missing-parent reference keeps the checkpoint held"
+    );
+    assert_eq!(
+        first.stats.sync_token_blocked_reason,
+        Some("legacy_preservation_incomplete"),
+        "the hold is the missing-reference preservation refusal"
+    );
+    assert!(!first.can_advance_database_checkpoint());
+    assert_independent_download(&f, asset_id, &provider_checksum).await;
+    assert_eq!(
+        accepted_child_source_count(&f.database, &f.targets),
+        0,
+        "six accepted bindings never claim source provenance"
+    );
+    assert_eq!(
+        f.source_counts().await,
+        (1, 6),
+        "only the independent download has source provenance"
+    );
+    assert_eq!(
+        rows(&f.database, "SELECT * FROM legacy_master_state_owners"),
+        json!([]),
+        "no invented owner from the missing-parent variant"
+    );
+    {
+        let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+        assert_eq!(
+            db.stored_trusted_legacy_file_count().await.unwrap(),
+            6,
+            "six acceptances remain immutable"
+        );
+        assert_eq!(
+            db.get_metadata(TOKEN).await.unwrap(),
+            token_before,
+            "blocked checkpoint token does not advance"
+        );
+    }
+    f.verify_old();
+
+    let reopen = f
+        .cycle(
+            "mixed-missing-parent-reopen",
+            CancellationToken::new(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopen.stats.downloaded, 0, "no duplicate transfer");
+    assert!(
+        reopen.stats.sync_token_blocked,
+        "missing-parent hold survives reopen"
+    );
+    assert_eq!(
+        reopen.stats.sync_token_blocked_reason,
+        Some("legacy_preservation_incomplete"),
+        "the missing-reference refusal survives reopen"
+    );
+    assert!(!reopen.can_advance_database_checkpoint());
+    assert_eq!(reopen.stats.failed, 0, "reopen is quiet");
+    assert_independent_download(&f, asset_id, &provider_checksum).await;
+    assert_eq!(accepted_child_source_count(&f.database, &f.targets), 0);
+    assert_eq!(f.source_counts().await, (1, 6));
+    {
+        let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+        assert_eq!(db.stored_trusted_legacy_file_count().await.unwrap(), 6);
+        assert_eq!(
+            db.get_metadata(TOKEN).await.unwrap(),
+            token_before,
+            "reopen still leaves the checkpoint token untouched"
+        );
+    }
+    let conn = rusqlite::Connection::open(&f.database).unwrap();
+    let retained_orphan_mappings: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM asset_master_mappings WHERE library=?1 AND asset_record_name=?2",
+            [ZONE, orphan.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        retained_orphan_mappings, 0,
+        "reopen never invents the missing parent"
+    );
     f.verify_old();
 }
 
