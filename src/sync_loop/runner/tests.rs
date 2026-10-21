@@ -25,3 +25,5 @@ mod indexing;
 mod trusted_legacy;
 
 mod sparse_recovery;
+
+mod unprepared_recovery;
