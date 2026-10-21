@@ -20,6 +20,7 @@ struct Session {
     unrelated: bool,
     records: Vec<Value>,
     target_calls: Arc<AtomicUsize>,
+    source_calls: Arc<std::sync::Mutex<Vec<Option<String>>>>,
 }
 fn sparse() -> Value {
     let mut row = crate::test_helpers::sparse_shared_asset_record();
@@ -82,6 +83,12 @@ impl PhotosSession for Session {
         } else {
             "SharedSync-test"
         };
+        if self.source {
+            self.source_calls
+                .lock()
+                .unwrap()
+                .push(request["zones"][0]["syncToken"].as_str().map(str::to_owned));
+        }
         let records = if self.source && !self.quiet {
             let mut records = vec![sparse()];
             if self.unrelated {
@@ -134,8 +141,16 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
         (true, false, false, false),
         (true, true, true, false),
         (true, true, false, true),
+        (true, true, true, true),
     ] {
         let complete = selected && owner_matches && !unrelated;
+        // A held source obligation beside eligible target work still reopens so
+        // the next cycle can prove that the completed transfer is not repeated.
+        let cycles = if complete || (pending && unrelated) {
+            2
+        } else {
+            1
+        };
         let server = crate::start_wiremock_or_skip!();
         let bytes = [
             0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0, 1, 0, 0, 1, 0, 1, 0, 0,
@@ -168,14 +183,17 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
         let media = directory.path().join("media");
         std::fs::create_dir(&media).unwrap();
         let config = make_run_cycle_config();
+        let enum_hash = download::compute_config_hash(&config);
         let calls = Arc::new(AtomicUsize::new(0));
+        let source_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut previous_calls = None;
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-        for cycle in 0..if complete { 2 } else { 1 } {
+        for cycle in 0..cycles {
+            let source_calls_at_start = source_calls.lock().unwrap().len();
             let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
             let db: Arc<dyn download::DownloadStore> = inner.clone();
             let builder = make_run_cycle_download_config_builder(&media, db.clone());
             if cycle == 0 {
-                let enum_hash = download::compute_config_hash(&config);
                 let run = inner.start_sync_run().await.unwrap();
                 inner
                     .complete_sync_run(run, &state::SyncRunStats::default())
@@ -220,6 +238,7 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                         unrelated,
                         records: Vec::new(),
                         target_calls: calls.clone(),
+                        source_calls: source_calls.clone(),
                     },
                 ),
             );
@@ -239,6 +258,7 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                         unrelated: false,
                         records: records.clone(),
                         target_calls: calls.clone(),
+                        source_calls: source_calls.clone(),
                     },
                 ),
             );
@@ -313,7 +333,8 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                 assert!(result.stats.identity_incomplete);
                 assert_eq!(
                     result.stats.downloaded,
-                    usize::from(selected && owner_matches)
+                    usize::from(selected && owner_matches && cycle == 0),
+                    "eligible target work progresses once, then reopens quietly"
                 );
                 assert_eq!(
                     inner
@@ -327,11 +348,56 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                     inner.sparse_identities("PrimarySync").await.unwrap().len(),
                     if unrelated { 2 } else { 1 }
                 );
-                assert_eq!(
-                    calls.load(Ordering::SeqCst),
-                    if selected && owner_matches { 2 } else { 0 },
-                    "unselected or wrong scope must not be requested"
-                );
+                if pending {
+                    assert_eq!(
+                        inner
+                            .get_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY)
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some("old-enum"),
+                        "held source work must not activate the pending configuration"
+                    );
+                    assert_eq!(
+                        inner
+                            .get_metadata(crate::sync_cycle::PENDING_ENUM_CONFIG_HASH_KEY)
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some(enum_hash.as_str())
+                    );
+                }
+                if pending && unrelated {
+                    let observed = source_calls.lock().unwrap();
+                    let cycle_calls = &observed[source_calls_at_start..];
+                    assert!(
+                        cycle_calls
+                            .iter()
+                            .any(|cursor| cursor.as_deref() == Some("before")),
+                        "eligible work still requires the retained-cursor bridge: {cycle_calls:?}"
+                    );
+                    assert!(
+                        !cycle_calls
+                            .iter()
+                            .any(|cursor| cursor.as_deref() == Some("source-after")),
+                        "unproven source progress must never be replayed as active: {cycle_calls:?}"
+                    );
+                }
+                let observed_calls = calls.load(Ordering::SeqCst);
+                if cycle == 0 {
+                    assert_eq!(
+                        observed_calls,
+                        if selected && owner_matches { 2 } else { 0 },
+                        "unselected or wrong scope must not be requested"
+                    );
+                } else {
+                    assert_eq!(
+                        observed_calls,
+                        previous_calls.unwrap(),
+                        "reopen must not repeat the completed target lookup"
+                    );
+                }
+                previous_calls = Some(observed_calls);
             }
         }
         server.verify().await;

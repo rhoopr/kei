@@ -497,17 +497,24 @@ mod tests {
     #[tokio::test]
     async fn unresolved_identity_does_not_advance_health_success() {
         let dir = tempfile::tempdir().unwrap();
+        let report_path = dir.path().join("sync_report.json");
         let notifier = Notifier::new(None);
-        let reporter = reporter_with_surfaces(dir.path(), None, &notifier, None, None);
+        let reporter = reporter(dir.path(), Some(&report_path), &notifier);
         let mut health = HealthStatus::new();
         health.record_success();
         let previous = health.last_success_at;
         let mut stats = SyncStats {
+            downloaded: 1,
             identity_incomplete: true,
             sync_token_blocked: true,
             ..SyncStats::default()
         };
         report_cycle(&reporter, &mut health, &stats, 0, false).await;
+        let report = parse_json(&report_path);
+        assert_eq!(report["status"], "partial_failure");
+        assert_eq!(report["stats"]["downloaded"], 1);
+        assert_eq!(report["stats"]["interrupted"], false);
+        assert_eq!(report["stats"]["sync_token_blocked"], true);
         assert_eq!(health.last_success_at, previous);
         assert_eq!(health.consecutive_failures, 1);
         assert!(
@@ -517,11 +524,33 @@ mod tests {
                 .unwrap()
                 .contains("unresolved asset identity")
         );
-        // Intentional bounded holds remain successful.
+
+        // A later held cycle still reports and accumulates failures; the hold
+        // is not a process crash or an interruption.
+        report_cycle(&reporter, &mut health, &stats, 0, false).await;
+        assert_eq!(parse_json(&report_path)["status"], "partial_failure");
+        assert_eq!(health.last_success_at, previous);
+        assert_eq!(health.consecutive_failures, 2);
+
+        // Intentional bounded holds without unresolved identity remain
+        // successful even though the checkpoint stays blocked.
         stats.identity_incomplete = false;
         report_cycle(&reporter, &mut health, &stats, 0, false).await;
+        assert_eq!(parse_json(&report_path)["status"], "success");
         assert_eq!(health.consecutive_failures, 0);
         assert!(health.last_error.is_none());
+
+        // Genuinely clean stats clear both identity debt and the checkpoint
+        // hold, so health records a fresh success.
+        stats.sync_token_blocked = false;
+        report_cycle(&reporter, &mut health, &stats, 0, false).await;
+        let report = parse_json(&report_path);
+        assert_eq!(report["status"], "success");
+        assert_eq!(report["stats"]["sync_token_blocked"], false);
+        assert_eq!(report["stats"]["interrupted"], false);
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.last_error.is_none());
+        assert!(health.last_success_at > previous);
     }
 
     #[tokio::test]

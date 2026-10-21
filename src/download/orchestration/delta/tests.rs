@@ -2201,6 +2201,186 @@ async fn issue956_changed_master_confirmation_is_bounded_and_retains_unproven_ma
     }
 }
 
+#[tokio::test]
+async fn issue956_mixed_changed_master_batch_confirms_only_one_exact_scoped_pair() {
+    use crate::icloud::photos::asset::DeltaRecordBuffer;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct AggregateConfirmation {
+        requests: Arc<Mutex<Vec<Vec<String>>>>,
+        aggregate: Value,
+        fresh_pair: Value,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for AggregateConfirmation {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            assert!(url.contains("/records/lookup?"), "unexpected {url}");
+            let request: Value = serde_json::from_str(&body)?;
+            assert_eq!(
+                request["zoneID"],
+                json!({"zoneName": "PrimarySync"}),
+                "lookup must stay inside the changes album scope"
+            );
+            let names: Vec<String> = request["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["recordName"].as_str().unwrap().to_owned())
+                .collect();
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(names);
+            assert!(
+                requests.len() <= 2,
+                "confirmation must stop after the aggregate and one fresh pair: {requests:?}"
+            );
+            Ok(if requests.len() == 1 {
+                self.aggregate.clone()
+            } else {
+                self.fresh_pair.clone()
+            })
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+    let pairs = [
+        ("asset-CHANGED", "OLD_CHANGED"),
+        ("asset-MISSING", "OLD_MISSING"),
+        ("asset-FOREIGN", "OLD_FOREIGN"),
+    ];
+    for (asset, old_master) in pairs {
+        db.upsert_asset_master_mapping("PrimarySync", asset, old_master)
+            .await
+            .unwrap();
+    }
+    let mut records = Vec::new();
+    for (asset, old_master) in pairs {
+        let mut record = incremental_photo_records(old_master)[1].clone();
+        record["recordName"] = json!(asset);
+        record["fields"]
+            .as_object_mut()
+            .unwrap()
+            .remove("masterRef");
+        records.push(record);
+    }
+    let mut buffer = DeltaRecordBuffer::new();
+    let mut events = buffer.process_records(serde_json::from_value(Value::Array(records)).unwrap());
+    assert_eq!(events.len(), 3);
+
+    let changed_master = incremental_photo_records("NEW_CHANGED");
+    let mut changed_child = changed_master[1].clone();
+    changed_child["recordName"] = json!("asset-CHANGED");
+    let mut missing_child = incremental_photo_records("OLD_MISSING")[1].clone();
+    missing_child["recordName"] = json!("asset-MISSING");
+    missing_child["fields"]
+        .as_object_mut()
+        .unwrap()
+        .remove("masterRef");
+    let mut foreign_child = incremental_photo_records("NEW_FOREIGN")[1].clone();
+    foreign_child["recordName"] = json!("asset-FOREIGN");
+    foreign_child["fields"]["masterRef"]["value"]["zoneID"]["ownerRecordName"] =
+        json!("foreign-owner");
+    // Synthetic response variants, not observed reference shapes. The reporter
+    // receives only these three same-aggregate rejections.
+    let aggregate = json!({"records": [
+        {"recordName": "OLD_CHANGED", "serverErrorCode": "NOT_FOUND"},
+        changed_child.clone(),
+        {"recordName": "OLD_MISSING", "serverErrorCode": "NOT_FOUND"},
+        missing_child,
+        {"recordName": "OLD_FOREIGN", "serverErrorCode": "NOT_FOUND"},
+        foreign_child,
+    ]});
+    let fresh_pair = json!({"records": [changed_master[0].clone(), changed_child]});
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: changes_album(
+            "",
+            AggregateConfirmation {
+                requests: requests.clone(),
+                aggregate,
+                fresh_pair,
+            },
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let mut config = test_config();
+    config.state_db = Some(db.clone() as Arc<dyn DownloadStore>);
+    let mut summary = IncrementalDeltaSummary::default();
+    hydrate_unpaired_created_asset_deltas(
+        &mut events,
+        Some(&pass),
+        &config,
+        &mut summary,
+        DownloadRunMode::Download,
+        &CancellationToken::new(),
+    )
+    .await;
+
+    // One aggregate request for all three exact pairs, then one fresh pair for
+    // the only changed reference. The other two receive no follow-up lookup.
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(
+        requests[0],
+        [
+            "OLD_CHANGED",
+            "asset-CHANGED",
+            "OLD_MISSING",
+            "asset-MISSING",
+            "OLD_FOREIGN",
+            "asset-FOREIGN"
+        ]
+    );
+    assert_eq!(requests[1], ["NEW_CHANGED", "asset-CHANGED"]);
+    assert!(summary.identity_incomplete);
+    assert_eq!(summary.state_transition_failures, 0);
+    assert_eq!(
+        events[0].asset.as_ref().map(PhotoAsset::state_id),
+        Some("asset-CHANGED")
+    );
+    assert!(events[1].asset.is_none(), "missing reference refused");
+    assert!(events[2].asset.is_none(), "foreign owner refused");
+
+    drop(config);
+    drop(pass);
+    drop(db);
+    let reopened = SqliteStateDb::open(&database).await.unwrap();
+    for (asset, expected) in [
+        ("asset-CHANGED", "NEW_CHANGED"),
+        ("asset-MISSING", "OLD_MISSING"),
+        ("asset-FOREIGN", "OLD_FOREIGN"),
+    ] {
+        assert_eq!(
+            reopened
+                .get_master_record_name_for_asset("PrimarySync", asset)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(expected),
+            "{asset}"
+        );
+    }
+    assert_eq!(
+        reopened
+            .get_metadata(&crate::state::unresolved_identity_key("PrimarySync"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("1")
+    );
+}
+
 // Synthetic page-count and cancellation regressions for #958.
 type AlbumScanCalls = Vec<(String, Option<String>)>;
 
