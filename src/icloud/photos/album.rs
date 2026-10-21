@@ -306,6 +306,43 @@ impl PhotoAlbum {
         self.lookup_records(requests).await
     }
 
+    pub(crate) fn sparse_link_matches(&self, link: &super::asset::SparseShareLink) -> bool {
+        link.target_in_scope(&self.zone_id).is_some()
+    }
+
+    /// Resolve only an explicitly selected sparse target, never a fallback zone.
+    pub(crate) async fn resolve_sparse_target(
+        &self,
+        link: &super::asset::SparseShareLink,
+    ) -> RecordResolution {
+        let Some(child) = link.target_in_scope(&self.zone_id) else {
+            return RecordResolution::Unknown;
+        };
+        let first = self
+            .resolve_records(&[RecordLookupRequest::asset_only(child.clone())])
+            .await;
+        let master_record_name = match first
+            .results
+            .into_iter()
+            .find(|(id, _)| id == &child)
+            .map(|(_, result)| result)
+        {
+            Some(RecordResolution::AssetPresent { master_record_name }) => master_record_name,
+            Some(RecordResolution::TransientFailure(error)) => {
+                return RecordResolution::TransientFailure(error);
+            }
+            _ => return RecordResolution::Unknown,
+        };
+        let request = RecordLookupRequest::paired(child.clone(), master_record_name, child.clone());
+        self.resolve_records(&[request])
+            .await
+            .results
+            .into_iter()
+            .find(|(id, _)| id == &child)
+            .map(|(_, result)| result)
+            .unwrap_or(RecordResolution::Unknown)
+    }
+
     /// Stream photos page-by-page without buffering the full album in memory.
     ///
     /// Returns the stream paired with a `oneshot::Receiver<bool>` that

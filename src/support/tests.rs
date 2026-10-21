@@ -466,3 +466,31 @@ fn issue956_child_reference_status_is_a_field_specific_allowlist() {
         "old history cannot invent reference evidence"
     );
 }
+
+#[test]
+fn recovery_decisions_preserve_only_fixed_evidence_outcomes() {
+    for (decision, reason) in [
+        ("partial", "historical_claim_prepared"),
+        ("unsupported", "historical_claim_unverified"),
+    ] {
+        let fields = json!({
+            "mechanism": "historical_path", "decision": decision, "reason": reason,
+            "owner": "private-owner", "path": "/private/media", "record": "private-record",
+            "token": "private-token", "url": "https://private-provider"
+        });
+        let projected =
+            privacy::diagnostic("recovery_decision_v1", fields.as_object().unwrap()).unwrap();
+        assert_eq!(
+            json!(projected),
+            json!({"mechanism":"historical_path","decision":decision,"reason":reason})
+        );
+    }
+    let fields =
+        json!({"mechanism":"private-owner","decision":"private-token","reason":"private-path"});
+    let projected =
+        privacy::diagnostic("recovery_decision_v1", fields.as_object().unwrap()).unwrap();
+    assert!(
+        projected.is_empty(),
+        "saved history must not authorize arbitrary labels"
+    );
+}

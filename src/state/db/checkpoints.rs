@@ -146,6 +146,17 @@ impl SqliteStateDb {
                     )?;
                 }
             }
+            // Validate against the planning generation before this transaction promotes it.
+            // Any subsequent update failure rolls back these removals as well.
+            for key in &transition.metadata_deletes {
+                if let Some(library) = key.strip_prefix(crate::state::UNRESOLVED_IDENTITY_PREFIX) {
+                    sparse_identity::clear_proven(
+                        &tx,
+                        library,
+                        &transition.sparse_identity_proofs,
+                    )?;
+                }
+            }
             for (key, value) in transition.metadata_updates {
                 tx.execute(
                     "INSERT INTO metadata (key, value) VALUES (?1, ?2) \
@@ -155,13 +166,6 @@ impl SqliteStateDb {
                 .map_err(|e| StateError::query("commit_checkpoint_transition::update", e))?;
             }
             for key in transition.metadata_deletes {
-                if let Some(library) = key.strip_prefix(crate::state::UNRESOLVED_IDENTITY_PREFIX) {
-                    sparse_identity::clear_proven(
-                        &tx,
-                        library,
-                        &transition.sparse_identity_proofs,
-                    )?;
-                }
                 tx.execute("DELETE FROM metadata WHERE key = ?1", [key])
                     .map_err(|e| StateError::query("commit_checkpoint_transition::delete", e))?;
             }

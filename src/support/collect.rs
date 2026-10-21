@@ -179,6 +179,14 @@ fn next_actions(history: &history::History) -> Vec<&'static str> {
     {
         actions.push("Use the checkpoint reason, pass completion and receiver observations to distinguish intentional bounds, provider token conflict, identity debt and state-write failure.");
     }
+    if history
+        .cycles
+        .iter()
+        .flat_map(|cycle| &cycle.diagnostics)
+        .any(|diagnostic| diagnostic.kind == "recovery_decision_v1")
+    {
+        actions.push("Recovery decisions apply only to their recorded evidence and scope. Partial work is not a complete backup; local acceptance is not provider authority. Preserve unresolved obligations and historical files. Unsupported means this recovery path cannot proceed with the available proof, not permission to reset state or request another diagnostic run.");
+    }
     if history.queue_dropped > 0 || history.groups_omitted > 0 || history.cycles_evicted > 0 {
         actions.push("Evidence was bounded or omitted. Treat retained records as a sample and tell the maintainer which operation/time window you are investigating.");
     }

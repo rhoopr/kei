@@ -23,7 +23,6 @@ pub(crate) use album::MAX_EMPTY_PAGE_PROBES;
 pub use album::PhotoAlbum;
 #[cfg(test)]
 pub use album::PhotoAlbumConfig;
-#[cfg(test)]
 pub(crate) use album::ProviderLookupError;
 pub(crate) use album::catalog_observed_page;
 pub(crate) use album::work::{current_asset, same_selected_facts};

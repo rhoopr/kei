@@ -448,6 +448,7 @@ impl<'a> IncrementalDeltaState<'a> {
 
 #[derive(Debug, Default)]
 pub(super) struct IncrementalDeltaSummary {
+    pub(super) sparse_target_stats: crate::download::SyncStats,
     pub(super) sparse_identity_proofs: Vec<SparseIdentityProof>,
     pub(super) identity_incomplete: bool,
     pub(super) sync_token: Option<String>,
@@ -1070,6 +1071,31 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                     }));
                 }
                 RecordResolution::SparseShareUnresolved(evidence) => {
+                    let stable = indices.iter().all(|index| {
+                        events
+                            .get(*index)
+                            .and_then(|event| event.sparse_share.as_ref())
+                            == Some(&evidence)
+                    });
+                    if stable && run_mode.downloads_files() && summary.auth_errors == 0 {
+                        match crate::download::sparse_target::recover(
+                            &evidence,
+                            config,
+                            shutdown_token,
+                            &mut summary.sparse_target_stats,
+                        )
+                        .await
+                        {
+                            Ok(Some(target)) => {
+                                retry.prove_target(state_id.as_str(), target, summary);
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                summary.record_provider_error(error);
+                            }
+                        }
+                    }
                     summary.block_identity();
                     for index in indices {
                         let Some(event) = events.get_mut(index) else {

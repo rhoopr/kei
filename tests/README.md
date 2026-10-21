@@ -1700,3 +1700,19 @@ atomic stale/cancelled/SQL-failed plans, and readiness/Primary bridge holds.
 Run it with default and `--no-default-features` profiles when changing trusted
 legacy receipts. Existing `legacy_preservation` tests retain the no-acceptance
 verified-source controls.
+
+## Recovery evidence regressions
+
+The recovery scenarios separate historical path claims from sparse shared-library
+identity. Historical recovery starts with an independently source-backed current
+receipt; missing current evidence remains refused. Sparse recovery may materialize
+a missing rendition only after a fresh exact pair in another selected unrestricted
+library. Local acceptance never substitutes for source provenance.
+
+Focused library filters are `historical_`, `sparse_target`, `protected`,
+`replacement_recovery`, and `recovery_decisions_preserve`. The fixtures use
+temporary SQLite databases and synthetic provider responses, preserve unrelated
+debt and historical bytes, and check transaction rejection after file or ownership
+drift. Normal-cycle fixtures must establish completion followed by a quiet reopen;
+a target-ready decision alone is not success. These tests do not establish that
+any reporter account has the evidence required for recovery.

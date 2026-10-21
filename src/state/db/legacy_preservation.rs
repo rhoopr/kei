@@ -1346,9 +1346,10 @@ mod tests {
                     .as_deref(),
                 Some("before")
             );
-            let conn = db.acquire_lock("historical_after").unwrap();
-            assert_eq!(super::snapshot_rows(&conn,"SELECT * FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND source_checksum IS NULL","PrimarySync","child-a").unwrap(),historical_before);
-            drop(conn);
+            {
+                let conn = db.acquire_lock("historical_after").unwrap();
+                assert_eq!(super::snapshot_rows(&conn,"SELECT * FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND source_checksum IS NULL","PrimarySync","child-a").unwrap(),historical_before);
+            }
             drop(db);
             let db = SqliteStateDb::open(&database).await.unwrap();
             assert_eq!(

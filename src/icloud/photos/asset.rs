@@ -72,6 +72,16 @@ impl std::fmt::Debug for SparseShareLink {
     }
 }
 
+impl SparseShareLink {
+    /// A link is admissible only in the explicitly selected authenticated scope.
+    pub(crate) fn target_in_scope(&self, scope: &Value) -> Option<super::ProviderRecordId> {
+        (scope.get("zoneName").and_then(Value::as_str) == Some(self.zone_name.0.as_ref())
+            && scope.get("ownerRecordName").and_then(Value::as_str)
+                == Some(self.owner_record_name.0.as_ref()))
+        .then(|| super::ProviderRecordId::new(self.record_name.0.as_ref()))
+    }
+}
+
 impl SparseShareEvidence {
     pub(crate) fn from_fields(fields: &Value) -> Option<Self> {
         let has_link = [

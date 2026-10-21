@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use std::sync::Arc;
 
 use super::SqliteStateDb;
 use crate::state::error::StateError;
@@ -112,6 +113,7 @@ impl SparseIdentity {
             library: self.library.clone(),
             source: self.source.clone(),
             generation: self.generation,
+            target: None,
         }
     }
 }
@@ -123,6 +125,38 @@ pub(crate) struct SparseIdentityProof {
     library: String,
     source: SparseSourceId,
     generation: SparseGeneration,
+    target: Option<SparseTargetState>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SparseTargetState {
+    library: String,
+    child: String,
+    master: String,
+    evidence: String,
+    validate_files: Option<Arc<SparseFileValidation>>,
+}
+type SparseFileValidation = dyn Fn() -> Result<(), StateError> + Send + Sync;
+impl PartialEq for SparseTargetState {
+    fn eq(&self, other: &Self) -> bool {
+        self.library == other.library
+            && self.child == other.child
+            && self.master == other.master
+            && self.evidence == other.evidence
+    }
+}
+impl Eq for SparseTargetState {}
+impl SparseTargetState {
+    pub(crate) fn with_file_validation(mut self, validation: Arc<SparseFileValidation>) -> Self {
+        self.validate_files = Some(validation);
+        self
+    }
+}
+impl SparseIdentityProof {
+    pub(crate) fn with_target(mut self, target: SparseTargetState) -> Self {
+        self.target = Some(target);
+        self
+    }
 }
 
 impl std::fmt::Debug for SparseIdentityProof {
@@ -141,6 +175,15 @@ pub(crate) enum SparseAttemptOutcome {
 #[async_trait]
 pub(crate) trait SparseIdentityStore: Send + Sync {
     async fn sparse_identities(&self, library: &str) -> Result<Vec<SparseIdentity>, StateError>;
+    async fn sparse_target_state(
+        &self,
+        _library: &str,
+        _child: &str,
+        _master: &str,
+    ) -> Result<Option<SparseTargetState>, StateError> {
+        Ok(None)
+    }
+
     async fn observe_sparse_identity(
         &self,
         library: &str,
@@ -244,6 +287,19 @@ fn read_rows(
 
 #[async_trait]
 impl SparseIdentityStore for SqliteStateDb {
+    async fn sparse_target_state(
+        &self,
+        library: &str,
+        child: &str,
+        master: &str,
+    ) -> Result<Option<SparseTargetState>, StateError> {
+        let (library, child, master) = (library.to_owned(), child.to_owned(), master.to_owned());
+        self.with_conn("sparse_target_state", move |conn| {
+            target_state(conn, &library, &child, &master)
+        })
+        .await
+    }
+
     async fn sparse_identities(&self, library: &str) -> Result<Vec<SparseIdentity>, StateError> {
         let library = library.to_owned();
         self.with_conn("sparse_identities", move |conn| {
@@ -327,6 +383,80 @@ impl SparseIdentityStore for SqliteStateDb {
     }
 }
 
+fn target_state(
+    conn: &Connection,
+    library: &str,
+    child: &str,
+    master: &str,
+) -> Result<Option<SparseTargetState>, StateError> {
+    let mapped: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM asset_master_mappings WHERE library=?1 AND asset_record_name=?2 AND master_record_name=?3)",
+        params![library, child, master], |row| row.get(0))?;
+    if !mapped || !super::legacy_preservation::child_receipts_ready(conn, library, child)? {
+        return Ok(None);
+    }
+    validate_target_paths(conn, library, child)?;
+    let dependencies = super::legacy_preservation::dependencies(conn, library, master)?;
+    let mut statement = conn.prepare("SELECT key,value FROM metadata WHERE key IN ('enum_config_hash','config_hash','pending_enum_config_hash','pending_download_config_hash') ORDER BY key")?;
+    let config = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let evidence = serde_json::json!([dependencies, config]).to_string();
+    Ok(Some(SparseTargetState {
+        library: library.into(),
+        child: child.into(),
+        master: master.into(),
+        evidence,
+        validate_files: None,
+    }))
+}
+
+// Repeat global authority checks inside the checkpoint transaction. Family
+// snapshots alone cannot see a competing owner created in another library.
+fn validate_target_paths(conn: &Connection, library: &str, child: &str) -> Result<(), StateError> {
+    let mut statement = conn.prepare("SELECT library,id,local_path FROM assets WHERE local_path IS NOT NULL UNION SELECT library,id,local_path FROM asset_metadata_paths")?;
+    let catalog = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut paths = conn.prepare(
+        "SELECT local_path FROM assets WHERE library=?1 AND id=?2 AND local_path IS NOT NULL",
+    )?;
+    let paths = paths
+        .query_map(params![library, child], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for media in paths {
+        for (path, sidecar) in [(media.clone(), false), (format!("{media}.xmp"), true)] {
+            let path = std::path::Path::new(&path);
+            super::primary_layout::guard_writer(conn, path)?;
+            super::legacy_preservation::guard_writer(conn, path)?;
+            let key = crate::fs_util::confined_path_key(path)
+                .map_err(|_private_error| invariant("invalid sparse target path"))?;
+            for (owner_library, owner_child, owner_path) in &catalog {
+                let owner_key = crate::fs_util::confined_path_key(std::path::Path::new(owner_path))
+                    .map_err(|_private_error| invariant("invalid sparse catalog path"))?;
+                if owner_key == key && (sidecar || owner_library != library || owner_child != child)
+                {
+                    return Err(invariant("sparse target has competing path authority"));
+                }
+            }
+            let reserved: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM reconciliation_paths WHERE (requested_path_key=?1 OR destination_path_key=?1) AND (?4 OR library<>?2 OR id<>?3))",
+                params![key,library,child,sidecar], |row| row.get(0))?;
+            if reserved {
+                return Err(invariant("sparse target has competing path reservation"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Remove only receipts covered by the same successful checkpoint transaction.
 /// Missing or stale receipts fail closed, including a record absent from replay.
 pub(super) fn clear_proven(
@@ -335,8 +465,26 @@ pub(super) fn clear_proven(
     proofs: &[SparseIdentityProof],
 ) -> Result<(), StateError> {
     for identity in read_rows(tx, library, None)? {
-        if !proofs.contains(&identity.proof()) {
-            return Err(invariant("checkpoint lacks current sparse identity proof"));
+        let current = identity.proof();
+        let proof = proofs
+            .iter()
+            .find(|proof| {
+                proof.library == current.library
+                    && proof.source == current.source
+                    && proof.generation == current.generation
+            })
+            .ok_or_else(|| invariant("checkpoint lacks current sparse identity proof"))?;
+        if let Some(target) = &proof.target
+            && target_state(tx, &target.library, &target.child, &target.master)?.as_ref()
+                != Some(target)
+        {
+            return Err(invariant("sparse target receipt state changed"));
+        }
+        if let Some(target) = &proof.target {
+            target
+                .validate_files
+                .as_ref()
+                .ok_or_else(|| invariant("sparse target file proof missing"))?()?;
         }
     }
     tx.execute(
@@ -351,6 +499,162 @@ mod tests {
     use super::{SparseAttemptOutcome, SparseEvidence, SparseIdentityStore, SparseSourceId};
     use crate::state::{CheckpointTransition, SqliteStateDb, unresolved_identity_key};
     use chrono::{TimeDelta, Utc};
+
+    #[tokio::test]
+    async fn sparse_target_path_authority_rechecks_competing_catalog_owner() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.with_conn_mut("sparse_target_test", |conn| {
+            conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,local_path,local_checksum) VALUES ('SharedSync','target','original','provider','image.jpg',1,10,'photo','downloaded',1,'/photos/image.jpg','local')", [])?;
+            super::validate_target_paths(conn, "SharedSync", "target")?;
+            // New authority is outside the target family and was previously invisible.
+            conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,local_path,local_checksum) VALUES ('OtherSync','other','original','provider','image.jpg',1,10,'photo','downloaded',1,'/photos/image.jpg','local')", [])?;
+            assert!(super::validate_target_paths(conn, "SharedSync", "target").is_err());
+            conn.execute("UPDATE assets SET local_path='/photos/image.jpg.xmp' WHERE library='OtherSync'", [])?;
+            assert!(super::validate_target_paths(conn, "SharedSync", "target").is_err());
+            conn.execute("UPDATE assets SET local_path='/photos/unrelated.jpg' WHERE library='OtherSync'", [])?;
+            super::validate_target_paths(conn, "SharedSync", "target")?;
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sparse_target_checkpoint_checks_callback_authority_and_pending_promotion_atomically() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        db.with_conn_mut("sparse_target_seed", |conn| {
+            conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,local_path,local_checksum,metadata_hash) VALUES ('SharedSync','target','original','provider','image.jpg',1,10,'photo','downloaded',1,'/photos/image.jpg','local','metadata')", [])?;
+            conn.execute("INSERT INTO asset_master_mappings(library,asset_record_name,master_record_name,updated_at) VALUES ('SharedSync','target','master',1)", [])?;
+            conn.execute("INSERT INTO asset_metadata_capture_revisions(library,asset_id,revision,updated_at) VALUES ('SharedSync','target',?1,1)", [crate::state::METADATA_CAPTURE_REVISION])?;
+            Ok(())
+        }).await.unwrap();
+        db.set_metadata("config_hash", "old").await.unwrap();
+        db.set_metadata("pending_download_config_hash", "new")
+            .await
+            .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "before")
+            .await
+            .unwrap();
+        let identity = db
+            .observe_sparse_identity(
+                "PrimarySync",
+                &SparseSourceId::new("source"),
+                &evidence("target"),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let stable = Arc::new(AtomicBool::new(true));
+        let check = Arc::clone(&stable);
+        let target = db
+            .sparse_target_state("SharedSync", "target", "master")
+            .await
+            .unwrap()
+            .unwrap()
+            .with_file_validation(Arc::new(move || {
+                if check.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(super::invariant("synthetic file proof drift"))
+                }
+            }));
+        let proof = identity.proof().with_target(target);
+        let transition = || CheckpointTransition {
+            expected_metadata: Vec::new(),
+            legacy_preservation_proofs: Vec::new(),
+            legacy_config_hash: None,
+            sparse_identity_proofs: vec![proof.clone()],
+            metadata_updates: vec![
+                ("sync_token:PrimarySync".into(), "after".into()),
+                ("config_hash".into(), "new".into()),
+            ],
+            metadata_deletes: vec![
+                "pending_download_config_hash".into(),
+                unresolved_identity_key("PrimarySync"),
+            ],
+        };
+        stable.store(false, Ordering::SeqCst);
+        assert!(db.commit_checkpoint_transition(transition()).await.is_err());
+        stable.store(true, Ordering::SeqCst);
+        db.with_conn_mut("sparse_target_real_debt", |conn| {
+            conn.execute("UPDATE assets SET metadata_write_failed_at=7 WHERE library='SharedSync' AND id='target'", [])?;
+            Ok(())
+        }).await.unwrap();
+        assert!(db.commit_checkpoint_transition(transition()).await.is_err());
+        assert_eq!(db.sparse_identities("PrimarySync").await.unwrap().len(), 1);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("before")
+        );
+        db.with_conn_mut("sparse_target_debt_preserved", |conn| {
+            let marker: i64 = conn.query_row("SELECT metadata_write_failed_at FROM assets WHERE library='SharedSync' AND id='target'", [], |row| row.get(0))?;
+            assert_eq!(marker, 7);
+            // Restore this synthetic prerequisite before the other independent faults.
+            conn.execute("UPDATE assets SET metadata_write_failed_at=NULL WHERE library='SharedSync' AND id='target'", [])?;
+            Ok(())
+        }).await.unwrap();
+        db.with_conn_mut("sparse_target_competitor", |conn| {
+            conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,last_seen_at,local_path) VALUES ('OtherSync','other','original','provider','image.jpg',1,10,'photo','downloaded',1,'/photos/image.jpg')", [])?;
+            Ok(())
+        }).await.unwrap();
+        assert!(db.commit_checkpoint_transition(transition()).await.is_err());
+        db.with_conn_mut("sparse_target_failure", |conn| {
+            conn.execute("DELETE FROM assets WHERE library='OtherSync'", [])?;
+            conn.execute_batch("CREATE TRIGGER sparse_checkpoint_failure BEFORE UPDATE ON metadata WHEN NEW.key='config_hash' BEGIN SELECT RAISE(FAIL,'injected checkpoint failure'); END;")?;
+            Ok(())
+        }).await.unwrap();
+        assert!(db.commit_checkpoint_transition(transition()).await.is_err());
+        assert_eq!(db.sparse_identities("PrimarySync").await.unwrap().len(), 1);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("before")
+        );
+        assert_eq!(
+            db.get_metadata("pending_download_config_hash")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new")
+        );
+        db.with_conn_mut("sparse_target_failure_remove", |conn| {
+            conn.execute_batch("DROP TRIGGER sparse_checkpoint_failure;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        db.commit_checkpoint_transition(transition()).await.unwrap();
+        assert!(
+            db.sparse_identities("PrimarySync")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("after")
+        );
+        assert_eq!(
+            db.get_metadata("config_hash").await.unwrap().as_deref(),
+            Some("new")
+        );
+        assert!(
+            db.get_metadata("pending_download_config_hash")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     fn evidence(target: &str) -> SparseEvidence {
         SparseEvidence::new(format!(

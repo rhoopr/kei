@@ -305,6 +305,19 @@ impl SparseRetryContext {
         }
     }
 
+    pub(super) fn prove_target(
+        &self,
+        source: &str,
+        target: crate::state::db::SparseTargetState,
+        summary: &mut IncrementalDeltaSummary,
+    ) {
+        if let Some(row) = self.rows.get(&SparseSourceId::new(source)) {
+            summary
+                .sparse_identity_proofs
+                .push(row.proof().with_target(target));
+        }
+    }
+
     pub(super) fn prove(&self, source: &str, summary: &mut IncrementalDeltaSummary) {
         if let Some(row) = self.rows.get(&SparseSourceId::new(source)) {
             let proof = row.proof();

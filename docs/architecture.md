@@ -901,7 +901,8 @@ modes retain their prior held behavior. Only a complete current pair may update 
 through the existing state owner. A missing or deleted redirected master,
 foreign scope, another relationship change, cancellation or failed write holds
 the checkpoint. Other lookup consumers keep the hint unresolved. Sparse share
-links do not authorize this retry and are never followed.
+links do not authorize this same-scope retry. Selected sparse-target recovery
+uses the separate strict qualification described below.
 
 Unpaired asset deltas retain typed sparse-share evidence from
 `isSparsePrivateRecord` and the `linkedShare*` fields. The marker accepts exact
@@ -911,7 +912,26 @@ lookups request these fields too; ordinary media enumeration keeps its existing 
 projection. A structurally valid link remains unverified. Malformed links and
 valid links without a usable master remain unresolved. Link identifiers are
 opaque and their debug output is redacted. Lookup changes do not overwrite the
-original delta evidence or authorize a target lookup.
+original delta evidence. A link alone does not authorize a target lookup.
+
+Selected sparse-target recovery is owned by
+`src/download/sparse_target.rs`. The cycle supplies only current selected,
+unrestricted full-library plans; it does not search an unselected library or
+infer membership for album, rank, bounded, managed-primary or provisional
+selections. A fresh source lookup must agree with its retained link. The Photos
+adapter qualifies target owner/zone and the exact child/master pair before the
+normal target download pipeline can materialize missing selected renditions.
+Ordinary downloadable validation remains strict; no deletion exception is added.
+
+A target receipt is useful only with exact current identity, metadata, source
+provenance and independent protected-path-safe files. Trusted Legacy File
+acceptance does not satisfy this source proof. The source checkpoint transaction
+revalidates the source generation, target catalogue/configuration snapshot and
+held target files. Partial downloads retain the source obligation. Existing
+bounded source retry selection remains authoritative; no general retry budget,
+checkpoint reset or debt-backed advancement is introduced. Recovery decisions
+use fixed allowlisted labels in retained support history; a target-ready or
+prepared historical file is partial work, not a complete backup.
 
 Schema 26 adds `unresolved_sparse_identities`, keyed by library and source
 record in the account-scoped database. `src/state/db/sparse_identity.rs` stores
@@ -1133,6 +1153,25 @@ historical children as unresolved work, even when targeted lookup returns one
 usable sibling. It does not reserve that master's path or relax preservation
 eligibility. Independently owned current children can still reconcile, and later
 complete inventory can prepare preservation and release the checkpoint hold.
+
+A historical child media receipt at a protected original is not a current claim
+when the exact mapped child and rendition have a separate ready, source-backed
+current file. A missing current file remains unsupported by this historical
+exception; historical rows do not authorize initial materialization. The state owner snapshots the family dependencies and rederives
+that exception inside preservation preparation. The file owner retains confined
+handles, verifies their bytes and namespace immediately before commit, and
+refuses cancellation or drift. Historical receipts, originals and owner facts
+remain unchanged. Explicit local-byte acceptance does not satisfy this exception.
+Ordinary adoption and skip decisions cannot reuse a protected original merely
+because a child has a historical receipt there.
+
+Replacement recovery resolves protected parents through their nearest existing
+ancestor when only a trailing directory is absent. The missing suffix remains in
+the protection key; a missing old directory in an unselected library does not
+block unrelated recovery. Permission errors, malformed paths, dangling links and
+protected journals still refuse recovery. Managed layout recovery remains
+fail-fast: an overlapping protected operation leaves later operations pending.
+Independent finish calls do not establish coordinator continuation.
 
 Local path reconciliation also loads these publication receipts. A verified
 copy in the selected pass satisfies that rendition even when the catalogue's

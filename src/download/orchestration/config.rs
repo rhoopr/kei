@@ -518,6 +518,7 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
 /// Decoupled from CLI parsing so the engine can be tested independently.
 #[derive(Clone)]
 pub(crate) struct DownloadConfig {
+    pub(crate) sparse_targets: Arc<[crate::download::sparse_target::SelectedSparseTarget]>,
     /// Drain ordered queries to certify bounded local path work on config drift.
     /// Download eligibility and provider checkpoint bounds remain unchanged.
     pub(crate) complete_path_selection: bool,
@@ -803,6 +804,7 @@ impl DownloadConfig {
             filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
             temp_suffix: Arc::from(".kei-tmp"),
             state_db: None,
+            sparse_targets: Arc::from([]),
             complete_path_selection: false,
             selection_context: None,
             selection_run: None,

@@ -23,3 +23,5 @@ mod retained_recovery;
 mod indexing;
 
 mod trusted_legacy;
+
+mod sparse_recovery;

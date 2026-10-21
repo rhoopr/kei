@@ -1414,6 +1414,49 @@ pub(crate) async fn run_cycle(
             Arc::make_mut(&mut download_config).complete_path_selection = true;
         }
         let download_client = shared_session.read().await.download_client().clone();
+        // Only an unrestricted current full-library selection can admit an exact
+        // sparse target without inventing album/rank membership.
+        let mut sparse_targets = Vec::new();
+        if download_controls.run_mode.downloads_files() && !is_retry_failed {
+            for target in library_states.iter().copied().filter(|target| {
+                target.zone_name != lib_state.zone_name
+                    && !target.plan_is_stale
+                    && target.plan.passes.len() == 1
+            }) {
+                let Some(pass) = target.plan.passes.first() else {
+                    continue;
+                };
+                if pass.kind != crate::commands::PassKind::Unfiled || !pass.exclude_ids.is_empty() {
+                    continue;
+                }
+                let target_config = build_download_config(
+                    download::SyncMode::Full,
+                    Arc::clone(&pass.exclude_ids),
+                    preload_asset_groupings(state_db, &target.zone_name).await,
+                    Arc::from(target.zone_name.as_str()),
+                );
+                if target_config.recent.is_some()
+                    || target_config.skip_created_before.is_some()
+                    || target_config.skip_created_after.is_some()
+                    || target_config.retry_only
+                    || target_config.edited_naming == crate::types::EditedNaming::Primary
+                {
+                    continue;
+                }
+                let mut target_config = target_config.with_pass(pass);
+                // A full-library path label is not evidence of album membership.
+                target_config.album_name = None;
+                sparse_targets.push(download::sparse_target::SelectedSparseTarget {
+                    library: target.library.clone(),
+                    album: pass.album.clone(),
+                    config: Arc::new(target_config),
+                    client: download_client.clone(),
+                    controls: download_controls,
+                });
+            }
+        }
+        Arc::make_mut(&mut download_config).sparse_targets = sparse_targets.into();
+
         let mut path_reconciliation_requires_smart_query = false;
         if indexing_finished
             && !indexing_reconciliation
@@ -1551,7 +1594,7 @@ pub(crate) async fn run_cycle(
                     CheckpointBasis::CompleteInventory,
                 );
                 if matches!(inventory_decision, SourceCheckpointDecision::Advance { .. }) {
-                    let bridge_config = build_download_config(
+                    let mut bridge_config = build_download_config(
                         download::SyncMode::Incremental {
                             zone_sync_token: prior_token.clone(),
                         },
@@ -1563,6 +1606,8 @@ pub(crate) async fn run_cycle(
                         zone = %lib_state.zone_name,
                         "Inventory reconciliation complete; bridging changes from the preserved provider checkpoint"
                     );
+                    Arc::make_mut(&mut bridge_config).sparse_targets =
+                        Arc::clone(&download_config.sparse_targets);
                     let bridge_result = download::download_photos_with_sync(
                         &download_client,
                         &lib_state.plan.passes,

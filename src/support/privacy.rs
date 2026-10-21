@@ -469,6 +469,7 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "http_status",
             "interrupted",
         ]),
+        "recovery_decision_v1" => Some(&["mechanism", "decision", "reason"]),
         "legacy_receipt_prerequisite_v1" => Some(&["prerequisite"]),
         "legacy_preservation_hardlink_trust" => Some(&["stage", "reason", "affected_paths"]),
         "expired_url_refresh_failed" => Some(&[
@@ -499,6 +500,29 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
 // Revalidate saved history as strictly as current producer observations.
 fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
     let label = value.as_str();
+    if kind == "recovery_decision_v1" {
+        return match key {
+            "mechanism" => matches!(label, Some("historical_path" | "sparse_target")),
+            "decision" => matches!(label, Some("recovered" | "unsupported" | "partial")),
+            "reason" => matches!(
+                label,
+                Some(
+                    "historical_claim_prepared"
+                        | "historical_claim_unverified"
+                        | "target_not_selected"
+                        | "target_scope_unqualified"
+                        | "target_pair_unresolved"
+                        | "target_policy_unsupported"
+                        | "target_receipt_unqualified"
+                        | "target_file_unverified"
+                        | "target_materialization_failed"
+                        | "target_receipt_ready"
+                        | "source_evidence_changed"
+                )
+            ),
+            _ => false,
+        };
+    }
     if kind == "legacy_receipt_prerequisite_v1" {
         return key == "prerequisite"
             && matches!(
