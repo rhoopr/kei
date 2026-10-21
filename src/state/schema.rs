@@ -1351,6 +1351,16 @@ fn migrate_to_version(
     Ok(())
 }
 
+/// Build a genuine schema-28 database by running every released migration
+/// step. Test-only: production migrations never stop at an older version.
+#[cfg(test)]
+pub(crate) fn migrate_genuine_v28(conn: &Connection) -> Result<(), StateError> {
+    for version in 1..=28 {
+        migrate_to_version(conn, 0, version)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3590,6 +3600,134 @@ mod tests {
                     "master-shared".to_string()
                 ),
             ]
+        );
+    }
+
+    fn baseline_rows(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.library,a.id,a.version_size,a.status,a.checksum,\
+                        a.local_path,a.downloaded_at,a.size_bytes,a.added_at \
+                 FROM assets a LEFT JOIN asset_metadata_paths p \
+                   ON p.library=a.library AND p.id=a.id AND p.version_size=a.version_size \
+                  AND p.local_path=a.local_path \
+                 ORDER BY a.library,a.id,a.version_size,p.local_path",
+            )
+            .unwrap();
+        let columns = stmt.column_count();
+        stmt.query_map([], |row| {
+            (0..columns)
+                .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                .collect()
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn genuine_v28_migration_preserves_keys_and_six_fields_without_creating_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate_genuine_v28(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 28);
+        conn.execute_batch(
+            "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,\
+                 added_at,size_bytes,media_type,status,downloaded_at,local_path,last_seen_at,source) \
+             VALUES('PrimarySync','asset-baseline','original','provider-baseline','collision.jpg',\
+                 1700000000,1690000000,42,'photo','downloaded',1700000001,\
+                 '/protected/primary-collision.jpg',1700000002,'icloud');
+             INSERT INTO asset_metadata_paths(library,id,version_size,local_path,\
+                 provider_checksum,local_checksum,download_checksum,source_checksum) \
+             VALUES('PrimarySync','asset-baseline','original','/protected/primary-collision.jpg',\
+                 'provider-baseline','local-baseline','download-baseline','source-baseline');
+             INSERT INTO asset_master_mappings VALUES \
+                 ('PrimarySync','asset-baseline','primary-master',1700000000);
+             INSERT INTO assets(library,id,version_size,checksum,filename,created_at,\
+                 added_at,size_bytes,media_type,status,downloaded_at,local_path,last_seen_at,source) \
+             VALUES('SharedSync-SYNTHETIC-KEYS','asset-shared-baseline','original',\
+                 'provider-shared-baseline','shared-baseline.jpg',1700000000,1690000000,84,\
+                 'photo','downloaded',1700000001,'/protected/shared-baseline.jpg',1700000002,'icloud');
+             INSERT INTO asset_metadata_paths(library,id,version_size,local_path,\
+                 provider_checksum,local_checksum,download_checksum,source_checksum) \
+             VALUES('SharedSync-SYNTHETIC-KEYS','asset-shared-baseline','original',\
+                 '/protected/shared-baseline.jpg','provider-shared-baseline',\
+                 'local-shared-baseline','download-shared-baseline','source-shared-baseline');
+             INSERT INTO asset_master_mappings VALUES \
+                 ('SharedSync-SYNTHETIC-KEYS','asset-shared-baseline','shared-baseline-master',\
+                  1700000000);",
+        )
+        .unwrap();
+
+        let keys_before: Vec<(String, String, String)> = conn
+            .prepare("SELECT library,id,version_size FROM assets ORDER BY library,id,version_size")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let rows_before = baseline_rows(&conn);
+        assert_eq!(keys_before.len(), 2);
+        assert_eq!(rows_before.len(), 2);
+        assert_eq!(
+            rows_before
+                .iter()
+                .filter(|row| row[0] == rusqlite::types::Value::Text("PrimarySync".into()))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows_before
+                .iter()
+                .filter(|row| row[0]
+                    == rusqlite::types::Value::Text("SharedSync-SYNTHETIC-KEYS".into()))
+                .count(),
+            1
+        );
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        let keys_after: Vec<(String, String, String)> = conn
+            .prepare("SELECT library,id,version_size FROM assets ORDER BY library,id,version_size")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            keys_after, keys_before,
+            "schema 28 -> current must not create, rename, or drop catalogue keys"
+        );
+        assert_eq!(
+            baseline_rows(&conn),
+            rows_before,
+            "status/checksum/path/downloadtime/size/addeddate must survive migration for every existing tuple"
+        );
+        let mappings: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT library,asset_record_name,master_record_name \
+                 FROM asset_master_mappings ORDER BY library,asset_record_name",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            mappings,
+            vec![
+                (
+                    "PrimarySync".to_string(),
+                    "asset-baseline".to_string(),
+                    "primary-master".to_string()
+                ),
+                (
+                    "SharedSync-SYNTHETIC-KEYS".to_string(),
+                    "asset-shared-baseline".to_string(),
+                    "shared-baseline-master".to_string()
+                )
+            ],
+            "the migration must not invent provider identities"
         );
     }
 }

@@ -24,6 +24,8 @@ mod indexing;
 
 mod trusted_legacy;
 
+mod shared_keys;
+
 mod sparse_recovery;
 
 mod unprepared_recovery;
