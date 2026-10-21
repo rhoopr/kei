@@ -1429,10 +1429,18 @@ pub(crate) async fn run_cycle(
                 if pass.kind != crate::commands::PassKind::Unfiled || !pass.exclude_ids.is_empty() {
                     continue;
                 }
+                #[cfg(feature = "xmp")]
+                let target_groupings = if config.metadata.embed_xmp || config.metadata.xmp_sidecar {
+                    preload_asset_groupings(state_db, &target.zone_name).await
+                } else {
+                    Arc::new(download::AssetGroupings::default())
+                };
+                #[cfg(not(feature = "xmp"))]
+                let target_groupings = Arc::new(download::AssetGroupings::default());
                 let target_config = build_download_config(
                     download::SyncMode::Full,
                     Arc::clone(&pass.exclude_ids),
-                    preload_asset_groupings(state_db, &target.zone_name).await,
+                    target_groupings,
                     Arc::from(target.zone_name.as_str()),
                 );
                 if target_config.recent.is_some()

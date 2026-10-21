@@ -11,7 +11,9 @@ use tokio_util::sync::CancellationToken;
 use crate::commands::{AlbumPass, PassKind};
 use crate::download::{file, filter, paths};
 use crate::icloud::photos::{PhotoAsset, PhotosSession};
-use crate::state::{DownloadStateStore, ReconciliationStateStore, SqliteStateDb, VersionSizeKey};
+#[cfg(target_os = "linux")]
+use crate::state::DownloadStateStore;
+use crate::state::{ReconciliationStateStore, SqliteStateDb, VersionSizeKey};
 use crate::test_helpers::{
     MockPhotosFlow, TestAssetRecord, mock_photo_records_for_zone_with_filename,
 };

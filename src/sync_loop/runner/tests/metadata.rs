@@ -3612,6 +3612,13 @@ enum AmbiguousChildFault {
     None,
     Preserve,
     PreserveHistoricalClaim,
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "The retained-inode replacement fixture requires Unix namespace semantics"
+        )
+    )]
     PreserveHistoricalReplacement,
     PreserveConfigChange,
     PreserveIncompleteInventory,
