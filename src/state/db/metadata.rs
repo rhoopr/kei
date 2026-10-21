@@ -1459,6 +1459,15 @@ impl MetadataRewriteStore for SqliteStateDb {
     ) -> Result<bool, StateError> {
         SqliteStateDb::prepare_legacy_preservation(self, snapshot, files).await
     }
+    async fn prepare_legacy_preservation_validated(
+        &self,
+        snapshot: &crate::state::db::LegacyPreparationSnapshot,
+        files: &[crate::state::db::LegacyFileEvidence],
+        validate_files: Box<dyn FnOnce() -> Result<(), crate::state::error::StateError> + Send>,
+    ) -> Result<bool, crate::state::error::StateError> {
+        SqliteStateDb::prepare_legacy_preservation_validated(self, snapshot, files, validate_files)
+            .await
+    }
     async fn legacy_preservations(
         &self,
         library: &str,

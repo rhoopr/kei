@@ -1038,6 +1038,18 @@ pub trait MetadataRewriteStore: Send + Sync {
             detail: "legacy preservation is unsupported by this store".into(),
         })
     }
+    /// Historical-claim exceptions retain verified file handles through commit.
+    async fn prepare_legacy_preservation_validated(
+        &self,
+        _snapshot: &super::LegacyPreparationSnapshot,
+        _files: &[super::LegacyFileEvidence],
+        _validate_files: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
+    ) -> Result<bool, StateError> {
+        Err(StateError::Invariant {
+            operation: "prepare_legacy_preservation_validated",
+            detail: "state store does not support validated historical claims".into(),
+        })
+    }
     async fn legacy_preservations(
         &self,
         _library: &str,

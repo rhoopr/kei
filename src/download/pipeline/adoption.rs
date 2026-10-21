@@ -540,6 +540,11 @@ async fn adopt_cross_parent_pending_file(
             crate::fs_util::reserved_path_under_root(&config.directory, saved_destination)?;
         let destination = &destination;
         anyhow::ensure!(
+            crate::download::legacy_preservation::current_path_is_independent(db, destination)
+                .await?,
+            "Reserved pending file overlaps a protected historical original"
+        );
+        anyhow::ensure!(
             task_planner.retry_path_allowed(
                 library,
                 asset.state_id(),
@@ -907,6 +912,13 @@ async fn mark_pending_downloaded_from_existing_path(
     existing_path: PathBuf,
     mark_capture_repair: bool,
 ) -> Option<PendingOnDiskAdoption> {
+    match crate::download::legacy_preservation::current_path_is_independent(db, &existing_path)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(_) => return Some(PendingOnDiskAdoption::StateWriteFailed(existing_path)),
+    }
     let local_checksum = match crate::download::file::compute_sha256(&existing_path).await {
         Ok(checksum) => checksum,
         Err(e) => {
@@ -1004,6 +1016,13 @@ pub(in crate::download) async fn recorded_current_path_exists(
     recorded_file: &RecordedLocalFile,
 ) -> Option<PathBuf> {
     let stored_path = &recorded_file.path;
+    if let Some(db) = config.state_db.as_deref()
+        && !crate::download::legacy_preservation::current_path_is_independent(db, stored_path)
+            .await
+            .ok()?
+    {
+        return None;
+    }
     let derived_paths = derive_expected_paths(asset, config);
 
     for derived in &derived_paths {

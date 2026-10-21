@@ -512,6 +512,7 @@ pub(super) struct FailingMetadataSetDb {
     pub(super) fail_source_delete: bool,
     pub(super) fail_mark_downloaded: bool,
     omit_verified_source: bool,
+    replace_historical_current: bool,
     receipt_diagnostic: Option<Result<state::db::LegacyChildReceiptRefusal, &'static str>>,
     pub(super) fail_refresh_downloaded_metadata: bool,
     /// Stands in for a concurrent pass: refreshes the row to this snapshot
@@ -539,6 +540,11 @@ impl std::fmt::Debug for FailingMetadataSetDb {
 }
 
 impl FailingMetadataSetDb {
+    pub(super) fn with_historical_current_replacement(mut self) -> Self {
+        self.replace_historical_current = true;
+        self
+    }
+
     pub(super) fn with_unknown_download_source(mut self) -> Self {
         self.omit_verified_source = true;
         self
@@ -611,6 +617,7 @@ impl FailingMetadataSetDb {
             fail_source_delete: false,
             fail_mark_downloaded: false,
             omit_verified_source: false,
+            replace_historical_current: false,
             receipt_diagnostic: None,
             fail_refresh_downloaded_metadata: false,
             refresh_on_mark_downloaded: None,
@@ -1480,6 +1487,27 @@ impl state::MetadataRewriteStore for FailingMetadataSetDb {
     ) -> Result<bool, state::error::StateError> {
         self.inner
             .prepare_legacy_preservation(snapshot, files)
+            .await
+    }
+    async fn prepare_legacy_preservation_validated(
+        &self,
+        snapshot: &crate::state::db::LegacyPreparationSnapshot,
+        files: &[crate::state::db::LegacyFileEvidence],
+        validate_files: Box<dyn FnOnce() -> Result<(), crate::state::error::StateError> + Send>,
+    ) -> Result<bool, crate::state::error::StateError> {
+        if self.replace_historical_current {
+            let path = &snapshot
+                .historical_claims
+                .first()
+                .expect("qualified historical claim")
+                .current_path;
+            let bytes = std::fs::read(path).expect("current file");
+            // The production retained handle keeps the old inode alive.
+            std::fs::remove_file(path).expect("unlink current namespace entry");
+            std::fs::write(path, bytes).expect("replace current namespace entry");
+        }
+        self.inner
+            .prepare_legacy_preservation_validated(snapshot, files, validate_files)
             .await
     }
     async fn legacy_preservations(

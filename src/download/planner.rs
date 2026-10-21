@@ -273,6 +273,13 @@ impl TaskPlanner {
                 continue;
             };
             if let Some(db) = config.state_db.as_deref()
+                && !super::legacy_preservation::current_path_is_independent(db, path)
+                    .await
+                    .ok()?
+            {
+                continue;
+            }
+            if let Some(db) = config.state_db.as_deref()
                 && db
                     .guard_primary_slot(
                         &owner.library,
@@ -367,6 +374,13 @@ impl TaskPlanner {
             let Some(path) = &record.local_path else {
                 return false;
             };
+            if let Some(db) = config.state_db.as_deref()
+                && !super::legacy_preservation::current_path_is_independent(db, path)
+                    .await
+                    .unwrap_or(false)
+            {
+                return false;
+            }
             if record.checksum != derived.checksum.as_ref()
                 || !super::filter::stored_path_matches_current_collision_family(
                     asset.state_id(),

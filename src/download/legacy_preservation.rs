@@ -25,6 +25,19 @@ pub(crate) async fn protected_replacement_paths(
     Ok(db.protected_legacy_paths().await?)
 }
 
+/// Shared originals remain unavailable to ordinary adoption/skip even when a
+/// child has a historical catalogue receipt for the same bytes. Managed primary
+/// ownership is checked separately by its exact slot owner.
+pub(in crate::download) async fn current_path_is_independent(
+    db: &dyn DownloadStore,
+    path: &Path,
+) -> anyhow::Result<bool> {
+    Ok(db.source_metadata_recovery(path).await?
+        != crate::state::db::SourceMetadataRecovery::ProtectedLegacy
+        && db.source_metadata_recovery(&sidecar(path)).await?
+            != crate::state::db::SourceMetadataRecovery::ProtectedLegacy)
+}
+
 const INVENTORY_RETRY_SECONDS: i64 = 60 * 60;
 const INVENTORY_RETRY_PREFIX: &str = "legacy_preservation_inventory_retry:";
 
@@ -353,11 +366,134 @@ impl LegacyCycle {
                                 break;
                             }
                         }
+                        let mut retained_current = Vec::new();
                         if valid {
-                            if !db.prepare_legacy_preservation(&candidate, &files).await? {
+                            // These bytes qualify only a historical catalogue claim;
+                            // they never become protected originals or provider proof.
+                            for claim in &candidate.historical_claims {
+                                let current = fingerprint(
+                                    &config.directory,
+                                    &claim.current_path,
+                                    true,
+                                    &config.temp_suffix,
+                                    cancel,
+                                    hardlink_trust.as_ref(),
+                                )
+                                .await;
+                                if !current.is_ok_and(|file| {
+                                    file.sha256.as_deref() == Some(claim.local_sha256.as_str())
+                                }) {
+                                    valid = false;
+                                    break;
+                                }
+                                let retained = super::file::retain_pending_file(
+                                    &config.directory,
+                                    &claim.current_path,
+                                )
+                                .await?;
+                                let Some(retained) = retained else {
+                                    valid = false;
+                                    break;
+                                };
+                                if data_encoding::HEXLOWER.encode(&retained.fingerprint.sha256)
+                                    != claim.local_sha256
+                                {
+                                    valid = false;
+                                    break;
+                                }
+                                retained_current.push(retained);
+                            }
+                        }
+                        if valid {
+                            let cancel = cancel.clone();
+                            let root = config.directory.to_path_buf();
+                            let suffix = config.temp_suffix.clone();
+                            let current_paths = candidate
+                                .historical_claims
+                                .iter()
+                                .map(|claim| claim.current_path.clone())
+                                .collect::<Vec<_>>();
+                            let allow_hardlinks = config.legacy_preservation_allow_hardlinks;
+                            let validate = Box::new(move || {
+                                if cancel.is_cancelled() {
+                                    return Err(crate::state::error::StateError::Invariant {
+                                        operation: "legacy_preservation",
+                                        detail: "historical claim validation cancelled".into(),
+                                    });
+                                }
+                                for (file, path) in retained_current.into_iter().zip(current_paths)
+                                {
+                                    let check = || -> anyhow::Result<()> {
+                                        for suffix in [suffix.as_ref(), ".part"] {
+                                            let mut temporary = path.as_os_str().to_owned();
+                                            temporary.push(suffix);
+                                            anyhow::ensure!(
+                                                !crate::fs_util::ConfinedPath::open(
+                                                    &root,
+                                                    Path::new(&temporary),
+                                                    crate::fs_util::ConfinedParents::Existing
+                                                )?
+                                                .entry_exists()?,
+                                                "Historical current temporary write is pending"
+                                            );
+                                        }
+                                        anyhow::ensure!(
+                                            !super::file::has_replacement_journal_blocking(
+                                                &root, &path
+                                            )?,
+                                            "Historical current replacement is pending"
+                                        );
+                                        let links = file.link_count()?;
+                                        anyhow::ensure!(
+                                            links == 1 || (allow_hardlinks && links > 0),
+                                            "Historical current hardlink policy changed"
+                                        );
+                                        file.validate_blocking()
+                                    };
+                                    check().map_err(|_private_error| {
+                                        crate::state::error::StateError::Invariant {
+                                            operation: "legacy_preservation",
+                                            detail: "historical claim file changed before commit"
+                                                .into(),
+                                        }
+                                    })?;
+                                }
+                                Ok(())
+                            });
+                            let prepared = if candidate.historical_claims.is_empty() {
+                                db.prepare_legacy_preservation(&candidate, &files).await?
+                            } else {
+                                db.prepare_legacy_preservation_validated(
+                                    &candidate, &files, validate,
+                                )
+                                .await?
+                            };
+                            if !prepared {
                                 deferred_candidates += 1;
                             }
+                            if !candidate.historical_claims.is_empty() {
+                                tracing::info!(
+                                    diagnostic = "recovery_decision_v1",
+                                    mechanism = "historical_path",
+                                    decision = if prepared { "partial" } else { "unsupported" },
+                                    reason = if prepared {
+                                        "historical_claim_prepared"
+                                    } else {
+                                        "historical_claim_unverified"
+                                    },
+                                    "Historical path recovery retains original evidence and provider checkpoint obligations"
+                                );
+                            }
                         } else {
+                            if !candidate.historical_claims.is_empty() {
+                                tracing::warn!(
+                                    diagnostic = "recovery_decision_v1",
+                                    mechanism = "historical_path",
+                                    decision = "unsupported",
+                                    reason = "historical_claim_unverified",
+                                    "Historical path recovery requires unchanged independent current files"
+                                );
+                            }
                             invalid_original_files += 1;
                         }
                     }
@@ -547,6 +683,24 @@ fn sidecar(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".xmp");
     PathBuf::from(name)
+}
+
+/// Strict current-file evidence for recovery paths without a hardlink policy.
+pub(in crate::download) async fn strict_current_file(
+    config: &DownloadConfig,
+    path: &Path,
+    required: bool,
+    cancel: &CancellationToken,
+) -> anyhow::Result<LegacyFileEvidence> {
+    fingerprint(
+        &config.directory,
+        path,
+        required,
+        &config.temp_suffix,
+        cancel,
+        None,
+    )
+    .await
 }
 
 async fn fingerprint(
@@ -1076,6 +1230,7 @@ mod tests {
             asset_id: "master".into(),
             evidence: value.to_string(),
             paths: Vec::new(),
+            historical_claims: Vec::new(),
         };
         let baseline =
             super::inventory_retry_signature("config-a", &[snapshot(original.clone())]).unwrap();

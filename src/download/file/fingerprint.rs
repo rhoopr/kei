@@ -71,19 +71,24 @@ impl RetainedPendingFile {
 
     pub(in crate::download) async fn validate(self: &Arc<Self>) -> anyhow::Result<()> {
         let retained = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
-            let identity = crate::fs_util::file_identity(&retained.file)?;
-            let mut file = retained.path.validate_identity(identity)?;
-            anyhow::ensure!(
-                fingerprint_open_file_snapshot_blocking(&mut file, retained.path.path())?
-                    .fingerprint
-                    == retained.fingerprint,
-                "Reserved pending file changed before adoption finalization"
-            );
-            retained.path.validate_identity(identity)?;
-            Ok(())
-        })
-        .await?
+        tokio::task::spawn_blocking(move || retained.validate_blocking()).await?
+    }
+
+    pub(in crate::download) fn link_count(&self) -> std::io::Result<u64> {
+        crate::fs_util::file_link_count(&self.file)
+    }
+
+    /// Recheck held bytes and namespace inside the owning state transaction.
+    pub(in crate::download) fn validate_blocking(&self) -> anyhow::Result<()> {
+        let identity = crate::fs_util::file_identity(&self.file)?;
+        let mut file = self.path.validate_identity(identity)?;
+        anyhow::ensure!(
+            fingerprint_open_file_snapshot_blocking(&mut file, self.path.path())?.fingerprint
+                == self.fingerprint,
+            "Reserved pending file changed before adoption finalization"
+        );
+        self.path.validate_identity(identity)?;
+        Ok(())
     }
 }
 

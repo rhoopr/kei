@@ -19,6 +19,19 @@ pub(crate) struct LegacyPreparationSnapshot {
     pub(crate) asset_id: String,
     pub(crate) evidence: String,
     pub(crate) paths: Vec<PathBuf>,
+    /// Exact historical media claims whose independent current files must be
+    /// verified by the file owner before preparation. No original is released.
+    pub(crate) historical_claims: Vec<LegacyHistoricalClaim>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LegacyHistoricalClaim {
+    pub(crate) child: String,
+    pub(crate) rendition: String,
+    pub(crate) historical_path: PathBuf,
+    pub(crate) current_path: PathBuf,
+    pub(crate) local_sha256: String,
+    pub(crate) dependencies: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +234,69 @@ pub(super) fn dependencies(
     Ok(json!([EVIDENCE_VERSION, children, mappings, owners, additional]).to_string())
 }
 
+/// A historical receipt is not a current claim only when its exact mapped
+/// child/rendition has a separate finalized source-backed current receipt.
+/// File verification remains with the download owner; this snapshot is compared
+/// again in the preparation transaction, including all family dependencies.
+fn historical_claims(
+    conn: &Connection,
+    library: &str,
+    master: &str,
+    originals: &[PathBuf],
+) -> Result<Vec<LegacyHistoricalClaim>, StateError> {
+    let original_keys = originals
+        .iter()
+        .map(|path| crate::fs_util::confined_path_key(path).map_err(|_private_error| invalid()))
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
+    let mut statement = conn.prepare(
+        "SELECT p.id,p.version_size,p.local_path,a.local_path,a.local_checksum
+         FROM asset_metadata_paths p
+         JOIN asset_master_mappings m ON m.library=p.library AND m.asset_record_name=p.id
+         JOIN assets a ON a.library=p.library AND a.id=p.id AND a.version_size=p.version_size
+         WHERE p.library=?1 AND m.master_record_name=?2 AND p.id!=?2
+           AND a.local_path IS NOT NULL AND a.local_checksum IS NOT NULL
+           AND a.local_path!=p.local_path ORDER BY p.id,p.version_size,p.local_path",
+    )?;
+    let rows = statement
+        .query_map(params![library, master], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut claims = Vec::new();
+    for (child, rendition, historical, current, local_sha256) in rows {
+        let historical_path = PathBuf::from(historical);
+        let current_path = PathBuf::from(current);
+        let historical_key = crate::fs_util::confined_path_key(&historical_path)
+            .map_err(|_private_error| invalid())?;
+        let mut current_sidecar = current_path.as_os_str().to_owned();
+        current_sidecar.push(".xmp");
+        if !original_keys.contains(&historical_key)
+            || !child_receipts_ready(conn, library, &child)?
+            || super::trusted_legacy::provenance(conn, library, &child, &rendition)?
+                != Some(super::trusted_legacy::LegacyReceiptProvenance::VerifiedSource)
+            || path_is_protected(conn, &current_path)?
+            || path_is_protected(conn, std::path::Path::new(&current_sidecar))?
+        {
+            continue;
+        }
+        claims.push(LegacyHistoricalClaim {
+            child,
+            rendition,
+            historical_path,
+            current_path,
+            local_sha256,
+            dependencies: dependencies(conn, library, master)?,
+        });
+    }
+    Ok(claims)
+}
+
 fn preparation_snapshot(
     conn: &Connection,
     library: &str,
@@ -252,6 +328,7 @@ fn preparation_snapshot(
         library: library.to_owned(),
         asset_id: id.to_owned(),
         evidence: original_evidence(conn, library, id)?,
+        historical_claims: historical_claims(conn, library, id, &paths)?,
         paths,
     }))
 }
@@ -406,6 +483,21 @@ impl SqliteStateDb {
         expected: &LegacyPreparationSnapshot,
         files: &[LegacyFileEvidence],
     ) -> Result<bool, StateError> {
+        // Historical exceptions require held file validation, not a caller's
+        // unchecked candidate snapshot.
+        if !expected.historical_claims.is_empty() {
+            return Ok(false);
+        }
+        self.prepare_legacy_preservation_validated(expected, files, Box::new(|| Ok(())))
+            .await
+    }
+
+    pub(crate) async fn prepare_legacy_preservation_validated(
+        &self,
+        expected: &LegacyPreparationSnapshot,
+        files: &[LegacyFileEvidence],
+        validate_files: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
+    ) -> Result<bool, StateError> {
         let expected = expected.clone();
         let files = files.to_vec();
         self.with_conn_mut("prepare_legacy_preservation",move |conn| {
@@ -414,11 +506,16 @@ impl SqliteStateDb {
             if current!=expected { return Ok(false); }
             let mut keys=std::collections::HashSet::new();
             let foreign_paths = {
-                let mut paths=tx.prepare("SELECT library,id,local_path FROM assets WHERE local_path IS NOT NULL UNION SELECT library,id,local_path FROM asset_metadata_paths")?;
-                let catalog=paths.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?;
+                let mut paths=tx.prepare("SELECT library,id,version_size,local_path,0 FROM assets WHERE local_path IS NOT NULL UNION SELECT library,id,version_size,local_path,1 FROM asset_metadata_paths WHERE local_path IS NOT NULL")?;
+                let catalog=paths.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,bool>(4)?)))?;
                 let mut foreign_paths = std::collections::HashSet::new();
                 for row in catalog {
-                    let (library,id,path)=row?;
+                    let (library,id,rendition,path,historical)=row?;
+                    if historical && library==expected.library && expected.historical_claims.iter().any(|claim|
+                        claim.child==id && claim.rendition==rendition && claim.historical_path==std::path::Path::new(&path)
+                    ) {
+                        continue;
+                    }
                     if library!=expected.library || id!=expected.asset_id {
                         foreign_paths.insert(crate::fs_util::confined_path_key(std::path::Path::new(&path)).map_err(|_private_error|invalid())?);
                     }
@@ -453,6 +550,7 @@ impl SqliteStateDb {
             for file in files {
                 tx.execute("INSERT INTO unattributed_legacy_paths VALUES (?1,?2,?3,?4)",params![expected.library,expected.asset_id,crate::fs_util::confined_path_key(&file.path).map_err(|_private_error|invalid())?,file.path.to_str().ok_or_else(invalid)?])?;
             }
+            validate_files()?;
             tx.commit()?;
             Ok(true)
         }).await
@@ -1097,6 +1195,175 @@ mod tests {
         ];
         (db, snapshot, files)
     }
+    #[tokio::test]
+    async fn legacy_historical_claim_requires_exact_source_backed_current_receipt() {
+        for fault in [
+            "none",
+            "no_current",
+            "source",
+            "library",
+            "rendition",
+            "mapping",
+            "debt",
+            "current_claim",
+            "sidecar",
+            "stale",
+            "commit",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let database = dir.path().join("state.db");
+            let (db, _, files) = seed(&database).await;
+            let current = dir.path().join("current.jpg");
+            std::fs::write(&current, b"current child bytes").unwrap();
+            let hash = crate::download::file::compute_sha256(&current)
+                .await
+                .unwrap();
+            db.upsert_seen(
+                &crate::test_helpers::TestAssetRecord::new("child-a")
+                    .checksum("provider")
+                    .size(19)
+                    .build(),
+            )
+            .await
+            .unwrap();
+            crate::state::DownloadStateStore::mark_verified_download(
+                &db,
+                "PrimarySync",
+                "child-a",
+                "original",
+                &current,
+                &hash,
+                Some(&hash),
+                false,
+            )
+            .await
+            .unwrap();
+            {
+                let conn = db.acquire_lock("seed_historical_claim").unwrap();
+                conn.execute(
+                    "INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum)
+                    VALUES ('PrimarySync','child-a','original',?1,'provider',?2)",
+                    rusqlite::params![files[0].path.to_str().unwrap(), files[0].sha256],
+                ).unwrap();
+                match fault {
+                    "no_current" => {
+                        conn.execute("DELETE FROM assets WHERE id='child-a'", [])
+                            .unwrap();
+                    }
+                    "source" => {
+                        conn.execute("UPDATE asset_metadata_paths SET source_checksum=NULL", [])
+                            .unwrap();
+                    }
+                    "library" => {
+                        conn.execute("UPDATE asset_metadata_paths SET library='OtherLibrary' WHERE source_checksum IS NOT NULL",[]).unwrap();
+                    }
+                    "rendition" => {
+                        conn.execute("UPDATE asset_metadata_paths SET version_size='adjusted' WHERE source_checksum IS NOT NULL",[]).unwrap();
+                    }
+                    "mapping" => {
+                        conn.execute("UPDATE asset_master_mappings SET master_record_name='other-master' WHERE asset_record_name='child-a'",[]).unwrap();
+                    }
+                    "debt" => {
+                        conn.execute("UPDATE asset_metadata_paths SET capture_repair_metadata_hash='pending' WHERE source_checksum IS NOT NULL",[]).unwrap();
+                    }
+                    "current_claim" => {
+                        conn.execute(
+                            "UPDATE assets SET local_path=?1 WHERE id='child-a'",
+                            [files[0].path.to_str().unwrap()],
+                        )
+                        .unwrap();
+                    }
+                    "sidecar" => {
+                        conn.execute("UPDATE asset_metadata_paths SET local_path=?1 WHERE source_checksum IS NULL AND id='child-a'",[files[1].path.to_str().unwrap()]).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            let historical_before = {
+                let conn = db.acquire_lock("historical_before").unwrap();
+                super::snapshot_rows(&conn,"SELECT * FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND source_checksum IS NULL","PrimarySync","child-a").unwrap()
+            };
+            drop(db);
+            let db = SqliteStateDb::open(&database).await.unwrap();
+            let candidates = db
+                .legacy_preparation_snapshots("PrimarySync", 10)
+                .await
+                .unwrap();
+            if fault == "mapping" {
+                assert!(candidates.is_empty());
+                continue;
+            }
+            let candidate = &candidates[0];
+            assert_eq!(
+                candidate.historical_claims.len(),
+                usize::from(matches!(fault, "none" | "stale" | "commit")),
+                "{fault}"
+            );
+            if fault == "stale" {
+                db.acquire_lock("change_current_receipt")
+                    .unwrap()
+                    .execute(
+                        "UPDATE assets SET local_checksum='changed' WHERE id='child-a'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            if fault == "none" {
+                assert!(
+                    !db.prepare_legacy_preservation(candidate, &files)
+                        .await
+                        .unwrap(),
+                    "an unvalidated snapshot must not authorize historical exceptions"
+                );
+            }
+            let prepared = db
+                .prepare_legacy_preservation_validated(
+                    candidate,
+                    &files,
+                    Box::new(move || {
+                        if fault == "commit" {
+                            Err(super::invalid())
+                        } else {
+                            Ok(())
+                        }
+                    }),
+                )
+                .await;
+            if fault == "commit" {
+                assert!(
+                    prepared.is_err(),
+                    "file validation failure must roll back preparation"
+                );
+            } else {
+                assert_eq!(prepared.unwrap(), fault == "none", "{fault}");
+            }
+            assert_eq!(std::fs::read(&files[0].path).unwrap(), b"legacy bytes");
+            assert_eq!(std::fs::read(&current).unwrap(), b"current child bytes");
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("before")
+            );
+            let conn = db.acquire_lock("historical_after").unwrap();
+            assert_eq!(super::snapshot_rows(&conn,"SELECT * FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND source_checksum IS NULL","PrimarySync","child-a").unwrap(),historical_before);
+            drop(conn);
+            drop(db);
+            let db = SqliteStateDb::open(&database).await.unwrap();
+            assert_eq!(
+                db.legacy_preservations("PrimarySync").await.unwrap().len(),
+                usize::from(fault == "none")
+            );
+            assert!(
+                db.get_legacy_master_state_owners()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn legacy_preservation_path_conflict_defers_only_its_family_after_reopen() {
         for claim in ["media", "metadata_sidecar"] {

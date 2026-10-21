@@ -131,20 +131,25 @@ pub(super) async fn has_replacement_journal(
     root: &std::path::Path,
     target: &std::path::Path,
 ) -> anyhow::Result<bool> {
+    let root = root.to_path_buf();
+    let target = target.to_path_buf();
+    tokio::task::spawn_blocking(move || has_replacement_journal_blocking(&root, &target)).await?
+}
+
+/// Same confined read for commit callbacks already running on a blocking worker.
+pub(super) fn has_replacement_journal_blocking(
+    root: &std::path::Path,
+    target: &std::path::Path,
+) -> anyhow::Result<bool> {
     #[cfg(target_os = "linux")]
     {
-        let root = root.to_path_buf();
-        let target = target.to_path_buf();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-            let path = replacement_recovery::directory_path(&target)?;
-            Ok(crate::fs_util::ConfinedPath::open(
-                &root,
-                &path,
-                crate::fs_util::ConfinedParents::Existing,
-            )?
-            .entry_exists()?)
-        })
-        .await?
+        let path = replacement_recovery::directory_path(target)?;
+        Ok(crate::fs_util::ConfinedPath::open(
+            root,
+            &path,
+            crate::fs_util::ConfinedParents::Existing,
+        )?
+        .entry_exists()?)
     }
     #[cfg(not(target_os = "linux"))]
     {

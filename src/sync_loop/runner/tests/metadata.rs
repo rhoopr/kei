@@ -3611,6 +3611,8 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
 enum AmbiguousChildFault {
     None,
     Preserve,
+    PreserveHistoricalClaim,
+    PreserveHistoricalReplacement,
     PreserveConfigChange,
     PreserveIncompleteInventory,
     PreserveInventoryRecovery,
@@ -3842,6 +3844,8 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
     let preserving = matches!(
         fault,
         AmbiguousChildFault::Preserve
+            | AmbiguousChildFault::PreserveHistoricalClaim
+            | AmbiguousChildFault::PreserveHistoricalReplacement
             | AmbiguousChildFault::PreserveConfigChange
             | AmbiguousChildFault::PreserveIncompleteInventory
             | AmbiguousChildFault::PreserveInventoryRecovery
@@ -4052,6 +4056,72 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     );
                 }
             }
+            if matches!(
+                fault,
+                AmbiguousChildFault::PreserveHistoricalClaim
+                    | AmbiguousChildFault::PreserveHistoricalReplacement
+            ) {
+                let db = state::SqliteStateDb::open(&database).await.unwrap();
+                let date =
+                    chrono::DateTime::from_timestamp_millis(RUN_CYCLE_ASSET_DATE_MS).unwrap();
+                for (index, child) in names.iter().enumerate() {
+                    let asset = crate::icloud::photos::PhotoAsset::from_records(
+                        serde_json::from_value(records[0].clone()).unwrap(),
+                        &serde_json::from_value(records[index + 1].clone()).unwrap(),
+                    );
+                    let current = destination.join(format!("independent-{index}.jpg"));
+                    std::fs::write(&current, bytes).unwrap();
+                    let hash = crate::download::file::compute_sha256(&current)
+                        .await
+                        .unwrap();
+                    db.upsert_seen(
+                        &crate::test_helpers::TestAssetRecord::new(child)
+                            .filename("photo.jpg")
+                            .created_at(date)
+                            .added_at(date)
+                            .checksum(&checksum)
+                            .size(bytes.len() as u64)
+                            .metadata(
+                                (*asset.metadata_arc(state::VersionSizeKey::Original)).clone(),
+                            )
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+                    state::DownloadStateStore::mark_verified_download(
+                        &db,
+                        "PrimarySync",
+                        child,
+                        "original",
+                        &current,
+                        &hash,
+                        Some(&hash),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                    if sidecars {
+                        std::fs::write(
+                            current.with_extension("jpg.xmp"),
+                            b"independent current sidecar",
+                        )
+                        .unwrap();
+                    }
+                }
+                drop(db);
+                let conn = rusqlite::Connection::open(&database).unwrap();
+                for child in &names {
+                    conn.execute(
+                        "INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum)
+                         VALUES ('PrimarySync',?1,'original',?2,?3,'historical-local')",
+                        rusqlite::params![child,legacy_path.to_str().unwrap(),checksum],
+                    ).unwrap();
+                }
+            }
+            let historical_child_receipts = rows(
+                &database,
+                "SELECT * FROM asset_metadata_paths WHERE id!='legacy-master' AND local_checksum='historical-local' ORDER BY id",
+            );
             if matches!(fault, AmbiguousChildFault::PreserveCheckpointFailure) {
                 rusqlite::Connection::open(&database).unwrap().execute_batch(
                     "CREATE TRIGGER fail_single_survivor_proof BEFORE INSERT ON unattributed_legacy_proofs BEGIN SELECT RAISE(ABORT,'injected checkpoint receipt failure'); END;"
@@ -4084,7 +4154,10 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
             );
             let fresh_source_recovery = matches!(fault, AmbiguousChildFault::PreserveStateWrite);
             let mut retained_unverified_outputs = Vec::new();
-            for cycle in 0..if relocating || fresh_source_recovery {
+            for cycle in 0..if relocating
+                || fresh_source_recovery
+                || matches!(fault, AmbiguousChildFault::PreserveHistoricalReplacement)
+            {
                 4
             } else {
                 3
@@ -4202,6 +4275,16 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                             unknown = unknown.with_receipt_diagnostic(result);
                         }
                         Arc::new(unknown)
+                    } else if cycle == 0
+                        && matches!(fault, AmbiguousChildFault::PreserveHistoricalReplacement)
+                    {
+                        Arc::new(
+                            FailingMetadataSetDb::without_set_failure(
+                                inner.clone(),
+                                "historical namespace replacement",
+                            )
+                            .with_historical_current_replacement(),
+                        )
                     } else if cycle == 0
                         && matches!(
                             fault,
@@ -4373,6 +4456,70 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                 )
                 .with_subscriber(subscriber)
                 .await;
+                if cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveHistoricalReplacement)
+                {
+                    assert!(
+                        result.is_err(),
+                        "held current namespace must reject preparation"
+                    );
+                    assert!(
+                        inner
+                            .legacy_preservations("PrimarySync")
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert_eq!(rows(&database, receipt_sql), receipt);
+                    assert_eq!(rows(&database, retry_sql), retry);
+                    assert_eq!(rows(&database, revision_sql), revision);
+                    assert_eq!(rows(&database, mapping_sql), mappings);
+                    assert_eq!(
+                        rows(&database, legacy_metadata_paths_sql),
+                        legacy_metadata_paths
+                    );
+                    assert_eq!(
+                        rows(
+                            &database,
+                            "SELECT * FROM asset_metadata_paths WHERE id!='legacy-master' AND local_checksum='historical-local' ORDER BY id"
+                        ),
+                        historical_child_receipts
+                    );
+                    assert!(
+                        inner
+                            .get_legacy_master_state_owners()
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert_eq!(
+                        inner
+                            .get_metadata("sync_token:PrimarySync")
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some("before")
+                    );
+                    assert_eq!(std::fs::read(&legacy_path).unwrap(), bytes);
+                    assert_eq!(
+                        std::fs::read(&legacy_xmp).unwrap(),
+                        b"legacy sidecar: never adopt or replace"
+                    );
+                    for index in 0..children {
+                        assert_eq!(
+                            std::fs::read(destination.join(format!("independent-{index}.jpg")))
+                                .unwrap(),
+                            bytes
+                        );
+                    }
+                    for (path, bytes) in &completed_outputs {
+                        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+                    }
+                    assert_eq!(
+                        server.received_requests().await.unwrap().len(),
+                        requests_before
+                    );
+                    continue;
+                }
                 if cycle >= 2
                     && hardlink_fault.is_some_and(|fault| fault != LegacyHardlinkFault::Quiet)
                 {
@@ -4588,6 +4735,14 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                     );
                 }
                 assert_eq!(rows(&database, receipt_sql), receipt, "receipt {label}");
+                assert_eq!(
+                    rows(
+                        &database,
+                        "SELECT * FROM asset_metadata_paths WHERE id!='legacy-master' AND local_checksum='historical-local' ORDER BY id"
+                    ),
+                    historical_child_receipts,
+                    "historical child receipts {label}"
+                );
                 if cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveFreshRetry) {
                     retry = rows(&database, retry_sql);
                     assert_eq!(
@@ -4761,7 +4916,13 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         )
                         || (cycle < 2
                             && matches!(fault, AmbiguousChildFault::PreserveInventoryRecovery))
-                        || (cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveFreshRetry)))
+                        || (cycle == 0
+                            && matches!(
+                                fault,
+                                AmbiguousChildFault::PreserveFreshRetry
+                                    | AmbiguousChildFault::PreserveHistoricalClaim
+                                    | AmbiguousChildFault::PreserveHistoricalReplacement
+                            )))
                 {
                     assert!(
                         inner
@@ -5346,4 +5507,19 @@ async fn run_cycle_legacy_receipt_diagnostic_never_grants_progress() {
         ))
         .await;
     }
+}
+
+#[tokio::test]
+async fn run_cycle_historical_claim_recovers_without_reassigning_originals() {
+    Box::pin(exercise_legacy_child_cycles(
+        AmbiguousChildFault::PreserveHistoricalClaim,
+        &[2],
+    ))
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn run_cycle_historical_namespace_replacement_rolls_back_then_recovers() {
+    exercise_legacy_child_cycles(AmbiguousChildFault::PreserveHistoricalReplacement, &[2]).await;
 }
