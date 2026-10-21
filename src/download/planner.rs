@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::icloud::photos::PhotoAsset;
@@ -412,8 +412,91 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
     ) -> Result<AssetTaskPlan> {
-        self.plan_download_asset_with_replay(asset, config, ReservedReplay::RequestedDirectory)
-            .await
+        let mut plan = self
+            .plan_download_asset_with_replay(asset, config, ReservedReplay::RequestedDirectory)
+            .await?;
+        if matches!(self.path_mode, PathPlanningMode::Download) && !self.managed_plan {
+            self.relocate_protected_tasks(&mut plan, config).await?;
+        }
+        Ok(plan)
+    }
+
+    /// Ordinary downloads must never publish to a protected legacy identity,
+    /// even when the directory cache cannot see the protected file under the
+    /// target spelling. Choose the existing identity suffix instead of asking
+    /// the state writer to reject the protected destination later.
+    async fn relocate_protected_tasks(
+        &mut self,
+        plan: &mut AssetTaskPlan,
+        config: &DownloadConfig,
+    ) -> Result<()> {
+        let Some(db) = config.state_db.as_deref() else {
+            return Ok(());
+        };
+        for task in &mut plan.tasks {
+            self.relocate_protected_task(db, task).await?;
+        }
+        Ok(())
+    }
+
+    async fn relocate_protected_task(
+        &mut self,
+        db: &dyn DownloadStore,
+        task: &mut DownloadTask,
+    ) -> Result<()> {
+        if super::legacy_preservation::current_path_is_independent(db, &task.download_path).await? {
+            return Ok(());
+        }
+        let protected_key = self.path_mode.key(&task.download_path)?;
+        if self.claimed_paths.get(protected_key.as_ref()) == Some(&task.size) {
+            self.claimed_paths.remove(protected_key.as_ref());
+        }
+        let parent = task
+            .download_path
+            .parent()
+            .context("protected download target has no parent")?;
+        let filename = task
+            .download_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("protected download target has no filename")?;
+        let mut ordinal: Option<u64> = None;
+        loop {
+            let candidate_filename = match ordinal {
+                None => paths::insert_asset_identity_suffix(filename, &task.asset_id),
+                Some(ordinal) => {
+                    paths::insert_asset_identity_ordinal_suffix(filename, &task.asset_id, ordinal)
+                }
+            };
+            let candidate = parent.join(candidate_filename);
+            let key = self.path_mode.key(&candidate)?;
+            let foreign_owner = self
+                .reconciliation
+                .path_owners
+                .get(&key)
+                .is_some_and(|owners| {
+                    owners.iter().any(|owner| {
+                        owner.library != task.library
+                            || owner.asset_id.as_ref() != task.asset_id.as_ref()
+                            || owner.version_size != task.version_size
+                    })
+                });
+            let available = !foreign_owner
+                && !self.claimed_paths.contains_key(key.as_ref())
+                && !self.dir_cache.exists(&candidate)
+                && super::legacy_preservation::current_path_is_independent(db, &candidate).await?;
+            if available {
+                self.claimed_paths.insert(key, task.size);
+                task.download_path = candidate;
+                return Ok(());
+            }
+            ordinal = Some(match ordinal {
+                None => 2,
+                Some(ordinal) => ordinal
+                    .checked_add(1)
+                    .context("protected identity suffix exhausted")?,
+            });
+        }
     }
 
     /// A durable retry may have recorded a destination in another directory.
@@ -1547,6 +1630,125 @@ mod tests {
                 .is_some_and(|name| name.contains("ON_DISK")),
             "same-size on-disk collision should use an identity path: {:?}",
             plan.tasks[0].download_path
+        );
+    }
+
+    #[tokio::test]
+    async fn planner_avoids_state_protected_legacy_target_without_disk_visibility() {
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let child = TestPhotoAsset::new("CHILD-1")
+            .filename("photo.jpg")
+            .orig_size(1000)
+            .build();
+        let mut config = test_config(tmp.path());
+        config.state_db = Some(db.clone() as Arc<dyn DownloadStore>);
+        let protected = super::super::filter::derive_expected_paths(&child, &config)
+            .into_iter()
+            .find(|path| path.version_size.is_primary_media())
+            .expect("child primary path")
+            .path;
+        assert_eq!(
+            protected.file_name().and_then(|name| name.to_str()),
+            Some("photo.JPG"),
+            "fixture uses the rendered extension"
+        );
+        db.upsert_seen(
+            &crate::test_helpers::TestAssetRecord::new("MASTER")
+                .filename("photo.jpg")
+                .checksum("provider")
+                .size(1000)
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "MASTER",
+            "original",
+            &protected,
+            "legacy-local",
+            None,
+        )
+        .await
+        .unwrap();
+        db.set_metadata_capture_revision_for_test("PrimarySync", "MASTER", 0);
+        for id in ["CHILD-1", "CHILD-2"] {
+            db.upsert_asset_master_mapping("PrimarySync", id, "MASTER")
+                .await
+                .unwrap();
+        }
+        let candidate = db
+            .get_metadata_capture_candidates("PrimarySync", 1, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(
+            db.defer_metadata_capture_ambiguity(&candidate, 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !crate::download::legacy_preservation::current_path_is_independent(
+                db.as_ref(),
+                &protected,
+            )
+            .await
+            .unwrap(),
+            "the historical original must be protected in state"
+        );
+
+        let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+        // Prime the directory cache before the exact protected file exists.
+        // This mirrors a case-insensitive host whose cached spelling differs
+        // from the protected key; the file is nonetheless present at planning.
+        super::super::filter::pre_ensure_asset_dir(&mut planner.dir_cache, &child, &config).await;
+        std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
+        std::fs::write(&protected, b"protected legacy bytes").unwrap();
+        let foreign_path = protected.with_file_name(paths::insert_asset_identity_suffix(
+            protected.file_name().unwrap().to_str().unwrap(),
+            "CHILD-1",
+        ));
+        planner.reconciliation.path_owners.insert(
+            planner.path_mode.key(&foreign_path).unwrap(),
+            [ReconciliationOwner {
+                library: Arc::from("SharedSync-foreign"),
+                asset_id: Box::from("CHILD-1"),
+                version_size: VersionSizeKey::Original,
+            }]
+            .into_iter()
+            .collect(),
+        );
+        let plan = planner.plan_download_asset(&child, &config).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let planned = &plan.tasks[0].download_path;
+        assert_ne!(
+            planned, &foreign_path,
+            "same child name in another library does not release its reserved destination"
+        );
+        assert_ne!(
+            planned, &protected,
+            "normal download must not claim the protected legacy identity"
+        );
+        assert_eq!(
+            std::fs::read(&protected).unwrap(),
+            b"protected legacy bytes",
+            "the exact protected original stays unchanged"
+        );
+        assert!(
+            planned
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("CHILD-1")),
+            "normal download uses an independent identity suffix: {planned:?}"
+        );
+        assert!(
+            crate::download::legacy_preservation::current_path_is_independent(
+                db.as_ref(),
+                planned,
+            )
+            .await
+            .unwrap()
         );
     }
 

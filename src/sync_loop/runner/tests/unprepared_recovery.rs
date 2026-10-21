@@ -138,6 +138,16 @@ fn owner_rows(database: &std::path::Path) -> Vec<Vec<rusqlite::types::Value>> {
 }
 
 async fn run_case(ambiguity: RetainedAmbiguity) {
+    for retained_provider_spelling in [false, true] {
+        Box::pin(run_case_with_spelling(
+            ambiguity,
+            retained_provider_spelling,
+        ))
+        .await;
+    }
+}
+
+async fn run_case_with_spelling(ambiguity: RetainedAmbiguity, retained_provider_spelling: bool) {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::{
@@ -192,35 +202,52 @@ async fn run_case(ambiguity: RetainedAmbiguity) {
     let media = dir.path().join("media");
     let destination = media.join(run_cycle_expected_date_dir());
     std::fs::create_dir_all(&destination).unwrap();
-    let original = destination.join("photo.jpg");
-    let sidecar = destination.join("photo.jpg.xmp");
-    std::fs::write(&original, bytes).unwrap();
-    std::fs::write(&sidecar, b"legacy sidecar: never replace").unwrap();
-
     let config = make_run_cycle_config();
     let date = chrono::DateTime::from_timestamp_millis(RUN_CYCLE_ASSET_DATE_MS).unwrap();
-    let rendered_filename = provider_asset
+    let provider_filename = provider_asset
         .filename()
         .expect("provider master must render the protected filename");
     assert_eq!(
-        rendered_filename, "photo.jpg",
+        provider_filename, "photo.jpg",
         "the provider filename, not a decoded fixture constant, names the protected path"
     );
+    // Normal path rendering maps the UTI extension to uppercase. The protected
+    // original must live at the exact path the planner renders, not at a
+    // case-only sibling that hides the collision on case-sensitive hosts.
+    let rendered_filename = provider_asset
+        .versions()
+        .first()
+        .map(|(_, version)| {
+            crate::download::paths::map_filename_extension(provider_filename, &version.asset_type)
+        })
+        .expect("provider master must have a version");
+    assert_eq!(rendered_filename, "photo.JPG");
+    // Cover both the exact rendered path and the retained provider spelling.
+    // The latter aliases the rendered path on case-insensitive filesystems.
+    let original_filename = if retained_provider_spelling {
+        provider_filename
+    } else {
+        &rendered_filename
+    };
+    let original = destination.join(original_filename);
+    let sidecar = destination.join(format!("{original_filename}.xmp"));
+    std::fs::write(&original, bytes).unwrap();
+    std::fs::write(&sidecar, b"legacy sidecar: never replace").unwrap();
     assert_eq!(
         crate::download::paths::local_download_path(
             &media,
             &config.download.folder_structure,
             &date,
-            rendered_filename,
+            &rendered_filename,
             None,
         ),
-        original,
-        "planner output must match the existing original path exactly"
+        destination.join(&rendered_filename),
+        "normal filename rendering must use the expected extension"
     );
     assert_eq!(
         original.file_name().unwrap(),
-        std::ffi::OsStr::new(rendered_filename),
-        "a case-only filename difference must not evade protected-path matching"
+        std::ffi::OsStr::new(original_filename),
+        "the protected path uses the selected retained spelling"
     );
 
     {
@@ -229,7 +256,7 @@ async fn run_case(ambiguity: RetainedAmbiguity) {
         metadata.refresh_hash();
         db.upsert_seen(
             &crate::test_helpers::TestAssetRecord::new("legacy-master")
-                .filename(rendered_filename)
+                .filename(&rendered_filename)
                 .created_at(date)
                 .added_at(date)
                 .checksum(&checksum)
@@ -252,7 +279,7 @@ async fn run_case(ambiguity: RetainedAmbiguity) {
         for child in names {
             db.upsert_seen(
                 &crate::test_helpers::TestAssetRecord::new(child)
-                    .filename(rendered_filename)
+                    .filename(&rendered_filename)
                     .created_at(date)
                     .added_at(date)
                     .checksum(&checksum)

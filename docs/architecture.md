@@ -1237,6 +1237,9 @@ failure can finish without downloading or creating a second media copy.
 Reconciliation retries the selected destination and leaves conflicting media
 or sidecars untouched; it does not allocate another collision filename on each
 attempt. Ordinary download collision naming and on-disk skip rules are unchanged.
+Ordinary download planning also treats a state-protected legacy original or exact
+sidecar as occupied when the directory cache cannot see that spelling, and selects
+an independent identity suffix instead of targeting the protected identity.
 
 Legacy preservation inventory failures retain the existing reason and budgets.
 `legacy_inventory_failure_v2` adds fixed phase/subreason labels, whether a valid
