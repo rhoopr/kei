@@ -687,49 +687,6 @@ fn recover_tree_blocking(root: &Path) -> Result<()> {
     recover_tree_blocking_with_protection(root, &[])
 }
 
-/// Resolve aliases in a protected parent while tolerating a genuinely absent
-/// tail. Missing entries cannot hold a journal now; retaining them below the
-/// nearest resolved ancestor preserves protection if that path reappears.
-/// Dangling links, permission failures and malformed paths still fail closed.
-fn canonicalize_protected_parent(parent: &Path) -> Result<PathBuf> {
-    anyhow::ensure!(
-        !parent
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir)),
-        "Protected replacement parent contains a parent component"
-    );
-    let mut existing = parent.to_path_buf();
-    let mut missing = Vec::new();
-    loop {
-        match std::fs::canonicalize(&existing) {
-            Ok(mut canonical) => {
-                for component in missing.into_iter().rev() {
-                    canonical.push(component);
-                }
-                return Ok(canonical);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match std::fs::symlink_metadata(&existing) {
-                    // A dangling link is absent by lookup but is still
-                    // malformed protection evidence, not a missing directory.
-                    Ok(_) => return Err(error.into()),
-                    Err(metadata_error)
-                        if metadata_error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(metadata_error) => return Err(metadata_error.into()),
-                }
-                let Some(name) = existing.file_name().map(ToOwned::to_owned) else {
-                    return Err(error.into());
-                };
-                missing.push(name);
-                if !existing.pop() {
-                    return Err(error.into());
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
 fn recover_tree_blocking_with_protection(
     root: &Path,
     protected_paths: &[std::path::PathBuf],
@@ -751,11 +708,30 @@ fn recover_tree_blocking_with_protection(
         let parent = journal
             .parent()
             .context("Protected replacement has no parent")?;
-        // Resolve aliases of the trusted root before comparing with recovery's
-        // canonical paths. Absent parents no longer block recovery of unrelated
-        // journals; their missing tail remains part of the protection key.
+        // Keep absent suffixes reserved while resolving existing root aliases.
+        let mut ancestor = crate::fs_util::absolute_confined_path(parent)?;
+        let mut missing = PathBuf::new();
+        let resolved = loop {
+            match std::fs::canonicalize(&ancestor) {
+                Ok(existing) => break existing.join(&missing),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match std::fs::symlink_metadata(&ancestor) {
+                        Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+                        _ => return Err(error.into()),
+                    }
+                    missing = PathBuf::from(
+                        ancestor
+                            .file_name()
+                            .context("Protected replacement has no ancestor")?,
+                    )
+                    .join(missing);
+                    ancestor.pop();
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         protected_journals.insert(
-            canonicalize_protected_parent(parent)?.join(
+            resolved.join(
                 journal
                     .file_name()
                     .context("Protected replacement has no name")?,

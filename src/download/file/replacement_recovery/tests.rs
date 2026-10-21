@@ -749,6 +749,95 @@ fn configured_root_alias_recovers_journals_without_following_descendant_links() 
 }
 
 #[test]
+fn missing_protected_parent_allows_independent_interrupted_recovery_through_root_alias() {
+    for use_alias in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("photos");
+        fs::create_dir(&root).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let (target, part, journal) = prepare(&root);
+        assert!(
+            publish_journal(&journal, |stage| {
+                anyhow::ensure!(stage != Stage::Displaced, "interrupted");
+                Ok(())
+            })
+            .is_err()
+        );
+        drop(journal);
+        assert!(!target.exists());
+        let missing = alias.join("moved/old/photo.jpg");
+        let recovery_root = if use_alias { &alias } else { &root };
+        for _ in 0..2 {
+            super::recover_tree_blocking_with_protection(
+                recovery_root,
+                std::slice::from_ref(&missing),
+            )
+            .unwrap();
+            assert_eq!(fs::read(&target).unwrap(), b"original");
+            assert_eq!(fs::read(&part).unwrap(), b"replacement");
+            assert!(!directory_path(&target).unwrap().exists());
+            assert!(!missing.parent().unwrap().exists());
+        }
+    }
+}
+
+#[test]
+fn invalid_protected_parent_keeps_independent_journal_untouched() {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[derive(Clone, Copy, Debug)]
+    enum InvalidParent {
+        Permission,
+        NotDirectory,
+        ParentComponent,
+        DanglingLink,
+    }
+    for case in [
+        InvalidParent::Permission,
+        InvalidParent::NotDirectory,
+        InvalidParent::ParentComponent,
+        InvalidParent::DanglingLink,
+    ] {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("photos");
+        fs::create_dir(&root).unwrap();
+        let (target, part, journal) = prepare(&root);
+        let blocked = dir.path().join("blocked");
+        let protected = match case {
+            InvalidParent::Permission => {
+                fs::create_dir(&blocked).unwrap();
+                fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+                blocked.join("missing/photo.jpg")
+            }
+            InvalidParent::NotDirectory => {
+                fs::write(&blocked, b"not a directory").unwrap();
+                blocked.join("missing/photo.jpg")
+            }
+            InvalidParent::ParentComponent => root.join("../missing/photo.jpg"),
+            InvalidParent::DanglingLink => {
+                std::os::unix::fs::symlink(dir.path().join("absent"), &blocked).unwrap();
+                blocked.join("missing/photo.jpg")
+            }
+        };
+        let result = super::recover_tree_blocking_with_protection(&root, &[protected]);
+        if matches!(case, InvalidParent::Permission) {
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(result.is_err(), "{case:?} must fail closed");
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert_eq!(fs::read(&part).unwrap(), b"replacement");
+        assert!(
+            directory_path(&target)
+                .unwrap()
+                .join("manifest.json")
+                .is_file()
+        );
+        assert!(journal.directory.path().exists());
+    }
+}
+
+#[test]
 fn protected_legacy_journal_is_untouched_even_through_root_alias() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("shared");
@@ -773,8 +862,11 @@ fn protected_legacy_journal_is_untouched_even_through_root_alias() {
     let alias = dir.path().join("alias");
     std::os::unix::fs::symlink(&root, &alias).unwrap();
     assert!(
-        super::recover_tree_blocking_with_protection(&alias, std::slice::from_ref(&target),)
-            .is_err()
+        super::recover_tree_blocking_with_protection(
+            &alias,
+            &[alias.join("missing/old/photo.jpg"), target.clone()],
+        )
+        .is_err()
     );
     assert_eq!(fs::read(&target).unwrap(), b"original");
     assert_eq!(fs::read(&part).unwrap(), b"replacement");
@@ -785,32 +877,6 @@ fn protected_legacy_journal_is_untouched_even_through_root_alias() {
     fs::create_dir(&journal_path).unwrap();
     assert!(super::recover_tree_blocking_with_protection(&root, &[target]).is_err());
     assert!(journal_path.is_dir());
-}
-
-#[test]
-fn missing_protected_parent_does_not_block_unrelated_recovery() {
-    let dir = TempDir::new().unwrap();
-    let current = dir.path().join("selected");
-    fs::create_dir(&current).unwrap();
-    let (target, part, journal) = prepare(&current);
-    assert!(
-        publish_journal(&journal, |stage| {
-            anyhow::ensure!(stage != Stage::Displaced, "interrupted");
-            Ok(())
-        })
-        .is_err()
-    );
-    drop(journal);
-    let absent = dir
-        .path()
-        .join("unselected")
-        .join("photos")
-        .join("original.jpg");
-    super::recover_tree_blocking_with_protection(&current, std::slice::from_ref(&absent)).unwrap();
-    assert_eq!(fs::read(&target).unwrap(), b"original");
-    assert_eq!(fs::read(&part).unwrap(), b"replacement");
-    assert!(!directory_path(&target).unwrap().exists());
-    assert!(!absent.parent().unwrap().exists());
 }
 
 #[test]
@@ -859,20 +925,6 @@ fn symlinked_protected_parent_still_blocks_recovery() {
     assert_eq!(fs::read(&target).unwrap(), b"original");
     assert_eq!(fs::read(&part).unwrap(), b"replacement");
     assert!(journal_path.exists());
-}
-
-#[test]
-fn dangling_protected_parent_symlink_remains_an_error() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().join("root");
-    fs::create_dir(&root).unwrap();
-    let alias = dir.path().join("old-library");
-    std::os::unix::fs::symlink(dir.path().join("missing-target"), &alias).unwrap();
-    let protected = alias.join("missing").join("photo.jpg");
-    assert!(
-        super::recover_tree_blocking_with_protection(&root, std::slice::from_ref(&protected))
-            .is_err()
-    );
 }
 
 // Dedicated subprocesses scope faults to disposable fixture paths. This models
@@ -1165,31 +1217,4 @@ async fn terminal_sidecar_worker() {
         );
         drop(db);
     }
-}
-
-#[test]
-fn inaccessible_or_malformed_protection_does_not_start_recovery() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().join("current");
-    fs::create_dir(&root).unwrap();
-    let (target, part, journal) = prepare(&root);
-    drop(journal);
-    let blocked = dir.path().join("blocked");
-    fs::create_dir(&blocked).unwrap();
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).unwrap();
-    let permission_result =
-        super::recover_tree_blocking_with_protection(&root, &[blocked.join("missing/photo.jpg")]);
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(permission_result.is_err());
-    assert!(
-        super::recover_tree_blocking_with_protection(
-            &root,
-            &[dir.path().join("absent/../photo.jpg")]
-        )
-        .is_err()
-    );
-    assert_eq!(fs::read(&target).unwrap(), b"original");
-    assert_eq!(fs::read(&part).unwrap(), b"replacement");
-    assert!(directory_path(&target).unwrap().is_dir());
 }

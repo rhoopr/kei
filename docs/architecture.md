@@ -1165,14 +1165,6 @@ remain unchanged. Explicit local-byte acceptance does not satisfy this exception
 Ordinary adoption and skip decisions cannot reuse a protected original merely
 because a child has a historical receipt there.
 
-Replacement recovery resolves protected parents through their nearest existing
-ancestor when only a trailing directory is absent. The missing suffix remains in
-the protection key; a missing old directory in an unselected library does not
-block unrelated recovery. Permission errors, malformed paths, dangling links and
-protected journals still refuse recovery. Managed layout recovery remains
-fail-fast: an overlapping protected operation leaves later operations pending.
-Independent finish calls do not establish coordinator continuation.
-
 Local path reconciliation also loads these publication receipts. A verified
 copy in the selected pass satisfies that rendition even when the catalogue's
 current path belongs to another album. Reconciliation preserves a verified
@@ -1924,7 +1916,11 @@ and replacement recovery remain unchanged. General hardlink support and stronger
 preservation guarantees remain open under #884.
 
 Shared-root replacement recovery checks protected paths from
-all libraries before opening a journal, including unselected libraries. Current child files and sidecar presence are also bound
+all libraries before opening a journal, including unselected libraries. Missing
+protected parents retain their path reservation through the nearest existing
+ancestor; they do not abort unrelated recovery or clear preservation/checkpoint
+holds. Other filesystem errors and existing protected journals still block
+recovery. Current child files and sidecar presence are also bound
 into the receipt. The preservation owner never moves, rewrites, adopts or deletes
 original paths. With the hardlink opt-in, that path protection cannot prevent
 changes made through another alias by an unchanged write path.
@@ -2292,6 +2288,11 @@ current owner instead.
 `download/orchestration/primary_layout.rs` owns opt-in `photos.edited_naming` transitions. The shared selected-rendition renderer assigns current/original-archive roles without changing rendition keys, RAW selection or URL deduplication. The layout owner confirms current provider resources through the Photos adapter, prepares all selected members, preserves displaced media and sidecars as independent exact copies, then conditionally publishes and retires verified obsolete aliases. Default suffix families retain ordinary append-only behavior.
 
 Schema 35 adds independently addressable layout bindings, operations, members, path claims and immutable preservation receipts under `state/db/primary_layout.rs`. Scoped native paths, stable child and pass identity, source/config decisions and a checked binding generation pin each operation. Durable phases are planned, prepared, preserved, publishing and committed; cancellation retains its journal and private prepared files. Recovery runs after filesystem replacement recovery and before ordinary source dispatch. A started handover finishes its recorded generation before new source/config work may plan another operation. Config/path reconciliation performs this recovery before reading catalogue paths, including operations at a previous root or template. First-binding migration inventories each scoped per-path rendition receipt and its own recorded placement independently of current selection or the latest catalogue filename; exact local bytes and the complete path-owner census remain required before preservation or retirement.
+
+Managed recovery stops at the first unresolved operation; later independent
+operations in that recovery pass remain pending. Reconciliation retains its
+checkpoint hold. A separately completed independent family does not establish
+continuation past a blocked operation in the coordinator.
 
 The claims fence ordinary transfer, finalization, adoption and queued metadata. Current-publication retry recovery leaves managed plans with the layout owner and rechecks slot generation and exact local-byte claims in its state transaction, including claims created after the reader snapshot. Metadata for selected renditions is prepared off the visible path; it commits with the new binding and matching provider selection receipts. Ordinary whole-asset metadata refresh resolves ownership across every binding and pending claim for the scoped provider child, including when the caller has no concrete pass key; it does not queue competing writes for managed paths. Explicit metadata refresh uses the preserving owner and records its intent in the operation; pending operations recover before unchanged-binding shortcuts. Retained-source reuse carries the SHA-verified fingerprint through candidate receipt capture and independent copying; a second snapshot must equal the trusted first snapshot. Local path reconciliation uses this same layout owner for managed families. Current/archived media and sidecars must match their pinned fingerprints. Unknown ownership or local changes hold completion and protect existing contents. Real album membership is persisted before managed reconciliation commits matching metadata; an unfiled path label is never recorded as album membership. Original archives retain their prior metadata and retry evidence outside the ordinary writer queue; prepared capture-repair evidence stays visible to source-deletion guards. Archive receipt and whole-asset ownership lookups use scoped library/child indexes. Historical catalogue receipts remain evidence, not permission to write a superseded slot.
 

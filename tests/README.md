@@ -1499,6 +1499,12 @@ cover capture attachment, durable receipts, rollback, replay and unchanged follo
 
 `cargo test --all-features --lib primary_layout` exercises the opt-in owner with file-backed SQLite, synthetic provider generations and a real local HTTP server. The fixture checks original, two edits, revert, edit-again from verified history, HEIC/JPEG extension changes, preserved media/sidecar hashes, rendition keys, manifests, private destination generations, suffix migration/reversal, collisions, source drift, read-only plans, state-write failure, process death and quiet reopened cycles. The ignored worker is launched and killed by the parent process-death test; it is not a skipped standalone proof.
 
+The protected-overlap regressions distinguish direct `finish` calls from the
+`recover` coordinator. Both media and sidecar conflicts preserve bytes, journals,
+retry debt and checkpoints across reopens. The coordinator stops before later
+independent operations; a separately completed family does not release the
+blocked journal on the next unchanged recovery attempt.
+
 The process-death oracle restarts at every journal boundary, checks independently retained old bytes before completion, and requires two subsequent zero-download, zero-lookup cycles. Real Live Photo fixture bytes cover both MOV naming policies; automated byte preservation does not qualify Immich pairing. Manual Immich testing requires both exclusion patterns documented in `docs/edited-primary.md`.
 
 The independent-review `review501` regressions compose a failed started handover with root/template changes and policy reversal, checking the latest catalogue checksum/path after two quiet reopens. First-binding migrations also cover an unselected owned original, a provider-reverted suffix edit, a legacy HEIC/JPEG edit history with equal-content aliases, exact sidecar/history retention and a locally changed unselected original that must hold completion.
