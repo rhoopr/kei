@@ -49,9 +49,27 @@ impl ShadowCapture {
         source: crate::state::db::provider_inbox::StoredPage,
     ) -> anyhow::Result<()> {
         let capture = self.clone();
-        let plan = tokio::task::spawn_blocking(move || super::projection::plan(&capture, source))
-            .await?
-            .map_err(super::error::ShadowPageError::from)?;
+        let plan =
+            match tokio::task::spawn_blocking(move || super::projection::plan(&capture, source))
+                .await?
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    if error.chain().any(|cause| {
+                        matches!(
+                            cause.downcast_ref::<crate::state::error::StateError>(),
+                            Some(crate::state::error::StateError::ProviderCatalogFull)
+                        )
+                    }) {
+                        crate::support::record_storage(
+                            crate::support::StorageComponent::Catalogue,
+                            crate::support::StorageOutcome::SingleItemLimit,
+                            None,
+                        );
+                    }
+                    return Err(super::error::ShadowPageError::from(error).into());
+                }
+            };
         self.db
             .project_catalog_page(self.owner.clone(), plan, self.catalog_capacity)
             .await

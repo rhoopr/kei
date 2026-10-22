@@ -1817,16 +1817,42 @@ mod tests {
             crate::state::schema::migrate(&conn).unwrap();
         }
 
-        crate::support::begin(serde_json::json!({"scenario": "catalogue"}));
+        crate::support::begin(serde_json::json!({"scenario": "inbox-catalogue-single-item-limit"}));
         let db = std::sync::Arc::new(
             crate::state::SqliteStateDb::open_owned(&commit_path, &owner)
                 .await
                 .unwrap(),
         );
+        let mut capture = crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            owner.clone(),
+            "legacy-realm",
+        );
+        capture.capacity = 512 * 1024 * 1024;
+        let oversized = oversized_unprojected_observed();
+        let error = capture.capture(oversized.clone()).await.unwrap_err();
+        assert!(
+            error.chain().any(|cause| matches!(
+                cause.downcast_ref::<crate::state::error::StateError>(),
+                Some(crate::state::error::StateError::ProviderCatalogFull)
+            )),
+            "normal capture preserves the catalogue capacity error"
+        );
+        let retained = db
+            .next_catalog_source(owner.clone(), 16 * 1024 * 1024)
+            .await
+            .unwrap()
+            .expect("the oversized raw page remains captured");
+        assert!(
+            String::from_utf8_lossy(&retained.page.body).contains("oversized-master"),
+            "the oversized raw page remains captured"
+        );
+        drop(capture);
+        crate::support::begin(serde_json::json!({"scenario": "catalogue"}));
         let fresh_catalog = fixture_observed(70, "https://p01.icloud-content.com/asset-70?token=1");
         let fresh_id = {
             let conn = db.acquire_lock("insert real catalogue source").unwrap();
-            insert_legacy(&*conn, &fresh_catalog, 20_000)
+            insert_legacy(&conn, &fresh_catalog, 20_000)
         };
         let source = db
             .catalog_source(owner.clone(), CapturedPageId(fresh_id), 16 * 1024 * 1024)
@@ -1848,7 +1874,7 @@ mod tests {
             fixture_observed(71, "https://p01.icloud-content.com/asset-71?token=2");
         let refused_id = {
             let conn = db.acquire_lock("insert refused catalogue source").unwrap();
-            insert_legacy(&*conn, &refused_catalog, 20_000)
+            insert_legacy(&conn, &refused_catalog, 20_000)
         };
         let source = db
             .catalog_source(owner.clone(), CapturedPageId(refused_id), 16 * 1024 * 1024)
@@ -1938,13 +1964,17 @@ mod tests {
                 .unwrap()
                 >= 1
         );
-        let catalogue = &cycles[6]["storage_reuse"]["catalogue"];
+        assert_eq!(cycles[5]["storage_reuse"]["catalogue"]["observed"], false);
+        let normal_capacity = &cycles[6]["storage_reuse"]["catalogue"];
+        assert_eq!(normal_capacity["single_item_limit"], 1);
+        assert_eq!(normal_capacity["new"], 0);
+        let catalogue = &cycles[7]["storage_reuse"]["catalogue"];
         assert_eq!(catalogue["new"], 1);
         assert_eq!(catalogue["exact"], 1);
         assert_eq!(catalogue["capacity_rejected"], 1);
         assert_eq!(catalogue["last_reason"], "capacity");
         assert_eq!(catalogue["last_observed_limit"], 0);
-        let unknown = &cycles[7]["storage_reuse"]["inbox"];
+        let unknown = &cycles[8]["storage_reuse"]["inbox"];
         assert_eq!(unknown["new"], 1);
         assert_eq!(unknown["exact"], 10);
         assert_eq!(unknown["equivalent"], 0);
