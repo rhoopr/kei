@@ -222,6 +222,112 @@ fn support_export_never_opens_live_wal_or_creates_sqlite_companions() {
 }
 
 #[test]
+fn support_export_retains_storage_and_migration_summary_when_sqlite_is_unavailable() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let username = "private-user@example.invalid";
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!("[auth]\nusername={}", crate::common::toml_string(username)),
+    )
+    .unwrap();
+    let path = data.join(format!("{}.db", sanitize_username(username)));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute_batch(
+        "CREATE TABLE private_data(secret TEXT); INSERT INTO private_data VALUES('private-secret')",
+    )
+    .unwrap();
+    let history = serde_json::json!({
+        "schema_version": 1,
+        "cycles_evicted": 0,
+        "queue_dropped": 0,
+        "groups_omitted": 0,
+        "previous_history_unavailable": false,
+        "cycles": [{
+            "id": uuid::Uuid::new_v4().to_string(),
+            "started_at": "2026-10-22T00:00:00Z",
+            "completed_at": "2026-10-22T00:01:00Z",
+            "outcome": "partial_failure",
+            "build_version": "0.25.1",
+            "configuration": {},
+            "stats": {},
+            "diagnostics": [],
+            "storage_reuse": {
+                "catalogue": {
+                    "new":1,
+                    "exact":1,
+                    "equivalent":0,
+                    "capacity_rejected":0,
+                    "single_item_limit":1,
+                    "last_reason":"single_item_limit",
+                    "last_observed_used":null,
+                    "last_observed_limit":null
+                },
+                "selection": {
+                    "new":0,
+                    "exact":0,
+                    "equivalent":0,
+                    "capacity_rejected":1,
+                    "single_item_limit":0,
+                    "last_reason":"capacity",
+                    "last_observed_used":7,
+                    "last_observed_limit":9
+                }
+            },
+            "transport_compaction": {
+                "committed":1,
+                "failed":0,
+                "reason":"committed",
+                "examined_raw_pages":4,
+                "invalid_canonical_or_member":2,
+                "logical_charge_before":1000,
+                "logical_charge_after":400,
+                "committed_reclaim":600
+            }
+        }]
+    });
+    let history_path = data.join(format!("{}.support.json", sanitize_username(username)));
+    std::fs::write(&history_path, serde_json::to_vec(&history).unwrap()).unwrap();
+    let before = snapshot(&data);
+    let output = root.path().join("bundle.json");
+    clean_cmd()
+        .env("KEI_DATA_DIR", &data)
+        .arg("--config")
+        .arg(&config)
+        .arg("support-export")
+        .arg("--output")
+        .arg(&output)
+        .assert()
+        .success();
+    assert_eq!(snapshot(&data), before);
+    let text = std::fs::read_to_string(output).unwrap();
+    assert!(!text.contains("private-"));
+    let bundle: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(bundle["state"]["status"], "live_wal_snapshot_unavailable");
+    assert_eq!(bundle["history"]["status"], "available");
+    let cycle = &bundle["history"]["data"]["cycles"][0];
+    assert_eq!(cycle["storage_reuse"]["catalogue"]["single_item_limit"], 1);
+    assert_eq!(
+        cycle["storage_reuse"]["catalogue"]["last_reason"],
+        "single_item_limit"
+    );
+    assert_eq!(cycle["storage_reuse"]["selection"]["last_observed_used"], 7);
+    assert_eq!(
+        cycle["storage_reuse"]["selection"]["last_observed_limit"],
+        9
+    );
+    assert_eq!(
+        cycle["transport_compaction"]["invalid_canonical_or_member"],
+        2
+    );
+    assert_eq!(cycle["transport_compaction"]["committed_reclaim"], 600);
+    drop(conn);
+}
+
+#[test]
 fn support_history_survives_a_real_process_restart_without_new_sync() {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().join("data");

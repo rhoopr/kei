@@ -2434,8 +2434,19 @@ SQL observations before transaction commit are explicitly identified as attempts
 projection. It exports fixed classes and numeric status codes from the cause
 chain, never messages or provider payloads, and does not decide retry policy.
 
+The inbox, catalogue, selection and work owners publish fixed storage counters
+after successful transaction commit and at existing capacity refusal branches.
+The history worker retains a fixed summary per cycle, not response rows.
+Budgets reuse existing admission accounting and are labeled last observed,
+pre-admission logical charges. Migration returns its compaction summary to the
+schema owner, which publishes it only after the migration savepoint commits;
+failed migration reports no committed reclaim. Optional charge observations
+cannot fail migration. Retained reasons and counters contain no source identity,
+URL or arbitrary error text, and remain subject to queue loss and bounded
+history retention. Unknown observations stay explicitly unavailable.
+
 History and export schema version 1 are separate from report version 3 and state
-schema 35. Raw reports and databases are never packaged. Interrupted writes
+schema 36. Raw reports and databases are never packaged. Interrupted writes
 preserve the previous history; read errors and limits appear as partial evidence.
 See [the operator guide](support-export.md) for limits and unavailable evidence.
 

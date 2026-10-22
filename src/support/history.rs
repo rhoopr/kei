@@ -35,6 +35,162 @@ pub(super) struct History {
     pub cycles: Vec<Cycle>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct CompactionSummary {
+    pub examined_raw_pages: u64,
+    pub eligible: u64,
+    pub compacted_aliases: u64,
+    pub retained_unsupported_shape: u64,
+    pub retained_projection_or_dependency: u64,
+    pub no_equivalent_peer: u64,
+    pub invalid_canonical_or_member: u64,
+    pub no_positive_saving: u64,
+    pub retained_representative: u64,
+    /// Logical `charged_bytes` before compaction, when the aggregate was readable.
+    pub logical_charge_before: Option<u64>,
+    /// Logical `charged_bytes` after compaction, when the aggregate was readable.
+    pub logical_charge_after: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct StorageReuse {
+    pub inbox: ReuseCounters,
+    pub catalogue: ReuseCounters,
+    pub selection: ReuseCounters,
+    pub work: ReuseCounters,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct ReuseCounters {
+    /// False also covers older histories without storage observations.
+    pub observed: bool,
+    pub new: u64,
+    pub exact: u64,
+    pub equivalent: u64,
+    pub capacity_rejected: u64,
+    pub single_item_limit: u64,
+    pub last_reason: ReuseReason,
+    /// Last observed pre-admission logical budget, not current usage. `None`
+    /// means no capacity admission has reported a budget in this cycle.
+    pub last_observed_used: Option<u64>,
+    pub last_observed_limit: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ReuseReason {
+    #[default]
+    None,
+    Capacity,
+    SingleItemLimit,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CompactionReason {
+    #[default]
+    NotObserved,
+    Committed,
+    MigrationFailed,
+    RollbackFailed,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct TransportCompactionEvidence {
+    pub committed: u64,
+    pub failed: u64,
+    pub reason: CompactionReason,
+    pub examined_raw_pages: u64,
+    pub eligible: u64,
+    pub compacted_aliases: u64,
+    pub retained_unsupported_shape: u64,
+    pub retained_projection_or_dependency: u64,
+    pub no_equivalent_peer: u64,
+    pub invalid_canonical_or_member: u64,
+    pub no_positive_saving: u64,
+    pub retained_representative: u64,
+    pub logical_charge_before: Option<u64>,
+    pub logical_charge_after: Option<u64>,
+    /// Logical `charged_bytes` reclaimed by committed compaction. This is a
+    /// budget-accounting value, never a physical disk-shrink claim.
+    pub committed_reclaim: Option<u64>,
+}
+
+impl StorageReuse {
+    fn record(
+        &mut self,
+        component: StorageComponent,
+        outcome: StorageOutcome,
+        budget: Option<(u64, u64)>,
+    ) {
+        let counters = match component {
+            StorageComponent::Inbox => &mut self.inbox,
+            StorageComponent::Catalogue => &mut self.catalogue,
+            StorageComponent::Selection => &mut self.selection,
+            StorageComponent::Work => &mut self.work,
+        };
+        counters.record(outcome, budget);
+    }
+}
+
+impl ReuseCounters {
+    fn record(&mut self, outcome: StorageOutcome, budget: Option<(u64, u64)>) {
+        self.observed = true;
+        match outcome {
+            StorageOutcome::New => self.new = self.new.saturating_add(1),
+            StorageOutcome::Exact => self.exact = self.exact.saturating_add(1),
+            StorageOutcome::Equivalent => {
+                self.equivalent = self.equivalent.saturating_add(1);
+            }
+            StorageOutcome::CapacityRejected => {
+                self.capacity_rejected = self.capacity_rejected.saturating_add(1);
+                self.last_reason = ReuseReason::Capacity;
+            }
+            StorageOutcome::SingleItemLimit => {
+                self.single_item_limit = self.single_item_limit.saturating_add(1);
+                self.last_reason = ReuseReason::SingleItemLimit;
+            }
+        }
+        if let Some((used, limit)) = budget {
+            self.last_observed_used = Some(used);
+            self.last_observed_limit = Some(limit);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StorageComponent {
+    Inbox,
+    Catalogue,
+    Selection,
+    Work,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StorageOutcome {
+    New,
+    Exact,
+    Equivalent,
+    CapacityRejected,
+    SingleItemLimit,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MigrationFailure {
+    MigrationFailed,
+    RollbackFailed,
+}
+
+#[derive(Clone, Debug)]
+enum MigrationEvent {
+    Committed(CompactionSummary),
+    Failed(MigrationFailure),
+}
+
 #[derive(Serialize, Deserialize)]
 pub(super) struct Cycle {
     pub id: String,
@@ -48,6 +204,10 @@ pub(super) struct Cycle {
     pub build_dirty: Option<bool>,
     pub configuration: Value,
     pub stats: Value,
+    #[serde(default)]
+    pub storage_reuse: StorageReuse,
+    #[serde(default)]
+    pub transport_compaction: TransportCompactionEvidence,
     pub diagnostics: Vec<Diagnostic>,
     /// None identifies history written before observation accounting existed.
     #[serde(default)]
@@ -202,6 +362,8 @@ enum Message {
     #[cfg(test)]
     Observe(&'static str, Map<String, Value>),
     Event(String, Map<String, Value>),
+    Storage(StorageComponent, StorageOutcome, Option<(u64, u64)>),
+    Migration(MigrationEvent),
     Stop,
 }
 
@@ -232,6 +394,28 @@ impl Recorder {
 }
 
 static ACTIVE: OnceLock<Recorder> = OnceLock::new();
+
+pub(crate) fn record_storage(
+    component: StorageComponent,
+    outcome: StorageOutcome,
+    budget: Option<(u64, u64)>,
+) {
+    if let Some(recorder) = ACTIVE.get() {
+        recorder.send(Message::Storage(component, outcome, budget));
+    }
+}
+
+pub(crate) fn record_transport_compaction(summary: CompactionSummary) {
+    if let Some(recorder) = ACTIVE.get() {
+        recorder.send(Message::Migration(MigrationEvent::Committed(summary)));
+    }
+}
+
+pub(crate) fn record_transport_compaction_failure(failure: MigrationFailure) {
+    if let Some(recorder) = ACTIVE.get() {
+        recorder.send(Message::Migration(MigrationEvent::Failed(failure)));
+    }
+}
 
 pub(crate) fn begin(configuration: Value) {
     if let Some(recorder) = ACTIVE.get() {
@@ -436,6 +620,12 @@ fn apply(history: &mut History, message: Message) -> bool {
                 cycle.stats = stats;
             }
         }
+        Message::Storage(component, outcome, budget) => {
+            if let Some(cycle) = history.cycles.last_mut() {
+                cycle.storage_reuse.record(component, outcome, budget);
+            }
+        }
+        Message::Migration(event) => apply_migration(history, event),
         #[cfg(test)]
         Message::Observe(kind, fields) => add(history, kind, fields),
         Message::Event(kind, fields) => add(history, &kind, fields),
@@ -462,6 +652,54 @@ fn apply(history: &mut History, message: Message) -> bool {
     false
 }
 
+fn apply_migration(history: &mut History, event: MigrationEvent) {
+    let Some(cycle) = history.cycles.last_mut() else {
+        return;
+    };
+    let evidence = &mut cycle.transport_compaction;
+    match event {
+        MigrationEvent::Committed(summary) => {
+            evidence.committed = evidence.committed.saturating_add(1);
+            evidence.reason = CompactionReason::Committed;
+            evidence.examined_raw_pages = summary.examined_raw_pages;
+            evidence.eligible = summary.eligible;
+            evidence.compacted_aliases = summary.compacted_aliases;
+            evidence.retained_unsupported_shape = summary.retained_unsupported_shape;
+            evidence.retained_projection_or_dependency = summary.retained_projection_or_dependency;
+            evidence.no_equivalent_peer = summary.no_equivalent_peer;
+            evidence.invalid_canonical_or_member = summary.invalid_canonical_or_member;
+            evidence.no_positive_saving = summary.no_positive_saving;
+            evidence.retained_representative = summary.retained_representative;
+            evidence.logical_charge_before = summary.logical_charge_before;
+            evidence.logical_charge_after = summary.logical_charge_after;
+            evidence.committed_reclaim =
+                match (summary.logical_charge_before, summary.logical_charge_after) {
+                    (Some(before), Some(after)) => Some(before.saturating_sub(after)),
+                    _ => None,
+                };
+        }
+        MigrationEvent::Failed(failure) => {
+            evidence.failed = evidence.failed.saturating_add(1);
+            evidence.reason = match failure {
+                MigrationFailure::MigrationFailed => CompactionReason::MigrationFailed,
+                MigrationFailure::RollbackFailed => CompactionReason::RollbackFailed,
+            };
+            evidence.examined_raw_pages = 0;
+            evidence.eligible = 0;
+            evidence.compacted_aliases = 0;
+            evidence.retained_unsupported_shape = 0;
+            evidence.retained_projection_or_dependency = 0;
+            evidence.no_equivalent_peer = 0;
+            evidence.invalid_canonical_or_member = 0;
+            evidence.no_positive_saving = 0;
+            evidence.retained_representative = 0;
+            evidence.logical_charge_before = None;
+            evidence.logical_charge_after = None;
+            evidence.committed_reclaim = Some(0);
+        }
+    }
+}
+
 fn begin_record(history: &mut History, configuration: Value, complete_startup: bool) {
     // Entering the next cycle proves startup reached normal operation.
     // A process that stops before this handoff retains an unfinished record.
@@ -486,6 +724,8 @@ fn begin_record(history: &mut History, configuration: Value, complete_startup: b
         build_dirty: option_env!("KEI_BUILD_DIRTY").and_then(|v| v.parse().ok()),
         configuration,
         stats: Value::Object(Map::new()),
+        storage_reuse: StorageReuse::default(),
+        transport_compaction: TransportCompactionEvidence::default(),
         diagnostics: Vec::new(),
         observations_total: Some(0),
         observations_shown: Some(0),
@@ -763,4 +1003,11 @@ pub(crate) fn test_retained_events(path: &Path) -> Vec<Value> {
                 .map(|d| serde_json::json!({"kind":d.kind,"fields":d.fields}))
         })
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn test_retained_snapshot(path: &Path) -> Value {
+    let (history, status) = read(path);
+    assert_eq!(status, "available");
+    serde_json::to_value(history).expect("support history snapshot")
 }

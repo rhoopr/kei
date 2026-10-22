@@ -5,6 +5,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use super::provider_inbox::{CapturedPageId, StoredPage, load_page};
 use super::{SqliteStateDb, account};
 use crate::state::error::StateError;
+use crate::support::{StorageComponent, StorageOutcome};
 
 pub(crate) const PROJECTOR_VERSION: i64 = 1;
 
@@ -119,11 +120,21 @@ impl SqliteStateDb {
                     }
                 }
                 tx.commit()?;
+                crate::support::record_storage(
+                    StorageComponent::Catalogue,
+                    StorageOutcome::Exact,
+                    None,
+                );
                 return Ok(());
             }
             let used: i64 = tx.query_row("SELECT COALESCE(SUM(charged_bytes),0) FROM provider_catalog_pages",[],|row|row.get(0))?;
             let used = u64::try_from(used).map_err(|_out_of_range|StateError::ProviderCatalogInvalid)?;
             if plan.charged_bytes > capacity.saturating_sub(used) {
+                crate::support::record_storage(
+                    StorageComponent::Catalogue,
+                    StorageOutcome::CapacityRejected,
+                    Some((used, capacity)),
+                );
                 return Err(StateError::ProviderCatalogFull);
             }
             for (ordinal,(record,identity)) in plan.records.iter().zip(&current.page.identities).enumerate() {
@@ -152,6 +163,11 @@ impl SqliteStateDb {
                 params![page_id,expected.0,expected.1,records,references,debt,charged],
             )?;
             tx.commit()?;
+            crate::support::record_storage(
+                StorageComponent::Catalogue,
+                StorageOutcome::New,
+                Some((used, capacity)),
+            );
             Ok(())
         }).await
     }

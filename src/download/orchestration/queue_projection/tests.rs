@@ -6684,3 +6684,163 @@ async fn private_prepared_native_opaque_mmcs_receipt_survives_drift_without_touc
     ))
     .await;
 }
+
+async fn queue_projection_actual_diagnostics_child() {
+    let history =
+        std::path::PathBuf::from(std::env::var_os("KEI_TEST_QUEUE_DIAGNOSTICS_HISTORY").unwrap());
+    let (_recorder, guard) =
+        crate::support::history::start(history, json!({"threads": 1})).unwrap();
+
+    const INITIAL_URL: &str = "https://p01.icloud-content.com/diagnostics-source.jpg?token=1";
+    const ROTATED_URL: &str = "https://p01.icloud-content.com/diagnostics-source.jpg?token=2";
+
+    let f = Fixture::new().await;
+    *f.session.records.lock().unwrap() = eligible_records("m", INITIAL_URL);
+    f.capture(records("m", OLD, "source"), "old").await;
+    f.cycle().await.unwrap();
+    let queue = f.queue();
+    assert_eq!(f.count("provider_selection_generations"), 1);
+    assert_eq!(f.count("provider_work_receipts"), 1);
+
+    let (id, manifest) = selection_manifest(&f).await;
+    assert_eq!(
+        f.db.capture_selection_shadow(owner(), manifest.clone(), 0)
+            .await
+            .unwrap(),
+        id
+    );
+    let plan = f.plan().await;
+    assert_eq!(
+        f.db.project_provider_work(owner(), plan, 0).await.unwrap(),
+        WorkAdmission::Admitted
+    );
+
+    let mut equivalent = manifest.clone();
+    let body = equivalent.decisions[0].confirmation.take().unwrap();
+    let body = String::from_utf8(body)
+        .unwrap()
+        .replace(INITIAL_URL, ROTATED_URL)
+        .into_bytes();
+    equivalent.decisions[0].confirmation = Some(body);
+    assert_eq!(
+        f.db.capture_selection_shadow(owner(), equivalent, MAX_SELECTION_BYTES)
+            .await
+            .unwrap(),
+        id
+    );
+    *f.session.records.lock().unwrap() = eligible_records("m", ROTATED_URL);
+    let plan = f.plan().await;
+    assert_eq!(
+        f.db.project_provider_work(owner(), plan, 512 * 1024 * 1024)
+            .await
+            .unwrap(),
+        WorkAdmission::Admitted
+    );
+    assert_eq!(f.count("provider_selection_generations"), 1);
+    assert_eq!(f.count("provider_work_receipts"), 1);
+    assert_eq!(f.queue(), queue);
+
+    crate::support::begin(json!({"scenario": "single-item-limit"}));
+    let mut plan = f.plan().await;
+    let mut body = plan.confirmation.take().unwrap();
+    assert_eq!(body.pop(), Some(b'}'));
+    body.resize(16 * 1024 * 1024 - 1, b' ');
+    body.push(b'}');
+    plan.confirmation = Some(body);
+    assert!(matches!(
+        f.db.project_provider_work(owner(), plan, 512 * 1024 * 1024)
+            .await,
+        Err(crate::state::error::StateError::ProviderWorkFull)
+    ));
+    let (_, mut manifest) = selection_manifest(&f).await;
+    manifest.decisions[0].reason = "x".repeat(16 * 1024 * 1024);
+    assert!(matches!(
+        f.db.capture_selection_shadow(owner(), manifest, MAX_SELECTION_BYTES)
+            .await,
+        Err(crate::state::error::StateError::ProviderSelectionFull)
+    ));
+    let plan = f.plan().await;
+    assert_eq!(
+        f.db.project_provider_work(owner(), plan, 0).await.unwrap(),
+        WorkAdmission::Admitted
+    );
+    let (_, manifest) = selection_manifest(&f).await;
+    assert_eq!(
+        f.db.capture_selection_shadow(owner(), manifest, 0)
+            .await
+            .unwrap(),
+        id
+    );
+
+    crate::support::begin(json!({"scenario": "capacity"}));
+    let mut plan = f.plan().await;
+    plan.config_hash = "c".repeat(64);
+    assert!(matches!(
+        f.db.project_provider_work(owner(), plan, 0).await,
+        Err(crate::state::error::StateError::ProviderWorkFull)
+    ));
+    let (_, mut manifest) = selection_manifest(&f).await;
+    let mut second = manifest.decisions[0].clone();
+    manifest.decisions[0].pass_key = "album-A".to_owned();
+    second.pass_key = "album-B".to_owned();
+    second.destinations[0].path = SelectionPath::from_path(&f.config.directory.join("B/photo.jpg"));
+    manifest.decisions.push(second);
+    assert!(matches!(
+        f.db.capture_selection_shadow(owner(), manifest, 0).await,
+        Err(crate::state::error::StateError::ProviderSelectionFull)
+    ));
+
+    guard.finish().await;
+}
+
+#[tokio::test]
+async fn queue_projection_actual_diagnostics_record_selection_and_work_limits() {
+    if std::env::var_os("KEI_TEST_QUEUE_DIAGNOSTICS_CHILD").is_some() {
+        queue_projection_actual_diagnostics_child().await;
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let history = root.path().join("support.json");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "download::orchestration::queue_projection::tests::queue_projection_actual_diagnostics_record_selection_and_work_limits",
+            "--nocapture",
+        ])
+        .env("TMPDIR", root.path())
+        .env("TMP", root.path())
+        .env("TEMP", root.path())
+        .env("KEI_TEST_QUEUE_DIAGNOSTICS_CHILD", "1")
+        .env("KEI_TEST_QUEUE_DIAGNOSTICS_HISTORY", &history)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot = crate::support::history::test_retained_snapshot(&history);
+    let cycles = snapshot["cycles"].as_array().unwrap();
+    let first = &cycles[0]["storage_reuse"];
+    assert_eq!(first["selection"]["new"], 1);
+    assert_eq!(first["selection"]["exact"], 1);
+    assert_eq!(first["selection"]["equivalent"], 1);
+    assert_eq!(first["work"]["new"], 1);
+    assert_eq!(first["work"]["exact"], 1);
+    assert_eq!(first["work"]["equivalent"], 1);
+    let single = &cycles[1]["storage_reuse"];
+    assert_eq!(single["selection"]["single_item_limit"], 1);
+    assert_eq!(single["selection"]["last_reason"], "single_item_limit");
+    assert!(single["selection"]["last_observed_used"].is_null());
+    assert_eq!(single["work"]["single_item_limit"], 1);
+    assert_eq!(single["work"]["last_reason"], "single_item_limit");
+    assert!(single["work"]["last_observed_used"].is_null());
+    let capacity = &cycles[2]["storage_reuse"];
+    assert_eq!(capacity["selection"]["capacity_rejected"], 1);
+    assert_eq!(capacity["selection"]["last_reason"], "capacity");
+    assert_eq!(capacity["selection"]["last_observed_limit"], 0);
+    assert_eq!(capacity["work"]["capacity_rejected"], 1);
+    assert_eq!(capacity["work"]["last_reason"], "capacity");
+    assert_eq!(capacity["work"]["last_observed_limit"], 0);
+}

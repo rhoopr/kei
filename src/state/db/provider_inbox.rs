@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 
 use super::{SqliteStateDb, account};
 use crate::state::error::StateError;
+use crate::support::{StorageComponent, StorageOutcome};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SourceIdentity {
@@ -317,6 +318,18 @@ const ALIAS_OVERHEAD_BYTES: u64 = 320;
 /// representative. New captures already include this in their own charge.
 const CANONICAL_INDEX_OVERHEAD_BYTES: u64 = 96;
 
+/// Optional logical-charge aggregate for diagnostics. A read failure records
+/// unknown rather than failing the migration.
+fn logical_charge(conn: &Connection) -> Option<u64> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_shadow_pages",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .ok()
+    .and_then(|charge| u64::try_from(charge).ok())
+}
+
 /// Validate every known consumer of a page before its body may be dropped.
 /// Work receipts, work retries/scans and selection sources all retain the old
 /// durable identity; a hash, scope, ordinal or confirmation mismatch pins the
@@ -476,9 +489,14 @@ fn projection_is_valid(conn: &Connection, page: &StoredPage) -> Result<bool, Sta
 /// aliases. Runs inside the schema migration savepoint, streams one body at a
 /// time, and never aliases a page whose projection, references, debt, owner,
 /// raw hash, or classifier evidence cannot be proved.
-pub(crate) fn compact_legacy_aliases(conn: &Connection) -> Result<(), StateError> {
+pub(crate) fn compact_legacy_aliases(
+    conn: &Connection,
+) -> Result<crate::support::CompactionSummary, StateError> {
+    use crate::support::CompactionSummary;
     use std::collections::HashMap;
 
+    let mut summary = CompactionSummary::default();
+    let before_charge = logical_charge(conn);
     let ids: Vec<i64> = conn.prepare(
         "SELECT p.id FROM provider_shadow_pages p LEFT JOIN provider_transport_aliases a ON a.page_id=p.id WHERE a.page_id IS NULL ORDER BY p.id",
     )?.query_map([], |row| row.get(0))?.collect::<Result<_,_>>()?;
@@ -489,19 +507,32 @@ pub(crate) fn compact_legacy_aliases(conn: &Connection) -> Result<(), StateError
             CapturedPageId(id),
             crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES,
         )?;
-        if !matches!(page.provenance, PageProvenance::Raw) || page.page.body.is_empty() {
+        if !matches!(page.provenance, PageProvenance::Raw) {
+            summary.retained_unsupported_shape =
+                summary.retained_unsupported_shape.saturating_add(1);
+            continue;
+        }
+        summary.examined_raw_pages = summary.examined_raw_pages.saturating_add(1);
+        if page.page.body.is_empty() {
+            summary.retained_unsupported_shape =
+                summary.retained_unsupported_shape.saturating_add(1);
             continue;
         }
         let Some(evidence) =
             crate::icloud::photos::transport_evidence::capture_evidence(&page.page)
                 .map_err(|_error| StateError::ProviderInboxInvalid)?
         else {
+            summary.retained_unsupported_shape =
+                summary.retained_unsupported_shape.saturating_add(1);
             continue;
         };
         let key = canonical_key(&page.account_key, &page.provider_key, &page.page, &evidence)?;
         if !projection_is_valid(conn, &page)? {
+            summary.retained_projection_or_dependency =
+                summary.retained_projection_or_dependency.saturating_add(1);
             continue;
         }
+        summary.eligible = summary.eligible.saturating_add(1);
         groups
             .entry(key)
             .or_insert_with(|| (evidence.version, Vec::new()))
@@ -510,8 +541,10 @@ pub(crate) fn compact_legacy_aliases(conn: &Connection) -> Result<(), StateError
     }
     for (certificate, (version, members)) in groups {
         if members.len() < 2 {
+            summary.no_equivalent_peer = summary.no_equivalent_peer.saturating_add(1);
             continue;
         }
+        let group_pages = u64::try_from(members.len()).unwrap_or(u64::MAX);
         // An existing canonical index is authoritative. A representative that
         // failed validation must pin the whole group rather than being replaced.
         let existing: Option<i64> = conn.query_row(
@@ -521,7 +554,12 @@ pub(crate) fn compact_legacy_aliases(conn: &Connection) -> Result<(), StateError
         ).optional()?;
         let canonical_id = match existing {
             Some(id) if members.contains(&id) => id,
-            Some(_) => continue,
+            Some(_) => {
+                summary.invalid_canonical_or_member = summary
+                    .invalid_canonical_or_member
+                    .saturating_add(group_pages);
+                continue;
+            }
             None => *members
                 .iter()
                 .min()
@@ -544,8 +582,12 @@ pub(crate) fn compact_legacy_aliases(conn: &Connection) -> Result<(), StateError
                 &canonical_evidence,
             )? != certificate
         {
+            summary.invalid_canonical_or_member = summary
+                .invalid_canonical_or_member
+                .saturating_add(group_pages);
             continue;
         }
+        summary.retained_representative = summary.retained_representative.saturating_add(1);
         if existing.is_none() {
             conn.execute(
                 "INSERT INTO provider_transport_canonical(canonical_sha,version,page_id) VALUES (?1,?2,?3)",
@@ -578,8 +620,14 @@ pub(crate) fn compact_legacy_aliases(conn: &Connection) -> Result<(), StateError
                 || member_evidence.masked != canonical_evidence.masked
                 || masked_sha != format!("{:x}", Sha256::digest(&canonical_evidence.masked))
                 || !same_capture_metadata(&member.page, &canonical.page)
-                || !projection_is_valid(conn, &member)?
             {
+                summary.invalid_canonical_or_member =
+                    summary.invalid_canonical_or_member.saturating_add(1);
+                continue;
+            }
+            if !projection_is_valid(conn, &member)? {
+                summary.retained_projection_or_dependency =
+                    summary.retained_projection_or_dependency.saturating_add(1);
                 continue;
             }
             let body_len = member.page.body.len() as u64;
@@ -594,6 +642,7 @@ pub(crate) fn compact_legacy_aliases(conn: &Connection) -> Result<(), StateError
                 .saturating_sub(body_len)
                 .saturating_add(ALIAS_OVERHEAD_BYTES);
             if new_charge >= old_charge {
+                summary.no_positive_saving = summary.no_positive_saving.saturating_add(1);
                 continue;
             }
             // Certificate fields repeat only this proven pair. The alias row
@@ -622,6 +671,7 @@ pub(crate) fn compact_legacy_aliases(conn: &Connection) -> Result<(), StateError
                     i64::try_from(new_charge).map_err(|_error| StateError::ProviderInboxInvalid)?
                 ],
             )?;
+            summary.compacted_aliases = summary.compacted_aliases.saturating_add(1);
             #[cfg(test)]
             {
                 let remaining = TEST_ABORT_AFTER_ALIASES.with(std::cell::Cell::get);
@@ -634,7 +684,9 @@ pub(crate) fn compact_legacy_aliases(conn: &Connection) -> Result<(), StateError
             }
         }
     }
-    Ok(())
+    summary.logical_charge_before = before_charge;
+    summary.logical_charge_after = logical_charge(conn);
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -674,6 +726,7 @@ impl SqliteStateDb {
                 params![page.scope, page.request_cursor, hash],
                 |row| row.get(0),
             ).optional()?;
+            let storage: (StorageOutcome, Option<(u64, u64)>);
             let page_id = if let Some(id) = existing {
                 let original = load_page(
                     &tx,
@@ -687,6 +740,7 @@ impl SqliteStateDb {
                         {
                             return Err(StateError::ProviderInboxInvalid);
                         }
+                        storage = (StorageOutcome::Exact, None);
                         id
                     }
                     PageProvenance::LegacyAlias(alias) => {
@@ -705,6 +759,7 @@ impl SqliteStateDb {
                         {
                             return Err(StateError::ProviderInboxInvalid);
                         }
+                        storage = (StorageOutcome::Equivalent, None);
                         alias.canonical_page_id.0
                     }
                 }
@@ -751,6 +806,7 @@ impl SqliteStateDb {
                     {
                         return Err(StateError::ProviderInboxInvalid);
                     }
+                    storage = (StorageOutcome::Equivalent, None);
                     representative_id
                 } else {
                     // Charge UTF-8 payload and provenance bytes, including source
@@ -766,8 +822,14 @@ impl SqliteStateDb {
                     )?;
                     let used = u64::try_from(used).map_err(|_error| StateError::ProviderInboxInvalid)?;
                     if charge > capacity.saturating_sub(used) {
+                        crate::support::record_storage(
+                            StorageComponent::Inbox,
+                            StorageOutcome::CapacityRejected,
+                            Some((used, capacity)),
+                        );
                         return Err(StateError::ProviderInboxFull);
                     }
+                    storage = (StorageOutcome::New, Some((used, capacity)));
                     let charge = i64::try_from(charge).map_err(|_error| StateError::ProviderInboxFull)?;
                     tx.execute(
                         "INSERT INTO provider_shadow_pages(account_key,provider_key,scope,request_cursor,successor,more_coming,body_hash,body,charged_bytes,observed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -798,6 +860,7 @@ impl SqliteStateDb {
                 params![page.scope, page_id],
             )?;
             tx.commit()?;
+            crate::support::record_storage(StorageComponent::Inbox, storage.0, storage.1);
             Ok(CapturedPageId(page_id))
         }).await
     }
@@ -1666,5 +1729,225 @@ mod tests {
                 .provenance,
             PageProvenance::LegacyAlias(_)
         ));
+    }
+
+    async fn actual_inbox_migration_and_catalog_child() {
+        let history =
+            std::path::PathBuf::from(std::env::var_os("KEI_TEST_ACTUAL_INBOX_HISTORY").unwrap());
+        let (_recorder, guard) =
+            crate::support::history::start(history, serde_json::json!({"threads": 1})).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+
+        let commit_path = directory.path().join("commit.db");
+        let (owner, _, _) = legacy_v35(&commit_path);
+        let before_charge = {
+            let conn = Connection::open(&commit_path).unwrap();
+            charged_sum(&conn)
+        };
+        {
+            let conn = Connection::open(&commit_path).unwrap();
+            crate::state::schema::migrate(&conn).unwrap();
+        }
+        let after_charge = {
+            let conn = Connection::open(&commit_path).unwrap();
+            charged_sum(&conn)
+        };
+        assert!(after_charge < before_charge);
+
+        crate::support::begin(serde_json::json!({"scenario": "inbox-new-capacity"}));
+        let db = std::sync::Arc::new(
+            crate::state::SqliteStateDb::open_owned(&commit_path, &owner)
+                .await
+                .unwrap(),
+        );
+        let mut capture = crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            owner.clone(),
+            "legacy-realm",
+        );
+        capture.capacity = 512 * 1024 * 1024;
+        let fresh = fixture_observed(60, "https://p01.icloud-content.com/asset-60?token=1");
+        capture.capture(fresh.clone()).await.unwrap();
+        capture.capacity = 0;
+        let refused = fixture_observed(61, "https://p01.icloud-content.com/asset-61?token=2");
+        assert!(capture.capture(refused).await.is_err());
+        drop(capture);
+        drop(db);
+
+        crate::support::begin(serde_json::json!({"scenario": "inbox-reuse-unknown"}));
+        let db = std::sync::Arc::new(
+            crate::state::SqliteStateDb::open_owned(&commit_path, &owner)
+                .await
+                .unwrap(),
+        );
+        let mut capture = crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            owner.clone(),
+            "legacy-realm",
+        );
+        capture.capacity = 512 * 1024 * 1024;
+        capture.capture(fresh).await.unwrap();
+        let equivalent = fixture_observed(60, "https://p01.icloud-content.com/asset-60?token=9");
+        capture.capture(equivalent).await.unwrap();
+        drop(capture);
+        drop(db);
+
+        crate::support::begin(serde_json::json!({"scenario": "failed-alias"}));
+        let failed_path = directory.path().join("failed.db");
+        let (_owner, _, _) = legacy_v35(&failed_path);
+        {
+            let conn = Connection::open(&failed_path).unwrap();
+            TEST_ABORT_AFTER_ALIASES.with(|count| count.set(1));
+            assert!(crate::state::schema::migrate(&conn).is_err());
+            TEST_ABORT_AFTER_ALIASES.with(|count| count.set(0));
+        }
+
+        crate::support::begin(serde_json::json!({"scenario": "reopen-commit"}));
+        {
+            let conn = Connection::open(&failed_path).unwrap();
+            crate::state::schema::migrate(&conn).unwrap();
+        }
+
+        crate::support::begin(serde_json::json!({"scenario": "unprojectable"}));
+        let unprojectable_path = directory.path().join("unprojectable.db");
+        let (_owner, _, _) = legacy_v35(&unprojectable_path);
+        {
+            let conn = Connection::open(&unprojectable_path).unwrap();
+            insert_legacy(&conn, &oversized_unprojected_observed(), 200_000);
+            crate::state::schema::migrate(&conn).unwrap();
+        }
+
+        crate::support::begin(serde_json::json!({"scenario": "catalogue"}));
+        let db = std::sync::Arc::new(
+            crate::state::SqliteStateDb::open_owned(&commit_path, &owner)
+                .await
+                .unwrap(),
+        );
+        let fresh_catalog = fixture_observed(70, "https://p01.icloud-content.com/asset-70?token=1");
+        let fresh_id = {
+            let conn = db.acquire_lock("insert real catalogue source").unwrap();
+            insert_legacy(&*conn, &fresh_catalog, 20_000)
+        };
+        let source = db
+            .catalog_source(owner.clone(), CapturedPageId(fresh_id), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        let plan = crate::icloud::photos::plan_retained(&source).unwrap();
+        db.project_catalog_page(owner.clone(), plan, 512 * 1024 * 1024)
+            .await
+            .unwrap();
+        let source = db
+            .catalog_source(owner.clone(), CapturedPageId(fresh_id), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        let plan = crate::icloud::photos::plan_retained(&source).unwrap();
+        db.project_catalog_page(owner.clone(), plan, 0)
+            .await
+            .unwrap();
+        let refused_catalog =
+            fixture_observed(71, "https://p01.icloud-content.com/asset-71?token=2");
+        let refused_id = {
+            let conn = db.acquire_lock("insert refused catalogue source").unwrap();
+            insert_legacy(&*conn, &refused_catalog, 20_000)
+        };
+        let source = db
+            .catalog_source(owner.clone(), CapturedPageId(refused_id), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        let plan = crate::icloud::photos::plan_retained(&source).unwrap();
+        assert!(matches!(
+            db.project_catalog_page(owner.clone(), plan, 0).await,
+            Err(crate::state::error::StateError::ProviderCatalogFull)
+        ));
+        crate::support::begin(serde_json::json!({}));
+        let mut changed = fixture_observed(60, "https://p01.icloud-content.com/asset-60?token=9");
+        let mut value: serde_json::Value = serde_json::from_slice(&changed.body).unwrap();
+        value["newProviderField"] = serde_json::json!("synthetic");
+        changed.body = serde_json::to_vec(&value).unwrap();
+        db.capture_shadow_page(owner.clone(), changed.clone(), 512 * 1024 * 1024)
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            db.capture_shadow_page(owner.clone(), changed.clone(), 0)
+                .await
+                .unwrap();
+        }
+        drop(db);
+        guard.finish().await;
+    }
+
+    #[tokio::test]
+    async fn actual_inbox_migration_and_catalog_budget_record_real_owners() {
+        if std::env::var_os("KEI_TEST_ACTUAL_INBOX_CHILD").is_some() {
+            actual_inbox_migration_and_catalog_child().await;
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let history = root.path().join("support.json");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "state::db::provider_inbox::tests::actual_inbox_migration_and_catalog_budget_record_real_owners",
+                "--nocapture",
+            ])
+            .env("TMPDIR", root.path())
+            .env("TMP", root.path())
+            .env("TEMP", root.path())
+            .env("KEI_TEST_ACTUAL_INBOX_CHILD", "1")
+            .env("KEI_TEST_ACTUAL_INBOX_HISTORY", &history)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let snapshot = crate::support::history::test_retained_snapshot(&history);
+        let cycles = snapshot["cycles"].as_array().unwrap();
+        let committed = &cycles[0]["transport_compaction"];
+        assert_eq!(committed["committed"], 1);
+        assert_eq!(committed["reason"], "committed");
+        let before = committed["logical_charge_before"].as_u64().unwrap();
+        let after = committed["logical_charge_after"].as_u64().unwrap();
+        assert!(before > after);
+        assert_eq!(committed["committed_reclaim"], before - after);
+        let inbox_new = &cycles[1]["storage_reuse"]["inbox"];
+        assert_eq!(inbox_new["new"], 1);
+        assert_eq!(inbox_new["capacity_rejected"], 1);
+        assert_eq!(inbox_new["last_reason"], "capacity");
+        assert_eq!(inbox_new["last_observed_limit"], 0);
+        let inbox_reuse = &cycles[2]["storage_reuse"]["inbox"];
+        assert_eq!(inbox_reuse["exact"], 1);
+        assert_eq!(inbox_reuse["equivalent"], 1);
+        assert_eq!(inbox_reuse["last_reason"], "none");
+        assert!(inbox_reuse["last_observed_used"].is_null());
+        let failed = &cycles[3]["transport_compaction"];
+        assert_eq!(failed["failed"], 1);
+        assert_eq!(failed["reason"], "migration_failed");
+        assert_eq!(failed["committed_reclaim"], 0);
+        assert!(failed["logical_charge_before"].is_null());
+        let reopened = &cycles[4]["transport_compaction"];
+        assert_eq!(reopened["committed"], 1);
+        assert_eq!(reopened["reason"], "committed");
+        assert!(reopened["committed_reclaim"].as_u64().unwrap() > 0);
+        let unprojectable = &cycles[5]["transport_compaction"];
+        assert!(
+            unprojectable["retained_projection_or_dependency"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+        let catalogue = &cycles[6]["storage_reuse"]["catalogue"];
+        assert_eq!(catalogue["new"], 1);
+        assert_eq!(catalogue["exact"], 1);
+        assert_eq!(catalogue["capacity_rejected"], 1);
+        assert_eq!(catalogue["last_reason"], "capacity");
+        assert_eq!(catalogue["last_observed_limit"], 0);
+        let unknown = &cycles[7]["storage_reuse"]["inbox"];
+        assert_eq!(unknown["new"], 1);
+        assert_eq!(unknown["exact"], 10);
+        assert_eq!(unknown["equivalent"], 0);
+        assert_eq!(unknown["observed"], true);
     }
 }

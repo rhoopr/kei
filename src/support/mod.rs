@@ -8,7 +8,11 @@ pub(crate) mod history;
 mod privacy;
 pub(crate) mod token_equivalence;
 
-pub(crate) use history::{begin, complete, observe, observe_scoped};
+pub(crate) use history::{
+    CompactionSummary, MigrationFailure, StorageComponent, StorageOutcome, begin, complete,
+    observe, observe_scoped, record_storage, record_transport_compaction,
+    record_transport_compaction_failure,
+};
 pub(crate) use privacy::fixed_label;
 
 use serde_json::{Value, json};

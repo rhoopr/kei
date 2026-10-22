@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use super::provider_inbox::{CapturedPageId, load_page};
 use super::{SqliteStateDb, account};
 use crate::state::{VersionSizeKey, error::StateError};
+use crate::support::{StorageComponent, StorageOutcome};
 
 pub(crate) const MAX_SELECTION_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
@@ -393,7 +394,14 @@ impl SqliteStateDb {
         self.with_conn_mut("capturing selection shadow", move |conn| {
             let bytes = serde_json::to_vec(&manifest)
                 .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
-            if bytes.len() > MAX_MANIFEST_BYTES { return Err(StateError::ProviderSelectionFull) }
+            if bytes.len() > MAX_MANIFEST_BYTES {
+                crate::support::record_storage(
+                    StorageComponent::Selection,
+                    StorageOutcome::SingleItemLimit,
+                    None,
+                );
+                return Err(StateError::ProviderSelectionFull);
+            }
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             account::validate_authenticated(&tx, &owner)?;
             validate(&tx, &manifest)?;
@@ -411,12 +419,22 @@ impl SqliteStateDb {
                 if existing != (account_key, provider_key, MANIFEST_VERSION, bytes) { return invalid() }
                 validate_rows(&tx, &id, &manifest)?;
                 tx.commit()?;
+                crate::support::record_storage(
+                    StorageComponent::Selection,
+                    StorageOutcome::Exact,
+                    None,
+                );
                 return Ok(id);
             }
             if let Some(equivalent) =
                 equivalent_generation(&tx, &manifest, &account_key, &provider_key)?
             {
                 tx.commit()?;
+                crate::support::record_storage(
+                    StorageComponent::Selection,
+                    StorageOutcome::Equivalent,
+                    None,
+                );
                 return Ok(equivalent);
             }
             let mut charge = bytes.len() + id.len() + account_key.len() + provider_key.len()
@@ -433,7 +451,14 @@ impl SqliteStateDb {
             }
             let charge = u64::try_from(charge).map_err(|_invalid| StateError::ProviderSelectionFull)?;
             let used: i64 = tx.query_row("SELECT COALESCE(SUM(charged_bytes),0) FROM provider_selection_generations", [], |r| r.get(0))?;
-            if charge > capacity.saturating_sub(u64::try_from(used).map_err(|_invalid| StateError::ProviderSelectionInvalid)?) {
+            let used = u64::try_from(used)
+                .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+            if charge > capacity.saturating_sub(used) {
+                crate::support::record_storage(
+                    StorageComponent::Selection,
+                    StorageOutcome::CapacityRejected,
+                    Some((used, capacity)),
+                );
                 return Err(StateError::ProviderSelectionFull);
             }
             tx.execute("INSERT INTO provider_selection_generations(id,account_key,provider_key,format,scope,config_hash,manifest,charged_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -449,6 +474,11 @@ impl SqliteStateDb {
                 }
             }
             tx.commit()?;
+            crate::support::record_storage(
+                StorageComponent::Selection,
+                StorageOutcome::New,
+                Some((used, capacity)),
+            );
             Ok(id)
         }).await
     }

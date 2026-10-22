@@ -10,6 +10,7 @@ use super::provider_inbox::{CapturedPageId, StoredPage, load_page};
 use super::rows::encode_asset_date;
 use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
+use crate::support::{StorageComponent, StorageOutcome};
 
 pub(crate) const MAX_WORK_BYTES: u64 = 512 * 1024 * 1024;
 // Match the existing ambiguous-metadata retry cadence. This is an operational
@@ -268,17 +269,32 @@ impl SqliteStateDb {
                 && (receipt.scope!=plan.scope || receipt.source_hash!=current.observation_hash || receipt.confirmation!=plan.confirmation || receipt.master!=plan.master) {
                 return Err(StateError::ProviderWorkInvalid);
             }
+            let mut storage_outcome = if existing.is_some() {
+                StorageOutcome::Exact
+            } else {
+                StorageOutcome::New
+            };
             if existing.is_none() {
                 // The current confirmation and planned records were already
                 // validated above. Only after that may a strictly equivalent
                 // retained confirmation supply the original representative key.
                 existing=equivalent_receipt(&tx,&plan,current.id.0,&identity.name)?;
+                if existing.is_some() {
+                    storage_outcome = StorageOutcome::Equivalent;
+                }
             }
             let retained_hash=existing.as_ref().map_or(incoming_hash.as_str(),|receipt|receipt.confirmation_hash.as_str());
             let retained_confirmation=existing.as_ref().and_then(|receipt|receipt.confirmation.as_deref()).or(plan.confirmation.as_deref());
             let charge=retained_confirmation.map_or(0,|body|body.len() as u64)+plan.scope.len() as u64+plan.config_hash.len() as u64+plan.master.as_ref().map_or(0,|name|name.len() as u64)+identity.name.len() as u64+current.observation_hash.len() as u64+plan.records.iter().map(|r|r.library.len() as u64+r.id.len() as u64+r.filename.len() as u64+r.checksum.len() as u64
                 + [r.metadata.source.as_deref(),r.metadata.title.as_deref(),r.metadata.keywords.as_deref(),r.metadata.description.as_deref(),r.metadata.media_subtype.as_deref(),r.metadata.burst_id.as_deref(),r.metadata.provider_data.as_deref(),r.metadata.metadata_hash.as_deref()].iter().map(|value|value.map_or(0,|text|text.len() as u64)).sum::<u64>()+512).sum::<u64>()+256;
-            if charge>MAX_WORK_PLAN_BYTES {return Err(StateError::ProviderWorkFull);}
+            if charge > MAX_WORK_PLAN_BYTES {
+                crate::support::record_storage(
+                    StorageComponent::Work,
+                    StorageOutcome::SingleItemLimit,
+                    None,
+                );
+                return Err(StateError::ProviderWorkFull);
+            }
             if let Some(receipt)=&existing
                 && receipt.state=="admitted" {
                     if !receipt.reason.is_empty() || receipt.charged_bytes!=i64::try_from(charge).map_err(|_invalid|StateError::ProviderWorkInvalid)? {return Err(StateError::ProviderWorkInvalid);}
@@ -291,6 +307,11 @@ impl SqliteStateDb {
                         if !valid {return Err(StateError::ProviderWorkInvalid);}
                     }
                     tx.commit()?;
+                    crate::support::record_storage(
+                        StorageComponent::Work,
+                        storage_outcome,
+                        None,
+                    );
                     return Ok(WorkAdmission::Admitted);
             }
             let mut reason=plan.reason;
@@ -307,7 +328,15 @@ impl SqliteStateDb {
             }
             let previous_charge=existing.as_ref().map_or(Ok(0),|receipt|u64::try_from(receipt.charged_bytes).map_err(|_invalid|StateError::ProviderWorkInvalid))?;
             let used:i64=tx.query_row("SELECT COALESCE(SUM(charged_bytes),0) FROM provider_work_receipts",[],|r|r.get(0))?;
-            if charge.saturating_sub(previous_charge)>capacity.saturating_sub(u64::try_from(used).map_err(|_invalid|StateError::ProviderWorkInvalid)?) {return Err(StateError::ProviderWorkFull);}
+            let used=u64::try_from(used).map_err(|_invalid|StateError::ProviderWorkInvalid)?;
+            if charge.saturating_sub(previous_charge)>capacity.saturating_sub(used) {
+                crate::support::record_storage(
+                    StorageComponent::Work,
+                    StorageOutcome::CapacityRejected,
+                    Some((used, capacity)),
+                );
+                return Err(StateError::ProviderWorkFull);
+            }
             if admitted {
                 let now=Utc::now().timestamp();
                 for record in &plan.records {
@@ -334,6 +363,11 @@ impl SqliteStateDb {
             // Last write: queue/mapping/debt/scan and receipt commit together.
             tx.execute("INSERT INTO provider_work_receipts(page_id,ordinal,config_hash,confirmation_hash,confirmation,state,reason,scope,source_hash,master_record_name,charged_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(page_id,ordinal,config_hash,confirmation_hash) DO UPDATE SET state=excluded.state,reason=excluded.reason,charged_bytes=excluded.charged_bytes",params![current.id.0,plan.source.ordinal,plan.config_hash,retained_hash,retained_confirmation,if admitted {"admitted"} else {"deferred"},if admitted {""} else if reason.is_empty() {"no_selected_tasks"} else {reason},plan.scope,current.observation_hash,plan.master,i64::try_from(charge).map_err(|_invalid|StateError::ProviderWorkFull)?])?;
             tx.commit()?;
+            crate::support::record_storage(
+                StorageComponent::Work,
+                storage_outcome,
+                Some((used, capacity)),
+            );
             Ok(if admitted {WorkAdmission::Admitted} else {WorkAdmission::Deferred})
         }).await
     }

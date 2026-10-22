@@ -106,6 +106,25 @@ is capped at 2 MiB. Counts refer to their documented operation/account scope,
 and diagnostic observation counts can overlap. For example, paired lookup
 counts of 604, 17 and 604 remain separate observations, not 1,225 unique assets.
 
+Storage reuse evidence has fixed component counters for inbox, catalogue,
+selection and work. `observed = false` means no storage observation was retained,
+including histories written before these counters existed. `new`, `exact`, `equivalent`, `capacity_rejected` and
+`single_item_limit` count decisions, not unique assets. `last_reason` preserves
+the most recent rejection reason (`capacity` or `single_item_limit`) even when a
+later decision reuses storage successfully. `last_observed_used` is the logical
+budget used immediately before admission, not current inventory, and it can be
+older than the latest decision. `last_observed_limit` is that admission's logical
+budget. Both are null when no capacity check has reported a budget. These are
+logical charge values, not physical file sizes.
+
+Transport compaction evidence describes only the latest migration result in
+that record. Counts, logical charge before and after, and committed reclaim are
+replaced by that result; failed migrations do not claim reclaimed bytes.
+Committed reclaim is a logical budget release, not proof that physical disk space
+shrank. Group omission, queue drop and generation-loss counts mean evidence is
+incomplete. None of these counters are unique asset counts. No identifiers,
+paths, checksums or provider text are included.
+
 The collector rejects live nonempty WAL/journal evidence and detects observed
 main-file changes during collection. It explicitly reports an unavailable
 snapshot instead of reading a stale WAL checkpoint. Stop the sync process
@@ -200,3 +219,6 @@ reference scopes in the lookup response. It describes that later lookup, not
 membership at the inventory cursor. The original inventory refusal, proof and
 checkpoint hold remain unchanged even when a current parent is found. A missing
 observation in an older export is not evidence that the condition was absent.
+
+A null committed-reclaim value means charge accounting was unavailable or no
+compaction result was observed; it is not a measured zero.

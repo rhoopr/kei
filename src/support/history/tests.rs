@@ -844,3 +844,192 @@ fn issue956_child_reference_status_crosses_tracing_and_reopen_without_private_va
     );
     assert!(!serde_json::to_string(&clean).unwrap().contains("PRIVATE_"));
 }
+
+#[test]
+fn storage_reuse_counters_saturate_and_preserve_last_stop() {
+    let mut reuse = super::StorageReuse::default();
+    reuse.inbox.new = u64::MAX;
+    reuse.inbox.exact = u64::MAX;
+    reuse.inbox.equivalent = u64::MAX;
+    reuse.inbox.capacity_rejected = u64::MAX;
+    reuse.inbox.single_item_limit = u64::MAX;
+    reuse.record(
+        super::StorageComponent::Inbox,
+        super::StorageOutcome::New,
+        Some((7, 11)),
+    );
+    reuse.record(
+        super::StorageComponent::Inbox,
+        super::StorageOutcome::Exact,
+        None,
+    );
+    reuse.record(
+        super::StorageComponent::Inbox,
+        super::StorageOutcome::Equivalent,
+        None,
+    );
+    reuse.record(
+        super::StorageComponent::Inbox,
+        super::StorageOutcome::CapacityRejected,
+        Some((8, 11)),
+    );
+    assert!(reuse.inbox.observed);
+    assert!(!reuse.catalogue.observed);
+    assert_eq!(reuse.inbox.new, u64::MAX);
+    assert_eq!(reuse.inbox.exact, u64::MAX);
+    assert_eq!(reuse.inbox.equivalent, u64::MAX);
+    assert_eq!(reuse.inbox.capacity_rejected, u64::MAX);
+    assert_eq!(reuse.inbox.last_reason, super::ReuseReason::Capacity);
+    assert_eq!(reuse.inbox.last_observed_used, Some(8));
+    assert_eq!(reuse.inbox.last_observed_limit, Some(11));
+    reuse.record(
+        super::StorageComponent::Selection,
+        super::StorageOutcome::SingleItemLimit,
+        None,
+    );
+    assert_eq!(reuse.selection.single_item_limit, 1);
+    assert_eq!(
+        reuse.selection.last_reason,
+        super::ReuseReason::SingleItemLimit
+    );
+    assert_eq!(reuse.selection.last_observed_used, None);
+    reuse.record(
+        super::StorageComponent::Selection,
+        super::StorageOutcome::Exact,
+        Some((3, 9)),
+    );
+    assert_eq!(
+        reuse.selection.last_reason,
+        super::ReuseReason::SingleItemLimit
+    );
+    assert_eq!(reuse.selection.last_observed_used, Some(3));
+    assert_eq!(reuse.selection.last_observed_limit, Some(9));
+}
+
+#[test]
+fn migration_evidence_replaces_counts_and_budgets_with_the_last_result() {
+    let mut history = History {
+        schema_version: 1,
+        ..History::default()
+    };
+    apply(&mut history, Message::Begin(json!({})));
+    super::apply_migration(
+        &mut history,
+        super::MigrationEvent::Committed(super::CompactionSummary {
+            examined_raw_pages: 10,
+            logical_charge_before: Some(100),
+            logical_charge_after: Some(40),
+            ..Default::default()
+        }),
+    );
+    super::apply_migration(
+        &mut history,
+        super::MigrationEvent::Committed(super::CompactionSummary {
+            examined_raw_pages: 2,
+            logical_charge_before: Some(9),
+            logical_charge_after: Some(4),
+            ..Default::default()
+        }),
+    );
+    let evidence = &history.cycles[0].transport_compaction;
+    assert_eq!(evidence.committed, 2);
+    assert_eq!(evidence.examined_raw_pages, 2);
+    assert_eq!(evidence.logical_charge_before, Some(9));
+    assert_eq!(evidence.logical_charge_after, Some(4));
+    assert_eq!(evidence.committed_reclaim, Some(5));
+    super::apply_migration(
+        &mut history,
+        super::MigrationEvent::Failed(super::MigrationFailure::MigrationFailed),
+    );
+    let evidence = &history.cycles[0].transport_compaction;
+    assert_eq!(evidence.failed, 1);
+    assert_eq!(evidence.reason, super::CompactionReason::MigrationFailed);
+    assert_eq!(evidence.examined_raw_pages, 0);
+    assert_eq!(evidence.logical_charge_before, None);
+    assert_eq!(evidence.logical_charge_after, None);
+    assert_eq!(evidence.committed_reclaim, Some(0));
+    assert_eq!(evidence.committed, 2);
+}
+
+#[test]
+fn older_storage_and_migration_fields_default_without_rejecting_history() {
+    let value = json!({
+        "schema_version": 1,
+        "cycles_evicted": 0,
+        "queue_dropped": 0,
+        "groups_omitted": 0,
+        "previous_history_unavailable": false,
+        "cycles": [{
+            "id": uuid::Uuid::new_v4().to_string(),
+            "started_at": "2026-10-22T00:00:00Z",
+            "completed_at": null,
+            "outcome": "running",
+            "build_version": "0.25.1",
+            "configuration": {},
+            "stats": {},
+            "diagnostics": [],
+            "storage_reuse": {
+                "inbox": {"new":1,"exact":0,"equivalent":0,"capacity_rejected":0},
+                "selection": {"new":0,"exact":0,"equivalent":0,"capacity_rejected":0},
+                "work": {"new":0,"exact":0,"equivalent":0,"capacity_rejected":0}
+            },
+            "transport_compaction": {
+                "committed": 1,
+                "failed": 0,
+                "reason": "committed",
+                "examined_raw_pages": 2
+            }
+        }]
+    });
+    let history: History = serde_json::from_value(value).unwrap();
+    assert_eq!(history.cycles[0].storage_reuse.inbox.new, 1);
+    assert_eq!(history.cycles[0].storage_reuse.catalogue.new, 0);
+    assert_eq!(history.cycles[0].storage_reuse.inbox.single_item_limit, 0);
+    assert_eq!(
+        history.cycles[0].transport_compaction.logical_charge_before,
+        None
+    );
+}
+
+#[test]
+fn unknown_fixed_enum_labels_do_not_escape_from_stored_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("support.json");
+    let cycle = json!({
+        "id": uuid::Uuid::new_v4().to_string(),
+        "started_at": "2026-10-22T00:00:00Z",
+        "completed_at": null,
+        "outcome": "running",
+        "build_version": "0.25.1",
+        "configuration": {},
+        "stats": {},
+        "diagnostics": []
+    });
+    let mut value = json!({
+        "schema_version": 1,
+        "cycles_evicted": 0,
+        "queue_dropped": 0,
+        "groups_omitted": 0,
+        "previous_history_unavailable": false,
+        "cycles": [cycle]
+    });
+    value["cycles"][0]["storage_reuse"] = json!({"inbox":{"last_reason":"PRIVATE_ENUM_CANARY"}});
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let (clean, status) = read(&path);
+    assert_eq!(status, "invalid_or_interrupted");
+    assert!(
+        !serde_json::to_string(&clean)
+            .unwrap()
+            .contains("PRIVATE_ENUM_CANARY")
+    );
+    value["cycles"][0]["storage_reuse"] = json!({});
+    value["cycles"][0]["transport_compaction"] = json!({"reason":"PRIVATE_ENUM_CANARY"});
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let (clean, status) = read(&path);
+    assert_eq!(status, "invalid_or_interrupted");
+    assert!(
+        !serde_json::to_string(&clean)
+            .unwrap()
+            .contains("PRIVATE_ENUM_CANARY")
+    );
+}
