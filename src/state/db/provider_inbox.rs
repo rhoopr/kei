@@ -1850,18 +1850,18 @@ mod tests {
             projection_error.downcast_ref::<crate::state::error::StateError>(),
             Some(crate::state::error::StateError::ProviderCatalogFull)
         ));
-        let conn = db
-            .acquire_lock("verify refused projection retained no catalogue commit")
-            .unwrap();
-        let projections: i64 = conn
-            .query_row(
+        let projections: i64 = {
+            let conn = db
+                .acquire_lock("verify refused projection retained no catalogue commit")
+                .unwrap();
+            conn.query_row(
                 "SELECT count(*) FROM provider_catalog_pages WHERE page_id=?1",
                 [retained.id.0],
                 |row| row.get(0),
             )
-            .unwrap();
+            .unwrap()
+        };
         assert_eq!(projections, 0);
-        drop(conn);
         drop(capture);
         crate::support::begin(serde_json::json!({"scenario": "catalogue"}));
         let fresh_catalog = fixture_observed(70, "https://p01.icloud-content.com/asset-70?token=1");
