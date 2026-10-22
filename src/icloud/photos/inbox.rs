@@ -55,12 +55,7 @@ impl ShadowCapture {
             {
                 Ok(plan) => plan,
                 Err(error) => {
-                    if error.chain().any(|cause| {
-                        matches!(
-                            cause.downcast_ref::<crate::state::error::StateError>(),
-                            Some(crate::state::error::StateError::ProviderCatalogFull)
-                        )
-                    }) {
+                    if super::error::classify_catalog_projection_error(&error) {
                         crate::support::record_storage(
                             crate::support::StorageComponent::Catalogue,
                             crate::support::StorageOutcome::SingleItemLimit,

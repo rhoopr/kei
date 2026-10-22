@@ -1984,6 +1984,7 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_api_error",
         "classify_auth_flow_error",
         "classify_auth_retry_error",
+        "classify_catalog_projection_error",
         "classify_cli_parse_exit",
         "classify_conditional_publish_error",
         "classify_download_task_error",
