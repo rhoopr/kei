@@ -378,8 +378,12 @@ fn dependencies_are_valid(conn: &Connection, page: &StoredPage) -> Result<bool, 
 fn projection_is_valid(conn: &Connection, page: &StoredPage) -> Result<bool, StateError> {
     use std::collections::BTreeSet;
 
-    let plan = crate::icloud::photos::plan_retained(page)
-        .map_err(|_error| StateError::ProviderCatalogInvalid)?;
+    // Projection proof is optional evidence for dropping a duplicate body. A
+    // page whose normalized reference paths exceed the projection budget stays
+    // raw; only SQLite/storage failures while reading retained facts propagate.
+    let Ok(plan) = crate::icloud::photos::plan_retained(page) else {
+        return Ok(false);
+    };
     let receipt: Option<(i64, String, i64, i64, i64, i64)> = conn.query_row(
         "SELECT projector_version,body_hash,record_count,reference_count,debt_count,charged_bytes FROM provider_catalog_pages WHERE page_id=?1",
         [page.id.0],
@@ -1168,6 +1172,149 @@ mod tests {
         conn.execute("UPDATE provider_shadow_pages SET body=X'00' WHERE id=1", [])
             .unwrap();
         assert!(load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024).is_err());
+    }
+
+    fn oversized_unprojected_observed() -> ObservedPage {
+        let targets: Vec<serde_json::Value> = (0..3000)
+            .map(|n| serde_json::json!({"recordName":format!("target-{n}")}))
+            .collect();
+        let body = serde_json::to_vec(&serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"successor-oversized","moreComing":false,
+            "records":[{"recordName":"oversized-master","recordType":"CPLMaster","recordChangeTag":"tag-oversized","fields":{
+                "resOriginalRes":{"type":"ASSETID","value":{"size":1000,"downloadURL":"https://p01.icloud-content.com/oversized?token=1","fileChecksum":"checksum-oversized","referenceChecksum":"reference-oversized","wrappingKey":"wrapping-oversized"}},
+                ("u".repeat(4000)):{"value":targets}}}]}]})).unwrap();
+        assert!(
+            body.len() < 16 * 1024 * 1024,
+            "the captured raw page fits the inbox limit"
+        );
+        ObservedPage {
+            scope: scope(),
+            request_cursor: "cursor-oversized".to_owned(),
+            successor: "successor-oversized".to_owned(),
+            more_coming: false,
+            body,
+            identities: vec![SourceIdentity {
+                name: "oversized-master".to_owned(),
+                record_type: Some("CPLMaster".to_owned()),
+                deleted: false,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_compaction_pins_captured_page_whose_projection_exceeds_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized-projection.db");
+        let (owner, _, _) = legacy_v35(&path);
+        let oversized = oversized_unprojected_observed();
+        let original_hash = format!("{:x}", Sha256::digest(&oversized.body));
+        let id = {
+            let conn = Connection::open(&path).unwrap();
+            // Captured before projection, exactly as the live capture owner
+            // commits the raw page before computing catalogue facts.
+            let id = insert_legacy(&conn, &oversized, 200_000);
+            let (account_key, provider_key): (String, String) = conn
+                .query_row(
+                    "SELECT account_key,provider_key FROM account_owner",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            let stored = StoredPage {
+                id: CapturedPageId(id),
+                account_key,
+                provider_key,
+                observation_hash: original_hash.clone(),
+                provenance: PageProvenance::Raw,
+                page: oversized.clone(),
+            };
+            let error = match crate::icloud::photos::plan_retained(&stored) {
+                Ok(_) => panic!("the fixture's projection must exceed its byte budget"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("projection is full"),
+                "unexpected fixture projection error: {error}"
+            );
+            assert!(
+                !conn
+                    .query_row::<bool, _, _>(
+                        "SELECT EXISTS(SELECT 1 FROM provider_catalog_pages WHERE page_id=?1)",
+                        [id],
+                        |r| r.get(0)
+                    )
+                    .unwrap()
+            );
+            id
+        };
+        let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
+            .await
+            .unwrap();
+        let conn = db.acquire_lock("oversized projection oracle").unwrap();
+        assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM provider_transport_aliases",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            1,
+            "unrelated eligible duplicates still compact"
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM provider_transport_aliases WHERE page_id=?1 OR canonical_page_id=?1",
+                [id],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            0,
+            "an unprovable projection must not gain an alias or index"
+        );
+        let (
+            body,
+            body_hash,
+            stored_scope,
+            cursor,
+            successor,
+            more_coming,
+            charged,
+        ): (Vec<u8>, String, String, String, String, bool, i64) = conn
+            .query_row(
+                "SELECT body,body_hash,scope,request_cursor,successor,more_coming,charged_bytes FROM provider_shadow_pages WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )
+            .unwrap();
+        assert_eq!(body, oversized.body);
+        assert_eq!(body_hash, original_hash);
+        assert_eq!(stored_scope, oversized.scope);
+        assert_eq!(cursor, oversized.request_cursor);
+        assert_eq!(successor, oversized.successor);
+        assert_eq!(more_coming, oversized.more_coming);
+        assert_eq!(charged, 200_000);
+        let stored = load_page(&conn, CapturedPageId(id), 16 * 1024 * 1024).unwrap();
+        assert!(matches!(stored.provenance, PageProvenance::Raw));
+        assert_eq!(stored.page.body, oversized.body);
+        assert_eq!(stored.observation_hash, original_hash);
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            "saved"
+        );
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT value FROM metadata WHERE key='pending_sync_token:old:PrimarySync'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            "debt"
+        );
     }
 
     #[test]

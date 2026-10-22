@@ -253,14 +253,12 @@ pub(super) async fn admit_retained_work(
             .db
             .capture_selection_shadow(capture.owner.clone(), manifest.clone(), MAX_SELECTION_BYTES)
             .await?;
-        anyhow::ensure!(
-            capture
-                .db
-                .replay_selection_shadow(capture.owner.clone(), generation)
-                .await?
-                == manifest,
-            "Selection shadow replay differs from current planning"
-        );
+        // Replay proof accepts only the owner-classified URL-only equivalent of
+        // the retained representative. All other manifest bytes stay exact.
+        capture
+            .db
+            .verify_selection_shadow_equivalent(capture.owner.clone(), generation, manifest)
+            .await?;
         // Shadow parity cannot authorize queue admission or a source cursor.
         let admission = capture
             .db

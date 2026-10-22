@@ -575,6 +575,284 @@ async fn queue_projection_equivalent_confirmation_requires_exact_non_url_bytes()
 }
 
 #[tokio::test]
+async fn queue_projection_selection_equivalent_url_retries_stay_bounded_across_reopen() {
+    let mut f = Fixture::new().await;
+    f.capture(
+        eligible_records(
+            "m",
+            "https://p01.icloud-content.com/selection-source.jpg?token=0",
+        ),
+        "old",
+    )
+    .await;
+    f.db.upsert_asset_master_mapping("PrimarySync", "asset-m", "other-master")
+        .await
+        .unwrap();
+    // Explicit fixture scheduling only: the production retry clock stays
+    // unchanged, and catalogue/selection preparation is never manual.
+    let make_due = |f: &Fixture| {
+        f.db.acquire_lock("fixture retry schedule")
+            .unwrap()
+            .execute(
+                "UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1",
+                [],
+            )
+            .unwrap();
+    };
+    let mut baseline: Option<(Vec<i64>, i64, i64)> = None;
+    let mut first_url = String::new();
+    let mut last_url = String::new();
+    for reopen in 0..2 {
+        if reopen == 1 {
+            let db = Arc::new(
+                SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+                    .await
+                    .unwrap(),
+            );
+            f.db = db;
+            f.capture = ShadowCapture::new(Arc::clone(&f.db), owner(), "com");
+            f.pass
+                .album
+                .set_shadow_capture(f.capture.clone(), Arc::from("private"));
+            f.config.state_db = Some(Arc::clone(&f.db) as Arc<dyn DownloadStore>);
+        }
+        for index in 0..4 {
+            let rotation = reopen * 4 + index;
+            let url = format!(
+                "https://p01.icloud-content.com/selection-fresh-{rotation}.jpg?token={rotation:04}"
+            );
+            if rotation == 0 {
+                first_url = url.clone();
+            }
+            last_url = url.clone();
+            *f.session.records.lock().unwrap() = eligible_records("m", &url);
+            make_due(&f);
+            f.cycle().await.unwrap();
+            let reason: String = f
+                .db
+                .acquire_lock("selection conflict oracle")
+                .unwrap()
+                .query_row(
+                    "SELECT reason FROM provider_work_receipts WHERE state='deferred' ORDER BY confirmation_hash LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(reason, "identity_conflict");
+            let counts = [
+                "provider_selection_generations",
+                "provider_selection_sources",
+                "provider_selection_decisions",
+                "provider_selection_destinations",
+                "provider_work_receipts",
+                "provider_work_obligations",
+                "provider_shadow_pages",
+                "provider_catalog_pages",
+                "provider_catalog_records",
+            ]
+            .map(|table| f.count(table))
+            .to_vec();
+            let selection_charge: i64 =
+                f.db.acquire_lock("selection charge oracle")
+                    .unwrap()
+                    .query_row(
+                        "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_selection_generations",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+            let work_charge: i64 =
+                f.db.acquire_lock("work charge oracle")
+                    .unwrap()
+                    .query_row(
+                        "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_work_receipts",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+            if let Some((expected_counts, expected_selection, expected_work)) = &baseline {
+                assert_eq!(&counts, expected_counts, "count growth at {rotation}");
+                assert_eq!(selection_charge, *expected_selection, "selection charge");
+                assert_eq!(work_charge, *expected_work, "work charge");
+            } else {
+                baseline = Some((counts, selection_charge, work_charge));
+            }
+            f.preserved().await;
+        }
+    }
+    let (_, manifest) = selection_manifest(&f).await;
+    let retained = manifest.decisions[0].confirmation.as_deref().unwrap();
+    assert!(
+        String::from_utf8_lossy(retained).contains(&first_url),
+        "the retained selection representative must keep its original bytes"
+    );
+    assert!(
+        !String::from_utf8_lossy(retained).contains(&last_url),
+        "a fresh URL must not replace retained selection bytes"
+    );
+    // A genuine non-URL confirmation change remains a distinct decision.
+    let mut changed = eligible_records(
+        "m",
+        "https://p01.icloud-content.com/selection-changed.jpg?token=9999",
+    );
+    changed[0]["recordChangeTag"] = json!("ct-selection-changed");
+    *f.session.records.lock().unwrap() = changed;
+    make_due(&f);
+    f.cycle().await.unwrap();
+    assert_eq!(f.count("provider_selection_generations"), 2);
+    assert_eq!(f.count("provider_work_receipts"), 2);
+    f.preserved().await;
+}
+
+#[tokio::test]
+async fn queue_projection_selection_equivalent_url_reuses_class_beyond_lexical_prefix() {
+    let f = Fixture::new().await;
+    f.capture(
+        eligible_records(
+            "m",
+            "https://p01.icloud-content.com/selection-class-source.jpg?token=0",
+        ),
+        "old",
+    )
+    .await;
+    f.db.upsert_asset_master_mapping("PrimarySync", "asset-m", "other-master")
+        .await
+        .unwrap();
+    let make_due = |f: &Fixture| {
+        f.db.acquire_lock("fixture class retry schedule")
+            .unwrap()
+            .execute(
+                "UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1",
+                [],
+            )
+            .unwrap();
+    };
+    // More genuine non-URL confirmation classes than the retired 64-candidate
+    // prefix. Each class keeps one stable record tag, so URL rotation within a
+    // class must reuse that class's already charged representative.
+    let mut classes = Vec::new();
+    let mut previous: Vec<String> = Vec::new();
+    for index in 0..66_u32 {
+        let tag = format!("ct-selection-class-{index:02}");
+        let original_url = format!(
+            "https://p01.icloud-content.com/selection-class-{index:02}.jpg?token={index:04}"
+        );
+        let mut records = eligible_records("m", &original_url);
+        records[0]["recordChangeTag"] = json!(tag);
+        *f.session.records.lock().unwrap() = records;
+        make_due(&f);
+        f.cycle().await.unwrap();
+        let ids: Vec<String> =
+            f.db.acquire_lock("selection class identities")
+                .unwrap()
+                .prepare("SELECT id FROM provider_selection_generations ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+        let inserted: Vec<String> = ids
+            .iter()
+            .filter(|id| !previous.contains(id))
+            .cloned()
+            .collect();
+        assert_eq!(inserted.len(), 1, "class {index} generation growth");
+        previous = ids;
+        assert_eq!(
+            f.count("provider_selection_generations"),
+            i64::from(index) + 1
+        );
+        classes.push((tag, original_url, inserted[0].clone()));
+    }
+    classes.sort_by(|left, right| left.2.cmp(&right.2));
+    const TARGET: usize = 64;
+    assert_eq!(classes.len(), 66);
+    let (target_tag, target_url, target_id) = classes[TARGET].clone();
+    assert_eq!(
+        classes[..TARGET]
+            .iter()
+            .filter(|(_, _, id)| id < &target_id)
+            .count(),
+        TARGET,
+        "target representative must sort beyond the first 64 candidate IDs"
+    );
+    let counts = [
+        "provider_selection_generations",
+        "provider_selection_sources",
+        "provider_selection_decisions",
+        "provider_selection_destinations",
+    ]
+    .map(|table| f.count(table));
+    assert_eq!(counts, [66; 4]);
+    let charge: i64 =
+        f.db.acquire_lock("selection class charge")
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_selection_generations",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+    for rotation in 0..3 {
+        let rotated_url = format!(
+            "https://p01.icloud-content.com/selection-class-{TARGET:02}-rotated-{rotation}.jpg?token={:04}",
+            100 + rotation
+        );
+        let mut records = eligible_records("m", &rotated_url);
+        records[0]["recordChangeTag"] = json!(target_tag);
+        *f.session.records.lock().unwrap() = records;
+        make_due(&f);
+        f.cycle().await.unwrap();
+        assert_eq!(
+            [
+                "provider_selection_generations",
+                "provider_selection_sources",
+                "provider_selection_decisions",
+                "provider_selection_destinations",
+            ]
+            .map(|table| f.count(table)),
+            counts,
+            "selection count growth at rotation {rotation}"
+        );
+        let current_charge: i64 =
+            f.db.acquire_lock("selection class charge after rotation")
+                .unwrap()
+                .query_row(
+                    "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_selection_generations",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(current_charge, charge, "selection charge at {rotation}");
+        assert_eq!(
+            f.db.acquire_lock("target class generation oracle")
+                .unwrap()
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_selection_generations WHERE id=?1",
+                    [&target_id],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+            1
+        );
+        let retained =
+            f.db.replay_selection_shadow(owner(), target_id.clone())
+                .await
+                .unwrap();
+        let body = retained.decisions[0].confirmation.as_deref().unwrap();
+        assert!(
+            String::from_utf8_lossy(body).contains(&target_url),
+            "the beyond-prefix representative must keep its original bytes at {rotation}"
+        );
+        assert!(
+            !String::from_utf8_lossy(body).contains(&rotated_url),
+            "a fresh URL must not replace retained class bytes at {rotation}"
+        );
+    }
+    f.preserved().await;
+}
+
+#[tokio::test]
 async fn queue_projection_incomplete_confirmation_binding_stays_raw() {
     let f = Fixture::new().await;
     f.capture(records("m", OLD, "source"), "old").await;

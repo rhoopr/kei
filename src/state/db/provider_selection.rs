@@ -120,6 +120,143 @@ fn invalid<T>() -> Result<T, StateError> {
     Err(StateError::ProviderSelectionInvalid)
 }
 
+/// Strict provider-owned equivalence between a retained selection manifest and
+/// the current one. Every non-confirmation field stays exact. A paired lookup
+/// confirmation may differ only in validated private `ASSETID` URL tokens
+/// classified by the provider-owned transport evidence rule.
+fn manifest_equivalent(stored: &SelectionManifest, current: &SelectionManifest) -> bool {
+    if stored == current {
+        return true;
+    }
+    if stored.scope != current.scope
+        || stored.zone != current.zone
+        || stored.config_hash != current.config_hash
+        || stored.profile != current.profile
+        || stored.sources != current.sources
+        || stored.decisions.len() != current.decisions.len()
+    {
+        return false;
+    }
+    stored
+        .decisions
+        .iter()
+        .zip(&current.decisions)
+        .all(|(stored, current)| {
+            if stored.pass_key != current.pass_key
+                || stored.child != current.child
+                || stored.master != current.master
+                || stored.outcome != current.outcome
+                || stored.reason != current.reason
+                || stored.destinations != current.destinations
+            {
+                return false;
+            }
+            match (&stored.confirmation, &current.confirmation) {
+                (None, None) => true,
+                (Some(stored_body), Some(current_body)) => {
+                    let Some(master) = current.master.as_deref() else {
+                        return false;
+                    };
+                    let Ok(Some(stored_evidence)) =
+                        crate::icloud::photos::transport_evidence::classify_lookup_confirmation(
+                            stored_body,
+                            &current.child,
+                            master,
+                        )
+                    else {
+                        return false;
+                    };
+                    let Ok(Some(current_evidence)) =
+                        crate::icloud::photos::transport_evidence::classify_lookup_confirmation(
+                            current_body,
+                            &current.child,
+                            master,
+                        )
+                    else {
+                        return false;
+                    };
+                    stored_evidence.version == current_evidence.version
+                        && stored_evidence.masked == current_evidence.masked
+                }
+                _ => false,
+            }
+        })
+}
+
+/// One bounded manifest body at a time. Candidates are narrowed by exact
+/// account/provider/config/scope/source/decision metadata, then compared
+/// through the strict provider-owned equivalence rule before any new charge.
+/// The full matching set is scanned so a legitimate class is never treated as
+/// absent merely because it sorts after an arbitrary prefix.
+fn equivalent_generation(
+    tx: &rusqlite::Transaction<'_>,
+    manifest: &SelectionManifest,
+    account_key: &str,
+    provider_key: &str,
+) -> Result<Option<String>, StateError> {
+    if manifest.sources.len() != 1 || manifest.decisions.len() != 1 {
+        return Ok(None);
+    }
+    let source = manifest
+        .sources
+        .first()
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    let decision = manifest
+        .decisions
+        .first()
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    if decision.confirmation.is_none() {
+        return Ok(None);
+    }
+    let mut statement = tx.prepare(
+        "SELECT g.id,g.manifest FROM provider_selection_generations g
+         WHERE g.account_key=?1 AND g.provider_key=?2 AND g.format=?3 AND g.scope=?4 AND g.config_hash=?5
+           AND (SELECT count(*) FROM provider_selection_sources s WHERE s.generation=g.id)=1
+           AND (SELECT count(*) FROM provider_selection_decisions d WHERE d.generation=g.id)=1
+           AND EXISTS(SELECT 1 FROM provider_selection_sources s WHERE s.generation=g.id AND s.page_id=?6 AND s.ordinal=?7 AND s.body_hash=?8)
+           AND EXISTS(SELECT 1 FROM provider_selection_decisions d WHERE d.generation=g.id AND d.pass_key=?9 AND d.child=?10 AND d.outcome=?11 AND d.reason=?12)
+         ORDER BY g.id",
+    )?;
+    let mut rows = statement.query(params![
+        account_key,
+        provider_key,
+        MANIFEST_VERSION,
+        manifest.scope,
+        manifest.config_hash,
+        source.page_id,
+        source.ordinal,
+        source.body_hash,
+        decision.pass_key,
+        decision.child,
+        outcome_name(decision.outcome),
+        decision.reason
+    ])?;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let bytes: Vec<u8> = row.get(1)?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            continue;
+        }
+        let Ok(stored) = serde_json::from_slice::<SelectionManifest>(&bytes) else {
+            continue;
+        };
+        if !manifest_equivalent(&stored, manifest) {
+            continue;
+        }
+        validate(tx, &stored)?;
+        validate_rows(tx, &id, &stored)?;
+        let expected = digest(
+            &serde_json::to_vec(&(account_key, provider_key, MANIFEST_VERSION, &bytes))
+                .map_err(|_invalid| StateError::ProviderSelectionInvalid)?,
+        );
+        if expected != id {
+            continue;
+        }
+        return Ok(Some(id));
+    }
+    Ok(None)
+}
+
 fn validate(conn: &Connection, manifest: &SelectionManifest) -> Result<(), StateError> {
     if manifest.config_hash.len() != 64
         || !manifest.config_hash.bytes().all(|b| b.is_ascii_hexdigit())
@@ -276,6 +413,12 @@ impl SqliteStateDb {
                 tx.commit()?;
                 return Ok(id);
             }
+            if let Some(equivalent) =
+                equivalent_generation(&tx, &manifest, &account_key, &provider_key)?
+            {
+                tx.commit()?;
+                return Ok(equivalent);
+            }
             let mut charge = bytes.len() + id.len() + account_key.len() + provider_key.len()
                 + manifest.scope.len() + manifest.config_hash.len();
             for source in &manifest.sources { charge += id.len() + source.body_hash.len() + 16; }
@@ -311,6 +454,7 @@ impl SqliteStateDb {
     }
 
     /// Recheck owner, original sources, confirmations and normalized rows.
+    #[cfg(test)]
     pub(crate) async fn replay_selection_shadow(
         &self,
         owner: account::AccountOwner,
@@ -318,22 +462,75 @@ impl SqliteStateDb {
     ) -> Result<SelectionManifest, StateError> {
         self.with_conn("replaying selection shadow", move |conn| {
             let tx = conn.unchecked_transaction()?;
-            account::validate_authenticated(&tx, &owner)?;
-            let length: i64 = tx.query_row("SELECT length(manifest) FROM provider_selection_generations WHERE id=?1", [&id], |r| r.get(0))?;
-            if usize::try_from(length).map_or(true, |n| n > MAX_MANIFEST_BYTES) { return invalid() }
-            let (account_key, provider_key, format, scope, config_hash, bytes): (String,String,i64,String,String,Vec<u8>) = tx.query_row("SELECT account_key,provider_key,format,scope,config_hash,manifest FROM provider_selection_generations WHERE id=?1", [&id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
-            let actual: (String,String) = tx.query_row("SELECT account_key,provider_key FROM account_owner WHERE singleton=1", [], |r| Ok((r.get(0)?,r.get(1)?)))?;
-            if actual != (account_key.clone(),provider_key.clone()) || format != MANIFEST_VERSION
-                || id != digest(&serde_json::to_vec(&(&account_key,&provider_key,format,&bytes)).map_err(|_invalid| StateError::ProviderSelectionInvalid)?)
-            { return invalid() }
-            let manifest: SelectionManifest = serde_json::from_slice(&bytes).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
-            if scope != manifest.scope || config_hash != manifest.config_hash { return invalid() }
-            validate(&tx, &manifest)?;
-            validate_rows(&tx, &id, &manifest)?;
+            let manifest = load_shadow(&tx, &owner, &id)?;
             tx.commit()?;
             Ok(manifest)
-        }).await
+        })
+        .await
     }
+
+    /// Prove that a retained shadow is strictly provider-equivalent to the
+    /// current planning manifest before its generation may be reused. The
+    /// current manifest was already validated by capture; this second owner
+    /// check revalidates the retained representative and every non-confirmation
+    /// field without replacing its original bytes.
+    pub(crate) async fn verify_selection_shadow_equivalent(
+        &self,
+        owner: account::AccountOwner,
+        id: String,
+        current: SelectionManifest,
+    ) -> Result<(), StateError> {
+        self.with_conn("verifying equivalent selection shadow", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let stored = load_shadow(&tx, &owner, &id)?;
+            if !manifest_equivalent(&stored, &current) {
+                return invalid();
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+fn load_shadow(
+    conn: &Connection,
+    owner: &account::AccountOwner,
+    id: &str,
+) -> Result<SelectionManifest, StateError> {
+    account::validate_authenticated(conn, owner)?;
+    let length: i64 = conn.query_row(
+        "SELECT length(manifest) FROM provider_selection_generations WHERE id=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    if usize::try_from(length).map_or(true, |n| n > MAX_MANIFEST_BYTES) {
+        return invalid();
+    }
+    let (account_key, provider_key, format, scope, config_hash, bytes): (String,String,i64,String,String,Vec<u8>) = conn.query_row("SELECT account_key,provider_key,format,scope,config_hash,manifest FROM provider_selection_generations WHERE id=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+    let actual: (String, String) = conn.query_row(
+        "SELECT account_key,provider_key FROM account_owner WHERE singleton=1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if actual != (account_key.clone(), provider_key.clone())
+        || format != MANIFEST_VERSION
+        || id
+            != digest(
+                &serde_json::to_vec(&(&account_key, &provider_key, format, &bytes))
+                    .map_err(|_invalid| StateError::ProviderSelectionInvalid)?,
+            )
+    {
+        return invalid();
+    }
+    let manifest: SelectionManifest =
+        serde_json::from_slice(&bytes).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+    if scope != manifest.scope || config_hash != manifest.config_hash {
+        return invalid();
+    }
+    validate(conn, &manifest)?;
+    validate_rows(conn, id, &manifest)?;
+    Ok(manifest)
 }
 
 fn outcome_name(outcome: SelectionOutcome) -> &'static str {

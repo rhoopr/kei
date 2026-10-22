@@ -419,7 +419,10 @@ raw. Loads expose `Raw` versus `LegacyAlias` provenance and verify the
 representative hash, certificate, provenance binding and index on every access.
 Alias chains and cycles are refused. The historical hash is never presented as a hash
 of representative bytes, and no original hash is fabricated. Unknown formats,
-unsupported projector versions or failed projection proof stay raw. Migration
+unsupported projector versions or failed projection proof stay raw; inability to
+prove the optional projection (including its byte budget) makes a page
+ineligible for compaction rather than failing migration, while SQLite and
+storage errors still abort. Migration
 charges retained provenance plus alias and index overhead, does not raise budgets
 or prune catalogue rows, and rolls every alias and body drop back with the schema
 version on any failure. Replaying a discarded URL variant validates the alias and
@@ -613,8 +616,14 @@ Schema 33 adds account-bound `provider_selection_generations`, source links in
 `provider_selection_sources`, per-pass `provider_selection_decisions`, and
 rendition/path obligations in `provider_selection_destinations`. The existing
 private library-wide retained-work path captures its planning result before
-queue admission and compares exact replay with that result. Original current
-child/master confirmation bytes retain unknown fields and numeric lexemes.
+queue admission and verifies strict provider-owned equivalence on replay.
+Every non-confirmation manifest field stays exact; an eligible paired current
+confirmation may differ only in validated private `ASSETID` URL tokens. The
+retained representative keeps its original bytes and hash, while the current
+response and URLs remain the downstream planning input. A changed decision,
+identity, version, metadata or resource fact stays a distinct generation.
+Original current child/master confirmation bytes retain unknown fields and
+numeric lexemes.
 Current confirmation is separate from the historical trigger observation;
 source order, page IDs and opaque cursors cannot establish a current version.
 
