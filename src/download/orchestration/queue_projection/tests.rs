@@ -162,6 +162,15 @@ fn records(name: &str, checksum: &str, title: &str) -> Vec<Value> {
     records[1]["fields"]["captionEnc"] = json!({"value":title,"type":"STRING"});
     records
 }
+fn eligible_records(name: &str, url: &str) -> Vec<Value> {
+    let mut records = records(name, CURRENT, "current");
+    records[0]["fields"]["resOriginalRes"]["type"] = json!("ASSETID");
+    records[0]["fields"]["resOriginalRes"]["value"]["referenceChecksum"] =
+        json!("reference-current");
+    records[0]["fields"]["resOriginalRes"]["value"]["wrappingKey"] = json!("wrapping-current");
+    records[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] = json!(url);
+    records
+}
 const OLD: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 const CURRENT: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
 
@@ -387,6 +396,345 @@ async fn queue_projection_current_confirmation_then_two_reopens_have_no_repeat_a
         assert_eq!(f.session.calls.load(Ordering::SeqCst), calls);
         f.preserved().await;
     }
+}
+
+async fn project_eligible_url(f: &Fixture, url: &str) -> WorkAdmission {
+    *f.session.records.lock().unwrap() = eligible_records("m", url);
+    let plan = f.plan().await;
+    f.db.project_provider_work(owner(), plan, 512 * 1024 * 1024)
+        .await
+        .unwrap()
+}
+
+async fn deferred_receipt_count(f: &Fixture, url: &str) -> i64 {
+    assert_eq!(project_eligible_url(f, url).await, WorkAdmission::Deferred);
+    f.count("provider_work_receipts")
+}
+
+async fn deferred_receipt_count_with_config(f: &Fixture, url: &str, config_hash: String) -> i64 {
+    *f.session.records.lock().unwrap() = eligible_records("m", url);
+    let mut plan = f.plan().await;
+    plan.config_hash = config_hash;
+    assert_eq!(
+        f.db.project_provider_work(owner(), plan, 512 * 1024 * 1024)
+            .await
+            .unwrap(),
+        WorkAdmission::Deferred
+    );
+    f.count("provider_work_receipts")
+}
+
+async fn deferred_receipt_count_with_records(f: &Fixture, records: Vec<Value>) -> i64 {
+    *f.session.records.lock().unwrap() = records;
+    let plan = f.plan().await;
+    assert_eq!(
+        f.db.project_provider_work(owner(), plan, 512 * 1024 * 1024)
+            .await
+            .unwrap(),
+        WorkAdmission::Deferred
+    );
+    f.count("provider_work_receipts")
+}
+
+#[tokio::test]
+async fn queue_projection_equivalent_url_confirmations_do_not_grow_deferred_history() {
+    let f = Fixture::new().await;
+    f.capture(records("m", OLD, "source"), "old").await;
+    f.db.upsert_asset_master_mapping("PrimarySync", "asset-m", "other-master")
+        .await
+        .unwrap();
+    let mut receipt_counts = Vec::new();
+    let mut obligation_counts = Vec::new();
+    let mut charges = Vec::new();
+    let mut first_url = String::new();
+    for index in 0..8 {
+        let url = format!("https://p01.icloud-content.com/fresh-{index}.jpg?token={index:04}");
+        if index == 0 {
+            first_url = url.clone();
+        }
+        *f.session.records.lock().unwrap() = eligible_records("m", &url);
+        let plan = f.plan().await;
+        assert!(
+            String::from_utf8_lossy(plan.confirmation.as_deref().unwrap()).contains(&url),
+            "current confirmation must carry the fresh URL"
+        );
+        assert_eq!(
+            f.db.project_provider_work(owner(), plan, 512 * 1024 * 1024)
+                .await
+                .unwrap(),
+            WorkAdmission::Deferred
+        );
+        let reason: String =
+            f.db.acquire_lock("retained conflict oracle")
+                .unwrap()
+                .query_row(
+                    "SELECT reason FROM provider_work_receipts ORDER BY confirmation_hash LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(reason, "identity_conflict");
+        receipt_counts.push(f.count("provider_work_receipts"));
+        obligation_counts.push(f.count("provider_work_obligations"));
+        charges.push(
+            f.db.acquire_lock("retained charge oracle")
+                .unwrap()
+                .query_row::<i64, _, _>(
+                    "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_work_receipts",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+        );
+    }
+    assert!(
+        receipt_counts.iter().all(|count| *count == 1),
+        "receipt growth: {receipt_counts:?}"
+    );
+    assert!(
+        obligation_counts.iter().all(|count| *count == 0),
+        "obligation growth: {obligation_counts:?}"
+    );
+    assert!(
+        charges.windows(2).all(|pair| pair[0] == pair[1]),
+        "charge growth: {charges:?}"
+    );
+    let stored: Vec<Vec<u8>> =
+        f.db.acquire_lock("retained confirmation oracle")
+            .unwrap()
+            .prepare("SELECT confirmation FROM provider_work_receipts ORDER BY confirmation_hash")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+    assert_eq!(stored.len(), 1, "retained representative count");
+    assert!(
+        String::from_utf8_lossy(&stored[0]).contains(&first_url),
+        "the first retained representative must keep its original bytes"
+    );
+    assert!(
+        stored
+            .iter()
+            .all(|body| !String::from_utf8_lossy(body).contains("fresh-7.jpg")),
+        "the newest URL must not replace or grow retained representative bytes"
+    );
+    assert_eq!(f.count("provider_work_retries"), 1);
+    f.preserved().await;
+}
+
+#[tokio::test]
+async fn queue_projection_equivalent_confirmation_requires_exact_non_url_bytes() {
+    let f = Fixture::new().await;
+    f.capture(records("m", OLD, "source"), "old").await;
+    f.db.upsert_asset_master_mapping("PrimarySync", "asset-m", "other-master")
+        .await
+        .unwrap();
+    assert_eq!(
+        deferred_receipt_count(&f, "https://p01.icloud-content.com/one.jpg?token=0000").await,
+        1
+    );
+    // URL-only rotation reuses the first receipt.
+    assert_eq!(
+        deferred_receipt_count(&f, "https://p01.icloud-content.com/two.jpg?token=0001").await,
+        1
+    );
+    // Genuine checksum, tag, unknown-field, size and metadata changes remain
+    // distinct even when the URL is otherwise eligible.
+    let mut changed = eligible_records(
+        "m",
+        "https://p01.icloud-content.com/checksum.jpg?token=0002",
+    );
+    changed[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(OLD);
+    assert_eq!(deferred_receipt_count_with_records(&f, changed).await, 2);
+    // A fresh URL with that same changed checksum still reuses its receipt.
+    let mut changed = eligible_records(
+        "m",
+        "https://p01.icloud-content.com/checksum-rotated.jpg?token=0003",
+    );
+    changed[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(OLD);
+    assert_eq!(deferred_receipt_count_with_records(&f, changed).await, 2);
+    let mut changed = eligible_records("m", "https://p01.icloud-content.com/tag.jpg?token=0004");
+    changed[0]["recordChangeTag"] = json!("ct-changed");
+    assert_eq!(deferred_receipt_count_with_records(&f, changed).await, 3);
+    let mut changed =
+        eligible_records("m", "https://p01.icloud-content.com/unknown.jpg?token=0005");
+    changed[0]["unknownRecordField"] = json!({"value": "changed"});
+    assert_eq!(deferred_receipt_count_with_records(&f, changed).await, 4);
+    let mut changed = eligible_records("m", "https://p01.icloud-content.com/size.jpg?token=0006");
+    changed[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(2048);
+    assert_eq!(deferred_receipt_count_with_records(&f, changed).await, 5);
+    let mut changed = eligible_records(
+        "m",
+        "https://p01.icloud-content.com/metadata.jpg?token=0007",
+    );
+    changed[1]["fields"]["captionEnc"] = json!({"value":"changed-metadata","type":"STRING"});
+    assert_eq!(deferred_receipt_count_with_records(&f, changed).await, 6);
+    assert_eq!(f.count("provider_work_obligations"), 0);
+    f.preserved().await;
+}
+
+#[tokio::test]
+async fn queue_projection_incomplete_confirmation_binding_stays_raw() {
+    let f = Fixture::new().await;
+    f.capture(records("m", OLD, "source"), "old").await;
+    f.db.upsert_asset_master_mapping("PrimarySync", "asset-m", "other-master")
+        .await
+        .unwrap();
+    for (url, expected) in [
+        ("https://p01.icloud-content.com/raw-one.jpg?token=1", 1),
+        ("https://p01.icloud-content.com/raw-two.jpg?token=2", 2),
+    ] {
+        let mut records = eligible_records("m", url);
+        records[0]["fields"]["resOriginalRes"]["value"]
+            .as_object_mut()
+            .unwrap()
+            .remove("referenceChecksum");
+        assert_eq!(
+            deferred_receipt_count_with_records(&f, records).await,
+            expected,
+            "{url}"
+        );
+    }
+    assert_eq!(f.count("provider_work_obligations"), 0);
+    f.preserved().await;
+}
+
+#[tokio::test]
+async fn queue_projection_equivalent_confirmation_never_crosses_scope_config_or_source() {
+    let f = Fixture::new().await;
+    f.capture(records("m", OLD, "source"), "old").await;
+    f.db.upsert_asset_master_mapping("PrimarySync", "asset-m", "other-master")
+        .await
+        .unwrap();
+    assert_eq!(
+        deferred_receipt_count(&f, "https://p01.icloud-content.com/scope-one.jpg?token=1").await,
+        1
+    );
+    assert_eq!(
+        deferred_receipt_count(&f, "https://p01.icloud-content.com/scope-two.jpg?token=2").await,
+        1
+    );
+    assert_eq!(
+        deferred_receipt_count_with_config(
+            &f,
+            "https://p01.icloud-content.com/config-other.jpg?token=3",
+            "b".repeat(64),
+        )
+        .await,
+        2
+    );
+    // A candidate with a different historical source or scope is not a
+    // representative even when its masked confirmation matches.
+    f.db.acquire_lock("alter retained source binding")
+        .unwrap()
+        .execute(
+            "UPDATE provider_work_receipts SET source_hash='other-source'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        deferred_receipt_count(
+            &f,
+            "https://p01.icloud-content.com/source-other.jpg?token=4"
+        )
+        .await,
+        3
+    );
+    f.db.acquire_lock("alter retained scope binding")
+        .unwrap()
+        .execute("UPDATE provider_work_receipts SET scope='other-scope'", [])
+        .unwrap();
+    assert_eq!(
+        deferred_receipt_count(&f, "https://p01.icloud-content.com/scope-three.jpg?token=5").await,
+        4
+    );
+    assert_eq!(f.count("provider_work_obligations"), 0);
+    f.preserved().await;
+}
+
+#[tokio::test]
+async fn queue_projection_admitted_equivalent_confirmation_never_resurrects_work() {
+    let f = Fixture::new().await;
+    f.capture(records("m", OLD, "source"), "old").await;
+    *f.session.records.lock().unwrap() =
+        eligible_records("m", "https://p01.icloud-content.com/admitted.jpg?token=1");
+    let plan = f.plan().await;
+    let record = plan.records[0].clone();
+    assert_eq!(
+        f.db.project_provider_work(owner(), plan, 512 * 1024 * 1024)
+            .await
+            .unwrap(),
+        WorkAdmission::Admitted
+    );
+    let media = f.config.directory.join("completed.jpg");
+    std::fs::write(&media, b"completed-generation").unwrap();
+    f.db.mark_downloaded(
+        "PrimarySync",
+        "asset-m",
+        record.version_size.as_str(),
+        &media,
+        "local",
+        None,
+    )
+    .await
+    .unwrap();
+    let baseline = f.queue();
+    *f.session.records.lock().unwrap() = eligible_records(
+        "m",
+        "https://p01.icloud-content.com/rotated-after-admission.jpg?token=2",
+    );
+    let plan = f.plan().await;
+    assert_eq!(
+        f.db.project_provider_work(owner(), plan, 512 * 1024 * 1024)
+            .await
+            .unwrap(),
+        WorkAdmission::Admitted
+    );
+    assert_eq!(f.count("provider_work_receipts"), 1);
+    assert_eq!(f.count("provider_work_obligations"), 1);
+    assert_eq!(f.queue(), baseline);
+    assert_eq!(std::fs::read(media).unwrap(), b"completed-generation");
+    let retained: Vec<u8> =
+        f.db.acquire_lock("admitted representative oracle")
+            .unwrap()
+            .query_row("SELECT confirmation FROM provider_work_receipts", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+    assert!(String::from_utf8_lossy(&retained).contains("admitted.jpg?token=1"));
+    assert!(!String::from_utf8_lossy(&retained).contains("rotated-after-admission"));
+    f.preserved().await;
+}
+
+#[tokio::test]
+async fn queue_projection_invalid_current_confirmation_cannot_reuse_prior_proof() {
+    let f = Fixture::new().await;
+    f.capture(records("m", OLD, "source"), "old").await;
+    f.db.upsert_asset_master_mapping("PrimarySync", "asset-m", "other-master")
+        .await
+        .unwrap();
+    *f.session.records.lock().unwrap() =
+        eligible_records("m", "https://p01.icloud-content.com/proof.jpg?token=1");
+    let plan = f.plan().await;
+    assert_eq!(
+        f.db.project_provider_work(owner(), plan, 512 * 1024 * 1024)
+            .await
+            .unwrap(),
+        WorkAdmission::Deferred
+    );
+    let baseline = f.queue();
+    let mut plan = f.plan().await;
+    plan.confirmation = Some(br#"{"records":[]}"#.to_vec());
+    assert!(matches!(
+        f.db.project_provider_work(owner(), plan, 512 * 1024 * 1024)
+            .await,
+        Err(crate::state::error::StateError::ProviderWorkInvalid)
+    ));
+    assert_eq!(f.count("provider_work_receipts"), 1);
+    assert_eq!(f.count("provider_work_obligations"), 0);
+    assert_eq!(f.queue(), baseline);
+    f.preserved().await;
 }
 
 #[tokio::test]

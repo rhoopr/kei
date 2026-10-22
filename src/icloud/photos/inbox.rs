@@ -83,6 +83,8 @@ impl ShadowCapture {
             .capture_shadow_page(self.owner.clone(), page, self.capacity)
             .await
             .map_err(|error| super::error::ShadowPageError::from(anyhow::Error::new(error)))?;
+        // Projection is always replayed from durable state. An interruption
+        // after capture but before projection recovers on the next observation.
         let source = self
             .db
             .catalog_source(self.owner.clone(), id, MAX_CHANGES_PAGE_BYTES)

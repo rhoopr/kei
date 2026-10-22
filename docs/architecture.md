@@ -373,6 +373,58 @@ Exact already-captured replay remains possible at capacity. No observations are 
 remains unchanged; a successful commit does not promise that every acknowledged
 observation survives power loss. Network filesystems are not newly qualified.
 
+Schema 36 adds a private-only canonical transport index. The provider adapter
+recomputes evidence from the retained page after account validation. It
+recognizes exactly two direct descriptor paths: a complete `CPLMaster`
+`fields.resOriginalRes` `ASSETID`, and a complete `CPLAsset` or `CPLMaster`
+`fields.resComputeStateData` `ASSETID`. Each must have a nonblank `recordName`
+and `recordChangeTag`, a numeric `size`, nonblank `fileChecksum`,
+`referenceChecksum` and `wrappingKey`, and a validated download URL. Only the
+whole validated `downloadURL` token is masked. Record type, tag, descriptor
+bytes and unknown bytes stay exact, and nested or arbitrary `downloadURL`
+fields are not eligible. Each candidate is bound to the envelope that produced
+its byte path: a changes candidate is resolved only against `zones[0].records`
+and a lookup candidate only against the paired root `records`, so a lookalike
+record at the same ordinal in another envelope can never lend eligibility or
+mask an unknown-envelope URL. This is a provider-versioned asset identity, not a
+verified content hash. The private compute path is conditional coverage: it
+does not claim that observed reporter records satisfy this descriptor shape.
+A scope that lacks the realm, database, zone name, or exact nonblank owner is a
+raw observation with no coalescing proof, not a rejected capture. An invalid
+private page, malformed scope, or mismatched index entry still fails validation.
+The canonical key is an unambiguous hash of account namespace,
+provider fingerprint, exact scope, request cursor, successor, `moreComing`,
+classifier version and masked body digest, so different cursors or scopes remain
+independent classes. A hit reloads the representative through the checked page
+loader, recomputes its key and masked bytes, and requires exact metadata and
+source-identity equality. Unsupported scopes stay ordinary raw observations;
+an invalid private page or a mismatched index entry fails validation. A replay
+always reprojects the durable source, so an interruption after capture but before
+projection recovers on the next equivalent observation.
+
+The same schema step compacts finite legacy duplicates before ordinary admission.
+It streams one body at a time inside the migration savepoint and requires a
+validated raw hash, provider-owned evidence, exact account/provider/scope/cursor/
+successor/`moreComing` binding, complete masked-byte equality, and a fresh pure
+projection that equals every stored record, reference, debt and charge. Only then
+may an old body become empty. The old row keeps its original ID, ordinal source
+identities, historical observation hash and catalogue/work/selection references;
+a typed alias stores the canonical page, classifier version, masked digest,
+canonical certificate and an immutable provenance binding over the original ID
+and hash, canonical ID and hash, class key, version and ordinal identities.
+Known work receipts, work retries/scans and selection sources must still match
+that old identity, source hash and independent confirmation bytes before the
+body may be dropped; an unsupported or mismatched dependency pins the page as
+raw. Loads expose `Raw` versus `LegacyAlias` provenance and verify the
+representative hash, certificate, provenance binding and index on every access.
+Alias chains and cycles are refused. The historical hash is never presented as a hash
+of representative bytes, and no original hash is fabricated. Unknown formats,
+unsupported projector versions or failed projection proof stay raw. Migration
+charges retained provenance plus alias and index overhead, does not raise budgets
+or prune catalogue rows, and rolls every alias and body drop back with the schema
+version on any failure. Replaying a discarded URL variant validates the alias and
+returns the canonical ID; it creates no new alias.
+
 A shadow receipt is only the last observed page, and replay can move it back. It
 is not a coverage frontier, materialization receipt or verified filesystem
 progress. Existing `CheckpointEvidence`, sparse and legacy generation proofs,
@@ -500,6 +552,21 @@ Identical existing queue rows retain their retry and publication metadata.
 Admitted-receipt replay verifies frozen obligations and never reconstructs an old
 generation over a queue that has since advanced. Receipt state describes work
 admission, not download completion, metadata publication or verified media.
+Future confirmations that differ from a retained receipt only in complete
+eligible Asset `downloadURL` tokens reuse that receipt's original raw bytes,
+hash, scope, source and master as the charged representative. The current
+authenticated confirmation and planned records are still validated first, and
+the retained URL is never used for current download work. This requires exact
+masked-byte equality, the same work source/config/scope/master and historical
+source hash, and an existing receipt whose own hash still matches its bytes.
+Non-URL bytes, unknown or incomplete descriptor shapes, and genuine checksum,
+tag, metadata or size changes remain distinct raw confirmations. Reuse adds no
+receipt row and does not clear conflict/debt, resurrect admitted work or merge
+sources or configurations. Retained receipt confirmations stay historical,
+finite evidence tied to their admitted obligation; reuse reads the existing
+bytes and never rewrites or duplicates that stored confirmation set. Equivalent
+replay therefore grows no further, while genuinely novel confirmations are
+still admitted subject to the existing budget.
 
 Matching unfinished projected generations fence shared asset admission, identity
 mapping and metadata refresh, including independent path publication receipts.

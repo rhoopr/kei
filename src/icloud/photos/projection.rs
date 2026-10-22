@@ -157,6 +157,51 @@ pub(super) fn plan(capture: &ShadowCapture, source: StoredPage) -> anyhow::Resul
         capture.scope(database, zone)? == source.page.scope,
         StateError::ProviderCatalogInvalid
     );
+    plan_retained(&source)
+}
+
+/// Recompute source facts for a retained page without capture authority.
+///
+/// Migration uses this to prove that every stored catalogue row still follows
+/// from retained semantic bytes before a transport-only duplicate body is
+/// dropped. The caller must already have validated the provider scope and the
+/// complete masked equivalence of the discarded bytes.
+pub(crate) fn plan_retained(source: &StoredPage) -> anyhow::Result<CatalogPlan> {
+    let scope: Value = serde_json::from_str(&source.page.scope)
+        .map_err(|_invalid_scope| StateError::ProviderCatalogInvalid)?;
+    anyhow::ensure!(
+        scope.get("format") == Some(&Value::from(1))
+            && scope.get("container").and_then(Value::as_str) == Some("com.apple.photos.cloud")
+            && scope.get("environment").and_then(Value::as_str) == Some("production")
+            && matches!(
+                scope.get("database").and_then(Value::as_str),
+                Some("private" | "shared")
+            )
+            && scope
+                .get("realm")
+                .and_then(Value::as_str)
+                .is_some_and(|realm| !realm.trim().is_empty()),
+        StateError::ProviderCatalogInvalid
+    );
+    let body = super::changes_json::parse(&source.page.body)?;
+    let zone = body
+        .get("zones")
+        .and_then(Value::as_array)
+        .and_then(|zones| zones.first())
+        .and_then(|zone| zone.get("zoneID"))
+        .context("Missing catalog returned scope")?;
+    // An absent owner and a JSON null owner are the same raw scope. The live
+    // capture contract serializes an unavailable owner as null, while the
+    // returned zone omits it. A present owner must still match exactly.
+    fn present(value: Option<&Value>) -> Option<&Value> {
+        value.filter(|value| !value.is_null())
+    }
+    anyhow::ensure!(
+        scope.pointer("/zone/zoneName") == zone.get("zoneName")
+            && present(scope.pointer("/zone/ownerRecordName"))
+                == present(zone.get("ownerRecordName")),
+        StateError::ProviderCatalogInvalid
+    );
     let validated = super::album::catalog_observed_page(
         source.page.body.clone(),
         &source.page.scope,
@@ -262,7 +307,7 @@ pub(super) fn plan(capture: &ShadowCapture, source: StoredPage) -> anyhow::Resul
         projected.push(record);
     }
     Ok(CatalogPlan {
-        source,
+        source: source.clone(),
         records: projected,
         charged_bytes,
     })

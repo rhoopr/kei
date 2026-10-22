@@ -601,3 +601,581 @@ async fn catalog_projection_completed_replay_refuses_inconsistent_receipt_or_fac
         );
     }
 }
+
+fn transport_page(url: &str, size: u64) -> Vec<u8> {
+    format!(
+        r#"{{"zones":[{{"zoneID":{{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}},"syncToken":"successor","moreComing":false,"records":[{{"recordName":"master-1","recordType":"CPLMaster","recordChangeTag":"ct1","fields":{{"resOriginalRes":{{"type":"ASSETID","value":{{"size":{size},"downloadURL":"{url}","fileChecksum":"f","referenceChecksum":"r","wrappingKey":"w"}}}}}}}}]}}]}}"#
+    )
+    .into_bytes()
+}
+
+fn transport_compute_page(url: &str, wrapping_key: &str) -> Vec<u8> {
+    format!(
+        r#"{{"zones":[{{"zoneID":{{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}},"syncToken":"successor","moreComing":false,"records":[{{"recordName":"asset-1","recordType":"CPLAsset","recordChangeTag":"ct1","fields":{{"resComputeStateData":{{"type":"ASSETID","value":{{"size":2048,"downloadURL":"{url}","fileChecksum":"f","referenceChecksum":"r","wrappingKey":"{wrapping_key}"}}}}}}}}]}}]}}"#
+    )
+    .into_bytes()
+}
+
+fn transport_scope(db: &Arc<SqliteStateDb>, database: &str) -> String {
+    capture(db)
+        .scope(
+            database,
+            &json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+        )
+        .unwrap()
+}
+
+fn transport_stream_page(
+    master_url: &str,
+    compute_url: &str,
+    size: u64,
+    master_tag: &str,
+    successor: &str,
+    more_coming: bool,
+) -> Vec<u8> {
+    serde_json::to_vec(&json!({"zones":[{
+        "zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+        "syncToken":successor,"moreComing":more_coming,
+        "records":[
+            {"recordName":"master-1","recordType":"CPLMaster","recordChangeTag":master_tag,
+             "fields":{
+                "resOriginalRes":{"type":"ASSETID","value":{"size":size,"downloadURL":master_url,
+                    "fileChecksum":"f","referenceChecksum":"r","wrappingKey":"w"}},
+                "filenameEnc":{"value":"photo.jpg","type":"STRING"},
+                "itemType":{"value":"public.jpeg"},
+                "resOriginalFileType":{"value":"public.jpeg"}
+             }},
+            {"recordName":"asset-1","recordType":"CPLAsset","recordChangeTag":"ct2",
+             "fields":{
+                "masterRef":{"value":{"recordName":"master-1","zoneID":{"zoneName":"PrimarySync"}},"type":"REFERENCE"},
+                "assetDate":{"value":1700000000000i64,"type":"TIMESTAMP"},
+                "resComputeStateData":{"type":"ASSETID","value":{"size":2048,"downloadURL":compute_url,
+                    "fileChecksum":"cf","referenceChecksum":"cr","wrappingKey":"cw"}}
+             }}
+        ]
+    }]})).unwrap()
+}
+
+async fn stream_urls(
+    album: &crate::icloud::photos::PhotoAlbum,
+    request_cursor: &str,
+) -> (Vec<String>, Vec<String>, String) {
+    use tokio_stream::StreamExt;
+
+    let (stream, token) = album.changes_stream(request_cursor);
+    let mut urls = Vec::new();
+    let mut errors = Vec::new();
+    for item in stream.collect::<Vec<_>>().await {
+        match item {
+            Ok(event) => {
+                if let Some(asset) = event.asset {
+                    for (_, version) in asset.versions() {
+                        urls.push(version.url.to_string());
+                    }
+                }
+            }
+            Err(error) => errors.push(format!("{error:#}")),
+        }
+    }
+    (urls, errors, token.await.unwrap())
+}
+
+fn transport_alias_counts(db: &SqliteStateDb) -> (i64, i64, i64, i64, i64, i64) {
+    let conn = db.acquire_lock("transport stream counts").unwrap();
+    conn.query_row(
+        "SELECT (SELECT count(*) FROM provider_shadow_pages),(SELECT count(*) FROM provider_transport_canonical),(SELECT count(*) FROM provider_transport_aliases),(SELECT count(*) FROM provider_catalog_debt),(SELECT COALESCE(SUM(charged_bytes),0) FROM provider_shadow_pages),(SELECT COALESCE(SUM(charged_bytes),0) FROM provider_catalog_pages)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+    )
+    .unwrap()
+}
+
+fn transport_page_totals(db: &SqliteStateDb) -> (i64, i64, i64) {
+    let conn = db.acquire_lock("transport stream page totals").unwrap();
+    conn.query_row(
+        "SELECT COALESCE(SUM(record_count),0),COALESCE(SUM(reference_count),0),COALESCE(SUM(debt_count),0) FROM provider_catalog_pages",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn transport_stream_url_rotations_keep_latest_events_and_unchanged_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("owned.db");
+    let media = directory.path().join("kept.jpg");
+    std::fs::write(&media, b"existing-media").unwrap();
+    let db = open(&path).await;
+    seed(&db);
+
+    let first_master = "https://p01.icloud-content.com/original?token=0";
+    let first_compute = "https://p01.icloud-content.com/compute?token=0";
+    let result = stream_urls(
+        &album(
+            transport_stream_page(first_master, first_compute, 1024, "ct1", "successor", false),
+            capture(&db),
+        ),
+        "saved",
+    )
+    .await;
+    assert!(result.1.is_empty(), "{:?}", result.1);
+    assert_eq!(result.2, "successor");
+    assert!(result.0.iter().any(|url| url == first_master));
+    let baseline = transport_alias_counts(&db);
+    assert_eq!(baseline.0, 1);
+    assert_eq!(baseline.1, baseline.0, "one canonical index per class");
+    let checkpoint = db.get_metadata("sync_token:PrimarySync").await.unwrap();
+
+    // Repeated old-range captures rotate only the URL tokens. Each downstream
+    // event still carries the incoming latest URLs, while the retained class,
+    // catalogue facts, debt, charged bytes and checkpoint do not move.
+    for index in 1..4 {
+        let master_url = format!("https://p{index:02}.icloud-content.com/original?token={index}");
+        let compute_url = format!("https://p{index:02}.icloud-content.com/compute?token={index}");
+        let result = stream_urls(
+            &album(
+                transport_stream_page(&master_url, &compute_url, 1024, "ct1", "successor", false),
+                capture(&db),
+            ),
+            "saved",
+        )
+        .await;
+        assert!(result.1.is_empty(), "{:?}", result.1);
+        assert_eq!(result.2, "successor");
+        assert!(
+            result.0.iter().any(|url| url == &master_url),
+            "incoming original URL downstream"
+        );
+        assert!(!result.0.iter().any(|url| url == first_master));
+        assert_eq!(transport_alias_counts(&db), baseline);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+            checkpoint
+        );
+    }
+
+    // A fixed-cursor EOF page requests and returns the same successor with
+    // `moreComing: false`. The cursor is part of the canonical key, so this is
+    // an independent class from the old-range page even though the record
+    // bytes differ only in their eligible URLs. Both URL variants rotate
+    // together, and repeated equivalent EOF captures stay in this class.
+    let eof_master = "https://p11.icloud-content.com/original?token=11";
+    let eof_compute = "https://p11.icloud-content.com/compute?token=11";
+    let result = stream_urls(
+        &album(
+            transport_stream_page(eof_master, eof_compute, 1024, "ct1", "successor", false),
+            capture(&db),
+        ),
+        "successor",
+    )
+    .await;
+    assert!(result.1.is_empty(), "{:?}", result.1);
+    assert_eq!(result.2, "successor");
+    assert!(
+        result.0.iter().any(|url| url == eof_master),
+        "incoming original URL downstream"
+    );
+    let eof_baseline = transport_alias_counts(&db);
+    assert_eq!(
+        eof_baseline.0,
+        baseline.0 + 1,
+        "fixed-cursor EOF is an independent canonical class"
+    );
+    assert_eq!(eof_baseline.1, baseline.1 + 1);
+    assert_eq!(eof_baseline.2, baseline.2);
+    assert_eq!(
+        eof_baseline.3,
+        baseline.3 * 2,
+        "one debt set per class page"
+    );
+    assert!(
+        eof_baseline.4 > baseline.4,
+        "the new class is charged in the inbox budget"
+    );
+    assert!(
+        eof_baseline.5 > baseline.5,
+        "the new class is charged in the catalogue budget"
+    );
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+        checkpoint
+    );
+
+    for index in 1..4 {
+        let master_url = format!("https://p1{index}.icloud-content.com/original?token={index}");
+        let compute_url = format!("https://p1{index}.icloud-content.com/compute?token={index}");
+        let result = stream_urls(
+            &album(
+                transport_stream_page(&master_url, &compute_url, 1024, "ct1", "successor", false),
+                capture(&db),
+            ),
+            "successor",
+        )
+        .await;
+        assert!(result.1.is_empty(), "{:?}", result.1);
+        assert_eq!(result.2, "successor");
+        assert!(
+            result.0.iter().any(|url| url == &master_url),
+            "incoming original URL downstream"
+        );
+        assert!(!result.0.iter().any(|url| url == eof_master));
+        assert_eq!(transport_alias_counts(&db), eof_baseline);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+            checkpoint
+        );
+    }
+
+    let page_facts = transport_page_totals(&db);
+    drop(db);
+    let db = open(&path).await;
+    capture(&db)
+        .replay_catalog(&CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(transport_alias_counts(&db), eof_baseline);
+    assert_eq!(transport_page_totals(&db), page_facts);
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+        checkpoint
+    );
+
+    // Reopened durable state still serves another equivalent EOF through the
+    // actual stream, not only through local catalogue replay.
+    let reopened_master = "https://p21.icloud-content.com/original?token=21";
+    let reopened_compute = "https://p21.icloud-content.com/compute?token=21";
+    let result = stream_urls(
+        &album(
+            transport_stream_page(
+                reopened_master,
+                reopened_compute,
+                1024,
+                "ct1",
+                "successor",
+                false,
+            ),
+            capture(&db),
+        ),
+        "successor",
+    )
+    .await;
+    assert!(result.1.is_empty(), "{:?}", result.1);
+    assert_eq!(result.2, "successor");
+    assert!(
+        result.0.iter().any(|url| url == reopened_master),
+        "incoming original URL downstream"
+    );
+    assert_eq!(transport_alias_counts(&db), eof_baseline);
+    assert_eq!(transport_page_totals(&db), page_facts);
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+        checkpoint
+    );
+    unchanged(&db, &media).await;
+
+    // A genuine new record version is admitted separately, not aliased.
+    let result = collect(&album(
+        transport_stream_page(
+            "https://p05.icloud-content.com/original?token=5",
+            "https://p05.icloud-content.com/compute?token=5",
+            1025,
+            "ct2",
+            "successor",
+            false,
+        ),
+        capture(&db),
+    ))
+    .await;
+    assert!(result.1.is_empty(), "{:?}", result.1);
+    let after = transport_alias_counts(&db);
+    assert_eq!(after.0, eof_baseline.0 + 1);
+    assert_eq!(after.1, eof_baseline.1 + 1);
+    assert_eq!(after.2, eof_baseline.2);
+}
+
+fn transport_counts(db: &SqliteStateDb) -> (i64, i64, i64) {
+    let conn = db.acquire_lock("transport fixture counts").unwrap();
+    conn.query_row(
+        "SELECT (SELECT count(*) FROM provider_shadow_pages),(SELECT count(*) FROM provider_transport_canonical),(SELECT count(*) FROM provider_catalog_pages)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn transport_replay_reuses_one_canonical_page_before_capacity() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open(&directory.path().join("owned.db")).await;
+    let scope = transport_scope(&db, "private");
+    let capture = capture(&db);
+    let first = super::catalog_observed_page(
+        transport_page("https://p01.icloud-content.com/a?token=0", 1024),
+        &scope,
+        "held",
+    )
+    .unwrap();
+    capture.capture(first).await.unwrap();
+    for index in 1..100 {
+        let next = super::catalog_observed_page(
+            transport_page(
+                &format!("https://p02.icloud-content.com/a?token={index}"),
+                1024,
+            ),
+            &scope,
+            "held",
+        )
+        .unwrap();
+        capture.capture(next).await.unwrap();
+        assert_eq!(transport_counts(&db), (1, 1, 1));
+    }
+    let changed = super::catalog_observed_page(
+        transport_page("https://p01.icloud-content.com/a?token=0", 1025),
+        &scope,
+        "held",
+    )
+    .unwrap();
+    capture.capture(changed).await.unwrap();
+    assert_eq!(transport_counts(&db), (2, 2, 2));
+}
+
+#[tokio::test]
+async fn compute_state_replay_reuses_one_canonical_page() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open(&directory.path().join("owned.db")).await;
+    let scope = transport_scope(&db, "private");
+    let capture = capture(&db);
+    let first = super::catalog_observed_page(
+        transport_compute_page("https://p01.icloud-content.com/a?token=0", "w"),
+        &scope,
+        "held",
+    )
+    .unwrap();
+    capture.capture(first).await.unwrap();
+    let rotated = super::catalog_observed_page(
+        transport_compute_page("https://p09.icloud-content.com/a/much/longer?token=1", "w"),
+        &scope,
+        "held",
+    )
+    .unwrap();
+    capture.capture(rotated).await.unwrap();
+    assert_eq!(transport_counts(&db), (1, 1, 1));
+
+    // A non-URL compute descriptor change is not a transport rotation.
+    let changed = super::catalog_observed_page(
+        transport_compute_page("https://p09.icloud-content.com/a/much/longer?token=1", "w2"),
+        &scope,
+        "held",
+    )
+    .unwrap();
+    capture.capture(changed).await.unwrap();
+    assert_eq!(transport_counts(&db), (2, 2, 2));
+}
+
+#[tokio::test]
+async fn same_body_with_different_request_cursor_is_an_independent_class() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open(&directory.path().join("owned.db")).await;
+    let scope = transport_scope(&db, "private");
+    let capture = capture(&db);
+    let body = transport_page("https://p01.icloud-content.com/a?token=0", 1024);
+    for cursor in ["held", "held-next"] {
+        let page = super::catalog_observed_page(body.clone(), &scope, cursor).unwrap();
+        capture.capture(page).await.unwrap();
+    }
+    assert_eq!(transport_counts(&db), (2, 2, 2));
+    let ids: Vec<i64> = db
+        .acquire_lock("independent cursor classes")
+        .unwrap()
+        .prepare("SELECT page_id FROM provider_transport_canonical ORDER BY page_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[tokio::test]
+async fn shared_scope_stays_raw_while_private_scope_masks() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open(&directory.path().join("owned.db")).await;
+    let capture = capture(&db);
+    let body = transport_page("https://p01.icloud-content.com/a?token=0", 1024);
+    for database in ["shared", "private"] {
+        let scope = transport_scope(&db, database);
+        let page = super::catalog_observed_page(body.clone(), &scope, "held").unwrap();
+        capture.capture(page).await.unwrap();
+    }
+    assert_eq!(transport_counts(&db), (2, 1, 2));
+}
+
+#[tokio::test]
+async fn ownerless_private_scope_is_raw_and_cannot_coalesce() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open(&directory.path().join("owned.db")).await;
+
+    let missing_owner = json!({
+        "format": 1, "realm": "com", "container": "com.apple.photos.cloud",
+        "environment": "production", "database": "private",
+        "zone": {"zoneName": "PrimarySync"}
+    });
+    for url in [
+        "https://p01.icloud-content.com/a?token=0",
+        "https://p02.icloud-content.com/a?token=1",
+    ] {
+        let page = super::catalog_observed_page(
+            transport_page(url, 1024),
+            &missing_owner.to_string(),
+            "held",
+        )
+        .unwrap();
+        db.capture_shadow_page(owner(), page, 512 * 1024 * 1024)
+            .await
+            .unwrap();
+    }
+    // No complete private scope proof means no canonical identity: both
+    // captures remain distinct raw observations instead of being rejected or
+    // coalesced.
+    assert_eq!(transport_counts(&db), (2, 0, 0));
+
+    let unknown = json!({
+        "format": 1, "realm": "com", "container": "com.apple.photos.cloud",
+        "environment": "staging", "database": "private",
+        "zone": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"}
+    });
+    let page = super::catalog_observed_page(
+        transport_page("https://p01.icloud-content.com/a?token=0", 1024),
+        &unknown.to_string(),
+        "held",
+    )
+    .unwrap();
+    db.capture_shadow_page(owner(), page, 512 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(transport_counts(&db), (3, 0, 0));
+}
+
+#[tokio::test]
+async fn url_repeat_projects_after_capture_without_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open(&directory.path().join("owned.db")).await;
+    let scope = transport_scope(&db, "private");
+    let first = super::catalog_observed_page(
+        transport_page("https://p01.icloud-content.com/a?token=0", 1024),
+        &scope,
+        "held",
+    )
+    .unwrap();
+    let id = db
+        .capture_shadow_page(owner(), first, 512 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(transport_counts(&db), (1, 1, 0));
+
+    let repeat = super::catalog_observed_page(
+        transport_page("https://p02.icloud-content.com/a?token=1", 1024),
+        &scope,
+        "held",
+    )
+    .unwrap();
+    capture(&db).capture(repeat).await.unwrap();
+    assert_eq!(transport_counts(&db), (1, 1, 1));
+    let projected: i64 = db
+        .acquire_lock("interrupted projection recovered")
+        .unwrap()
+        .query_row("SELECT page_id FROM provider_catalog_pages", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(projected, id.0);
+}
+
+#[tokio::test]
+async fn full_budget_accepts_equivalent_repeat_and_refuses_distinct_change() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open(&directory.path().join("owned.db")).await;
+    let scope = transport_scope(&db, "private");
+    let mut capture = capture(&db);
+    let first = super::catalog_observed_page(
+        transport_page("https://p01.icloud-content.com/a?token=0", 1024),
+        &scope,
+        "held",
+    )
+    .unwrap();
+    capture.capture(first).await.unwrap();
+    capture.capacity = 0;
+
+    let repeat = super::catalog_observed_page(
+        transport_page("https://p02.icloud-content.com/a?token=1", 1024),
+        &scope,
+        "held",
+    )
+    .unwrap();
+    capture.capture(repeat).await.unwrap();
+    assert_eq!(transport_counts(&db), (1, 1, 1));
+
+    let changed = super::catalog_observed_page(
+        transport_page("https://p02.icloud-content.com/a?token=1", 1025),
+        &scope,
+        "held",
+    )
+    .unwrap();
+    let error = capture.capture(changed).await.expect_err("full inbox");
+    assert!(format!("{error:#}").contains("inbox is full"));
+    assert_eq!(transport_counts(&db), (1, 1, 1));
+    let receipt: i64 = db
+        .acquire_lock("refused change keeps receipt")
+        .unwrap()
+        .query_row("SELECT page_id FROM provider_shadow_receipts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(receipt, 1);
+}
+
+#[tokio::test]
+async fn mismatched_canonical_index_entry_is_invalid() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = open(&directory.path().join("owned.db")).await;
+    let scope = transport_scope(&db, "private");
+    let capture = capture(&db);
+    let body = transport_page("https://p01.icloud-content.com/a?token=0", 1024);
+    for cursor in ["held", "held-next"] {
+        let page = super::catalog_observed_page(body.clone(), &scope, cursor).unwrap();
+        capture.capture(page).await.unwrap();
+    }
+    {
+        let conn = db.acquire_lock("tamper canonical index").unwrap();
+        let rows: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT canonical_sha,page_id FROM provider_transport_canonical ORDER BY page_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        conn.execute(
+            "DELETE FROM provider_transport_canonical WHERE canonical_sha=?1",
+            [&rows[1].0],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE provider_transport_canonical SET page_id=?1 WHERE canonical_sha=?2",
+            rusqlite::params![rows[1].1, rows[0].0],
+        )
+        .unwrap();
+    }
+    let repeat = super::catalog_observed_page(
+        transport_page("https://p02.icloud-content.com/a?token=1", 1024),
+        &scope,
+        "held",
+    )
+    .unwrap();
+    assert!(capture.capture(repeat).await.is_err());
+    assert_eq!(transport_counts(&db), (2, 1, 2));
+}

@@ -163,7 +163,7 @@ fn validate(conn: &Connection, manifest: &SelectionManifest) -> Result<(), State
         let ordinal = usize::try_from(source.ordinal)
             .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
         if page.page.scope != manifest.scope
-            || page.body_hash != source.body_hash
+            || page.observation_hash != source.body_hash
             || page.page.identities.get(ordinal).is_none()
         {
             return invalid();

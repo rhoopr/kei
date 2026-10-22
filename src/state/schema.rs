@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 35;
+pub(crate) const SCHEMA_VERSION: i32 = 36;
 
 fn migrate_active_selection(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(r"CREATE TABLE IF NOT EXISTS provider_active_generations (
@@ -251,6 +251,60 @@ CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
     }
     // Preparing the conflict target also verifies the replay uniqueness key.
     conn.prepare("INSERT INTO provider_shadow_pages(scope,request_cursor,body_hash) VALUES (?1,?2,?3) ON CONFLICT(scope,request_cursor,body_hash) DO NOTHING")?;
+    Ok(())
+}
+
+/// Canonical transport index and finite typed aliases. One exact raw
+/// representative stays in `provider_shadow_pages`; this table records the
+/// adapter's versioned masked identity and links replayed URL-only variants to
+/// that representative.
+///
+/// `provider_shadow_pages.body_hash` remains the historical observation hash.
+/// For a legacy alias it is the original transport hash of bytes removed by
+/// this migration, never a digest of the representative body.
+fn migrate_provider_transport_index(conn: &Connection) -> Result<(), StateError> {
+    conn.execute_batch(
+        r"
+CREATE TABLE IF NOT EXISTS provider_transport_canonical (
+    canonical_sha TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(version > 0),
+    page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id),
+    PRIMARY KEY(canonical_sha, version)
+) WITHOUT ROWID;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_transport_canonical_page
+    ON provider_transport_canonical(page_id);
+CREATE TABLE IF NOT EXISTS provider_transport_aliases (
+    page_id INTEGER PRIMARY KEY REFERENCES provider_shadow_pages(id),
+    canonical_page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id),
+    classifier_version INTEGER NOT NULL CHECK(classifier_version > 0),
+    masked_sha TEXT NOT NULL,
+    certificate TEXT NOT NULL,
+    provenance_hash TEXT NOT NULL,
+    CHECK(page_id <> canonical_page_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_transport_alias_canonical
+    ON provider_transport_aliases(canonical_page_id);
+",
+    )?;
+    conn.prepare("SELECT canonical_sha,version,page_id FROM provider_transport_canonical LIMIT 0")?;
+    let actual: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('provider_transport_canonical') WHERE pk>0 ORDER BY pk")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if actual != ["canonical_sha", "version"] {
+        return Err(StateError::ProviderInboxInvalid);
+    }
+    conn.prepare("SELECT page_id,canonical_page_id,classifier_version,masked_sha,certificate,provenance_hash FROM provider_transport_aliases LIMIT 0")?;
+    let actual: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('provider_transport_aliases') WHERE pk>0 ORDER BY pk")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if actual != ["page_id"] {
+        return Err(StateError::ProviderInboxInvalid);
+    }
+    // Automatic legacy compaction is part of the same savepoint as DDL. Any
+    // failure rolls back all aliases and dropped bodies with this version step.
+    crate::state::db::provider_inbox::compact_legacy_aliases(conn)?;
     Ok(())
 }
 
@@ -1157,7 +1211,7 @@ CREATE INDEX idx_reconciliation_paths_destination ON reconciliation_paths(destin
 /// was entered (before any steps ran); some migrations only want to
 /// execute their one-shot side effects on the initial crossing, not on
 /// subsequent re-entries through unusual paths.
-fn migrate_to_version(
+pub(crate) fn migrate_to_version(
     conn: &Connection,
     start_version: i32,
     version: i32,
@@ -1339,6 +1393,7 @@ fn migrate_to_version(
         33 => migrate_provider_selection(conn)?,
         34 => migrate_active_selection(conn)?,
         35 => conn.execute_batch(super::db::primary_layout::DDL)?,
+        36 => migrate_provider_transport_index(conn)?,
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,
@@ -1911,7 +1966,7 @@ mod tests {
         assert_eq!(get_schema_version(&conn).unwrap(), 34);
         for _ in 0..2 {
             migrate(&conn).unwrap();
-            assert_eq!(get_schema_version(&conn).unwrap(), 35);
+            assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
             assert_eq!(
                 conn.query_row::<String, _, _>(
                     "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",

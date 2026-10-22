@@ -46,6 +46,7 @@ pub(crate) enum WorkAdmission {
 }
 
 struct WorkReceipt {
+    confirmation_hash: String,
     state: String,
     reason: String,
     scope: String,
@@ -53,6 +54,81 @@ struct WorkReceipt {
     confirmation: Option<Vec<u8>>,
     master: Option<String>,
     charged_bytes: i64,
+}
+
+/// Find a retained receipt whose original confirmation differs from the current
+/// incoming confirmation only in eligible Asset URL tokens.
+///
+/// The caller has already authenticated and validated the current incoming
+/// confirmation and planned records. This lookup never reuses an old body for
+/// current work: it only reuses the original receipt key and raw bytes as the
+/// charged representative. Candidate bodies are classified one at a time, so
+/// no whole-store or whole-source body set is materialized.
+fn equivalent_receipt(
+    tx: &rusqlite::Transaction<'_>,
+    plan: &WorkPlan,
+    page_id: i64,
+    child: &str,
+) -> Result<Option<WorkReceipt>, StateError> {
+    let Some(master) = plan.master.as_deref() else {
+        return Ok(None);
+    };
+    let Some(incoming) = plan.confirmation.as_deref() else {
+        return Ok(None);
+    };
+    let Some(incoming_evidence) =
+        crate::icloud::photos::transport_evidence::classify_lookup_confirmation(
+            incoming, child, master,
+        )
+        .ok()
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    let mut statement = tx.prepare(
+        "SELECT confirmation_hash,state,reason,scope,source_hash,confirmation,master_record_name,charged_bytes FROM provider_work_receipts WHERE page_id=?1 AND ordinal=?2 AND config_hash=?3 AND scope=?4 AND source_hash=?5 AND master_record_name IS ?6 AND confirmation IS NOT NULL ORDER BY (state='admitted') DESC,confirmation_hash ASC",
+    )?;
+    let mut rows = statement.query(params![
+        page_id,
+        plan.source.ordinal,
+        plan.config_hash,
+        plan.scope,
+        plan.source.page.observation_hash,
+        master
+    ])?;
+    let mut found = None;
+    while let Some(row) = rows.next()? {
+        let confirmation_hash: String = row.get(0)?;
+        let Some(body) = row.get::<_, Option<Vec<u8>>>(5)? else {
+            continue;
+        };
+        // A representative must own exactly the bytes it was stored with.
+        if format!("{:x}", Sha256::digest(&body)) != confirmation_hash {
+            continue;
+        }
+        let Ok(Some(candidate)) =
+            crate::icloud::photos::transport_evidence::classify_lookup_confirmation(
+                &body, child, master,
+            )
+        else {
+            continue;
+        };
+        if candidate.masked != incoming_evidence.masked {
+            continue;
+        }
+        found = Some(WorkReceipt {
+            confirmation_hash,
+            state: row.get(1)?,
+            reason: row.get(2)?,
+            scope: row.get(3)?,
+            source_hash: row.get(4)?,
+            confirmation: Some(body),
+            master: row.get(6)?,
+            charged_bytes: row.get(7)?,
+        });
+        break;
+    }
+    Ok(found)
 }
 
 fn record_matches(
@@ -144,7 +220,7 @@ impl SqliteStateDb {
             let identity=current.page.identities.get(ordinal).ok_or(StateError::ProviderWorkInvalid)?;
             let validated=crate::icloud::photos::catalog_observed_page(current.page.body.clone(),&plan.scope,&current.page.request_cursor).map_err(|_invalid|StateError::ProviderWorkInvalid)?;
             if validated!=current.page {return Err(StateError::ProviderWorkInvalid);}
-            let indexed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_catalog_records c JOIN provider_catalog_pages p ON p.page_id=c.page_id WHERE c.page_id=?1 AND c.ordinal=?2 AND c.kind='asset' AND c.deleted=0 AND c.record_name=?3 AND p.projector_version=1 AND p.body_hash=?4)",params![current.id.0,plan.source.ordinal,identity.name,current.body_hash],|row|row.get(0))?;
+            let indexed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_catalog_records c JOIN provider_catalog_pages p ON p.page_id=c.page_id WHERE c.page_id=?1 AND c.ordinal=?2 AND c.kind='asset' AND c.deleted=0 AND c.record_name=?3 AND p.projector_version=1 AND p.body_hash=?4)",params![current.id.0,plan.source.ordinal,identity.name,current.observation_hash],|row|row.get(0))?;
             if !indexed || identity.record_type.as_deref()!=Some("CPLAsset") || identity.deleted {
                 return Err(StateError::ProviderWorkInvalid);
             }
@@ -156,7 +232,6 @@ impl SqliteStateDb {
             if scope.get("database").and_then(serde_json::Value::as_str)!=Some("private") || zone.get("ownerRecordName").and_then(serde_json::Value::as_str)!=Some("_defaultOwner") {
                 return Err(StateError::ProviderWorkInvalid);
             }
-            let confirmation_hash=plan.confirmation.as_ref().map_or_else(String::new,|body|format!("{:x}",Sha256::digest(body)));
             let photo=match (&plan.confirmation,&plan.master) {
                 (Some(body),Some(master)) if body.len()<=crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES => Some(crate::icloud::photos::current_asset(body,&identity.name,master,zone).map_err(|_invalid|StateError::ProviderWorkInvalid)?),
                 (None,None) if plan.records.is_empty()=>None,
@@ -187,27 +262,36 @@ impl SqliteStateDb {
                     return Err(StateError::ProviderWorkInvalid);
                 }
             }
-            let charge=plan.confirmation.as_ref().map_or(0,|body|body.len() as u64)+plan.scope.len() as u64+plan.config_hash.len() as u64+plan.master.as_ref().map_or(0,|name|name.len() as u64)+identity.name.len() as u64+current.body_hash.len() as u64+plan.records.iter().map(|r|r.library.len() as u64+r.id.len() as u64+r.filename.len() as u64+r.checksum.len() as u64
+            let incoming_hash=plan.confirmation.as_ref().map_or_else(String::new,|body|format!("{:x}",Sha256::digest(body)));
+            let mut existing:Option<WorkReceipt>=tx.query_row("SELECT confirmation_hash,state,reason,scope,source_hash,confirmation,master_record_name,charged_bytes FROM provider_work_receipts WHERE page_id=?1 AND ordinal=?2 AND config_hash=?3 AND confirmation_hash=?4",params![current.id.0,plan.source.ordinal,plan.config_hash,incoming_hash],|r|Ok(WorkReceipt{confirmation_hash:r.get(0)?,state:r.get(1)?,reason:r.get(2)?,scope:r.get(3)?,source_hash:r.get(4)?,confirmation:r.get(5)?,master:r.get(6)?,charged_bytes:r.get(7)?})).optional()?;
+            if let Some(receipt)=&existing
+                && (receipt.scope!=plan.scope || receipt.source_hash!=current.observation_hash || receipt.confirmation!=plan.confirmation || receipt.master!=plan.master) {
+                return Err(StateError::ProviderWorkInvalid);
+            }
+            if existing.is_none() {
+                // The current confirmation and planned records were already
+                // validated above. Only after that may a strictly equivalent
+                // retained confirmation supply the original representative key.
+                existing=equivalent_receipt(&tx,&plan,current.id.0,&identity.name)?;
+            }
+            let retained_hash=existing.as_ref().map_or(incoming_hash.as_str(),|receipt|receipt.confirmation_hash.as_str());
+            let retained_confirmation=existing.as_ref().and_then(|receipt|receipt.confirmation.as_deref()).or(plan.confirmation.as_deref());
+            let charge=retained_confirmation.map_or(0,|body|body.len() as u64)+plan.scope.len() as u64+plan.config_hash.len() as u64+plan.master.as_ref().map_or(0,|name|name.len() as u64)+identity.name.len() as u64+current.observation_hash.len() as u64+plan.records.iter().map(|r|r.library.len() as u64+r.id.len() as u64+r.filename.len() as u64+r.checksum.len() as u64
                 + [r.metadata.source.as_deref(),r.metadata.title.as_deref(),r.metadata.keywords.as_deref(),r.metadata.description.as_deref(),r.metadata.media_subtype.as_deref(),r.metadata.burst_id.as_deref(),r.metadata.provider_data.as_deref(),r.metadata.metadata_hash.as_deref()].iter().map(|value|value.map_or(0,|text|text.len() as u64)).sum::<u64>()+512).sum::<u64>()+256;
             if charge>MAX_WORK_PLAN_BYTES {return Err(StateError::ProviderWorkFull);}
-            let existing:Option<WorkReceipt>=tx.query_row("SELECT state,reason,scope,source_hash,confirmation,master_record_name,charged_bytes FROM provider_work_receipts WHERE page_id=?1 AND ordinal=?2 AND config_hash=?3 AND confirmation_hash=?4",params![current.id.0,plan.source.ordinal,plan.config_hash,confirmation_hash],|r|Ok(WorkReceipt{state:r.get(0)?,reason:r.get(1)?,scope:r.get(2)?,source_hash:r.get(3)?,confirmation:r.get(4)?,master:r.get(5)?,charged_bytes:r.get(6)?})).optional()?;
-            if let Some(receipt)=&existing {
-                if receipt.scope!=plan.scope || receipt.source_hash!=current.body_hash || receipt.confirmation!=plan.confirmation || receipt.master!=plan.master {
-                    return Err(StateError::ProviderWorkInvalid);
-                }
-                if receipt.state=="admitted" {
+            if let Some(receipt)=&existing
+                && receipt.state=="admitted" {
                     if !receipt.reason.is_empty() || receipt.charged_bytes!=i64::try_from(charge).map_err(|_invalid|StateError::ProviderWorkInvalid)? {return Err(StateError::ProviderWorkInvalid);}
                     // A receipt records admission, not ongoing queue contents.
                     // In particular, never resurrect an old generation here.
-                    let actual:i64=tx.query_row("SELECT count(*) FROM provider_work_obligations WHERE page_id=?1 AND ordinal=?2 AND config_hash=?3 AND confirmation_hash=?4",params![current.id.0,plan.source.ordinal,plan.config_hash,confirmation_hash],|r|r.get(0))?;
+                    let actual:i64=tx.query_row("SELECT count(*) FROM provider_work_obligations WHERE page_id=?1 AND ordinal=?2 AND config_hash=?3 AND confirmation_hash=?4",params![current.id.0,plan.source.ordinal,plan.config_hash,retained_hash],|r|r.get(0))?;
                     if actual!=i64::try_from(plan.records.len()).map_err(|_invalid|StateError::ProviderWorkInvalid)? {return Err(StateError::ProviderWorkInvalid);}
                     for record in &plan.records {
-                        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_work_obligations WHERE page_id=?1 AND ordinal=?2 AND config_hash=?3 AND confirmation_hash=?4 AND version_size=?5 AND library=?6 AND asset_id=?7 AND checksum=?8 AND size_bytes=?9 AND filename=?10 AND created_at IS ?11 AND added_at IS ?12 AND metadata_hash=?13)",params![current.id.0,plan.source.ordinal,plan.config_hash,confirmation_hash,record.version_size.as_str(),record.library,record.id,record.checksum,i64::try_from(record.size_bytes).map_err(|_invalid|StateError::ProviderWorkInvalid)?,record.filename,encode_asset_date(record.created_at),record.added_at.map(encode_asset_date),record.metadata.metadata_hash.as_deref()],|r|r.get(0))?;
+                        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_work_obligations WHERE page_id=?1 AND ordinal=?2 AND config_hash=?3 AND confirmation_hash=?4 AND version_size=?5 AND library=?6 AND asset_id=?7 AND checksum=?8 AND size_bytes=?9 AND filename=?10 AND created_at IS ?11 AND added_at IS ?12 AND metadata_hash=?13)",params![current.id.0,plan.source.ordinal,plan.config_hash,retained_hash,record.version_size.as_str(),record.library,record.id,record.checksum,i64::try_from(record.size_bytes).map_err(|_invalid|StateError::ProviderWorkInvalid)?,record.filename,encode_asset_date(record.created_at),record.added_at.map(encode_asset_date),record.metadata.metadata_hash.as_deref()],|r|r.get(0))?;
                         if !valid {return Err(StateError::ProviderWorkInvalid);}
                     }
                     tx.commit()?;
                     return Ok(WorkAdmission::Admitted);
-                }
             }
             let mut reason=plan.reason;
             if !plan.records.is_empty() {
@@ -218,7 +302,7 @@ impl SqliteStateDb {
             }
             let admitted=reason.is_empty() && !plan.records.is_empty();
             if let Some(receipt)=&existing {
-                let obligations:i64=tx.query_row("SELECT count(*) FROM provider_work_obligations WHERE page_id=?1 AND ordinal=?2 AND config_hash=?3 AND confirmation_hash=?4",params![current.id.0,plan.source.ordinal,plan.config_hash,confirmation_hash],|r|r.get(0))?;
+                let obligations:i64=tx.query_row("SELECT count(*) FROM provider_work_obligations WHERE page_id=?1 AND ordinal=?2 AND config_hash=?3 AND confirmation_hash=?4",params![current.id.0,plan.source.ordinal,plan.config_hash,retained_hash],|r|r.get(0))?;
                 if receipt.state!="deferred" || obligations!=0 {return Err(StateError::ProviderWorkInvalid);}
             }
             let previous_charge=existing.as_ref().map_or(Ok(0),|receipt|u64::try_from(receipt.charged_bytes).map_err(|_invalid|StateError::ProviderWorkInvalid))?;
@@ -232,7 +316,7 @@ impl SqliteStateDb {
                         refresh_asset_album_groupings_tx(&tx,library,&identity.name,None)?;
                         tx.execute("UPDATE assets SET metadata_write_failed_at=COALESCE(metadata_write_failed_at,?3) WHERE library=?1 AND id=?2 AND EXISTS(SELECT 1 FROM asset_albums WHERE library=?1 AND asset_id=?2)",params![library,identity.name,now])?;
                     }
-                    tx.execute("INSERT INTO provider_work_obligations(page_id,ordinal,config_hash,confirmation_hash,version_size,library,asset_id,checksum,size_bytes,filename,created_at,added_at,metadata_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![current.id.0,plan.source.ordinal,plan.config_hash,confirmation_hash,record.version_size.as_str(),record.library,record.id,record.checksum,i64::try_from(record.size_bytes).map_err(|_invalid|StateError::ProviderWorkInvalid)?,record.filename,encode_asset_date(record.created_at),record.added_at.map(encode_asset_date),record.metadata.metadata_hash.as_deref()])?;
+                    tx.execute("INSERT INTO provider_work_obligations(page_id,ordinal,config_hash,confirmation_hash,version_size,library,asset_id,checksum,size_bytes,filename,created_at,added_at,metadata_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![current.id.0,plan.source.ordinal,plan.config_hash,retained_hash,record.version_size.as_str(),record.library,record.id,record.checksum,i64::try_from(record.size_bytes).map_err(|_invalid|StateError::ProviderWorkInvalid)?,record.filename,encode_asset_date(record.created_at),record.added_at.map(encode_asset_date),record.metadata.metadata_hash.as_deref()])?;
                 }
                 tx.execute("INSERT INTO asset_master_mappings(library,asset_record_name,master_record_name,updated_at) VALUES (?1,?2,?3,?4) ON CONFLICT(library,asset_record_name) DO NOTHING",params![library,identity.name,plan.master,now])?;
             }
@@ -248,7 +332,7 @@ impl SqliteStateDb {
             #[cfg(test)]
             pause_before_receipt(&database)?;
             // Last write: queue/mapping/debt/scan and receipt commit together.
-            tx.execute("INSERT INTO provider_work_receipts(page_id,ordinal,config_hash,confirmation_hash,confirmation,state,reason,scope,source_hash,master_record_name,charged_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(page_id,ordinal,config_hash,confirmation_hash) DO UPDATE SET state=excluded.state,reason=excluded.reason,charged_bytes=excluded.charged_bytes",params![current.id.0,plan.source.ordinal,plan.config_hash,confirmation_hash,plan.confirmation,if admitted {"admitted"} else {"deferred"},if admitted {""} else if reason.is_empty() {"no_selected_tasks"} else {reason},plan.scope,current.body_hash,plan.master,i64::try_from(charge).map_err(|_invalid|StateError::ProviderWorkFull)?])?;
+            tx.execute("INSERT INTO provider_work_receipts(page_id,ordinal,config_hash,confirmation_hash,confirmation,state,reason,scope,source_hash,master_record_name,charged_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(page_id,ordinal,config_hash,confirmation_hash) DO UPDATE SET state=excluded.state,reason=excluded.reason,charged_bytes=excluded.charged_bytes",params![current.id.0,plan.source.ordinal,plan.config_hash,retained_hash,retained_confirmation,if admitted {"admitted"} else {"deferred"},if admitted {""} else if reason.is_empty() {"no_selected_tasks"} else {reason},plan.scope,current.observation_hash,plan.master,i64::try_from(charge).map_err(|_invalid|StateError::ProviderWorkFull)?])?;
             tx.commit()?;
             Ok(if admitted {WorkAdmission::Admitted} else {WorkAdmission::Deferred})
         }).await

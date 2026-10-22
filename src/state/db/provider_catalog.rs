@@ -85,7 +85,7 @@ impl SqliteStateDb {
             let references = i64::try_from(plan.records.iter().map(|r|r.references.len()).sum::<usize>()).map_err(|_out_of_range|StateError::ProviderCatalogInvalid)?;
             let debt = i64::try_from(plan.records.iter().map(|r|r.debt.len()).sum::<usize>()).map_err(|_out_of_range|StateError::ProviderCatalogInvalid)?;
             let charged = i64::try_from(plan.charged_bytes).map_err(|_out_of_range|StateError::ProviderCatalogFull)?;
-            let expected = (PROJECTOR_VERSION,current.body_hash.clone(),records,references,debt,charged);
+            let expected = (PROJECTOR_VERSION,current.observation_hash.clone(),records,references,debt,charged);
             let existing: Option<(i64,String,i64,i64,i64,i64)> = tx.query_row(
                 "SELECT projector_version,body_hash,record_count,reference_count,debt_count,charged_bytes FROM provider_catalog_pages WHERE page_id=?1",
                 [page_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),

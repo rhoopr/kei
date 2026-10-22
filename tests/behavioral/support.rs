@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 35;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 36;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -223,6 +223,26 @@ CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
     scope TEXT PRIMARY KEY,
     page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id)
 ) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS provider_transport_canonical (
+    canonical_sha TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(version > 0),
+    page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id),
+    PRIMARY KEY(canonical_sha, version)
+) WITHOUT ROWID;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_transport_canonical_page
+    ON provider_transport_canonical(page_id);
+CREATE TABLE IF NOT EXISTS provider_transport_aliases (
+    page_id INTEGER PRIMARY KEY REFERENCES provider_shadow_pages(id),
+    canonical_page_id INTEGER NOT NULL REFERENCES provider_shadow_pages(id),
+    classifier_version INTEGER NOT NULL CHECK(classifier_version > 0),
+    masked_sha TEXT NOT NULL,
+    certificate TEXT NOT NULL,
+    provenance_hash TEXT NOT NULL,
+    CHECK(page_id <> canonical_page_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_transport_alias_canonical
+    ON provider_transport_aliases(canonical_page_id);
 
 
 CREATE TABLE IF NOT EXISTS provider_work_receipts (

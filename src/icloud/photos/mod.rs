@@ -16,6 +16,7 @@ mod projection;
 pub mod queries;
 pub mod session;
 pub(crate) mod smart_folders;
+pub(crate) mod transport_evidence;
 pub mod types;
 
 #[cfg(test)]
@@ -33,6 +34,7 @@ pub(crate) use album::{
 pub use asset::{PhotoAsset, VersionsMap};
 pub use library::PhotoLibrary;
 pub(crate) use library::{PRIMARY_ZONE_NAME, is_shared_zone};
+pub(crate) use projection::plan_retained;
 pub use session::{PhotosSession, SyncTokenError};
 
 use std::collections::HashMap;

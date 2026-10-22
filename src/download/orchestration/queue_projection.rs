@@ -231,7 +231,7 @@ pub(super) async fn admit_retained_work(
             sources: vec![SelectionSource {
                 page_id: source.page.id.0,
                 ordinal: source.ordinal,
-                body_hash: source.page.body_hash.clone(),
+                body_hash: source.page.observation_hash.clone(),
             }],
             decisions: vec![SelectionDecision {
                 pass_key: "unfiled".to_owned(),

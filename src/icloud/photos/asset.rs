@@ -506,7 +506,7 @@ const ALLOWED_DOWNLOAD_HOST_SUFFIXES: &[&str] = &[
 /// Validate that a CloudKit-provided download URL is safe to fetch from.
 /// Rejects empty strings, non-https schemes, and hosts outside the Apple
 /// CDN allowlist. On reject, returns a short reason suitable for a log line.
-fn validate_download_url(raw: &str) -> Result<(), &'static str> {
+pub(crate) fn validate_download_url(raw: &str) -> Result<(), &'static str> {
     if raw.is_empty() {
         return Err("empty URL");
     }
