@@ -1832,21 +1832,36 @@ mod tests {
         let oversized = oversized_unprojected_observed();
         let error = capture.capture(oversized.clone()).await.unwrap_err();
         assert!(
-            error.chain().any(|cause| matches!(
-                cause.downcast_ref::<crate::state::error::StateError>(),
-                Some(crate::state::error::StateError::ProviderCatalogFull)
-            )),
-            "normal capture preserves the catalogue capacity error"
+            error
+                .downcast_ref::<crate::icloud::photos::error::ShadowPageError>()
+                .is_some(),
+            "normal capture preserves the observation-refusal wrapper"
         );
         let retained = db
             .next_catalog_source(owner.clone(), 16 * 1024 * 1024)
             .await
             .unwrap()
             .expect("the oversized raw page remains captured");
-        assert!(
-            String::from_utf8_lossy(&retained.page.body).contains("oversized-master"),
-            "the oversized raw page remains captured"
-        );
+        assert_eq!(retained.page.body, oversized.body);
+        let projection_error = crate::icloud::photos::plan_retained(&retained)
+            .err()
+            .expect("normalization exceeds its existing bound");
+        assert!(matches!(
+            projection_error.downcast_ref::<crate::state::error::StateError>(),
+            Some(crate::state::error::StateError::ProviderCatalogFull)
+        ));
+        let conn = db
+            .acquire_lock("verify refused projection retained no catalogue commit")
+            .unwrap();
+        let projections: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM provider_catalog_pages WHERE page_id=?1",
+                [retained.id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(projections, 0);
+        drop(conn);
         drop(capture);
         crate::support::begin(serde_json::json!({"scenario": "catalogue"}));
         let fresh_catalog = fixture_observed(70, "https://p01.icloud-content.com/asset-70?token=1");
