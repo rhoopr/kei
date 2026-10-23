@@ -116,7 +116,6 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(args[4], "kei:candidate")
             self.assertTrue(check)
             Path(args[3]).write_bytes(archive_bytes(members))
-            return None
 
         return fake
 
@@ -199,9 +198,8 @@ class ArtifactTests(unittest.TestCase):
             config = next(data for name, data in members if name == "config.json")
             mutated = replace_member(members, "config.json", config + b" ")
             self.seed_container(mutated, image_id)
-            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")):
-                with self.assertRaises(ValueError):
-                    artifact.verify_loaded_container("amd64")
+            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")), self.assertRaises(ValueError):
+                artifact.verify_loaded_container("amd64")
 
     @patch.object(artifact, "identity", return_value=("a" * 40, "1.2.3"))
     def test_verify_loaded_container_rejects_fresh_archive_mutation(self, _identity):
@@ -210,9 +208,8 @@ class ArtifactTests(unittest.TestCase):
             self.seed_container(original, image_id)
             fresh, _ = image_members()
             fresh = replace_member(fresh, "layer-0/layer.tar", b"changed")
-            with patch.object(artifact.subprocess, "run", side_effect=self.save_fake(fresh)):
-                with self.assertRaises(ValueError):
-                    artifact.verify_loaded_container("amd64")
+            with patch.object(artifact.subprocess, "run", side_effect=self.save_fake(fresh)), self.assertRaises(ValueError):
+                artifact.verify_loaded_container("amd64")
 
     @patch.object(artifact, "identity", return_value=("a" * 40, "1.2.3"))
     def test_verify_loaded_container_rejects_layer_mutation_and_order(self, _identity):
@@ -220,9 +217,8 @@ class ArtifactTests(unittest.TestCase):
             members, image_id = image_members()
             mutated = replace_member(members, "layer-0/layer.tar", b"mutated layer")
             self.seed_container(mutated, image_id)
-            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")):
-                with self.assertRaises(ValueError):
-                    artifact.verify_loaded_container("amd64")
+            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")), self.assertRaises(ValueError):
+                artifact.verify_loaded_container("amd64")
         with workspace():
             reordered = [{
                 "Config": "config.json",
@@ -231,9 +227,8 @@ class ArtifactTests(unittest.TestCase):
             }]
             members, image_id = image_members(manifest=reordered)
             self.seed_container(members, image_id)
-            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")):
-                with self.assertRaises(ValueError):
-                    artifact.verify_loaded_container("amd64")
+            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")), self.assertRaises(ValueError):
+                artifact.verify_loaded_container("amd64")
 
     @patch.object(artifact, "identity", return_value=("a" * 40, "1.2.3"))
     def test_verify_loaded_container_rejects_provenance_and_checksum(self, _identity):
@@ -252,9 +247,8 @@ class ArtifactTests(unittest.TestCase):
             ):
                 with self.subTest(field=field):
                     record.write_text(json.dumps({**original, field: value}))
-                    with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")):
-                        with self.assertRaises(ValueError):
-                            artifact.verify_loaded_container("amd64")
+                    with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")), self.assertRaises(ValueError):
+                        artifact.verify_loaded_container("amd64")
             record.write_text(json.dumps(original))
 
     @patch.object(artifact, "identity", return_value=("a" * 40, "1.2.3"))
@@ -270,9 +264,8 @@ class ArtifactTests(unittest.TestCase):
                 manifest=manifest,
             )
             self.seed_container(members, image_id)
-            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")):
-                with self.assertRaises(ValueError):
-                    artifact.verify_loaded_container("amd64")
+            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")), self.assertRaises(ValueError):
+                artifact.verify_loaded_container("amd64")
 
     @patch.object(artifact, "identity", return_value=("a" * 40, "1.2.3"))
     def test_verify_loaded_container_rejects_duplicate_members(self, _identity):
@@ -280,18 +273,16 @@ class ArtifactTests(unittest.TestCase):
             members, image_id = image_members()
             members.append(("manifest.json", b"{}"))
             self.seed_container(members, image_id)
-            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")):
-                with self.assertRaises(ValueError):
-                    artifact.verify_loaded_container("amd64")
+            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")), self.assertRaises(ValueError):
+                artifact.verify_loaded_container("amd64")
 
     @patch.object(artifact, "identity", return_value=("a" * 40, "1.2.3"))
     def test_verify_loaded_container_rejects_bad_architecture(self, _identity):
         with workspace():
             members, image_id = image_members(architecture="arm64")
             self.seed_container(members, image_id)
-            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")):
-                with self.assertRaises(ValueError):
-                    artifact.verify_loaded_container("amd64")
+            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")), self.assertRaises(ValueError):
+                artifact.verify_loaded_container("amd64")
             with self.assertRaises(ValueError):
                 artifact.verify_loaded_container("riscv64")
 
@@ -300,9 +291,8 @@ class ArtifactTests(unittest.TestCase):
         with workspace():
             members, image_id = image_members(diff_ids=["not-a-digest", "sha256:" + "0" * 64])
             self.seed_container(members, image_id)
-            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")):
-                with self.assertRaises(ValueError):
-                    artifact.verify_loaded_container("amd64")
+            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")), self.assertRaises(ValueError):
+                artifact.verify_loaded_container("amd64")
 
     @patch.object(artifact, "identity", return_value=("a" * 40, "1.2.3"))
     def test_verify_loaded_container_rejects_compressed_layers(self, _identity):
@@ -313,9 +303,8 @@ class ArtifactTests(unittest.TestCase):
                 layer_bytes=(compressed,),
             )
             self.seed_container(members, image_id)
-            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")):
-                with self.assertRaises(ValueError):
-                    artifact.verify_loaded_container("amd64")
+            with patch.object(artifact.subprocess, "run", side_effect=AssertionError("docker save must not run")), self.assertRaises(ValueError):
+                artifact.verify_loaded_container("amd64")
 
 
 if __name__ == "__main__":

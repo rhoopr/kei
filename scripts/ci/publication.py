@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 '''Validate a guarded publication resume against the original release run.'''
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ Api = Callable[[str], Any]
 
 def _mapping(value: Any, what: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
-        raise ValueError('invalid ' + what)
+        raise TypeError('invalid ' + what)
     return value
 
 
@@ -216,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
             gh_api,
         )
         write_output(result)
-    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+    except (TypeError, ValueError, OSError, subprocess.CalledProcessError) as error:
         print(error, file=sys.stderr)
         return 1
     return 0

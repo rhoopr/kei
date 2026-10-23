@@ -164,7 +164,7 @@ def _manifest(
         raise ValueError("manifest must describe exactly one image")
     entry = manifest[0]
     if not isinstance(entry, dict):
-        raise ValueError("manifest entry is malformed")
+        raise TypeError("manifest entry is malformed")
     config = entry.get("Config")
     layers = entry.get("Layers")
     tags = entry.get("RepoTags")
@@ -210,14 +210,14 @@ def _layer_digest(tar: tarfile.TarFile, member: tarfile.TarInfo, label: str) -> 
 
 def _verify_config(config: object, architecture: str, layer_digests: list[str]) -> None:
     if not isinstance(config, dict):
-        raise ValueError("config is malformed")
+        raise TypeError("config is malformed")
     if config.get("os") != "linux":
         raise ValueError("config operating system is unsupported")
     if config.get("architecture") != architecture:
         raise ValueError("config architecture does not match target")
     rootfs = config.get("rootfs")
     if not isinstance(rootfs, dict):
-        raise ValueError("config rootfs is malformed")
+        raise TypeError("config rootfs is malformed")
     diff_ids = rootfs.get("diff_ids")
     if not isinstance(diff_ids, list) or not all(isinstance(value, str) for value in diff_ids):
         raise ValueError("config rootfs.diff_ids is malformed")
@@ -263,7 +263,7 @@ def verify_loaded_container(arch: str) -> None:
     record_path = OUT / f"{name}.json"
     item = json.loads(record_path.read_text())
     if not isinstance(item, dict):
-        raise ValueError(f"invalid candidate record: {name}")
+        raise TypeError(f"invalid candidate record: {name}")
     filename = f"{name}.tar"
     if any(item.get(key) != value for key, value in {
         "sha": sha, "version": version, "target": target, "file": filename,
@@ -318,5 +318,5 @@ if __name__ == "__main__":
             verify_loaded_container(*arguments)
         else:
             raise ValueError("expected package, container, verify, or verify-loaded-container")
-    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+    except (TypeError, ValueError, OSError, subprocess.CalledProcessError) as error:
         sys.exit(str(error))
