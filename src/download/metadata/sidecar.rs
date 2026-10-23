@@ -124,8 +124,13 @@ pub(in crate::download) fn write_reconciled_sidecar(
         let mut file = temp.create_new_regular()?;
         std::io::Write::write_all(&mut file, &bytes)?;
         file.sync_all()?;
-        temp.validate_identity(crate::fs_util::file_identity(&file)?)?;
-        crate::download::file::publish_reconciliation_part_blocking(&temp, &destination)?;
+        let temp_identity = crate::fs_util::file_identity(&file)?;
+        temp.validate_identity(temp_identity)?;
+        crate::download::file::publish_reconciliation_part_blocking(
+            &temp,
+            &destination,
+            temp_identity,
+        )?;
         let installed = ReconciledSidecarSnapshot::read(destination)?
             .context("Reconciled sidecar disappeared")?;
         anyhow::ensure!(
