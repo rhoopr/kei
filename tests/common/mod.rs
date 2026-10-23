@@ -26,15 +26,7 @@ thread_local! {
 }
 
 fn copy_auth_material(username: &str, source: &Path, destination: &Path) {
-    let sanitized: String = username
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect();
-    for name in [
-        sanitized.clone(),
-        format!("{sanitized}.session"),
-        format!("{sanitized}.cache"),
-    ] {
+    for name in auth_file_names(username, ACCOUNT_REALM) {
         let source_path = source.join(&name);
         if source_path.is_file() {
             std::fs::copy(&source_path, destination.join(&name)).unwrap_or_else(|error| {
@@ -68,23 +60,259 @@ fn refresh_isolated_auth_material(username: &str, shared_cookie_dir: &Path) {
     });
 }
 
+const ACCOUNT_REALM: &str = "com";
+
+fn fingerprint_input(kind: &str, values: &[&str]) -> Vec<u8> {
+    let mut bytes = kind.as_bytes().to_vec();
+    for value in values {
+        bytes.extend_from_slice(value.len().to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    bytes
+}
+
+fn fingerprint(kind: &str, values: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hash = Sha256::new();
+    hash.update(fingerprint_input(kind, values));
+    format!("{:x}", hash.finalize())
+}
+
+fn account_namespace(username: &str, realm: &str) -> String {
+    format!(
+        "account-v1-{}",
+        fingerprint("configured-account-v1", &[realm, username])
+    )
+}
+
+fn auth_file_names(username: &str, realm: &str) -> [String; 3] {
+    let namespace = account_namespace(username, realm);
+    [
+        namespace.clone(),
+        format!("{namespace}.session"),
+        format!("{namespace}.cache"),
+    ]
+}
+
+fn write_auth_files(source: &Path, names: &[String; 3], prefix: &str) {
+    for (index, name) in names.iter().enumerate() {
+        std::fs::write(source.join(name.as_str()), format!("{prefix}-{index}"))
+            .expect("write auth source");
+    }
+}
+
+fn destination_file_names(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = walkdir(directory)
+        .into_iter()
+        .map(|path| {
+            path.file_name()
+                .expect("auth file name")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 #[test]
 fn repeated_isolated_data_dirs_remain_available() {
     let source = tempfile::tempdir().expect("create auth source");
-    std::fs::write(source.path().join("userexamplecom.session"), b"session")
-        .expect("write auth source");
+    let names = auth_file_names("user@example.com", ACCOUNT_REALM);
+    for name in &names {
+        std::fs::write(source.path().join(name.as_str()), b"session").expect("write auth source");
+    }
 
     let first = isolated_data_dir("user@example.com", source.path());
     let second = isolated_data_dir("user@example.com", source.path());
 
     assert_ne!(first, second);
+    for name in &names {
+        assert_eq!(
+            std::fs::read(first.join(name.as_str())).expect("read first auth copy"),
+            b"session"
+        );
+        assert_eq!(
+            std::fs::read(second.join(name.as_str())).expect("read second auth copy"),
+            b"session"
+        );
+    }
+}
+
+#[test]
+fn copies_exactly_three_namespaced_auth_files() {
+    let source = tempfile::tempdir().expect("create auth source");
+    let destination = tempfile::tempdir().expect("create auth destination");
+    let username = "user@example.com";
+    let names = auth_file_names(username, ACCOUNT_REALM);
+    write_auth_files(source.path(), &names, "auth");
+
+    copy_auth_material(username, source.path(), destination.path());
+
+    let mut expected = names.to_vec();
+    expected.sort();
+    assert_eq!(destination_file_names(destination.path()), expected);
+    for (index, name) in names.iter().enumerate() {
+        assert_eq!(
+            std::fs::read(destination.path().join(name.as_str())).expect("read copied auth file"),
+            format!("auth-{index}").into_bytes()
+        );
+    }
+}
+
+#[test]
+fn copies_no_legacy_database_wal_shm_or_lock_files() {
+    let source = tempfile::tempdir().expect("create auth source");
+    let destination = tempfile::tempdir().expect("create auth destination");
+    let username = "user@example.com";
+    let names = auth_file_names(username, ACCOUNT_REALM);
+    write_auth_files(source.path(), &names, "auth");
+
+    let sanitized: String = username
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let legacy_names = [
+        sanitized.clone(),
+        format!("{sanitized}.session"),
+        format!("{sanitized}.cache"),
+    ];
+    for name in &legacy_names {
+        std::fs::write(source.path().join(name.as_str()), b"legacy")
+            .expect("write legacy auth source");
+    }
+    let namespace = account_namespace(username, ACCOUNT_REALM);
+    let excluded_names = [
+        "state.db".to_string(),
+        "state.db-wal".to_string(),
+        "state.db-shm".to_string(),
+        "state.lock".to_string(),
+        format!("{namespace}.db"),
+        format!("{namespace}.db-wal"),
+        format!("{namespace}.db-shm"),
+        format!("{namespace}.lock"),
+        "unrelated.txt".to_string(),
+    ];
+    for name in &excluded_names {
+        std::fs::write(source.path().join(name.as_str()), b"excluded")
+            .expect("write excluded auth source");
+    }
+
+    copy_auth_material(username, source.path(), destination.path());
+
+    let mut expected = names.to_vec();
+    expected.sort();
+    assert_eq!(destination_file_names(destination.path()), expected);
+    for name in legacy_names.iter().chain(excluded_names.iter()) {
+        assert!(
+            !destination.path().join(name.as_str()).exists(),
+            "unexpected copied file {name}"
+        );
+        assert!(
+            source.path().join(name.as_str()).is_file(),
+            "source file was removed: {name}"
+        );
+    }
+}
+
+#[test]
+fn collision_usernames_get_distinct_namespaces() {
+    let source = tempfile::tempdir().expect("create auth source");
+    let first_username = "user@example.com";
+    let second_username = "userexamplecom";
+    let first_names = auth_file_names(first_username, ACCOUNT_REALM);
+    let second_names = auth_file_names(second_username, ACCOUNT_REALM);
+    assert_ne!(first_names, second_names);
+    write_auth_files(source.path(), &first_names, "first");
+    write_auth_files(source.path(), &second_names, "second");
+    let sanitized: String = first_username
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let legacy_session = format!("{sanitized}.session");
+    std::fs::write(source.path().join(&legacy_session), b"legacy")
+        .expect("write legacy collision source");
+
+    let first = isolated_data_dir(first_username, source.path());
+    let second = isolated_data_dir(second_username, source.path());
+
+    for (index, name) in first_names.iter().enumerate() {
+        assert_eq!(
+            std::fs::read(first.join(name.as_str())).expect("read first user auth"),
+            format!("first-{index}").into_bytes()
+        );
+        assert!(!second.join(name.as_str()).exists());
+    }
+    for (index, name) in second_names.iter().enumerate() {
+        assert_eq!(
+            std::fs::read(second.join(name.as_str())).expect("read second user auth"),
+            format!("second-{index}").into_bytes()
+        );
+        assert!(!first.join(name.as_str()).exists());
+    }
+    assert!(!first.join(legacy_session.as_str()).exists());
+    assert!(!second.join(legacy_session.as_str()).exists());
+}
+
+#[test]
+fn refresh_updates_all_isolated_dirs_for_same_account() {
+    let source = tempfile::tempdir().expect("create auth source");
+    let username = "user@example.com";
+    let names = auth_file_names(username, ACCOUNT_REALM);
+    write_auth_files(source.path(), &names, "initial");
+
+    let first = isolated_data_dir(username, source.path());
+    let second = isolated_data_dir(username, source.path());
+    std::fs::write(first.join("sentinel"), b"keep").expect("write first sentinel");
+    std::fs::write(second.join("sentinel"), b"keep").expect("write second sentinel");
+
+    write_auth_files(source.path(), &names, "refreshed");
+    refresh_isolated_auth_material(username, source.path());
+
+    for directory in [&first, &second] {
+        assert!(directory.is_dir(), "isolated data dir was removed");
+        assert_eq!(
+            std::fs::read(directory.join("sentinel")).expect("read sentinel"),
+            b"keep"
+        );
+        for (index, name) in names.iter().enumerate() {
+            assert_eq!(
+                std::fs::read(directory.join(name.as_str())).expect("read refreshed auth"),
+                format!("refreshed-{index}").into_bytes()
+            );
+        }
+    }
+}
+
+#[test]
+fn account_namespace_preserves_com_and_cn_realms() {
+    let username = "first.last@example.invalid";
+    let com = account_namespace(username, "com");
+    let cn = account_namespace(username, "cn");
+    assert_eq!(com, account_namespace(username, "com"));
+    assert_eq!(cn, account_namespace(username, "cn"));
+    assert_ne!(com, cn);
+    assert!(com.starts_with("account-v1-"));
+    assert!(cn.starts_with("account-v1-"));
+    assert_eq!(com.len(), 75);
+    assert_eq!(cn.len(), 75);
+}
+
+#[test]
+fn account_namespace_matches_fixed_derivation_vector() {
     assert_eq!(
-        std::fs::read(first.join("userexamplecom.session")).expect("read first auth copy"),
-        b"session"
+        fingerprint_input("configured-account-v1", &["com", "u"]),
+        b"configured-account-v13:com1:u".to_vec()
     );
     assert_eq!(
-        std::fs::read(second.join("userexamplecom.session")).expect("read second auth copy"),
-        b"session"
+        fingerprint("abc", &[]),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        account_namespace("u", "com"),
+        "account-v1-94c1c6a7a5c5d32c5fa832d47ec730268f75a8a3089682138e4e649198875dc4"
     );
 }
 
@@ -213,12 +441,9 @@ fn ensure_session(username: &str, password: &str, cookie_dir: &Path) {
         // the WEBAUTH-TOKEN cookie (set only after 2FA trust is established).
         // Without this check, a session that lost trust (e.g., after a 421
         // storm) would be considered "fresh" but fail with 2FA required.
-        let sanitized: String = username
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .collect();
-        let session_file = cookie_dir.join(format!("{sanitized}.session"));
-        let cookie_file = cookie_dir.join(&sanitized);
+        let namespace = account_namespace(username, ACCOUNT_REALM);
+        let session_file = cookie_dir.join(format!("{namespace}.session"));
+        let cookie_file = cookie_dir.join(&namespace);
         let session_fresh = std::fs::metadata(&session_file)
             .ok()
             .and_then(|m| m.modified().ok())
