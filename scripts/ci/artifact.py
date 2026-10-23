@@ -23,6 +23,15 @@ ARCHIVES = {
 }
 CONTAINERS = {"container-amd64": "linux/amd64", "container-arm64": "linux/arm64"}
 OUT = Path("candidate")
+DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+MAX_JSON_BYTES = 8 * 1024 * 1024
+LAYER_CHUNK = 1024 * 1024
+COMPRESSED_MAGIC = (
+    bytes.fromhex("1f8b"),
+    bytes.fromhex("28b52ffd"),
+    bytes.fromhex("fd377a585a00"),
+    b"BZh",
+)
 
 
 def run(*args: str, **kwargs) -> str:
@@ -98,6 +107,182 @@ def container(arch: str) -> None:
     record(name, CONTAINERS[name], archive, image_id=info["Id"])
 
 
+def _archive_members(tar: tarfile.TarFile) -> dict[str, tarfile.TarInfo]:
+    members: dict[str, tarfile.TarInfo] = {}
+    for member in tar:
+        if member.issym() or member.islnk() or not (member.isreg() or member.isdir()):
+            raise ValueError(f"unsupported archive member: {member.name}")
+        if member.name in members:
+            raise ValueError(f"duplicate archive member: {member.name}")
+        members[member.name] = member
+    return members
+
+
+def _member(
+    members: dict[str, tarfile.TarInfo],
+    name: str,
+    label: str,
+) -> tarfile.TarInfo:
+    member = members.get(name)
+    if member is None:
+        raise ValueError(f"missing {label}: {name}")
+    if not member.isreg():
+        raise ValueError(f"{label} is not a regular file: {name}")
+    return member
+
+
+def _member_bytes(
+    tar: tarfile.TarFile,
+    member: tarfile.TarInfo,
+    label: str,
+) -> bytes:
+    if member.size < 0 or member.size > MAX_JSON_BYTES:
+        raise ValueError(f"{label} size is out of bounds")
+    stream = tar.extractfile(member)
+    if stream is None:
+        raise ValueError(f"{label} is unreadable")
+    try:
+        data = stream.read(MAX_JSON_BYTES + 1)
+    finally:
+        stream.close()
+    if len(data) != member.size:
+        raise ValueError(f"{label} was truncated")
+    return data
+
+
+def _manifest(
+    tar: tarfile.TarFile,
+    members: dict[str, tarfile.TarInfo],
+) -> tuple[str, list[str]]:
+    member = _member(members, "manifest.json", "manifest")
+    data = _member_bytes(tar, member, "manifest")
+    try:
+        manifest = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("manifest is not valid JSON") from error
+    if not isinstance(manifest, list) or len(manifest) != 1:
+        raise ValueError("manifest must describe exactly one image")
+    entry = manifest[0]
+    if not isinstance(entry, dict):
+        raise ValueError("manifest entry is malformed")
+    config = entry.get("Config")
+    layers = entry.get("Layers")
+    tags = entry.get("RepoTags")
+    if not isinstance(config, str) or not config:
+        raise ValueError("manifest config path is malformed")
+    if (
+        not isinstance(layers, list)
+        or not all(isinstance(layer, str) and layer for layer in layers)
+    ):
+        raise ValueError("manifest layer paths are malformed")
+    if len(set(layers)) != len(layers):
+        raise ValueError("manifest repeats a layer")
+    if config in layers:
+        raise ValueError("manifest reuses config as a layer")
+    if (
+        not isinstance(tags, list)
+        or not all(isinstance(tag, str) for tag in tags)
+        or "kei:candidate" not in tags
+    ):
+        raise ValueError("manifest does not identify kei:candidate")
+    return config, layers
+
+
+def _layer_digest(tar: tarfile.TarFile, member: tarfile.TarInfo, label: str) -> str:
+    stream = tar.extractfile(member)
+    if stream is None:
+        raise ValueError(f"layer is unreadable: {label}")
+    hasher = hashlib.sha256()
+    try:
+        first = stream.read(LAYER_CHUNK)
+        if first.startswith(COMPRESSED_MAGIC):
+            raise ValueError(f"compressed layer is unsupported: {label}")
+        hasher.update(first)
+        while True:
+            chunk = stream.read(LAYER_CHUNK)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    finally:
+        stream.close()
+    return "sha256:" + hasher.hexdigest()
+
+
+def _verify_config(config: object, architecture: str, layer_digests: list[str]) -> None:
+    if not isinstance(config, dict):
+        raise ValueError("config is malformed")
+    if config.get("os") != "linux":
+        raise ValueError("config operating system is unsupported")
+    if config.get("architecture") != architecture:
+        raise ValueError("config architecture does not match target")
+    rootfs = config.get("rootfs")
+    if not isinstance(rootfs, dict):
+        raise ValueError("config rootfs is malformed")
+    diff_ids = rootfs.get("diff_ids")
+    if not isinstance(diff_ids, list) or not all(isinstance(value, str) for value in diff_ids):
+        raise ValueError("config rootfs.diff_ids is malformed")
+    if len(diff_ids) != len(layer_digests):
+        raise ValueError("config layer count does not match archive")
+    for index, (expected, actual) in enumerate(zip(diff_ids, layer_digests)):
+        if DIGEST_RE.fullmatch(expected) is None:
+            raise ValueError(f"invalid layer digest at index {index}")
+        if expected != actual:
+            raise ValueError(f"layer digest mismatch at index {index}")
+
+
+def _verify_saved_archive(path: Path, image_id: str, architecture: str) -> None:
+    if DIGEST_RE.fullmatch(image_id) is None:
+        raise ValueError("invalid container image ID")
+    try:
+        with tarfile.open(path, "r:") as tar:
+            members = _archive_members(tar)
+            config_name, layers = _manifest(tar, members)
+            config_member = _member(members, config_name, "config")
+            config_bytes = _member_bytes(tar, config_member, "config")
+            if "sha256:" + hashlib.sha256(config_bytes).hexdigest() != image_id:
+                raise ValueError("config digest does not match recorded image ID")
+            try:
+                config = json.loads(config_bytes)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError("config is not valid JSON") from error
+            layer_digests = [
+                _layer_digest(tar, _member(members, name, "layer"), name)
+                for name in layers
+            ]
+            _verify_config(config, architecture, layer_digests)
+    except tarfile.TarError as error:
+        raise ValueError(f"invalid container archive: {path}") from error
+
+
+def verify_loaded_container(arch: str) -> None:
+    name = f"container-{arch}"
+    target = CONTAINERS.get(name)
+    if target is None:
+        raise ValueError("unknown container architecture")
+    sha, version = identity()
+    record_path = OUT / f"{name}.json"
+    item = json.loads(record_path.read_text())
+    if not isinstance(item, dict):
+        raise ValueError(f"invalid candidate record: {name}")
+    filename = f"{name}.tar"
+    if any(item.get(key) != value for key, value in {
+        "sha": sha, "version": version, "target": target, "file": filename,
+    }.items()):
+        raise ValueError(f"invalid candidate identity: {name}")
+    image_id = item.get("image_id")
+    if not isinstance(image_id, str) or DIGEST_RE.fullmatch(image_id) is None:
+        raise ValueError(f"invalid container image ID: {name}")
+    archive = OUT / filename
+    if item.get("sha256") != digest(archive):
+        raise ValueError(f"candidate checksum mismatch: {name}")
+    architecture = target.rsplit("/", maxsplit=1)[1]
+    _verify_saved_archive(archive, image_id, architecture)
+    with tempfile.TemporaryDirectory() as work:
+        fresh = Path(work) / filename
+        subprocess.run(["docker", "save", "--output", str(fresh), "kei:candidate"], check=True)
+        _verify_saved_archive(fresh, image_id, architecture)
+
+
 def verify(directory: Path = OUT) -> dict:
     sha, version = identity()
     records = []
@@ -129,7 +314,9 @@ if __name__ == "__main__":
             container(*arguments)
         elif command == "verify":
             verify()
+        elif command == "verify-loaded-container":
+            verify_loaded_container(*arguments)
         else:
-            raise ValueError("expected package, container, or verify")
+            raise ValueError("expected package, container, verify, or verify-loaded-container")
     except (ValueError, OSError, subprocess.CalledProcessError) as error:
         sys.exit(str(error))

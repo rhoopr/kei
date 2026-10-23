@@ -202,3 +202,17 @@ release concurrency groups are separate. Nightly work cannot cancel a release.
 [OpenCode advisory review](opencode-review.md) documents the optional bot review,
 secret setup, provider data transmission, limits, and security boundary. It is
 advisory and does not contribute to the required CI gate.
+
+## Resume a partially published release
+
+The Release workflow accepts optional `publication_run` and `publication_tag`
+inputs together when dispatched from main. This mode publishes retained container
+artifacts and updates Homebrew; it does not rebuild, republish archives, or move
+the release tag. The tag must be the latest public stable release, and the original
+tag-push run must have successful validation, heavy qualification and archive
+publication for that exact commit.
+
+The resume path checks artifact checksums and provenance again. After loading each
+container, it verifies the exact config digest and ordered uncompressed layer
+digests from a fresh Docker save, rather than comparing storage-backend-specific
+image IDs. Missing, ambiguous or mismatched evidence stops publication.

@@ -4,6 +4,15 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      publication_run:
+        description: Original release run ID to resume
+        required: false
+        type: string
+      publication_tag:
+        description: Stable release tag to resume
+        required: false
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,7 +22,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.publication_tag && format('refs/tags/{0}', inputs.publication_tag) || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -21,6 +30,7 @@ jobs:
   # Catches version mismatches, missing CHANGELOG, and new advisories
   # before burning 15+ minutes of build time.
   validate:
+    if: github.event_name != 'workflow_dispatch' || (inputs.publication_run == '' && inputs.publication_tag == '')
     permissions:
       contents: read
       statuses: read
@@ -156,9 +166,8 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           for arch in amd64 arm64; do
             docker load --input "candidate/container-$arch.tar"
-            id=$(jq -er .image_id "candidate/container-$arch.json")
-            test "$(docker image inspect kei:candidate --format '{{.Id}}')" = "$id"
-            docker tag "$id" "$image:$version-$arch"
+            python3 scripts/ci/artifact.py verify-loaded-container "$arch"
+            docker tag kei:candidate "$image:$version-$arch"
             docker push "$image:$version-$arch"
           done
           docker buildx imagetools create -t "$image:$version" "$image:$version-amd64" "$image:$version-arm64"
@@ -167,9 +176,86 @@ jobs:
             docker buildx imagetools create -t "$image:${version%.*}" -t "$image:latest" "$image:$version"
           fi
 
-  homebrew:
-    needs: [release, containers]
+  resume_containers:
+    if: github.event_name == 'workflow_dispatch' && (inputs.publication_run != '' || inputs.publication_tag != '') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+    steps:
+      - name: Checkout trusted workflow source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate the original run and release
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_RUN: ${{ inputs.publication_run }}
+          PUBLICATION_TAG: ${{ inputs.publication_tag }}
+        run: python3 scripts/ci/publication.py --repo "$GITHUB_REPOSITORY" --run "$PUBLICATION_RUN" --tag "$PUBLICATION_TAG"
+
+      - name: Checkout the validated release commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ steps.validate.outputs.sha }}
+          path: qualified
+          persist-credentials: false
+
+      - name: Download retained qualified candidates
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: candidate-*
+          path: qualified/candidate
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.validate.outputs.run_id }}
+
+      - name: Reverify retained candidates
+        working-directory: qualified
+        env:
+          RELEASE_SHA: ${{ steps.validate.outputs.sha }}
+        run: env GITHUB_SHA="$RELEASE_SHA" python3 ../scripts/ci/artifact.py verify
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the verified retained images without rebuilding
+        working-directory: qualified
+        env:
+          RELEASE_TAG: ${{ steps.validate.outputs.tag }}
+          RELEASE_SHA: ${{ steps.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          version="${RELEASE_TAG#v}"
+          for arch in amd64 arm64; do
+            docker load --input "candidate/container-$arch.tar"
+            env GITHUB_SHA="$RELEASE_SHA" python3 ../scripts/ci/artifact.py verify-loaded-container "$arch"
+            docker tag kei:candidate "$image:$version-$arch"
+            docker push "$image:$version-$arch"
+          done
+          docker buildx imagetools create -t "$image:$version" "$image:$version-amd64" "$image:$version-arm64"
+          docker buildx imagetools create -t "$image:${version%.*}" -t "$image:latest" "$image:$version"
+
+  homebrew:
+    needs: [release, containers, resume_containers]
+    if: |
+      always() && (
+        (needs.release.result == 'success' && needs.containers.result == 'success') ||
+        needs.resume_containers.result == 'success'
+      )
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ needs.resume_containers.result == 'success' && needs.resume_containers.outputs.tag || github.ref_name }}
     steps:
       - name: Checkout tap
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -179,8 +265,8 @@ jobs:
 
       - name: Update formula
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          BASE="https://github.com/rhoopr/kei/releases/download/${{ github.ref_name }}"
+          VERSION="${RELEASE_TAG#v}"
+          BASE="https://github.com/rhoopr/kei/releases/download/${RELEASE_TAG}"
 
           declare -A ASSETS=(
             [macos-aarch64]="kei-macos-aarch64.tar.gz"
@@ -255,5 +341,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/kei.rb
-          git commit -m "kei ${GITHUB_REF_NAME#v}"
+          git commit -m "kei ${RELEASE_TAG#v}"
           git push

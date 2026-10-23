@@ -95,11 +95,22 @@ def check_release(errors: list[str]) -> None:
         errors.append("release.yml: missing top-level read-only token permissions")
     if "cargo build --locked --release --target ${{ matrix.target }}" not in workflow_text("artifacts.yml"):
         errors.append("release.yml: release builds must use cargo build --locked")
-    for needle in ("statuses: read", "needs: qualification", "needs: [qualification, release]", "needs: [release, containers]",
+    for needle in ("statuses: read", "needs: qualification", "needs: [qualification, release]", "needs: [release, containers, resume_containers]",
                    "scripts/ci/local_release.py check", "uses: ./.github/workflows/qualification.yml",
                    "python3 scripts/ci/artifact.py verify", "docker load --input"):
         if needle not in text:
             errors.append(f"release.yml: missing qualification guard: {needle}")
+    for needle in (
+        "github.ref == 'refs/heads/main'",
+        'scripts/ci/publication.py --repo "$GITHUB_REPOSITORY"',
+        'run-id: ${{ steps.validate.outputs.run_id }}',
+        'ref: ${{ steps.validate.outputs.sha }}',
+        'env GITHUB_SHA="$RELEASE_SHA" python3 ../scripts/ci/artifact.py verify',
+        'env GITHUB_SHA="$RELEASE_SHA" python3 ../scripts/ci/artifact.py verify-loaded-container',
+        "needs.resume_containers.result == 'success'",
+    ):
+        if needle not in text:
+            errors.append(f"release.yml: missing publication-resume guard: {needle}")
     if text.count("if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')") != 2:
         errors.append("release.yml: release and containers must both be tag-only")
     if 'curl -fsSL "$BASE/SHA256SUMS.txt"' not in text:
