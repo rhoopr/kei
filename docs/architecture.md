@@ -402,6 +402,16 @@ an invalid private page or a mismatched index entry fails validation. A replay
 always reprojects the durable source, so an interruption after capture but before
 projection recovers on the next equivalent observation.
 
+If the index misses, capture also checks saved raw responses from the same
+account, provider, scope, request cursor and successor. This covers older pages
+that were left without an index entry, including databases already opened by
+v0.26.0. Reuse requires the same complete proof plus valid catalogue and dependent
+records; it keeps the original page ID, body and historical hash. When space
+permits, capture adds the missing index entry and charges its 96-byte overhead
+in the same transaction. At capacity it can reuse the proven response without
+adding the entry; a later retry checks the proof again. No startup-wide rewrite,
+new schema version, evidence deletion or checkpoint change is involved.
+
 The same schema step compacts finite legacy duplicates before ordinary admission.
 It streams one body at a time inside the migration savepoint and requires a
 validated raw hash, provider-owned evidence, exact account/provider/scope/cursor/

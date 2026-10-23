@@ -485,6 +485,64 @@ fn projection_is_valid(conn: &Connection, page: &StoredPage) -> Result<bool, Sta
         && dependencies_are_valid(conn, page)?)
 }
 
+/// Find a retained raw page that the classifier proves equivalent to an
+/// incoming page while no canonical index exists. Candidate rows are streamed
+/// by the existing scoped lookup; the caller writes only after this returns.
+fn find_legacy_equivalent(
+    conn: &Connection,
+    account_key: &str,
+    provider_key: &str,
+    page: &ObservedPage,
+    evidence: &crate::icloud::photos::transport_evidence::TransportEvidence,
+    canonical_sha: &str,
+) -> Result<Option<CapturedPageId>, StateError> {
+    let mut candidates = conn.prepare(
+        "SELECT p.id FROM provider_shadow_pages p WHERE p.account_key=?1 AND p.provider_key=?2 AND p.scope=?3 AND p.request_cursor=?4 AND p.successor=?5 AND p.more_coming=?6 AND NOT EXISTS(SELECT 1 FROM provider_transport_canonical c WHERE c.page_id=p.id) AND NOT EXISTS(SELECT 1 FROM provider_transport_aliases a WHERE a.page_id=p.id) ORDER BY p.id",
+    )?;
+    let mut rows = candidates.query(params![
+        account_key,
+        provider_key,
+        page.scope,
+        page.request_cursor,
+        page.successor,
+        page.more_coming,
+    ])?;
+    while let Some(row) = rows.next()? {
+        let id = CapturedPageId(row.get(0)?);
+        let candidate = load_page(
+            conn,
+            id,
+            crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES,
+        )?;
+        if !matches!(candidate.provenance, PageProvenance::Raw)
+            || !same_capture_metadata(&candidate.page, page)
+        {
+            continue;
+        }
+        let Some(candidate_evidence) =
+            crate::icloud::photos::transport_evidence::capture_evidence(&candidate.page)
+                .map_err(|_error| StateError::ProviderInboxInvalid)?
+        else {
+            continue;
+        };
+        if candidate_evidence.version != evidence.version
+            || candidate_evidence.masked != evidence.masked
+            || canonical_key(
+                &candidate.account_key,
+                &candidate.provider_key,
+                &candidate.page,
+                &candidate_evidence,
+            )? != canonical_sha
+            || !projection_is_valid(conn, &candidate)?
+            || !dependencies_are_valid(conn, &candidate)?
+        {
+            continue;
+        }
+        return Ok(Some(id));
+    }
+    Ok(None)
+}
+
 /// Replace strictly equivalent legacy transport duplicate bodies with typed
 /// aliases. Runs inside the schema migration savepoint, streams one body at a
 /// time, and never aliases a page whose projection, references, debt, owner,
@@ -774,6 +832,24 @@ impl SqliteStateDb {
                         .optional()?,
                     None => None,
                 };
+                let mut legacy_candidate = false;
+                let canonical_hit = if canonical_hit.is_some() {
+                    canonical_hit
+                } else if let Some((canonical_sha, version)) = canonical.as_ref() {
+                    let incoming = evidence.as_ref().ok_or(StateError::ProviderInboxInvalid)?;
+                    let found = find_legacy_equivalent(
+                        &tx,
+                        &account_key,
+                        &provider_key,
+                        &page,
+                        incoming,
+                        canonical_sha,
+                    )?;
+                    legacy_candidate = found.is_some();
+                    found.map(|id| (id.0, i64::from(*version)))
+                } else {
+                    None
+                };
                 if let Some((representative_id, stored_version)) = canonical_hit {
                     let (canonical_sha, version) =
                         canonical.as_ref().ok_or(StateError::ProviderInboxInvalid)?;
@@ -805,6 +881,31 @@ impl SqliteStateDb {
                         || !same_capture_metadata(&representative.page, &page)
                     {
                         return Err(StateError::ProviderInboxInvalid);
+                    }
+                    if legacy_candidate {
+                        let used: i64 = tx.query_row(
+                            "SELECT COALESCE(SUM(charged_bytes),0) FROM provider_shadow_pages",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        let used = u64::try_from(used)
+                            .map_err(|_error| StateError::ProviderInboxInvalid)?;
+                        if used.saturating_add(CANONICAL_INDEX_OVERHEAD_BYTES) <= capacity {
+                            let inserted = tx.execute(
+                                "INSERT INTO provider_transport_canonical(canonical_sha,version,page_id) VALUES (?1,?2,?3) ON CONFLICT(canonical_sha,version) DO NOTHING",
+                                params![canonical_sha, i64::from(*version), representative_id],
+                            )?;
+                            if inserted == 1 {
+                                tx.execute(
+                                    "UPDATE provider_shadow_pages SET charged_bytes=charged_bytes+?2 WHERE id=?1",
+                                    params![
+                                        representative_id,
+                                        i64::try_from(CANONICAL_INDEX_OVERHEAD_BYTES)
+                                            .map_err(|_error| StateError::ProviderInboxInvalid)?
+                                    ],
+                                )?;
+                            }
+                        }
                     }
                     storage = (StorageOutcome::Equivalent, None);
                     representative_id
@@ -1235,6 +1336,440 @@ mod tests {
         conn.execute("UPDATE provider_shadow_pages SET body=X'00' WHERE id=1", [])
             .unwrap();
         assert!(load_page(&conn, CapturedPageId(2), 16 * 1024 * 1024).is_err());
+    }
+
+    /// Schema 35 fixture with one released-charge page whose projection is
+    /// valid but not canonically indexed; lazy capture must recover it.
+    fn legacy_singleton_v35(path: &std::path::Path) -> (AccountOwner, ObservedPage) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE account_owner(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL,account_key TEXT NOT NULL,provider_key TEXT NOT NULL);").unwrap();
+        conn.execute(
+            "INSERT INTO account_owner VALUES(1,1,?1,?2)",
+            params![
+                crate::account::namespace(USER, "com"),
+                crate::account::provider_fingerprint("com", "legacy-provider")
+            ],
+        )
+        .unwrap();
+        for version in 1..=35 {
+            crate::state::schema::migrate_to_version(&conn, 0, version).unwrap();
+        }
+        let (account_key, provider_key): (String, String) = conn
+            .query_row(
+                "SELECT account_key,provider_key FROM account_owner",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let page = observed("https://p01.icloud-content.com/asset-1?token=first");
+        let charge = released_charge(&page, &account_key, &provider_key);
+        let id = insert_legacy(&conn, &page, i64::try_from(charge).unwrap());
+        insert_projection(&conn, id, &page);
+        conn.execute(
+            "INSERT INTO metadata(key,value) VALUES ('sync_token:PrimarySync','saved'),('pending_sync_token:old:PrimarySync','debt')",
+            [],
+        )
+        .unwrap();
+        (owner_record(), page)
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Snapshot {
+        pages: i64,
+        canonical: i64,
+        aliases: i64,
+        charge: i64,
+        body: Vec<u8>,
+        hash: String,
+        identities: Vec<(String, Option<String>, bool)>,
+        catalog: (String, i64, i64, i64),
+        checkpoints: (String, String),
+    }
+
+    fn count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    fn snapshot(conn: &Connection) -> Snapshot {
+        let (body, hash, charge) = conn
+            .query_row(
+                "SELECT body,body_hash,charged_bytes FROM provider_shadow_pages WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let mut stmt = conn.prepare("SELECT record_name,record_type,deleted FROM provider_shadow_records WHERE page_id=1 ORDER BY ordinal").unwrap();
+        let identities = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let catalog = conn.query_row("SELECT body_hash,record_count,reference_count,debt_count FROM provider_catalog_pages WHERE page_id=1", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        let checkpoints = conn.query_row("SELECT (SELECT value FROM metadata WHERE key='sync_token:PrimarySync'),(SELECT value FROM metadata WHERE key='pending_sync_token:old:PrimarySync')", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        Snapshot {
+            pages: count(conn, "provider_shadow_pages"),
+            canonical: count(conn, "provider_transport_canonical"),
+            aliases: count(conn, "provider_transport_aliases"),
+            charge,
+            body,
+            hash,
+            identities,
+            catalog,
+            checkpoints,
+        }
+    }
+
+    fn tight(before: i64) -> u64 {
+        u64::try_from(before).unwrap() + super::CANONICAL_INDEX_OVERHEAD_BYTES
+    }
+
+    fn with_lazy_index(mut base: Snapshot) -> Snapshot {
+        base.canonical = 1;
+        base.charge += i64::try_from(super::CANONICAL_INDEX_OVERHEAD_BYTES).unwrap();
+        base
+    }
+
+    fn evidence_identity(page: &ObservedPage) -> String {
+        let evidence = crate::icloud::photos::transport_evidence::capture_evidence(page)
+            .ok()
+            .flatten()
+            .expect("synthetic page must classify");
+        format!("{:?}|{:?}", evidence.version, evidence.masked)
+    }
+
+    fn replace_body(mut page: ObservedPage, from: &str, to: &str) -> ObservedPage {
+        page.body = String::from_utf8(page.body)
+            .unwrap()
+            .replace(from, to)
+            .into_bytes();
+        page
+    }
+
+    fn check(db: &crate::state::SqliteStateDb, label: &str, expected: &Snapshot) {
+        let conn = db.acquire_lock(label).unwrap();
+        assert_eq!(&snapshot(&conn), expected);
+    }
+
+    async fn open_ready(
+        path: &std::path::Path,
+        owner: &AccountOwner,
+    ) -> (crate::state::SqliteStateDb, Snapshot) {
+        let db = crate::state::SqliteStateDb::open_owned(path, owner)
+            .await
+            .unwrap();
+        let baseline = {
+            let conn = db.acquire_lock("open legacy fixture").unwrap();
+            assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+            assert_eq!(count(&conn, "provider_transport_canonical"), 0);
+            assert_eq!(count(&conn, "provider_transport_aliases"), 0);
+            snapshot(&conn)
+        };
+        (db, baseline)
+    }
+
+    #[tokio::test]
+    async fn legacy_singleton_url_variants_recover_once() {
+        for pre_migrated in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory
+                .path()
+                .join(format!("singleton-{pre_migrated}.db"));
+            let (owner, original) = legacy_singleton_v35(&path);
+            if pre_migrated {
+                let conn = Connection::open(&path).unwrap();
+                crate::state::schema::migrate(&conn).unwrap();
+            }
+            let (db, baseline) = open_ready(&path, &owner).await;
+            let replay = db
+                .capture_shadow_page(owner.clone(), original.clone(), 512 * 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(replay.0, 1);
+            check(&db, "exact replay", &baseline);
+            let original_evidence = evidence_identity(&original);
+            for index in 0..65 {
+                let variant = observed(&format!(
+                    "https://p01.icloud-content.com/asset-{index}?token=variant-{index}"
+                ));
+                assert_eq!(evidence_identity(&variant), original_evidence);
+                let id = db
+                    .capture_shadow_page(owner.clone(), variant, tight(baseline.charge))
+                    .await
+                    .unwrap();
+                assert_eq!(id.0, 1);
+            }
+            let expected = with_lazy_index(baseline.clone());
+            {
+                let conn = db.acquire_lock("indexed singleton").unwrap();
+                assert_eq!(snapshot(&conn), expected);
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        "SELECT page_id FROM provider_transport_canonical",
+                        [],
+                        |row| row.get(0)
+                    )
+                    .unwrap(),
+                    1
+                );
+            }
+            drop(db);
+            let reopened = crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .unwrap();
+            check(&reopened, "reopened singleton", &expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_singleton_exact_capacity_defers_index_until_headroom() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("singleton-exact.db");
+        let (owner, original) = legacy_singleton_v35(&path);
+        let (db, baseline) = open_ready(&path, &owner).await;
+        let exact = u64::try_from(baseline.charge).unwrap();
+        let original_evidence = evidence_identity(&original);
+        for index in 0..65 {
+            let variant = observed(&format!(
+                "https://p02.icloud-content.com/exact-{index}?token=exact-{index}"
+            ));
+            assert_eq!(evidence_identity(&variant), original_evidence);
+            let id = db
+                .capture_shadow_page(owner.clone(), variant, exact)
+                .await
+                .unwrap();
+            assert_eq!(id.0, 1);
+        }
+        check(&db, "exact-capacity singleton", &baseline);
+        drop(db);
+        let reopened = crate::state::SqliteStateDb::open_owned(&path, &owner)
+            .await
+            .unwrap();
+        check(&reopened, "reopened exact-capacity singleton", &baseline);
+        assert_eq!(
+            reopened
+                .capture_shadow_page(
+                    owner.clone(),
+                    observed("https://p02.icloud-content.com/reopened?token=fresh"),
+                    exact
+                )
+                .await
+                .unwrap()
+                .0,
+            1
+        );
+        check(&reopened, "reopened no-index replay", &baseline);
+        let expected = with_lazy_index(baseline.clone());
+        let first = observed("https://p03.icloud-content.com/headroom?token=one");
+        assert_eq!(evidence_identity(&first), original_evidence);
+        let id = reopened
+            .capture_shadow_page(owner.clone(), first, tight(baseline.charge))
+            .await
+            .unwrap();
+        assert_eq!(id.0, 1);
+        check(&reopened, "headroom indexed singleton", &expected);
+        let second = observed("https://p04.icloud-content.com/again?token=two");
+        let id = reopened
+            .capture_shadow_page(owner.clone(), second, tight(baseline.charge))
+            .await
+            .unwrap();
+        assert_eq!(id.0, 1);
+        check(&reopened, "index charged once", &expected);
+    }
+
+    #[tokio::test]
+    async fn legacy_singleton_rejects_non_equivalent_and_invalid_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("singleton-negative.db");
+        let (owner, original) = legacy_singleton_v35(&path);
+        let (db, baseline) = open_ready(&path, &owner).await;
+        let capacity = tight(baseline.charge);
+        let tag = replace_body(original.clone(), "\"tag-1\"", "\"tag-2\"");
+        let unknown = replace_body(
+            original.clone(),
+            "\"recordChangeTag\":\"tag-1\"",
+            "\"recordChangeTag\":\"tag-1\",\"unknownField\":{\"type\":\"UNKNOWN\",\"value\":\"surprise\"}",
+        );
+        let mut cursor = original.clone();
+        cursor.request_cursor = "cursor-2".to_owned();
+        let mut realm = original.clone();
+        realm.scope = original
+            .scope
+            .replace("\"legacy-realm\"", "\"another-realm\"");
+        assert!(serde_json::from_str::<serde_json::Value>(&realm.scope).is_ok());
+        let shape = replace_body(
+            original.clone(),
+            "\"type\":\"ASSETID\"",
+            "\"type\":\"FUTURE_ASSET\"",
+        );
+        for variant in [tag, unknown, cursor, realm, shape] {
+            let error = db
+                .capture_shadow_page(owner.clone(), variant, capacity)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::state::error::StateError::ProviderInboxFull
+            ));
+            check(&db, "non-equivalent refusal", &baseline);
+        }
+        {
+            let conn = db.acquire_lock("corrupt projection").unwrap();
+            conn.execute(
+                "UPDATE provider_catalog_pages SET body_hash='corrupt' WHERE page_id=1",
+                [],
+            )
+            .unwrap();
+        }
+        let corrupt = {
+            let conn = db.acquire_lock("corrupt projection baseline").unwrap();
+            snapshot(&conn)
+        };
+        let variant = observed("https://p05.icloud-content.com/projection?token=invalid");
+        assert_eq!(evidence_identity(&variant), evidence_identity(&original));
+        let error = db
+            .capture_shadow_page(owner.clone(), variant, capacity)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::state::error::StateError::ProviderInboxFull
+        ));
+        check(&db, "invalid projection refusal", &corrupt);
+    }
+
+    #[tokio::test]
+    async fn legacy_singleton_index_rolls_back_on_charge_trigger() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("singleton-trigger.db");
+        let (owner, original) = legacy_singleton_v35(&path);
+        let (db, baseline) = open_ready(&path, &owner).await;
+        let capacity = tight(baseline.charge);
+        let variant = observed("https://p06.icloud-content.com/trigger?token=blocked");
+        assert_eq!(evidence_identity(&variant), evidence_identity(&original));
+        {
+            let conn = db.acquire_lock("install charge trigger").unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_lazy_singleton_charge BEFORE UPDATE OF charged_bytes ON provider_shadow_pages BEGIN SELECT RAISE(ABORT, 'blocked lazy charge'); END;",
+            )
+            .unwrap();
+        }
+        assert!(
+            db.capture_shadow_page(owner.clone(), variant.clone(), capacity)
+                .await
+                .is_err()
+        );
+        check(&db, "trigger rollback", &baseline);
+        {
+            let conn = db.acquire_lock("drop charge trigger").unwrap();
+            conn.execute_batch("DROP TRIGGER fail_lazy_singleton_charge")
+                .unwrap();
+        }
+        let id = db
+            .capture_shadow_page(owner.clone(), variant, capacity)
+            .await
+            .unwrap();
+        assert_eq!(id.0, 1);
+        check(&db, "trigger retry", &with_lazy_index(baseline));
+    }
+    #[tokio::test]
+    async fn legacy_singleton_damaged_evidence_stays_untouched() {
+        for damage in ["hash", "unprojected_dependency"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("damaged.db");
+            let (owner, original) = legacy_singleton_v35(&path);
+            let (db, baseline) = open_ready(&path, &owner).await;
+            {
+                let conn = db.acquire_lock("damage singleton fixture").unwrap();
+                if damage == "hash" {
+                    conn.execute(
+                        "UPDATE provider_shadow_pages SET body_hash='invalid' WHERE id=1",
+                        [],
+                    )
+                    .unwrap();
+                } else {
+                    conn.execute("DELETE FROM provider_catalog_pages WHERE page_id=1", [])
+                        .unwrap();
+                    conn.execute("INSERT INTO provider_work_scan(scope,config_hash,page_id,ordinal) VALUES (?1,'config',1,99)", [&original.scope]).unwrap();
+                }
+            }
+            let error = db
+                .capture_shadow_page(
+                    owner.clone(),
+                    observed("https://p07.icloud-content.com/new?token=fresh"),
+                    tight(baseline.charge),
+                )
+                .await
+                .unwrap_err();
+            if damage == "hash" {
+                assert!(matches!(
+                    error,
+                    crate::state::error::StateError::ProviderCatalogInvalid
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    crate::state::error::StateError::ProviderInboxFull
+                ));
+            }
+            let conn = db.acquire_lock("damaged evidence preserved").unwrap();
+            assert_eq!(count(&conn, "provider_shadow_pages"), 1);
+            assert_eq!(count(&conn, "provider_transport_canonical"), 0);
+            assert_eq!(charged_sum(&conn), baseline.charge);
+            let body: Vec<u8> = conn
+                .query_row(
+                    "SELECT body FROM provider_shadow_pages WHERE id=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(body, original.body);
+            if damage == "unprojected_dependency" {
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        "SELECT ordinal FROM provider_work_scan",
+                        [],
+                        |r| r.get(0)
+                    )
+                    .unwrap(),
+                    99
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_singleton_normal_capture_reprojects_without_growth() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("capture.db");
+        let (owner, _) = legacy_singleton_v35(&path);
+        let (db, baseline) = open_ready(&path, &owner).await;
+        let db = std::sync::Arc::new(db);
+        let mut capture = crate::icloud::photos::inbox::ShadowCapture::new(
+            std::sync::Arc::clone(&db),
+            owner,
+            "legacy-realm",
+        );
+        capture.capacity = u64::try_from(baseline.charge).unwrap();
+        for index in 0..3 {
+            capture
+                .capture(observed(&format!(
+                    "https://p08.icloud-content.com/capture?token={index}"
+                )))
+                .await
+                .unwrap();
+        }
+        check(&db, "normal capture unchanged", &baseline);
+        let conn = db.acquire_lock("normal capture receipt").unwrap();
+        assert_eq!(count(&conn, "provider_shadow_receipts"), 1);
+        assert_eq!(
+            conn.query_row::<i64, _, _>("SELECT page_id FROM provider_shadow_receipts", [], |r| r
+                .get(0))
+                .unwrap(),
+            1
+        );
     }
 
     fn oversized_unprojected_observed() -> ObservedPage {
