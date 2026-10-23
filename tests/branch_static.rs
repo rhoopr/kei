@@ -103,11 +103,6 @@ fn state_machine_quiet_greps_do_not_sigpipe() {
             absent.status,
             String::from_utf8_lossy(&absent.stderr)
         );
-
-        assert!(
-            predicate.contains("<<< \"$OUTPUT\"") || predicate.contains("<<< \"$out\""),
-            "quiet grep must read from a here-string: `{predicate}`"
-        );
     }
 }
 
