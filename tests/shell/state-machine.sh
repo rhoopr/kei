@@ -47,7 +47,7 @@ get_effective_enum_hash() {
     kei_db_query "SELECT value FROM metadata WHERE key IN ('pending_enum_config_hash', 'enum_config_hash') ORDER BY key DESC LIMIT 1"
 }
 check_checkpoint() {
-    if echo "$OUTPUT" | grep -q 'recent_limited_full_enumeration'; then
+    if grep -q 'recent_limited_full_enumeration' <<< "$OUTPUT"; then
         [ -z "$(get_token)" ]
         kei_check "bounded incomplete inventory does not checkpoint"
     else
@@ -142,7 +142,7 @@ KEI_DATA_DIR="$COOKIES" "$KEI" reset sync-token --yes >/dev/null
 OUTPUT=$(KEI_SYNC_LOG_LEVEL=debug kei_sync "$DIR")
 kei_check "reset sync exit status" "$?"
 echo "$OUTPUT" | grep -E "reset|clear|token|Fetching|full|incremental|download|completed"
-echo "$OUTPUT" | grep -qi "Fetching\|full enumeration"
+grep -qi "Fetching\|full enumeration" <<< "$OUTPUT"
 kei_check "full enumeration ran"
 check_checkpoint
 
@@ -154,7 +154,7 @@ if [ -n "$(get_token)" ]; then
     OUTPUT=$(KEI_SYNC_LOG_LEVEL=debug kei_sync "$DIR")
     SYNC_RC=$?
     kei_check "corrupt-token sync succeeds" "$SYNC_RC"
-    echo "$OUTPUT" | grep -qi "fallback\|full enumeration\|Fetching"
+    grep -qi "fallback\|full enumeration\|Fetching" <<< "$OUTPUT"
     kei_check "fell back to full enumeration"
     [ "$(get_token)" != 'CORRUPT_GARBAGE_TOKEN_XYZ' ]
     kei_check "corrupt token replaced"
@@ -193,7 +193,7 @@ sync_and_count_downloads() {
     out=$(kei_sync "$DIR")
     kei_check "$label exit status" "$?"
     echo "$out" | grep -E "incremental|change|download|[Cc]ompleted"
-    echo "$out" | grep -qE "No new photos|[Cc]ompleted"
+    grep -qE "No new photos|[Cc]ompleted" <<< "$out"
     kei_check "$label completed without error"
     # Parameter expansion uses glob patterns and cannot express ANSI SGR sequences.
     # shellcheck disable=SC2001
@@ -245,13 +245,13 @@ echo ""
 echo "=== 10. Session reuse check ==="
 OUTPUT=$(KEI_SYNC_LOG_LEVEL=debug kei_sync "$DIR")
 kei_check "session-reuse sync exit status" "$?"
-if echo "$OUTPUT" | grep -q "Existing session token is valid"; then
+if grep -q "Existing session token is valid" <<< "$OUTPUT"; then
     kei_check "session reuse (validate_token succeeded)" 0
-elif echo "$OUTPUT" | grep -q "accountLogin succeeded"; then
+elif grep -q "accountLogin succeeded" <<< "$OUTPUT"; then
     kei_check "session reuse (accountLogin succeeded)" 0
-elif echo "$OUTPUT" | grep -q "Session validated recently, skipping /validate call"; then
+elif grep -q "Session validated recently, skipping /validate call" <<< "$OUTPUT"; then
     kei_check "session reuse (cached validation)" 0
-elif echo "$OUTPUT" | grep -q "Authenticating\|SRP"; then
+elif grep -q "Authenticating\|SRP" <<< "$OUTPUT"; then
     echo "  INFO: session did full SRP auth"
     kei_check "session reuse" 1
 else

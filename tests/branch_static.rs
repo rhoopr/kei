@@ -29,6 +29,88 @@ fn repo_file(path: &str) -> String {
         .replace('\r', "\n")
 }
 
+#[cfg(unix)]
+#[test]
+fn state_machine_quiet_greps_do_not_sigpipe() {
+    use std::io::Write as _;
+
+    let source = repo_file("tests/shell/state-machine.sh");
+    let predicates: Vec<String> = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.contains("grep -q") && (line.contains("$OUTPUT") || line.contains("$out"))
+        })
+        .map(|line| {
+            let line = line
+                .strip_prefix("if ")
+                .or_else(|| line.strip_prefix("elif "))
+                .unwrap_or(line);
+            line.strip_suffix("; then").unwrap_or(line).to_owned()
+        })
+        .collect();
+    assert_eq!(predicates.len(), 8, "quiet search lines: {predicates:#?}");
+
+    let matching = concat!(
+        "recent_limited_full_enumeration Fetching full enumeration fallback ",
+        "No new photos Completed Existing session token is valid ",
+        "accountLogin succeeded Session validated recently, skipping /validate call ",
+        "Authenticating SRP",
+    );
+    let mut large_matching = String::from(matching);
+    large_matching.push('\n');
+    large_matching.push_str(&"x".repeat(1024 * 1024 + 1));
+    large_matching.push('\n');
+    let missing = "ordinary sync output without a matching marker\n";
+
+    let run = |predicate: &str, input: &str| {
+        let mut file = tempfile::NamedTempFile::new().expect("create quiet-grep input");
+        file.write_all(input.as_bytes())
+            .expect("write quiet-grep input");
+        file.flush().expect("flush quiet-grep input");
+        let script = format!("set -o pipefail\nOUTPUT=$(cat \"$1\")\nout=$OUTPUT\n{predicate}\n");
+        Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .arg("kei-quiet-grep")
+            .arg(file.path())
+            .output()
+            .expect("run quiet-grep predicate")
+    };
+
+    for predicate in &predicates {
+        let short = run(predicate, matching);
+        assert!(
+            short.status.success(),
+            "short match failed for `{predicate}`: {:?}\n{}",
+            short.status.code(),
+            String::from_utf8_lossy(&short.stderr)
+        );
+
+        let large = run(predicate, &large_matching);
+        assert!(
+            large.status.success(),
+            ">1MiB match-at-start failed for `{predicate}`: {:?}\n{}",
+            large.status.code(),
+            String::from_utf8_lossy(&large.stderr)
+        );
+
+        let absent = run(predicate, missing);
+        assert_eq!(
+            absent.status.code(),
+            Some(1),
+            "missing match must exit 1 for `{predicate}`: {:?}\n{}",
+            absent.status,
+            String::from_utf8_lossy(&absent.stderr)
+        );
+
+        assert!(
+            predicate.contains("<<< \"$OUTPUT\"") || predicate.contains("<<< \"$out\""),
+            "quiet grep must read from a here-string: `{predicate}`"
+        );
+    }
+}
+
 fn repo_path(path: &str) -> PathBuf {
     let mut full = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     full.push(path);
