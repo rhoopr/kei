@@ -3,9 +3,12 @@
   "stable": {
     "version": "0.25.3",
     "source_revision": "a2081bfd109993c76f34ac13b12ee15b48c86008",
-    "guide_revision": "2c59e9962ea926b810abc814ab34aeea3658d08a"
+    "guide_revision": "2c59e9962ea926b810abc814ab34aeea3658d08a",
+    "guide_revisions": {
+      "migration-from-icloudpd.md": "cc3faff80d237aedcaa07a6d30e791550d1d9f07"
+    }
   },
-  "wiki_revision": "c51f350bba04688b0d5f9abad1f469ea0bac5a59",
+  "wiki_revision": "6d16f933eb216edf6a25a8799ae5d90dd3daca09",
   "compatibility_revision": "5e7decd371ff186d8ca87600e2efeaa6920a283b",
   "development_revision": "1d6187e2b7899f4cd55d94e382056558cd524b16",
   "actions": {
