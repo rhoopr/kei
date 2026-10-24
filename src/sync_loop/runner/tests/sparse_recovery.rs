@@ -53,7 +53,9 @@ impl PhotosSession for Session {
                     .unwrap()
                     .iter()
                     .map(|id| {
-                        if id["recordName"] == "unrelated-source" {
+                        if id["recordName"] == "stale-master" {
+                            json!({"recordName":"stale-master","serverErrorCode":"NOT_FOUND"})
+                        } else if id["recordName"] == "unrelated-source" {
                             unrelated_sparse()
                         } else {
                             sparse()
@@ -129,6 +131,15 @@ fn album(zone: &str, owner: &str, session: Session) -> PhotoAlbum {
 
 #[tokio::test]
 async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
+    Box::pin(exercise_sparse_target(false)).await;
+}
+
+#[tokio::test]
+async fn sparse_target_stale_mapping_does_not_hide_selected_recovery() {
+    Box::pin(exercise_sparse_target(true)).await;
+}
+
+async fn exercise_sparse_target(stale_mapping: bool) {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::{
@@ -194,6 +205,12 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
             let db: Arc<dyn download::DownloadStore> = inner.clone();
             let builder = make_run_cycle_download_config_builder(&media, db.clone());
             if cycle == 0 {
+                if stale_mapping {
+                    inner
+                        .upsert_asset_master_mapping("PrimarySync", "source-child", "stale-master")
+                        .await
+                        .unwrap();
+                }
                 let run = inner.start_sync_run().await.unwrap();
                 inner
                     .complete_sync_run(run, &state::SyncRunStats::default())
@@ -279,6 +296,17 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
             )
             .await
             .unwrap();
+            if stale_mapping {
+                assert_eq!(
+                    inner
+                        .get_master_record_name_for_asset("PrimarySync", "source-child")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("stale-master"),
+                    "target recovery must preserve historical source mapping"
+                );
+            }
             assert!(
                 inner
                     .get_all_asset_albums("SharedSync-test")

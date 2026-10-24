@@ -1022,8 +1022,15 @@ paths. A matching valid sparse lookup starts a one-hour delay. Repeated
 matching results double the delay to a 24-hour maximum. Each library execution
 selects at most 100 due, identified sparse source-only lookups, ordered by
 retry deadline or last attempt, then generation and source key. Exact
-source/master mappings bypass suppression and do not consume that budget. Malformed or changed
-incoming evidence cannot inherit a cached negative result. Unclassified
+source/master mappings bypass suppression and do not consume that budget,
+except when a linked sparse observation has no current master reference. That
+case rechecks the source through the bounded lookup instead of letting a saved
+master hide selected-target recovery. The historical mapping remains intact;
+fresh source evidence and the existing target proof still govern recovery.
+When sparse retry is delayed, a saved mapping still permits the ordinary
+paired lookup. Recovery then requires a complete current pair; another sparse
+result remains held. An explicit current master reference continues to take precedence. Malformed or
+changed incoming evidence cannot inherit a cached negative result. Unclassified
 sources still need an initial lookup before sparse retry policy can apply.
 A deferred source remains unresolved and blocks the checkpoint. Retained
 sources absent from replay re-enter normal hydration and media planning.

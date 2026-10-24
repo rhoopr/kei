@@ -848,6 +848,7 @@ async fn asset_only_delta_recovers_identity_refreshes_metadata_and_advances_toke
             session_probe.records_query_count(),
             match identity_source {
                 IdentitySource::ProviderLookup | IdentitySource::StaleState => 2,
+                IdentitySource::State if sparse => 2,
                 IdentitySource::Delta | IdentitySource::State => 1,
             },
             "{identity_source:?}"
