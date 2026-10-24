@@ -499,28 +499,7 @@ impl SqliteStateDb {
         .await
     }
 
-    /// Prove that a retained shadow is strictly provider-equivalent to the
-    /// current planning manifest before its generation may be reused. The
-    /// current manifest was already validated by capture; this second owner
-    /// check revalidates the retained representative and every non-confirmation
-    /// field without replacing its original bytes.
-    pub(crate) async fn verify_selection_shadow_equivalent(
-        &self,
-        owner: account::AccountOwner,
-        id: String,
-        current: SelectionManifest,
-    ) -> Result<(), StateError> {
-        self.with_conn("verifying equivalent selection shadow", move |conn| {
-            let tx = conn.unchecked_transaction()?;
-            let stored = load_shadow(&tx, &owner, &id)?;
-            if !manifest_equivalent(&stored, &current) {
-                return invalid();
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-    }
+
 }
 
 fn load_shadow(

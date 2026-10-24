@@ -6844,3 +6844,5 @@ async fn queue_projection_actual_diagnostics_record_selection_and_work_limits() 
     assert_eq!(capacity["work"]["last_reason"], "capacity");
     assert_eq!(capacity["work"]["last_observed_limit"], 0);
 }
+
+mod parity_optional;
