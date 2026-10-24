@@ -992,8 +992,12 @@ original delta evidence. A link alone does not authorize a target lookup.
 
 Selected sparse-target recovery is owned by
 `src/download/sparse_target.rs`. The cycle supplies only current selected,
-unrestricted full-library plans; it does not search an unselected library or
-infer membership for album, rank, bounded, managed-primary or provisional
+unrestricted full-library plans. A unique ordinary-photo pass may have one
+same-scope Hidden companion with the exact provider query definitions and no
+additional filters. Recovery still refuses hidden targets; the companion does
+not change the selected ordinary-photo output path. Other collections,
+duplicated passes and filtered ordinary passes remain unsupported. The cycle
+does not search an unselected library or infer membership for album, rank, bounded, managed-primary or provisional
 selections. A fresh source lookup must agree with its retained link. The Photos
 adapter qualifies target owner/zone and the exact child/master pair before the
 normal target download pipeline can materialize missing selected renditions.

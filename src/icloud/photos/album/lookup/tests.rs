@@ -1174,3 +1174,16 @@ async fn issue956_single_target_statuses_do_not_invent_the_other_record() {
             && event.field("child_status") == Some("not_requested"))
     );
 }
+
+#[tokio::test]
+async fn hidden_companion_matches_actual_library_folder_construction() {
+    let library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+        Box::new(MockPhotosSession::new()),
+        "SharedSync-test",
+    );
+    let ordinary = library.all();
+    let folders = library.albums().await.unwrap();
+    assert!(folders["Hidden"].is_hidden_companion_of(&ordinary));
+    assert!(!folders["Favorites"].is_hidden_companion_of(&ordinary));
+    assert!(!ordinary.is_hidden_companion_of(&ordinary));
+}

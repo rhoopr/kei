@@ -1418,16 +1418,37 @@ pub(crate) async fn run_cycle(
         // sparse target without inventing album/rank membership.
         let mut sparse_targets = Vec::new();
         if download_controls.run_mode.downloads_files() && !is_retry_failed {
-            for target in library_states.iter().copied().filter(|target| {
-                target.zone_name != lib_state.zone_name
-                    && !target.plan_is_stale
-                    && target.plan.passes.len() == 1
-            }) {
-                let Some(pass) = target.plan.passes.first() else {
+            for target in library_states
+                .iter()
+                .copied()
+                .filter(|target| target.zone_name != lib_state.zone_name && !target.plan_is_stale)
+            {
+                let mut ordinary = target
+                    .plan
+                    .passes
+                    .iter()
+                    .filter(|pass| pass.kind == crate::commands::PassKind::Unfiled);
+                let Some(pass) = ordinary.next() else {
                     continue;
                 };
-                if pass.kind != crate::commands::PassKind::Unfiled || !pass.exclude_ids.is_empty() {
+                if ordinary.next().is_some() || !pass.exclude_ids.is_empty() {
                     continue;
+                }
+                if target.plan.passes.len() != 1 {
+                    let companion = target
+                        .plan
+                        .passes
+                        .iter()
+                        .find(|candidate| candidate.kind != crate::commands::PassKind::Unfiled);
+                    if target.plan.passes.len() != 2
+                        || !companion.is_some_and(|companion| {
+                            companion.kind == crate::commands::PassKind::SmartFolder
+                                && companion.exclude_ids.is_empty()
+                                && companion.album.is_hidden_companion_of(&pass.album)
+                        })
+                    {
+                        continue;
+                    }
                 }
                 #[cfg(feature = "xmp")]
                 let target_groupings = if config.metadata.embed_xmp || config.metadata.xmp_sidecar {

@@ -178,6 +178,24 @@ impl PhotoAlbum {
             .unwrap_or("")
     }
 
+    /// A Hidden query can accompany ordinary photos without selecting another
+    /// non-hidden asset or changing its output pass.
+    pub(crate) fn is_hidden_companion_of(&self, ordinary: &Self) -> bool {
+        ordinary.list_type.as_ref() == QUERY_ALL_LIST
+            && ordinary.obj_type.as_ref() == QUERY_ALL_OBJ
+            && ordinary.query_filter.is_none()
+            && ordinary.container_id.is_none()
+            && ordinary.cross_zone_sources.is_empty()
+            && self.list_type.as_ref() == "CPLAssetAndMasterHiddenByAssetDate"
+            && self.obj_type.as_ref() == "CPLAssetHiddenByAssetDate"
+            && self.query_filter.is_none()
+            && self.container_id.is_none()
+            && self.cross_zone_sources.is_empty()
+            && self.zone_id == ordinary.zone_id
+            && self.params == ordinary.params
+            && self.service_endpoint == ordinary.service_endpoint
+    }
+
     /// Provider scope used to bind durable selection recovery to its query owners.
     pub(crate) fn selection_scope(&self) -> Value {
         serde_json::json!({

@@ -127,8 +127,81 @@ fn album(zone: &str, owner: &str, session: Session) -> PhotoAlbum {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Companion {
+    None,
+    Hidden,
+    HiddenTarget,
+    AlbumOnly,
+    Filtered,
+    ForeignOwner,
+    ForeignZone,
+    ForeignAccount,
+    OtherCollection,
+    DuplicateOrdinary,
+    DuplicateHidden,
+    ConfigChange,
+}
+fn hidden_companion(case: Companion, session: Session, zone: &str, owner: &str) -> PhotoAlbum {
+    let mut params = std::collections::HashMap::new();
+    if case == Companion::ForeignAccount {
+        params.insert("dsid".into(), json!("different-test-account"));
+    }
+    PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(params),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from(if case == Companion::OtherCollection {
+                "Favorites"
+            } else {
+                "Hidden"
+            }),
+            list_type: Arc::from(if case == Companion::OtherCollection {
+                "CPLAssetAndMasterInSmartAlbumByAssetDate"
+            } else {
+                "CPLAssetAndMasterHiddenByAssetDate"
+            }),
+            obj_type: Arc::from("CPLAssetHiddenByAssetDate"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(
+                json!({"zoneName":if case == Companion::ForeignZone {"SharedSync-other"} else {zone},
+            "ownerRecordName":if case == Companion::ForeignOwner {"foreign-owner"} else {owner}}),
+            ),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(session),
+    )
+}
 #[tokio::test]
 async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
+    Box::pin(exercise_companion(Companion::None)).await;
+}
+#[tokio::test]
+async fn sparse_hidden_companion_refuses_unsafe_plans_and_hidden_targets() {
+    for case in [
+        Companion::HiddenTarget,
+        Companion::AlbumOnly,
+        Companion::Filtered,
+        Companion::ForeignOwner,
+        Companion::ForeignZone,
+        Companion::ForeignAccount,
+        Companion::OtherCollection,
+        Companion::DuplicateOrdinary,
+        Companion::DuplicateHidden,
+    ] {
+        Box::pin(exercise_companion(case)).await;
+    }
+}
+#[tokio::test]
+async fn sparse_hidden_companion_recovers_once_and_preserves_holds_across_configuration_change() {
+    for case in [Companion::Hidden, Companion::ConfigChange] {
+        Box::pin(exercise_companion(case)).await;
+    }
+}
+async fn exercise_companion(case: Companion) {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::{
@@ -143,7 +216,16 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
         (true, true, false, true),
         (true, true, true, true),
     ] {
-        let complete = selected && owner_matches && !unrelated;
+        if case != Companion::None && (!selected || !owner_matches || !pending || !unrelated) {
+            continue;
+        }
+        let plan_eligible = matches!(
+            case,
+            Companion::None | Companion::Hidden | Companion::HiddenTarget | Companion::ConfigChange
+        );
+        let can_recover =
+            selected && owner_matches && plan_eligible && case != Companion::HiddenTarget;
+        let complete = can_recover && !unrelated;
         // A held source obligation beside eligible target work still reopens so
         // the next cycle can prove that the completed transfer is not repeated.
         let cycles = if complete || (pending && unrelated) {
@@ -164,10 +246,10 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                     .set_body_bytes(bytes)
                     .insert_header("content-type", "image/jpeg"),
             )
-            .expect(if selected && owner_matches { 1 } else { 0 })
+            .expect(if can_recover { 1 } else { 0 })
             .mount(&server)
             .await;
-        let records = full_album_page_with_download(
+        let mut records = full_album_page_with_download(
             "SharedSync-test",
             "target",
             "target-after",
@@ -178,21 +260,57 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
             .as_array()
             .unwrap()
             .clone();
+        if case == Companion::HiddenTarget {
+            for record in &mut records {
+                if record["recordType"] == "CPLAsset" {
+                    record["fields"]["isHidden"] = json!({"value":1,"type":"INT64"});
+                }
+            }
+        }
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("state.db");
         let media = directory.path().join("media");
         std::fs::create_dir(&media).unwrap();
-        let config = make_run_cycle_config();
-        let enum_hash = download::compute_config_hash(&config);
+        let mut config = make_run_cycle_config();
+        if case != Companion::None {
+            config.filters.selection.libraries =
+                crate::selection::parse_library_selector(&["shared".into()]).unwrap();
+            config.filters.selection.albums = crate::selection::AlbumSelector::None;
+            config.filters.selection.smart_folders = crate::selection::SmartFolderSelector::Named {
+                included: std::collections::BTreeSet::from(["Hidden".into()]),
+                excluded: std::collections::BTreeSet::new(),
+            };
+            config.filters.selection.smart_folders_explicit = true;
+        }
         let calls = Arc::new(AtomicUsize::new(0));
         let source_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut previous_calls = None;
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
         for cycle in 0..cycles {
+            if case == Companion::ConfigChange && cycle == 1 {
+                config.filters.selection.smart_folders =
+                    crate::selection::SmartFolderSelector::Named {
+                        included: std::collections::BTreeSet::from([
+                            "Hidden".into(),
+                            "Favorites".into(),
+                        ]),
+                        excluded: std::collections::BTreeSet::new(),
+                    };
+            }
+            let enum_hash = download::compute_config_hash(&config);
             let source_calls_at_start = source_calls.lock().unwrap().len();
             let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
             let db: Arc<dyn download::DownloadStore> = inner.clone();
-            let builder = make_run_cycle_download_config_builder(&media, db.clone());
+            let base_builder = make_run_cycle_download_config_builder(&media, db.clone());
+            let builder = |mode, excluded, groups, library| {
+                let mut built = base_builder(mode, excluded, groups, library);
+                if case != Companion::None {
+                    let built = Arc::make_mut(&mut built);
+                    built.folder_structure = "ordinary".into();
+                    built.folder_structure_smart_folders = Arc::from("hidden");
+                }
+                built
+            };
             if cycle == 0 {
                 let run = inner.start_sync_run().await.unwrap();
                 inner
@@ -226,7 +344,7 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                         .unwrap();
                 }
             }
-            let primary = make_run_cycle_library_state_with_album(
+            let mut primary = make_run_cycle_library_state_with_album(
                 "PrimarySync",
                 "sync_token:PrimarySync",
                 album(
@@ -242,7 +360,7 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                     },
                 ),
             );
-            let shared = make_run_cycle_library_state_with_album(
+            let mut shared = make_run_cycle_library_state_with_album(
                 "SharedSync-test",
                 "sync_token:SharedSync-test",
                 album(
@@ -262,6 +380,83 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                     },
                 ),
             );
+            if case != Companion::None {
+                let effective = if case == Companion::ConfigChange {
+                    Companion::Hidden
+                } else {
+                    case
+                };
+                let source = Session {
+                    source: true,
+                    quiet: cycle > 0,
+                    unrelated,
+                    records: Vec::new(),
+                    target_calls: calls.clone(),
+                    source_calls: source_calls.clone(),
+                };
+                primary.library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+                    Box::new(source.clone()),
+                    "PrimarySync",
+                );
+                primary.pass_scope.include_unfiled = false;
+                primary.pass_scope.include_smart_folders = true;
+                primary.plan.passes[0].kind = crate::commands::PassKind::SmartFolder;
+                primary.plan.passes[0].album =
+                    hidden_companion(Companion::Hidden, source, "PrimarySync", "_defaultOwner");
+                let companion = || crate::commands::AlbumPass {
+                    kind: crate::commands::PassKind::SmartFolder,
+                    album: hidden_companion(
+                        effective,
+                        Session {
+                            source: false,
+                            quiet: true,
+                            unrelated: false,
+                            records: records.clone(),
+                            target_calls: calls.clone(),
+                            source_calls: source_calls.clone(),
+                        },
+                        "SharedSync-test",
+                        "owner-test",
+                    ),
+                    exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+                };
+                shared.plan.passes.push(companion());
+                if case == Companion::ConfigChange && cycle == 1 {
+                    shared.plan.passes.push(crate::commands::AlbumPass {
+                        kind: crate::commands::PassKind::SmartFolder,
+                        album: hidden_companion(
+                            Companion::OtherCollection,
+                            Session {
+                                source: false,
+                                quiet: true,
+                                unrelated: false,
+                                records: records.clone(),
+                                target_calls: calls.clone(),
+                                source_calls: source_calls.clone(),
+                            },
+                            "SharedSync-test",
+                            "owner-test",
+                        ),
+                        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+                    });
+                }
+                shared.pass_scope.include_smart_folders = true;
+                if case == Companion::AlbumOnly {
+                    shared.plan.passes[0].kind = crate::commands::PassKind::Album;
+                    shared.pass_scope.include_unfiled = false;
+                    shared.pass_scope.include_albums = true;
+                }
+                if case == Companion::Filtered {
+                    shared.plan.passes[0].exclude_ids =
+                        Arc::new(rustc_hash::FxHashSet::from_iter(["asset-target".into()]));
+                }
+                if case == Companion::DuplicateOrdinary {
+                    shared.plan.passes.push(shared.plan.passes[0].clone());
+                }
+                if case == Companion::DuplicateHidden {
+                    shared.plan.passes.push(companion());
+                }
+            }
             let libraries = if selected {
                 vec![&primary, &shared]
             } else {
@@ -287,6 +482,36 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                     .is_empty(),
                 "full-library recovery must not invent album membership"
             );
+            if case != Companion::None {
+                let rows = inner.get_downloaded_page(0, 10).await.unwrap();
+                let targets: Vec<_> = rows
+                    .iter()
+                    .filter(|row| row.library.as_ref() == "SharedSync-test")
+                    .collect();
+                if can_recover {
+                    assert_eq!(targets.len(), 1);
+                    let row = targets[0];
+                    assert_eq!(row.id.as_ref(), "asset-target");
+                    assert_eq!(row.version_size.as_str(), "original");
+                    let path = row.local_path.as_ref().unwrap();
+                    assert!(
+                        path.starts_with(media.join("ordinary")),
+                        "ordinary pass owns output: {path:?}"
+                    );
+                    assert_eq!(std::fs::read(path).unwrap(), bytes);
+                    assert!(matches!(db.legacy_child_provenance("SharedSync-test", "asset-target", "original").await.unwrap(),
+                        Some(crate::state::db::trusted_legacy::LegacyReceiptProvenance::VerifiedSource)));
+                } else {
+                    assert!(
+                        targets.is_empty(),
+                        "refused target must not gain a downloaded receipt"
+                    );
+                }
+                assert!(
+                    !media.join("hidden").exists(),
+                    "sparse recovery must not write the Hidden path"
+                );
+            }
             if complete {
                 assert!(
                     !result.stats.identity_incomplete,
@@ -333,7 +558,7 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                 assert!(result.stats.identity_incomplete);
                 assert_eq!(
                     result.stats.downloaded,
-                    usize::from(selected && owner_matches && cycle == 0),
+                    usize::from(can_recover && cycle == 0),
                     "eligible target work progresses once, then reopens quietly"
                 );
                 assert_eq!(
@@ -385,11 +610,22 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                 }
                 let observed_calls = calls.load(Ordering::SeqCst);
                 if cycle == 0 {
-                    assert_eq!(
-                        observed_calls,
-                        if selected && owner_matches { 2 } else { 0 },
-                        "unselected or wrong scope must not be requested"
-                    );
+                    if case == Companion::HiddenTarget {
+                        assert!(
+                            observed_calls <= 2,
+                            "hidden target can only receive one bounded pair confirmation"
+                        );
+                    } else {
+                        assert_eq!(
+                            observed_calls,
+                            if selected && owner_matches && plan_eligible {
+                                2
+                            } else {
+                                0
+                            },
+                            "unselected or wrong scope must not be requested"
+                        );
+                    }
                 } else {
                     assert_eq!(
                         observed_calls,
