@@ -712,7 +712,12 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_download_and_reope
     use wiremock::{Mock, ResponseTemplate};
     use xmp_toolkit::{XmpMeta, xmp_ns};
 
-    for (native_location, embed) in [(false, true), (true, false), (true, true)] {
+    for (native_location, embed, embed_xmp) in [
+        (false, true, false),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+    ] {
         let source = if native_location {
             crate::test_helpers::minimal_jpeg_with_source_gps_and_location()
         } else {
@@ -746,6 +751,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_download_and_reope
                 "recordName": "asset-GPS_CHILD",
                 "fields": {
                     "assetDate": {"value": 1736899200000.0},
+                    "assetSubtypeV2": {"value": 2},
                     "locationLatitude": {"value": 1.5}, "locationLongitude": {"value": 2.5}
                 }
             }),
@@ -757,6 +763,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_download_and_reope
         let mut config = DownloadConfig::test_default();
         config.directory = Arc::from(download_dir.as_path());
         config.metadata.set_exif_gps = embed;
+        config.metadata.embed_xmp = embed_xmp;
         config.metadata.xmp_sidecar = true;
         config.state_db = Some(db.clone());
         let config = Arc::new(config);
@@ -788,7 +795,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_download_and_reope
             native_location
         );
         let media_bytes = fs::read(&media).unwrap();
-        if native_location {
+        if native_location && !embed_xmp {
             assert_eq!(media_bytes, source);
         } else {
             assert_ne!(media_bytes, source);

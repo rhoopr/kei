@@ -109,6 +109,7 @@ pub(super) fn prepare_metadata_xmp_toolkit(
         guard,
         expected_input: expected,
         expected_output: output,
+        wrote_gps: write.gps.is_some(),
     })
 }
 

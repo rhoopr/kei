@@ -179,7 +179,14 @@ pub(in crate::download) async fn run_download_pass(
     // the end of the pass — defeating the point of parallel cleanup.
     while let Some((task, result)) = download_stream.next().await {
         match &result {
-            Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes, retained)) => {
+            Ok((
+                exif_ok,
+                local_checksum,
+                (download_checksum, source_checksum),
+                bytes_dl,
+                disk_bytes,
+                retained,
+            )) => {
                 downloaded += 1;
                 downloaded_tasks.push(task.clone());
                 bytes_downloaded_total += bytes_dl;
@@ -209,7 +216,7 @@ pub(in crate::download) async fn run_download_pass(
                         &task.library,
                         &task,
                         local_checksum.clone(),
-                        download_checksum.clone(),
+                        (download_checksum.clone(), source_checksum.clone()),
                         *exif_ok,
                         mark_capture_repair_after_download,
                         retained.clone(),

@@ -1652,6 +1652,69 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_rewrite_and_retry(
             stored_checksums(&db).await.0.as_deref(),
             Some(checksum.as_str())
         );
+
+        if owned {
+            metadata.latitude = Some(1.5);
+            metadata.longitude = Some(2.5);
+            metadata.media_subtype = Some("hdr".into());
+            metadata.refresh_hash();
+            db.refresh_downloaded_asset_metadata(
+                "PrimarySync",
+                "GPS_PROVENANCE",
+                (
+                    &crate::state::MetadataCapture {
+                        shared: Arc::new(metadata.clone()),
+                        renditions: Arc::from([]),
+                    },
+                    now_local().to_utc(),
+                    None,
+                ),
+                true,
+                false,
+                crate::state::METADATA_CAPTURE_REVISION,
+            )
+            .await
+            .unwrap();
+            let embed_pass = run_pending(
+                &db,
+                MetadataFlags::EMBED_XMP | MetadataFlags::XMP_SIDECAR,
+                Arc::from(".gps-test"),
+                &token,
+            )
+            .await;
+            assert_eq!((embed_pass.applied, embed_pass.failed), (1, 0));
+            assert_ne!(std::fs::read(&path).unwrap(), source);
+            assert_eq!(
+                stored_checksums(&db).await.1.as_deref(),
+                Some(checksum.as_str())
+            );
+            let after_embed: XmpMeta = std::fs::read_to_string(&sidecar_path)
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                after_embed
+                    .property(xmp_ns::EXIF, "GPSHPositioningError")
+                    .unwrap()
+                    .value,
+                "3/2"
+            );
+            db.record_metadata_write_failure("PrimarySync", "GPS_PROVENANCE", "original")
+                .await
+                .unwrap();
+            assert_eq!(drain().await.applied, 1);
+            let after_retry: XmpMeta = std::fs::read_to_string(&sidecar_path)
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                after_retry
+                    .property(xmp_ns::EXIF, "GPSHPositioningError")
+                    .unwrap()
+                    .value,
+                "3/2"
+            );
+        }
     }
 }
 

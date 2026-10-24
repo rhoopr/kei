@@ -190,6 +190,7 @@ pub(super) fn prepare_metadata_heif(
             guard,
             expected_input: expected,
             expected_output: rewritten_fingerprint,
+            wrote_gps: write.gps.is_some(),
         })
     })();
     // Even validation/error paths must report source drift as InputChanged:

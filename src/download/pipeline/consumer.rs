@@ -130,7 +130,14 @@ pub(super) async fn consume_stream_download_tasks(
         // can tell which album's items are downloading.
         pb.set_message(format!("{} \u{00b7} {filename}", config.pass_label()));
         match result {
-            Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes, retained)) => {
+            Ok((
+                exif_ok,
+                local_checksum,
+                (download_checksum, source_checksum),
+                bytes_dl,
+                disk_bytes,
+                retained,
+            )) => {
                 downloaded += 1;
                 bytes_downloaded_total += bytes_dl;
                 // Photos / videos fire in both modes (SyncStats serialises
@@ -167,7 +174,7 @@ pub(super) async fn consume_stream_download_tasks(
                         &task.library,
                         &task,
                         local_checksum,
-                        download_checksum,
+                        (download_checksum, source_checksum),
                         exif_ok,
                         mark_capture_repair_after_download,
                         retained.clone(),

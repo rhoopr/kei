@@ -170,6 +170,7 @@ pub(super) fn prepare_metadata_native(
         guard,
         expected_input: expected,
         expected_output: output_fingerprint,
+        wrote_gps: write.gps.is_some(),
     })
 }
 

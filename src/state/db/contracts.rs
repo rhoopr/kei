@@ -137,6 +137,9 @@ pub struct PendingMetadataRewrite {
         )
     )]
     pub source_checksum: Option<String>,
+    /// Advance `source_checksum` to the new `local_checksum` when a verified
+    /// source file was rewritten without inserting GPS coordinates.
+    pub(crate) advance_source_checksum: bool,
 }
 
 /// Debt retired by one atomic metadata-rewrite completion.
@@ -497,6 +500,26 @@ pub trait DownloadStateStore: Send + Sync {
         download_checksum: Option<&str>,
         mark_capture_repair: bool,
     ) -> Result<(), StateError> {
+        self.mark_verified_download_with_source(
+            library,
+            id,
+            version_size,
+            local_path,
+            (local_checksum, download_checksum, download_checksum),
+            mark_capture_repair,
+        )
+        .await
+    }
+    async fn mark_verified_download_with_source(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &Path,
+        checksums: (&str, Option<&str>, Option<&str>),
+        mark_capture_repair: bool,
+    ) -> Result<(), StateError> {
+        let (local_checksum, download_checksum, _source_checksum) = checksums;
         self.mark_downloaded_with_capture_repair(
             library,
             id,

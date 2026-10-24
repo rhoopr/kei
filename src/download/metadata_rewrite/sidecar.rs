@@ -162,16 +162,11 @@ fn plan_sidecar_write(
         ),
     };
     // CONTRACT: XMP_GPS_ACCURACY_REQUIRES_MATCHING_LOCATION
-    // Exact decoded-coordinate equality is conservative: rounding differences
-    // omit accuracy rather than using proximity as evidence of the same fix.
+    // Native coordinates must match the provider coordinates (including exact
+    // camera EXIF DMS rational quantization); proximity alone is insufficient.
     // I/O failures remain unknown under the shared sidecar ownership policy.
     let accuracy_matches_location =
-        source_gps
-            .latitude
-            .zip(source_gps.longitude)
-            .is_some_and(|(latitude, longitude)| {
-                payload.latitude == Some(latitude) && payload.longitude == Some(longitude)
-            });
+        source_gps.matches_provider_coordinates(payload.latitude, payload.longitude);
     // Current native coordinates may have been inserted by an earlier embed.
     // Reuse the pre-embed checksum, including on retries after a state reopen.
     // A changed or unrecorded source cannot establish native provenance. This
@@ -245,6 +240,103 @@ fn plan_sidecar_from_gps(
     write.media_subtype.clone_from(&payload.media_subtype);
     write.burst_id.clone_from(&payload.burst_id);
     write
+}
+
+#[cfg(feature = "xmp")]
+pub(in crate::download) async fn refresh_companion_mov_sidecars(
+    still_path: &Path,
+    payload: Arc<MetadataPayload>,
+    created_local: DateTime<FixedOffset>,
+    temp_suffix: &str,
+    shutdown_token: &tokio_util::sync::CancellationToken,
+) -> bool {
+    if payload.latitude.is_none() || payload.longitude.is_none() {
+        return true;
+    }
+    let Some(parent) = still_path.parent() else {
+        return true;
+    };
+    let Some(stem) = still_path.file_stem().and_then(|s| s.to_str()) else {
+        return true;
+    };
+    let mut base_stems = Vec::with_capacity(2);
+    base_stems.push(stem);
+    if let Some(start) = stem.len().checked_sub("_edited".len())
+        && stem
+            .get(start..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case("_edited"))
+        && let Some(base) = stem.get(..start).filter(|base| !base.is_empty())
+    {
+        base_stems.push(base);
+    }
+    let mut all_ok = true;
+    for base in base_stems {
+        for suffix in [
+            "_HEVC.MOV",
+            "_HEVC.mov",
+            "_edited.MOV",
+            "_edited.mov",
+            ".MOV",
+            ".mov",
+        ] {
+            let mov_path = parent.join(format!("{base}{suffix}"));
+            let Some(mov_name) = mov_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let sidecar_path = parent.join(format!("{mov_name}.xmp"));
+            if !tokio::fs::try_exists(&mov_path).await.unwrap_or(false)
+                || !tokio::fs::try_exists(&sidecar_path).await.unwrap_or(false)
+            {
+                continue;
+            }
+            let Ok(_guard) =
+                crate::download::file::lock_download_destination(&mov_path, shutdown_token).await
+            else {
+                continue;
+            };
+            let mov_check_path = mov_path.clone();
+            let (lat, lon) = (payload.latitude, payload.longitude);
+            let matches_companion = tokio::task::spawn_blocking(move || {
+                crate::download::metadata::read_source_gps(&mov_check_path)
+                    .is_ok_and(|gps| gps.matches_provider_coordinates(lat, lon))
+            })
+            .await
+            .unwrap_or(false);
+            if !matches_companion {
+                continue;
+            }
+            let had_verified_accuracy = tokio::fs::read_to_string(&sidecar_path)
+                .await
+                .ok()
+                .and_then(|text| text.parse::<xmp_toolkit::XmpMeta>().ok())
+                .and_then(|meta| {
+                    meta.property("https://github.com/rhoopr/kei/ns/1.0/", "managedFields")
+                })
+                .is_some_and(|managed| {
+                    managed
+                        .value
+                        .split(',')
+                        .any(|token| token == "exif:GPSHPositioningError")
+                });
+            let mov_source_checksum = if had_verified_accuracy {
+                crate::download::file::fingerprint_regular_file(&mov_path)
+                    .await
+                    .ok()
+                    .map(fingerprint_checksum)
+            } else {
+                None
+            };
+            all_ok &= write_sidecar_metadata(
+                &mov_path,
+                Arc::clone(&payload),
+                created_local,
+                mov_source_checksum.as_deref(),
+                temp_suffix,
+            )
+            .await;
+        }
+    }
+    all_ok
 }
 
 #[cfg(test)]

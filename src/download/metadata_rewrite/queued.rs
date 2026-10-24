@@ -541,11 +541,13 @@ where
                             };
                             pending_for_finish.capture_repair_receipt = Some(prepared_receipt);
                         }
+                        let wrote_gps = prepared.wrote_gps;
                         match publish_embed_metadata(&path, prepared).await {
                             EmbedWriteResult::Applied(output) => {
                                 final_fingerprint = output;
                                 capture_embed_complete =
                                     selected_queue == MetadataRewriteQueue::CaptureRepair;
+                                outcome.embed_wrote_gps = wrote_gps;
                                 outcome.embed_output_fingerprint = output;
                             }
                             EmbedWriteResult::InputChanged => {
@@ -569,13 +571,24 @@ where
             }
         }
 
+        let preserve_source_gps = pending_rewrite.source_checksum.is_some()
+            && pending_rewrite.source_checksum == pre_rewrite_checksum
+            && !outcome.embed_wrote_gps;
+
         #[cfg(feature = "xmp")]
         if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
+            let effective_source_checksum = if preserve_source_gps {
+                final_fingerprint
+                    .map(fingerprint_checksum)
+                    .or_else(|| pending_rewrite.source_checksum.clone())
+            } else {
+                pending_rewrite.source_checksum.clone()
+            };
             outcome.sidecar_failed = !write_sidecar_metadata(
                 &path,
                 Arc::clone(&payload),
                 created_local,
-                pending_rewrite.source_checksum.as_deref(),
+                effective_source_checksum.as_deref(),
                 &temp_suffix,
             )
             .await;
@@ -645,6 +658,7 @@ where
             .map(fingerprint_checksum)
             .or_else(|| record.local_checksum.clone());
         let media_checksum_changed = final_checksum != record.local_checksum;
+        pending_for_finish.advance_source_checksum = preserve_source_gps && media_checksum_changed;
         let input_checksum_for_download = final_checksum
             .as_deref()
             .zip(record.local_checksum.as_deref())

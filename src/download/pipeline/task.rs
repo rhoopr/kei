@@ -88,7 +88,7 @@ pub(super) fn log_interrupted_download(
 pub(super) type DownloadSingleResult = (
     bool,
     String,
-    Option<String>,
+    (Option<String>, Option<String>),
     u64,
     u64,
     Option<Arc<crate::download::file::RetainedPendingFile>>,
@@ -196,6 +196,8 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
         let download_checksum = downloaded_fingerprint.map(|fingerprint| data_encoding::HEXLOWER.encode(&fingerprint.sha256));
 
         let mut exif_ok = true;
+        let mut embed_wrote_gps = false;
+        let mut post_embed_source_checksum = None;
         if let Some(part) = &part_path {
             let outcome = metadata_rewrite::write_download_metadata(
                 metadata_rewrite::MetadataWriteRequest {
@@ -213,7 +215,12 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
             )
             .await;
             anyhow::ensure!(!outcome.embed_input_changed, "Temporary download changed before metadata write");
+            embed_wrote_gps = outcome.embed_wrote_gps;
             if let Some(expected) = outcome.embed_output_fingerprint {
+                if !embed_wrote_gps {
+                    post_embed_source_checksum =
+                        Some(data_encoding::HEXLOWER.encode(&expected.sha256));
+                }
                 downloaded.accept_metadata_output(expected).await?;
             }
             exif_ok = !outcome.any_failed();
@@ -245,7 +252,10 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
                 final_path: &task.download_path,
                 embed_path: None,
                 expected_embed_fingerprint: None,
-                source_checksum: download_checksum.as_deref().or(unmodified_checksum.as_deref()),
+                source_checksum: post_embed_source_checksum
+                    .as_deref()
+                    .or(download_checksum.as_deref())
+                    .or(unmodified_checksum.as_deref()),
                 sidecar_path: Some(&task.download_path),
                 payload: Arc::clone(&task.metadata),
                 created_local: task.created_local,
@@ -255,6 +265,19 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
             })
             .await;
         exif_ok &= !outcome.any_failed();
+        #[cfg(feature = "xmp")]
+        if task.media_type == crate::state::MediaType::LivePhotoImage
+            && metadata_flags.contains(metadata_rewrite::MetadataFlags::XMP_SIDECAR)
+        {
+            exif_ok &= metadata_rewrite::refresh_companion_mov_sidecars(
+                &task.download_path,
+                Arc::clone(&task.metadata),
+                task.created_local,
+                context.temp_suffix,
+                context.shutdown_token,
+            )
+            .await;
+        }
 
         let disk_bytes = match tokio::fs::metadata(&task.download_path).await {
             Ok(meta) => meta.len(),
@@ -280,6 +303,11 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
         // Future sidecar-only retries must not infer provenance from a local
         // checksum that may have been refreshed after an embedded rewrite.
         let download_checksum = Some(download_checksum.or(unmodified_checksum).unwrap_or_else(|| local_checksum.clone()));
+        let source_checksum = if embed_wrote_gps {
+            download_checksum.clone()
+        } else {
+            Some(local_checksum.clone())
+        };
         let retained = match &task.pending_cross_parent_root {
             Some(root) => Some(downloaded.retain_pending_publication(root.as_path(), &task.download_path).await?),
             None => None,
@@ -291,7 +319,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
         Ok((
             exif_ok,
             local_checksum,
-            download_checksum,
+            (download_checksum, source_checksum),
             downloaded.bytes_written,
             disk_bytes,
             retained,

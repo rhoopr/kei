@@ -391,6 +391,7 @@ fn row_to_pending_metadata_rewrite(
         selection_receipt: None,
         capture_repair_receipt,
         source_checksum: row.get(ASSET_COLUMN_COUNT + 3)?,
+        advance_source_checksum: false,
     })
 }
 
@@ -980,6 +981,7 @@ impl SqliteStateDb {
         let selected_capture = i64::from(selected_queue == MetadataRewriteQueue::CaptureRepair);
         let clear_ordinary = i64::from(completion.clears(MetadataRewriteQueue::Ordinary));
         let clear_capture = i64::from(completion.clears(MetadataRewriteQueue::CaptureRepair));
+        let advance_source_checksum = pending.advance_source_checksum;
         let Some(path) = pending.asset.local_path.clone() else {
             return Ok(false);
         };
@@ -1046,6 +1048,29 @@ impl SqliteStateDb {
                         &version_size,
                         MetadataPathWrite::Rewritten,
                     )?;
+                }
+                if updated > 0
+                    && advance_source_checksum
+                    && let (Some(previous_source), Some(new_source)) =
+                        (pre_rewrite_checksum.as_deref(), local_checksum.as_deref())
+                {
+                    tx.execute(
+                        "UPDATE asset_metadata_paths SET source_checksum = ?6 \
+                         WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
+                           AND local_path IS ?4 AND source_checksum IS ?5 \
+                           AND local_checksum IS ?6",
+                        rusqlite::params![
+                            &library,
+                            &asset_id,
+                            &version_size,
+                            path.to_str(),
+                            previous_source,
+                            new_source,
+                        ],
+                    )
+                    .map_err(|e| {
+                        StateError::query("finish_metadata_rewrite::source_checksum", e)
+                    })?;
                 }
                 updated
             } else {

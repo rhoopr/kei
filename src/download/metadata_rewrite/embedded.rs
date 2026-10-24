@@ -191,6 +191,7 @@ pub(super) async fn publish_embed_metadata(
     }
 }
 
+#[cfg(test)]
 pub(super) async fn write_embed_metadata(
     path: &Path,
     expected_fingerprint: Option<crate::download::file::ExistingFileFingerprint>,

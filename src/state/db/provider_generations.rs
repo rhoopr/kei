@@ -2007,6 +2007,7 @@ pub(super) fn metadata_receipt(
         asset,
         capture_repair_receipt: None,
         source_checksum: Some(source),
+        advance_source_checksum: false,
         selection_receipt: Some(super::contracts::SelectionMetadataReceipt {
             generation: generation.to_owned(),
             pass_key: key.to_owned(),
@@ -2066,7 +2067,8 @@ pub(super) fn finish_metadata_receipt(
     {
         return invalid();
     }
-    let changed=conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,local_checksum=COALESCE(?8,local_checksum),verified_metadata=CASE WHEN ?9=1 THEN 1 ELSE verified_metadata END WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND local_checksum IS ?6 AND grouping_hash=?7 AND source_checksum IS ?10 AND metadata_hash IS ?11 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=provider_active_destinations.library AND a.id=provider_active_destinations.asset_id AND a.version_size=provider_active_destinations.version_size AND a.checksum=provider_active_destinations.checksum AND a.metadata_hash=provider_active_destinations.metadata_hash AND a.created_at IS provider_active_destinations.created_at AND a.added_at IS provider_active_destinations.added_at AND a.is_deleted=0)",params![receipt.generation,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path,pending.asset.local_checksum,receipt.grouping_hash,local,complete,pending.source_checksum,pending.asset.metadata.metadata_hash])?;
+    let advance_source = i64::from(pending.advance_source_checksum);
+    let changed=conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,local_checksum=COALESCE(?8,local_checksum),source_checksum=CASE WHEN ?12=1 THEN COALESCE(?8,source_checksum) ELSE source_checksum END,verified_metadata=CASE WHEN ?9=1 THEN 1 ELSE verified_metadata END WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND local_checksum IS ?6 AND grouping_hash=?7 AND source_checksum IS ?10 AND metadata_hash IS ?11 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=provider_active_destinations.library AND a.id=provider_active_destinations.asset_id AND a.version_size=provider_active_destinations.version_size AND a.checksum=provider_active_destinations.checksum AND a.metadata_hash=provider_active_destinations.metadata_hash AND a.created_at IS provider_active_destinations.created_at AND a.added_at IS provider_active_destinations.added_at AND a.is_deleted=0)",params![receipt.generation,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path,pending.asset.local_checksum,receipt.grouping_hash,local,complete,pending.source_checksum,pending.asset.metadata.metadata_hash,advance_source])?;
     if changed > 0 {
         let destination = manifest
             .decision
@@ -2120,7 +2122,7 @@ pub(super) fn finish_metadata_receipt(
             if alias.decision.master != manifest.decision.master {
                 continue;
             }
-            conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,local_checksum=COALESCE(?6,local_checksum),verified_metadata=CASE WHEN ?10=1 THEN 1 ELSE verified_metadata END WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND local_checksum IS ?7 AND source_checksum IS ?8 AND grouping_hash=?9 AND verified_media=1 AND verified_metadata=0",params![generation,key,child,pending.asset.version_size.as_str(),path,local,pending.asset.local_checksum,pending.source_checksum,receipt.grouping_hash,complete])?;
+            conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,local_checksum=COALESCE(?6,local_checksum),source_checksum=CASE WHEN ?11=1 THEN COALESCE(?6,source_checksum) ELSE source_checksum END,verified_metadata=CASE WHEN ?10=1 THEN 1 ELSE verified_metadata END WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND local_checksum IS ?7 AND source_checksum IS ?8 AND grouping_hash=?9 AND verified_media=1 AND verified_metadata=0",params![generation,key,child,pending.asset.version_size.as_str(),path,local,pending.asset.local_checksum,pending.source_checksum,receipt.grouping_hash,complete,advance_source])?;
             let destination = alias
                 .decision
                 .destinations

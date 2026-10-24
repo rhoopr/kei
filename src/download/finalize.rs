@@ -25,6 +25,7 @@ pub(super) struct PendingStateWrite {
     pub(super) download_path: PathBuf,
     pub(super) local_checksum: String,
     pub(super) download_checksum: Option<String>,
+    pub(super) source_checksum: Option<String>,
     pub(super) mark_capture_repair: bool,
     pub(super) retained: Option<Arc<super::file::RetainedPendingFile>>,
     pub(super) requires_retained: bool,
@@ -73,12 +74,13 @@ pub(super) async fn finalize_downloaded<D>(
 where
     D: DownloadFinalizationStore + ?Sized,
 {
+    let source_checksum = download_checksum.clone();
     finalize_downloaded_with_proof(
         db,
         library,
         task,
         local_checksum,
-        download_checksum,
+        (download_checksum, source_checksum),
         exif_ok,
         mark_capture_repair,
         None,
@@ -91,7 +93,7 @@ pub(super) async fn finalize_downloaded_with_proof<D>(
     library: &Arc<str>,
     task: &DownloadTask,
     local_checksum: String,
-    download_checksum: Option<String>,
+    checksums: (Option<String>, Option<String>),
     exif_ok: bool,
     mark_capture_repair: bool,
     retained: Option<Arc<super::file::RetainedPendingFile>>,
@@ -99,6 +101,7 @@ pub(super) async fn finalize_downloaded_with_proof<D>(
 where
     D: DownloadFinalizationStore + ?Sized,
 {
+    let (download_checksum, source_checksum) = checksums;
     #[cfg(all(test, target_os = "linux"))]
     crate::test_helpers::process_death_point("published");
     let write = PendingStateWrite {
@@ -108,6 +111,7 @@ where
         download_path: task.download_path.clone(),
         local_checksum,
         download_checksum,
+        source_checksum,
         mark_capture_repair,
         retained,
         requires_retained: task.pending_cross_parent_root.is_some(),
@@ -119,13 +123,16 @@ where
         };
     }
     match db
-        .mark_verified_download(
+        .mark_verified_download_with_source(
             library,
             &task.asset_id,
             task.version_size.as_str(),
             &task.download_path,
-            &write.local_checksum,
-            write.download_checksum.as_deref(),
+            (
+                &write.local_checksum,
+                write.download_checksum.as_deref(),
+                write.source_checksum.as_deref(),
+            ),
             mark_capture_repair,
         )
         .await
@@ -255,13 +262,16 @@ where
             return false;
         }
         match db
-            .mark_verified_download(
+            .mark_verified_download_with_source(
                 &write.library,
                 &write.asset_id,
                 write.version_size.as_str(),
                 &write.download_path,
-                &write.local_checksum,
-                write.download_checksum.as_deref(),
+                (
+                    &write.local_checksum,
+                    write.download_checksum.as_deref(),
+                    write.source_checksum.as_deref(),
+                ),
                 write.mark_capture_repair,
             )
             .await
@@ -470,7 +480,7 @@ mod tests {
             &Arc::from(LIBRARY),
             &pending_task,
             checksum.clone(),
-            Some(checksum),
+            (Some(checksum.clone()), Some(checksum)),
             true,
             false,
             Some(proof),
@@ -581,7 +591,7 @@ mod tests {
                 &Arc::from(LIBRARY),
                 &pending_task,
                 checksum.clone(),
-                Some(checksum),
+                (Some(checksum.clone()), Some(checksum)),
                 true,
                 false,
                 if missing { None } else { Some(proof) },

@@ -999,7 +999,7 @@ async fn prepare(
                 shutdown_token: cancel,
                 mode: crate::personality::Mode::Off,
             };
-            let (metadata_ok, checksum, source_checksum, bytes, disk, _) =
+            let (metadata_ok, checksum, (download_checksum, _), bytes, disk, _) =
                 crate::download::pipeline::download_single_task(
                     client,
                     &task,
@@ -1017,7 +1017,7 @@ async fn prepare(
                 &stage,
                 record.version_size.as_str(),
                 &record.checksum,
-                source_checksum,
+                download_checksum,
             )
             .await?;
             anyhow::ensure!(

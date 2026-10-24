@@ -164,6 +164,69 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
         assert_eq!(std::fs::read(&path).unwrap(), source);
     }
 
+    // iOS EXIF quantizes arcseconds to 1/100" (for example 36.678" -> 3668/100).
+    // Provider coordinates that round to the exact stored EXIF DMS rational
+    // match, whereas coordinates outside that rational step do not.
+    let mut quantized_meta = Metadata::new_from_vec(&source, FileExtension::JPEG).unwrap();
+    quantized_meta.set_tag(ExifTag::GPSLatitudeRef("S".into()));
+    quantized_meta.set_tag(ExifTag::GPSLatitude(vec![
+        ur64(33, 1),
+        ur64(45, 1),
+        ur64(3668, 100),
+    ]));
+    quantized_meta.set_tag(ExifTag::GPSLongitudeRef("E".into()));
+    quantized_meta.set_tag(ExifTag::GPSLongitude(vec![
+        ur64(151, 1),
+        ur64(13, 1),
+        ur64(426, 100),
+    ]));
+    let mut quantized_jpeg = minimal_jpeg_bytes();
+    quantized_meta
+        .write_to_vec(&mut quantized_jpeg, FileExtension::JPEG)
+        .unwrap();
+    for (name, latitude, longitude, expected) in [
+        (
+            "quantized-hundredths-match",
+            -33.760_188_333_333_33,
+            151.21785,
+            true,
+        ),
+        (
+            "quantized-hundredths-outside-step",
+            -33.7602,
+            151.21785,
+            false,
+        ),
+    ] {
+        let path = dir.path().join(format!("{name}.jpg"));
+        std::fs::write(&path, &quantized_jpeg).unwrap();
+        let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+        assert!(
+            write_sidecar_metadata(
+                &path,
+                Arc::new(MetadataPayload {
+                    latitude: Some(latitude),
+                    longitude: Some(longitude),
+                    ..MetadataPayload::default()
+                }),
+                now_local(),
+                Some(&checksum),
+                ".gps-test"
+            )
+            .await,
+            "{name}"
+        );
+        let xmp: XmpMeta = std::fs::read_to_string(path.with_extension("jpg.xmp"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            xmp.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
+            expected,
+            "{name}"
+        );
+    }
+
     // Remove a tag, or replace it with invalid readable EXIF. Both are
     // known absence, not retryable I/O failures.
     let native_cases = [

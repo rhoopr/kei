@@ -32,7 +32,7 @@ pub(super) use queued::{
     RewritePass, run_pending, run_pending_budget, run_pending_page, run_pending_rows, tag_if_needed,
 };
 #[cfg(feature = "xmp")]
-pub(super) use sidecar::write_reconciled_sidecar;
+pub(super) use sidecar::{refresh_companion_mov_sidecars, write_reconciled_sidecar};
 
 #[cfg(all(test, feature = "xmp"))]
 pub(in crate::download) use embedded::publication_pause;

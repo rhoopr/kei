@@ -145,6 +145,7 @@ pub(in crate::download) struct PreparedMetadataFile {
     pub(super) guard: TmpGuard,
     pub(super) expected_input: crate::download::file::ExistingFileFingerprint,
     pub(super) expected_output: crate::download::file::ExistingFileFingerprint,
+    pub(in crate::download) wrote_gps: bool,
 }
 
 impl PreparedMetadataFile {
@@ -175,6 +176,7 @@ impl PreparedMetadataFile {
             guard,
             expected_input,
             expected_output,
+            wrote_gps: _,
         } = self;
         let temp_path = guard.path.clone();
         if let Err(error) = install(&temp_path, final_path, expected_input, expected_output) {
