@@ -1027,9 +1027,10 @@ except when a linked sparse observation has no current master reference. That
 case rechecks the source through the bounded lookup instead of letting a saved
 master hide selected-target recovery. The historical mapping remains intact;
 fresh source evidence and the existing target proof still govern recovery.
-When sparse retry is delayed, a saved mapping still permits the ordinary
-paired lookup. Recovery then requires a complete current pair; another sparse
-result remains held. An explicit current master reference continues to take precedence. Malformed or
+A saved mapping alone cannot bypass the sparse retry deadline or the
+100-source limit. Deferred work stays held. Once due, fresh source confirmation
+can supply a complete current pair or qualify selected-target recovery.
+An explicit current master reference continues to take precedence. Malformed or
 changed incoming evidence cannot inherit a cached negative result. Unclassified
 sources still need an initial lookup before sparse retry policy can apply.
 A deferred source remains unresolved and blocks the checkpoint. Retained

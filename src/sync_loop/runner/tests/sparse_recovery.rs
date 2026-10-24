@@ -122,7 +122,7 @@ impl PhotosSession for Session {
         Box::new(self.clone())
     }
 }
-fn album(zone: &str, owner: &str, session: Session) -> PhotoAlbum {
+fn album(zone: &str, owner: &str, session: impl PhotosSession + 'static) -> PhotoAlbum {
     PhotoAlbum::new(
         PhotoAlbumConfig {
             params: Arc::new(std::collections::HashMap::new()),
@@ -455,5 +455,231 @@ async fn exercise_sparse_target(stale_mapping: bool, discover_in_lookup: bool) {
             }
         }
         server.verify().await;
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BudgetSession {
+    records: Vec<Value>,
+    looked_up: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for BudgetSession {
+    async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        if url.contains("/internal/records/query/batch?") {
+            return Ok(album_count_response(0));
+        }
+        if url.contains("/records/query?") {
+            return Ok(json!({"records":[],"syncToken":"inventory-only"}));
+        }
+        if url.contains("/records/lookup?") {
+            assert_eq!(request["zoneID"]["zoneName"], "PrimarySync");
+            let records: Vec<_> = request["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| {
+                    let name = id["recordName"].as_str().unwrap();
+                    if name == "stale-master" {
+                        json!({"recordName":name,"serverErrorCode":"NOT_FOUND"})
+                    } else {
+                        self.looked_up.lock().unwrap().push(name.into());
+                        self.records
+                            .iter()
+                            .find(|record| record["recordName"] == name)
+                            .unwrap()
+                            .clone()
+                    }
+                })
+                .collect();
+            return Ok(json!({"records":records}));
+        }
+        assert!(url.contains("/changes/zone?"), "unexpected request {url}");
+        Ok(json!({"zones":[{
+            "zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+            "syncToken":"after","moreComing":false,"records":self.records
+        }]}))
+    }
+
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn mapped_sparse_retry_honors_deadline_budget_and_changed_evidence_after_reopen() {
+    use crate::icloud::photos::asset::SparseShareEvidence;
+    use crate::state::{SparseAttemptOutcome, SparseSourceId};
+    use chrono::{TimeDelta, Utc};
+
+    for (mapped, due, changed) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, false, true),
+    ] {
+        let count = if due { 101 } else { 1 };
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("state.db");
+        let media = directory.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        let sentinel = media.join("keep.bin");
+        std::fs::write(&sentinel, b"preserve original").unwrap();
+        let config = make_run_cycle_config();
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+        let looked_up = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let records: Vec<_> = (0..count)
+            .map(|index| {
+                let mut record = sparse();
+                record["recordName"] = json!(format!("source-{index:03}"));
+                record
+            })
+            .collect();
+        let initial_key = SparseShareEvidence::from_fields(&records[0]["fields"])
+            .unwrap()
+            .durable_key()
+            .unwrap();
+        for cycle in 0..3 {
+            let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            let db: Arc<dyn download::DownloadStore> = inner.clone();
+            let builder = make_run_cycle_download_config_builder(&media, db.clone());
+            if cycle == 0 {
+                let run = inner.start_sync_run().await.unwrap();
+                inner
+                    .complete_sync_run(run, &state::SyncRunStats::default())
+                    .await
+                    .unwrap();
+                inner
+                    .set_metadata(
+                        crate::sync_cycle::ENUM_CONFIG_HASH_KEY,
+                        &download::compute_config_hash(&config),
+                    )
+                    .await
+                    .unwrap();
+                let target_config = builder(
+                    download::SyncMode::Full,
+                    Arc::new(rustc_hash::FxHashSet::default()),
+                    Arc::new(download::AssetGroupings::default()),
+                    Arc::from("PrimarySync"),
+                );
+                inner
+                    .set_metadata(
+                        download::DOWNLOAD_CONFIG_HASH_KEY,
+                        &download::hash_download_config(&target_config),
+                    )
+                    .await
+                    .unwrap();
+                inner
+                    .set_metadata("sync_token:PrimarySync", "before")
+                    .await
+                    .unwrap();
+                let attempt_at = Utc::now()
+                    - if due {
+                        TimeDelta::hours(2)
+                    } else {
+                        TimeDelta::zero()
+                    };
+                for record in &records {
+                    let name = record["recordName"].as_str().unwrap();
+                    if mapped {
+                        inner
+                            .upsert_asset_master_mapping("PrimarySync", name, "stale-master")
+                            .await
+                            .unwrap();
+                    }
+                    let row = inner
+                        .observe_sparse_identity(
+                            "PrimarySync",
+                            &SparseSourceId::new(name),
+                            &initial_key,
+                            attempt_at,
+                        )
+                        .await
+                        .unwrap();
+                    inner
+                        .record_sparse_attempt(
+                            &row,
+                            SparseAttemptOutcome::Unresolved(initial_key.clone()),
+                            attempt_at,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            let mut current_records = records.clone();
+            if changed && cycle > 0 {
+                current_records[0]["fields"]["linkedShareRecordName"]["value"] =
+                    json!("changed-target");
+            }
+            let primary = make_run_cycle_library_state_with_album(
+                "PrimarySync",
+                "sync_token:PrimarySync",
+                album(
+                    "PrimarySync",
+                    "_defaultOwner",
+                    BudgetSession {
+                        records: current_records,
+                        looked_up: looked_up.clone(),
+                    },
+                ),
+            );
+            let result = crate::sync_cycle::run_cycle(
+                &[&primary],
+                &config,
+                Some(db.as_ref()),
+                false,
+                &builder,
+                download::DownloadControls::download_hidden(),
+                &shared_session,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(result.stats.identity_incomplete);
+            assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve original");
+            assert_eq!(
+                inner
+                    .get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("before")
+            );
+            let rows = inner.sparse_identities("PrimarySync").await.unwrap();
+            assert_eq!(rows.len(), count);
+            for row in &rows {
+                assert_eq!(row.original, initial_key);
+                if mapped {
+                    assert_eq!(
+                        inner
+                            .get_master_record_name_for_asset("PrimarySync", row.source.as_str(),)
+                            .await
+                            .unwrap()
+                            .as_deref(),
+                        Some("stale-master")
+                    );
+                }
+            }
+            let observed = looked_up.lock().unwrap();
+            let expected = if due {
+                if cycle == 0 { 100 } else { 101 }
+            } else {
+                usize::from(changed && cycle > 0)
+            };
+            assert_eq!(
+                observed.len(),
+                expected,
+                "mapped={mapped} due={due} changed={changed} cycle={cycle}"
+            );
+            let unique: std::collections::BTreeSet<_> = observed.iter().collect();
+            assert_eq!(
+                unique.len(),
+                observed.len(),
+                "repeated unchanged evidence should not bypass backoff"
+            );
+        }
     }
 }

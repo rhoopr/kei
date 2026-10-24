@@ -3117,10 +3117,18 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
                 .map(|record| record["recordName"].as_str().unwrap())
                 .collect();
             names.sort_unstable();
-            assert_eq!(names, ["asset-recovered", "recovered"]);
+            assert!(names == ["asset-recovered"] || names == ["asset-recovered", "recovered"]);
             self.lookups
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(serde_json::json!({"records":self.records}))
+            let selected: Vec<_> = self
+                .records
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|record| names.contains(&record["recordName"].as_str().unwrap()))
+                .cloned()
+                .collect();
+            Ok(serde_json::json!({"records":selected}))
         }
         fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
             Box::new(self.clone())
@@ -3174,19 +3182,21 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
                 db.set_metadata("sync_token:PrimarySync", "before")
                     .await
                     .unwrap();
+                let observed_at = Utc::now() - chrono::TimeDelta::hours(2);
                 let row = db
-                    .observe_sparse_identity("PrimarySync", &source, &evidence, Utc::now())
+                    .observe_sparse_identity("PrimarySync", &source, &evidence, observed_at)
                     .await
                     .unwrap();
                 db.record_sparse_attempt(
                     &row,
                     SparseAttemptOutcome::Unresolved(evidence.clone()),
-                    Utc::now(),
+                    observed_at,
                 )
                 .await
                 .unwrap();
-                // Exact source identity bypasses a future deadline. The absent
-                // linked zone is never queried and supplies no identity proof.
+                // The saved sparse retry is due. Fresh source and pair checks
+                // must reach the injected write failure, then recover on reopen.
+                // The absent linked zone supplies no identity proof.
                 db.upsert_asset_master_mapping("PrimarySync", source.as_str(), "recovered")
                     .await
                     .unwrap();
@@ -3288,7 +3298,7 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
                     }
                 }
             }
-            assert_eq!(lookups.load(std::sync::atomic::Ordering::Relaxed), 2);
+            assert_eq!(lookups.load(std::sync::atomic::Ordering::Relaxed), 4);
             server.verify().await;
         }
     }

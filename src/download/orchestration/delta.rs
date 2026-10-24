@@ -951,7 +951,6 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
     shutdown_token: &CancellationToken,
 ) {
     let mut pending = Vec::new();
-    let mut deferred_pairs = FxHashMap::default();
     let mut unresolved: FxHashMap<String, Vec<usize>> = FxHashMap::default();
     for (index, event) in events.iter().enumerate() {
         if event.reason != ChangeReason::Created
@@ -985,15 +984,12 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
             None
         };
 
-        // Prefer fresh sparse confirmation when due. If sparse retry is
-        // deferred, preserve the existing mapped-pair lookup: it can reveal
-        // that the source is complete again without trusting the saved master.
+        // A historical mapping cannot bypass a known sparse retry deadline
+        // or budget. Current explicit master references still take precedence.
+        let has_master_candidate = master_record_name.is_some();
         let master_record_name = if event.master_record_name.is_none()
             && matches!(event.sparse_share, Some(SparseShareEvidence::Linked(_)))
         {
-            if let Some(master) = master_record_name {
-                deferred_pairs.insert(event.record_name.to_string(), master);
-            }
             None
         } else {
             master_record_name
@@ -1002,9 +998,7 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
             Some(master_record_name) => {
                 pending.push((index, event.record_name.to_string(), master_record_name));
             }
-            None if !deferred_pairs.contains_key(event.record_name.as_ref())
-                && retry.deletion_is_current(event) =>
-            {
+            None if !has_master_candidate && retry.deletion_is_current(event) => {
                 apply_sparse_source_deletion(event, config, summary).await;
                 retry.prove(&event.record_name, summary);
             }
@@ -1027,14 +1021,6 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
     unresolved.retain(|source, indices| {
         if retry.permits(source, events, indices) {
             return true;
-        }
-        if let Some(master) = deferred_pairs.remove(source) {
-            pending.extend(
-                indices
-                    .iter()
-                    .map(|index| (*index, source.clone(), master.clone())),
-            );
-            return false;
         }
         summary.block_identity();
         false

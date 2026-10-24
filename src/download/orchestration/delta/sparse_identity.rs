@@ -225,8 +225,8 @@ impl SparseRetryContext {
         )
     }
 
-    // Select after authoritative mappings have been removed from the source-only
-    // work. Otherwise recovered rows could monopolize a held library's budget.
+    // Current master references use paired confirmation. Historical mappings
+    // do not exempt a known sparse source from this deadline and budget.
     pub(super) fn select_due(&mut self, sources: &FxHashMap<String, Vec<usize>>) {
         let now = Utc::now();
         let mut due: Vec<_> = self
