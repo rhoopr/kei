@@ -3288,6 +3288,60 @@ mod wiremock_tests {
         assert_eq!(decision, StrictImportDecision::Accepted);
     }
 
+    /// Characterize the evidence boundary before reusing import checks for
+    /// automatic baseline matching: Accepted proves a prefix, not the file.
+    #[tokio::test]
+    async fn strict_prefix_equality_does_not_prove_complete_content() {
+        use sha2::{Digest, Sha256};
+
+        let server = crate::start_wiremock_or_skip!();
+        let prefix_len = usize::try_from(super::STRICT_IMPORT_PREFIX_BYTES).unwrap();
+        let mut provider = vec![b'a'; prefix_len + 16];
+        provider[prefix_len..].fill(b'p');
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/asset"))
+            .and(header("Range", format!("bytes=0-{}", prefix_len - 1)))
+            .respond_with(
+                ResponseTemplate::new(206).set_body_bytes(provider[..prefix_len].to_vec()),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("IMG_0004.JPG");
+        for (change_prefix, expected) in [
+            (false, StrictImportDecision::Accepted),
+            (true, StrictImportDecision::Refused),
+        ] {
+            let mut local = provider.clone();
+            local[prefix_len..].fill(b'x');
+            if change_prefix {
+                local[0] = b'z';
+            }
+            assert_eq!(local.len(), provider.len());
+            assert_ne!(Sha256::digest(&local), Sha256::digest(&provider));
+            stage_file_with_bytes(&path, &local);
+            let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+            let decision = verify_strict_prefix(
+                &reqwest::Client::new(),
+                &path,
+                &format!("{}/asset", server.uri()),
+                u64::try_from(provider.len()).unwrap(),
+            )
+            .await
+            .expect("prefix comparison");
+
+            assert_eq!(decision, expected);
+            assert_eq!(std::fs::read(&path).unwrap(), local);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                before
+            );
+        }
+    }
+
     // ── Tests: idempotency ────────────────────────────────────────────
 
     #[tokio::test]
