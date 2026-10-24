@@ -17,6 +17,7 @@ use std::sync::{
 struct Session {
     source: bool,
     quiet: bool,
+    discover_in_lookup: bool,
     unrelated: bool,
     records: Vec<Value>,
     target_calls: Arc<AtomicUsize>,
@@ -92,7 +93,18 @@ impl PhotosSession for Session {
                 .push(request["zones"][0]["syncToken"].as_str().map(str::to_owned));
         }
         let records = if self.source && !self.quiet {
-            let mut records = vec![sparse()];
+            let mut source = sparse();
+            if self.discover_in_lookup {
+                for key in [
+                    "isSparsePrivateRecord",
+                    "linkedShareRecordName",
+                    "linkedShareZoneName",
+                    "linkedShareZoneOwner",
+                ] {
+                    source["fields"].as_object_mut().unwrap().remove(key);
+                }
+            }
+            let mut records = vec![source];
             if self.unrelated {
                 records.push(unrelated_sparse());
             }
@@ -131,15 +143,20 @@ fn album(zone: &str, owner: &str, session: Session) -> PhotoAlbum {
 
 #[tokio::test]
 async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
-    Box::pin(exercise_sparse_target(false)).await;
+    Box::pin(exercise_sparse_target(false, false)).await;
 }
 
 #[tokio::test]
 async fn sparse_target_stale_mapping_does_not_hide_selected_recovery() {
-    Box::pin(exercise_sparse_target(true)).await;
+    Box::pin(exercise_sparse_target(true, false)).await;
 }
 
-async fn exercise_sparse_target(stale_mapping: bool) {
+#[tokio::test]
+async fn paired_sparse_discovery_is_retained_then_confirmed_after_reopen() {
+    Box::pin(exercise_sparse_target(true, true)).await;
+}
+
+async fn exercise_sparse_target(stale_mapping: bool, discover_in_lookup: bool) {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::{
@@ -157,7 +174,9 @@ async fn exercise_sparse_target(stale_mapping: bool) {
         let complete = selected && owner_matches && !unrelated;
         // A held source obligation beside eligible target work still reopens so
         // the next cycle can prove that the completed transfer is not repeated.
-        let cycles = if complete || (pending && unrelated) {
+        let cycles = if discover_in_lookup {
+            3
+        } else if complete || (pending && unrelated) {
             2
         } else {
             1
@@ -251,7 +270,8 @@ async fn exercise_sparse_target(stale_mapping: bool) {
                     "_defaultOwner",
                     Session {
                         source: true,
-                        quiet: cycle > 0,
+                        quiet: cycle > usize::from(discover_in_lookup),
+                        discover_in_lookup,
                         unrelated,
                         records: Vec::new(),
                         target_calls: calls.clone(),
@@ -272,6 +292,7 @@ async fn exercise_sparse_target(stale_mapping: bool) {
                     Session {
                         source: false,
                         quiet: true,
+                        discover_in_lookup: false,
                         unrelated: false,
                         records: records.clone(),
                         target_calls: calls.clone(),
@@ -315,13 +336,14 @@ async fn exercise_sparse_target(stale_mapping: bool) {
                     .is_empty(),
                 "full-library recovery must not invent album membership"
             );
-            if complete {
+            let recovered_cycle = cycle == usize::from(discover_in_lookup);
+            if complete && (!discover_in_lookup || cycle > 0) {
                 assert!(
                     !result.stats.identity_incomplete,
                     "sufficient target proof must finish: {result:?}, target calls {}",
                     calls.load(Ordering::SeqCst)
                 );
-                assert_eq!(result.stats.downloaded, usize::from(cycle == 0));
+                assert_eq!(result.stats.downloaded, usize::from(recovered_cycle));
                 assert_eq!(
                     inner
                         .get_metadata("sync_token:PrimarySync")
@@ -361,7 +383,7 @@ async fn exercise_sparse_target(stale_mapping: bool) {
                 assert!(result.stats.identity_incomplete);
                 assert_eq!(
                     result.stats.downloaded,
-                    usize::from(selected && owner_matches && cycle == 0),
+                    usize::from(selected && owner_matches && recovered_cycle),
                     "eligible target work progresses once, then reopens quietly"
                 );
                 assert_eq!(
@@ -412,10 +434,14 @@ async fn exercise_sparse_target(stale_mapping: bool) {
                     );
                 }
                 let observed_calls = calls.load(Ordering::SeqCst);
-                if cycle == 0 {
+                if cycle <= usize::from(discover_in_lookup) {
                     assert_eq!(
                         observed_calls,
-                        if selected && owner_matches { 2 } else { 0 },
+                        if selected && owner_matches && recovered_cycle {
+                            2
+                        } else {
+                            0
+                        },
                         "unselected or wrong scope must not be requested"
                     );
                 } else {

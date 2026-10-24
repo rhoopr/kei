@@ -575,12 +575,21 @@ impl PhotoAlbum {
                                 && classify_change_reason(record)
                                     == crate::types::ChangeReason::Created
                         })
-                        .and_then(|record| extract_master_ref(&record.fields))
-                        .filter(|name| !name.trim().is_empty())
-                        .map_or(RecordResolution::Unknown, |master_record_name| {
-                            RecordResolution::MasterChanged {
-                                master_record_name: ProviderRecordId::new(master_record_name),
+                        .map_or(RecordResolution::Unknown, |record| {
+                            if let Some(master_record_name) = extract_master_ref(&record.fields)
+                                .filter(|name| !name.trim().is_empty())
+                            {
+                                return RecordResolution::MasterChanged {
+                                    master_record_name: ProviderRecordId::new(master_record_name),
+                                };
                             }
+                            if record.fields.get("masterRef").is_none()
+                                && let Some(evidence @ SparseShareEvidence::Linked(_)) =
+                                    SparseShareEvidence::from_fields(&record.fields)
+                            {
+                                return RecordResolution::SparseShareUnresolved(evidence);
+                            }
+                            RecordResolution::Unknown
                         })
                 } else if primary_deleted || asset_deleted {
                     RecordResolution::Deleted {
@@ -662,7 +671,9 @@ impl PhotoAlbum {
                 if matches!(
                     resolution,
                     RecordResolution::Unknown | RecordResolution::MasterChanged { .. }
-                ) {
+                ) || (request.target == RecordLookupTarget::Master
+                    && matches!(resolution, RecordResolution::SparseShareUnresolved(_)))
+                {
                     let (reason, stage) =
                         lookup_rejection(master, asset, request, &self.zone_id, pair_matches);
                     let target = match request.target {

@@ -1302,10 +1302,18 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                     );
                     summary.record_provider_error(error.into());
                 }
+                RecordResolution::SparseShareUnresolved(evidence) => {
+                    // A failed pair can still reveal a scoped sparse source.
+                    // Retain it as unresolved work; a later source-only lookup
+                    // must confirm it before the ordinary recovery path runs.
+                    retry
+                        .observe_discovered(state_id.as_str(), &evidence, config, summary, run_mode)
+                        .await;
+                    summary.block_identity();
+                }
                 RecordResolution::Present(_)
                 | RecordResolution::AssetPresent { .. }
                 | RecordResolution::MasterPresent
-                | RecordResolution::SparseShareUnresolved(_)
                 | RecordResolution::MasterChanged { .. }
                 | RecordResolution::Unknown => {
                     summary.block_identity();

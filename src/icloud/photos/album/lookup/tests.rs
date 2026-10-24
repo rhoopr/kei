@@ -929,6 +929,11 @@ async fn issue956_missing_master_returned_child_distinguishes_references() {
                     matches!(&result.results[0].1, RecordResolution::MasterChanged { master_record_name }
                     if master_record_name.as_str() == "new-master")
                 );
+            } else if fault == "sparse" {
+                assert!(matches!(
+                    result.results[0].1,
+                    RecordResolution::SparseShareUnresolved(SparseShareEvidence::Linked(_))
+                ));
             } else {
                 assert!(
                     matches!(result.results[0].1, RecordResolution::Unknown),
@@ -1173,4 +1178,88 @@ async fn issue956_single_target_statuses_do_not_invent_the_other_record() {
             && event.field("master_status") == Some("omitted")
             && event.field("child_status") == Some("not_requested"))
     );
+}
+
+#[tokio::test]
+async fn paired_sparse_child_retains_link_without_claiming_pair_completion() {
+    for missing_master in [false, true] {
+        let master = if missing_master {
+            json!({"recordName":"old-master","serverErrorCode":"NOT_FOUND"})
+        } else {
+            test_master_record("old-master")
+        };
+        let mut child = crate::test_helpers::sparse_shared_asset_record();
+        child["recordName"] = json!("sparse-child");
+        let album = make_album_with_session(
+            100,
+            Box::new(MockPhotosSession::new().ok(json!({"records":[master,child]}))),
+        );
+        let result = album
+            .resolve_records(&[lookup_request("sparse-child", "old-master", "sparse-child")])
+            .await;
+        assert!(!result.complete, "a sparse link is not a complete pair");
+        assert!(
+            matches!(
+                result.results[0].1,
+                RecordResolution::SparseShareUnresolved(SparseShareEvidence::Linked(_))
+            ),
+            "returned child must preserve qualified sparse evidence: {:?}",
+            result.results
+        );
+    }
+}
+
+#[tokio::test]
+async fn paired_sparse_hint_rejects_unqualified_or_nonlive_records() {
+    for fault in [
+        "foreign_owner",
+        "foreign_zone",
+        "master_error",
+        "master_tombstone",
+        "child_error",
+        "soft_deleted",
+        "hidden",
+        "wrong_type",
+        "malformed_master_ref",
+        "missing_link",
+        "malformed_link",
+    ] {
+        let mut master = test_master_record("old-master");
+        let mut child = crate::test_helpers::sparse_shared_asset_record();
+        child["recordName"] = json!("sparse-child");
+        match fault {
+            "foreign_owner" => {
+                child["zoneID"] = json!({"zoneName":"PrimarySync","ownerRecordName":"other"})
+            }
+            "foreign_zone" => child["zoneID"] = json!({"zoneName":"SharedSync-other"}),
+            "master_error" => master["serverErrorCode"] = json!("ACCESS_DENIED"),
+            "master_tombstone" => master["deleted"] = json!(true),
+            "child_error" => child["serverErrorCode"] = json!("RETRY_LATER"),
+            "soft_deleted" => child["fields"]["isDeleted"] = json!({"value":1,"type":"INT64"}),
+            "hidden" => child["fields"]["isHidden"] = json!({"value":1,"type":"INT64"}),
+            "wrong_type" => child["recordType"] = json!("CPLAlbum"),
+            "malformed_master_ref" => child["fields"]["masterRef"] = json!(null),
+            "missing_link" => {
+                child["fields"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("linkedShareRecordName");
+            }
+            "malformed_link" => child["fields"]["linkedShareRecordName"]["value"] = json!(42),
+            _ => panic!("unexpected synthetic fault: {fault}"),
+        }
+        let album = make_album_with_session(
+            100,
+            Box::new(MockPhotosSession::new().ok(json!({"records":[master,child]}))),
+        );
+        let result = album
+            .resolve_records(&[lookup_request("sparse-child", "old-master", "sparse-child")])
+            .await;
+        assert!(!result.complete, "{fault}");
+        assert!(
+            matches!(result.results[0].1, RecordResolution::Unknown),
+            "{fault}: {:?}",
+            result.results
+        );
+    }
 }

@@ -1035,6 +1035,13 @@ sources still need an initial lookup before sparse retry policy can apply.
 A deferred source remains unresolved and blocks the checkpoint. Retained
 sources absent from replay re-enter normal hydration and media planning.
 
+A paired lookup can retain a live, scoped sparse link, including when the old
+master is present or explicitly not found. It does not establish a complete pair or
+deletion. The current pass stays incomplete. On replay, an unpaired source with
+no current master or sparse fields can use that saved link only to select a
+fresh source lookup. The current lookup must agree before selected-target
+recovery proceeds. Saved deletion results cannot supply this replay hint.
+
 Authoritative source-only deletion lookups retain the completed delta token in
 `last_outcome` as `["source_deleted_v1", token]`. This is provider evidence,
 not a persisted claim that local processing completed. On restart or the next

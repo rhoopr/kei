@@ -84,6 +84,21 @@ impl SparseRetryContext {
             }
             context.rows.insert(row.source.clone(), row);
         }
+        // A replay may repeat the original unpaired child without its newer
+        // sparse fields. Retain the saved hint, but still require a fresh,
+        // matching source lookup before target recovery or checkpoint proof.
+        for event in events.iter_mut() {
+            if event.reason == ChangeReason::Created
+                && event.record_type.as_deref() == Some("CPLAsset")
+                && event.asset.is_none()
+                && event.master_record_name.is_none()
+                && event.sparse_share.is_none()
+                && let Some(row) = context.rows.get(&SparseSourceId::new(&event.record_name))
+                && row.deletion_checkpoint.is_none()
+            {
+                event.sparse_share = SparseShareEvidence::from_durable_key(&row.observed);
+            }
+        }
         context.checkpoint = summary
             .sync_token
             .as_deref()
@@ -261,6 +276,36 @@ impl SparseRetryContext {
             return true;
         }
         self.due.contains(&key)
+    }
+
+    pub(super) async fn observe_discovered(
+        &mut self,
+        source: &str,
+        evidence: &SparseShareEvidence,
+        config: &DownloadConfig,
+        summary: &mut IncrementalDeltaSummary,
+        run_mode: DownloadRunMode,
+    ) {
+        if !run_mode.downloads_files() {
+            return;
+        }
+        let (Some(db), Some(key)) = (&config.state_db, evidence.durable_key()) else {
+            return;
+        };
+        let source = SparseSourceId::new(source);
+        // Existing observations retain their generation and disagreement.
+        if self.rows.contains_key(&source) {
+            return;
+        }
+        match db
+            .observe_sparse_identity(&config.library, &source, &key, Utc::now())
+            .await
+        {
+            Ok(row) => {
+                self.rows.insert(source, row);
+            }
+            Err(_) => state_failure(summary),
+        }
     }
 
     pub(super) async fn record(
@@ -510,6 +555,32 @@ mod tests {
         )
         .await
         .unwrap();
+        // A newly returned child must not inherit an older deletion receipt,
+        // even if the response repeats the saved token.
+        let mut restored = vec![crate::icloud::photos::asset::ChangeEvent {
+            record_name: "source".into(),
+            record_type: Some("CPLAsset".into()),
+            master_record_name: None,
+            sparse_share: None,
+            reason: crate::types::ChangeReason::Created,
+            asset: None,
+            album: None,
+            relation: None,
+            token_unsafe_reason: None,
+        }];
+        let mut restored_summary = IncrementalDeltaSummary {
+            sync_token: Some("snapshot".into()),
+            ..IncrementalDeltaSummary::default()
+        };
+        let restored_context = SparseRetryContext::prepare(
+            &mut restored,
+            &config,
+            &mut restored_summary,
+            DownloadRunMode::Download,
+        )
+        .await;
+        assert!(restored[0].sparse_share.is_none());
+        assert!(!restored_context.deletion_is_current(&restored[0]));
         for token in [None, Some("new-snapshot"), Some("snapshot")] {
             let mut events = Vec::new();
             let mut summary = IncrementalDeltaSummary {
@@ -561,6 +632,71 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn sparse_discovery_preserves_current_evidence_and_existing_generation() {
+        use crate::icloud::photos::asset::ChangeEvent;
+        use crate::types::ChangeReason;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let config = DownloadConfig {
+            library: "PrimarySync".into(),
+            state_db: Some(db.clone()),
+            ..DownloadConfig::test_default()
+        };
+        let row = db
+            .observe_sparse_identity(
+                "PrimarySync",
+                &SparseSourceId::new("source"),
+                &key(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let different = SparseEvidence::new(
+            r#"[1,"different-child","SharedSync-private-zone","private-owner"]"#.into(),
+        );
+        for (master, evidence, mode) in [
+            (Some("current-master"), None, DownloadRunMode::Download),
+            (
+                None,
+                Some(SparseShareEvidence::Malformed),
+                DownloadRunMode::Download,
+            ),
+            (None, None, DownloadRunMode::DryRun),
+            (None, None, DownloadRunMode::PrintFilenames),
+        ] {
+            let mut events = vec![ChangeEvent {
+                record_name: "source".into(),
+                record_type: Some("CPLAsset".into()),
+                master_record_name: master.map(Into::into),
+                sparse_share: evidence.clone(),
+                reason: ChangeReason::Created,
+                asset: None,
+                album: None,
+                relation: None,
+                token_unsafe_reason: None,
+            }];
+            let mut summary = IncrementalDeltaSummary::default();
+            let mut context =
+                SparseRetryContext::prepare(&mut events, &config, &mut summary, mode).await;
+            assert_eq!(events[0].master_record_name.as_deref(), master);
+            assert_eq!(events[0].sparse_share, evidence);
+            context
+                .observe_discovered(
+                    "source",
+                    &SparseShareEvidence::from_durable_key(&different).unwrap(),
+                    &config,
+                    &mut summary,
+                    mode,
+                )
+                .await;
+            let retained = db.sparse_identities("PrimarySync").await.unwrap().remove(0);
+            assert_eq!(retained.generation, row.generation);
+            assert_eq!(retained.observed, row.observed);
+            assert_eq!(retained.original, row.original);
+        }
     }
 
     #[tokio::test]
