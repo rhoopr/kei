@@ -2599,6 +2599,7 @@ async fn issue958_album_groups_share_one_fallback_per_source() {
         let mut claims = Default::default();
         let pass_configs: Vec<_> = passes.iter().map(|_| Arc::new(test_config())).collect();
         let mut context = super::IncrementalAssetHydrationContext {
+            run_mode: DownloadRunMode::Download,
             asset_to_master: &mut mapping,
             complete_delta_assets: &mut complete,
             downloadable_assets: &mut downloads,
@@ -2780,3 +2781,333 @@ async fn issue958_cancel_paged_scan_explains_orphan_buffer_warning() {
 
 #[path = "album_progress_tests.rs"]
 mod album_progress_tests;
+
+#[derive(Clone)]
+struct RelationSparseSession {
+    lookup_calls: Arc<AtomicUsize>,
+    history_calls: Arc<AtomicUsize>,
+    row: Value,
+    complete_history: bool,
+    history_error: bool,
+    cancel_in_history: Option<CancellationToken>,
+}
+#[async_trait::async_trait]
+impl PhotosSession for RelationSparseSession {
+    async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        if url.contains("/records/lookup?") {
+            self.lookup_calls.fetch_add(1, Ordering::SeqCst);
+            return Ok(json!({"records":[self.row.clone()]}));
+        }
+        assert!(
+            url.contains("/changes/zone?"),
+            "unexpected synthetic request"
+        );
+        let records = if request["zones"][0]["syncToken"] == "zone-token-prev" {
+            vec![relation_delta_record(
+                "container-vacation",
+                "asset-MASTER_HYDRATED",
+            )]
+        } else {
+            self.history_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(cancel) = &self.cancel_in_history {
+                cancel.cancel();
+                return std::future::pending().await;
+            }
+            anyhow::ensure!(!self.history_error, "synthetic history failure");
+            if self.complete_history {
+                incremental_photo_records("MASTER_HYDRATED")
+            } else {
+                Vec::new()
+            }
+        };
+        Ok(json!({"zones":[{
+            "zoneID":request["zones"][0]["zoneID"],
+            "syncToken":"zone-token-next","moreComing":false,"records":records
+        }]}))
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn relation_only_sparse_link_survives_hydration_and_sqlite_reopen() {
+    use crate::state::SparseIdentityStore as _;
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("state.db");
+    let mut row = crate::test_helpers::sparse_shared_asset_record();
+    row["recordName"] = json!("asset-MASTER_HYDRATED");
+    let session = RelationSparseSession {
+        lookup_calls: Arc::default(),
+        history_calls: Arc::default(),
+        row,
+        complete_history: false,
+        history_error: false,
+        cancel_in_history: None,
+    };
+    for cycle in 0..2 {
+        let db = Arc::new(SqliteStateDb::open(&path).await.unwrap());
+        if cycle == 0 {
+            seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
+        }
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: changes_album_with_container(
+                "Vacation",
+                Some("container-vacation"),
+                session.clone(),
+            ),
+            exclude_ids: Arc::default(),
+        }];
+        // Verify this is accepted sparse evidence, not a malformed synthetic row.
+        let resolution = passes[0]
+            .album
+            .resolve_records(&[crate::icloud::photos::RecordLookupRequest::asset_only(
+                crate::icloud::photos::ProviderRecordId::new("asset-MASTER_HYDRATED"),
+            )])
+            .await;
+        assert!(matches!(
+            &resolution.results[0].1,
+            crate::icloud::photos::RecordResolution::SparseShareUnresolved(_)
+        ));
+        let prior = if cycle == 1 {
+            let prior = db.sparse_identities("PrimarySync").await.unwrap().remove(0);
+            Some(
+                db.record_sparse_attempt(
+                    &prior,
+                    crate::state::SparseAttemptOutcome::Unresolved(prior.observed.clone()),
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(root.path());
+        config.state_db = Some(db.clone() as Arc<dyn DownloadStore>);
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::Download, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.stats.downloaded, 0);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(result.sync_token, None);
+        assert_eq!(
+            session.history_calls.load(Ordering::SeqCst),
+            cycle + 1,
+            "the normal history fallback must run before any conclusion"
+        );
+        let rows = db.sparse_identities("PrimarySync").await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "valid relation-only sparse discovery must reach durable recovery"
+        );
+        assert_eq!(rows[0].source.as_str(), "asset-MASTER_HYDRATED");
+        let expected = resolution
+            .results
+            .iter()
+            .find_map(|(_, result)| match result {
+                crate::icloud::photos::RecordResolution::SparseShareUnresolved(evidence) => {
+                    evidence.durable_key()
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(rows[0].observed == expected);
+        if let Some(prior) = prior {
+            assert!(rows[0].generation == prior.generation);
+            assert_eq!(rows[0].next_retry, prior.next_retry);
+            assert_eq!(rows[0].last_attempt, prior.last_attempt);
+        }
+    }
+}
+
+#[tokio::test]
+async fn relation_only_sparse_lookup_keeps_recovering_history_fallback() {
+    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+    seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
+    let mut row = crate::test_helpers::sparse_shared_asset_record();
+    row["recordName"] = json!("asset-MASTER_HYDRATED");
+    let session = RelationSparseSession {
+        lookup_calls: Arc::default(),
+        history_calls: Arc::default(),
+        row,
+        complete_history: true,
+        history_error: false,
+        cancel_in_history: None,
+    };
+    let passes = vec![AlbumPass {
+        kind: PassKind::Album,
+        album: changes_album_with_container(
+            "Vacation",
+            Some("container-vacation"),
+            session.clone(),
+        ),
+        exclude_ids: Arc::default(),
+    }];
+    let mut missing = FxHashSet::from_iter(["asset-MASTER_HYDRATED".to_owned()]);
+    let hydrated = passes[0]
+        .album
+        .hydrate_matching_assets_with_evidence(&mut missing)
+        .await
+        .unwrap();
+    assert_eq!(hydrated.assets.len(), 1);
+    assert!(hydrated.sparse.is_empty());
+    assert!(missing.is_empty());
+    session.history_calls.store(0, Ordering::SeqCst);
+    let mut config = test_config();
+    config.state_db = Some(db.clone() as Arc<dyn DownloadStore>);
+    let result = download_photos_incremental(
+        &Client::new(),
+        &passes,
+        &Arc::new(config),
+        "zone-token-prev",
+        DownloadControls::new(DownloadRunMode::PrintFilenames, DownloadReporting::hidden()),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(session.history_calls.load(Ordering::SeqCst), 1);
+    assert!(!result.stats.sync_token_blocked);
+    assert_eq!(
+        result.sync_token, None,
+        "filename-only mode cannot advance a checkpoint"
+    );
+    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    let memberships = db
+        .get_live_selected_album_memberships_for_asset(
+            "PrimarySync",
+            "asset-MASTER_HYDRATED",
+            &["container-vacation"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(memberships.len(), 1);
+    assert_eq!(
+        memberships[0].master_record_name.as_deref(),
+        Some("MASTER_HYDRATED")
+    );
+}
+
+#[tokio::test]
+async fn relation_only_sparse_handoff_refuses_bad_scope_read_only_and_interrupted_history() {
+    use crate::state::SparseIdentityStore as _;
+    for case in [
+        "wrong_scope",
+        "malformed",
+        "dry_run",
+        "filenames",
+        "history_error",
+        "cancel",
+    ] {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("state.db");
+        let db = Arc::new(SqliteStateDb::open(&path).await.unwrap());
+        seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
+        let cancel = CancellationToken::new();
+        let mut row = crate::test_helpers::sparse_shared_asset_record();
+        row["recordName"] = json!("asset-MASTER_HYDRATED");
+        if case == "wrong_scope" {
+            row["zoneID"] = json!({"zoneName":"SharedSync-other","ownerRecordName":"other-owner"});
+        }
+        if case == "malformed" {
+            row["fields"]["linkedShareZoneOwner"]["value"] = json!("");
+        }
+        let session = RelationSparseSession {
+            lookup_calls: Arc::default(),
+            history_calls: Arc::default(),
+            row,
+            complete_history: false,
+            history_error: case == "history_error",
+            cancel_in_history: (case == "cancel").then(|| cancel.clone()),
+        };
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: changes_album_with_container(
+                "Vacation",
+                Some("container-vacation"),
+                session.clone(),
+            ),
+            exclude_ids: Arc::default(),
+        }];
+        let mut config = test_config();
+        config.directory = Arc::from(root.path());
+        config.state_db = Some(db.clone() as Arc<dyn DownloadStore>);
+        let mode = match case {
+            "dry_run" => DownloadRunMode::DryRun,
+            "filenames" => DownloadRunMode::PrintFilenames,
+            _ => DownloadRunMode::Download,
+        };
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(mode, DownloadReporting::hidden()),
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.stats.downloaded, 0, "{case}");
+        assert_eq!(result.sync_token, None, "{case}");
+        assert!(
+            db.sparse_identities("PrimarySync")
+                .await
+                .unwrap()
+                .is_empty(),
+            "{case}"
+        );
+        assert_eq!(session.history_calls.load(Ordering::SeqCst), 1, "{case}");
+        drop(db);
+        let reopened = SqliteStateDb::open(&path).await.unwrap();
+        assert!(
+            reopened
+                .sparse_identities("PrimarySync")
+                .await
+                .unwrap()
+                .is_empty(),
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn relation_only_sparse_cross_zone_hint_is_not_relabelled_as_owner() {
+    let owner = RelationSparseSession {
+        lookup_calls: Arc::default(),
+        history_calls: Arc::default(),
+        row: json!({"recordName":"asset-MASTER_HYDRATED","serverErrorCode":"NOT_FOUND"}),
+        complete_history: false,
+        history_error: false,
+        cancel_in_history: None,
+    };
+    let mut row = crate::test_helpers::sparse_shared_asset_record();
+    row["recordName"] = json!("asset-MASTER_HYDRATED");
+    let other = RelationSparseSession {
+        row,
+        ..owner.clone()
+    };
+    // The fake history is empty, so it supplies no ownership or match proof.
+    let source =
+        album_with_session_and_container("SharedSync-other", "Other", None, Box::new(other));
+    let album = changes_album_with_container("Vacation", Some("container-vacation"), owner)
+        .with_cross_zone_sources(vec![source]);
+    let mut missing = FxHashSet::from_iter(["asset-MASTER_HYDRATED".to_owned()]);
+    let result = album
+        .hydrate_matching_assets_with_evidence(&mut missing)
+        .await
+        .unwrap();
+    assert!(result.assets.is_empty());
+    assert!(result.sparse.is_empty());
+    assert_eq!(missing.len(), 1);
+}

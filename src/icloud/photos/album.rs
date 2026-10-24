@@ -533,10 +533,21 @@ impl PhotoAlbum {
                 .all(|(left, right)| same_source(left, right))
     }
 
+    #[cfg(test)]
     pub(crate) async fn hydrate_matching_assets_from_changes(
         &self,
         missing_asset_record_names: &mut FxHashSet<String>,
     ) -> anyhow::Result<Vec<PhotoAsset>> {
+        Ok(self
+            .hydrate_assets(missing_asset_record_names)
+            .await?
+            .assets)
+    }
+
+    pub(crate) async fn hydrate_matching_assets_with_evidence(
+        &self,
+        missing_asset_record_names: &mut FxHashSet<String>,
+    ) -> anyhow::Result<hydration::HydratedAssets> {
         self.hydrate_assets(missing_asset_record_names).await
     }
 

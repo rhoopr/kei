@@ -403,3 +403,256 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
         server.verify().await;
     }
 }
+
+#[derive(Clone, Debug)]
+struct RelationOnlySession(Session);
+#[async_trait::async_trait]
+impl PhotosSession for RelationOnlySession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        if self.0.source && url.contains("/changes/zone?") {
+            let request: Value = serde_json::from_str(&body)?;
+            let records = if request["zones"][0]["syncToken"] == "before" {
+                vec![
+                    json!({"recordName":"source-child-IN-vacation","recordType":"CPLContainerRelation",
+                    "fields":{"containerId":{"value":"vacation"},"itemId":{"value":"source-child"}}}),
+                ]
+            } else {
+                Vec::new()
+            };
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+                "syncToken":"source-after","moreComing":false,"records":records}]}),
+            );
+        }
+        self.0.post(url, body, headers).await
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn relation_only_sparse_discovery_reopens_and_recovers_selected_target_once() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
+    let server = crate::start_wiremock_or_skip!();
+    let bytes = [
+        0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0xff,
+        0xd9,
+    ];
+    Mock::given(method("GET"))
+        .and(path("/relation.jpg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(bytes)
+                .insert_header("content-type", "image/jpeg"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+    let records = full_album_page_with_download(
+        "SharedSync-test",
+        "target",
+        "target-after",
+        &format!("{}/relation.jpg", server.uri()),
+        bytes.len() as u64,
+        &checksum,
+    )["records"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    let database = root.path().join("state.db");
+    let mut config = make_run_cycle_config();
+    config.filters.selection.albums = crate::selection::AlbumSelector::Named {
+        included: std::collections::BTreeSet::from(["Vacation".into()]),
+        excluded: Default::default(),
+    };
+    let enum_hash = download::compute_config_hash(&config);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    for cycle in 0..3 {
+        let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let db: Arc<dyn download::DownloadStore> = inner.clone();
+        let builder = make_run_cycle_download_config_builder(&media, db.clone());
+        if cycle == 0 {
+            let run = inner.start_sync_run().await.unwrap();
+            inner
+                .complete_sync_run(run, &state::SyncRunStats::default())
+                .await
+                .unwrap();
+            inner
+                .set_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY, &enum_hash)
+                .await
+                .unwrap();
+            let cfg = builder(
+                download::SyncMode::Full,
+                Arc::default(),
+                Arc::new(download::AssetGroupings::default()),
+                Arc::from("PrimarySync"),
+            );
+            inner
+                .set_metadata(
+                    download::DOWNLOAD_CONFIG_HASH_KEY,
+                    &download::hash_download_config(&cfg),
+                )
+                .await
+                .unwrap();
+            for zone in ["PrimarySync", "SharedSync-test"] {
+                inner
+                    .set_metadata(&crate::sync_cycle::sync_token_key(zone), "before")
+                    .await
+                    .unwrap();
+            }
+            inner
+                .upsert_album_container("PrimarySync", "vacation", "Vacation", "album")
+                .await
+                .unwrap();
+            let generation = inner
+                .start_album_membership_snapshot("PrimarySync", "vacation", Some("hash-test"))
+                .await
+                .unwrap();
+            inner
+                .complete_album_membership_snapshot("PrimarySync", "vacation", generation)
+                .await
+                .unwrap();
+        }
+        let provider = RelationOnlySession(Session {
+            source: true,
+            quiet: true,
+            unrelated: false,
+            records: Vec::new(),
+            target_calls: calls.clone(),
+            source_calls: Arc::default(),
+        });
+        let selected_album = PhotoAlbum::new(
+            PhotoAlbumConfig {
+                params: Arc::default(),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from("Vacation"),
+                list_type: Arc::from("CPLContainerRelationLiveByAssetDate"),
+                obj_type: Arc::from("CPLAssetInContainerByAssetDate"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(
+                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                ),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: Some(Arc::from("vacation")),
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(provider.clone()),
+        );
+        let mut primary = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            selected_album,
+        );
+        primary.library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+            Box::new(provider),
+            "PrimarySync",
+        );
+        primary.pass_scope.include_unfiled = false;
+        primary.pass_scope.include_albums = true;
+        primary.plan.passes[0].kind = crate::commands::PassKind::Album;
+        let target_provider = Session {
+            source: false,
+            quiet: true,
+            unrelated: false,
+            records: records.clone(),
+            target_calls: calls.clone(),
+            source_calls: Arc::default(),
+        };
+        let mut shared = make_run_cycle_library_state_with_album(
+            "SharedSync-test",
+            "sync_token:SharedSync-test",
+            album("SharedSync-test", "owner-test", target_provider.clone()),
+        );
+        shared.library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+            Box::new(target_provider),
+            "SharedSync-test",
+        );
+        let result = crate::sync_cycle::run_cycle(
+            &[&primary, &shared],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.stats.downloaded,
+            usize::from(cycle == 1),
+            "cycle {cycle}: {result:?}"
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("before"),
+            "a recovered target does not prove the unresolved source album membership"
+        );
+        assert!(
+            inner
+                .get_all_asset_albums("SharedSync-test")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            inner.sparse_identities("PrimarySync").await.unwrap().len(),
+            1,
+            "cycle {cycle}"
+        );
+        if cycle == 0 {
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "completed target should not be looked up repeatedly"
+            );
+        }
+        let rows = inner.get_downloaded_page(0, 10).await.unwrap();
+        let targets: Vec<_> = rows
+            .iter()
+            .filter(|row| row.library.as_ref() == "SharedSync-test")
+            .collect();
+        if cycle == 0 {
+            assert!(targets.is_empty());
+        } else {
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].id.as_ref(), "asset-target");
+            assert_eq!(targets[0].version_size.as_str(), "original");
+            assert_eq!(
+                std::fs::read(targets[0].local_path.as_ref().unwrap()).unwrap(),
+                bytes
+            );
+            assert!(matches!(
+                db.legacy_child_provenance("SharedSync-test", "asset-target", "original")
+                    .await
+                    .unwrap(),
+                Some(crate::state::db::trusted_legacy::LegacyReceiptProvenance::VerifiedSource)
+            ));
+        }
+    }
+    server.verify().await;
+}

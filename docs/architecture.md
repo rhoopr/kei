@@ -175,6 +175,14 @@ including the ignored live lookup test. Shared fixtures stay in
 `src/icloud/photos/album/test_support.rs`. Album tracing keeps the
 `kei::icloud::photos::album` target.
 
+Selected-album hydration returns complete assets separately from unresolved
+owner-source sparse links. It still runs the normal history fallback and drops
+a link when any permitted source supplies the complete asset. Only download
+mode saves remaining owner-source links through the existing sparse-observation
+store. Failed or interrupted history saves no partial handoff. Saved links are
+discovery hints for later confirmation, not album membership, historical
+ownership, or checkpoint proof.
+
 Album-owner dependencies are one-way: hydration uses enumeration, lookup and
 change scans; enumeration uses planning, fetching, and completion; fetching uses
 planning types and completion evidence. Lookup, counts, planning, completion,

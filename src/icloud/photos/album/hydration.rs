@@ -2,7 +2,9 @@
 
 use super::planning::PhotoStreamProfile;
 use super::{PhotoAlbum, PhotoStream, ProviderRecordId, RecordLookupRequest, RecordResolution};
-use crate::icloud::photos::asset::{ChangeEvent, DeltaRecordBuffer, PhotoAsset};
+use crate::icloud::photos::asset::{
+    ChangeEvent, DeltaRecordBuffer, PhotoAsset, SparseShareEvidence,
+};
 use crate::icloud::photos::hydration_progress::{self, Phase};
 use rustc_hash::FxHashSet;
 use serde_json::Value;
@@ -11,6 +13,12 @@ use std::sync::Arc;
 use crate::types::ChangeReason;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+/// Discovery hints remain unverified; only complete assets may be materialized.
+pub(crate) struct HydratedAssets {
+    pub(crate) assets: Vec<PhotoAsset>,
+    pub(crate) sparse: Vec<(ProviderRecordId, SparseShareEvidence)>,
+}
 
 impl PhotoAlbum {
     pub(super) fn photo_stream_with_cross_zone_hydration(
@@ -199,12 +207,13 @@ impl PhotoAlbum {
     pub(super) async fn hydrate_assets(
         &self,
         missing_asset_record_names: &mut FxHashSet<String>,
-    ) -> anyhow::Result<Vec<PhotoAsset>> {
+    ) -> anyhow::Result<HydratedAssets> {
         hydration_progress::observe(async {
             let sources: Vec<_> = std::iter::once(self.clone_for_task_without_sources())
                 .chain(self.cross_zone_sources_for_task())
                 .collect();
             let mut matched = Vec::new();
+            let mut sparse = Vec::new();
             // Preserve source priority: an inconclusive owner lookup still needs its
             // fallback before an equal record name in another source can match.
             for (index, source) in sources.iter().enumerate() {
@@ -212,11 +221,14 @@ impl PhotoAlbum {
                     break;
                 }
                 hydration_progress::source(index + 1);
-                matched.extend(
-                    source
-                        .matching_assets_from_lookup(missing_asset_record_names)
-                        .await?,
-                );
+                let lookup = source
+                    .matching_assets_from_lookup(missing_asset_record_names)
+                    .await?;
+                matched.extend(lookup.assets);
+                // Only the initiating owner's observations belong to this library.
+                if index == 0 {
+                    sparse.extend(lookup.sparse);
+                }
                 if !missing_asset_record_names.is_empty() {
                     matched.extend(
                         source
@@ -225,7 +237,11 @@ impl PhotoAlbum {
                     );
                 }
             }
-            Ok(matched)
+            sparse.retain(|(source, _)| missing_asset_record_names.contains(source.as_str()));
+            Ok(HydratedAssets {
+                assets: matched,
+                sparse,
+            })
         })
         .await
     }
@@ -233,7 +249,7 @@ impl PhotoAlbum {
     async fn matching_assets_from_lookup(
         &self,
         missing: &mut FxHashSet<String>,
-    ) -> anyhow::Result<Vec<PhotoAsset>> {
+    ) -> anyhow::Result<HydratedAssets> {
         let mut ids: Vec<_> = missing.iter().collect();
         ids.sort_unstable();
         let requests: Vec<_> = ids
@@ -241,6 +257,7 @@ impl PhotoAlbum {
             .map(|id| RecordLookupRequest::asset_only(ProviderRecordId::new(id.as_str())))
             .collect();
         let mut pairs = Vec::new();
+        let mut sparse = Vec::new();
         hydration_progress::phase(Phase::AssetLookup);
         for (child, resolution) in self.resolve_records(&requests).await.results {
             match resolution {
@@ -250,6 +267,11 @@ impl PhotoAlbum {
                         master_record_name,
                         child,
                     ));
+                }
+                RecordResolution::SparseShareUnresolved(
+                    evidence @ SparseShareEvidence::Linked(_),
+                ) => {
+                    sparse.push((child, evidence));
                 }
                 RecordResolution::TransientFailure(error) => return Err(error.into()),
                 _ => {} // Absence or incomplete identity is not hydration proof.
@@ -265,11 +287,19 @@ impl PhotoAlbum {
                 {
                     matched.push(asset.with_source_zone(Arc::from(self.zone_name())));
                 }
+                RecordResolution::SparseShareUnresolved(
+                    evidence @ SparseShareEvidence::Linked(_),
+                ) => {
+                    sparse.push((child, evidence));
+                }
                 RecordResolution::TransientFailure(error) => return Err(error.into()),
                 _ => {}
             }
         }
-        Ok(matched)
+        Ok(HydratedAssets {
+            assets: matched,
+            sparse,
+        })
     }
 
     /// Recover current `CPLAsset` records for legacy state keyed only by a

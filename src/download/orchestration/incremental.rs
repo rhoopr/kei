@@ -663,6 +663,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     let downloadable_before_relation_hydration = downloadable_assets.len();
     {
         let mut hydration_context = IncrementalAssetHydrationContext {
+            run_mode: controls.run_mode,
             asset_to_master: &mut delta.asset_to_master,
             complete_delta_assets: &mut complete_delta_assets,
             downloadable_assets: &mut downloadable_assets,

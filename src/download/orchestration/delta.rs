@@ -1303,6 +1303,7 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
 }
 
 pub(super) struct IncrementalAssetHydrationContext<'a> {
+    pub(super) run_mode: DownloadRunMode,
     pub(super) asset_to_master: &'a mut FxHashMap<String, String>,
     pub(super) complete_delta_assets: &'a mut Vec<PhotoAsset>,
     pub(super) downloadable_assets: &'a mut Vec<(PhotoAsset, usize)>,
@@ -1386,7 +1387,7 @@ pub(super) async fn hydrate_missing_selected_relation_assets(
 
         let Some(result) = wait_for_hydration_read(
             pass.album
-                .hydrate_matching_assets_from_changes(&mut missing),
+                .hydrate_matching_assets_with_evidence(&mut missing),
             "album_relation",
             shutdown_token,
         )
@@ -1397,7 +1398,7 @@ pub(super) async fn hydrate_missing_selected_relation_assets(
                 .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
             return;
         };
-        let assets = match result {
+        let hydrated = match result {
             Ok(assets) => assets,
             Err(e) => {
                 tracing::warn!(
@@ -1413,7 +1414,30 @@ pub(super) async fn hydrate_missing_selected_relation_assets(
             }
         };
 
-        for asset in assets {
+        if shutdown_token.is_cancelled() {
+            delta_summary.block_identity();
+            return;
+        }
+        if pass.album.zone_name() == config.library.as_ref() {
+            for (source, evidence) in hydrated.sparse {
+                delta_summary.block_identity();
+                if context.run_mode.downloads_files()
+                    && let (Some(db), Some(key)) = (&config.state_db, evidence.durable_key())
+                    && db
+                        .observe_sparse_identity(
+                            &config.library,
+                            &crate::state::SparseSourceId::new(source.as_str()),
+                            &key,
+                            Utc::now(),
+                        )
+                        .await
+                        .is_err()
+                {
+                    delta_summary.state_transition_failures += 1;
+                }
+            }
+        }
+        for asset in hydrated.assets {
             delta_summary
                 .persist_asset_mapping_for_asset(&asset, config)
                 .await;
