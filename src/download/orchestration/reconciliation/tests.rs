@@ -3344,3 +3344,86 @@ async fn path_reconciliation_copies_catalog_file_without_provider_inventory() {
 
 #[path = "issue_770_recovery.rs"]
 mod issue_770_recovery;
+
+#[tokio::test]
+async fn reconciliation_changed_master_confirms_same_child_without_downloading() {
+    use super::super::test_support::{
+        MovedPendingChildSession, mock_asset_record_for, mock_master_record_with_filename,
+        seed_downloaded_metadata_asset,
+    };
+    for stale in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let database = dir.path().join("state.db");
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for cycle in 0..2 {
+            let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+            let pass = AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session(
+                    "PrimarySync",
+                    "",
+                    Box::new(MovedPendingChildSession {
+                        requests: requests.clone(),
+                    }),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            };
+            let mut config = test_config();
+            config.directory = Arc::from(dir.path());
+            config.state_db = Some(db.clone());
+            if cycle == 0 {
+                let asset = PhotoAsset::new(
+                    mock_master_record_with_filename("new-master", "photo.jpg"),
+                    mock_asset_record_for("child", "new-master"),
+                )
+                .with_state_record_name(Arc::from("child"));
+                let path =
+                    seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &asset).await;
+                let checksum = file::compute_sha256(&path).await.unwrap();
+                db.mark_downloaded("PrimarySync", "child", "original", &path, &checksum, None)
+                    .await
+                    .unwrap();
+                db.upsert_asset_master_mapping(
+                    "PrimarySync",
+                    "child",
+                    if stale { "old-master" } else { "new-master" },
+                )
+                .await
+                .unwrap();
+            }
+            let before = db.get_downloaded_page(0, 10).await.unwrap();
+            assert_eq!(before.len(), 1);
+            let path = before[0].local_path.as_ref().unwrap();
+            let bytes = std::fs::read(path).unwrap();
+            let result = reconcile_catalog_paths(
+                std::slice::from_ref(&pass),
+                Arc::new(config),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(result.complete, "stale={stale} cycle={cycle}: {result:?}");
+            assert_eq!(
+                requests.lock().unwrap().len(),
+                cycle + 1 + usize::from(stale)
+            );
+            assert_eq!(
+                db.get_master_record_name_for_asset("PrimarySync", "child")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("new-master")
+            );
+            assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(result.stats.failed, 0);
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert!(
+                db.get_legacy_master_state_owners()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(db.get_summary().await.unwrap().source_deleted, 0);
+        }
+    }
+}

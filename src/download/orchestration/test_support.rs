@@ -538,3 +538,36 @@ pub(super) fn hard_deleted_change_record(record_name: &str) -> Value {
         "deleted": true,
     })
 }
+
+#[derive(Clone, Debug)]
+pub(super) struct MovedPendingChildSession {
+    pub(super) requests: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for MovedPendingChildSession {
+    async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+        assert!(url.contains("/records/lookup?"), "unexpected request {url}");
+        let request: Value = serde_json::from_str(&body)?;
+        assert_eq!(request["zoneID"]["zoneName"], "PrimarySync");
+        let mut names: Vec<String> = request["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["recordName"].as_str().unwrap().into())
+            .collect();
+        names.sort();
+        self.requests.lock().unwrap().push(names.clone());
+        assert!(names == ["child", "new-master"] || names == ["child", "old-master"]);
+        let master = if names.iter().any(|name| name == "old-master") {
+            json!({"recordName":"old-master","serverErrorCode":"NOT_FOUND"})
+        } else {
+            mock_master_record_with_filename("new-master", "photo.jpg")
+        };
+        Ok(json!({"records":[master,mock_asset_record_for("child", "new-master")]}))
+    }
+
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}

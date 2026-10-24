@@ -976,7 +976,11 @@ lookup in that same scope during a normal download run. Dry-run and filename-onl
 modes retain their prior held behavior. Only a complete current pair may update the mapping
 through the existing state owner. A missing or deleted redirected master,
 foreign scope, another relationship change, cancellation or failed write holds
-the checkpoint. Other lookup consumers keep the hint unresolved. Sparse share
+the checkpoint. Pending retry, metadata capture repair and path reconciliation
+also confirm at most one changed-master hint for a unique child-keyed request.
+They never use that confirmation to transfer ownership of a historical
+master-keyed row. Redirected deletion or another redirect remains inconclusive.
+Pending read-only planning does not update the saved mapping. Sparse share
 links do not authorize this same-scope retry. Selected sparse-target recovery
 uses the separate strict qualification described below.
 

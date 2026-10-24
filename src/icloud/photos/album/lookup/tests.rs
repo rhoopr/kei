@@ -1174,3 +1174,154 @@ async fn issue956_single_target_statuses_do_not_invent_the_other_record() {
             && event.field("child_status") == Some("not_requested"))
     );
 }
+
+#[derive(Clone, Debug)]
+struct ChangedChildConfirmationSession {
+    replies: Arc<Mutex<std::collections::VecDeque<Value>>>,
+    calls: Arc<Mutex<Vec<Value>>>,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+}
+#[async_trait::async_trait]
+impl PhotosSession for ChangedChildConfirmationSession {
+    async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+        assert!(url.contains("/records/lookup?"));
+        self.calls
+            .lock()
+            .unwrap()
+            .push(serde_json::from_str(&body)?);
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+        }
+        let reply = self
+            .replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("confirmation must be bounded");
+        if reply.get("test_auth_failure").is_some() {
+            return Err(crate::icloud::photos::session::HttpStatusError {
+                status: 401,
+                url: "https://example.com/records/lookup".into(),
+                retry_after: None,
+                body: None,
+            }
+            .into());
+        }
+        Ok(reply)
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn recovery_changed_child_confirmation_is_bounded_and_never_transfers_legacy_ownership() {
+    for case in [
+        "present",
+        "second_change",
+        "wrong_owner",
+        "omitted",
+        "deleted",
+        "master_deleted",
+        "legacy",
+        "duplicate_request",
+        "cancelled",
+        "authentication",
+    ] {
+        let first = json!({"records":[
+            {"recordName":"old-master","serverErrorCode":"NOT_FOUND"},
+            test_asset_record_for("child","new-master")
+        ]});
+        let mut child = test_asset_record_for("child", "new-master");
+        let mut master = test_master_record("new-master");
+        match case {
+            "second_change" => child = test_asset_record_for("child", "third-master"),
+            "wrong_owner" => {
+                child["zoneID"] = json!({"zoneName":"PrimarySync","ownerRecordName":"foreign"})
+            }
+            "deleted" => child = json!({"recordName":"child","deleted":true}),
+            "master_deleted" => master = json!({"recordName":"new-master","deleted":true}),
+            _ => {}
+        }
+        let second = if case == "authentication" {
+            json!({"test_auth_failure":true})
+        } else if case == "omitted" {
+            json!({"records":[master]})
+        } else {
+            json!({"records":[master, child]})
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let album = make_album_with_session(
+            100,
+            Box::new(ChangedChildConfirmationSession {
+                replies: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                    first, second,
+                ]))),
+                calls: calls.clone(),
+                cancel: (case == "cancelled").then(|| shutdown.clone()),
+            }),
+        );
+        let state = if case == "legacy" {
+            "old-master"
+        } else {
+            "child"
+        };
+        let mut requests = vec![lookup_request(state, "old-master", "child")];
+        if case == "duplicate_request" {
+            requests.push(requests[0].clone());
+        }
+        let result = album
+            .resolve_child_records_for_recovery(&requests, &shutdown)
+            .await;
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            if matches!(case, "legacy" | "duplicate_request" | "cancelled") {
+                1
+            } else {
+                2
+            },
+            "{case}"
+        );
+        assert_eq!(result.complete, case == "present", "{case}");
+        assert_eq!(result.results.len(), 1);
+        if case == "present" {
+            assert!(
+                matches!(&result.results[0].1, RecordResolution::Present(asset)
+                if asset.asset_record_name() == "child" && asset.id() == "new-master")
+            );
+            assert!(
+                result
+                    .url_observed_at
+                    .contains_key(&ProviderRecordId::new("child"))
+            );
+        } else if case == "authentication" {
+            assert!(matches!(
+                &result.results[0].1,
+                RecordResolution::TransientFailure(ProviderLookupError::Authentication {
+                    status: 401,
+                    ..
+                })
+            ));
+            assert!(result.url_observed_at.is_empty());
+        } else {
+            assert!(
+                matches!(&result.results[0].1, RecordResolution::MasterChanged { .. }),
+                "{case}"
+            );
+            assert!(result.url_observed_at.is_empty(), "{case}");
+        }
+        if calls.len() == 2 {
+            let mut names: Vec<_> = calls[1]["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["recordName"].as_str().unwrap())
+                .collect();
+            names.sort_unstable();
+            assert_eq!(names, ["child", "new-master"], "{case}");
+            assert_eq!(calls[0]["zoneID"], calls[1]["zoneID"], "{case}");
+        }
+    }
+}

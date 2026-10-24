@@ -321,7 +321,10 @@ pub(crate) async fn reconcile_catalog_paths_with_client(
         && !passes
             .iter()
             .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder);
-    let batch = provider_pass.album.resolve_records(&requests).await;
+    let batch = provider_pass
+        .album
+        .resolve_child_records_for_recovery(&requests, &shutdown_token)
+        .await;
     let catalog_paths = db.get_reconciliation_catalog_paths().await?;
     let reservations = db.get_reconciliation_reservations().await?;
     let mut task_planner =
@@ -423,6 +426,18 @@ pub(crate) async fn reconcile_catalog_paths_with_client(
                                 continue;
                             }
                         }
+                    }
+                    if state_id.as_str() == asset.asset_record_name()
+                        && master_by_state_id
+                            .get(state_id.as_str())
+                            .is_some_and(|master| master != asset.id())
+                    {
+                        db.upsert_asset_master_mapping(
+                            &config.library,
+                            asset.asset_record_name(),
+                            asset.id(),
+                        )
+                        .await?;
                     }
                     let mut unsafe_destination = false;
                     for expected in filter::expected_paths_for(&asset, pass_config.as_ref()) {

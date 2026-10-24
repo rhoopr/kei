@@ -306,6 +306,94 @@ impl PhotoAlbum {
         self.lookup_records(requests).await
     }
 
+    /// Confirm one changed-master hint for an existing child-keyed identity.
+    /// Historical master-keyed rows require their separate ownership proof.
+    /// Failure or deletion at the new pair never establishes deletion of the
+    /// original request.
+    pub(crate) async fn resolve_child_records_for_recovery(
+        &self,
+        requests: &[RecordLookupRequest],
+        shutdown: &CancellationToken,
+    ) -> RecordResolutionBatch {
+        let mut batch = self.resolve_records(requests).await;
+        let mut unique_requests = HashMap::with_capacity(requests.len());
+        for request in requests {
+            unique_requests
+                .entry(&request.state_id)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(request));
+        }
+        let confirmations: Vec<_> = batch
+            .results
+            .iter()
+            .filter_map(|(state_id, resolution)| {
+                let RecordResolution::MasterChanged { master_record_name } = resolution else {
+                    return None;
+                };
+                let request = unique_requests.get(state_id).copied().flatten()?;
+                if request.asset_record_name.as_ref() != Some(state_id)
+                    || request.master_record_name == *master_record_name
+                {
+                    return None;
+                }
+                Some(RecordLookupRequest::paired(
+                    state_id.clone(),
+                    master_record_name.clone(),
+                    state_id.clone(),
+                ))
+            })
+            .collect();
+        if confirmations.is_empty() || shutdown.is_cancelled() {
+            return batch;
+        }
+        let confirmed = self.resolve_records(&confirmations).await;
+        let confirmation_by_id: HashMap<_, _> = confirmations
+            .iter()
+            .map(|request| (&request.state_id, request))
+            .collect();
+        let result_positions: HashMap<_, _> = batch
+            .results
+            .iter()
+            .enumerate()
+            .map(|(index, (id, _))| (id.clone(), index))
+            .collect();
+        batch.rate_limit_observations = batch
+            .rate_limit_observations
+            .saturating_add(confirmed.rate_limit_observations);
+        for (state_id, resolution) in confirmed.results {
+            let Some(request) = confirmation_by_id.get(&state_id) else {
+                continue;
+            };
+            let usable = match &resolution {
+                RecordResolution::Present(asset) => {
+                    asset.asset_record_name() == state_id.as_str()
+                        && asset.id() == request.master_record_name.as_str()
+                }
+                RecordResolution::TransientFailure(_) => true,
+                _ => false,
+            };
+            if !usable {
+                continue;
+            }
+            if let Some((_, original)) = result_positions
+                .get(&state_id)
+                .and_then(|index| batch.results.get_mut(*index))
+            {
+                *original = resolution;
+                if let Some(observed) = confirmed.url_observed_at.get(&state_id) {
+                    batch.url_observed_at.insert(state_id, *observed);
+                }
+            }
+        }
+        batch.complete = batch.results.iter().all(|(_, resolution)| {
+            matches!(
+                resolution,
+                RecordResolution::Present(_) | RecordResolution::Deleted { .. }
+            )
+        });
+        batch
+    }
+
     pub(crate) fn sparse_link_matches(&self, link: &super::asset::SparseShareLink) -> bool {
         link.target_in_scope(&self.zone_id).is_some()
     }

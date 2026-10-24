@@ -2257,3 +2257,100 @@ async fn hidden_invalid_capture_date_preserves_pending_recovery() {
         }
     }
 }
+
+#[tokio::test]
+async fn pending_child_changed_master_confirms_pair_and_reopens_with_current_mapping() {
+    for run_mode in [DownloadRunMode::Download, DownloadRunMode::DryRun] {
+        for stale in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let database = dir.path().join("state.db");
+            let media = dir.path().join("media");
+            std::fs::create_dir(&media).unwrap();
+            let sentinel = media.join("keep.bin");
+            std::fs::write(&sentinel, b"original bytes").unwrap();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            for cycle in 0..2 {
+                let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+                if cycle == 0 {
+                    db.upsert_seen(
+                        &TestAssetRecord::new("child")
+                            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                            .filename("photo.jpg")
+                            .size(1024)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+                    db.upsert_asset_master_mapping(
+                        "PrimarySync",
+                        "child",
+                        if stale { "old-master" } else { "new-master" },
+                    )
+                    .await
+                    .unwrap();
+                }
+                let passes = vec![AlbumPass {
+                    kind: PassKind::Unfiled,
+                    album: album_with_session(
+                        "PrimarySync",
+                        "",
+                        Box::new(super::super::test_support::MovedPendingChildSession {
+                            requests: requests.clone(),
+                        }),
+                    ),
+                    exclude_ids: Arc::new(FxHashSet::default()),
+                }];
+                let mut config = test_config();
+                config.directory = Arc::from(media.as_path());
+                config.state_db = Some(db.clone());
+                let plan = build_pending_retry_download_tasks(
+                    &passes,
+                    &config,
+                    run_mode,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    plan.tasks.len(),
+                    1,
+                    "stale={stale} cycle={cycle}: current pair should schedule the same child"
+                );
+                assert!(plan.unmatched_targets.is_empty());
+                assert!(!plan.identity_incomplete);
+                assert_eq!(plan.tasks[0].asset_id.as_ref(), "child");
+                assert_eq!(
+                    db.get_master_record_name_for_asset("PrimarySync", "child")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some(if stale && !run_mode.downloads_files() {
+                        "old-master"
+                    } else {
+                        "new-master"
+                    })
+                );
+                assert_eq!(db.get_summary().await.unwrap().source_deleted, 0);
+                assert!(
+                    db.get_legacy_master_state_owners()
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(std::fs::read(&sentinel).unwrap(), b"original bytes");
+                assert_eq!(std::fs::read_dir(&media).unwrap().count(), 1);
+                assert_eq!(
+                    requests.lock().unwrap().len(),
+                    cycle
+                        + 1
+                        + usize::from(stale)
+                            * if run_mode.downloads_files() {
+                                1
+                            } else {
+                                cycle + 1
+                            }
+                );
+            }
+        }
+    }
+}

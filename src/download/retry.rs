@@ -844,7 +844,10 @@ pub(super) async fn build_pending_retry_download_tasks(
     }
 
     let resolutions = if let Some(pass) = passes.first() {
-        let batch = pass.album.resolve_records(&lookup_requests).await;
+        let batch = pass
+            .album
+            .resolve_child_records_for_recovery(&lookup_requests, &shutdown_token)
+            .await;
         if !batch.complete {
             tracing::warn!(
                 library = %config.library,
@@ -913,6 +916,19 @@ pub(super) async fn build_pending_retry_download_tasks(
                             "legacy ownership is not established by durable family and date evidence").await?;
                         continue;
                     }
+                }
+                if run_mode.downloads_files()
+                    && state_id.as_str() == asset.asset_record_name()
+                    && master_by_state_id
+                        .get(state_id.as_str())
+                        .is_some_and(|master| master != asset.id())
+                {
+                    db.upsert_asset_master_mapping(
+                        &config.library,
+                        asset.asset_record_name(),
+                        asset.id(),
+                    )
+                    .await?;
                 }
                 PendingRetryPlanning {
                     run_mode,

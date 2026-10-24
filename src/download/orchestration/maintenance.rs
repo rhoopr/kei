@@ -300,7 +300,10 @@ async fn collect_metadata_capture_repair(
             ),
         })
         .collect();
-    let resolutions = provider_pass.album.resolve_records(&requests).await;
+    let resolutions = provider_pass
+        .album
+        .resolve_child_records_for_recovery(&requests, shutdown_token)
+        .await;
     repair.stats.rate_limited = repair
         .stats
         .rate_limited
