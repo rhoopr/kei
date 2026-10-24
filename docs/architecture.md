@@ -1935,16 +1935,36 @@ new candidates. Exhausting a limit retains the hold. Sparse, malformed,
 cross-library or incomplete evidence cannot activate preservation. No diagnostic
 count is ownership proof.
 
-Failed preparation discovery records a versioned, library-scoped
-`legacy_preservation_inventory_retry:` receipt in the metadata table. An unchanged
-configuration and durable original-family evidence defer another preparation scan
-for at most one hour across restart. Retry scheduling, capture cycle counters and
-unchanged relation refresh timestamps do not reset that delay. Changed
-configuration or original-family evidence permits
-a new attempt; malformed, unsupported or out-of-range retry receipts never defer
-work. Deferral supplies no provider evidence or checkpoint permission. Prepared
-records still require fresh certification, and metadata-capture retry scheduling
-remains independent. Successful discovery clears its failure delay.
+Preparation examines at most 64 retry identities per library and cycle. A
+transactional, library-scoped `legacy_preservation_preparation_cursor:v1:` key
+rotates through the retained identities across restart, including identities
+that are not yet eligible. File or provider refusals cannot pin the first batch
+and starve later families. The cursor changes scheduling only; eligibility and
+immutable preparation evidence are checked independently.
+
+Every attempted family that remains unprepared receives a versioned
+`legacy_preservation_candidate_retry:v1:` receipt keyed by a hash of its library
+and identity. Provider failure, missing current children, refused originals and
+deferred preparation all retain their existing attribution and checkpoint holds.
+An unchanged family defers another preparation scan for at most one hour after
+the attempt. This bounds immediate retries; runs already separated by an hour
+still attempt fresh discovery. Old library-wide failure receipts are ignored.
+
+The retry signature includes normalized original evidence, current family
+receipts, configuration and confined observations of local file presence, size,
+timestamps, link counts and pending-write blockers. Unix observations also
+include device, inode and change time. These observations are scheduling hints,
+not byte or provider proof. Changed observations permit another attempt on the
+family's next turn. Removal of an unrelated catalogue-path collision and provider
+changes not yet observed locally may wait until expiry. Expiry always permits
+fresh discovery; malformed, unsupported and out-of-range receipts never defer
+work. Cancellation does not create a delay. A failed scheduler write cannot
+supply preservation or checkpoint permission.
+
+Retry scheduling, capture cycle counters and unchanged relation refresh times
+do not reset the delay. Each actual preparation attempt still requires fresh
+complete discovery and full file fingerprinting, and prepared records still
+require fresh certification. Metadata-capture retry scheduling remains separate.
 
 Preparation and certification use separate complete scans; a preparation result
 cannot certify work performed later. Failure warnings expose only a fixed stage

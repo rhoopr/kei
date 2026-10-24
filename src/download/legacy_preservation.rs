@@ -39,7 +39,7 @@ pub(in crate::download) async fn current_path_is_independent(
 }
 
 const INVENTORY_RETRY_SECONDS: i64 = 60 * 60;
-const INVENTORY_RETRY_PREFIX: &str = "legacy_preservation_inventory_retry:";
+const INVENTORY_RETRY_PREFIX: &str = "legacy_preservation_candidate_retry:v1:";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -106,6 +106,122 @@ fn inventory_retry_signature(
         evidence,
     ))?;
     Ok(data_encoding::HEXLOWER.encode(&Sha256::digest(encoded)))
+}
+
+// Candidate receipts schedule another discovery attempt; they never contain
+// inventory proof. Include observed current receipts and local qualification so
+// new evidence can wake a candidate before the bounded retry deadline.
+fn retry_file_time(time: std::io::Result<std::time::SystemTime>) -> Option<(bool, u64, u32)> {
+    time.ok()
+        .map(|time| match time.duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => (false, duration.as_secs(), duration.subsec_nanos()),
+            Err(before_epoch) => {
+                let duration = before_epoch.duration();
+                (true, duration.as_secs(), duration.subsec_nanos())
+            }
+        })
+}
+
+async fn candidate_retry_signature(
+    db: &dyn DownloadStore,
+    config: &DownloadConfig,
+    config_hash: &str,
+    candidate: &crate::state::db::LegacyPreparationSnapshot,
+    cancel: &CancellationToken,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !cancel.is_cancelled(),
+        "Legacy preparation retry check cancelled"
+    );
+    let original = inventory_retry_signature(config_hash, std::slice::from_ref(candidate))?;
+    let dependencies = db
+        .legacy_dependency_evidence(&candidate.library, &candidate.asset_id)
+        .await?;
+    let mut paths = Vec::new();
+    for path in &candidate.paths {
+        paths.push((path.clone(), true));
+        paths.push((sidecar(path), false));
+    }
+    for claim in &candidate.historical_claims {
+        paths.push((claim.current_path.clone(), true));
+    }
+    let root = config.directory.to_path_buf();
+    let suffix = config.temp_suffix.to_string();
+    let files = tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|(path, required)| {
+                let probe = || -> anyhow::Result<serde_json::Value> {
+                    let confined = crate::fs_util::ConfinedPath::open(
+                        &root,
+                        &path,
+                        crate::fs_util::ConfinedParents::Existing,
+                    )?;
+                    let mut temporary = Vec::new();
+                    for suffix in [suffix.as_str(), ".part"] {
+                        let mut name = path.as_os_str().to_owned();
+                        name.push(suffix);
+                        temporary.push(
+                            crate::fs_util::ConfinedPath::open(
+                                &root,
+                                Path::new(&name),
+                                crate::fs_util::ConfinedParents::Existing,
+                            )?
+                            .entry_exists()?,
+                        );
+                    }
+                    let file = confined.open_optional_regular()?;
+                    let metadata = if let Some(file) = file {
+                        let info = file.metadata()?;
+                        #[cfg(unix)]
+                        let identity = {
+                            use std::os::unix::fs::MetadataExt as _;
+                            json!([info.dev(), info.ino(), info.ctime(), info.ctime_nsec()])
+                        };
+                        #[cfg(not(unix))]
+                        let identity = serde_json::Value::Null;
+                        json!([
+                            info.len(),
+                            retry_file_time(info.modified()),
+                            retry_file_time(info.created()),
+                            crate::fs_util::file_link_count(&file)?,
+                            identity
+                        ])
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    Ok(json!([
+                        required,
+                        metadata,
+                        temporary,
+                        super::file::has_replacement_journal_blocking(&root, &path)?
+                    ]))
+                };
+                probe().unwrap_or_else(|_| json!({"unavailable":true}))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await?;
+    anyhow::ensure!(
+        !cancel.is_cancelled(),
+        "Legacy preparation retry check cancelled"
+    );
+    Ok(
+        data_encoding::HEXLOWER.encode(&Sha256::digest(serde_json::to_vec(&(
+            original,
+            dependencies,
+            config.legacy_preservation_allow_hardlinks,
+            files,
+        ))?)),
+    )
+}
+
+fn candidate_retry_key(library: &str, asset_id: &str) -> anyhow::Result<String> {
+    let identity = serde_json::to_vec(&(library, asset_id))?;
+    Ok(format!(
+        "{INVENTORY_RETRY_PREFIX}{}",
+        data_encoding::HEXLOWER.encode(&Sha256::digest(identity))
+    ))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -295,19 +411,29 @@ impl LegacyCycle {
         }
         let candidates = db.legacy_preparation_snapshots(&config.library, 64).await?;
         if !candidates.is_empty() {
-            let retry_key = format!("{INVENTORY_RETRY_PREFIX}{}", config.library);
-            let signature = inventory_retry_signature(config_hash, &candidates)?;
-            let now = chrono::Utc::now().timestamp();
-            let deferred = db
-                .get_metadata(&retry_key)
-                .await?
-                .and_then(|encoded| serde_json::from_str::<InventoryRetry>(&encoded).ok())
-                .is_some_and(|retry| retry.deferred(&signature, now));
-            if deferred {
+            let mut ready = Vec::new();
+            let mut attempted = Vec::new();
+            for candidate in candidates {
+                let key = candidate_retry_key(&candidate.library, &candidate.asset_id)?;
+                let candidate_signature =
+                    candidate_retry_signature(db, config, config_hash, &candidate, cancel).await?;
+                let deferred = db
+                    .get_metadata(&key)
+                    .await?
+                    .and_then(|value| serde_json::from_str::<InventoryRetry>(&value).ok())
+                    .is_some_and(|retry| {
+                        retry.deferred(&candidate_signature, chrono::Utc::now().timestamp())
+                    });
+                if !deferred {
+                    attempted.push((candidate.asset_id.clone(), key, candidate_signature));
+                    ready.push(candidate);
+                }
+            }
+            let candidates = ready;
+            if candidates.is_empty() {
                 tracing::info!(
                     stage = "preparation",
                     reason = "inventory_retry_deferred",
-                    candidates = candidates.len(),
                     "Legacy preservation discovery deferred; retaining attribution checkpoint hold"
                 );
                 return Ok(Self {
@@ -323,8 +449,6 @@ impl LegacyCycle {
             // Provider failures cannot relax existing capture/checkpoint guards.
             match album.complete_legacy_inventory(&masters, cancel).await {
                 Ok(inventory) => {
-                    // A successful scan cannot borrow an earlier failure delay.
-                    db.set_metadata(&retry_key, "").await?;
                     let mut no_current_child = 0usize;
                     let mut invalid_original_files = 0usize;
                     let mut shared_file_links = 0usize;
@@ -511,7 +635,13 @@ impl LegacyCycle {
                 }
                 Err(error) => {
                     log_preservation_hold("preparation", &error);
-                    if !cancel.is_cancelled() {
+                }
+            }
+            if !cancel.is_cancelled() {
+                for (asset_id, key, signature) in attempted {
+                    if preserved.iter().any(|record| record.asset_id == asset_id) {
+                        db.set_metadata(&key, "").await?;
+                    } else {
                         let retry = InventoryRetry {
                             version: 1,
                             signature,
@@ -519,7 +649,7 @@ impl LegacyCycle {
                                 .timestamp()
                                 .saturating_add(INVENTORY_RETRY_SECONDS),
                         };
-                        db.set_metadata(&retry_key, &serde_json::to_string(&retry)?)
+                        db.set_metadata(&key, &serde_json::to_string(&retry)?)
                             .await?;
                     }
                 }
@@ -1174,7 +1304,7 @@ mod tests {
     async fn preservation_inventory_retry_roundtrip_is_bounded_and_evidence_fenced() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let key = format!("{}PrimarySync", super::INVENTORY_RETRY_PREFIX);
+        let key = super::candidate_retry_key("PrimarySync", "master").unwrap();
         let retry = super::InventoryRetry {
             version: 1,
             signature: "original-evidence".into(),

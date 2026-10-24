@@ -1018,6 +1018,8 @@ pub trait MetadataRewriteStore: Send + Sync {
     ) -> Result<super::LegacyChildReceiptRefusal, StateError> {
         Ok(super::LegacyChildReceiptRefusal::Unavailable)
     }
+    /// Consume a bounded round-robin batch, durably advancing past examined
+    /// retry identities even when none qualify. This is scheduling, not proof.
     async fn legacy_preparation_snapshots(
         &self,
         _library: &str,

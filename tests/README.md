@@ -1722,3 +1722,23 @@ debt and historical bytes, and check transaction rejection after file or ownersh
 drift. Normal-cycle fixtures must establish completion followed by a quiet reopen;
 a target-ready decision alone is not success. These tests do not establish that
 any reporter account has the evidence required for recovery.
+
+
+### Legacy preservation retry scheduling
+
+`run_cycle_single_survivor_shared_original_keeps_hold` counts complete discovery
+requests across unchanged production cycles and SQLite reopen with hardlink trust
+off. It checks unchanged originals and aliases, retained attribution debt and the
+held checkpoint. `legacy_preparation_retry_wakes_on_evidence_and_expiry_without_reusing_proof`
+changes local link topology, policy, current-child evidence and synthetic retry
+expiry independently. It also checks malformed receipts, cancellation and a
+retry-write failure; no delay or preparation receipt grants checkpoint permission.
+
+`legacy_retry_round_robin_passes_ineligible_prefix_after_reopen` covers one and 64
+ineligible low-sort identities, bounded selection, wraparound, reopen, zero limit,
+library isolation and cursor-write rollback. The production preparation test
+`legacy_preparation_rotates_past_64_refused_families_after_reopen` covers 64
+eligible families refused by files, missing children or inventory failure before
+a ready family, then unchanged reopened cycles. Every synthetic original remains
+protected and unchanged. These tests do not establish historical ownership or
+qualify a live library.

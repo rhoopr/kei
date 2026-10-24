@@ -463,17 +463,43 @@ impl SqliteStateDb {
         }).await
     }
 
+    /// Take a bounded round-robin batch of retry identities. Advance past every
+    /// examined identity, including ineligible families, so a refused prefix
+    /// cannot starve later work. The cursor is scheduling only, never evidence.
     pub(crate) async fn legacy_preparation_snapshots(
         &self,
         library: &str,
         limit: usize,
     ) -> Result<Vec<LegacyPreparationSnapshot>, StateError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let library = library.to_owned();
-        self.with_conn("legacy_preparation_snapshots", move |conn| {
-            let mut stmt=conn.prepare("SELECT DISTINCT asset_id FROM metadata_capture_retries WHERE library=?1 AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=metadata_capture_retries.library AND p.asset_id=metadata_capture_retries.asset_id) ORDER BY asset_id LIMIT ?2")?;
-            let ids=stmt.query_map(params![library,i64::try_from(limit).unwrap_or(i64::MAX)],|row|row.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
-            let mut snapshots=Vec::new();
-            for id in ids { if let Some(snapshot)=preparation_snapshot(conn,&library,&id)? { snapshots.push(snapshot); } }
+        self.with_conn_mut("legacy_preparation_snapshots", move |conn| {
+            let tx = conn.transaction()?;
+            let key = format!("legacy_preservation_preparation_cursor:v1:{library}");
+            let cursor: String = tx.query_row("SELECT value FROM metadata WHERE key=?1", [&key], |row| row.get(0))
+                .optional()?.unwrap_or_default();
+            let mut ids = Vec::new();
+            // Two ordered ranges preserve the bounded batch across wraparound.
+            for comparison in [">", "<="] {
+                let mut stmt = tx.prepare(&format!("SELECT DISTINCT asset_id FROM metadata_capture_retries WHERE library=?1 AND asset_id {comparison} ?2 AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=metadata_capture_retries.library AND p.asset_id=metadata_capture_retries.asset_id) ORDER BY asset_id LIMIT ?3"))?;
+                let remaining = i64::try_from(limit.saturating_sub(ids.len())).unwrap_or(i64::MAX);
+                ids.extend(stmt.query_map(params![library, cursor, remaining], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?);
+                if ids.len() == limit {
+                    break;
+                }
+            }
+            let mut snapshots = Vec::new();
+            for id in &ids {
+                if let Some(snapshot) = preparation_snapshot(&tx, &library, id)? {
+                    snapshots.push(snapshot);
+                }
+            }
+            if let Some(last) = ids.last() {
+                tx.execute("INSERT INTO metadata(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, last])?;
+            }
+            tx.commit()?;
             Ok(snapshots)
         }).await
     }
@@ -1195,6 +1221,112 @@ mod tests {
         ];
         (db, snapshot, files)
     }
+    #[tokio::test]
+    async fn legacy_retry_round_robin_passes_ineligible_prefix_after_reopen() {
+        for blocked in [1usize, 64] {
+            let dir = tempfile::tempdir().unwrap();
+            let database = dir.path().join("state.db");
+            let (db, ready, _) = seed(&database).await;
+            for index in 0..blocked {
+                let id = format!("a-blocked-{index:03}");
+                let media = dir.path().join(format!("{id}.jpg"));
+                std::fs::write(&media, b"unchanged legacy").unwrap();
+                db.upsert_seen(&crate::test_helpers::TestAssetRecord::new(&id).build())
+                    .await
+                    .unwrap();
+                db.mark_downloaded(
+                    "PrimarySync",
+                    &id,
+                    "original",
+                    &media,
+                    "synthetic-local",
+                    None,
+                )
+                .await
+                .unwrap();
+                db.set_metadata_capture_revision_for_test("PrimarySync", &id, 0);
+                db.upsert_asset_master_mapping("PrimarySync", &format!("child-{index}"), &id)
+                    .await
+                    .unwrap();
+                let candidate = db
+                    .get_metadata_capture_candidates("PrimarySync", 1000, 1000)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|c| c.asset_id == id)
+                    .unwrap();
+                assert!(
+                    db.defer_metadata_capture_ambiguity(&candidate, 1000)
+                        .await
+                        .unwrap()
+                );
+            }
+            // The bounded first batch examines only the blocked prefix.
+            assert!(
+                db.legacy_preparation_snapshots("PrimarySync", blocked)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            drop(db);
+            let db = SqliteStateDb::open(&database).await.unwrap();
+            let selected = db
+                .legacy_preparation_snapshots("PrimarySync", blocked)
+                .await
+                .unwrap();
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0].asset_id, ready.asset_id);
+            // A whole-queue batch wraps and reaches the ready family exactly once.
+            let selected = db
+                .legacy_preparation_snapshots("PrimarySync", blocked + 1)
+                .await
+                .unwrap();
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0].asset_id, ready.asset_id);
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("before")
+            );
+            let key = "legacy_preservation_preparation_cursor:v1:PrimarySync";
+            let before = db.get_metadata(key).await.unwrap();
+            assert!(
+                db.legacy_preparation_snapshots("PrimarySync", 0)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                db.legacy_preparation_snapshots("OtherSync", 1)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(db.get_metadata(key).await.unwrap(), before);
+            let conn = rusqlite::Connection::open(&database).unwrap();
+            conn.execute_batch("CREATE TRIGGER fail_cursor BEFORE UPDATE ON metadata WHEN OLD.key='legacy_preservation_preparation_cursor:v1:PrimarySync' BEGIN SELECT RAISE(ABORT,'synthetic cursor failure'); END;").unwrap();
+            assert!(
+                db.legacy_preparation_snapshots("PrimarySync", 1)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                db.get_metadata(key).await.unwrap(),
+                before,
+                "failed cursor transaction rolls back"
+            );
+            conn.execute_batch("DROP TRIGGER fail_cursor;").unwrap();
+            assert!(
+                db.get_legacy_master_state_owners()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn legacy_historical_claim_requires_exact_source_backed_current_receipt() {
         for fault in [

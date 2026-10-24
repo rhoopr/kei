@@ -504,9 +504,12 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
             // Model the scheduled recovery becoming eligible without waiting
             // an hour. Only the synthetic discovery retry timestamp changes;
             // the evidence signature, identity debt and receipts stay intact.
-            // This key is absent before the inventory-budget fix (#881).
             let db = state::SqliteStateDb::open(&database).await.unwrap();
-            let key = format!("legacy_preservation_inventory_retry:{}", ZONES[0]);
+            let identity = serde_json::to_vec(&(ZONES[0], "legacy-master")).unwrap();
+            let key = format!(
+                "legacy_preservation_candidate_retry:v1:{}",
+                data_encoding::HEXLOWER.encode(&Sha256::digest(identity))
+            );
             if let Some(encoded) = db.get_metadata(&key).await.unwrap()
                 && !encoded.is_empty()
             {

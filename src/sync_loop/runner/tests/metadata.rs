@@ -4662,7 +4662,7 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         );
                     }
                 }
-                if matches!(fault, AmbiguousChildFault::PreserveSharedOriginal) {
+                if cycle == 0 && matches!(fault, AmbiguousChildFault::PreserveSharedOriginal) {
                     let log = std::fs::read_to_string(&warning_path).unwrap();
                     let warning = log
                         .lines()
@@ -5063,6 +5063,12 @@ async fn exercise_legacy_child_cycles_with_receipt_diagnostic(
                         .unwrap()
                         .execute_batch("DROP TRIGGER fail_single_survivor_proof;")
                         .unwrap();
+                }
+                if matches!(fault, AmbiguousChildFault::PreserveSharedOriginal) {
+                    assert_eq!(
+                        inventory_requests.load(std::sync::atomic::Ordering::SeqCst),
+                        1
+                    );
                 }
                 if matches!(fault, AmbiguousChildFault::PreserveIncompleteInventory) {
                     assert_eq!(
@@ -5529,4 +5535,383 @@ async fn run_cycle_historical_claim_recovers_without_reassigning_originals() {
 #[tokio::test]
 async fn run_cycle_historical_namespace_replacement_rolls_back_then_recovers() {
     exercise_legacy_child_cycles(AmbiguousChildFault::PreserveHistoricalReplacement, &[2]).await;
+}
+
+#[tokio::test]
+async fn legacy_preparation_rotates_past_64_refused_families_after_reopen() {
+    use crate::state::MetadataRewriteStore as _;
+    for refusal in ["file", "no_child", "inventory"] {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        let database = dir.path().join("state.db");
+        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        let mut records = Vec::new();
+        let mut originals = Vec::new();
+        for index in 0..65 {
+            let master = format!("master-{index:03}");
+            let child = format!("child-{index:03}");
+            let path = media.join(format!("{master}.jpg"));
+            std::fs::write(&path, b"untouched original").unwrap();
+            if refusal == "file" && index < 64 {
+                std::fs::hard_link(&path, media.join(format!("alias-{index:03}.jpg"))).unwrap();
+            }
+            originals.push(path.clone());
+            db.upsert_seen(&crate::test_helpers::TestAssetRecord::new(&master).build())
+                .await
+                .unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                &master,
+                "original",
+                &path,
+                "historical",
+                None,
+            )
+            .await
+            .unwrap();
+            db.set_metadata_capture_revision_for_test("PrimarySync", &master, 0);
+            for name in [&child, &format!("absent-{index:03}")] {
+                db.upsert_asset_master_mapping("PrimarySync", name, &master)
+                    .await
+                    .unwrap();
+            }
+            if refusal != "no_child" || index == 64 {
+                let page = full_album_page_with_download(
+                    "PrimarySync",
+                    &master,
+                    "inventory",
+                    "https://cvws.icloud-content.com/synthetic.jpg",
+                    18,
+                    "synthetic-provider",
+                );
+                records.push(page["records"][0].clone());
+                let mut asset = page["records"][1].clone();
+                asset["recordName"] = serde_json::json!(child);
+                records.push(asset);
+            }
+        }
+        let candidates = db
+            .get_metadata_capture_candidates("PrimarySync", 1, 1000)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 65);
+        for candidate in candidates {
+            assert!(
+                db.defer_metadata_capture_ambiguity(&candidate, 1)
+                    .await
+                    .unwrap()
+            );
+        }
+        db.set_metadata("sync_token:PrimarySync", "held")
+            .await
+            .unwrap();
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = LegacyRetryInventory {
+            records,
+            scans: scans.clone(),
+            fail_first: refusal == "inventory",
+        };
+        let album = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+            Box::new(provider),
+            "PrimarySync",
+        )
+        .all();
+        drop(db);
+        for cycle in 0..4 {
+            let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            let builder = make_run_cycle_download_config_builder_with_options(
+                &media,
+                db.clone(),
+                RunCycleDownloadConfigOptions::default(),
+            );
+            let config = builder(
+                download::SyncMode::Full,
+                Arc::new(rustc_hash::FxHashSet::default()),
+                Arc::new(download::AssetGroupings::default()),
+                Arc::from("PrimarySync"),
+            );
+            assert!(!config.legacy_preservation_allow_hardlinks);
+            crate::download::legacy_preservation::LegacyCycle::begin(
+                db.as_ref(),
+                &config,
+                &album,
+                "stable-policy",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let preserved = db.legacy_preservations("PrimarySync").await.unwrap();
+            if cycle == 0 {
+                assert!(preserved.is_empty(), "{refusal}");
+            } else {
+                assert!(
+                    preserved
+                        .iter()
+                        .any(|record| record.asset_id == "master-064"),
+                    "ready family starved: {refusal}"
+                );
+                assert!(
+                    preserved
+                        .iter()
+                        .all(|record| record.active_generation.is_none())
+                );
+            }
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("held")
+            );
+            assert!(
+                db.get_legacy_master_state_owners()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            for path in &originals {
+                assert_eq!(std::fs::read(path).unwrap(), b"untouched original");
+            }
+            assert_eq!(db.protected_legacy_paths().await.unwrap().len(), 130);
+        }
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "{refusal}"
+        );
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LegacyRetryInventory {
+    records: Vec<serde_json::Value>,
+    scans: Arc<std::sync::atomic::AtomicUsize>,
+    fail_first: bool,
+}
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for LegacyRetryInventory {
+    async fn post(
+        &self,
+        url: &str,
+        _: String,
+        _: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        assert!(url.contains("/changes/zone?"));
+        let attempt = self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_first && attempt == 0 {
+            // A structurally incomplete inventory is refused without retrying HTTP.
+            return Ok(serde_json::json!({"zones":[]}));
+        }
+        Ok(
+            serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"inventory","moreComing":false,"records":self.records}]}),
+        )
+    }
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn legacy_preparation_retry_wakes_on_evidence_and_expiry_without_reusing_proof() {
+    for mutation in [
+        "file",
+        "policy",
+        "provider",
+        "expiry",
+        "malformed",
+        "cancel",
+        "write_failure",
+        "discovery",
+        "old_timestamp",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        std::fs::create_dir(&media).unwrap();
+        let original = media.join("original.jpg");
+        let alias = media.join("alias.jpg");
+        std::fs::write(&original, b"unchanged original").unwrap();
+        if mutation != "discovery" {
+            std::fs::hard_link(&original, &alias).unwrap();
+        }
+        if mutation == "old_timestamp" {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&original)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH - std::time::Duration::from_secs(1)),
+                )
+                .unwrap();
+        }
+        let database = dir.path().join("state.db");
+        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        db.upsert_seen(&crate::test_helpers::TestAssetRecord::new("master").build())
+            .await
+            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "master",
+            "original",
+            &original,
+            "historical",
+            None,
+        )
+        .await
+        .unwrap();
+        db.set_metadata_capture_revision_for_test("PrimarySync", "master", 0);
+        for child in ["child", "absent"] {
+            db.upsert_asset_master_mapping("PrimarySync", child, "master")
+                .await
+                .unwrap();
+        }
+        let candidate = db
+            .get_metadata_capture_candidates("PrimarySync", 1, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert!(
+            db.defer_metadata_capture_ambiguity(&candidate, 1)
+                .await
+                .unwrap()
+        );
+        db.set_metadata("sync_token:PrimarySync", "held")
+            .await
+            .unwrap();
+        drop(db);
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let page = full_album_page_with_download(
+            "PrimarySync",
+            "master",
+            "inventory",
+            "https://cvws.icloud-content.com/synthetic.jpg",
+            18,
+            "synthetic-provider",
+        );
+        let mut child = page["records"][1].clone();
+        child["recordName"] = serde_json::json!("child");
+        let records = vec![page["records"][0].clone(), child];
+        for cycle in 0..4 {
+            let provider = LegacyRetryInventory {
+                records: if mutation == "discovery" && cycle < 2 {
+                    Vec::new()
+                } else {
+                    records.clone()
+                },
+                scans: scans.clone(),
+                fail_first: false,
+            };
+            let album = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+                Box::new(provider),
+                "PrimarySync",
+            )
+            .all();
+            let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            let conn = rusqlite::Connection::open(&database).unwrap();
+            let cancel = CancellationToken::new();
+            if cycle == 0 && mutation == "write_failure" {
+                conn.execute_batch("CREATE TRIGGER fail_retry BEFORE INSERT ON metadata WHEN NEW.key LIKE 'legacy_preservation_candidate_retry:v1:%' BEGIN SELECT RAISE(ABORT,'synthetic retry failure'); END;").unwrap();
+            }
+            if cycle == 0 && mutation == "cancel" {
+                cancel.cancel();
+            }
+            if cycle == 1 && mutation == "write_failure" {
+                conn.execute_batch("DROP TRIGGER fail_retry;").unwrap();
+            }
+            if cycle == 2 {
+                match mutation {
+                    "file" => std::fs::remove_file(&alias).unwrap(),
+                    "provider" => db
+                        .upsert_seen(
+                            &crate::test_helpers::TestAssetRecord::new("child")
+                                .checksum("new-provider-generation")
+                                .build(),
+                        )
+                        .await
+                        .unwrap(),
+                    "expiry" | "discovery" => {
+                        conn.execute("UPDATE metadata SET value=json_set(value,'$.next_attempt_at',0) WHERE key LIKE 'legacy_preservation_candidate_retry:v1:%'", []).unwrap();
+                    }
+                    "malformed" => {
+                        conn.execute("UPDATE metadata SET value='invalid-json' WHERE key LIKE 'legacy_preservation_candidate_retry:v1:%'", []).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            let builder = make_run_cycle_download_config_builder_with_options(
+                &media,
+                db.clone(),
+                RunCycleDownloadConfigOptions::default(),
+            );
+            let mut config = builder(
+                download::SyncMode::Full,
+                Arc::new(rustc_hash::FxHashSet::default()),
+                Arc::new(download::AssetGroupings::default()),
+                Arc::from("PrimarySync"),
+            );
+            let allow = cycle >= 2 && mutation == "policy";
+            Arc::make_mut(&mut config).legacy_preservation_allow_hardlinks = allow;
+            let result = crate::download::legacy_preservation::LegacyCycle::begin(
+                db.as_ref(),
+                &config,
+                &album,
+                if allow {
+                    "trusted-policy"
+                } else {
+                    "strict-policy"
+                },
+                &cancel,
+            )
+            .await;
+            if cycle == 0 && matches!(mutation, "cancel" | "write_failure") {
+                assert!(result.is_err(), "{mutation}");
+                assert_eq!(conn.query_row("SELECT count(*) FROM metadata WHERE key LIKE 'legacy_preservation_candidate_retry:v1:%'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+            } else {
+                result.unwrap();
+            }
+            let expected = if mutation == "old_timestamp" {
+                1
+            } else if mutation == "cancel" {
+                usize::from(cycle > 0)
+            } else if mutation == "write_failure" {
+                1 + usize::from(cycle > 0)
+            } else {
+                1 + usize::from(cycle >= 2)
+            };
+            assert_eq!(
+                scans.load(std::sync::atomic::Ordering::SeqCst),
+                expected,
+                "{mutation} cycle {cycle}"
+            );
+            let preserved = db.legacy_preservations("PrimarySync").await.unwrap();
+            assert_eq!(
+                !preserved.is_empty(),
+                cycle >= 2 && matches!(mutation, "file" | "policy" | "discovery"),
+                "{mutation} cycle {cycle}"
+            );
+            assert!(
+                preserved
+                    .iter()
+                    .all(|record| record.active_generation.is_none())
+            );
+            assert_eq!(std::fs::read(&original).unwrap(), b"unchanged original");
+            if alias.exists() {
+                assert_eq!(std::fs::read(&alias).unwrap(), b"unchanged original");
+            }
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("held")
+            );
+            assert!(
+                db.get_legacy_master_state_owners()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
 }
