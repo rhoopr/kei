@@ -68,3 +68,6 @@ pub(crate) mod legacy_preservation;
 pub(crate) mod trusted_legacy;
 
 pub(crate) mod sparse_target;
+
+#[cfg(test)]
+mod live_baseline_test;

@@ -1684,3 +1684,6 @@ mod tests {
         assert!(!rendered.contains("debug@example.com"));
     }
 }
+
+#[cfg(test)]
+pub(crate) mod live_zone_cursor_test;
