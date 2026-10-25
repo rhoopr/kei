@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 36;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 37;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -724,6 +724,25 @@ CREATE INDEX IF NOT EXISTS primary_layout_binding_source ON primary_layout_bindi
 CREATE INDEX IF NOT EXISTS primary_layout_binding_owner ON primary_layout_bindings(library,child);
 CREATE INDEX IF NOT EXISTS primary_layout_claim_owner ON primary_layout_claims(library,child);
 CREATE INDEX IF NOT EXISTS primary_layout_pending_library ON primary_layout_operations(source_library,phase);
+").unwrap();
+    // Match schema 37 before marking this synthetic database current.
+    conn.execute_batch(r"
+ALTER TABLE provider_active_destinations ADD COLUMN frozen_metadata BLOB;
+ALTER TABLE provider_active_destinations ADD COLUMN frozen_metadata_hash BLOB;
+ALTER TABLE owned_temp_files ADD COLUMN publication TEXT;
+ALTER TABLE asset_metadata_paths ADD COLUMN preserved_path_key TEXT;
+CREATE INDEX IF NOT EXISTS idx_receipt_preserved_path ON asset_metadata_paths(preserved_path_key) WHERE preserved_path_key IS NOT NULL;
+ALTER TABLE provider_active_decisions ADD COLUMN compacted_hash TEXT;
+
+CREATE TABLE IF NOT EXISTS download_receipts (
+ id TEXT PRIMARY KEY, account_key TEXT NOT NULL, provider_key TEXT NOT NULL,
+ scope TEXT NOT NULL, library TEXT NOT NULL, child TEXT NOT NULL, master TEXT NOT NULL,
+ state_id TEXT NOT NULL, origin_pass TEXT NOT NULL, version_size TEXT NOT NULL, provider_checksum TEXT NOT NULL,
+ provider_size INTEGER NOT NULL CHECK(provider_size>=0), native_path TEXT NOT NULL,
+ source_checksum TEXT NOT NULL, local_checksum TEXT NOT NULL, proof_hash TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS download_receipts_identity ON download_receipts(scope,child,master,version_size,provider_checksum,provider_size);
+CREATE INDEX IF NOT EXISTS download_receipts_library ON download_receipts(library,scope);
 ").unwrap();
     conn.pragma_update(None, "user_version", HELPER_SCHEMA_VERSION)
         .unwrap();

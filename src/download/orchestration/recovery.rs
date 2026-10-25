@@ -23,6 +23,13 @@ use super::url_refresh::{
     build_incremental_expired_url_retry_tasks, merge_expired_url_retry_result,
 };
 
+/// Keep durable-state failures distinct from retained provider ambiguity.
+fn classify_targeted_recovery_state_failure(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::state::error::StateError>()
+        .is_some()
+}
+
 async fn run_targeted_recovery_pass(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
@@ -299,10 +306,7 @@ pub(super) async fn append_targeted_recovery_to_sync_result(
         Err(e) => {
             // A failed durable marker/write is still an accounting failure.
             // Do not disguise it as ordinary retained provider ambiguity.
-            let state_write_failures = usize::from(
-                e.downcast_ref::<crate::state::error::StateError>()
-                    .is_some(),
-            );
+            let state_write_failures = usize::from(classify_targeted_recovery_state_failure(&e));
             let stats = SyncStats {
                 failed: 1,
                 state_write_failures,
