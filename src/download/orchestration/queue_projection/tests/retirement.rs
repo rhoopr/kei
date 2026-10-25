@@ -56,6 +56,33 @@ async fn admission_with_legacy_state(
     Vec<crate::download::filter::DownloadTask>,
     Vec<crate::state::AssetRecord>,
 ) {
+    let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+    admission_with_planner(
+        db,
+        root,
+        media,
+        index,
+        (companion, legacy),
+        capacity,
+        &mut planner,
+    )
+    .await
+}
+
+async fn admission_with_planner(
+    db: &Arc<SqliteStateDb>,
+    root: &str,
+    media: &std::path::Path,
+    index: usize,
+    options: (bool, bool),
+    capacity: u64,
+    planner: &mut TaskPlanner,
+) -> (
+    ActiveDecision,
+    Vec<crate::download::filter::DownloadTask>,
+    Vec<crate::state::AssetRecord>,
+) {
+    let (companion, legacy) = options;
     let master = format!("compact-{index}");
     let child = format!("asset-{master}");
     let mut values = records(&master, CURRENT, "compact fixture");
@@ -80,9 +107,6 @@ async fn admission_with_legacy_state(
     config.folder_structure = "none".into();
     config.media.live_photos = companion;
     config.state_db = Some(db.clone() as Arc<dyn DownloadStore>);
-    let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
-        .await
-        .unwrap();
     let mut plan = planner.plan_download_asset(&asset, &config).await.unwrap();
     if legacy {
         db.acquire_lock("valid historical master state owner").unwrap().execute(
@@ -1944,3 +1968,5 @@ async fn v027_path_lookup_keeps_native_non_utf8_collision_owners() {
             .is_empty()
     );
 }
+
+mod lookup_measurement;

@@ -339,3 +339,69 @@ Final standalone paired debug measurements (ten calls each):
 The affected v027 acceptance slice passed 110 tests with four explicit probes or
 subprocess workers ignored. Formatting and diff checks passed. This is focused
 qualification, not final broad lint/platform validation or independent PR review.
+
+### Optimized lookup and normal-orchestration measurement
+
+The ignored synthetic workload
+`v027_optimized_pending_lookup_and_normal_cycles` runs alone with one test thread
+in the default-feature release test binary. Build command:
+`cargo test --release --lib v027_optimized_pending_lookup_and_normal_cycles -- --ignored --nocapture --test-threads=1`.
+The initial optimized build took 3m18s; the final fixture build reused those
+dependencies and took 2m26s. No index, cache, schema or runtime policy changed in
+this measurement checkpoint; counters exist only under cfg(test).
+
+Each case uses one downloaded JPEG fulfilling two album passes, plus 0, 100 or
+1,000 unrelated pending renditions with approximately 4 KiB synthetic response
+padding apiece. Setup reuses one planner instead of rebuilding a full saved-path
+planner for every admission. It still uses real admission APIs and their SQLite
+checks; setup is excluded from all workload timings. It takes 0.001/0.435/10.275s
+in the selected-ledger cases and 0.001/0.499/10.346s in fallback cases. This is not
+a claim of linear setup complexity.
+
+Observed final release measurements, seconds:
+
+| Pending | Full reader, 10 calls | Path reader, 10 calls | Selected baseline | Selected quiet, two cycles | Fallback baseline | Fallback quiet, two cycles |
+| --- | ---: | ---: | ---: | --- | ---: | --- |
+| 0 | 0.000449 | 0.000142 | 0.028525 | 0.005393 / 0.005507 | 0.018539 | 0.002878 / 0.002665 |
+| 100 | 0.700566 | 0.131390 | 0.164780 | 0.007302 / 0.006625 | 0.366401 | 0.043271 / 0.043294 |
+| 1,000 | 5.536973 | 1.446369 | 1.169534 | 0.013783 / 0.014032 | 2.543877 | 0.503372 / 0.503912 |
+
+Both reader variants run against the same database in each case. The table uses
+the selected-ledger paired lookup timings; the fallback paired 1,000-item timings
+were similar (5.559374s full, 1.451884s path). Workload timings exclude initial
+download/setup. They include ordinary download orchestration, synthetic provider
+responses and localhost transport where needed, not a complete account/CLI run.
+
+Observed call counts explain why helper timing alone overstated the common path:
+- Selected-ledger baseline: two full reads, zero path-specific reads.
+- Fallback baseline: three full reads, two path-specific reads for two passes.
+- Both quiet cycles in both modes: zero of either reader.
+
+Source tracing agrees: only a committed RecordedPresent match invokes
+reuse_bound_download and its path-specific ownership lookup, once per rendition.
+Existing selected-ledger completion can bypass that route. Fallback publication
+(for example cross-zone albums) reaches it; the fixture selects that production
+mode through the existing album source API using synthetic records, not a live
+shared account. Quiet fallback time still grows in this fixture even with zero
+lookup calls, so that cost must not be attributed to this helper.
+
+All six cases preserve the original bytes/mtime, retain every pending destination,
+download the one original only once and perform no later media GET or quiet rank
+inventory. The six-case workload passed in 43s. These are small fixed-output
+workloads with increasing pending state, not large-library throughput tests.
+
+Recommendation: another bounded fix for repeated fallback ownership scanning is
+justified before beta. At the measured 1,000-pending cost, 40,000 such commits
+would add about 97 minutes of path lookup alone if per-call costs remained
+similar. That is an arithmetic projection (not observed runtime, not an estimate
+of reporter scope); at 100 pending, the analogous projection is about 9 minutes.
+The common selected-ledger path did not make these calls. Do not replace the
+persistence design based on these measurements. Review a narrow way to avoid
+revalidating all unrelated pending evidence per fallback commit while retaining
+transactional collision safety, then rerun this exact optimized workload.
+
+The same optimized binary subsequently passed the 110-test affected v027
+acceptance slice in 21.51s, with five explicit probes/workers ignored (including
+the measurement workload already run separately). Formatting and diff checks
+passed. Final broad lint/features/platform checks and independent exact-head
+review are still outstanding.

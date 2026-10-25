@@ -2153,6 +2153,8 @@ fn validate_identity_decisions(
 pub(super) fn pending_destination_reservations(
     conn: &Connection,
 ) -> Result<Vec<super::ReconciliationReservation>, StateError> {
+    #[cfg(test)]
+    FULL_RESERVATION_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     pending_reservations(conn, None)
 }
 
@@ -2163,8 +2165,27 @@ pub(crate) fn pending_destination_reservations_for_path(
     conn: &Connection,
     path: &Path,
 ) -> Result<Vec<super::ReconciliationReservation>, StateError> {
+    #[cfg(test)]
+    PATH_RESERVATION_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let chosen = super::primary_layout::path_key(path)?;
     pending_reservations(conn, Some(&chosen))
+}
+
+#[cfg(test)]
+static FULL_RESERVATION_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static PATH_RESERVATION_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Measurement-only counters; run the ignored workload alone with one test thread.
+#[cfg(test)]
+pub(crate) fn take_reservation_read_counts() -> (usize, usize) {
+    use std::sync::atomic::Ordering;
+    (
+        FULL_RESERVATION_READS.swap(0, Ordering::Relaxed),
+        PATH_RESERVATION_READS.swap(0, Ordering::Relaxed),
+    )
 }
 
 fn pending_manifest_may_collide(
