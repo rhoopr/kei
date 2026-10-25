@@ -30,7 +30,7 @@ fn checkpoint() -> CheckpointTransition {
 }
 
 #[tokio::test]
-async fn sparse_origin_same_evidence_promotes_and_omission_survives_reopen() {
+async fn sparse_origin_same_source_coexists_and_omission_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let db = owned(&path).await;
@@ -41,9 +41,10 @@ async fn sparse_origin_same_evidence_promotes_and_omission_survives_reopen() {
         .await
         .unwrap();
     db.with_conn_mut("seed_history", |conn| {
+        conn.execute("UPDATE unresolved_sparse_identities SET epoch=0", [])?;
         conn.execute(
-            "UPDATE unresolved_sparse_identities SET observation_origin='historical-v1'",
-            [],
+            "UPDATE metadata SET key='unresolved_asset_identity:PrimarySync' WHERE key=?1",
+            [crate::state::unresolved_identity_key("PrimarySync")],
         )?;
         Ok(())
     })
@@ -60,7 +61,7 @@ async fn sparse_origin_same_evidence_promotes_and_omission_survives_reopen() {
         )
         .await
         .unwrap();
-    assert!(!current.is_historical());
+    assert!(current.origin.is_some());
     assert_ne!(current.generation, old.generation);
     assert_eq!(current.original, old.original);
     let mut stale = checkpoint();
@@ -141,9 +142,10 @@ async fn sparse_origin_checkpoint_failure_restores_current_and_preserves_history
     .await
     .unwrap();
     db.with_conn_mut("history", |conn| {
+        conn.execute("UPDATE unresolved_sparse_identities SET epoch=0", [])?;
         conn.execute(
-            "UPDATE unresolved_sparse_identities SET observation_origin='historical-v1'",
-            [],
+            "UPDATE metadata SET key='unresolved_asset_identity:PrimarySync' WHERE key=?1",
+            [crate::state::unresolved_identity_key("PrimarySync")],
         )?;
         Ok(())
     })
@@ -170,7 +172,7 @@ async fn sparse_origin_checkpoint_failure_restores_current_and_preserves_history
     assert!(db.commit_checkpoint_transition(transition).await.is_err());
     drop(db);
     let db = owned(&path).await;
-    assert_eq!(db.sparse_identities("PrimarySync").await.unwrap().len(), 2);
+    assert_eq!(db.sparse_identities("PrimarySync").await.unwrap().len(), 1);
     db.with_conn_mut("allow_token", |conn| {
         conn.execute_batch("DROP TRIGGER reject_token")?;
         Ok(())
@@ -181,10 +183,19 @@ async fn sparse_origin_checkpoint_failure_restores_current_and_preserves_history
     transition.sparse_identity_proofs.push(current.proof());
     db.commit_checkpoint_transition(transition).await.unwrap();
     let retained = db.sparse_identities("PrimarySync").await.unwrap();
-    assert_eq!(retained.len(), 1);
-    assert!(retained[0].is_historical());
+    assert!(retained.is_empty());
+    let count: i64 = db
+        .acquire_lock("preserved old evidence")
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM unresolved_sparse_identities WHERE epoch=0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
     assert_eq!(
-        db.get_metadata(&crate::state::unresolved_identity_key("PrimarySync"))
+        db.get_metadata("unresolved_asset_identity:PrimarySync")
             .await
             .unwrap()
             .as_deref(),
@@ -288,9 +299,10 @@ async fn sparse_origin_blank_source_barrier_survives_history_and_later_writes() 
     .await
     .unwrap();
     db.with_conn_mut("history", |conn| {
+        conn.execute("UPDATE unresolved_sparse_identities SET epoch=0", [])?;
         conn.execute(
-            "UPDATE unresolved_sparse_identities SET observation_origin='historical-v1'",
-            [],
+            "UPDATE metadata SET key='unresolved_asset_identity:PrimarySync' WHERE key=?1",
+            [crate::state::unresolved_identity_key("PrimarySync")],
         )?;
         Ok(())
     })

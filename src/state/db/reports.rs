@@ -270,8 +270,8 @@ impl SqliteStateDb {
             };
             let unresolved_identity_zones: u64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM (SELECT substr(key,length(?1)+1) AS library FROM metadata WHERE substr(key,1,length(?1))=?1 UNION SELECT library FROM unresolved_sparse_identities)",
-                    [crate::state::UNRESOLVED_IDENTITY_PREFIX],
+                    "SELECT COUNT(*) FROM (SELECT substr(key,length(?1)+1) AS library FROM metadata WHERE substr(key,1,length(?1))=?1 UNION SELECT substr(key,length(?2)+1) FROM metadata WHERE substr(key,1,length(?2))=?2 UNION SELECT library FROM unresolved_sparse_identities)",
+                    [crate::state::UNRESOLVED_IDENTITY_PREFIX,crate::state::HISTORICAL_IDENTITY_PREFIX],
                     |row| row.get::<_, i64>(0),
                 )
                 .map_err(|e| StateError::query("get_summary::unresolved_identity", e))?
@@ -293,7 +293,10 @@ impl SqliteStateDb {
             }
             let mut last_recovery_action = metadata_value("last_recovery_action")
                 .map_err(|e| StateError::query("get_summary::recovery_action", e))?;
-            if unresolved_identity_zones > 0 {
+            let current_identity_work: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM metadata WHERE substr(key,1,length(?1))=?1) OR EXISTS(SELECT 1 FROM unresolved_sparse_identities WHERE epoch=1)",
+                [crate::state::UNRESOLVED_IDENTITY_PREFIX], |row| row.get(0))?;
+            if current_identity_work {
                 provider_checkpoint_status = Some("preserved".to_owned());
                 if last_recovery_action.as_deref().is_none_or(|action| action == "none") {
                     last_recovery_action = Some("replay_from_prior_token".to_owned());

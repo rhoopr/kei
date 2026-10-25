@@ -180,7 +180,7 @@ where
                     .iter()
                     .map(|capture| capture.unattributed_legacy_pending)
                     .sum();
-                summary.unresolved_identity_zones > 0
+                summary.provider_checkpoint_status.as_deref() == Some("preserved")
                     || summary.metadata_capture.iter().any(|capture| {
                         capture.unresolved_assets > 0 || capture.unattributed_legacy_pending > 0
                     })
@@ -1206,6 +1206,41 @@ mod tests {
         assert_eq!(health_json["last_error"], "sync interrupted");
         let report_json = parse_json(&report_path);
         assert_eq!(report_json["status"], "interrupted");
+    }
+
+    #[tokio::test]
+    async fn skipped_watch_history_stays_visible_without_false_replay_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = state::SqliteStateDb::open_in_memory().unwrap();
+        db.set_metadata("unresolved_asset_identity:old-zone", "opaque old marker")
+            .await
+            .unwrap();
+        db.set_metadata("last_checkpoint_status", "current")
+            .await
+            .unwrap();
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.unresolved_identity_zones, 1);
+        assert_eq!(
+            summary.provider_checkpoint_status.as_deref(),
+            Some("current")
+        );
+        assert_ne!(
+            summary.last_recovery_action.as_deref(),
+            Some("replay_from_prior_token")
+        );
+        let notifier = Notifier::new(None);
+        let reporter = reporter_with_surfaces(dir.path(), None, &notifier, Some(&db), None);
+        let mut health = HealthStatus::new();
+        reporter.report_skipped_watch_cycle(&mut health).await;
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.last_success_at.is_some());
+        assert_eq!(
+            db.get_metadata("unresolved_asset_identity:old-zone")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("opaque old marker")
+        );
     }
 
     #[tokio::test]

@@ -78,12 +78,8 @@ impl SparseRetryContext {
                 state_failure(summary);
                 continue;
             }
-            if current_scope.is_some() && row.is_historical() && !seen.contains(row.source.as_str())
-            {
-                continue;
-            }
-            // Every actual source observation promotes retained history, even an
-            // asset-only or deleted record with no usable new sparse evidence.
+            // Actual observation binds unknown work to current scope.
+            // Historical epoch rows never enter this runtime read path.
             if let Some(scope) = current_scope.filter(|_| seen.contains(row.source.as_str())) {
                 match db
                     .observe_current_sparse_identity(

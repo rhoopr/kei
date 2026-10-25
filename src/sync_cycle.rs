@@ -70,7 +70,7 @@ async fn sparse_identity_holds_current(
         return Ok(marked);
     }
     let rows = db.sparse_identities(library).await?;
-    Ok((marked && rows.is_empty()) || rows.iter().any(|row| !row.is_historical()))
+    Ok(marked || !rows.is_empty())
 }
 
 pub(crate) fn is_current_zone_checkpoint(key: &str) -> bool {

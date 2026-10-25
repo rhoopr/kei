@@ -2574,25 +2574,30 @@ acknowledgement cannot re-seal damaged inventory.
 
 ### Sparse observations across the v27 upgrade
 
-Sparse identity evidence remains in the existing retry table. Schema38 records
-whether a row is validated pre-epoch history or a current observed obligation.
-Unmarked development state and malformed evidence remain blocking. Historical
-rows are preserved, not certified, reassigned or deleted when the new baseline
-completes. Transfers, publication journals and prepared operations retain their
-independent ownership and recovery requirements.
+Sparse identity evidence remains in one retry table. Schema39 adds a stable
+historical/current discriminator to its key, so the same source can coexist in
+both without changing or deleting old evidence. A trusted stock upgrade through
+schema36 preserves every old row and marker verbatim, including opaque or
+malformed payloads. Historical rows are excluded in SQL before runtime decoding.
+Their visible diagnostic counts do not claim repair, current ownership, or a
+held current cursor.
 
-Every actual source observation promotes retained history atomically, including
-an asset-only response or identical evidence. Current obligations survive omitted
-responses and configuration changes. Checkpoint publication validates remaining
-current/unknown rows and generation-fenced resolution proofs in its transaction.
-Historical rows and their diagnostic marker may remain after current progress.
-Full account/database/zone scope remains fenced through the owned database and
-the existing download-ledger scope key.
+A complete fresh selected inventory and its change bridge establish new progress
+independently of this history. Actual current observations create current rows
+before lookup; unresolved sources survive omitted responses and configuration
+changes. Checkpoint publication validates current/unknown rows and generation
+proofs in its transaction. Current markers use a distinct namespace, so current
+retirement cannot erase an old marker. Transfers, publication journals and
+prepared operations retain their independent owners and recovery requirements.
+Account/database/zone fences remain unchanged.
 
-Supported stock upgrades cross schema37 and the origin marker in one savepoint.
-Existing schema37 databases cannot prove pre-epoch origin and remain conservative.
-Older binaries reject the new schema; rollback requires a consistent pre-upgrade
-state snapshot and matching binary, never manually lowering the schema version.
+Stock upgrades cross schemas37 through39 in one savepoint. Existing development
+schemas37/38, or purported stock states containing positive current-ledger
+artifacts, remain conservative: rows remain current/unknown and old markers also
+establish a current unaccounted barrier. Missing fields alone never prove history.
+No automatic reinterpretation of previously modified development markers occurs.
+Older binaries reject schema39; rollback requires a consistent pre-upgrade state
+snapshot and matching binary, never manually lowering the schema version.
 
 
 An unresolved current CPLAsset with a usable source ID is admitted before lookup.

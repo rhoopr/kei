@@ -36,7 +36,8 @@ pub use types::{
 
 /// Durable per-zone evidence of asset deltas that cannot yet be hydrated.
 /// Cleared atomically with a proven replacement provider checkpoint only.
-pub(crate) const UNRESOLVED_IDENTITY_PREFIX: &str = "unresolved_asset_identity:";
+pub(crate) const HISTORICAL_IDENTITY_PREFIX: &str = "unresolved_asset_identity:";
+pub(crate) const UNRESOLVED_IDENTITY_PREFIX: &str = "unresolved_current_asset_identity:";
 /// Current provider input lacked a usable source key; unrelated rows cannot
 /// certify that obligation. Keep its scoped cursor until explicit proof exists.
 pub(crate) const UNACCOUNTED_CURRENT_IDENTITY: &str = "unaccounted_current_v1";

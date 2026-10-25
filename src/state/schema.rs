@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 38;
+pub(crate) const SCHEMA_VERSION: i32 = 39;
 
 fn migrate_active_selection(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(r"CREATE TABLE IF NOT EXISTS provider_active_generations (
@@ -1454,51 +1454,37 @@ pub(crate) fn migrate_to_version(
                     "ALTER TABLE unresolved_sparse_identities ADD COLUMN observation_origin TEXT;",
                 )?;
             }
-            // Only the supported pre-ledger migration lineage may classify old
-            // identity debt. Existing development state stays unknown.
+        }
+        39 => {
+            // Missing fields in development state cannot establish old lineage.
             let ledger_artifacts: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM metadata WHERE key GLOB 'sync_token:v27:*' OR key GLOB 'pending_sync_token:v27:*' OR key GLOB 'download_ledger_scope:*') OR EXISTS(SELECT 1 FROM provider_active_generations WHERE NOT json_valid(CAST(specification AS TEXT)) OR CASE WHEN json_valid(CAST(specification AS TEXT)) THEN json_extract(CAST(specification AS TEXT),'$.format') IS NOT 1 ELSE 1 END)",
+                "SELECT EXISTS(SELECT 1 FROM metadata WHERE key GLOB 'sync_token:v27:*' OR key GLOB 'pending_sync_token:v27:*' OR key GLOB 'download_ledger_scope:*' OR key GLOB 'unresolved_current_asset_identity:*') OR EXISTS(SELECT 1 FROM provider_active_generations WHERE NOT json_valid(CAST(specification AS TEXT)) OR CASE WHEN json_valid(CAST(specification AS TEXT)) THEN json_extract(CAST(specification AS TEXT),'$.format') IS NOT 1 ELSE 1 END)",
                 [], |row| row.get(0))?;
-            if start_version <= 36 && !ledger_artifacts {
-                let mut statement = conn.prepare("SELECT library,source_record_name,original_evidence,observed_evidence,lookup_evidence FROM unresolved_sparse_identities WHERE observation_origin IS NULL")?;
-                let rows = statement.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (library, source, original, observed, lookup) = row?;
-                    let valid = |value: &str| {
-                        matches!(
-                            crate::icloud::photos::asset::SparseShareEvidence::from_durable_key(
-                                &super::db::SparseEvidence::new(value.to_owned())
-                            ),
-                            Some(crate::icloud::photos::asset::SparseShareEvidence::Linked(_))
-                        )
-                    };
-                    if !library.trim().is_empty()
-                        && !source.trim().is_empty()
-                        && valid(&original)
-                        && valid(&observed)
-                        && lookup.as_deref().is_none_or(valid)
-                    {
-                        conn.execute("UPDATE unresolved_sparse_identities SET observation_origin='historical-v1' WHERE library=?1 AND source_record_name=?2", rusqlite::params![library,source])?;
-                    }
-                }
-            }
-            // An older marker may represent work that had no row at all.
-            // Do not let a subsequently resolved row erase that unknown debt.
-            conn.execute(
-                "UPDATE metadata SET value=?1 WHERE key GLOB ?2 AND (?3 OR NOT EXISTS(SELECT 1 FROM unresolved_sparse_identities WHERE library=substr(metadata.key,length(?4)+1)) OR EXISTS(SELECT 1 FROM unresolved_sparse_identities WHERE library=substr(metadata.key,length(?4)+1) AND observation_origin IS NOT 'historical-v1'))",
-                rusqlite::params![super::UNACCOUNTED_CURRENT_IDENTITY,
-                    format!("{}*",super::UNRESOLVED_IDENTITY_PREFIX),
-                    start_version >= 37 || ledger_artifacts,
-                    super::UNRESOLVED_IDENTITY_PREFIX],
+            let historical = start_version <= 36 && !ledger_artifacts;
+            // Preserve the old payload verbatim, including undecodable fields.
+            // Zero retains history; one retains current or unknown obligations.
+            conn.execute_batch(
+                "CREATE TABLE sparse_epoch_upgrade (
+                    library TEXT NOT NULL, source_record_name TEXT NOT NULL,
+                    original_evidence TEXT NOT NULL, observed_evidence TEXT NOT NULL,
+                    lookup_evidence TEXT, generation INTEGER NOT NULL CHECK(generation>0),
+                    first_seen_at INTEGER NOT NULL, last_attempt_at INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0),
+                    next_retry_at INTEGER, last_outcome TEXT, observation_origin TEXT,
+                    epoch INTEGER NOT NULL DEFAULT 1 CHECK(epoch IN (0,1)),
+                    PRIMARY KEY(epoch,library,source_record_name));",
             )?;
+            conn.execute("INSERT INTO sparse_epoch_upgrade SELECT library,source_record_name,original_evidence,observed_evidence,lookup_evidence,generation,first_seen_at,last_attempt_at,attempts,next_retry_at,last_outcome,observation_origin,?1 FROM unresolved_sparse_identities",
+                [i32::from(!historical)])?;
+            conn.execute_batch("DROP TABLE unresolved_sparse_identities;
+                ALTER TABLE sparse_epoch_upgrade RENAME TO unresolved_sparse_identities;
+                CREATE INDEX idx_sparse_identity_retry ON unresolved_sparse_identities(epoch,library,next_retry_at);")?;
+            if !historical {
+                // Keep old markers untouched; unrepresented dev work also has
+                // a current barrier that source retirement cannot erase.
+                conn.execute("INSERT INTO metadata(key,value) SELECT ?1 || substr(key,length(?2)+1),?3 FROM metadata WHERE substr(key,1,length(?2))=?2 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    rusqlite::params![super::UNRESOLVED_IDENTITY_PREFIX,super::HISTORICAL_IDENTITY_PREFIX,super::UNACCOUNTED_CURRENT_IDENTITY])?;
+            }
         }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
@@ -1507,10 +1493,9 @@ pub(crate) fn migrate_to_version(
             });
         }
     }
-    // Stock upgrades must not expose schema37 between the lineage decision
-    // and the schema38 writer fence. Both steps share the caller's savepoint.
-    if version == 37 && start_version <= 36 {
-        return migrate_to_version(conn, start_version, 38);
+    // The stock lineage decision and future-writer fence share one savepoint.
+    if (37..39).contains(&version) && start_version <= 36 {
+        return migrate_to_version(conn, start_version, version + 1);
     }
     set_schema_version(conn, version)?;
     tracing::info!(version, "Migrated database schema");
@@ -1523,6 +1508,15 @@ pub(crate) fn migrate_to_version(
 pub(crate) fn migrate_genuine_v28(conn: &Connection) -> Result<(), StateError> {
     for version in 1..=28 {
         migrate_to_version(conn, 0, version)?;
+    }
+    Ok(())
+}
+
+/// Build the released schema36 shape without downgrading a newer database.
+#[cfg(test)]
+pub(crate) fn migrate_genuine_v36(conn: &Connection) -> Result<(), StateError> {
+    for version in 1..=36 {
+        migrate_to_version(conn, 36, version)?;
     }
     Ok(())
 }
@@ -3910,117 +3904,134 @@ mod sparse_origin_migration_tests {
             migrate_to_version(&conn, version, step).unwrap();
         }
         conn.execute("INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at) VALUES('PrimarySync','source',?1,?1,1,1000)", [r#"[1,"child","SharedSync-test","owner"]"#]).unwrap();
+        conn.execute("INSERT INTO metadata(key,value) VALUES('unresolved_asset_identity:PrimarySync','opaque old marker')", []).unwrap();
+        (dir, conn)
+    }
+    fn epoch(conn: &Connection) -> i32 {
+        conn.query_row("SELECT epoch FROM unresolved_sparse_identities", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+    fn assert_old_marker(conn: &Connection) {
+        let marker: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='unresolved_asset_identity:PrimarySync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, "opaque old marker");
+    }
+    fn current_marker(conn: &Connection) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [super::super::unresolved_identity_key("PrimarySync")],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+    #[test]
+    fn sparse_origin_stock_upgrade_preserves_evidence_as_opaque_history() {
+        for version in [26, 28, 35, 36] {
+            let (_dir, conn) = seeded(version);
+            migrate(&conn).unwrap();
+            assert_eq!(get_schema_version(&conn).unwrap(), 39);
+            assert_eq!(epoch(&conn), 0);
+            assert_old_marker(&conn);
+            assert_eq!(current_marker(&conn), None);
+            let evidence:(String,String,i64,Option<String>)=conn.query_row("SELECT original_evidence,observed_evidence,generation,observation_origin FROM unresolved_sparse_identities",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            assert_eq!(
+                evidence,
+                (
+                    r#"[1,"child","SharedSync-test","owner"]"#.into(),
+                    r#"[1,"child","SharedSync-test","owner"]"#.into(),
+                    1,
+                    None
+                )
+            );
+        }
+    }
+    #[test]
+    fn sparse_origin_development_and_current_artifacts_stay_unknown() {
+        for version in [36, 37, 38] {
+            let (_dir, conn) = seeded(version);
+            if version == 36 {
+                conn.execute(
+                    "INSERT INTO metadata VALUES('sync_token:v27:PrimarySync','opaque')",
+                    [],
+                )
+                .unwrap();
+            }
+            migrate(&conn).unwrap();
+            assert_eq!(epoch(&conn), 1);
+            assert_old_marker(&conn);
+            assert_eq!(
+                current_marker(&conn).as_deref(),
+                Some(super::super::UNACCOUNTED_CURRENT_IDENTITY)
+            );
+        }
+    }
+    #[test]
+    fn sparse_origin_current_marker_is_positive_development_evidence() {
+        let (_dir, conn) = seeded(36);
         conn.execute(
-            "INSERT INTO metadata(key,value) VALUES(?1,'1')",
+            "INSERT INTO metadata(key,value) VALUES(?1,'current unknown')",
             [super::super::unresolved_identity_key("PrimarySync")],
         )
         .unwrap();
-        (dir, conn)
-    }
-
-    fn origin(conn: &Connection) -> Option<String> {
-        conn.query_row(
-            "SELECT observation_origin FROM unresolved_sparse_identities",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn sparse_origin_stock_upgrade_preserves_evidence_and_marks_history() {
-        let (_dir, conn) = seeded(36);
         migrate(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 38);
-        assert_eq!(origin(&conn).as_deref(), Some("historical-v1"));
-        let evidence: (String,String,i64) = conn.query_row("SELECT original_evidence,observed_evidence,generation FROM unresolved_sparse_identities", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(epoch(&conn), 1);
+        assert_old_marker(&conn);
         assert_eq!(
-            evidence,
-            (
-                r#"[1,"child","SharedSync-test","owner"]"#.into(),
-                r#"[1,"child","SharedSync-test","owner"]"#.into(),
-                1
-            )
+            current_marker(&conn).as_deref(),
+            Some(super::super::UNACCOUNTED_CURRENT_IDENTITY)
         );
     }
 
     #[test]
-    fn sparse_origin_development_and_current_artifacts_stay_unknown() {
-        let (_dev_dir, dev) = seeded(37);
-        migrate(&dev).unwrap();
-        assert_eq!(origin(&dev), None);
-        let marker: String = dev
-            .query_row(
-                "SELECT value FROM metadata WHERE key=?1",
-                [super::super::unresolved_identity_key("PrimarySync")],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(marker, super::super::UNACCOUNTED_CURRENT_IDENTITY);
-        let (_stock_dir, stock) = seeded(36);
-        stock
-            .execute(
-                "INSERT INTO metadata(key,value) VALUES('sync_token:v27:PrimarySync','opaque')",
-                [],
-            )
-            .unwrap();
-        migrate(&stock).unwrap();
-        assert_eq!(origin(&stock), None);
-    }
-
-    #[test]
-    fn sparse_origin_stock_marker_without_row_remains_unaccounted() {
+    fn sparse_origin_stock_marker_without_row_is_preserved_not_current() {
         let (_dir, conn) = seeded(36);
         conn.execute("DELETE FROM unresolved_sparse_identities", [])
             .unwrap();
         migrate(&conn).unwrap();
-        let marker: String = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key=?1",
-                [super::super::unresolved_identity_key("PrimarySync")],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(marker, super::super::UNACCOUNTED_CURRENT_IDENTITY);
+        assert_old_marker(&conn);
+        assert_eq!(current_marker(&conn), None);
     }
-
     #[test]
-    fn sparse_origin_malformed_stock_evidence_stays_unknown() {
+    fn sparse_origin_malformed_stock_evidence_is_opaque_unchanged() {
         for evidence in ["malformed", r#"[2,"source_only"]"#] {
             let (_dir, conn) = seeded(36);
-            conn.execute(
-                "UPDATE unresolved_sparse_identities SET observed_evidence=?1",
-                [evidence],
-            )
-            .unwrap();
+            conn.execute("UPDATE unresolved_sparse_identities SET observed_evidence=?1,last_outcome='[invalid',first_seen_at=9223372036854775807",[evidence]).unwrap();
             migrate(&conn).unwrap();
-            assert_eq!(origin(&conn), None);
-            let marker: String = conn
-                .query_row(
-                    "SELECT value FROM metadata WHERE key=?1",
-                    [super::super::unresolved_identity_key("PrimarySync")],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(marker, super::super::UNACCOUNTED_CURRENT_IDENTITY);
+            assert_eq!(epoch(&conn), 0);
+            assert_old_marker(&conn);
+            assert_eq!(current_marker(&conn), None);
+            let retained:(String,String,i64)=conn.query_row("SELECT observed_evidence,last_outcome,first_seen_at FROM unresolved_sparse_identities",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(retained, (evidence.into(), "[invalid".into(), i64::MAX));
         }
     }
-
     #[test]
-    fn sparse_origin_failed_upgrade_rolls_back_schema37_seam_then_reopens() {
-        let (_dir, conn) = seeded(36);
-        conn.execute_batch("CREATE TRIGGER fail_origin BEFORE UPDATE ON unresolved_sparse_identities BEGIN SELECT RAISE(ABORT,'synthetic migration failure'); END;").unwrap();
+    fn sparse_origin_failed_upgrade_rolls_back_all_steps_then_reopens() {
+        let (dir, conn) = seeded(36);
+        conn.execute_batch("CREATE TABLE sparse_epoch_upgrade(blocker INTEGER);")
+            .unwrap();
         assert!(migrate(&conn).is_err());
         assert_eq!(get_schema_version(&conn).unwrap(), 36);
         assert!(
             !column_exists(&conn, "unresolved_sparse_identities", "observation_origin").unwrap()
         );
         assert!(!column_exists(&conn, "provider_active_destinations", "frozen_metadata").unwrap());
+        assert_old_marker(&conn);
         drop(conn);
-        let conn = Connection::open(_dir.path().join("upgrade.db")).unwrap();
+        let conn = Connection::open(dir.path().join("upgrade.db")).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), 36);
-        conn.execute_batch("DROP TRIGGER fail_origin").unwrap();
+        conn.execute_batch("DROP TABLE sparse_epoch_upgrade")
+            .unwrap();
         migrate(&conn).unwrap();
-        assert_eq!(origin(&conn).as_deref(), Some("historical-v1"));
+        assert_eq!(epoch(&conn), 0);
+        assert_old_marker(&conn);
     }
 }

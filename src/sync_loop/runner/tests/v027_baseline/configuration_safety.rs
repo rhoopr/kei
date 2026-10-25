@@ -21,6 +21,8 @@ use wiremock::{Mock, ResponseTemplate};
 struct Session {
     records: Arc<Vec<Value>>,
     cycle: usize,
+    first_observation: usize,
+    interrupted_inventory: Option<std::path::PathBuf>,
     unresolved: bool,
     observed_historical: bool,
     omit_after_first: bool,
@@ -61,10 +63,28 @@ impl PhotosSession for Session {
                 .find(|f| f["fieldName"] == "startRank")
                 .and_then(|f| f["fieldValue"]["value"].as_u64())
                 .unwrap_or(0) as usize;
+            if offset > 0
+                && let Some(published) = &self.interrupted_inventory
+            {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while !published.exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("partial baseline must publish before injected page failure");
+                self.omissions.fetch_add(1, Ordering::SeqCst);
+                return Ok(json!({"records":"malformed later inventory page"}));
+            }
             let records: Vec<_> = self
                 .records
                 .chunks(2)
                 .skip(offset)
+                .take(if self.interrupted_inventory.is_some() {
+                    1
+                } else {
+                    usize::MAX
+                })
                 .flat_map(|p| p.iter().cloned())
                 .collect();
             return Ok(json!({"records":records,"syncToken":"query-not-checkpoint"}));
@@ -96,8 +116,8 @@ impl PhotosSession for Session {
                     json!({"recordName":"historical-source","recordType":null,"deleted":true,"recordChangeTag":"deleted-current"}),
                 ]
             } else if self.observed_historical
-                && self.cycle > 0
-                && (!self.omit_after_first || self.cycle == 1)
+                && self.cycle >= self.first_observation
+                && (!self.omit_after_first || self.cycle == self.first_observation)
                 && (!self.resolve_source || self.cycle == 1)
             {
                 let mut record = crate::test_helpers::sparse_shared_asset_record();
@@ -131,45 +151,185 @@ impl PhotosSession for Session {
 
 #[tokio::test]
 async fn v027_date_expansion_downloads_new_selection_then_two_quiet_reopens() {
-    expansion(false, false, false, false, false, false, false).await;
+    expansion(false, History::None, false, false, false, false, false).await;
 }
 #[tokio::test]
 async fn v027_date_expansion_unconfirmed_identity_holds_then_recovers() {
-    expansion(true, false, false, false, false, false, false).await;
+    expansion(true, History::None, false, false, false, false, false).await;
 }
 #[tokio::test]
 async fn v027_date_expansion_preserves_historical_uncertainty_without_global_hold() {
-    expansion(false, true, false, false, false, false, false).await;
+    expansion(false, History::Linked, false, false, false, false, false).await;
 }
 
 #[tokio::test]
 async fn v027_current_sparse_source_observed_again_holds_current_cursor() {
-    expansion(false, false, true, false, false, false, false).await;
+    expansion(false, History::None, true, false, false, false, false).await;
 }
 #[tokio::test]
 async fn v027_current_sparse_source_omitted_on_replay_stays_pending() {
-    expansion(false, false, true, true, false, false, false).await;
+    expansion(false, History::None, true, true, false, false, false).await;
 }
 #[tokio::test]
 async fn v027_historical_asset_only_observation_then_omission_retains_current_work() {
-    expansion(false, true, true, true, true, false, false).await;
+    expansion(false, History::Linked, true, true, true, false, false).await;
 }
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn v027_mixed_history_current_deletion_resolves_then_reopens_quietly() {
-    expansion(false, true, true, true, true, true, false).await;
+    expansion(false, History::Linked, true, true, true, true, false).await;
 }
 #[tokio::test]
 async fn v027_new_plain_source_with_unrelated_history_survives_omitted_reopen() {
-    expansion(false, true, true, true, true, false, true).await;
+    expansion(false, History::Linked, true, true, true, false, true).await;
 }
 #[tokio::test]
 async fn v027_malformed_new_source_with_history_survives_omitted_reopen() {
-    expansion(false, true, true, true, false, false, true).await;
+    expansion(false, History::Linked, true, true, false, false, true).await;
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum History {
+    None,
+    Linked,
+    MarkerOnly,
+    Malformed,
+    InterruptedMigration,
+    InterruptedBaseline,
+    InterruptedInventory,
+    CurrentBaseline,
+}
+
+#[tokio::test]
+async fn v027_stock_marker_only_baseline_expansion_and_quiet_reopens() {
+    expansion(
+        false,
+        History::MarkerOnly,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+    .await;
+}
+#[tokio::test]
+async fn v027_stock_malformed_history_baseline_expansion_and_quiet_reopens() {
+    expansion(false, History::Malformed, false, false, false, false, false).await;
+}
+#[tokio::test]
+async fn v027_stock_malformed_same_source_current_omission_stays_pending() {
+    expansion(false, History::Malformed, true, true, true, false, false).await;
+}
+
+#[tokio::test]
+async fn v027_stock_migration_interruption_then_baseline_and_quiet_reopens() {
+    expansion(
+        false,
+        History::InterruptedMigration,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+    .await;
+}
+#[tokio::test]
+async fn v027_stock_initial_checkpoint_failure_reopens_without_duplicate_transfer() {
+    expansion(
+        false,
+        History::InterruptedBaseline,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+    .await;
+}
+#[tokio::test]
+async fn v027_stock_current_unknown_during_first_baseline_survives_omission() {
+    expansion(
+        false,
+        History::CurrentBaseline,
+        true,
+        true,
+        true,
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn v027_stock_partial_initial_inventory_preserves_admission_then_reopens() {
+    expansion(
+        false,
+        History::InterruptedInventory,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+    .await;
+}
+
+fn snapshot_history(path: &std::path::Path) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let has_epoch: bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('unresolved_sparse_identities') WHERE name='epoch')", [], |r|r.get(0)).unwrap();
+    let query = "SELECT library,source_record_name,original_evidence,observed_evidence,lookup_evidence,generation,first_seen_at,last_attempt_at,attempts,next_retry_at,last_outcome FROM unresolved_sparse_identities WHERE source_record_name IN ('historical-source','other-history') ORDER BY library,source_record_name";
+    let query = if has_epoch {
+        query.replace(
+            "WHERE source_record_name",
+            "WHERE epoch=0 AND source_record_name",
+        )
+    } else {
+        query.to_owned()
+    };
+    let mut statement = conn.prepare(&query).unwrap();
+    statement
+        .query_map([], |row| (0..11).map(|i| row.get(i)).collect())
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+fn seed_stock_history(path: &std::path::Path, history: History, extra: bool) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    crate::state::schema::migrate_genuine_v36(&conn).unwrap();
+    conn.execute_batch("CREATE TABLE account_owner(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL,account_key TEXT NOT NULL,provider_key TEXT NOT NULL);").unwrap();
+    conn.execute(
+        "INSERT INTO account_owner VALUES(1,1,?1,?2)",
+        rusqlite::params![
+            crate::account::namespace("baseline@example.invalid", "com"),
+            crate::account::provider_fingerprint("com", "synthetic-baseline")
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO metadata(key,value) VALUES(?1,'opaque original marker')",
+        [format!("unresolved_asset_identity:{ZONE}")],
+    )
+    .unwrap();
+    if history != History::MarkerOnly {
+        for source in if extra {
+            vec!["historical-source", "other-history"]
+        } else {
+            vec!["historical-source"]
+        } {
+            let evidence = if history == History::Malformed {
+                "unparseable old evidence"
+            } else {
+                r#"[1,"historical-child","SharedSync-absent","historical-owner"]"#
+            };
+            conn.execute("INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at,last_outcome) VALUES(?1,?2,?3,?3,7,1000,?4)", rusqlite::params![ZONE,source,evidence,if history==History::Malformed { Some("[invalid outcome") } else { None }]).unwrap();
+        }
+    }
+}
+
 async fn expansion(
     unavailable: bool,
-    historical: bool,
+    historical: History,
     observed_historical: bool,
     omit_after_first: bool,
     plain_source: bool,
@@ -211,71 +371,53 @@ async fn expansion(
     let key = sync_token_key(ZONE);
     let mut april_mtime = None;
     let mut january_mtime = None;
-    let mut historical_before = None;
+    if historical != History::None {
+        seed_stock_history(&database, historical, resolve_source);
+    }
+    let historical_before = (historical != History::None).then(|| snapshot_history(&database));
+    if historical == History::InterruptedMigration {
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        conn.execute_batch("CREATE TABLE sparse_epoch_upgrade(blocker INTEGER)")
+            .unwrap();
+        drop(conn);
+        assert!(
+            SqliteStateDb::open_owned(&database, &baseline_owner())
+                .await
+                .is_err()
+        );
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(crate::state::schema::get_schema_version(&conn).unwrap(), 36);
+        assert_eq!(
+            snapshot_history(&database),
+            *historical_before.as_ref().unwrap()
+        );
+        conn.execute_batch("DROP TABLE sparse_epoch_upgrade")
+            .unwrap();
+    }
+    let first_observation = usize::from(historical != History::CurrentBaseline);
     for cycle in 0..if unavailable { 5 } else { 4 } {
         let db = Arc::new(
             SqliteStateDb::open_owned(&database, &baseline_owner())
                 .await
                 .unwrap(),
         );
-        if cycle == 0 && historical {
-            use crate::state::{SparseAttemptOutcome, SparseEvidence, SparseSourceId};
-            db.set_metadata(&crate::state::unresolved_identity_key(ZONE), "1")
-                .await
-                .unwrap();
-            let evidence = SparseEvidence::new(
-                r#"[1,"historical-child","SharedSync-absent","historical-owner"]"#.into(),
+        if historical == History::InterruptedBaseline && cycle == 0 {
+            let sql = format!(
+                "CREATE TRIGGER fail_initial_checkpoint BEFORE INSERT ON metadata WHEN NEW.key='{}' BEGIN SELECT RAISE(ABORT,'initial checkpoint failure'); END;",
+                key
             );
-            let row = db
-                .observe_sparse_identity(
-                    ZONE,
-                    &SparseSourceId::new("historical-source"),
-                    &evidence,
-                    chrono::Utc::now(),
-                )
-                .await
-                .unwrap();
-            db.record_sparse_attempt(
-                &row,
-                SparseAttemptOutcome::Unresolved(evidence),
-                chrono::Utc::now(),
-            )
-            .await
-            .unwrap();
-        }
-        if cycle == 0 && historical {
-            if resolve_source {
-                db.observe_sparse_identity(
-                    ZONE,
-                    &crate::state::SparseSourceId::new("other-history"),
-                    &crate::state::SparseEvidence::new(
-                        r#"[1,"other-child","SharedSync-absent","historical-owner"]"#.into(),
-                    ),
-                    chrono::Utc::now(),
-                )
-                .await
-                .unwrap();
-            }
-            // Seed the exact output of the separately tested stock migration.
-            // New/unmarked observations are deliberately NOT historical.
-            rusqlite::Connection::open(&database)
+            db.acquire_lock("install initial checkpoint fault")
                 .unwrap()
-                .execute(
-                    "UPDATE unresolved_sparse_identities SET observation_origin='historical-v1'",
-                    [],
-                )
+                .execute_batch(&sql)
                 .unwrap();
-            historical_before = db
-                .sparse_identities(ZONE)
-                .await
-                .unwrap()
-                .into_iter()
-                .find(|row| row.source.as_str() == "historical-source");
         }
         let prior_cursor = db.get_metadata(&key).await.unwrap();
         let session = Session {
             records: records.clone(),
             cycle,
+            first_observation,
+            interrupted_inventory: (historical == History::InterruptedInventory && cycle == 0)
+                .then(|| root.join("april.JPG")),
             unresolved: unavailable && cycle == 1,
             observed_historical,
             omit_after_first,
@@ -330,8 +472,41 @@ async fn expansion(
             &shared,
             &CancellationToken::new(),
         )
-        .await
-        .unwrap();
+        .await;
+        if matches!(
+            historical,
+            History::InterruptedBaseline | History::InterruptedInventory
+        ) && cycle == 0
+        {
+            if historical == History::InterruptedInventory {
+                assert!(
+                    session.omissions.load(Ordering::SeqCst) > 0,
+                    "later malformed page must actually execute after publication"
+                );
+            }
+            match &result {
+                Ok(outcome) => assert!(!outcome.can_advance_database_checkpoint()),
+                Err(error) => assert!(format!("{error:#}").contains("initial checkpoint failure")),
+            }
+            assert_eq!(db.get_metadata(&key).await.unwrap(), None);
+            assert_eq!(std::fs::read(root.join("april.JPG")).unwrap(), MEDIA);
+            april_mtime = Some(
+                std::fs::metadata(root.join("april.JPG"))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+            );
+            assert_eq!(
+                snapshot_history(&database),
+                *historical_before.as_ref().unwrap()
+            );
+            db.acquire_lock("remove initial checkpoint fault")
+                .unwrap()
+                .execute_batch("DROP TRIGGER IF EXISTS fail_initial_checkpoint")
+                .unwrap();
+            continue;
+        }
+        let result = result.unwrap();
         let april = root.join("april.JPG");
         assert_eq!(std::fs::read(&april).unwrap(), MEDIA);
         let mtime = std::fs::metadata(&april).unwrap().modified().unwrap();
@@ -340,18 +515,20 @@ async fn expansion(
         }
         assert_eq!(Some(mtime), april_mtime);
         let january = root.join("january.JPG");
-        if observed_historical && cycle > 0 && (!resolve_source || cycle == 1) {
+        if observed_historical && cycle >= first_observation && (!resolve_source || cycle == 1) {
             assert!(!result.can_advance_database_checkpoint(), "{result:?}");
             assert!(
                 result.stats.identity_incomplete,
                 "current sparse source must not be ignored"
             );
             assert_eq!(db.get_metadata(&key).await.unwrap(), prior_cursor);
-            assert_eq!(
-                std::fs::read(&january).unwrap(),
-                MEDIA,
-                "healthy newly selected item still completes"
-            );
+            if cycle > 0 {
+                assert_eq!(
+                    std::fs::read(&january).unwrap(),
+                    MEDIA,
+                    "healthy newly selected item still completes"
+                );
+            }
         } else if unavailable && cycle == 1 {
             assert!(
                 session.omissions.load(Ordering::SeqCst) > 0,
@@ -410,50 +587,46 @@ async fn expansion(
                 "quiet reopened configuration must not replay inventory"
             );
         }
-        if historical {
-            let rows = db.sparse_identities(ZONE).await.unwrap();
-            if resolve_source && cycle >= 2 {
-                assert_eq!(rows.len(), 1);
-                assert!(rows[0].is_historical());
-                assert!(rows[0].source.as_str() == "other-history");
-                continue;
-            }
+        if let Some(before) = &historical_before {
             assert_eq!(
-                rows.len(),
-                if resolve_source || unrepresented && cycle > 0 {
-                    2
-                } else {
-                    1
-                }
+                &snapshot_history(&database),
+                before,
+                "all old fields stay unchanged"
             );
-            if unrepresented && cycle > 0 {
-                let pending = rows
-                    .iter()
-                    .find(|row| row.source.as_str() == "new-unrepresented-source")
-                    .unwrap();
-                assert!(!pending.is_historical());
-                assert_eq!(pending.original.as_str(), r#"[2,"source_only"]"#);
-            }
-            let before = historical_before.as_ref().unwrap();
-            let after = rows
-                .iter()
-                .find(|row| row.source.as_str() == "historical-source")
+            let conn = rusqlite::Connection::open(&database).unwrap();
+            let marker: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key=?1",
+                    [format!("unresolved_asset_identity:{ZONE}")],
+                    |row| row.get(0),
+                )
                 .unwrap();
-            assert_eq!(after.library, before.library);
-            if observed_historical && cycle > 0 && !unrepresented {
-                assert!(after.source == before.source && after.original == before.original);
-                assert!(!after.is_historical(), "actual source must promote history");
-                continue;
-            }
+            assert_eq!(marker, "opaque original marker");
+            let summary = db.get_summary().await.unwrap();
             assert!(
-                after.source == before.source
-                    && after.original == before.original
-                    && after.observed == before.observed
-                    && after.lookup == before.lookup
-                    && after.generation == before.generation
-                    && after.deletion_checkpoint == before.deletion_checkpoint,
-                "historical identity evidence and ownership must survive unchanged"
+                summary.unresolved_identity_zones > 0,
+                "historical uncertainty stays visible"
             );
+            if result.can_advance_database_checkpoint() {
+                assert_ne!(
+                    summary.provider_checkpoint_status.as_deref(),
+                    Some("preserved")
+                );
+                assert_ne!(
+                    summary.last_recovery_action.as_deref(),
+                    Some("replay_from_prior_token")
+                );
+            }
+            let rows = db.sparse_identities(ZONE).await.unwrap();
+            if observed_historical && cycle >= first_observation && (!resolve_source || cycle == 1)
+            {
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "only current obligations enter the runtime retry path"
+                );
+                assert!(rows[0].origin.is_some());
+            }
         }
     }
     server.verify().await;
@@ -522,6 +695,8 @@ async fn v027_destination_root_replaced_during_transfer_preserves_work_and_reope
         let session = Session {
             records: records.clone(),
             cycle,
+            first_observation: 1,
+            interrupted_inventory: None,
             unresolved: false,
             observed_historical: false,
             omit_after_first: false,
