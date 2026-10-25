@@ -103,6 +103,19 @@ impl std::fmt::Debug for SqliteStateDb {
 }
 
 impl SqliteStateDb {
+    /// Construct actual released state for upgrade tests, never downgrade it.
+    #[cfg(test)]
+    pub(crate) fn create_stock_v36_for_test(path: &Path, owner: &account::AccountOwner) -> Self {
+        assert!(!path.exists(), "stock fixture must be a new database");
+        let conn = account::open(path, owner).unwrap();
+        schema::migrate_genuine_v36(&conn).unwrap();
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path: path.to_owned(),
+            legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
     pub(crate) async fn open_owned(
         path: &Path,
         owner: &account::AccountOwner,

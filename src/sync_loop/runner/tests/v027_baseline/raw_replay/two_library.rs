@@ -33,6 +33,7 @@ fn healthy_zone() -> Value {
 struct HealthySession {
     cycle: usize,
     records: Arc<Vec<Value>>,
+    delta: Arc<Vec<Value>>,
     inventory: Arc<AtomicUsize>,
     changes: Arc<AtomicUsize>,
     boundaries: Arc<AtomicUsize>,
@@ -54,7 +55,9 @@ impl PhotosSession for HealthySession {
             );
         }
         if url.contains("/internal/records/query/batch") {
-            return Ok(album_count_response(1));
+            return Ok(album_count_response(
+                u64::try_from(self.records.len() / 2).unwrap(),
+            ));
         }
         if url.contains("/records/query?") {
             assert_eq!(request["zoneID"], healthy_zone());
@@ -82,8 +85,10 @@ impl PhotosSession for HealthySession {
                     format!("healthy-cycle-{}", self.cycle)
                 }
             );
-            return Ok(json!({"zones":[{"zoneID":healthy_zone(),"records":[],
-                "syncToken":format!("healthy-cycle-{}",self.cycle+1),"moreComing":false}]}));
+            return Ok(
+                json!({"zones":[{"zoneID":healthy_zone(),"records":self.delta.as_ref(),
+                "syncToken":format!("healthy-cycle-{}",self.cycle+1),"moreComing":false}]}),
+            );
         }
         if url.contains("/records/lookup?") {
             assert_eq!(request["zoneID"], healthy_zone());
@@ -214,6 +219,7 @@ async fn prove_isolation(blocked_first: bool) {
         let session = HealthySession {
             cycle,
             records: Arc::new(records.clone()),
+            delta: Arc::new(Vec::new()),
             inventory: Arc::new(AtomicUsize::new(0)),
             changes: Arc::new(AtomicUsize::new(0)),
             boundaries: Arc::new(AtomicUsize::new(0)),
@@ -340,3 +346,5 @@ async fn prove_isolation(blocked_first: bool) {
     }
     server.verify().await;
 }
+
+mod storage;
