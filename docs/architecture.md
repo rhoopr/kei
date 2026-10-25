@@ -2654,3 +2654,24 @@ Configuration reconciliation passes validated sparse proofs into its staged
 checkpoint transaction as well as final activation. Retirement and the durable
 pending cursor therefore commit together; activation still checks configuration,
 cursor fences and any newly observed obligation.
+
+### Watch service health and backup completeness
+
+`/healthz` and `health.json` describe operational sync health. Their success
+clock and consecutive failure count are not a backup-completeness certificate.
+A completed current cycle with durably accounted transfer failures can be
+operationally healthy while its report remains `partial_failure` and its pending
+work remains visible in the database metrics. Only the cycle owner's checkpoint
+accounting evidence can qualify this exception; equal failure counts alone cannot.
+Authentication, interruption, unsafe checkpoints, state-write failures and
+incomplete enumeration remain operational failures. Existing five-failure and
+stale-success HTTP503 thresholds remain unchanged. Before the first cycle the
+endpoint reports startup, not completed backup readiness. There is no separate
+readiness endpoint.
+
+A skipped watch cycle follows a successful provider precheck and pending-work
+inspection. Successful summary inspection refreshes operational health without
+rewriting the last backup report or changing cycle counters. Historical metadata
+ambiguity and attribution remain visible but do not imply a broken service.
+Summary-read failure still fails health. Restart does not discard durable work;
+health counters themselves start fresh with the process.

@@ -310,6 +310,11 @@ async fn storage_contract(fault: Fault) {
     let mut stable_pending = None;
     let mut stable_overhead = None;
     let mut completed_companion_receipt = None;
+    let check_health = ASSESS_HEALTH.try_with(|value| *value).unwrap_or(false);
+    let mut health = crate::health::HealthStatus::new();
+    let mut metrics = crate::metrics::MetricsHandle::new(None);
+    let notifier = crate::notifications::Notifier::new(None);
+
     for step in 0..if fault == Fault::None && refresh_fault == 0 {
         7
     } else {
@@ -489,8 +494,13 @@ async fn storage_contract(fault: Fault) {
         };
         let prior_owners = owner_snapshot(&db);
         let prior_cursor = db.get_metadata(&sync_token_key(HEALTHY)).await.unwrap();
+        let selected_states = if check_health {
+            vec![&healthy]
+        } else {
+            vec![&blocked, &healthy]
+        };
         let result = run_cycle(
-            &[&blocked, &healthy],
+            &selected_states,
             &make_run_cycle_config(),
             Some(db.as_ref()),
             false,
@@ -586,6 +596,51 @@ async fn storage_contract(fault: Fault) {
             continue;
         }
         let result = result.unwrap();
+        if check_health {
+            if cycle == 3 {
+                health = crate::health::HealthStatus::new();
+                metrics = crate::metrics::MetricsHandle::new(None);
+            }
+            let report_path = dir.path().join("health-cycle.json");
+            let reporter = crate::cycle_reporter::CycleReporter::new(
+                crate::cycle_reporter::CycleReporterConfig {
+                    watch_mode: true,
+                    report_path: Some(&report_path),
+                    run_options: crate::report::RunOptions::from_config(&make_run_cycle_config()),
+                    health_dir: dir.path(),
+                    personality_mode: crate::personality::Mode::Off,
+                    state_db: Some(db.as_ref()),
+                    metrics_handle: Some(&metrics),
+                    notifier: &notifier,
+                },
+            );
+            reporter
+                .report_completed_cycle(
+                    &mut health,
+                    crate::cycle_reporter::CycleFacts::from_cycle_result(
+                        &result,
+                        std::time::Duration::ZERO,
+                    ),
+                )
+                .await;
+            assert_eq!(
+                health.consecutive_failures, 0,
+                "durable pending work is not service failure: {result:?}"
+            );
+            assert_eq!(crate::metrics::health_status_for_test(&metrics).await, 200);
+            let report: Value =
+                serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+            if cycle < 5 {
+                assert_eq!(report["status"], "partial_failure");
+            }
+            // A quiet provider check must refresh only service health, preserving
+            // the partial backup report and the durable pending destination.
+            reporter.report_skipped_watch_cycle(&mut health).await;
+            assert_eq!(crate::metrics::health_status_for_test(&metrics).await, 200);
+            let after: Value =
+                serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
+            assert_eq!(after, report);
+        }
         if partial {
             let conn = db
                 .acquire_lock("original completed companion receipt stays unchanged")
@@ -827,6 +882,17 @@ async fn changed_master_partial_seal_rollback_reopens() {
                 true,
                 ASSESS_MASTER_CHANGE.scope(true, storage_contract(Fault::None)),
             ),
+        )
+        .await;
+}
+
+tokio::task_local! { static ASSESS_HEALTH: bool; }
+#[tokio::test]
+async fn v027_durable_expiry_is_healthy_service_with_incomplete_backup() {
+    ASSESS_HEALTH
+        .scope(
+            true,
+            ASSESS_FAIRNESS.scope(true, storage_contract(Fault::None)),
         )
         .await;
 }

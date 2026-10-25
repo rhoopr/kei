@@ -613,6 +613,15 @@ async fn handle_metrics(State(handle): State<MetricsHandle>) -> impl IntoRespons
     )
 }
 
+#[cfg(test)]
+pub(crate) async fn health_status_for_test(handle: &MetricsHandle) -> u16 {
+    handle_healthz(State(handle.clone()))
+        .await
+        .into_response()
+        .status()
+        .as_u16()
+}
+
 async fn handle_healthz(State(handle): State<MetricsHandle>) -> impl IntoResponse {
     let inner = handle.inner.lock().await;
     let staleness_threshold = inner.staleness_threshold;

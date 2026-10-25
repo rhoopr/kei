@@ -83,9 +83,37 @@ pub(crate) struct CycleFacts<'a> {
     pub(crate) failed_count: usize,
     pub(crate) elapsed: Duration,
     pub(crate) status: CycleStatus,
+    accounted_transfer_failures: bool,
 }
 
 impl<'a> CycleFacts<'a> {
+    /// Only the cycle owner can attest that failed transfers are durably accounted for.
+    pub(crate) fn from_cycle_result(
+        result: &'a crate::sync_cycle::CycleResult,
+        elapsed: Duration,
+    ) -> Self {
+        let mut facts = Self::new(
+            &result.stats,
+            result.failed_count,
+            result.session_expired,
+            elapsed,
+        );
+        let stats = &result.stats;
+        facts.accounted_transfer_failures = result.db_sync_token_advance_safe
+            && result.failed_count > 0
+            && result.failed_count == stats.failed
+            && !result.session_expired
+            && !stats.interrupted
+            && stats.state_write_failures == 0
+            && stats.enumeration_errors == 0
+            && !stats.enumeration_incomplete
+            && !stats.identity_incomplete
+            && !stats.sync_token_blocked
+            && stats.exif_failures == 0
+            && stats.count_probe_failures == 0;
+        facts
+    }
+
     pub(crate) fn new(
         stats: &'a SyncStats,
         failed_count: usize,
@@ -97,6 +125,7 @@ impl<'a> CycleFacts<'a> {
             failed_count,
             elapsed,
             status: classify_cycle(stats, failed_count, session_expired),
+            accounted_transfer_failures: false,
         }
     }
 }
@@ -168,7 +197,7 @@ where
     /// gauges and `health.json` need fresh timestamps, but cycle counters,
     /// duration, reports, and completion notifications must not change.
     pub(crate) async fn report_skipped_watch_cycle(&self, health: &mut HealthStatus) {
-        let unresolved = if let Some(db) = self.state_db {
+        let inspected = if let Some(db) = self.state_db {
             db.get_summary().await.map(|summary| {
                 health.unattributed_legacy_assets = summary
                     .metadata_capture
@@ -180,23 +209,16 @@ where
                     .iter()
                     .map(|capture| capture.unattributed_legacy_pending)
                     .sum();
-                summary.provider_checkpoint_status.as_deref() == Some("preserved")
-                    || summary.metadata_capture.iter().any(|capture| {
-                        capture.unresolved_assets > 0 || capture.unattributed_legacy_pending > 0
-                    })
             })
         } else {
-            Ok(false)
+            Ok(())
         };
-        match unresolved {
-            Ok(false) => health.record_success(),
-            Ok(true) if health.unattributed_legacy_pending > 0 => {
-                health.record_failure("legacy current-work certification remains incomplete");
-            }
-            Ok(true) => health
-                .record_failure("unresolved asset identity; provider checkpoint replay required"),
+        match inspected {
+            // The caller completed the provider precheck and found no due selected
+            // work. Historical ambiguity is visible history, not service failure.
+            Ok(()) => health.record_success(),
             Err(error) => {
-                tracing::warn!(error = %error, "Could not inspect durable identity evidence for idle health");
+                tracing::warn!(error = %error, "Could not inspect durable work for idle health");
                 health.record_failure("could not inspect unresolved asset identity evidence");
             }
         }
@@ -270,6 +292,7 @@ where
         health.unattributed_legacy_pending = input.stats.unattributed_legacy_pending;
         match input.status {
             CycleStatus::Success => health.record_success(),
+            CycleStatus::Failed if input.accounted_transfer_failures => health.record_success(),
             CycleStatus::Failed if input.stats.identity_incomplete => {
                 health.record_failure(
                     "unresolved asset identity; provider checkpoint replay required",
@@ -1244,7 +1267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skipped_watch_cycle_retains_unselected_zone_identity_failure() {
+    async fn skipped_watch_preserves_unselected_history_without_service_failure() {
         let dir = tempfile::tempdir().unwrap();
         let db = state::SqliteStateDb::open_in_memory().unwrap();
         db.set_metadata(&state::unresolved_identity_key("unselected-zone"), "1")
@@ -1256,19 +1279,13 @@ mod tests {
         health.record_success();
         let previous = health.last_success_at;
         reporter.report_skipped_watch_cycle(&mut health).await;
-        assert_eq!(health.last_success_at, previous);
-        assert_eq!(health.consecutive_failures, 1);
-        assert!(
-            health
-                .last_error
-                .as_deref()
-                .unwrap()
-                .contains("unresolved asset identity")
-        );
+        assert!(health.last_success_at > previous);
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.last_error.is_none());
     }
 
     #[tokio::test]
-    async fn metadata_capture_retry_keeps_idle_health_incomplete() {
+    async fn metadata_capture_retry_does_not_fail_idle_service() {
         let dir = tempfile::tempdir().unwrap();
         let db = state::SqliteStateDb::open_in_memory().unwrap();
         let row = crate::test_helpers::TestAssetRecord::new("private-legacy")
@@ -1300,13 +1317,26 @@ mod tests {
                 .unwrap()
         );
         let notifier = Notifier::new(None);
-        let reporter = reporter_with_surfaces(dir.path(), None, &notifier, Some(&db), None);
+        let metrics = MetricsHandle::new(None);
+        let reporter =
+            reporter_with_surfaces(dir.path(), None, &notifier, Some(&db), Some(&metrics));
         let mut health = HealthStatus::new();
         health.record_success();
         let previous = health.last_success_at;
-        reporter.report_skipped_watch_cycle(&mut health).await;
-        assert_eq!(health.last_success_at, previous);
-        assert_eq!(health.consecutive_failures, 1);
+        for _ in 0..5 {
+            reporter.report_skipped_watch_cycle(&mut health).await;
+            assert_eq!(crate::metrics::health_status_for_test(&metrics).await, 200);
+        }
+        assert!(
+            db.get_summary()
+                .await
+                .unwrap()
+                .metadata_capture
+                .iter()
+                .any(|capture| capture.unresolved_assets > 0)
+        );
+        assert!(health.last_success_at > previous);
+        assert_eq!(health.consecutive_failures, 0);
         db.set_metadata_capture_revision_for_test("unselected-zone", "private-legacy", 1);
         db.complete_metadata_capture_revision("unselected-zone", 1)
             .await
@@ -1316,7 +1346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_legacy_certification_keeps_idle_health_incomplete() {
+    async fn pending_legacy_history_does_not_fail_idle_service() {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("state.db");
         let db = state::SqliteStateDb::open(&database).await.unwrap();
@@ -1350,15 +1380,9 @@ mod tests {
         health.record_success();
         let previous = health.last_success_at;
         reporter.report_skipped_watch_cycle(&mut health).await;
-        assert_eq!(health.last_success_at, previous);
-        assert_eq!(health.consecutive_failures, 1);
-        assert!(
-            health
-                .last_error
-                .as_deref()
-                .unwrap()
-                .contains("certification")
-        );
+        assert!(health.last_success_at > previous);
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.last_error.is_none());
         let dependencies = db
             .legacy_dependency_evidence("unselected-zone", "legacy")
             .await
@@ -1374,6 +1398,99 @@ mod tests {
         assert_eq!(health.unattributed_legacy_assets, 1);
         assert_eq!(health.consecutive_failures, 0);
         assert!(health.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn operational_health_requires_accounted_work_and_preserves_backup_failure() {
+        for kind in [
+            "accounted",
+            "unsafe",
+            "state_write",
+            "auth",
+            "inventory",
+            "unclassified",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let report_path = dir.path().join("report.json");
+            let notifier = Notifier::new(None);
+            let metrics = MetricsHandle::new(None);
+            let reporter = reporter_with_surfaces(
+                dir.path(),
+                Some(&report_path),
+                &notifier,
+                None,
+                Some(&metrics),
+            );
+            let mut result = crate::sync_cycle::CycleResult {
+                failed_count: 1,
+                session_expired: kind == "auth",
+                db_sync_token_advance_safe: kind != "unsafe",
+                stats: SyncStats {
+                    failed: 1,
+                    ..SyncStats::default()
+                },
+            };
+            match kind {
+                "state_write" => result.stats.state_write_failures = 1,
+                "inventory" => result.stats.enumeration_incomplete = true,
+                "unclassified" => result.failed_count = 2,
+                _ => {}
+            }
+            let mut health = HealthStatus::new();
+            for _ in 0..5 {
+                reporter
+                    .report_completed_cycle(
+                        &mut health,
+                        CycleFacts::from_cycle_result(&result, Duration::ZERO),
+                    )
+                    .await;
+            }
+            assert_eq!(
+                crate::metrics::health_status_for_test(&metrics).await,
+                if kind == "accounted" { 200 } else { 503 },
+                "{kind}"
+            );
+            let report = parse_json(&report_path);
+            assert_eq!(
+                report["status"],
+                if kind == "auth" {
+                    "session_expired"
+                } else {
+                    "partial_failure"
+                }
+            );
+            assert_eq!(report["stats"]["failed"], 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn skipped_watch_summary_read_failure_remains_unhealthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = state::SqliteStateDb::open_in_memory().unwrap();
+        // Break only this disposable fixture's reporting read, not admission.
+        db.acquire_lock("synthetic summary read failure")
+            .unwrap()
+            .execute_batch("ALTER TABLE assets RENAME TO unavailable_assets")
+            .unwrap();
+        assert!(db.get_summary().await.is_err());
+        let notifier = Notifier::new(None);
+        let metrics = MetricsHandle::new(None);
+        let reporter =
+            reporter_with_surfaces(dir.path(), None, &notifier, Some(&db), Some(&metrics));
+        let mut health = HealthStatus::new();
+        for _ in 0..5 {
+            reporter.report_skipped_watch_cycle(&mut health).await;
+        }
+        assert_eq!(health.consecutive_failures, 5);
+        assert_eq!(crate::metrics::health_status_for_test(&metrics).await, 503);
+        assert!(health.last_success_at.is_none());
+        assert!(
+            health
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("could not inspect")
+        );
     }
 
     #[tokio::test]

@@ -773,10 +773,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             cycle_reporter
                 .report_completed_cycle(
                     &mut health,
-                    crate::cycle_reporter::CycleFacts::new(
-                        &cycle_result.stats,
-                        cycle_result.failed_count,
-                        cycle_result.session_expired,
+                    crate::cycle_reporter::CycleFacts::from_cycle_result(
+                        &cycle_result,
                         cycle_started_at.elapsed(),
                     ),
                 )

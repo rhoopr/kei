@@ -3,6 +3,8 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+/// Operational watch health, not a claim that the backup is complete.
+/// Partial transfer outcomes and durable pending counts remain in reports/metrics.
 #[derive(Debug, Serialize)]
 pub(crate) struct HealthStatus {
     pub(crate) last_sync_at: Option<DateTime<Utc>>,
