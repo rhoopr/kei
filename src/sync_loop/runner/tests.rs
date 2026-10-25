@@ -13,8 +13,6 @@ mod mixed_provider_shapes;
 #[cfg(target_os = "linux")]
 mod process_death;
 
-mod smart_reconciliation;
-
 mod primary_layout;
 
 mod mixed_delta;

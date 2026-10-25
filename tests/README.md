@@ -1722,3 +1722,6 @@ debt and historical bytes, and check transaction rejection after file or ownersh
 drift. Normal-cycle fixtures must establish completion followed by a quiet reopen;
 a target-ready decision alone is not success. These tests do not establish that
 any reporter account has the evidence required for recovery.
+
+Smart-selection path-convergence tests retired for v0.27 are mapped to current
+outcomes and explicit remaining fault gaps in [smart transition coverage](smart-transition-coverage.md).

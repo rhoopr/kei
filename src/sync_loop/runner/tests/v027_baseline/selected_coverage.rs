@@ -144,29 +144,60 @@ impl PhotosSession for Session {
 
 #[tokio::test]
 async fn v027_selected_hidden_sparse_delta_downloads_current_member_then_stays_quiet() {
-    selected_contract(Selection::Hidden, false).await;
+    selected_contract(Selection::Hidden, false, Transition::Stable).await;
 }
 #[tokio::test]
 async fn v027_selected_favorites_sparse_delta_downloads_current_member_then_stays_quiet() {
-    selected_contract(Selection::Favorites, false).await;
+    selected_contract(Selection::Favorites, false, Transition::Stable).await;
 }
 #[tokio::test]
 async fn v027_recent_removal_selects_unchanged_next_member_then_stays_quiet() {
-    selected_contract(Selection::Recent, false).await;
+    selected_contract(Selection::Recent, false, Transition::Stable).await;
 }
 
 #[tokio::test]
 async fn v027_recent_short_window_without_token_cannot_authorize_baseline_bridge() {
-    selected_contract(Selection::Recent, true).await;
+    selected_contract(Selection::Recent, true, Transition::Stable).await;
 }
 
-async fn selected_contract(selection: Selection, incomplete_window: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transition {
+    Stable,
+    PathChange,
+    MixedPathChange,
+    #[cfg(feature = "xmp")]
+    SidecarPathChange,
+}
+
+#[tokio::test]
+async fn v027_hidden_template_change_preserves_recorded_paths_then_stays_quiet() {
+    selected_contract(Selection::Hidden, false, Transition::PathChange).await;
+}
+
+#[tokio::test]
+async fn v027_favorites_mixed_template_change_preserves_paths_and_current_membership() {
+    selected_contract(Selection::Favorites, false, Transition::MixedPathChange).await;
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn v027_smart_template_change_preserves_sidecar_bytes_and_timestamps() {
+    selected_contract(Selection::Hidden, false, Transition::SidecarPathChange).await;
+}
+
+async fn selected_contract(selection: Selection, incomplete_window: bool, transition: Transition) {
     let server = crate::start_wiremock_or_skip!();
     for name in ["original", "next"] {
         Mock::given(method("GET"))
             .and(path(format!("/{name}")))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
-            .expect(u64::from(name == "original" || !incomplete_window))
+            .expect(
+                if name == "next" && transition == Transition::MixedPathChange {
+                    2 // Two newly selected physical destinations, not a copy of old media.
+                } else {
+                    u64::from(name == "original" || !incomplete_window)
+                },
+            )
             .mount(&server)
             .await;
     }
@@ -199,6 +230,10 @@ async fn selected_contract(selection: Selection, incomplete_window: bool) {
     }
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     let mut original_mtime = None;
+    #[cfg(feature = "xmp")]
+    let mut original_sidecar: Option<(std::path::PathBuf, Vec<u8>, std::time::SystemTime)> = None;
+    #[cfg(not(feature = "xmp"))]
+    let original_sidecar: Option<(std::path::PathBuf, Vec<u8>, std::time::SystemTime)> = None;
     for cycle in 0..if incomplete_window { 1 } else { 3 } {
         let db = Arc::new(
             SqliteStateDb::open_owned(&database, &baseline_owner())
@@ -253,15 +288,34 @@ async fn selected_contract(selection: Selection, incomplete_window: bool) {
                 exclude_ids: Arc::default(),
             }],
         );
+        if transition == Transition::MixedPathChange {
+            selected.plan.passes.push(AlbumPass {
+                kind: PassKind::Unfiled,
+                album: library.all(),
+                exclude_ids: Arc::default(),
+            });
+            selected.pass_scope.include_unfiled = true;
+        }
         selected.library = library;
         let base = make_run_cycle_download_config_builder(&root, db.clone());
         let builder = |mode, exclude, groups, zone| {
             let mut config = (*base(mode, exclude, groups, zone)).clone();
-            config.folder_structure = "none".into();
-            config.folder_structure_smart_folders = "selected".into();
+            config.folder_structure = if transition == Transition::MixedPathChange {
+                "selected"
+            } else {
+                "none"
+            }
+            .into();
+            config.folder_structure_smart_folders =
+                if transition != Transition::Stable && cycle > 0 {
+                    "new-selected"
+                } else {
+                    "selected"
+                }
+                .into();
             #[cfg(feature = "xmp")]
             {
-                config.metadata.xmp_sidecar = false;
+                config.metadata.xmp_sidecar = transition == Transition::SidecarPathChange;
             }
             if matches!(selection, Selection::Recent) {
                 config.recent = Some(if incomplete_window { 2 } else { 1 });
@@ -280,9 +334,19 @@ async fn selected_contract(selection: Selection, incomplete_window: bool) {
         )
         .await
         .unwrap();
+        if !incomplete_window {
+            assert_eq!(
+                result.failed_count, 0,
+                "{selection:?} cycle {cycle}: {result:?}"
+            );
+        }
         assert_eq!(
             result.stats.downloaded,
-            usize::from(cycle < 2),
+            if cycle == 1 && transition == Transition::MixedPathChange {
+                2
+            } else {
+                usize::from(cycle < 2)
+            },
             "{selection:?} cycle {cycle}: {result:?}"
         );
         if incomplete_window {
@@ -307,9 +371,43 @@ async fn selected_contract(selection: Selection, incomplete_window: bool) {
         if cycle == 0 {
             assert_eq!(std::fs::read(&first).unwrap(), MEDIA);
             original_mtime = Some(std::fs::metadata(&first).unwrap().modified().unwrap());
+            #[cfg(feature = "xmp")]
+            if transition == Transition::SidecarPathChange {
+                let path = first.with_file_name("original.JPG.xmp");
+                original_sidecar = Some((
+                    path.clone(),
+                    std::fs::read(&path).unwrap(),
+                    std::fs::metadata(&path).unwrap().modified().unwrap(),
+                ));
+            }
             assert!(!directory.join("next.JPG").exists());
         } else {
-            assert_eq!(std::fs::read(directory.join("next.JPG")).unwrap(), MEDIA);
+            let next_directory = if transition == Transition::Stable {
+                directory.clone()
+            } else {
+                root.join("new-selected")
+            };
+            assert_eq!(
+                std::fs::read(next_directory.join("next.JPG")).unwrap(),
+                MEDIA
+            );
+            if transition == Transition::MixedPathChange {
+                assert_eq!(
+                    std::fs::read(directory.join("next.JPG")).unwrap(),
+                    MEDIA,
+                    "the independent Unfiled destination must exist on both later cycles"
+                );
+            }
+            if transition != Transition::Stable {
+                assert!(
+                    !root.join("new-selected/original.JPG").exists(),
+                    "template change must not create another copy of recorded content"
+                );
+            }
+            if let Some((path, bytes, mtime)) = &original_sidecar {
+                assert_eq!(&std::fs::read(path).unwrap(), bytes);
+                assert_eq!(&std::fs::metadata(path).unwrap().modified().unwrap(), mtime);
+            }
             assert_eq!(std::fs::read(&first).unwrap(), MEDIA);
             assert_eq!(
                 Some(std::fs::metadata(&first).unwrap().modified().unwrap()),
