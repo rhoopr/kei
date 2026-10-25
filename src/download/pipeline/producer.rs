@@ -4,30 +4,25 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use futures_util::StreamExt;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use tokio::sync::mpsc;
 
-use crate::download::filter::{
-    DownloadTask, FilterReason, extract_skip_candidates, is_asset_filtered,
-};
+use crate::download::filter::{DownloadTask, FilterReason, is_asset_filtered};
 use crate::download::finalize::finalize_failed;
 use crate::download::metadata_rewrite::MetadataFlags;
 use crate::download::orchestration::generation::{
     SelectionConfirmationErrorClass, classify_selection_confirmation_error,
 };
-use crate::download::planner::{ExistingPathMatch, TaskPlanner};
+use crate::download::planner::TaskPlanner;
 use crate::download::{
-    ClaimedLegacyMasterStates, DownloadConfig, DownloadContext, DownloadStore, metadata_rewrite,
-    planner,
+    ClaimedLegacyMasterStates, DownloadConfig, DownloadContext, DownloadStore, planner,
 };
 use crate::icloud::photos::PhotoAsset;
 use crate::icloud::photos::session::is_session_error as is_provider_session_error;
 
 use super::StreamPipelineShared;
 use super::adoption::{
-    PendingOnDiskAdoption, adopt_pending_on_disk_skip, adopt_pending_on_disk_task,
-    effective_asset_library, effective_asset_library_arc, mark_reserved_pending_task,
-    recover_pending_current_publications, state_confirmed_current_path_exists,
+    effective_asset_library, mark_reserved_pending_task, recover_pending_current_publications,
     validate_enumerated_reserved_pending,
 };
 use super::task::capture_repair_requested;
@@ -104,6 +99,7 @@ enum AssetDisposition {
     StateSkip,
     AmpmVariant,
     OnDisk,
+    Uncertain,
     Forwarded,
 }
 
@@ -116,6 +112,7 @@ enum AssetDisposition {
 pub(in crate::download) struct ProducerSkipSummary {
     pub(in crate::download) by_state: usize,
     pub(in crate::download) on_disk: usize,
+    pub(in crate::download) uncertain: usize,
     pub(in crate::download) ampm_variant: usize,
     pub(in crate::download) by_media_type: usize,
     pub(in crate::download) by_date_range: usize,
@@ -131,6 +128,7 @@ impl ProducerSkipSummary {
     pub(in crate::download) fn total(&self) -> usize {
         self.by_state
             + self.on_disk
+            + self.uncertain
             + self.ampm_variant
             + self.by_media_type
             + self.by_date_range
@@ -158,6 +156,7 @@ impl std::ops::AddAssign for ProducerSkipSummary {
     fn add_assign(&mut self, rhs: Self) {
         self.by_state += rhs.by_state;
         self.on_disk += rhs.on_disk;
+        self.uncertain += rhs.uncertain;
         self.ampm_variant += rhs.ampm_variant;
         self.by_media_type += rhs.by_media_type;
         self.by_date_range += rhs.by_date_range;
@@ -175,6 +174,7 @@ impl From<ProducerSkipSummary> for crate::download::SkipBreakdown {
         Self {
             by_state: s.by_state,
             on_disk: s.on_disk,
+            uncertain: s.uncertain,
             by_media_type: s.by_media_type,
             by_date_range: s.by_date_range,
             by_live_photo: s.by_live_photo,
@@ -270,16 +270,6 @@ where
         };
         let mut seen_asset_record_names: FxHashSet<Arc<str>> = FxHashSet::default();
         let mut claimed_legacy_master_states = ClaimedLegacyMasterStates::default();
-        // Skipped-asset IDs accumulated across the producer run and
-        // flushed to the DB in a single transaction at the end. This
-        // collapses N UPDATE statements (one per fast-skip / on-disk
-        // skip) into one batched UPDATE so the producer loop doesn't
-        // serialize behind an fsync-per-asset under WAL mode.
-        //
-        // Vec is sufficient: every push is inside a branch predicated on
-        // `seen_asset_record_names.insert(asset.asset_record_name_arc())`
-        // returning true, so IDs are already unique at this point.
-        let mut touched_assets: Vec<(Arc<str>, Arc<str>)> = Vec::new();
         let mut skips = ProducerSkipSummary::default();
         let mut assets_forwarded = 0u64;
         // Free-space probe lives in an `AtomicU64` (sentinel
@@ -379,12 +369,7 @@ where
                     }
 
                     assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // The pre-plan refresh has already committed the marker,
-                    // so the skip sites must not re-stamp it from the stale
-                    // context.
-                    let mut metadata_refresh_attempted = false;
                     let mut selected_plan = None;
-                    let mut reserved_pending = false;
                     if let Some(run) = &config.selection_run {
                         if run
                             .session_expired
@@ -473,7 +458,7 @@ where
                             )
                             .await
                             {
-                                Ok(affected) => reserved_pending = affected,
+                                Ok(_) => {}
                                 Err(error) => {
                                     enum_errors_producer
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -514,7 +499,6 @@ where
                                 continue;
                             }
                         }
-                        metadata_refresh_attempted = true;
                     }
                     if config.selection_run.is_none()
                         && let Some(db) = &producer_state_db
@@ -574,7 +558,7 @@ where
                         )
                         .await
                         {
-                            Ok(affected) => reserved_pending = affected,
+                            Ok(_) => {}
                             Err(error) => {
                                 enum_errors_producer
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -617,7 +601,6 @@ where
                                     asset.state_id(),
                                 );
                             if config.refresh_metadata || drift || retry_marker {
-                                metadata_refresh_attempted = true;
                                 // A marker-only refresh must not queue more work:
                                 // the marker is already visible for retry.
                                 let mark_for_rewrite =
@@ -804,9 +787,26 @@ where
                             true
                         }
                     });
+                    let mut existing_matches = Vec::with_capacity(plan.tasks.len());
+                    for task in &plan.tasks {
+                        existing_matches
+                            .push(task_planner.match_existing(&asset, config, task).await);
+                    }
+                    let missing_tasks: Vec<_> = plan
+                        .tasks
+                        .iter()
+                        .zip(&existing_matches)
+                        .filter(|(_, decision)| {
+                            matches!(
+                                decision,
+                                crate::download::baseline_matching::BaselineMatch::Missing
+                            )
+                        })
+                        .map(|(task, _)| task.clone())
+                        .collect();
                     if let Some(db) = &producer_state_db
                         && let Err(error) = task_planner
-                            .persist_download_reservations(db.as_ref(), &plan.tasks)
+                            .persist_download_reservations(db.as_ref(), &missing_tasks)
                             .await
                     {
                         state_write_failures_producer
@@ -816,73 +816,16 @@ where
                     }
 
                     if plan.tasks.is_empty() {
-                        // No-op for status='downloaded' rows (the common
-                        // case). A pending row from a prior failed or
-                        // interrupted sync is adopted when the matching file
-                        // is already on disk; if adoption fails, the touched
-                        // flush still lets stuck-pipeline recovery promote it.
-                        let candidates = extract_skip_candidates(&asset, config.as_ref());
-                        if !reserved_pending && !metadata_refresh_attempted {
-                            metadata_rewrite::tag_if_needed(
-                                producer_state_db.as_deref(),
-                                config,
-                                &asset,
-                                &candidates,
-                                &download_ctx,
-                            )
-                            .await;
-                        }
-                        let adoption = match adopt_pending_on_disk_skip(
-                            producer_state_db.as_deref(),
-                            config,
-                            &asset,
-                            &download_ctx,
-                            &mut task_planner,
-                            &recovered.retained_versions,
-                        )
-                        .await
-                        {
-                            Ok(adoption) => adoption,
-                            Err(error) => {
-                                enum_errors_producer
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                tracing::error!(%error, "Reserved pending skip refused unsafe local evidence");
-                                continue 'assets;
-                            }
-                        };
-                        if adoption.state_write_failures > 0 {
-                            state_write_failures_producer.fetch_add(
-                                adoption.state_write_failures,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        }
-                        if reserved_pending
-                            && !(metadata_refresh_attempted
-                                || adoption.retained_cross_parent
-                                    && adoption.state_write_failures > 0)
-                        {
-                            metadata_rewrite::tag_if_needed(
-                                producer_state_db.as_deref(),
-                                config,
-                                &asset,
-                                &candidates,
-                                &download_ctx,
-                            )
-                            .await;
-                        }
-                        if producer_state_db.is_some()
-                            && !adoption.retained_cross_parent
-                            && recovered.state_write_failures == 0
-                        {
-                            let library = effective_asset_library_arc(&asset, config);
-                            touched_assets.push((library, asset.state_id_arc()));
-                        }
+                        // Selected versions were either absent or recovered through
+                        // the proven pending-publication owner above.
                         skips.on_disk += 1;
                         producer_pb.inc(1);
                     } else {
                         let mut disposition = AssetDisposition::Unresolved;
 
-                        for mut task in plan.tasks {
+                        for (mut task, existing_match) in
+                            plan.tasks.into_iter().zip(existing_matches)
+                        {
                             if let Err(error) = mark_reserved_pending_task(
                                 &download_ctx,
                                 &task_planner,
@@ -937,58 +880,84 @@ where
                                 continue;
                             }
 
-                            if let Some(db) = &producer_state_db {
-                                let adoption = match adopt_pending_on_disk_task(
-                                    producer_state_db.as_deref(),
-                                    config,
-                                    &asset,
-                                    &download_ctx,
-                                    &mut task_planner,
-                                    &task,
-                                )
-                                .await
-                                {
-                                    Ok(adoption) => adoption,
-                                    Err(error) => {
-                                        enum_errors_producer
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        tracing::error!(%error, "Reserved pending task refused unsafe local evidence");
-                                        continue 'assets;
-                                    }
-                                };
-                                if let Some(adoption) = adoption {
-                                    disposition = disposition.max(AssetDisposition::OnDisk);
-                                    match adoption {
-                                        PendingOnDiskAdoption::Adopted(existing_path) => {
-                                            tracing::debug!(target: "kei::download::pipeline",
-                                                asset_id = %task.asset_id,
-                                                path = %existing_path.display(),
-                                                "Skipping (pending state adopted existing file)"
-                                            );
+                            let provider_verified = matches!(
+                                &existing_match,
+                                crate::download::baseline_matching::BaselineMatch::ProviderPresent { .. }
+                            );
+                            match existing_match {
+                                crate::download::baseline_matching::BaselineMatch::Present {
+                                    receipt, file,
+                                } | crate::download::baseline_matching::BaselineMatch::ProviderPresent {
+                                    receipt, file,
+                                } => {
+                                    let adoption = async {
+                                        let _guard = crate::download::file::lock_download_destination(
+                                            &receipt.local_path, &producer_shutdown,
+                                        ).await?;
+                                        let db = producer_state_db.as_deref().ok_or_else(|| anyhow::anyhow!(
+                                            "Existing-file adoption requires durable state"
+                                        ))?;
+                                        let record = planner::pending_record_for_task(config, &asset, &task);
+                                        let expected_checksum = task.checksum.to_string();
+                                        let expected_size = task.size;
+                                        let validate: Box<dyn FnOnce() -> Result<(), crate::state::error::StateError> + Send> =
+                                            Box::new(move || {
+                                                let valid = if provider_verified {
+                                                    file.fingerprint.size == expected_size
+                                                        && matches!(file.matches_provider_v1_blocking(&expected_checksum), Ok(Some(true)))
+                                                } else {
+                                                    file.validate_blocking().is_ok()
+                                                };
+                                                if !valid {
+                                                    return Err(crate::state::error::StateError::Invariant {
+                                                        operation: "adopt_baseline_receipt",
+                                                        detail: "existing file changed before receipt commit".into(),
+                                                    });
+                                                }
+                                                Ok(())
+                                            });
+                                        if provider_verified {
+                                            db.adopt_provider_signature(&record, &receipt, validate).await?;
+                                        } else {
+                                            db.adopt_baseline_receipt(&record, &receipt, validate).await?;
                                         }
-                                        PendingOnDiskAdoption::StateWriteFailed(existing_path) => {
+                                        Ok::<(), anyhow::Error>(())
+                                    }.await;
+                                    match adoption {
+                                        Ok(()) => {
+                                            disposition = disposition.max(AssetDisposition::OnDisk)
+                                        }
+                                        Err(error) => {
                                             state_write_failures_producer
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                            tracing::debug!(target: "kei::download::pipeline",
-                                                asset_id = %task.asset_id,
-                                                path = %existing_path.display(),
-                                                "Skipping re-download after pending on-disk state write failed"
-                                            );
+                                            disposition =
+                                                disposition.max(AssetDisposition::Uncertain);
+                                            tracing::warn!(%error, "Existing-file receipt remains pending");
                                         }
                                     }
-                                    continue;
                                 }
-
-                                match download_ctx.should_download_fast(
-                                    &task.library,
-                                    &task.asset_id,
-                                    task.version_size,
-                                    &task.checksum,
-                                    false,
-                                ) {
-                                    Some(true) => {
-                                        disposition = disposition.max(AssetDisposition::Forwarded);
-                                        if record_seen_for_forwarded_task(
+                                crate::download::baseline_matching::BaselineMatch::Uncertain => {
+                                    disposition = disposition.max(AssetDisposition::Uncertain);
+                                    let retained = if let Some(db) = &producer_state_db {
+                                        db.defer_baseline_match(&planner::pending_record_for_task(
+                                            config, &asset, &task,
+                                        ))
+                                        .await
+                                        .is_ok()
+                                    } else {
+                                        false
+                                    };
+                                    if !retained {
+                                        state_write_failures_producer
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    tracing::warn!(
+                                        "Existing file match is uncertain; retaining pending work without downloading a duplicate"
+                                    );
+                                }
+                                crate::download::baseline_matching::BaselineMatch::Missing => {
+                                    if let Some(db) = &producer_state_db
+                                        && record_seen_for_forwarded_task(
                                             db.as_ref(),
                                             config,
                                             &asset,
@@ -996,120 +965,20 @@ where
                                         )
                                         .await
                                         .is_err()
-                                        {
-                                            state_write_failures_producer
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                            continue;
-                                        }
-                                        let size = task.size;
-                                        if task_tx.send(task).await.is_err() {
-                                            return skips;
-                                        }
-                                        if forecast_check(size) {
-                                            return skips;
-                                        }
+                                    {
+                                        state_write_failures_producer
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        disposition = disposition.max(AssetDisposition::Uncertain);
+                                        continue;
                                     }
-                                    Some(false) => {
-                                        disposition = disposition.max(AssetDisposition::StateSkip);
-                                        tracing::debug!(target: "kei::download::pipeline",
-                                            asset_id = %task.asset_id,
-                                            "Skipping (state confirms no download needed)"
-                                        );
+                                    disposition = disposition.max(AssetDisposition::Forwarded);
+                                    let size = task.size;
+                                    if task_tx.send(task).await.is_err() {
+                                        return skips;
                                     }
-                                    None => {
-                                        if let Some(existing_path) =
-                                            state_confirmed_current_path_exists(
-                                                &download_ctx,
-                                                config,
-                                                &asset,
-                                                &task,
-                                                &mut task_planner,
-                                            )
-                                            .await
-                                        {
-                                            disposition = disposition.max(AssetDisposition::OnDisk);
-                                            tracing::debug!(target: "kei::download::pipeline",
-                                                asset_id = %task.asset_id,
-                                                path = %existing_path.display(),
-                                                "Skipping (state path exists on disk)"
-                                            );
-                                            let candidates =
-                                                extract_skip_candidates(&asset, config.as_ref());
-                                            if !metadata_refresh_attempted {
-                                                metadata_rewrite::tag_if_needed(
-                                                    producer_state_db.as_deref(),
-                                                    config,
-                                                    &asset,
-                                                    &candidates,
-                                                    &download_ctx,
-                                                )
-                                                .await;
-                                            }
-                                            continue;
-                                        }
-
-                                        match task_planner.existing_path_match(&task.download_path)
-                                        {
-                                            ExistingPathMatch::Exact => {
-                                                disposition =
-                                                    disposition.max(AssetDisposition::OnDisk);
-                                                tracing::debug!(target: "kei::download::pipeline",
-                                                    asset_id = %task.asset_id,
-                                                    path = %task.download_path.display(),
-                                                    "Skipping (already downloaded)"
-                                                );
-                                            }
-                                            ExistingPathMatch::AmpmVariant => {
-                                                disposition =
-                                                    disposition.max(AssetDisposition::AmpmVariant);
-                                                tracing::debug!(target: "kei::download::pipeline",
-                                                    asset_id = %task.asset_id,
-                                                    path = %task.download_path.display(),
-                                                    "Skipping (AM/PM variant exists on disk)"
-                                                );
-                                            }
-                                            ExistingPathMatch::Missing => {
-                                                tracing::debug!(target: "kei::download::pipeline",
-                                                    asset_id = %task.asset_id,
-                                                    path = %task.download_path.display(),
-                                                    "File missing, will re-download"
-                                                );
-                                                disposition =
-                                                    disposition.max(AssetDisposition::Forwarded);
-                                                if record_seen_for_forwarded_task(
-                                                    db.as_ref(),
-                                                    config,
-                                                    &asset,
-                                                    &task,
-                                                )
-                                                .await
-                                                .is_err()
-                                                {
-                                                    state_write_failures_producer.fetch_add(
-                                                        1,
-                                                        std::sync::atomic::Ordering::Relaxed,
-                                                    );
-                                                    continue;
-                                                }
-                                                let size = task.size;
-                                                if task_tx.send(task).await.is_err() {
-                                                    return skips;
-                                                }
-                                                if forecast_check(size) {
-                                                    return skips;
-                                                }
-                                            }
-                                        }
+                                    if forecast_check(size) {
+                                        return skips;
                                     }
-                                }
-                            } else {
-                                disposition = disposition.max(AssetDisposition::Forwarded);
-                                let size = task.size;
-                                if task_tx.send(task).await.is_err() {
-                                    return skips;
-                                }
-                                if forecast_check(size) {
-                                    return skips;
                                 }
                             }
                         }
@@ -1117,6 +986,7 @@ where
                         match disposition {
                             AssetDisposition::Forwarded => assets_forwarded += 1,
                             AssetDisposition::OnDisk => skips.on_disk += 1,
+                            AssetDisposition::Uncertain => skips.uncertain += 1,
                             AssetDisposition::AmpmVariant => skips.ampm_variant += 1,
                             AssetDisposition::StateSkip => skips.by_state += 1,
                             AssetDisposition::RetryExhausted => skips.retry_exhausted += 1,
@@ -1169,6 +1039,7 @@ where
             tracing::debug!(target: "kei::download::pipeline",
                 state = skips.by_state,
                 on_disk = skips.on_disk,
+                uncertain = skips.uncertain,
                 ampm_variant = skips.ampm_variant,
                 media_type = skips.by_media_type,
                 date_range = skips.by_date_range,
@@ -1198,45 +1069,6 @@ where
                 duplicates = skips.duplicates,
                 "Asset accounting mismatch -- some assets may be untracked"
             );
-        }
-
-        // Flush the accumulated last_seen_at updates in one transaction.
-        // Running after the producer loop exits means we skip the fsync-
-        // per-asset cost that dominated sync-start on mostly-synced
-        // libraries.
-        //
-        // touched_assets contains assets the consumer will not finalize this
-        // sync: trust-state fast-skips and on-disk skips. Bumping
-        // last_seen_at is a no-op for terminal rows. For pending rows that
-        // could not be adopted from disk, it is load-bearing for
-        // stuck-pipeline recovery: promote_pending_to_failed promotes any
-        // pending row whose last_seen_at >= sync_started_at.
-        //
-        // If we lose this flush (e.g. process killed between the producer
-        // loop exiting and touch_last_seen_many returning), stuck-pipeline
-        // promotion is delayed by exactly one sync. The same row hits the
-        // same path next run and gets adopted or promoted then. No data loss.
-        if let Some(db) = &producer_state_db
-            && !touched_assets.is_empty()
-        {
-            let mut touched_by_library: FxHashMap<Arc<str>, Vec<Arc<str>>> = FxHashMap::default();
-            for (library, id) in touched_assets {
-                touched_by_library.entry(library).or_default().push(id);
-            }
-            for (library, ids) in touched_by_library {
-                let touched_count = ids.len();
-                let id_refs: Vec<&str> = ids.iter().map(AsRef::as_ref).collect();
-                if let Err(e) = db.touch_last_seen_many(&library, &id_refs).await {
-                    producer_pb.suspend(|| {
-                        tracing::warn!(target: "kei::download::pipeline",
-                            error = %e,
-                            count = touched_count,
-                            library = %library,
-                            "Failed to batch-update last_seen_at for skipped assets"
-                        );
-                    });
-                }
-            }
         }
 
         skips

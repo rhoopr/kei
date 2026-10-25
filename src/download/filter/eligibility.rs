@@ -601,3 +601,17 @@ mod tests {
         );
     }
 }
+
+/// Synthesized names follow the same exclusion policy as provider filenames.
+pub(in crate::download) fn fallback_filename_excluded(
+    asset: &crate::icloud::photos::PhotoAsset,
+    config: &crate::download::DownloadConfig,
+) -> bool {
+    asset.filename().is_none()
+        && config.filename_exclude.iter().any(|pattern| {
+            pattern.matches_with(
+                &super::expected_paths::raw_filename(asset),
+                GLOB_CASE_INSENSITIVE,
+            )
+        })
+}

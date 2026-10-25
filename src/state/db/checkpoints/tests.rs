@@ -351,3 +351,5 @@ async fn retained_checkpoint_metadata_fence_rolls_back_stale_plans() {
         Some("preserved")
     );
 }
+
+mod v027_historical;

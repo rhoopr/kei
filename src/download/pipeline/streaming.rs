@@ -9,9 +9,7 @@ use reqwest::Client;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::download::filter::{
-    DownloadTask, FilterReason, extract_skip_candidates, is_asset_filtered,
-};
+use crate::download::filter::{DownloadTask, FilterReason, is_asset_filtered};
 use crate::download::metadata_rewrite::MetadataFlags;
 use crate::download::planner::TaskPlanner;
 use crate::download::{
@@ -21,12 +19,10 @@ use crate::download::{
 use crate::icloud::photos::session::is_session_error as is_provider_session_error;
 
 use super::StreamPipelineShared;
-use super::adoption::effective_asset_library;
 use super::consumer::{StreamConsumerSettings, consume_stream_download_tasks};
 use super::outcome::{StreamingResult, finalize_streaming_download};
 use super::producer::spawn_stream_download_producer;
 
-/// Return the subset of `paths` that do not exist on disk.
 /// Streaming download pipeline that consumes a pre-built combined stream.
 ///
 /// This is the core producer/consumer download logic from `stream_and_download`,
@@ -201,33 +197,6 @@ where
                     if is_asset_filtered(&asset, config.as_ref()).is_some() {
                         continue;
                     }
-                    // Fast-skip is path-blind; in `{album}` mode the same
-                    // asset legitimately lives at multiple paths, so we'd
-                    // under-report the listing if we trusted the DB here.
-                    // `album_name.is_some()` is the right signal because by
-                    // the time this runs, `with_album_name` has expanded
-                    // `{album}` out of `folder_structure` entirely.
-                    if config.album_name.is_none() && !config.primary_layout_preview {
-                        let candidates = extract_skip_candidates(&asset, config.as_ref());
-                        let library = effective_asset_library(&asset, config);
-                        if !candidates.is_empty()
-                            && candidates.iter().all(|&(vs, cs)| {
-                                matches!(
-                                    download_ctx.should_download_fast(
-                                        library,
-                                        asset.state_id(),
-                                        vs,
-                                        cs,
-                                        true
-                                    ),
-                                    Some(false)
-                                )
-                            })
-                        {
-                            continue;
-                        }
-                    }
-
                     let plan = match task_planner.plan_download_asset(&asset, config).await {
                         Ok(plan) => plan,
                         Err(error) if config.primary_layout_preview => {
@@ -255,6 +224,17 @@ where
                         reason = "--only-print-filenames writes target paths to stdout so callers can pipe to xargs/etc"
                     )]
                     for task in &plan.tasks {
+                        match task_planner.match_existing(&asset, config, task).await {
+                            crate::download::baseline_matching::BaselineMatch::Present { .. }
+                            | crate::download::baseline_matching::BaselineMatch::ProviderPresent { .. } => continue,
+                            crate::download::baseline_matching::BaselineMatch::Uncertain => {
+                                tracing::warn!(
+                                    "Existing file match is uncertain; no duplicate download planned"
+                                );
+                                continue;
+                            }
+                            crate::download::baseline_matching::BaselineMatch::Missing => {}
+                        }
                         #[cfg(test)]
                         printed_filenames.push(task.download_path.clone());
                         println!("{}", task.download_path.display());
@@ -323,9 +303,20 @@ where
                         continue;
                     }
                     for task in &plan.tasks {
-                        tracing::info!(target: "kei::download::pipeline", path = %task.download_path.display(), "[DRY RUN] Would download");
+                        match task_planner.match_existing(&asset, config, task).await {
+                            crate::download::baseline_matching::BaselineMatch::Present { .. }
+                            | crate::download::baseline_matching::BaselineMatch::ProviderPresent { .. } => {}
+                            crate::download::baseline_matching::BaselineMatch::Uncertain => {
+                                tracing::warn!(
+                                    "Existing file match is uncertain; no duplicate download planned"
+                                );
+                            }
+                            crate::download::baseline_matching::BaselineMatch::Missing => {
+                                tracing::info!(target: "kei::download::pipeline", path = %task.download_path.display(), "[DRY RUN] Would download");
+                                count += 1;
+                            }
+                        }
                     }
-                    count += plan.tasks.len();
                 }
                 Err(e) => {
                     enum_errors += 1;
@@ -453,3 +444,6 @@ where
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod baseline_tests;

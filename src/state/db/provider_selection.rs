@@ -385,6 +385,7 @@ fn validate(conn: &Connection, manifest: &SelectionManifest) -> Result<(), State
 
 impl SqliteStateDb {
     /// Atomic shadow evidence only. An exact replay is possible at capacity.
+    #[cfg(test)]
     pub(crate) async fn capture_selection_shadow(
         &self,
         owner: account::AccountOwner,
@@ -498,8 +499,6 @@ impl SqliteStateDb {
         })
         .await
     }
-
-
 }
 
 fn load_shadow(

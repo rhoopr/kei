@@ -535,6 +535,8 @@ async fn attempt_download_with_publication<C: DownloadClient>(
                     limiter.consume(chunk.len()).await;
                 }
             }
+            #[cfg(test)]
+            crate::download::live_baseline_test::admit_transfer_chunk(download_path, chunk.len())?;
             file.write_all(&chunk).await?;
             bytes_written += chunk.len() as u64;
         }
@@ -623,6 +625,34 @@ pub(in crate::download) struct DownloadedFile {
 }
 
 impl DownloadedFile {
+    /// Reopen only bytes already verified and owned by the durable publication
+    /// ledger. Never feed a metadata-modified completed part back into HTTP resume.
+    pub(in crate::download) async fn reopen_prepared(
+        root: &Path,
+        part: &Path,
+        expected_checksum: &str,
+    ) -> anyhow::Result<Self> {
+        let root = root.to_path_buf();
+        let part = part.to_path_buf();
+        let expected_checksum = expected_checksum.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let path = ConfinedPath::open(&root, &part, ConfinedParents::Existing)?;
+            let mut file = path.open_regular()?;
+            let identity = file_identity(&file)?;
+            let actual = fingerprint_open_file_snapshot_blocking(&mut file, &part)?.fingerprint;
+            anyhow::ensure!(
+                data_encoding::HEXLOWER.encode(&actual.sha256) == expected_checksum,
+                "Prepared publication bytes changed; retaining pending work"
+            );
+            path.validate_identity(identity)?;
+            Ok(Self {
+                bytes_written: 0,
+                retained: Arc::new(RetainedDownload { path, file }),
+            })
+        })
+        .await?
+    }
+
     /// Retain the current-root namespace only if it still names the exact
     /// publication owner. The owner remains live while the guard is acquired.
     pub(in crate::download) async fn retain_pending_publication(

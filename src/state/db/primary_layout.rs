@@ -238,6 +238,99 @@ pub(super) fn guard_writer(conn: &Connection, path: &std::path::Path) -> Result<
     Ok(())
 }
 
+// A journal may publish old prepared bytes, but must never roll newer provider
+// observations back through its stored AssetRecord. This check runs inside the
+// phase/finalization transaction, independently of orchestration preflight.
+fn guard_recorded_catalogue(conn: &Connection, op: &LayoutOperation) -> Result<(), StateError> {
+    for member in &op.members {
+        if let Some(expected) = &member.record {
+            let current = conn
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
+                        super::rows::ASSET_COLUMNS
+                    ),
+                    params![
+                        expected.library,
+                        expected.id,
+                        expected.version_size.as_str()
+                    ],
+                    super::rows::row_to_asset_record,
+                )
+                .optional()?;
+            let Some(current) = current else { continue };
+            let stored_metadata = |record: &AssetRecord| -> Result<serde_json::Value, StateError> {
+                let mut metadata = (*record.metadata).clone();
+                metadata.metadata_hash = Some(
+                    metadata
+                        .metadata_hash
+                        .clone()
+                        .unwrap_or_else(|| metadata.compute_hash()),
+                );
+                if metadata.source.is_none() {
+                    metadata.source = Some("icloud".into());
+                }
+                metadata.modified_at = metadata
+                    .modified_at
+                    .and_then(|date| chrono::DateTime::from_timestamp(date.timestamp(), 0));
+                metadata.deleted_at = metadata
+                    .deleted_at
+                    .and_then(|date| chrono::DateTime::from_timestamp(date.timestamp(), 0));
+                serde_json::to_value(metadata)
+                    .map_err(|_| invalid("invalid journal metadata snapshot"))
+            };
+            if current.checksum != expected.checksum
+                || current.filename != expected.filename
+                || current.size_bytes != expected.size_bytes
+                || current.media_type != expected.media_type
+                || super::rows::encode_asset_date(current.created_at).to_bits()
+                    != super::rows::encode_asset_date(expected.created_at).to_bits()
+                || current
+                    .added_at
+                    .map(|date| super::rows::encode_asset_date(date).to_bits())
+                    != expected
+                        .added_at
+                        .map(|date| super::rows::encode_asset_date(date).to_bits())
+                || stored_metadata(&current)? != stored_metadata(expected)?
+            {
+                return Err(invalid(
+                    "recorded layout differs from current provider observation",
+                ));
+            }
+        } else if let Some(source) = &member.archive_source {
+            // Archive-only finalization does not replace provider metadata, but
+            // can move its canonical path. Permit only the exact recorded source.
+            let current: Option<(String, Option<String>, Option<String>)> = conn
+                .query_row(
+                    "SELECT checksum,local_path,local_checksum FROM assets
+                 WHERE library=?1 AND id=?2 AND version_size=?3",
+                    params![op.library, op.child, source.version],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if let Some((checksum, path, local)) = current
+                && checksum == source.provider_checksum
+            {
+                let source_path = source.path.to_path();
+                if source_path.to_str().is_none()
+                    || path.as_deref() != source_path.to_str()
+                    || local.as_deref()
+                        != Some(
+                            data_encoding::HEXLOWER
+                                .encode(&source.fingerprint.sha256)
+                                .as_str(),
+                        )
+                {
+                    return Err(invalid(
+                        "recorded archive source differs from current canonical path",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl SqliteStateDb {
     pub(crate) async fn primary_layout_binding(
         &self,
@@ -346,6 +439,7 @@ impl SqliteStateDb {
             let tx=conn.unchecked_transaction()?;
             let previous:Vec<u8>=tx.query_row("SELECT header FROM primary_layout_operations WHERE operation=?1 AND phase NOT IN ('committed','cancelled')",[&op.operation],|row|row.get(0))?;
             let old:LayoutOperation=decode(&previous)?;
+            guard_recorded_catalogue(&tx, &op)?;
             let phase=|phase:&str|match phase {"planned"=>0,"prepared"=>1,"preserved"=>2,"publishing"=>3,_=>4};
             if phase(&op.phase)<phase(&old.phase) || phase(&op.phase)>phase(&old.phase)+1 {return Err(invalid("invalid layout phase transition"));}
             let mut identity=op.clone();identity.members.clear();identity.phase=old.phase.clone();
@@ -393,6 +487,7 @@ impl SqliteStateDb {
             if encode(&identity)?!=stored {return Err(invalid("commit differs from recorded layout identity"));}
             let stored_members:Vec<Vec<u8>>=tx.prepare("SELECT evidence FROM primary_layout_members WHERE operation=?1 ORDER BY member")?.query_map([&op.operation],|r|r.get(0))?.collect::<Result<_,_>>()?;
             if stored_members.len()!=op.members.len() || op.members.iter().zip(stored_members).any(|(member,stored)|encode(member).map_or(true,|bytes|bytes!=stored)) {return Err(invalid("commit differs from recorded member evidence"));}
+            guard_recorded_catalogue(&tx, &op)?;
             let mut files=Vec::new();
             for member in &op.members {
                 if let Some(old)=&member.old {

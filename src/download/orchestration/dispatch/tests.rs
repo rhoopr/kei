@@ -814,3 +814,16 @@ async fn smart_only_delta_successor_retains_missing_query_token_hold() {
         assert_eq!(result.stats.downloaded, 0);
     }
 }
+
+#[test]
+fn unaccounted_current_record_cannot_fall_back_to_inventory() {
+    let error = anyhow::Error::new(crate::icloud::photos::error::UnaccountedChangeError);
+    assert_eq!(
+        super::classify_incremental_error(&error),
+        super::IncrementalErrorClass::CaptureRefused
+    );
+    assert_eq!(
+        super::classify_selection_incremental_error(&error),
+        super::IncrementalErrorClass::CaptureRefused
+    );
+}

@@ -14,6 +14,13 @@ where
 {
     let mut ids_by_library: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for pending in pending {
+        if pending
+            .selection_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.frozen_groupings.is_some())
+        {
+            continue;
+        }
         let record = &pending.asset;
         ids_by_library
             .entry(record.library.as_ref())

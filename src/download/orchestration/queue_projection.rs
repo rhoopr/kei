@@ -181,12 +181,7 @@ pub(super) async fn admit_retained_work(
                     reason,
                 )
             }
-            Err(_unresolved) => (
-                None,
-                None,
-                Vec::new(),
-                "current_lookup_unresolved",
-            ),
+            Err(_unresolved) => (None, None, Vec::new(), "current_lookup_unresolved"),
         };
         if cancel.is_cancelled() {
             break;

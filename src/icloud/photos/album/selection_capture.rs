@@ -105,6 +105,29 @@ pub(crate) fn validated_rank_page(request: &Value, body: &[u8]) -> Result<Value>
 }
 
 impl PhotoAlbum {
+    /// Scope new download work to the authenticated account and complete
+    /// provider database/zone identity. Rank proof is not an admission owner.
+    pub(crate) fn download_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {
+        let Some((capture, database)) = &self.shadow_capture else {
+            return Ok(None);
+        };
+        if !matches!(database.as_ref(), "private" | "shared")
+            || self
+                .zone_id
+                .get("ownerRecordName")
+                .and_then(Value::as_str)
+                .is_none_or(|owner| owner.trim().is_empty())
+            || !self.cross_zone_sources.is_empty()
+        {
+            return Ok(None);
+        }
+        Ok(Some((
+            capture.clone(),
+            capture.scope(database, &self.zone_id)?,
+            self.zone_id.as_ref().clone(),
+        )))
+    }
+
     /// Independently bound ownership protects old private obligations even if
     /// the current pass is not an eligible activation selector.
     pub(crate) fn owned_private_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {

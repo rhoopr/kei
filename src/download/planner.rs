@@ -58,6 +58,7 @@ pub(super) struct TaskPlanner {
     dir_cache: paths::DirCache,
     layout_session: Option<Arc<super::orchestration::primary_layout::LayoutSession>>,
     managed_plan: bool,
+    baseline_matcher: super::baseline_matching::BaselineMatcher,
 }
 
 impl TaskPlanner {
@@ -69,6 +70,7 @@ impl TaskPlanner {
             dir_cache: paths::DirCache::new(),
             layout_session: None,
             managed_plan: false,
+            baseline_matcher: super::baseline_matching::BaselineMatcher::default(),
         }
     }
 
@@ -136,23 +138,11 @@ impl TaskPlanner {
             return Ok(Self::new());
         };
         let reservations = db.get_reconciliation_reservations().await?;
-        let catalog = match db.get_reconciliation_catalog_paths().await {
-            Ok(catalog) => catalog,
-            Err(error) if reservations.is_empty() => {
-                tracing::warn!(%error, "Could not load publication ownership; recorded path reuse disabled");
-                return Ok(Self::new());
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let catalog = db.get_reconciliation_catalog_paths().await?;
         let mut planner = if reservations.is_empty() {
             let mut planner = Self::new();
             for record in catalog {
-                let Ok(key) = PathPlanningMode::Reconciliation.key(&record.path) else {
-                    tracing::warn!(
-                        "Could not index publication ownership; recorded path reuse disabled"
-                    );
-                    return Ok(Self::new());
-                };
+                let key = PathPlanningMode::Reconciliation.key(&record.path)?;
                 planner
                     .reconciliation
                     .path_owners
@@ -170,14 +160,10 @@ impl TaskPlanner {
             planner.path_mode = PathPlanningMode::ReservedDownload;
             planner
         };
-        let records = match db.get_downloaded_path_records().await {
-            Ok(records) => records,
-            Err(error) => {
-                tracing::warn!(%error, "Could not load publication receipts; recorded path reuse disabled");
-                return Ok(planner);
-            }
-        };
+        let records = db.get_downloaded_path_records().await?;
         planner.add_downloaded_paths(records);
+        planner.baseline_matcher =
+            super::baseline_matching::BaselineMatcher::new(db.get_baseline_receipts().await?);
         Ok(planner)
     }
 
@@ -415,10 +401,206 @@ impl TaskPlanner {
         let mut plan = self
             .plan_download_asset_with_replay(asset, config, ReservedReplay::RequestedDirectory)
             .await?;
+        self.include_existing_comparison_tasks(asset, config, &mut plan);
         if matches!(self.path_mode, PathPlanningMode::Download) && !self.managed_plan {
             self.relocate_protected_tasks(&mut plan, config).await?;
         }
         Ok(plan)
+    }
+
+    /// Include occupied selected paths in the comparison. Path occupancy cannot
+    /// decide completion before receipts and local bytes have been checked.
+    fn include_existing_comparison_tasks(
+        &self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        plan: &mut AssetTaskPlan,
+    ) {
+        if plan.filter_reason.is_some() || self.managed_plan || !asset.has_valid_id() {
+            return;
+        }
+        // The original task builder applies exclusions to synthesized names too.
+        // Reintroducing occupied paths must preserve that same selection decision.
+        if super::filter::fallback_filename_excluded(asset, config) {
+            return;
+        }
+        for derived in super::filter::derive_expected_paths(asset, config) {
+            if plan
+                .tasks
+                .iter()
+                .any(|task| task.version_size == derived.version_size)
+            {
+                continue;
+            }
+            plan.tasks.push(DownloadTask {
+                url: derived.url,
+                download_path: derived.path,
+                replacement_fingerprint: None,
+                pending_cross_parent_root: None,
+                checksum: derived.checksum,
+                asset_id: asset.state_id_arc(),
+                asset_record_name: asset.asset_record_name_arc(),
+                library: Arc::from(asset.source_zone().unwrap_or(&config.library)),
+                metadata: super::filter::build_selected_payload(
+                    asset,
+                    config,
+                    derived.version_size,
+                ),
+                size: derived.size,
+                created_local: asset.created_local(),
+                version_size: derived.version_size,
+                media_type: determine_media_type(derived.version_size, asset),
+            });
+        }
+    }
+
+    /// Discover only historical filename families in the requested directory.
+    /// Arbitrary unindexed moves or unrelated renames are outside this census.
+    /// Names locate candidates; the matcher still requires full provider proof.
+    async fn discover_baseline_family(
+        &mut self,
+        asset: &PhotoAsset,
+        requested: &Path,
+    ) -> super::baseline_matching::BaselineCandidates {
+        let Some(parent) = requested.parent() else {
+            return super::baseline_matching::BaselineCandidates {
+                paths: Vec::new(),
+                complete: false,
+            };
+        };
+        let Some(filename) = requested.file_name().and_then(|name| name.to_str()) else {
+            return super::baseline_matching::BaselineCandidates {
+                paths: Vec::new(),
+                complete: false,
+            };
+        };
+        let mut bases = vec![paths::normalize_ampm(filename)];
+        if let Some(original) = asset.filename() {
+            // The current rendition supplies the extension. The old provider
+            // basename remains a clue when an identity suffix changed labels.
+            let mut original = std::path::PathBuf::from(paths::clean_filename(original).as_ref());
+            original.set_extension(requested.extension().unwrap_or_default());
+            if let Some(name) = original.file_name().and_then(|name| name.to_str()) {
+                bases.push(paths::normalize_ampm(name));
+            }
+        }
+        bases.sort();
+        bases.dedup();
+        let prefixes: Vec<String> = bases
+            .iter()
+            .filter_map(|name| {
+                Path::new(name)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .filter(|stem| !stem.is_empty())
+                    .map(str::to_owned)
+            })
+            .collect();
+        if prefixes.is_empty() {
+            return super::baseline_matching::BaselineCandidates {
+                paths: Vec::new(),
+                complete: false,
+            };
+        }
+        let (mut candidates, complete) =
+            self.dir_cache.baseline_candidates(parent, &prefixes).await;
+        candidates.retain(|path| {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return false;
+            };
+            let normalized = paths::normalize_ampm(name);
+            let candidate = Path::new(&normalized);
+            bases.iter().any(|base| {
+                let base = Path::new(base);
+                let extension = |path: &Path| {
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .unwrap_or("")
+                        .to_owned()
+                };
+                if !extension(candidate).eq_ignore_ascii_case(&extension(base)) {
+                    return false;
+                }
+                let Some(stem) = base.file_stem().and_then(|stem| stem.to_str()) else {
+                    return false;
+                };
+                candidate
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix(stem))
+                    .is_some_and(|tail| {
+                        tail.is_empty() || tail.starts_with('-') || tail.starts_with('_')
+                    })
+            })
+        });
+        super::baseline_matching::BaselineCandidates {
+            paths: candidates,
+            complete,
+        }
+    }
+
+    pub(super) async fn match_existing(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        task: &DownloadTask,
+    ) -> super::baseline_matching::BaselineMatch {
+        let derived = super::filter::derive_expected_paths(asset, config);
+        let requested = derived
+            .iter()
+            .find(|path| path.version_size == task.version_size)
+            .map_or(task.download_path.as_path(), |path| path.path.as_path());
+        let selected_copy_scope =
+            if let (Some(run), Some(key)) = (&config.selection_run, &config.primary_layout_pass) {
+                match run
+                    .capture
+                    .db
+                    .selection_destination_scope(
+                        run.capture.owner.clone(),
+                        run.root.id.clone(),
+                        key.to_string(),
+                        task.asset_record_name.to_string(),
+                        (
+                            task.asset_id.to_string(),
+                            task.version_size.as_str().to_owned(),
+                            crate::state::db::provider_selection::SelectionPath::from_path(
+                                &task.download_path,
+                            ),
+                            task.checksum.to_string(),
+                            task.size,
+                        ),
+                        crate::state::db::provider_selection::SelectionPath::from_path(requested),
+                    )
+                    .await
+                {
+                    Ok(admitted) => admitted,
+                    Err(_) => return super::baseline_matching::BaselineMatch::Uncertain,
+                }
+            } else {
+                Default::default()
+            };
+        let discovered = self.discover_baseline_family(asset, requested).await;
+        let matched = self
+            .baseline_matcher
+            .match_task_in_scope(
+                &config.directory,
+                task,
+                requested,
+                config.album_name.is_some()
+                    && config.primary_layout_pass_kind != Some(crate::commands::PassKind::Unfiled),
+                &selected_copy_scope,
+                &discovered,
+            )
+            .await;
+        if matches!(matched, super::baseline_matching::BaselineMatch::Missing)
+            && let Some(db) = config.state_db.as_deref()
+            && db.guard_primary_writer(&task.download_path).await.is_err()
+        {
+            // An absent leaf can still belong to an interrupted publication.
+            // Preserve its claim rather than transferring into the owned slot.
+            return super::baseline_matching::BaselineMatch::Uncertain;
+        }
+        matched
     }
 
     /// Ordinary downloads must never publish to a protected legacy identity,
@@ -506,8 +688,11 @@ impl TaskPlanner {
         asset: &PhotoAsset,
         config: &DownloadConfig,
     ) -> Result<AssetTaskPlan> {
-        self.plan_download_asset_with_replay(asset, config, ReservedReplay::PendingRetry)
-            .await
+        let mut plan = self
+            .plan_download_asset_with_replay(asset, config, ReservedReplay::PendingRetry)
+            .await?;
+        self.include_existing_comparison_tasks(asset, config, &mut plan);
+        Ok(plan)
     }
 
     async fn plan_download_asset_with_replay(
@@ -1281,9 +1466,7 @@ where
 {
     // An unfiled path label is not evidence of actual album membership.
     // Recording it would exclude the asset from later unfiled reconciliation.
-    if config.primary_layout_active
-        && config.primary_layout_pass_kind == Some(crate::commands::PassKind::Unfiled)
-    {
+    if config.primary_layout_pass_kind == Some(crate::commands::PassKind::Unfiled) {
         return Ok(());
     }
     let Some(album_name) = config.album_name.as_deref().filter(|name| !name.is_empty()) else {
@@ -2048,3 +2231,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "planner/baseline_discovery_tests.rs"]
+mod baseline_discovery_tests;

@@ -169,7 +169,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
             retry_config,
             context.temp_suffix,
             crate::download::file::DownloadOpts {
-                skip_rename: needs_embed,
+                skip_rename: true,
                 expected_size: if task.size > 0 { Some(task.size) } else { None },
                 publication: task.publication(),
             },
@@ -188,11 +188,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
 
         // Compute SHA-256 of the downloaded content before EXIF modification
         // so we store a hash that reflects the original download bytes.
-        let downloaded_fingerprint = if needs_embed {
-            Some(downloaded.fingerprint().await?)
-        } else {
-            None
-        };
+        let downloaded_fingerprint = Some(downloaded.fingerprint().await?);
         let download_checksum = downloaded_fingerprint.map(|fingerprint| data_encoding::HEXLOWER.encode(&fingerprint.sha256));
 
         let mut exif_ok = true;
@@ -226,9 +222,27 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
                 path = %task.download_path.display(), error = %e, "Could not set mtime");
         }
 
-        if part_path.is_some() {
-            downloaded.publish(&task.download_path, task.publication()).await?;
+        // The existing temporary owner retains provenance before publication.
+        // A crash after rename can then finish the receipt without another GET
+        // or any inference from filename/size.
+        if let Some(db) = context.state_db {
+            let fingerprint = downloaded.fingerprint().await?;
+            let proof = crate::state::db::PreparedPublication {
+                library: task.library.to_string(),
+                id: task.asset_id.to_string(),
+                version: task.version_size.as_str().to_owned(),
+                provider_checksum: task.checksum.to_string(),
+                provider_size: task.size,
+                temporary: crate::state::db::provider_selection::SelectionPath::from_path(&owned_part_path),
+                destination: crate::state::db::provider_selection::SelectionPath::from_path(&task.download_path),
+                local_checksum: data_encoding::HEXLOWER.encode(&fingerprint.sha256),
+                source_checksum: download_checksum.clone().ok_or_else(|| anyhow::anyhow!("Missing verified source fingerprint"))?,
+            };
+            db.prepare_temp_publication(&owned_part_path, &proof).await?;
+            #[cfg(all(test, target_os = "linux"))]
+            crate::test_helpers::process_death_point("publication-prepared");
         }
+        downloaded.publish(&task.download_path, task.publication()).await?;
 
         // Embed work already captured the original checksum. Otherwise take
         // a baseline for the unchanged download before sidecar planning.

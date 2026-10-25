@@ -3,6 +3,7 @@
 //! upfront. Uses a two-phase approach: (1) stream-and-download with bounded
 //! concurrency, then (2) cleanup pass with fresh CDN URLs for any failures.
 
+pub(crate) mod baseline_matching;
 pub mod error;
 pub mod file;
 pub(crate) mod filter;
@@ -41,9 +42,8 @@ use orchestration::models::PENDING_RETRY_UNMATCHED_REASON;
 pub(super) use orchestration::models::PRODUCER_ENUMERATION_INCOMPLETE_REASON;
 pub(crate) use orchestration::models::{
     CheckpointEvidence, DownloadControls, DownloadReporting, DownloadRunMode, DownloadStore,
-    InventoryMeasurement, RecoveryAction, block_sync_token_for_metadata_capture,
-    block_sync_token_for_unresolved_identity, sync_token_blocked_explanation,
-    sync_token_blocked_source,
+    InventoryMeasurement, RecoveryAction, block_sync_token_for_unresolved_identity,
+    sync_token_blocked_explanation, sync_token_blocked_source,
 };
 pub use orchestration::models::{
     DownloadOutcome, FullEnumerationReason, SkipBreakdown, SyncMode, SyncResult, SyncStats,
@@ -52,7 +52,7 @@ pub(crate) use orchestration::queue_projection::has_due_retained_work;
 pub(crate) use orchestration::recent::requires_recovery as recent_selection_requires_recovery;
 #[cfg(test)]
 pub(crate) use orchestration::reconciliation::reconcile_catalog_paths;
-pub(crate) use orchestration::reconciliation::reconcile_catalog_paths_with_client;
+pub(crate) use orchestration::reconciliation::recover_recorded_sources;
 use orchestration::selection::build_pass_configs_resolving_deferred_excludes;
 use orchestration::url_refresh::{
     CleanupUrlRefresh, RetryTaskKey, UrlRetrySource, build_retry_download_tasks,
@@ -71,3 +71,6 @@ pub(crate) mod sparse_target;
 
 #[cfg(test)]
 mod live_baseline_test;
+
+#[cfg(test)]
+pub(crate) use orchestration::primary_layout::tests::prepared_layout_in_library;

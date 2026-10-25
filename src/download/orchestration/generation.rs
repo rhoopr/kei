@@ -33,6 +33,19 @@ use crate::state::db::provider_selection::{
 const MAX_REPLAY_DECISIONS: u32 = 64;
 const DEFERRED_REASON: &str = "selection_generation_deferred";
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static TEST_GENERATION_FORMAT: u8;
+}
+
+fn generation_format() -> u8 {
+    #[cfg(test)]
+    if let Ok(format) = TEST_GENERATION_FORMAT.try_with(|format| *format) {
+        return format;
+    }
+    2
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("Selected identity retry is not due")]
 pub(in crate::download) struct SelectionRetryDeferred;
@@ -73,6 +86,7 @@ type SelectionRetrySources =
 
 #[derive(Clone)]
 pub(crate) struct SelectionContext {
+    format: u8,
     capture: ShadowCapture,
     scope: String,
     zone: Value,
@@ -97,6 +111,19 @@ pub(super) async fn freeze_before_sync(
     };
     let mut scopes = std::collections::HashSet::new();
     for pass in passes {
+        if let Some((capture, scope, zone)) = pass.album.download_scope()? {
+            capture
+                .db
+                .validate_download_scope(
+                    capture.owner,
+                    scope,
+                    zone.get("zoneName")
+                        .and_then(Value::as_str)
+                        .context("Missing provider zone name")?
+                        .to_owned(),
+                )
+                .await?;
+        }
         let Some((capture, scope, _zone)) = pass.album.owned_private_scope()? else {
             continue;
         };
@@ -123,6 +150,13 @@ pub(super) async fn hold_retained_debt(
     controls: DownloadControls,
     result: &mut SyncResult,
 ) -> Result<()> {
+    if config
+        .selection_context
+        .as_ref()
+        .is_some_and(|context| context.format == 2)
+    {
+        return Ok(());
+    }
     if !controls.run_mode.downloads_files() {
         return Ok(());
     }
@@ -167,13 +201,19 @@ pub(crate) async fn context(
     {
         return Ok(None);
     }
+    let format = generation_format();
     let mut qualified = None;
     let mut profile = Vec::new();
     for pass in passes {
-        if !matches!(pass.kind, PassKind::Album | PassKind::Unfiled) {
+        if format == 1 && !matches!(pass.kind, PassKind::Album | PassKind::Unfiled) {
             return Ok(None);
         }
-        let Some((capture, scope, zone)) = pass.album.private_selection_scope()? else {
+        let scope_owner = if format == 1 {
+            pass.album.private_selection_scope()?
+        } else {
+            pass.album.download_scope()?
+        };
+        let Some((capture, scope, zone)) = scope_owner else {
             return Ok(None);
         };
         if zone.get("zoneName").and_then(Value::as_str) != Some(config.library.as_ref()) {
@@ -208,16 +248,46 @@ pub(crate) async fn context(
     };
     let mut excludes: Vec<_> = config.exclude_asset_ids.iter().collect();
     excludes.sort_unstable();
-    let profile = json!({"format":1,"coverage":"observed_selection_window","passes":profile,
+    let mut profile = json!({"format":format,"coverage":if format == 1 { "observed_selection_window" } else { "selected_downloads" },"passes":profile,
         "recent":config.recent,"recent_scope":format!("{:?}",config.recent_scope),"excludes":excludes});
-    let config_hash=digest(serde_json::to_vec(&json!({"format":1,"profile":profile,"scope":scope,"zone":zone,
-        "paths":hash_download_config(config),"anchored_root":SelectionPath::from_path(&std::path::absolute(&config.directory)?),
-        "before":config.skip_created_before.map(crate::config::CreatedDateFilter::fingerprint),"after":config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
-        "enum_hash":config.enum_config_hash.as_deref(),"metadata_flags":crate::download::pipeline::MetadataFlags::from(config).bits(),
-        "capture_revision":crate::state::METADATA_CAPTURE_REVISION,"capture_repair":format!("{:?}",config.capture_timestamp_repair),
-        "repair_truncated":config.repair_truncated,"attempt_limit":config.max_download_attempts,
-    }))?.as_slice());
+    let anchored_root = SelectionPath::from_path(&std::path::absolute(&config.directory)?);
+    let policy = |paths: String| {
+        json!({"format":1,"scope":scope,"zone":zone,
+            "paths":paths,"anchored_root":anchored_root,
+            "before":config.skip_created_before.map(crate::config::CreatedDateFilter::fingerprint),"after":config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
+            "enum_hash":config.enum_config_hash.as_deref(),"metadata_flags":crate::download::pipeline::MetadataFlags::from(config).bits(),
+            "capture_revision":crate::state::METADATA_CAPTURE_REVISION,"capture_repair":format!("{:?}",config.capture_timestamp_repair),
+            "repair_truncated":config.repair_truncated,"attempt_limit":config.max_download_attempts,
+        })
+    };
+    if format == 2 {
+        // Folder templates cannot revoke already admitted destinations. Keep
+        // all eligibility, rendition, metadata and archive-root guards.
+        let mut retained_policy = config.clone();
+        retained_policy.folder_structure.clear();
+        retained_policy.folder_structure_albums = Arc::from("");
+        retained_policy.folder_structure_smart_folders = Arc::from("");
+        profile["retry_policy"] = json!(digest(&serde_json::to_vec(&policy(
+            hash_download_config(&retained_policy)
+        ))?));
+        // Admission freezes destinations, not current selection eligibility.
+        // Keep root/rendition/metadata policy strict while allowing membership,
+        // date and filename filters to change. Current filters are checked on
+        // replay and can defer, never retire, an older obligation.
+        retained_policy.skip_created_before = None;
+        retained_policy.skip_created_after = None;
+        retained_policy.filename_exclude = Arc::from([]);
+        let mut retry_policy = policy(hash_download_config(&retained_policy));
+        retry_policy["before"] = Value::Null;
+        retry_policy["after"] = Value::Null;
+        retry_policy["enum_hash"] = Value::Null;
+        profile["admitted_retry_policy"] = json!(digest(&serde_json::to_vec(&retry_policy)?));
+    }
+    let mut fingerprint = policy(hash_download_config(config));
+    fingerprint["profile"] = profile.clone();
+    let config_hash = digest(&serde_json::to_vec(&fingerprint)?);
     Ok(Some(SelectionContext {
+        format,
         capture,
         scope,
         zone,
@@ -239,6 +309,7 @@ pub(crate) struct SelectionRun {
     pub(crate) held: AtomicBool,
     pub(crate) session_expired: AtomicBool,
     fresh_confirmation: bool,
+    retained_retry: bool,
     retry_sources: Arc<std::sync::Mutex<SelectionRetrySources>>,
 }
 
@@ -256,6 +327,17 @@ impl SelectionContext {
     }
 
     async fn current(&self) -> Result<Option<ActiveGeneration>> {
+        if self.format == 2 {
+            return Ok(self
+                .capture
+                .db
+                .current_download_generation(
+                    self.capture.owner.clone(),
+                    self.scope.clone(),
+                    self.config_hash.clone(),
+                )
+                .await?);
+        }
         Ok(self
             .capture
             .db
@@ -273,21 +355,29 @@ impl SelectionContext {
         config: &DownloadConfig,
     ) -> Result<Arc<SelectionRun>> {
         let spec = GenerationSpec {
-            format: 1,
+            format: self.format,
             scope: self.scope.clone(),
             zone: self.zone.clone(),
             config_hash: self.config_hash.clone(),
-            basis: self
-                .capture
-                .db
-                .selection_basis(self.capture.owner.clone(), self.scope.clone())
-                .await?,
+            basis: if self.format == 2 {
+                self.config_hash.clone()
+            } else {
+                self.capture
+                    .db
+                    .selection_basis(self.capture.owner.clone(), self.scope.clone())
+                    .await?
+            },
             profile: self.profile.clone(),
-            metadata_enabled: crate::download::pipeline::MetadataFlags::from(config)
-                .has_any_write(),
-            metadata_flags: crate::download::pipeline::MetadataFlags::from(config).bits(),
+            metadata_enabled: self.format == 1
+                && crate::download::pipeline::MetadataFlags::from(config).has_any_write(),
+            metadata_flags: if self.format == 1 {
+                crate::download::pipeline::MetadataFlags::from(config).bits()
+            } else {
+                0
+            },
         };
-        let root = if let Some(current) = self.current().await?
+        let root = if self.format == 1
+            && let Some(current) = self.current().await?
             && !current.sealed
         {
             current
@@ -307,6 +397,7 @@ impl SelectionContext {
             held: AtomicBool::new(false),
             session_expired: AtomicBool::new(false),
             fresh_confirmation: false,
+            retained_retry: false,
             retry_sources: Arc::clone(&self.retry_sources),
         }))
     }
@@ -316,6 +407,7 @@ impl SelectionContext {
         root: ActiveGeneration,
         passes: &[AlbumPass],
         fresh_confirmation: bool,
+        retained_retry: bool,
     ) -> Arc<SelectionRun> {
         Arc::new(SelectionRun {
             capture: self.capture.clone(),
@@ -327,6 +419,7 @@ impl SelectionContext {
             held: AtomicBool::new(false),
             session_expired: AtomicBool::new(false),
             fresh_confirmation,
+            retained_retry,
             retry_sources: Arc::clone(&self.retry_sources),
         })
     }
@@ -343,6 +436,7 @@ impl SelectionRun {
         config: &DownloadConfig,
     ) -> Result<()> {
         let mut sources = Vec::new();
+        let mut deferred = std::collections::HashSet::new();
         for task in tasks {
             for (pass_index, pass) in passes.iter().enumerate() {
                 let key = pass_key(pass);
@@ -352,7 +446,7 @@ impl SelectionRun {
                     .selection_decision(
                         self.capture.owner.clone(),
                         self.root.id.clone(),
-                        key,
+                        key.clone(),
                         task.asset_record_name.to_string(),
                     )
                     .await?
@@ -368,6 +462,19 @@ impl SelectionRun {
                     })
                 {
                     continue;
+                }
+                if self.root.spec.format == 2
+                    && deferred.insert((key.clone(), task.asset_record_name.to_string()))
+                {
+                    self.capture
+                        .db
+                        .defer_selection_confirmation(
+                            self.capture.owner.clone(),
+                            self.root.id.clone(),
+                            key,
+                            task.asset_record_name.to_string(),
+                        )
+                        .await?;
                 }
                 let (Some(body), Some(master)) =
                     (&manifest.decision.confirmation, &manifest.decision.master)
@@ -525,6 +632,10 @@ impl SelectionRun {
                 .await?;
             return Ok(());
         }
+        anyhow::ensure!(
+            self.root.spec.format == 1,
+            "Unconfirmed observation could not be retained; keep the source cursor"
+        );
         // A failed retry preserves the original unresolved intent. New raw
         // observations remain retained independently; a later strict proof may
         // bind their additional links in the atomic resolving transaction.
@@ -580,6 +691,15 @@ impl SelectionRun {
             retained: body,
             fresh,
         } = confirmation;
+        if self.retained_retry && plan.filter_reason.is_some() {
+            self.defer_confirmation(key, asset.asset_record_name().to_owned())
+                .await?;
+            tracing::warn!(
+                reason = "retained_selection_currently_filtered",
+                "Previously selected work remains pending under the current filters"
+            );
+            return Ok(false);
+        }
         let reason = if plan.malformed_resource.is_some() {
             "malformed_current_resource"
         } else if plan.filter_reason.is_some() {
@@ -597,6 +717,31 @@ impl SelectionRun {
                 asset.asset_record_name().to_owned(),
             )
             .await?;
+        // Choose verified historical reuse before freezing the physical
+        // destination. This is a read-only candidate; the producer rechecks
+        // its receipt and retained file inside the final adoption transaction.
+        if reason.is_empty()
+            && previous.as_ref().is_none_or(|value| {
+                value.decision.confirmation.is_none()
+                    && value.decision.outcome != SelectionOutcome::Selected
+            })
+        {
+            for task in &mut plan.tasks {
+                if let crate::download::baseline_matching::BaselineMatch::Present {
+                    receipt, ..
+                }
+                | crate::download::baseline_matching::BaselineMatch::ProviderPresent {
+                    receipt,
+                    ..
+                } = planner.match_existing(asset, config, task).await
+                {
+                    if task.download_path != receipt.local_path {
+                        planner.release_unpublished_task_claim(task);
+                        task.download_path = receipt.local_path;
+                    }
+                }
+            }
+        }
         let mut destinations = Vec::new();
         let mut records = Vec::new();
         if reason.is_empty() {
@@ -618,15 +763,30 @@ impl SelectionRun {
                     .await?;
                 for candidate in candidates {
                     let path = candidate.to_path();
-                    if filter::stored_path_matches_download_family(
-                        asset.state_id(),
-                        derived,
-                        &derived_paths,
-                        config,
-                        &path,
-                    ) && let Ok(fingerprint) =
-                        crate::download::file::fingerprint_downloaded_path(&config.directory, &path)
-                            .await
+                    let fulfilled = self
+                        .capture
+                        .db
+                        .selection_path_fulfills_pass(
+                            self.capture.owner.clone(),
+                            self.root.spec.scope.clone(),
+                            key.to_owned(),
+                            asset.asset_record_name().to_owned(),
+                            candidate.clone(),
+                        )
+                        .await?;
+                    if (fulfilled
+                        || filter::stored_path_matches_download_family(
+                            asset.state_id(),
+                            derived,
+                            &derived_paths,
+                            config,
+                            &path,
+                        ))
+                        && let Ok(fingerprint) = crate::download::file::fingerprint_downloaded_path(
+                            &config.directory,
+                            &path,
+                        )
+                        .await
                         && self
                             .capture
                             .db
@@ -655,7 +815,8 @@ impl SelectionRun {
                         .download_path
                         .clone()
                 } else if let Some(previous) = &previous
-                    && previous.decision.confirmation.is_some()
+                    && (previous.decision.confirmation.is_some()
+                        || previous.decision.outcome == SelectionOutcome::Selected)
                 {
                     previous
                         .decision
@@ -715,7 +876,9 @@ impl SelectionRun {
                 });
             }
         }
-        let sources = if let Some(previous) = &previous
+        let sources = if self.root.spec.format == 2 {
+            Vec::new()
+        } else if let Some(previous) = &previous
             && previous.decision.confirmation.is_some()
         {
             previous.sources.clone()
@@ -763,7 +926,10 @@ impl SelectionRun {
             .await?;
         if !projection.admitted && manifest.decision.outcome != SelectionOutcome::Excluded {
             tracing::debug!(reason = %projection.reason, "Selection destination admission deferred");
-            self.held.store(true, Ordering::Relaxed);
+            if self.root.spec.format == 1 {
+                self.held.store(true, Ordering::Relaxed);
+            }
+            tracing::warn!(reason = %projection.reason, "Selected work remains in the download ledger for retry");
             return Ok(false);
         }
         for destination in &manifest.decision.destinations {
@@ -859,6 +1025,7 @@ pub(crate) async fn has_due(
             context.scope,
             context.config_hash,
             root.id,
+            (context.format == 2).then_some(context.profile),
         )
         .await?
         .is_some();
@@ -880,10 +1047,13 @@ pub(super) async fn inventory(
     let captured_passes: Vec<_> = passes
         .iter()
         .map(|pass| AlbumPass {
-            album: pass
-                .album
-                .clone()
-                .with_rank_capture(&run.root.id, &pass_key(pass)),
+            album: if run.root.spec.format == 1 {
+                pass.album
+                    .clone()
+                    .with_rank_capture(&run.root.id, &pass_key(pass))
+            } else {
+                pass.album.clone()
+            },
             ..pass.clone()
         })
         .collect();
@@ -981,11 +1151,12 @@ pub(super) async fn inventory(
         result.checkpoint.identity_incomplete = true;
         result.block_incremental_token(DEFERRED_REASON)
     }
-    if context
-        .capture
-        .db
-        .unfinished_selection_debt(context.capture.owner.clone(), context.scope.clone())
-        .await?
+    if context.format == 1
+        && context
+            .capture
+            .db
+            .unfinished_selection_debt(context.capture.owner.clone(), context.scope.clone())
+            .await?
     {
         result.block_incremental_token(DEFERRED_REASON)
     }
@@ -1025,6 +1196,9 @@ async fn metadata_tail(
     context: &SelectionContext,
     generation: &str,
 ) -> Result<usize> {
+    if !config.refresh_metadata {
+        return Ok(0);
+    }
     let Some(db) = &config.state_db else {
         return Ok(0);
     };
@@ -1117,6 +1291,7 @@ async fn recover_retained(
             context.scope.clone(),
             context.config_hash.clone(),
             current.id.clone(),
+            (context.format == 2).then(|| context.profile.clone()),
         )
         .await?
     else {
@@ -1126,7 +1301,13 @@ async fn recover_retained(
         });
     };
     anyhow::ensure!(
-        root.spec.profile == current.spec.profile
+        (root.spec.profile == current.spec.profile
+            || (root.spec.format == 2
+                && current.spec.format == 2
+                && crate::state::db::provider_generations::retained_profiles_compatible(
+                    &root.spec.profile,
+                    &current.spec.profile
+                )))
             && root.spec.zone == current.spec.zone
             && root.spec.metadata_flags == current.spec.metadata_flags,
         "Retained selection configuration disagrees"
@@ -1136,7 +1317,28 @@ async fn recover_retained(
         .db
         .retained_selection_decisions(context.capture.owner.clone(), root.id.clone())
         .await?;
-    let run = context.replay_run(root.clone(), passes, true);
+    let run = context.replay_run(root.clone(), passes, true, true);
+    for decision in &decisions {
+        if !passes
+            .iter()
+            .any(|pass| pass_key(pass) == decision.decision.pass_key)
+        {
+            context
+                .capture
+                .db
+                .defer_selection_confirmation(
+                    context.capture.owner.clone(),
+                    root.id.clone(),
+                    decision.decision.pass_key.clone(),
+                    decision.decision.child.clone(),
+                )
+                .await?;
+            tracing::warn!(
+                reason = "retained_pass_not_selected",
+                "Previously selected work remains pending because its album is not selected"
+            );
+        }
+    }
     let mut combined = crate::download::pipeline::StreamingResult {
         enumeration_complete: true,
         ..crate::download::pipeline::StreamingResult::default()
@@ -1225,7 +1427,7 @@ async fn replay(
         .selection_context
         .as_ref()
         .context("Missing replay context")?;
-    let run = context.replay_run(root.clone(), passes, false);
+    let run = context.replay_run(root.clone(), passes, root.spec.format == 2, false);
     let started = Instant::now();
     let mut combined = Box::pin(recover_retained(
         client,
@@ -1304,7 +1506,7 @@ async fn replay(
         .db
         .complete_selection_metadata(context.capture.owner.clone(), root.id.clone())
         .await?;
-    if !root.checkpoint_ready || run.held.load(Ordering::Relaxed) {
+    if (root.spec.format == 1 && !root.checkpoint_ready) || run.held.load(Ordering::Relaxed) {
         result.block_incremental_token(match root.checkpoint_veto.as_deref() {
             Some(super::models::RECENT_LIMITED_FULL_ENUMERATION_REASON) => {
                 super::models::RECENT_LIMITED_FULL_ENUMERATION_REASON
@@ -1315,13 +1517,98 @@ async fn replay(
             _ => DEFERRED_REASON,
         });
     }
-    if context
-        .capture
-        .db
-        .unfinished_selection_debt(context.capture.owner.clone(), context.scope.clone())
-        .await?
+    if context.format == 1
+        && context
+            .capture
+            .db
+            .unfinished_selection_debt(context.capture.owner.clone(), context.scope.clone())
+            .await?
     {
         result.block_incremental_token(DEFERRED_REASON)
+    }
+    Ok(result)
+}
+
+/// Deliver already-routed observations to the same immutable destination
+/// owner used by baseline inventory. A quiet delta replays due work only.
+async fn deliver_delta(
+    client: &Client,
+    passes: &[AlbumPass],
+    config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
+    cancel: CancellationToken,
+    assets: Vec<(PhotoAsset, usize)>,
+) -> Result<SyncResult> {
+    let context = config
+        .selection_context
+        .as_ref()
+        .context("Missing download ledger context")?;
+    if assets.is_empty()
+        && let Some(root) = context.current().await?
+    {
+        return replay(client, passes, config, controls, cancel, root).await;
+    }
+    let run = context.start(passes, config).await?;
+    let started = Instant::now();
+    let mut combined =
+        recover_retained(client, passes, config, controls, cancel.clone(), &run.root).await?;
+    for (index, pass) in passes.iter().enumerate() {
+        if cancel.is_cancelled() || combined.provider_auth_errors > 0 {
+            combined.enumeration_complete = false;
+            break;
+        }
+        let selected: Vec<_> = assets
+            .iter()
+            .filter(|(_, selected)| *selected == index)
+            .map(|(asset, _)| Ok::<_, anyhow::Error>(asset.clone()))
+            .collect();
+        if selected.is_empty() {
+            continue;
+        }
+        let mut effective = config.with_pass(pass);
+        effective.selection_run = Some(run.clone());
+        effective.selection_pass = Some(pass_key(pass));
+        let result = crate::download::pipeline::stream_and_download_from_stream(
+            client,
+            futures_util::stream::iter(selected),
+            &Arc::new(effective),
+            controls,
+            0,
+            cancel.clone(),
+            crate::download::pipeline::StreamRuntime::new(None, None).deferring_metadata_drain(),
+        )
+        .await?;
+        run.remember_retry_sources(&result.failed, passes, config)
+            .await?;
+        super::models::merge_streaming_result(&mut combined, result);
+    }
+    let mut result = crate::download::pipeline::build_download_result(
+        client,
+        passes,
+        config,
+        controls,
+        combined,
+        started,
+        cancel.clone(),
+    )
+    .await?;
+    let accounted = !run.held.load(Ordering::Relaxed)
+        && result.checkpoint.state_write_failures == 0
+        && result.checkpoint.enumeration_errors == 0
+        && !result.checkpoint.enumeration_incomplete
+        && !cancel.is_cancelled();
+    context
+        .capture
+        .db
+        .seal_selection_generation(
+            context.capture.owner.clone(),
+            run.root.id.clone(),
+            accounted,
+            (!accounted).then(|| DEFERRED_REASON.to_owned()),
+        )
+        .await?;
+    if !accounted {
+        result.block_incremental_token(DEFERRED_REASON);
     }
     Ok(result)
 }
@@ -1336,6 +1623,7 @@ pub(super) async fn after_delta(
     cancel: CancellationToken,
     delta: IncrementalDeltaSummary,
     prior_cursor: &str,
+    assets: Vec<(PhotoAsset, usize)>,
 ) -> Result<SyncResult> {
     let context = config
         .selection_context
@@ -1354,20 +1642,28 @@ pub(super) async fn after_delta(
             .map_err(super::recent::RecentSelectionError)?;
     }
     let root = context.current().await?;
-    let selection = match root {
-        Some(root)
-            if !repeat_inventory
-                && (root.sealed
-                    || context
-                        .capture
-                        .db
-                        .selection_waiting_for_retry(context.capture.owner.clone(), root.id.clone())
-                        .await?) =>
-        {
-            replay(client, passes, config, controls, cancel.clone(), root).await
+    let selection = if context.format == 2 && !repeat_inventory {
+        deliver_delta(client, passes, config, controls, cancel.clone(), assets).await
+    } else {
+        match root {
+            Some(root)
+                if !repeat_inventory
+                    && (root.sealed
+                        || context
+                            .capture
+                            .db
+                            .selection_waiting_for_retry(
+                                context.capture.owner.clone(),
+                                root.id.clone(),
+                            )
+                            .await?) =>
+            {
+                replay(client, passes, config, controls, cancel.clone(), root).await
+            }
+            _ => inventory(client, passes, config, controls, cancel.clone()).await,
         }
-        _ => inventory(client, passes, config, controls, cancel.clone()).await,
     };
+
     let mut selected = if recent {
         selection.map_err(|error| {
             if crate::icloud::photos::session::is_session_error(&error) {
@@ -1401,6 +1697,7 @@ pub(super) async fn after_delta(
         stats,
         delta.sparse_identity_proofs,
         completed_delta_replay,
+        delta.inventory_rank_changed,
     );
     selected.outcome = merge_download_outcomes(&selected.outcome, &delta_result.outcome);
     selected.accumulate(&delta_result);

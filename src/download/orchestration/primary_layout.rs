@@ -1527,8 +1527,8 @@ pub(in crate::download) async fn plan_asset(
 }
 
 pub(super) async fn recover(
-    client: &reqwest::Client,
-    passes: &[crate::commands::AlbumPass],
+    _client: &reqwest::Client,
+    _passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
     cancel: &CancellationToken,
 ) -> Result<()> {
@@ -1541,45 +1541,61 @@ pub(super) async fn recover(
     if operations.is_empty() {
         return Ok(());
     }
-    let session = LayoutSession::load(db).await?;
     for mut op in operations {
-        let protected =
-            crate::download::legacy_preservation::protected_replacement_paths(Some(db)).await?;
-        file::recover_conditional_replacements(&op.root.to_path(), &protected).await?;
         if op.phase == "publishing" {
+            // Publication may already have consumed a stage. Its existing
+            // recovery handles installed links and repeats the catalogue guard.
+            db.save_primary_layout(op.clone()).await?;
+            let protected =
+                crate::download::legacy_preservation::protected_replacement_paths(Some(db)).await?;
+            file::recover_conditional_replacements(&op.root.to_path(), &protected).await?;
             finish(db, &mut op, cancel, &mut LayoutOutcome::default()).await?;
             continue;
         }
-        let mut matched = false;
-        for pass in passes {
-            let effective = config.with_pass(pass);
-            if effective.primary_layout_pass.as_deref() != Some(&op.pass) {
-                continue;
-            }
-            let current = pass
-                .album
-                .confirm_layout_asset(&op.asset_record_name, &op.library)
-                .await?
-                .asset
-                .with_state_record_name(Arc::from(op.child.as_str()));
-            if family(&current, &effective)? != op.family {
-                db.cancel_primary_layout(op.operation.clone()).await?;
-                matched = true;
-                break;
-            }
-            process_asset(client, current, &effective, &session, cancel).await?;
-            matched = true;
-            break;
+        if !matches!(op.phase.as_str(), "planned" | "prepared" | "preserved")
+            || op
+                .members
+                .iter()
+                .any(|member| member.stage.is_some() && member.prepared.is_none())
+        {
+            tracing::warn!(
+                reason = "retained_layout_operation",
+                "Interrupted layout work waits for recorded preparation evidence"
+            );
+            continue;
         }
-        if !matched {
-            db.cancel_primary_layout(op.operation.clone()).await?;
+        // Only recorded files and destinations participate. Rehash every
+        // prepared member before preservation/publication can change any file.
+        for member in &op.members {
+            if let Some(prepared) = &member.prepared {
+                anyhow::ensure!(
+                    member.stage.as_ref() == Some(&prepared.path) && member.destination.is_some(),
+                    "Recorded layout preparation has a different native stage"
+                );
+                validate_file(&op.root.to_path(), prepared).await?;
+            }
+            for file in [&member.preserved, &member.installed].into_iter().flatten() {
+                validate_file(&op.root.to_path(), file).await?;
+            }
         }
+        if op.phase == "planned" {
+            op.phase = "prepared".into();
+        }
+        // Even a same-phase save validates current catalogue facts atomically.
+        // A changed pass/root never cancels the operation or invents a successor.
+        db.save_primary_layout(op.clone()).await?;
+        #[cfg(all(test, target_os = "linux"))]
+        crate::test_helpers::process_death_point("layout-recovery-prepared");
+        let protected =
+            crate::download::legacy_preservation::protected_replacement_paths(Some(db)).await?;
+        file::recover_conditional_replacements(&op.root.to_path(), &protected).await?;
+        finish(db, &mut op, cancel, &mut LayoutOutcome::default()).await?;
     }
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         DownloadConfig, EditedNaming, LayoutOperation, LayoutOutcome, LayoutSession, decision,
         digest, family, file_receipt, finish, plan, recover, sidecar,
@@ -1599,13 +1615,24 @@ mod tests {
         root: &Path,
         filename: &str,
     ) -> LayoutOperation {
+        prepared_layout_in_library(db, root, filename, "PrimarySync").await
+    }
+
+    pub(crate) async fn prepared_layout_in_library(
+        db: &Arc<SqliteStateDb>,
+        root: &Path,
+        filename: &str,
+        library: &str,
+    ) -> LayoutOperation {
         let asset = TestPhotoAsset::new(filename)
             .filename(filename)
             .orig_size(PREPARED.len() as u64)
             .orig_checksum("synthetic-provider-checksum")
-            .build();
+            .build()
+            .with_source_zone(library.into());
         let config = DownloadConfig {
             directory: Arc::from(root),
+            library: Arc::from(library),
             folder_structure: String::new(),
             edited_naming: EditedNaming::Primary,
             state_db: Some(db.clone()),
@@ -1843,4 +1870,5 @@ mod tests {
             }
         }
     }
+    mod normal_boundary_tests;
 }

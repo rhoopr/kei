@@ -73,6 +73,15 @@ fn single_unfiled_streaming_pass<'a>(
         .filter(|pass| pass.kind == crate::commands::PassKind::Unfiled)
 }
 
+fn collection_independent_rank(passes: &[crate::commands::AlbumPass]) -> bool {
+    !passes.is_empty()
+        && passes.iter().all(|pass| {
+            pass.kind == crate::commands::PassKind::Unfiled
+                && pass.exclude_ids.is_empty()
+                && pass.album.has_collection_independent_rank()
+        })
+}
+
 fn stream_incremental_assets_for_single_unfiled_pass(
     pass: crate::commands::AlbumPass,
     config: Arc<DownloadConfig>,
@@ -86,7 +95,10 @@ fn stream_incremental_assets_for_single_unfiled_pass(
 ) {
     let capacity = config.concurrent_downloads.saturating_mul(2).max(1);
     let (asset_tx, asset_rx) = mpsc::channel::<Result<PhotoAsset>>(capacity);
-    let (mut change_stream, token_rx) = pass.album.changes_stream(&zone_sync_token);
+    let (mut change_stream, token_rx, observed) = pass.album.changes_stream_observed(
+        &zone_sync_token,
+        collection_independent_rank(std::slice::from_ref(&pass)),
+    );
     let handle = tokio::spawn(async move {
         let mut delta = IncrementalDeltaState::new(std::slice::from_ref(&pass));
         let routing = IncrementalPassRouting::from_passes(std::slice::from_ref(&pass));
@@ -172,6 +184,7 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             () = asset_tx.closed() => None,
             token = token_rx => token.ok(),
         };
+        delta.summary.inventory_rank_changed |= observed.load(std::sync::atomic::Ordering::Relaxed);
         delta.record_completion(token);
         hydrate_unpaired_created_asset_deltas(
             &mut unpaired_asset_events,
@@ -354,6 +367,7 @@ async fn download_photos_incremental_streaming(
         stats,
         delta_summary.sparse_identity_proofs,
         completed_delta_replay,
+        delta_summary.inventory_rank_changed,
     ))
 }
 
@@ -445,7 +459,7 @@ async fn apply_changed_provider_metadata(
     if !download_ctx.has_provider_metadata_drift(library, asset.state_id(), &capture) {
         return;
     }
-    let mark_for_rewrite = MetadataFlags::from(config).has_any_write();
+    let mark_for_rewrite = config.refresh_metadata && MetadataFlags::from(config).has_any_write();
     let refresh = db
         .refresh_downloaded_asset_metadata(
             library,
@@ -489,7 +503,7 @@ async fn run_collecting_metadata_rewrite_batch(
     run_mode: DownloadRunMode,
     shutdown_token: &CancellationToken,
 ) -> usize {
-    if !run_mode.downloads_files() {
+    if !run_mode.downloads_files() || !config.refresh_metadata {
         return 0;
     }
     let Some(db) = &config.state_db else {
@@ -555,7 +569,9 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     // cycle with work.
     if let Some(pass) = delta_pass {
         let phase_started = Instant::now();
-        let (mut change_stream, token_rx) = pass.album.changes_stream(zone_sync_token);
+        let (mut change_stream, token_rx, observed) = pass
+            .album
+            .changes_stream_observed(zone_sync_token, collection_independent_rank(passes));
 
         loop {
             let result = tokio::select! {
@@ -579,6 +595,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             () = shutdown_token.cancelled() => None,
             token = token_rx => token.ok(),
         };
+        delta.summary.inventory_rank_changed |= observed.load(std::sync::atomic::Ordering::Relaxed);
         delta.record_completion(token);
         tracing::debug!(
             phase_elapsed = %format_duration(phase_started.elapsed()),
@@ -776,6 +793,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             stats,
             delta_summary.sparse_identity_proofs,
             completed_delta_replay,
+            delta_summary.inventory_rank_changed,
         ));
     }
 
@@ -788,6 +806,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             shutdown_token,
             delta_summary,
             zone_sync_token,
+            downloadable_assets,
         ))
         .await;
     }
@@ -797,7 +816,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             passes,
             config,
             zone_sync_token,
-            delta_summary.total_events > 0,
+            delta_summary.inventory_rank_changed,
         )
         .await
         .map_err(super::recent::RecentSelectionError)?
@@ -834,6 +853,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 stats,
                 delta_summary.sparse_identity_proofs,
                 completed_delta_replay,
+                delta_summary.inventory_rank_changed,
             ));
         }
         // Delta arrival is not an ordered library/pass inventory. Reuse the
@@ -878,6 +898,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             delta_stats,
             delta_summary.sparse_identity_proofs,
             completed_delta_replay,
+            delta_summary.inventory_rank_changed,
         );
         selected.outcome = merge_download_outcomes(&selected.outcome, &delta_result.outcome);
         selected.accumulate(&delta_result);
@@ -973,6 +994,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             stats,
             delta_summary.sparse_identity_proofs,
             completed_delta_replay,
+            delta_summary.inventory_rank_changed,
         ));
     }
 
@@ -1267,6 +1289,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             stats,
             delta_summary.sparse_identity_proofs,
             completed_delta_replay,
+            delta_summary.inventory_rank_changed,
         ));
     }
 
@@ -1306,6 +1329,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             stats,
             delta_summary.sparse_identity_proofs,
             completed_delta_replay,
+            delta_summary.inventory_rank_changed,
         ));
     }
 
@@ -1495,6 +1519,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             stats,
             delta_summary.sparse_identity_proofs,
             completed_delta_replay,
+            delta_summary.inventory_rank_changed,
         ));
     }
 
@@ -1525,6 +1550,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         stats,
         delta_summary.sparse_identity_proofs,
         completed_delta_replay,
+        delta_summary.inventory_rank_changed,
     ))
 }
 

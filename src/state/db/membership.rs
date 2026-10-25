@@ -26,6 +26,7 @@ pub(super) fn refresh_asset_album_groupings_tx(
     )? {
         return Ok(());
     }
+    super::provider_generations::freeze_metadata_identity(tx, library, asset_id)?;
     let operation = "refresh_asset_album_groupings";
     let mut stmt = tx
         .prepare_cached(
@@ -187,6 +188,7 @@ impl SqliteStateDb {
             let tx = conn
                 .transaction()
                 .map_err(|e| StateError::query("add_asset_album::begin", e))?;
+            super::provider_generations::freeze_metadata_identity(&tx, &library, &asset_id)?;
             let changed = tx
                 .execute(
                     "INSERT OR IGNORE INTO asset_albums (library, asset_id, album_name, source) \

@@ -314,3 +314,6 @@ pub(super) async fn append_targeted_recovery_to_sync_result(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod baseline_tests;

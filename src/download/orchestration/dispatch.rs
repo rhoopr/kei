@@ -17,7 +17,7 @@ use super::full::{
     download_photos_full_with_token_policy,
 };
 use super::incremental::download_photos_incremental;
-use super::maintenance::{has_metadata_backfill_work, run_metadata_capture_repair};
+use super::maintenance::MetadataCaptureRepair;
 use super::models::{
     DownloadControls, DownloadOutcome, FullEnumerationReason, SMART_FOLDER_REFRESH_FAILED_REASON,
     SyncMode, SyncResult, SyncStats, TARGETED_ALBUM_BACKFILL_FAILED_REASON,
@@ -46,6 +46,12 @@ enum IncrementalErrorClass {
 /// would likely hit the same service condition. Other static/decode errors
 /// fall back so malformed token responses do not strand the user.
 fn classify_incremental_error(error: &anyhow::Error) -> IncrementalErrorClass {
+    if error
+        .downcast_ref::<crate::icloud::photos::error::UnaccountedChangeError>()
+        .is_some()
+    {
+        return IncrementalErrorClass::CaptureRefused;
+    }
     if is_provider_session_error(error) {
         return IncrementalErrorClass::SessionExpired;
     }
@@ -341,16 +347,12 @@ async fn download_photos_with_sync_inner(
         )
         .await;
     }
-    let primary_layout_requested = config.edited_naming == crate::types::EditedNaming::Primary
-        || match &config.state_db {
-            Some(db) => db.has_primary_layouts(&config.library).await?,
-            None => false,
-        };
-    let primary_layout_active = controls.run_mode.downloads_files() && primary_layout_requested;
-    let primary_layout_preview = !controls.run_mode.downloads_files() && primary_layout_requested;
+    // Primary naming controls new filenames. Ordinary sync uses the shared
+    // matcher and append-only transfer path, never archive layout convergence.
+    let primary_layout_active = false;
     let config = Arc::new(DownloadConfig {
-        primary_layout_active,
-        primary_layout_preview,
+        primary_layout_active: false,
+        primary_layout_preview: false,
         ..config.as_ref().clone()
     });
     let sync_started_at = chrono::Utc::now().timestamp();
@@ -363,7 +365,7 @@ async fn download_photos_with_sync_inner(
         crate::download::file::recover_conditional_replacements(&config.directory, &protected)
             .await?;
     }
-    if primary_layout_active {
+    if controls.run_mode.downloads_files() {
         super::primary_layout::recover(download_client, passes, &config, &shutdown_token).await?;
     }
     if controls.run_mode.downloads_files() {
@@ -374,8 +376,9 @@ async fn download_photos_with_sync_inner(
     {
         backfill_asset_master_mappings_from_album_history(db.as_ref()).await;
     }
-    let metadata_capture_repair =
-        run_metadata_capture_repair(passes, &config, controls, &shutdown_token).await;
+    // Historical metadata queues retain their existing records. They do not
+    // hydrate or rewrite the archive as a prerequisite of normal v27 sync.
+    let metadata_capture_repair = MetadataCaptureRepair::default();
     if metadata_capture_repair.auth_errors > 0 {
         return Ok(SyncResult {
             outcome: DownloadOutcome::SessionExpired {
@@ -501,27 +504,6 @@ async fn download_photos_with_sync_inner(
                 &config,
                 controls,
                 shutdown_token.clone(),
-            )
-            .await
-        }
-        // Revision repair already owns stale catalogue rows. Re-enumerating the
-        // library cannot resolve ambiguous identity and defeats its batch bound.
-        SyncMode::Incremental { .. }
-            if metadata_capture_repair.stats.metadata_capture_remaining == 0
-                && has_metadata_backfill_work(&config).await =>
-        {
-            let reason = FullEnumerationReason::MetadataBackfill;
-            tracing::info!(
-                full_enumeration_reason = reason.as_str(),
-                "Metadata backfill requires full enumeration, skipping incremental sync"
-            );
-            download_photos_full_with_reason(
-                download_client,
-                passes,
-                &config,
-                controls,
-                shutdown_token.clone(),
-                reason,
             )
             .await
         }

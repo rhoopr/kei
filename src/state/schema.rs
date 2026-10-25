@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 36;
+pub(crate) const SCHEMA_VERSION: i32 = 37;
 
 fn migrate_active_selection(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(r"CREATE TABLE IF NOT EXISTS provider_active_generations (
@@ -1420,6 +1420,30 @@ pub(crate) fn migrate_to_version(
         34 => migrate_active_selection(conn)?,
         35 => conn.execute_batch(super::db::primary_layout::DDL)?,
         36 => summary = Some(migrate_provider_transport_index(conn)?),
+        37 => {
+            for column in ["frozen_metadata", "frozen_metadata_hash"] {
+                if !column_exists(conn, "provider_active_destinations", column)? {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE provider_active_destinations ADD COLUMN {column} BLOB;"
+                    ))?;
+                }
+            }
+            if !column_exists(conn, "owned_temp_files", "publication")? {
+                conn.execute_batch("ALTER TABLE owned_temp_files ADD COLUMN publication TEXT;")?;
+            }
+            if !column_exists(conn, "asset_metadata_paths", "preserved_path_key")? {
+                conn.execute_batch(
+                    "ALTER TABLE asset_metadata_paths ADD COLUMN preserved_path_key TEXT;",
+                )?;
+            }
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_receipt_preserved_path ON asset_metadata_paths(preserved_path_key) WHERE preserved_path_key IS NOT NULL;")?;
+            conn.execute_batch(super::db::download_receipts::DDL)?;
+            if !column_exists(conn, "provider_active_decisions", "compacted_hash")? {
+                conn.execute_batch(
+                    "ALTER TABLE provider_active_decisions ADD COLUMN compacted_hash TEXT;",
+                )?;
+            }
+        }
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,

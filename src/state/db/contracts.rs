@@ -38,6 +38,20 @@ pub struct ImportedRecord {
     pub imported_mtime: Option<i64>,
 }
 
+/// Source-byte receipt used by baseline matching, never an identity alias.
+#[derive(Debug, Clone)]
+pub(crate) struct BaselineReceipt {
+    pub(crate) is_current_path: bool,
+    pub(crate) library: String,
+    pub(crate) id: String,
+    pub(crate) version_size: VersionSizeKey,
+    pub(crate) provider_checksum: String,
+    pub(crate) provider_size: u64,
+    pub(crate) local_path: PathBuf,
+    pub(crate) local_checksum: Option<String>,
+    pub(crate) source_checksum: Option<String>,
+}
+
 /// Compact downloaded-state projection used to preload sync decisions.
 #[derive(Debug)]
 pub(crate) struct DownloadedFileRecord {
@@ -117,6 +131,8 @@ pub(crate) struct SelectionMetadataReceipt {
     pub(crate) pass_key: String,
     pub(crate) child: String,
     pub(crate) grouping_hash: String,
+    pub(crate) frozen_groupings: Option<(Vec<String>, Vec<String>)>,
+    pub(crate) frozen_metadata_hash: Option<String>,
     pub(crate) metadata_flags: u8,
     pub(crate) prepared: Option<(String, u64)>,
 }
@@ -299,6 +315,11 @@ pub(crate) trait ReconciliationStateStore: Send + Sync {
 /// State projections used to preload download decisions and publication receipts.
 #[async_trait]
 pub(crate) trait DownloadContextStateStore: Send + Sync {
+    /// Account-owned receipt candidates. Missing provenance remains explicit.
+    async fn get_baseline_receipts(&self) -> Result<Vec<BaselineReceipt>, StateError> {
+        Ok(Vec::new())
+    }
+
     async fn get_downloaded_file_records(&self) -> Result<Vec<DownloadedFileRecord>, StateError>;
 
     /// Historical content is visible only to the preservation owner, which
@@ -339,6 +360,24 @@ pub(crate) trait DownloadContextStateStore: Send + Sync {
 /// State operations for the temporary-file ownership ledger.
 #[async_trait]
 pub(crate) trait TempFileOwnershipStore: Send + Sync {
+    async fn prepare_temp_publication(
+        &self,
+        _part: &Path,
+        _proof: &super::PreparedPublication,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "prepare_temp_publication",
+            detail: "store cannot retain prepared publication evidence".into(),
+        })
+    }
+    async fn get_prepared_publications(
+        &self,
+        _library: &str,
+        _id: &str,
+        _version: VersionSizeKey,
+    ) -> Result<Vec<super::PreparedPublication>, StateError> {
+        Ok(Vec::new())
+    }
     async fn claim_temp_file(&self, path: &Path) -> Result<(), StateError>;
     async fn get_owned_temp_files_before(
         &self,
@@ -436,6 +475,38 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<bool, StateError>;
 
     async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError>;
+    async fn defer_baseline_match(&self, _record: &AssetRecord) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "defer_baseline_match",
+            detail: "durable matching retry is unavailable in this store".into(),
+        })
+    }
+    /// Record read-only reuse after rechecking the original source receipt.
+    async fn adopt_baseline_receipt(
+        &self,
+        _record: &AssetRecord,
+        _receipt: &BaselineReceipt,
+        _validate_file: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "adopt_baseline_receipt",
+            detail: "read-only receipt adoption is unavailable in this store".into(),
+        })
+    }
+
+    /// Read-only adoption after a complete supported provider-signature check.
+    async fn adopt_provider_signature(
+        &self,
+        _record: &AssetRecord,
+        _receipt: &BaselineReceipt,
+        _validate_file: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "adopt_provider_signature",
+            detail: "provider-verified adoption is unavailable in this store".into(),
+        })
+    }
+
     /// Persist the result of a landed local file.
     ///
     /// `mark_downloaded` and `mark_soft_deleted` may target the same
@@ -742,6 +813,11 @@ pub trait ImportStateStore: Send + Sync {
 )]
 #[async_trait]
 pub trait ReportStateStore: Send + Sync {
+    /// Ordinary transfer debt wakes quiet provider cycles independently of metadata.
+    async fn has_download_retry_work(&self, _library: &str) -> Result<bool, StateError> {
+        // Stores without a scoped implementation must not authorize skipping work.
+        Ok(true)
+    }
     async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError>;
     async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError>;
     async fn get_failed_page(

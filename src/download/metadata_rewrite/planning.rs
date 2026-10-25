@@ -77,11 +77,6 @@ impl From<&crate::config::MetadataConfig> for MetadataFlags {
     }
 }
 
-#[must_use]
-pub(crate) fn writers_enabled(metadata: &crate::config::MetadataConfig) -> bool {
-    MetadataFlags::from(metadata).has_any_write()
-}
-
 pub(super) fn gps_from_payload(
     payload: &MetadataPayload,
 ) -> Option<crate::download::metadata::GpsCoords> {

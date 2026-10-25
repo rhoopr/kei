@@ -17,7 +17,7 @@ pub enum DownloadOutcome {
     Success,
     /// Session expired mid-sync; caller should re-authenticate and retry.
     SessionExpired { auth_error_count: usize },
-    /// Some downloads failed (not session-related).
+    /// Some selected work failed or remains unresolved (not session-related).
     PartialFailure { failed_count: usize },
 }
 
@@ -222,6 +222,8 @@ pub(crate) struct CheckpointEvidence {
     /// selection also ran or source progress remains held. Any offered successor
     /// belongs to that replay. A rank query never sets this evidence.
     pub(crate) completed_delta_replay: bool,
+    /// A baseline rank scan must be repeated after observed provider mutations.
+    pub(crate) inventory_rank_changed: bool,
     /// The provider explicitly rejected the retained changes/zone cursor.
     /// Static decoding failures and rank-query tokens do not prove expiry.
     pub(crate) retained_token_rejected: bool,
@@ -258,6 +260,7 @@ impl CheckpointEvidence {
         self.identity_incomplete |= other.identity_incomplete;
         self.sync_token_blocked |= other.sync_token_blocked;
         self.completed_delta_replay |= other.completed_delta_replay;
+        self.inventory_rank_changed |= other.inventory_rank_changed;
         self.retained_token_rejected |= other.retained_token_rejected;
         self.retry_passes.extend(other.retry_passes.iter().cloned());
         self.revalidate_records
@@ -287,10 +290,12 @@ impl SyncResult {
         stats: SyncStats,
         proofs: Vec<crate::state::SparseIdentityProof>,
         completed_delta_replay: bool,
+        inventory_rank_changed: bool,
     ) -> Self {
         let mut result = Self::from_execution(outcome, sync_token, stats);
         result.checkpoint.sparse_identity_proofs = proofs;
         result.checkpoint.completed_delta_replay = completed_delta_replay;
+        result.checkpoint.inventory_rank_changed = inventory_rank_changed;
         result
     }
 
@@ -813,6 +818,8 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
 pub struct SkipBreakdown {
     pub by_state: usize,
     pub on_disk: usize,
+    /// Retained matching work without sufficient content evidence.
+    pub uncertain: usize,
     pub by_media_type: usize,
     pub by_date_range: usize,
     pub by_live_photo: usize,
@@ -828,6 +835,7 @@ impl SkipBreakdown {
     pub fn total(&self) -> usize {
         self.by_state
             + self.on_disk
+            + self.uncertain
             + self.by_media_type
             + self.by_date_range
             + self.by_live_photo
@@ -844,6 +852,7 @@ impl SkipBreakdown {
     pub fn accumulate(&mut self, other: &SkipBreakdown) {
         self.by_state += other.by_state;
         self.on_disk += other.on_disk;
+        self.uncertain += other.uncertain;
         self.by_media_type += other.by_media_type;
         self.by_date_range += other.by_date_range;
         self.by_live_photo += other.by_live_photo;

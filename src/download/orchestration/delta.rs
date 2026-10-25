@@ -448,6 +448,7 @@ impl<'a> IncrementalDeltaState<'a> {
 
 #[derive(Debug, Default)]
 pub(super) struct IncrementalDeltaSummary {
+    pub(super) inventory_rank_changed: bool,
     pub(super) sparse_target_stats: crate::download::SyncStats,
     pub(super) sparse_identity_proofs: Vec<SparseIdentityProof>,
     pub(super) identity_incomplete: bool,

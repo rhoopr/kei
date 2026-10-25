@@ -4,6 +4,18 @@ use serde_json::Value;
 
 pub(crate) async fn existing_session_for_validation()
 -> Result<(super::session::Session, String), &'static str> {
+    let (session, root, _) = existing_session_and_owner_for_validation().await?;
+    Ok((session, root))
+}
+
+pub(crate) async fn existing_session_and_owner_for_validation() -> Result<
+    (
+        super::session::Session,
+        String,
+        crate::state::db::account::AccountOwner,
+    ),
+    &'static str,
+> {
     if std::env::var("KEI_SESSION_CURSOR_PROBE").as_deref() != Ok("1") {
         return Err("explicit session probe opt-in is missing");
     }
@@ -55,7 +67,9 @@ pub(crate) async fn existing_session_for_validation()
         .and_then(|services| services.ckdatabasews.as_ref())
         .map(|endpoint| endpoint.url.clone())
         .ok_or("validated Photos endpoint missing")?;
-    Ok((session, root))
+    let owner = crate::state::db::account::AccountOwner::authenticated(&username, "com", &data)
+        .map_err(|_| "authenticated state owner unavailable")?;
+    Ok((session, root, owner))
 }
 
 #[tokio::test]

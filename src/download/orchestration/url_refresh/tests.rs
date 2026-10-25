@@ -1174,3 +1174,206 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
         server.verify().await;
     }
 }
+
+#[tokio::test]
+async fn ordinary_500_cleanup_preserves_selected_album_and_unfiled_tasks() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    #[derive(Clone, Debug)]
+    struct LookupOnly(Arc<Vec<Value>>);
+    #[async_trait::async_trait]
+    impl PhotosSession for LookupOnly {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            assert!(
+                url.contains("/records/lookup?"),
+                "ordinary 500 cleanup must never enumerate ranks"
+            );
+            Ok(json!({"records": self.0.as_ref()}))
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    for changed_generation in [false, true] {
+        for unfiled in [false, true] {
+            let server = crate::start_wiremock_or_skip!();
+            let bytes = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
+            Mock::given(method("GET"))
+                .and(path("/old"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/fresh"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+                .expect(u64::from(!changed_generation))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/excluded"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let mut old = incremental_photo_records_with_url(
+                "SELECTED",
+                "selected.jpg",
+                &format!("{}/old", server.uri()),
+                bytes.len() as u64,
+            );
+            let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+            old[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+            let mut fresh = old.clone();
+            fresh[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+                json!(format!("{}/fresh", server.uri()));
+            if changed_generation {
+                fresh[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+                    json!("different-generation");
+            }
+            let excluded = incremental_photo_records_with_url(
+                "EXCLUDED",
+                "excluded.jpg",
+                &format!("{}/excluded", server.uri()),
+                bytes.len() as u64,
+            );
+            let unfiled_pass = AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session_and_retry_config(
+                    "PrimarySync",
+                    "",
+                    None,
+                    RetryConfig {
+                        max_retries: 0,
+                        base_delay_secs: 0,
+                        max_delay_secs: 0,
+                    },
+                    Box::new(LookupOnly(Arc::new(fresh))),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            };
+            let mut named = unfiled_pass.clone();
+            named.kind = PassKind::Album;
+            named.album.name = "Album A".into();
+            let passes = vec![named, unfiled_pass];
+            let dir = TempDir::new().unwrap();
+            let db_path = dir.path().join("state.db");
+            let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+            let mut config = test_config();
+            config.directory = Arc::from(dir.path().join("media"));
+            config.state_db = Some(db.clone());
+            config.folder_structure = "Unfiled".into();
+            config.folder_structure_albums = "{album}".into();
+            config.filename_exclude = Arc::from([glob::Pattern::new("excluded.jpg").unwrap()]);
+            config.retry = RetryConfig {
+                max_retries: 0,
+                base_delay_secs: 0,
+                max_delay_secs: 0,
+            };
+            let stream_config = Arc::new(config.with_pass(&passes[usize::from(unfiled)]));
+            let config = Arc::new(config);
+            let client = Client::new();
+            let controls = DownloadControls::download_hidden();
+            let streaming = pipeline::stream_and_download_from_stream(
+                &client,
+                futures_util::stream::iter(vec![
+                    Ok(PhotoAsset::new(old[0].clone(), old[1].clone())),
+                    Ok(PhotoAsset::new(excluded[0].clone(), excluded[1].clone())),
+                ]),
+                &stream_config,
+                controls,
+                2,
+                CancellationToken::new(),
+                pipeline::StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert!(!streaming.url_expired_abort);
+            assert_eq!(streaming.failed.len(), 1);
+            let original = streaming.failed[0].clone();
+            assert!(
+                original
+                    .download_path
+                    .starts_with(config.directory.join(if unfiled {
+                        "Unfiled"
+                    } else {
+                        "Album A"
+                    }))
+            );
+            // Check the exact refresh owner used by outcome aggregation preserves
+            // first-pass selection, metadata and publication-proof requirements.
+            let refreshed = super::refresh_failed_download_urls(
+                &passes,
+                &streaming.failed,
+                &CancellationToken::new(),
+                None,
+            )
+            .await;
+            assert_eq!(refreshed.tasks.len(), usize::from(!changed_generation));
+            if let Some(task) = refreshed.tasks.first() {
+                assert_eq!(task.download_path, original.download_path);
+                assert_eq!(
+                    task.pending_cross_parent_root,
+                    original.pending_cross_parent_root
+                );
+                assert_eq!(
+                    task.replacement_fingerprint,
+                    original.replacement_fingerprint
+                );
+                assert_eq!(
+                    serde_json::to_value(task.metadata.as_ref()).unwrap(),
+                    serde_json::to_value(original.metadata.as_ref()).unwrap()
+                );
+                assert_eq!(task.checksum, original.checksum);
+            }
+            // This wrapper executes build_download_result and its actual cleanup pass.
+            let (_, stats) = pipeline::build_download_outcome(
+                &client,
+                &passes,
+                &config,
+                controls,
+                streaming,
+                Instant::now(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(stats.downloaded, usize::from(!changed_generation));
+            assert_eq!(stats.failed, usize::from(changed_generation));
+            let reopened = SqliteStateDb::open(&db_path).await.unwrap();
+            let summary = reopened.get_summary().await.unwrap();
+            assert_eq!(summary.downloaded, u64::from(!changed_generation));
+            assert_eq!(
+                summary.pending + summary.failed,
+                u64::from(changed_generation)
+            );
+            if !changed_generation {
+                let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].local_path.as_ref(), Some(&original.download_path));
+                assert_eq!(rows[0].checksum.as_ref(), checksum.as_str());
+                assert_eq!(
+                    rows[0].local_checksum.as_deref(),
+                    Some(
+                        data_encoding::HEXLOWER
+                            .encode(&Sha256::digest(bytes))
+                            .as_str()
+                    )
+                );
+                assert_eq!(std::fs::read(&original.download_path).unwrap(), bytes);
+            } else {
+                assert!(!original.download_path.exists());
+            }
+            server.verify().await;
+        }
+    }
+}

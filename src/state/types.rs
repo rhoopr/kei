@@ -392,7 +392,7 @@ pub struct AssetRecord {
     pub library: Arc<str>,
     /// iCloud asset ID (recordName).
     pub id: Box<str>,
-    /// SHA256 checksum of the file.
+    /// Opaque iCloud/MMCS resource-generation signature, not a local SHA-256.
     pub checksum: Box<str>,
     /// Original filename from iCloud.
     pub filename: Box<str>,

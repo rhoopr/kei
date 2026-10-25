@@ -27,6 +27,119 @@ pub(in crate::download) async fn recover_current_pending_publication(
         !shutdown.is_cancelled(),
         "Current publication recovery cancelled"
     );
+    if is_asset_filtered(asset, config).is_none() {
+        let library = effective_asset_library(asset, config);
+        let derived_paths = derive_expected_paths(asset, config);
+        if let Some(derived) = derived_paths
+            .iter()
+            .find(|path| path.version_size == version)
+        {
+            for proof in db
+                .get_prepared_publications(library, asset.state_id(), version)
+                .await?
+            {
+                let destination = proof.destination.to_path();
+                if proof.provider_checksum != derived.checksum.as_ref()
+                    || proof.provider_size != derived.size
+                    || !stored_path_matches_download_family(
+                        asset.state_id(),
+                        derived,
+                        &derived_paths,
+                        config,
+                        &destination,
+                    )
+                    || !planner.retry_path_allowed(
+                        library,
+                        asset.state_id(),
+                        version,
+                        &proof.provider_checksum,
+                        proof.provider_size,
+                        &destination,
+                    )
+                {
+                    continue;
+                }
+                let _guard =
+                    crate::download::file::lock_download_destination(&destination, shutdown)
+                        .await?;
+                let retained = match crate::download::file::retain_pending_file(
+                    &config.directory,
+                    &destination,
+                )
+                .await?
+                {
+                    Some(retained) => retained,
+                    None => {
+                        let temporary = proof.temporary.to_path();
+                        // Recheck the existing owner and current provider generation
+                        // before publishing. This is idempotent and never claims a
+                        // different part or discards older unfinished evidence.
+                        db.prepare_temp_publication(&temporary, &proof).await?;
+                        let mut completed = crate::download::file::DownloadedFile::reopen_prepared(
+                            &config.directory,
+                            &temporary,
+                            &proof.local_checksum,
+                        )
+                        .await?;
+                        ensure!(
+                            !shutdown.is_cancelled(),
+                            "Prepared publication recovery cancelled"
+                        );
+                        completed
+                            .publish(
+                                &destination,
+                                crate::download::file::FinalPublication::NoReplace,
+                            )
+                            .await?;
+                        completed
+                            .retain_pending_publication(&config.directory, &destination)
+                            .await?
+                    }
+                };
+                if data_encoding::HEXLOWER.encode(&retained.fingerprint.sha256)
+                    != proof.local_checksum
+                {
+                    continue;
+                }
+                retained.validate().await?;
+                ensure!(
+                    !shutdown.is_cancelled(),
+                    "Prepared publication recovery cancelled"
+                );
+                match db
+                    .mark_verified_download(
+                        library,
+                        asset.state_id(),
+                        version.as_str(),
+                        &destination,
+                        &proof.local_checksum,
+                        Some(&proof.source_checksum),
+                        false,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        planner.add_downloaded_paths(vec![crate::state::DownloadedFileRecord {
+                            added_at: None,
+                            is_current_path: true,
+                            is_preserved_history: false,
+                            library: library.to_owned(),
+                            id: asset.state_id().to_owned(),
+                            version_size: version,
+                            checksum: proof.provider_checksum,
+                            local_path: Some(destination.clone()),
+                            local_checksum: Some(proof.local_checksum.clone()),
+                            download_checksum: Some(proof.local_checksum),
+                        }]);
+                        return Ok(Some(PendingOnDiskAdoption::Adopted(destination)));
+                    }
+                    Err(_) => {
+                        return Ok(Some(PendingOnDiskAdoption::StateWriteFailed(destination)));
+                    }
+                }
+            }
+        }
+    }
     // Managed selection and layout journals keep their publication owner.
     if config.selection_run.is_some()
         || planner.managed_layout_session().is_some()

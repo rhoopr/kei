@@ -14,8 +14,12 @@
 pub(crate) mod account;
 mod asset_writes;
 mod assets;
+mod baseline_adoption;
+#[cfg(test)]
+mod baseline_adoption_tests;
 mod checkpoints;
 mod contracts;
+pub(crate) mod download_receipts;
 mod identity;
 mod import;
 mod legacy_preservation;
@@ -45,6 +49,8 @@ pub(crate) use sparse_identity::{
 };
 mod rows;
 mod temp_files;
+mod upgrade;
+pub(crate) use temp_files::PreparedPublication;
 
 pub use contracts::{
     AlbumMembershipRecord, CaptureRepairReceipt, DownloadStateStore, ImportStateStore,
@@ -53,11 +59,11 @@ pub use contracts::{
     SyncTokenStore,
 };
 pub(crate) use contracts::{
-    AssetGroupingRows, AssetVerificationState, CheckpointTransition, DownloadContextStateStore,
-    DownloadedFileRecord, ManifestAssetRow, OwnedTempFile, PendingPublicationRecord,
-    ReconciliationCatalogPath, ReconciliationContent, ReconciliationPathKey,
-    ReconciliationReservation, ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken,
-    SelectionMetadataReceipt, TempFileOwnershipStore,
+    AssetGroupingRows, AssetVerificationState, BaselineReceipt, CheckpointTransition,
+    DownloadContextStateStore, DownloadedFileRecord, ManifestAssetRow, OwnedTempFile,
+    PendingPublicationRecord, ReconciliationCatalogPath, ReconciliationContent,
+    ReconciliationPathKey, ReconciliationReservation, ReconciliationStateStore,
+    RetryErrorRetention, ScopedDbSyncToken, SelectionMetadataReceipt, TempFileOwnershipStore,
 };
 
 #[cfg(test)]
@@ -115,6 +121,7 @@ impl SqliteStateDb {
         let owner = owner.clone();
         let conn = tokio::task::spawn_blocking(move || {
             let conn = account::open(&cloned_path, &owner)?;
+            upgrade::preserve_before_v027(&conn, &cloned_path)?;
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
             schema::migrate(&conn)?;

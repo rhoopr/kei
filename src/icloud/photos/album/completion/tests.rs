@@ -207,3 +207,20 @@ async fn test_photo_stream_with_token_setup_does_not_panic() {
     let album = make_album(100, None, default_zone());
     let (_stream, _token_rx) = album.photo_stream_with_token(None, None, 10);
 }
+
+#[tokio::test]
+async fn v027_full_query_preserves_nonblank_opaque_token_bytes() {
+    use tokio_stream::StreamExt;
+    let opaque = "  opaque+/cursor==	";
+    let mock = MockPhotosFlow::new()
+        .query_photo_page("master-1", Some(opaque))
+        .empty_query_page(Some(opaque))
+        .build();
+    let album = make_album_with_session(100, Box::new(mock));
+    let (stream, token_rx) = album.photo_stream_with_token(None, Some(1), 1);
+    tokio::pin!(stream);
+    while let Some(result) = stream.next().await {
+        result.expect("valid synthetic photo");
+    }
+    assert_eq!(token_rx.await.unwrap().as_deref(), Some(opaque));
+}

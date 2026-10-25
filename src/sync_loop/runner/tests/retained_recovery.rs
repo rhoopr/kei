@@ -554,7 +554,6 @@ async fn retained_checkpoint_expiry_holds_all_trigger_classes_and_quiet_reopen()
                 crate::sync_loop::precheck::include_pending_local_work(
                     &mut precheck,
                     db.as_ref(),
-                    &config.metadata,
                     std::slice::from_ref(&library),
                 )
                 .await;

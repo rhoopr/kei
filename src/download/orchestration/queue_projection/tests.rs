@@ -8,6 +8,7 @@ use crate::download::planner::{TaskPlanner, pending_record_for_task};
 use crate::icloud::photos::inbox::ShadowCapture;
 use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
 use crate::state::SqliteStateDb;
+use crate::state::db::DownloadContextStateStore;
 use crate::state::db::account::AccountOwner;
 use crate::state::db::provider_selection::{MAX_SELECTION_BYTES, SelectionOutcome, SelectionPath};
 use crate::state::db::provider_work::{WorkAdmission, WorkPlan};
@@ -3325,8 +3326,24 @@ async fn destination_reopen_fixture_with_signature(
     .await
     .unwrap();
     assert_eq!(
-        result.stats.downloaded, 1,
-        "canonical A completion must not suppress selected B after quiet reopen"
+        result.stats.downloaded,
+        1,
+        "canonical A completion must not suppress selected B after quiet reopen: result={result:?}; queue={:?}; receipts={:?}; decisions={:?}",
+        f.queue(),
+        f.db.get_baseline_receipts().await.unwrap(),
+        f.db.acquire_lock("selected copy failure")
+            .unwrap()
+            .prepare(
+                "SELECT admission,reason FROM provider_active_decisions ORDER BY pass_key,child"
+            )
+            .unwrap()
+            .query_map([], |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?
+            )))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
     );
     let b = f.config.directory.join("B").join(a.file_name().unwrap());
     assert_eq!(std::fs::read(&b).unwrap(), media);
@@ -4602,6 +4619,7 @@ async fn private_historical_replay_windows_round_robin_and_persist_past_64_after
                     scope.clone(),
                     config_hash.clone(),
                     "independent-current-root".into(),
+                    None,
                 )
                 .await
                 .unwrap()
@@ -5606,7 +5624,7 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
 }
 
 #[tokio::test]
-async fn private_multi_destination_raw_edited_alternative_and_companion_failure_reopen_quietly() {
+async fn v027_multi_destination_raw_edited_alternative_and_companion_failure_reopen_quietly() {
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5680,8 +5698,10 @@ async fn private_multi_destination_raw_edited_alternative_and_companion_failure_
         .await
         .unwrap();
         assert_eq!(first.stats.downloaded, 8, "{policy:?}: {first:?}");
-        assert!(first.checkpoint.sync_token_blocked);
-        assert!(first.sync_token.is_none());
+        // Both missing companions have independent durable destinations.
+        // Source progress no longer waits for their transfer success.
+        assert!(!first.checkpoint.sync_token_blocked);
+        assert!(first.sync_token.is_some());
         assert_eq!(
             f.db.acquire_lock("failed companions retain both physical obligations")
                 .unwrap()
@@ -5696,6 +5716,9 @@ async fn private_multi_destination_raw_edited_alternative_and_companion_failure_
         f.preserved().await;
         fail.store(false, Ordering::SeqCst);
         f = reopen_destination_fixture(f).await;
+        f.db.make_selection_retry_due(owner(), "asset-l".into())
+            .await
+            .unwrap();
         let recovered = crate::download::download_photos_with_sync(
             &reqwest::Client::new(),
             &[destination_pass(&f, "A"), destination_pass(&f, "B")],
@@ -6846,3 +6869,605 @@ async fn queue_projection_actual_diagnostics_record_selection_and_work_limits() 
 }
 
 mod parity_optional;
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn v027_readonly_adoption_preserves_prepared_selected_metadata_across_reopen() {
+    crate::download::orchestration::generation::TEST_GENERATION_FORMAT
+        .scope(1, readonly_adoption_prepared_metadata_fixture(false, false))
+        .await;
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn v027_full_legacy_budget_preserves_optional_inputs_once() {
+    crate::download::orchestration::generation::TEST_GENERATION_FORMAT
+        .scope(1, readonly_adoption_prepared_metadata_fixture(true, false))
+        .await;
+}
+
+#[cfg(feature = "xmp")]
+async fn readonly_adoption_prepared_metadata_fixture(freeze_and_drift: bool, native_finish: bool) {
+    use crate::state::DownloadStateStore;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let server = wiremock::MockServer::start().await;
+    let media = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    Mock::given(method("GET"))
+        .and(path("/prepared"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    #[cfg(unix)]
+    if native_finish {
+        use std::os::unix::ffi::OsStringExt;
+        f.config.directory = f
+            .config
+            .directory
+            .join(std::ffi::OsString::from_vec(b"native-\xff".to_vec()))
+            .into();
+        std::fs::create_dir_all(&f.config.directory).unwrap();
+    }
+    f.config.folder_structure_albums = "copies".into();
+    f.config.metadata.xmp_sidecar = true;
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL":format!("{}/prepared",server.uri()), "size":media.len(),
+        "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))
+    });
+    let result = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &[destination_pass(&f, "A")],
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.stats.downloaded, 1);
+    let generation =
+        f.db.acquire_lock("read actual selected root")
+            .unwrap()
+            .query_row::<String, _, _>("SELECT id FROM provider_active_generations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+    if freeze_and_drift {
+        // Recreate a retained pre-upgrade owner whose optional inputs have not
+        // yet been snapshotted. The prepared receipt below binds this state.
+        f.db.acquire_lock("legacy owner before first immutable snapshot")
+            .unwrap()
+            .execute(
+                "UPDATE provider_active_destinations SET frozen_metadata=NULL,frozen_metadata_hash=NULL WHERE generation=?1",
+                [&generation],
+            )
+            .unwrap();
+        // An upgrade must preserve existing optional work even when earlier
+        // versions already filled their admission quota.
+        f.db.acquire_lock("full legacy admission budget")
+            .unwrap()
+            .execute(
+                "UPDATE provider_active_generations SET charged_bytes=?2 WHERE id=?1",
+                rusqlite::params![
+                    generation,
+                    crate::state::db::provider_generations::MAX_GENERATION_BYTES as i64
+                ],
+            )
+            .unwrap();
+    }
+    let mut pending =
+        f.db.pending_selection_metadata(owner(), generation.clone(), 10)
+            .await
+            .unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "normal sync leaves optional metadata separately owned"
+    );
+    let pending = pending.remove(0);
+    let output = b"prepared optional metadata output";
+    let staged = f.dir.path().join("retained-metadata-output");
+    std::fs::write(&staged, output).unwrap();
+    f.db.record_selection_metadata_prepared(
+        &pending,
+        &data_encoding::HEXLOWER.encode(&Sha256::digest(output)),
+        output.len() as u64,
+    )
+    .await
+    .unwrap()
+    .expect("real prepared receipt");
+    let snapshot = |db: &SqliteStateDb| {
+        db.acquire_lock("snapshot prepared optional work").unwrap()
+            .prepare("SELECT generation,pass_key,child,path,prepared_checksum,prepared_size,prepared_hash,verified_metadata FROM provider_active_destinations ORDER BY generation,pass_key,child,path")
+            .unwrap().query_map([], |row| (0..8).map(|i| row.get::<_,rusqlite::types::Value>(i)).collect::<rusqlite::Result<Vec<_>>>())
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    };
+    let before = snapshot(&f.db);
+    let destination = pending.asset.local_path.as_ref().unwrap();
+    let bytes = std::fs::read(destination).unwrap();
+    let mtime = std::fs::metadata(destination).unwrap().modified().unwrap();
+    let sidecar = destination.with_file_name(format!(
+        "{}.xmp",
+        destination.file_name().unwrap().to_str().unwrap()
+    ));
+    let sidecar_bytes = std::fs::read(&sidecar).unwrap();
+    let sidecar_mtime = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
+    // Native receipt completion is exercised through its lossless selected owner.
+    // Compatibility path TEXT does not authorize positive native baseline adoption.
+    if !native_finish {
+        let receipt =
+            f.db.get_baseline_receipts()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| {
+                    r.library == pending.asset.library.as_ref()
+                        && r.id == pending.asset.id.as_ref()
+                        && r.local_path == *destination
+                })
+                .unwrap();
+        let file = crate::download::file::retain_pending_file(&f.config.directory, destination)
+            .await
+            .unwrap()
+            .unwrap();
+        f.db.adopt_baseline_receipt(
+            &pending.asset,
+            &receipt,
+            Box::new(move || {
+                file.validate_blocking()
+                    .map_err(|_| crate::state::error::StateError::Invariant {
+                        operation: "adopt_baseline_receipt",
+                        detail: "retained test file changed".into(),
+                    })
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let frozen_before = if freeze_and_drift {
+        let mut changed = pending.asset.clone();
+        changed.checksum = "newer-opaque-provider-generation".into();
+        changed.local_path = None;
+        changed.local_checksum = None;
+        changed.download_checksum = None;
+        changed.status = crate::state::AssetStatus::Pending;
+        let mut metadata = changed.metadata.as_ref().clone();
+        metadata.title = Some("new current metadata".into());
+        metadata.refresh_hash();
+        changed.metadata = Arc::new(metadata);
+        f.db.upsert_seen(&changed)
+            .await
+            .expect("verified old optional metadata cannot block current observation");
+        let charged_after_freeze: i64 =
+            f.db.acquire_lock("bounded first preservation overhead")
+                .unwrap()
+                .query_row(
+                    "SELECT charged_bytes FROM provider_active_generations WHERE id=?1",
+                    [&generation],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert!(
+            charged_after_freeze
+                > crate::state::db::provider_generations::MAX_GENERATION_BYTES as i64
+        );
+        f.db.add_asset_album("PrimarySync", "asset-m", "Later album", "external")
+            .await
+            .expect("original grouping values have been frozen");
+        assert_eq!(
+            f.db.acquire_lock("repeated freeze allocates no additional evidence")
+                .unwrap()
+                .query_row(
+                    "SELECT charged_bytes FROM provider_active_generations WHERE id=?1",
+                    [&generation],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            charged_after_freeze
+        );
+        let current: String = f.db.acquire_lock("current generation advanced").unwrap()
+            .query_row("SELECT checksum FROM assets WHERE library='PrimarySync' AND id='asset-m' AND version_size='original'",
+                [],|row|row.get(0)).unwrap();
+        assert_eq!(current, changed.checksum.as_ref());
+        let frozen =
+            f.db.pending_selection_metadata(owner(), generation.clone(), 10)
+                .await
+                .unwrap();
+        assert_eq!(frozen.len(), 1);
+        assert_eq!(frozen[0].asset.checksum, pending.asset.checksum);
+        assert_eq!(frozen[0].asset.metadata.title, pending.asset.metadata.title);
+        assert_eq!(frozen[0].asset.created_at, pending.asset.created_at);
+        let receipt = frozen[0].selection_receipt.as_ref().unwrap();
+        let groups = receipt
+            .frozen_groupings
+            .as_ref()
+            .expect("actual original writer groups");
+        assert!(!groups.0.iter().any(|name| name == "Later album"));
+        assert!(groups.0.iter().any(|name| name == "A"));
+        Some((
+            {
+                let mut inputs = frozen[0].asset.clone();
+                inputs.local_path = None;
+                serde_json::to_vec(&inputs).unwrap()
+            },
+            receipt.frozen_metadata_hash.clone(),
+            receipt.frozen_groupings.clone(),
+            receipt.prepared.clone(),
+        ))
+    } else {
+        None
+    };
+    for _ in 0..2 {
+        let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        assert_eq!(snapshot(&reopened), before);
+        assert_eq!(std::fs::read(destination).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(destination).unwrap().modified().unwrap(),
+            mtime
+        );
+        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_bytes);
+        assert_eq!(
+            std::fs::metadata(&sidecar).unwrap().modified().unwrap(),
+            sidecar_mtime
+        );
+        assert_eq!(std::fs::read(&staged).unwrap(), output);
+        let pending = reopened
+            .pending_selection_metadata(owner(), generation.clone(), 10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        if let Some((asset, hash, groups, prepared)) = &frozen_before {
+            let receipt = pending[0].selection_receipt.as_ref().unwrap();
+            let mut inputs = pending[0].asset.clone();
+            inputs.local_path = None;
+            assert_eq!(&serde_json::to_vec(&inputs).unwrap(), asset);
+            assert_eq!(&receipt.frozen_metadata_hash, hash);
+            assert_eq!(&receipt.frozen_groupings, groups);
+            assert_eq!(&receipt.prepared, prepared);
+        }
+        assert!(
+            pending[0]
+                .selection_receipt
+                .as_ref()
+                .unwrap()
+                .prepared
+                .is_some()
+        );
+    }
+    if native_finish {
+        let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        let pending = reopened
+            .pending_selection_metadata(owner(), generation.clone(), 10)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(pending.asset.local_path.as_ref(), Some(destination));
+        assert!(
+            reopened
+                .finish_metadata_rewrite(
+                    &pending,
+                    crate::state::db::MetadataRewriteQueue::Ordinary,
+                    pending.asset.local_checksum.as_deref(),
+                    pending.asset.local_checksum.as_deref(),
+                    crate::state::db::MetadataRewriteCompletion::Ordinary,
+                )
+                .await
+                .expect("exact native destination finishes without JSON path encoding")
+        );
+        drop(reopened);
+        let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        assert!(
+            reopened
+                .pending_selection_metadata(owner(), generation.clone(), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(destination).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(destination).unwrap().modified().unwrap(),
+            mtime
+        );
+        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_bytes);
+    }
+    if freeze_and_drift && !native_finish {
+        let before = snapshot(&f.db);
+        f.db.acquire_lock("corrupt only frozen optional inputs")
+            .unwrap()
+            .execute(
+                "UPDATE provider_active_destinations SET frozen_metadata=?1",
+                [b"{}".as_slice()],
+            )
+            .unwrap();
+        assert!(
+            f.db.pending_selection_metadata(owner(), generation.clone(), 10)
+                .await
+                .is_err()
+        );
+        assert_eq!(snapshot(&f.db), before);
+        assert_eq!(std::fs::read(destination).unwrap(), bytes);
+        assert_eq!(std::fs::read(&staged).unwrap(), output);
+        f.db.acquire_lock("oversized snapshot with missing hash must not disappear").unwrap()
+            .execute("UPDATE provider_active_destinations SET frozen_metadata=zeroblob(16777217),frozen_metadata_hash=NULL",[]).unwrap();
+        assert!(
+            f.db.pending_selection_metadata(owner(), generation.clone(), 10)
+                .await
+                .is_err()
+        );
+        let mut changed = pending.asset.clone();
+        changed.checksum = "must-not-advance-through-invalid-snapshot".into();
+        assert!(f.db.upsert_seen(&changed).await.is_err());
+        assert_eq!(snapshot(&f.db), before);
+    }
+    server.verify().await;
+}
+
+mod config_change_retry;
+mod format_two;
+mod retirement;
+
+#[tokio::test]
+async fn v027_config_drift_quiet_provider_retries_original_selected_b_destination() {
+    use crate::state::DownloadStateStore;
+    use sha2::{Digest, Sha256};
+    use std::sync::atomic::AtomicBool;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let server = wiremock::MockServer::start().await;
+    let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    let ready = Arc::new(AtomicBool::new(false));
+    let gets = Arc::new(AtomicUsize::new(0));
+    let available = ready.clone();
+    let attempts = gets.clone();
+    Mock::given(method("GET"))
+        .and(path("/copy"))
+        .respond_with(move |_request: &wiremock::Request| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 || available.load(Ordering::SeqCst) {
+                ResponseTemplate::new(200).set_body_bytes(bytes.as_slice())
+            } else {
+                ResponseTemplate::new(500)
+            }
+        })
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = "{album}".into();
+    f.config.concurrent_downloads = 1;
+    f.config.retry.max_retries = 0;
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL":format!("{}/copy",server.uri()), "size":bytes.len(),
+        "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(bytes))
+    });
+    let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+    let first = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes,
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.stats.downloaded, 1, "{first:?}");
+    let a = f.config.directory.join("A/changed.JPG");
+    let b = f.config.directory.join("B/changed.JPG");
+    assert_eq!(std::fs::read(&a).unwrap(), bytes);
+    assert!(!b.exists());
+    let a_mtime = std::fs::metadata(&a).unwrap().modified().unwrap();
+    let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+    // Model A's verified completion arriving after B's failure. This uses the
+    // real receipt owner and leaves B's independently admitted destination pending.
+    f.db.mark_verified_download(
+        "PrimarySync",
+        "asset-m",
+        "original",
+        &a,
+        &digest,
+        Some(&digest),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(f.db.get_failed().await.unwrap().is_empty());
+    assert!(f.db.get_pending().await.unwrap().is_empty());
+    let original_b: (String,String,String) = f.db.acquire_lock("read pending physical copy").unwrap()
+        .query_row("SELECT generation,pass_key,path FROM provider_active_destinations WHERE child='asset-m' AND admitted=1 AND verified_media=0",
+            [],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(
+        serde_json::from_str::<SelectionPath>(&original_b.2)
+            .unwrap()
+            .to_path(),
+        b
+    );
+    f.db.make_selection_retry_due(owner(), "asset-m".into())
+        .await
+        .unwrap();
+    drop(passes);
+    f.config.state_db = None;
+    drop(f.capture);
+    drop(f.pass);
+    drop(f.db);
+    let reopened = Arc::new(
+        SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    f.db = reopened;
+    f.capture = ShadowCapture::new(f.db.clone(), owner(), "com");
+    f.config.state_db = Some(f.db.clone() as Arc<dyn DownloadStore>);
+    f.pass = destination_pass_with(&f.session, &f.capture, "A");
+    f.config.folder_structure_albums = "changed-template/{album}".into();
+    f.config.sync_mode = crate::download::SyncMode::Incremental {
+        zone_sync_token: "quiet-before-drift".into(),
+    };
+    ready.store(true, Ordering::SeqCst);
+    let before_gets = gets.load(Ordering::SeqCst);
+    let before_ranks = f.session.rank_calls.load(Ordering::SeqCst);
+    let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+    let recovered = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes,
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recovered.stats.downloaded, 1,
+        "quiet provider must retry owned B after config drift: {recovered:?}"
+    );
+    assert_eq!(gets.load(Ordering::SeqCst), before_gets + 1);
+    assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), before_ranks);
+    assert_eq!(std::fs::read(&b).unwrap(), bytes);
+    assert_eq!(std::fs::read(&a).unwrap(), bytes);
+    assert_eq!(std::fs::metadata(&a).unwrap().modified().unwrap(), a_mtime);
+    assert!(!f.config.directory.join("changed-template").exists());
+    let verified: bool = f.db.acquire_lock("original B owner completed").unwrap()
+        .query_row("SELECT verified_media FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child='asset-m' AND path=?3",
+            rusqlite::params![original_b.0,original_b.1,original_b.2],|r|r.get(0)).unwrap();
+    assert!(verified);
+    f.preserved().await;
+}
+
+#[tokio::test]
+async fn v027_newer_rendition_progresses_without_retiring_old_pending_destination() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = wiremock::MockServer::start().await;
+    let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    Mock::given(method("GET"))
+        .and(path("/old"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/current"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = "{album}".into();
+    f.config.retry.max_retries = 0;
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL":format!("{}/old",server.uri()),"size":bytes.len(),
+        "fileChecksum":"opaque-unavailable-old-provider-generation"
+    });
+    let passes = vec![destination_pass(&f, "A")];
+    let old = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes,
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(old.stats.downloaded, 0);
+    let retained: (String,String,String,String) = f.db.acquire_lock("read original pending owner").unwrap()
+        .query_row("SELECT w.generation,w.pass_key,w.path,w.checksum FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.child='asset-m' AND w.admitted=1 AND w.verified_media=0 AND json_extract(CAST(g.specification AS TEXT),'$.format')=2",
+            [],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    let old_path = serde_json::from_str::<SelectionPath>(&retained.2)
+        .unwrap()
+        .to_path();
+    assert!(!old_path.exists());
+    drop(passes);
+    f = reopen_destination_fixture(f).await;
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL":format!("{}/current",server.uri()),"size":bytes.len(),
+        "fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(bytes))
+    });
+    // A fresh normal observation must coexist with the unavailable old task.
+    // This full observation is intentional; the following reopened cycles are quiet.
+    f.config.sync_mode = crate::download::SyncMode::Full;
+    let passes = vec![destination_pass(&f, "A")];
+    let current = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes,
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        current.stats.downloaded, 1,
+        "new generation must not be blocked by old pending work: {current:?}"
+    );
+    let current_path: String = f.db.acquire_lock("read newly completed owner").unwrap()
+        .query_row("SELECT path FROM provider_active_destinations WHERE child='asset-m' AND verified_media=1",[],|r|r.get(0)).unwrap();
+    let current_path = serde_json::from_str::<SelectionPath>(&current_path)
+        .unwrap()
+        .to_path();
+    assert_ne!(
+        current_path, old_path,
+        "old admitted destination stays owned"
+    );
+    assert_eq!(std::fs::read(&current_path).unwrap(), bytes);
+    let modified = std::fs::metadata(&current_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    drop(passes);
+    for _ in 0..2 {
+        f = reopen_destination_fixture(f).await;
+        let ranks = f.session.rank_calls.load(Ordering::SeqCst);
+        let requests = server.received_requests().await.unwrap().len();
+        let passes = vec![destination_pass(&f, "A")];
+        let quiet = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &passes,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(quiet.stats.downloaded, 0, "{quiet:?}");
+        assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), ranks);
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        let old_pending: bool = f.db.acquire_lock("old task remains independently retained").unwrap()
+            .query_row("SELECT admitted=1 AND verified_media=0 AND checksum=?4 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child='asset-m' AND path=?3",
+                rusqlite::params![retained.0,retained.1,retained.2,retained.3],|r|r.get(0)).unwrap();
+        assert!(old_pending);
+        assert!(!old_path.exists());
+        assert_eq!(std::fs::read(&current_path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&current_path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified
+        );
+    }
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn v027_frozen_optional_metadata_survives_new_current_facts_and_reopen() {
+    crate::download::orchestration::generation::TEST_GENERATION_FORMAT
+        .scope(1, readonly_adoption_prepared_metadata_fixture(true, false))
+        .await;
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn v027_frozen_optional_metadata_native_receipt_finishes_after_reopen() {
+    crate::download::orchestration::generation::TEST_GENERATION_FORMAT
+        .scope(1, readonly_adoption_prepared_metadata_fixture(true, true))
+        .await;
+}
+
+mod provider_adoption;

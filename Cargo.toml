@@ -56,6 +56,8 @@ toml = "1"
 
 # Crypto (SRP auth)
 sha2 = "0.10"
+# CloudKit MMCS v1 whole-file signature, distinct from local SHA-256.
+sha1 = "0.10"
 pbkdf2 = "0.12"
 num-bigint = "0.4"
 base64 = "0.22"
@@ -182,7 +184,6 @@ rusqlite = { version = "0.39", features = ["bundled", "backup"] }
 http = "1"
 wiremock = "0.6"
 tracing-test = "0.2"
-sha1 = "0.10"
 # test-util enables `tokio::test(start_paused = true)` so retry/backoff
 # tests in the auth layer don't sleep through real wall-clock delays.
 tokio = { version = "1", features = ["test-util"] }

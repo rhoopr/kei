@@ -479,3 +479,115 @@ async fn managed_pending_plan_keeps_current_publication_with_its_layout_owner() 
     assert_eq!(verification, "transient_failure");
     assert_eq!(fs::read(&file).unwrap(), bytes);
 }
+
+#[tokio::test]
+async fn prepared_first_publication_reopens_before_rename_without_http_or_metadata_rewrite() {
+    use crate::state::db::{
+        DownloadContextStateStore, PreparedPublication, TempFileOwnershipStore,
+        provider_selection::SelectionPath,
+    };
+
+    for changed_part in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let database = dir.path().join("state.db");
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path().join("media"));
+        config.folder_structure = "none".to_owned();
+        let asset = TestPhotoAsset::new("prepared-first")
+            .filename("prepared.MOV")
+            .orig_url("http://127.0.0.1:1/must-not-download")
+            .orig_size(MOVIE.len() as u64)
+            .build();
+        let derived = derive_expected_paths(&asset, &config)
+            .into_iter()
+            .find(|path| path.version_size == VersionSizeKey::Original)
+            .unwrap();
+        fs::create_dir_all(derived.path.parent().unwrap()).unwrap();
+        let temporary = derived.path.with_extension("part");
+        fs::write(&temporary, MOVIE).unwrap();
+        let mtime = fs::metadata(&temporary).unwrap().modified().unwrap();
+        let local = data_encoding::HEXLOWER.encode(&Sha256::digest(MOVIE));
+        let source = data_encoding::HEXLOWER.encode(&Sha256::digest(b"raw bytes before metadata"));
+        let record =
+            asset_record_for_derived_path(Arc::from("PrimarySync"), &asset, &derived, &config);
+        let proof = PreparedPublication {
+            library: "PrimarySync".into(),
+            id: asset.state_id().into(),
+            version: "original".into(),
+            provider_checksum: derived.checksum.to_string(),
+            provider_size: derived.size,
+            temporary: SelectionPath::from_path(&temporary),
+            destination: SelectionPath::from_path(&derived.path),
+            local_checksum: local.clone(),
+            source_checksum: source.clone(),
+        };
+        {
+            let db = SqliteStateDb::open(&database).await.unwrap();
+            db.upsert_seen(&record).await.unwrap();
+            db.claim_temp_file(&temporary).await.unwrap();
+            db.prepare_temp_publication(&temporary, &proof)
+                .await
+                .unwrap();
+        }
+        if changed_part {
+            fs::write(&temporary, b"foreign altered temporary bytes").unwrap();
+        }
+        let db = SqliteStateDb::open(&database).await.unwrap();
+        let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
+        let recovered = recover_current_pending_publication(
+            &db,
+            &config,
+            &asset,
+            &mut planner,
+            VersionSizeKey::Original,
+            &CancellationToken::new(),
+        )
+        .await;
+        if changed_part {
+            assert!(recovered.is_err());
+            assert!(!derived.path.exists());
+            assert_eq!(
+                fs::read(&temporary).unwrap(),
+                b"foreign altered temporary bytes"
+            );
+            assert_eq!(
+                db.get_prepared_publications(
+                    "PrimarySync",
+                    asset.state_id(),
+                    VersionSizeKey::Original
+                )
+                .await
+                .unwrap(),
+                vec![proof]
+            );
+        } else {
+            assert_eq!(
+                recovered.unwrap(),
+                Some(PendingOnDiskAdoption::Adopted(derived.path.clone()))
+            );
+            assert!(!temporary.exists());
+            assert_eq!(fs::read(&derived.path).unwrap(), MOVIE);
+            assert_eq!(
+                fs::metadata(&derived.path).unwrap().modified().unwrap(),
+                mtime
+            );
+            assert!(
+                db.get_prepared_publications(
+                    "PrimarySync",
+                    asset.state_id(),
+                    VersionSizeKey::Original
+                )
+                .await
+                .unwrap()
+                .is_empty()
+            );
+            let receipts = db.get_baseline_receipts().await.unwrap();
+            let receipt = receipts
+                .iter()
+                .find(|receipt| receipt.id == asset.state_id())
+                .unwrap();
+            assert_eq!(receipt.local_checksum.as_deref(), Some(local.as_str()));
+            assert_eq!(receipt.source_checksum.as_deref(), Some(source.as_str()));
+        }
+    }
+}

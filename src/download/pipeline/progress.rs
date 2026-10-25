@@ -108,6 +108,12 @@ pub(in crate::download) fn log_sync_summary(title: &str, stats: &crate::download
         if stats.skipped.by_state > 0 {
             reasons.push(format!("{} already downloaded", stats.skipped.by_state));
         }
+        if stats.skipped.uncertain > 0 {
+            reasons.push(format!(
+                "{} pending content verification",
+                stats.skipped.uncertain
+            ));
+        }
         if stats.skipped.on_disk > 0 {
             reasons.push(format!("{} on disk", stats.skipped.on_disk));
         }

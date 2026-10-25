@@ -47,13 +47,20 @@ pub(crate) struct LibraryState {
 pub(crate) const ENUM_CONFIG_HASH_KEY: &str = "enum_config_hash";
 pub(crate) const PENDING_ENUM_CONFIG_HASH_KEY: &str = "pending_enum_config_hash";
 pub(crate) const PENDING_DOWNLOAD_CONFIG_HASH_KEY: &str = "pending_download_config_hash";
-const PENDING_ZONE_TOKEN_PREFIX: &str = "pending_sync_token:";
+const PENDING_ZONE_TOKEN_PREFIX: &str = "pending_sync_token:v27:";
 const LAST_CHECKPOINT_STATUS_KEY: &str = "last_checkpoint_status";
 const LAST_RECOVERY_ACTION_KEY: &str = "last_recovery_action";
 const LAST_FULL_ENUMERATION_REASON_KEY: &str = "last_full_enumeration_reason";
 
-/// Prefix for every per-zone CloudKit sync token row in the metadata table.
-pub(crate) const SYNC_TOKEN_PREFIX: &str = "sync_token:";
+/// Current sync epoch. Older opaque cursors remain stored for rollback but
+/// cannot authorize skipping the v27 filesystem/provider comparison.
+pub(crate) const SYNC_TOKEN_PREFIX: &str = "sync_token:v27:";
+
+/// Current observed-work checkpoints do not certify historical attribution.
+pub(crate) fn is_current_zone_checkpoint(key: &str) -> bool {
+    key.starts_with(SYNC_TOKEN_PREFIX) || key.starts_with(PENDING_ZONE_TOKEN_PREFIX)
+}
+
 // Legacy inventory_anchor: rows lack coverage proof and are never read or migrated.
 const INVENTORY_ANCHOR_PREFIX: &str = "inventory_anchor_v1:";
 const INVENTORY_ANCHOR_VERSION: u8 = 1;
@@ -67,7 +74,7 @@ pub(crate) fn indexing_reconciliation_key(zone: &str) -> String {
 
 /// A qualified inventory retains the old cursor and schedules its replay in a
 /// later trusted cycle. No deletion-capable bridge runs inside the held phase.
-pub(crate) const INDEXING_REPLAY_PREFIX: &str = "indexing_replay_required:";
+pub(crate) const INDEXING_REPLAY_PREFIX: &str = "indexing_replay_required:v27:";
 
 pub(crate) fn indexing_replay_key(zone: &str) -> String {
     format!("{INDEXING_REPLAY_PREFIX}{zone}")
@@ -141,7 +148,7 @@ pub(crate) async fn prepare_library_indexing(
     Ok((finished, hold))
 }
 
-pub(crate) const RETAINED_CHECKPOINT_HOLD_PREFIX: &str = "retained_checkpoint_hold:";
+pub(crate) const RETAINED_CHECKPOINT_HOLD_PREFIX: &str = "retained_checkpoint_hold:v27:";
 const RETAINED_CHECKPOINT_RETRY_SECONDS: i64 = 60 * 60;
 const RETAINED_CHECKPOINT_MAX_ATTEMPTS: u8 = 3;
 
@@ -1250,37 +1257,8 @@ pub(crate) async fn run_cycle(
             }
         }
 
-        let mut legacy_cycle = download::legacy_preservation::LegacyCycle::default();
-        if indexing_finished
-            && !indexing_reconciliation
-            && download_controls.run_mode.downloads_files()
-            && !lib_state.plan_is_stale
-            && let Some(db) = state_db
-            && db
-                .get_summary()
-                .await?
-                .metadata_capture
-                .iter()
-                .any(|capture| {
-                    capture.library == lib_state.zone_name
-                        && (capture.unresolved_assets > 0 || capture.unattributed_legacy_assets > 0)
-                })
-        {
-            let legacy_probe = build_download_config(
-                download::SyncMode::Full,
-                Arc::new(rustc_hash::FxHashSet::default()),
-                Arc::new(download::AssetGroupings::default()),
-                Arc::from(lib_state.zone_name.as_str()),
-            );
-            legacy_cycle = download::legacy_preservation::LegacyCycle::begin(
-                db,
-                &legacy_probe,
-                &lib_state.library.all(),
-                preservation_config_hash.as_deref().unwrap_or(""),
-                shutdown_token,
-            )
-            .await?;
-        }
+        // Historical attribution remains retained evidence. The v27 cursor
+        // accounts for current observations and does not activate old proofs.
 
         // Determine source-enumeration mode per library. Failed transfers are
         // rehydrated from durable pending state by the download engine and do
@@ -1309,11 +1287,6 @@ pub(crate) async fn run_cycle(
             metadata_refresh_mode_decision(config.runtime.refresh_metadata)
         {
             refresh_decision
-        } else if legacy_cycle.requires_inventory() {
-            SyncModeDecision {
-                mode: download::SyncMode::Full,
-                full_enumeration_reason: Some(download::FullEnumerationReason::MetadataBackfill),
-            }
         } else if let Some(zone_sync_token) = pending_zone_token {
             tracing::debug!(
                 zone = %lib_state.zone_name,
@@ -1397,6 +1370,35 @@ pub(crate) async fn run_cycle(
             Arc::clone(&asset_groupings),
             Arc::from(lib_state.zone_name.as_str()),
         );
+        let baseline_key = format!(
+            "baseline_cursor:v27:{}:{}:{}",
+            lib_state.library.baseline_scope(),
+            enum_config_hash,
+            preservation_config_hash.as_deref().unwrap_or(""),
+        );
+        let baseline_cursor_at_start = if retained_cursor_at_start.is_none()
+            && matches!(download_config.sync_mode, download::SyncMode::Full)
+            && download_controls.run_mode.downloads_files()
+            && !download_config.retry_only
+            && indexing_finished
+            && !indexing_reconciliation
+        {
+            let db = state_db
+                .ok_or_else(|| anyhow::anyhow!("Baseline comparison requires durable state"))?;
+            let cursor = match db.get_metadata(&baseline_key).await? {
+                Some(cursor) if !cursor.trim().is_empty() => cursor,
+                Some(_) => anyhow::bail!("Saved baseline cursor is invalid"),
+                None => {
+                    let cursor = lib_state.library.fresh_baseline_cursor().await?;
+                    db.set_metadata(&baseline_key, &cursor).await?;
+                    cursor
+                }
+            };
+            zone_metadata_fence.push((baseline_key.clone(), Some(cursor.clone())));
+            Some(cursor)
+        } else {
+            None
+        };
         // FINISHED is a prerequisite, not proof that this inventory remained
         // complete. Deletion-capable maintenance stays deferred until the
         // full scope and its final readiness check have qualified.
@@ -1471,7 +1473,7 @@ pub(crate) async fn run_cycle(
             && pending_download_config_hash.is_some()
             && download_controls.run_mode.downloads_files()
         {
-            let reconciliation = download::reconcile_catalog_paths_with_client(
+            let reconciliation = download::recover_recorded_sources(
                 &download_client,
                 &lib_state.plan.passes,
                 Arc::clone(&download_config),
@@ -1521,39 +1523,6 @@ pub(crate) async fn run_cycle(
             lib_state.plan.passes.len(),
         );
 
-        if indexing_finished
-            && legacy_cycle.requires_inventory()
-            && sync_result.full_enumeration_ran
-            && matches!(
-                source_checkpoint_decision(
-                    &sync_result,
-                    config.runtime.dry_run,
-                    lib_state.plan_is_stale,
-                    CheckpointBasis::CompleteInventory
-                ),
-                SourceCheckpointDecision::Advance { .. }
-            )
-            && let Some(db) = state_db
-        {
-            let prior = db
-                .get_metadata(&lib_state.sync_token_key)
-                .await?
-                .unwrap_or_default();
-            if let Err(error) = legacy_cycle
-                .certify(
-                    db,
-                    &download_config,
-                    &lib_state.library.all(),
-                    preservation_config_hash.as_deref().unwrap_or(""),
-                    &prior,
-                    shutdown_token,
-                )
-                .await
-            {
-                download::legacy_preservation::log_preservation_hold("certification", &error);
-            }
-        }
-
         let mut retained_checkpoint_expired = false;
         let mut checkpoint_basis =
             if sync_result.full_enumeration_ran && !sync_result.checkpoint.completed_delta_replay {
@@ -1574,9 +1543,9 @@ pub(crate) async fn run_cycle(
         } else {
             false
         };
-        if (matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed)
+        if (baseline_cursor_at_start.is_some()
+            || matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed)
             || unresolved_identity
-            || legacy_cycle.requires_inventory()
             || ((indexing_replay_pending || indexing_materialization_pending)
                 && !is_retry_failed
                 && !download_config.retry_only))
@@ -1593,113 +1562,183 @@ pub(crate) async fn run_cycle(
                     && download_config.skip_created_before.is_none()
                     && download_config.skip_created_after.is_none()))
         {
-            let prior_token = retained_cursor_at_start.clone();
-            if let Some(prior_token) = prior_token.filter(|token| !token.trim().is_empty()) {
-                let inventory_decision = source_checkpoint_decision(
-                    &sync_result,
-                    config.runtime.dry_run,
-                    lib_state.plan_is_stale,
-                    CheckpointBasis::CompleteInventory,
-                );
-                if matches!(inventory_decision, SourceCheckpointDecision::Advance { .. }) {
-                    let mut bridge_config = build_download_config(
-                        download::SyncMode::Incremental {
-                            zone_sync_token: prior_token.clone(),
-                        },
-                        Arc::new(rustc_hash::FxHashSet::default()),
-                        Arc::clone(&asset_groupings),
-                        Arc::from(lib_state.zone_name.as_str()),
-                    );
-                    tracing::info!(
-                        zone = %lib_state.zone_name,
-                        "Inventory reconciliation complete; bridging changes from the preserved provider checkpoint"
-                    );
-                    Arc::make_mut(&mut bridge_config).sparse_targets =
-                        Arc::clone(&download_config.sparse_targets);
-                    let bridge_result = download::download_photos_with_sync(
-                        &download_client,
-                        &lib_state.plan.passes,
-                        bridge_config,
-                        download_controls,
-                        shutdown_token.clone(),
-                    )
-                    .await?;
-                    observe_sync_component(
-                        &lib_state.zone_name,
-                        "delta_bridge",
-                        &bridge_result,
-                        lib_state.plan.passes.len(),
-                    );
-                    let bridge_decision = source_checkpoint_decision(
-                        &bridge_result,
+            let prior_token = baseline_cursor_at_start
+                .clone()
+                .or_else(|| retained_cursor_at_start.clone());
+            if let Some(mut prior_token) = prior_token.filter(|token| !token.trim().is_empty()) {
+                for baseline_attempt in 0..2 {
+                    let inventory_decision = source_checkpoint_decision(
+                        &sync_result,
                         config.runtime.dry_run,
                         lib_state.plan_is_stale,
-                        CheckpointBasis::IncrementalDelta,
+                        CheckpointBasis::CompleteInventory,
                     );
-                    sync_result.outcome =
-                        merge_download_outcomes(&sync_result.outcome, &bridge_result.outcome);
-                    sync_result.accumulate(&bridge_result);
-                    if bridge_result.checkpoint.retained_token_rejected
-                        && !bridge_result.checkpoint.completed_delta_replay
-                        && let Some(db) = state_db
-                    {
-                        retained_checkpoint_expired = true;
-                        let mut hold = RetainedCheckpointHold::new(
-                            &prior_token,
-                            &enum_config_hash,
-                            preservation_config_hash.as_deref(),
+                    if matches!(inventory_decision, SourceCheckpointDecision::Advance { .. }) {
+                        let mut bridge_config = build_download_config(
+                            download::SyncMode::Incremental {
+                                zone_sync_token: prior_token.clone(),
+                            },
+                            Arc::new(rustc_hash::FxHashSet::default()),
+                            Arc::clone(&asset_groupings),
+                            Arc::from(lib_state.zone_name.as_str()),
                         );
-                        hold.attempt_count = retained_checkpoint_attempt;
-                        if persist_retained_checkpoint_hold(
-                            db,
-                            retained_checkpoint_hold_key(&lib_state.zone_name),
-                            &hold,
-                            zone_metadata_fence.clone(),
+                        tracing::info!(
+                            zone = %lib_state.zone_name,
+                            "Inventory reconciliation complete; bridging changes from the preserved provider checkpoint"
+                        );
+                        Arc::make_mut(&mut bridge_config).sparse_targets =
+                            Arc::clone(&download_config.sparse_targets);
+                        let bridge_result = download::download_photos_with_sync(
+                            &download_client,
+                            &lib_state.plan.passes,
+                            bridge_config,
+                            download_controls,
+                            shutdown_token.clone(),
                         )
-                        .await
-                        .is_err()
+                        .await?;
+                        observe_sync_component(
+                            &lib_state.zone_name,
+                            "delta_bridge",
+                            &bridge_result,
+                            lib_state.plan.passes.len(),
+                        );
+                        let bridge_decision = source_checkpoint_decision(
+                            &bridge_result,
+                            config.runtime.dry_run,
+                            lib_state.plan_is_stale,
+                            CheckpointBasis::IncrementalDelta,
+                        );
+                        sync_result.outcome =
+                            merge_download_outcomes(&sync_result.outcome, &bridge_result.outcome);
+                        sync_result.accumulate(&bridge_result);
+                        if baseline_cursor_at_start.is_some()
+                            && bridge_result.checkpoint.retained_token_rejected
+                            && let Some(db) = state_db
                         {
-                            sync_result.checkpoint.state_write_failures = sync_result
-                                .checkpoint
-                                .state_write_failures
-                                .saturating_add(1);
-                            sync_result.stats.state_write_failures =
-                                sync_result.stats.state_write_failures.saturating_add(1);
+                            // This boundary never became an active token. Retain
+                            // all ledger work but obtain a fresh boundary next run.
+                            db.delete_metadata_by_prefix(&baseline_key).await?;
                         }
-                        block_for_retained_checkpoint(&mut sync_result.stats);
-                    }
-                    if !bridge_result.full_enumeration_ran
-                        || bridge_result.checkpoint.completed_delta_replay
-                    {
-                        if let SourceCheckpointDecision::Advance { token, .. } = bridge_decision {
-                            sync_result.sync_token = Some(token);
-                            checkpoint_basis = CheckpointBasis::InventoryWithDeltaBridge;
-                        } else {
+                        if baseline_cursor_at_start.is_some()
+                            && bridge_result.checkpoint.inventory_rank_changed
+                            && let SourceCheckpointDecision::Advance { token, .. } =
+                                &bridge_decision
+                        {
+                            let db = state_db.ok_or_else(|| {
+                                anyhow::anyhow!("Baseline comparison requires durable state")
+                            })?;
+                            db.set_metadata(&baseline_key, token).await?;
+                            for (key, expected) in &mut zone_metadata_fence {
+                                if key == &baseline_key {
+                                    *expected = Some(token.clone());
+                                }
+                            }
+                            if baseline_attempt == 0 {
+                                prior_token = token.clone();
+                                tracing::info!(
+                                    "Provider changed during baseline; repeating the rank inventory with completed work retained"
+                                );
+                                // Selected admission may already have enumerated
+                                // after processing this delta. Bridge that inventory
+                                // instead of immediately enumerating it a third time.
+                                if !bridge_result.full_enumeration_ran {
+                                    let previous = sync_result;
+                                    sync_result = download::download_photos_with_sync(
+                                        &download_client,
+                                        &lib_state.plan.passes,
+                                        Arc::clone(&download_config),
+                                        download_controls,
+                                        shutdown_token.clone(),
+                                    )
+                                    .await?;
+                                    sync_result.outcome = merge_download_outcomes(
+                                        &previous.outcome,
+                                        &sync_result.outcome,
+                                    );
+                                    sync_result.accumulate(&previous);
+                                }
+                                // Only the upcoming bridge may complete this new
+                                // rank inventory; older replay evidence is not its proof.
+                                sync_result.checkpoint.completed_delta_replay = false;
+                                sync_result.checkpoint.inventory_rank_changed = false;
+                                continue;
+                            }
                             sync_result.sync_token = None;
                             sync_result.checkpoint.sync_token_blocked = true;
                             sync_result.checkpoint.project(&mut sync_result.stats);
                             sync_result.stats.sync_token_blocked_reason =
-                                Some("inventory_delta_bridge_failed");
-                            sync_result.stats.sync_token_blocked_source = Some("kei");
+                                Some("baseline_changed_during_inventory");
+                            sync_result.stats.sync_token_blocked_source = Some("icloud");
                             sync_result.stats.sync_token_blocked_explanation = Some(
-                                "the inventory completed, but replay from the preserved provider checkpoint did not finish safely",
+                                "provider changes can shift rank pages; completed files and pending work are retained for the next baseline pass",
                             );
+                            break;
                         }
-                    } else {
-                        sync_result.sync_token = None;
-                        sync_result.checkpoint.sync_token_blocked = true;
-                        sync_result.checkpoint.project(&mut sync_result.stats);
-                        if bridge_result.checkpoint.retained_token_rejected {
-                            block_for_retained_checkpoint(&mut sync_result.stats);
-                        } else {
-                            sync_result.stats.sync_token_blocked_reason =
-                                Some("inventory_delta_bridge_failed");
-                            sync_result.stats.sync_token_blocked_source = Some("kei");
-                            sync_result.stats.sync_token_blocked_explanation = Some(
-                                "the prior provider checkpoint could not be replayed incrementally after inventory reconciliation",
+                        if baseline_cursor_at_start.is_none()
+                            && bridge_result.checkpoint.retained_token_rejected
+                            && !bridge_result.checkpoint.completed_delta_replay
+                            && let Some(db) = state_db
+                        {
+                            retained_checkpoint_expired = true;
+                            let mut hold = RetainedCheckpointHold::new(
+                                &prior_token,
+                                &enum_config_hash,
+                                preservation_config_hash.as_deref(),
                             );
+                            hold.attempt_count = retained_checkpoint_attempt;
+                            if persist_retained_checkpoint_hold(
+                                db,
+                                retained_checkpoint_hold_key(&lib_state.zone_name),
+                                &hold,
+                                zone_metadata_fence.clone(),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                sync_result.checkpoint.state_write_failures = sync_result
+                                    .checkpoint
+                                    .state_write_failures
+                                    .saturating_add(1);
+                                sync_result.stats.state_write_failures =
+                                    sync_result.stats.state_write_failures.saturating_add(1);
+                            }
+                            block_for_retained_checkpoint(&mut sync_result.stats);
+                        }
+                        if !bridge_result.full_enumeration_ran
+                            || bridge_result.checkpoint.completed_delta_replay
+                        {
+                            if let SourceCheckpointDecision::Advance { token, .. } = bridge_decision
+                            {
+                                sync_result.sync_token = Some(token);
+                                checkpoint_basis = CheckpointBasis::InventoryWithDeltaBridge;
+                            } else {
+                                sync_result.sync_token = None;
+                                sync_result.checkpoint.sync_token_blocked = true;
+                                sync_result.checkpoint.project(&mut sync_result.stats);
+                                sync_result.stats.sync_token_blocked_reason =
+                                    Some("inventory_delta_bridge_failed");
+                                sync_result.stats.sync_token_blocked_source = Some("kei");
+                                sync_result.stats.sync_token_blocked_explanation = Some(
+                                    "the inventory completed, but replay from the preserved provider checkpoint did not finish safely",
+                                );
+                            }
+                        } else {
+                            sync_result.sync_token = None;
+                            sync_result.checkpoint.sync_token_blocked = true;
+                            sync_result.checkpoint.project(&mut sync_result.stats);
+                            if bridge_result.checkpoint.retained_token_rejected {
+                                block_for_retained_checkpoint(&mut sync_result.stats);
+                            } else {
+                                sync_result.stats.sync_token_blocked_reason =
+                                    Some("inventory_delta_bridge_failed");
+                                sync_result.stats.sync_token_blocked_source = Some("kei");
+                                sync_result.stats.sync_token_blocked_explanation = Some(
+                                    "the prior provider checkpoint could not be replayed incrementally after inventory reconciliation",
+                                );
+                            }
                         }
                     }
+                    break;
                 }
             }
         }
@@ -1737,9 +1776,6 @@ pub(crate) async fn run_cycle(
             sync_result.stats.metadata_capture_remaining = capture.remaining_assets;
             sync_result.stats.metadata_capture_unresolved = capture.unresolved_assets;
             sync_result.stats.metadata_capture_deferred = capture.deferred_assets;
-            if capture.unresolved_assets > 0 {
-                sync_result.block_for_metadata_capture();
-            }
         }
 
         let library_completed_without_errors =
@@ -1979,39 +2015,7 @@ pub(crate) async fn run_cycle(
             path_reconciliation_cycle_safe = false;
         }
 
-        let mut legacy_proofs = Vec::new();
-        if let SourceCheckpointDecision::Advance { token, .. } = &checkpoint_decision
-            && let Some(db) = state_db
-        {
-            let qualified = if legacy_cycle.requires_inventory()
-                && (!matches!(sync_result.outcome, download::DownloadOutcome::Success)
-                    || sync_result.stats.failed > 0
-                    || sync_result.stats.exif_failures > 0)
-            {
-                Err(anyhow::anyhow!("Legacy current work is incomplete"))
-            } else {
-                legacy_cycle
-                    .finish(db, &download_config, token, shutdown_token)
-                    .await
-            };
-            match qualified {
-                Ok(proofs) => legacy_proofs = proofs,
-                Err(error) => {
-                    download::legacy_preservation::log_preservation_hold("checkpoint", &error);
-                    checkpoint_decision = SourceCheckpointDecision::Preserve {
-                        reason: CheckpointHoldReason::LegacyPreservationIncomplete,
-                        recovery: RecoveryAction::ReplayFromPriorToken,
-                    };
-                    sync_result.stats.sync_token_blocked = true;
-                    sync_result.stats.sync_token_blocked_reason =
-                        Some("legacy_preservation_incomplete");
-                    sync_result.stats.sync_token_blocked_source = Some("kei");
-                    sync_result.stats.sync_token_blocked_explanation = Some(
-                        "legacy evidence is protected, but independent current coverage is incomplete",
-                    );
-                }
-            }
-        }
+        let legacy_proofs = Vec::new();
 
         path_reconciliation_cycle_safe &= library_completed_without_errors
             && checkpoint_transition_state_safe
@@ -2027,8 +2031,7 @@ pub(crate) async fn run_cycle(
                 }
             ) && sync_result.checkpoint.bounded_path_selection_complete
                 && !sync_result.checkpoint.enumeration_incomplete
-                && sync_result.checkpoint.state_write_failures == 0
-                && !legacy_cycle.requires_inventory()));
+                && sync_result.checkpoint.state_write_failures == 0));
 
         let mut checkpoint_evidence = checkpoint_support_fields(&checkpoint_decision);
         let mut checkpoint_persistence = "no_state_db";
@@ -2060,9 +2063,10 @@ pub(crate) async fn run_cycle(
                                 legacy_config_hash: preservation_config_hash.clone(),
                                 sparse_identity_proofs: Vec::new(),
                                 metadata_updates: vec![(candidate_key, token)],
-                                metadata_deletes: vec![retained_checkpoint_hold_key(
-                                    &lib_state.zone_name,
-                                )],
+                                metadata_deletes: vec![
+                                    retained_checkpoint_hold_key(&lib_state.zone_name),
+                                    baseline_key.clone(),
+                                ],
                             })
                             .await
                         {
@@ -2109,6 +2113,7 @@ pub(crate) async fn run_cycle(
                                     .clone(),
                                 metadata_updates,
                                 metadata_deletes: vec![
+                                    baseline_key.clone(),
                                     state::unresolved_identity_key(&lib_state.zone_name),
                                     retained_checkpoint_hold_key(&lib_state.zone_name),
                                     indexing_key.clone(),
@@ -2385,25 +2390,6 @@ pub(crate) async fn run_cycle(
         let summary = db.get_summary().await?;
         if summary.unresolved_identity_zones > 0 {
             download::block_sync_token_for_unresolved_identity(&mut cycle_stats);
-            cycle_failed_count = cycle_failed_count.max(1);
-            db_sync_token_advance_safe = false;
-        }
-        if summary
-            .metadata_capture
-            .iter()
-            .any(|capture| capture.unattributed_legacy_pending > 0)
-        {
-            // Protected history no longer appears in the capture retry count,
-            // but pending current-work proof is still incomplete cycle work.
-            cycle_failed_count = cycle_failed_count.max(1);
-            db_sync_token_advance_safe = false;
-        }
-        if summary
-            .metadata_capture
-            .iter()
-            .any(|capture| capture.unresolved_assets > 0)
-        {
-            download::block_sync_token_for_metadata_capture(&mut cycle_stats);
             cycle_failed_count = cycle_failed_count.max(1);
             db_sync_token_advance_safe = false;
         }
@@ -3046,6 +3032,62 @@ mod tests {
             Some("stored-token-abc".to_string()),
             "mode selection must not consume or clear the stored token"
         );
+    }
+
+    #[tokio::test]
+    async fn v27_ignores_old_cursors_and_preserves_them_across_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.sqlite");
+        let db = state::SqliteStateDb::open(&path).await.unwrap();
+        for (key, value) in [
+            ("sync_token:PrimarySync", "old-opaque-zone"),
+            ("pending_sync_token:config:PrimarySync", "old-staged"),
+            ("retained_checkpoint_hold:PrimarySync", "old-hold"),
+            ("indexing_replay_required:PrimarySync", "old-replay"),
+        ] {
+            db.set_metadata(key, value).await.unwrap();
+        }
+        let current_key = sync_token_key("PrimarySync");
+        assert!(matches!(
+            determine_sync_mode(false, 1, Some(&db), &current_key, "PrimarySync").await,
+            download::SyncMode::Full
+        ));
+        assert!(
+            db.get_metadata(&pending_zone_token_key("config", "PrimarySync"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_metadata(&retained_checkpoint_hold_key("PrimarySync"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_metadata(&indexing_replay_key("PrimarySync"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        db.set_metadata(&current_key, "fresh-opaque-zone")
+            .await
+            .unwrap();
+        drop(db);
+        for _ in 0..2 {
+            let db = state::SqliteStateDb::open(&path).await.unwrap();
+            assert!(matches!(
+                determine_sync_mode(false, 1, Some(&db), &current_key, "PrimarySync").await,
+                download::SyncMode::Incremental { zone_sync_token } if zone_sync_token == "fresh-opaque-zone"
+            ));
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("old-opaque-zone")
+            );
+        }
     }
 
     #[test]

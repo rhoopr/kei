@@ -738,6 +738,17 @@ impl SqliteStateDb {
 
 #[async_trait]
 impl ReportStateStore for SqliteStateDb {
+    async fn has_download_retry_work(&self, library: &str) -> Result<bool, StateError> {
+        let library = library.to_owned();
+        self.with_conn("has_download_retry_work", move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND is_deleted=0 AND status IN ('pending','failed'))",
+                [library],
+                |row| row.get(0),
+            ).map_err(|error| StateError::query("has_download_retry_work", error))
+        }).await
+    }
+
     async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
         <SqliteStateDb as ReportStateStore>::get_failed_page(self, 0, u32::MAX).await
     }

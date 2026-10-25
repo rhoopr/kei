@@ -1394,6 +1394,28 @@ impl MetadataRewriteStore for SqliteStateDb {
     async fn guard_primary_writer(&self, path: &Path) -> Result<(), StateError> {
         let path = path.to_owned();
         self.with_conn("guard_primary_writer", move |conn| {
+            let requested = super::primary_layout::path_key(&path)?;
+            let sidecar_media = if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("xmp"))
+            {
+                Some(super::primary_layout::path_key(&path.with_extension(""))?)
+            } else {
+                None
+            };
+            let preserved: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM asset_metadata_paths
+                 WHERE preserved_path_key=?1 OR preserved_path_key=?2)",
+                rusqlite::params![requested, sidecar_media],
+                |row| row.get(0),
+            )?;
+            if preserved {
+                return Err(StateError::Invariant {
+                    operation: "guard_primary_writer",
+                    detail: "receipt-adopted existing media is read-only".into(),
+                });
+            }
             super::primary_layout::guard_writer(conn, &path)?;
             super::legacy_preservation::guard_writer(conn, &path)
         })

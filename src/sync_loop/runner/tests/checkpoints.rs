@@ -1772,7 +1772,6 @@ async fn run_cycle_rejected_zone_page_preserves_cursor_debt_and_media_across_res
             crate::sync_loop::precheck::include_pending_local_work(
                 &mut precheck,
                 inner.as_ref(),
-                &config.metadata,
                 std::slice::from_ref(&library),
             )
             .await;
@@ -2013,7 +2012,6 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
                 crate::sync_loop::precheck::include_pending_local_work(
                     &mut precheck,
                     inner.as_ref(),
-                    &config.metadata,
                     std::slice::from_ref(&library),
                 )
                 .await;
@@ -2427,7 +2425,6 @@ async fn run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_res
             crate::sync_loop::precheck::include_pending_local_work(
                 &mut precheck,
                 inner.as_ref(),
-                &config.metadata,
                 std::slice::from_ref(&library),
             )
             .await;

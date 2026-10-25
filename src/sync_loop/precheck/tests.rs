@@ -10,7 +10,7 @@ use crate::sync_loop::test_support::{
     FailingMetadataSetDb, MetadataSetFailure, SCOPED_DB_SYNC_TOKEN_FAILURE_KEY, make_library_state,
     make_run_cycle_library_state, make_state_db,
 };
-use crate::{config, download, state};
+use crate::{download, state};
 
 #[test]
 fn watch_precheck_skip_all_blocks_every_zone_and_token() {
@@ -121,13 +121,7 @@ async fn unresolved_identity_bypasses_watch_no_change_shortcut() {
     db.set_metadata(&marker, "1").await.unwrap();
     let library = make_run_cycle_library_state("PrimarySync", "sync_token", "zone_token");
     let mut precheck = WatchPrecheck::SkipAll;
-    include_pending_local_work(
-        &mut precheck,
-        &db,
-        &config::MetadataConfig::default(),
-        &[library],
-    )
-    .await;
+    include_pending_local_work(&mut precheck, &db, &[library]).await;
     assert!(precheck.should_sync_zone("PrimarySync"));
     assert!(!precheck.should_sync_zone("SharedSync-other"));
     assert!(precheck.db_sync_token_after_success().is_none());
@@ -149,13 +143,7 @@ async fn disabled_metadata_writers_leave_rewrite_marker_out_of_watch_work() {
     let library = make_run_cycle_library_state("PrimarySync", "sync_token", "zone_token");
     let mut precheck = WatchPrecheck::SkipAll;
 
-    include_pending_local_work(
-        &mut precheck,
-        &db,
-        &config::MetadataConfig::default(),
-        &[library],
-    )
-    .await;
+    include_pending_local_work(&mut precheck, &db, &[library]).await;
 
     assert!(!precheck.should_sync_zone("PrimarySync"));
     assert_eq!(
@@ -169,7 +157,7 @@ async fn disabled_metadata_writers_leave_rewrite_marker_out_of_watch_work() {
 }
 
 #[tokio::test]
-async fn enabled_metadata_writer_forces_only_selected_rewrite_zone() {
+async fn optional_metadata_rewrites_remain_queued_without_waking_normal_sync() {
     let db = state::SqliteStateDb::open_in_memory().expect("state db");
     for (library, asset_id) in [
         ("PrimarySync", "REWRITE_SELECTED"),
@@ -181,20 +169,24 @@ async fn enabled_metadata_writer_forces_only_selected_rewrite_zone() {
             .expect("seed rewrite marker");
     }
     let selected = make_run_cycle_library_state("PrimarySync", "sync_token", "zone_token");
-    let metadata = config::MetadataConfig {
-        set_exif_rating: true,
-        ..config::MetadataConfig::default()
-    };
     let mut precheck = WatchPrecheck::SkipAll;
 
-    include_pending_local_work(&mut precheck, &db, &metadata, &[selected]).await;
+    include_pending_local_work(&mut precheck, &db, &[selected]).await;
 
-    assert!(precheck.should_sync_zone("PrimarySync"));
+    assert!(!precheck.should_sync_zone("PrimarySync"));
+    assert_eq!(
+        db.get_pending_metadata_rewrites_page(None, 0, 10)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "ordinary sync must retain optional work without trying to rewrite old files"
+    );
     assert!(!precheck.should_sync_zone("SharedSync-OTHER"));
 }
 
 #[tokio::test]
-async fn capture_revision_forces_watch_work_with_metadata_writers_disabled() {
+async fn historical_capture_revision_remains_pending_without_waking_normal_sync() {
     let db = state::SqliteStateDb::open_in_memory().expect("state db");
     seed_watch_metadata_work(
         &db,
@@ -206,15 +198,15 @@ async fn capture_revision_forces_watch_work_with_metadata_writers_disabled() {
     let library = make_run_cycle_library_state("PrimarySync", "sync_token", "zone_token");
     let mut precheck = WatchPrecheck::SkipAll;
 
-    include_pending_local_work(
-        &mut precheck,
-        &db,
-        &config::MetadataConfig::default(),
-        &[library],
-    )
-    .await;
+    include_pending_local_work(&mut precheck, &db, &[library]).await;
 
-    assert!(precheck.should_sync_zone("PrimarySync"));
+    assert!(!precheck.should_sync_zone("PrimarySync"));
+    assert!(
+        db.has_metadata_capture_work(&["PrimarySync"], state::METADATA_CAPTURE_REVISION)
+            .await
+            .unwrap(),
+        "ordinary sync must preserve historical capture evidence"
+    );
 }
 
 fn assert_proceed_changed(precheck: &WatchPrecheck, expected_zone: &str, expected_db: &str) {
@@ -724,3 +716,5 @@ async fn indexing_qualified_replay_bypasses_quiet_database_shortcut_across_reope
         );
     }
 }
+
+mod baseline_watch_tests;

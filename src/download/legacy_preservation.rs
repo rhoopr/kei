@@ -1,21 +1,20 @@
 //! Preserve historical evidence without assigning it to a current provider child.
-//! The sync owner supplies completion/bridge permission; this owner proves files
-//! and current family receipts. State rechecks dependencies in the cursor transaction.
+//! Retained paths and source journals keep their existing safety checks.
+//! Normal source progress no longer requires historical archive certification.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use rustc_hash::FxHashSet;
+#[cfg(test)]
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::{DownloadConfig, DownloadStore};
-use crate::icloud::photos::CompleteLegacyInventory;
-use crate::icloud::photos::PhotoAlbum;
-use crate::state::{LegacyActivationProof, LegacyFileEvidence, LegacyPreservation};
+use crate::state::LegacyFileEvidence;
 
 /// Recovery scans a shared root, so its deny set must include every library.
 pub(crate) async fn protected_replacement_paths(
@@ -38,9 +37,12 @@ pub(in crate::download) async fn current_path_is_independent(
             != crate::state::db::SourceMetadataRecovery::ProtectedLegacy)
 }
 
-const INVENTORY_RETRY_SECONDS: i64 = 60 * 60;
+#[cfg(test)]
 const INVENTORY_RETRY_PREFIX: &str = "legacy_preservation_inventory_retry:";
+#[cfg(test)]
+const INVENTORY_RETRY_SECONDS: i64 = 60 * 60;
 
+#[cfg(test)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InventoryRetry {
@@ -49,6 +51,7 @@ struct InventoryRetry {
     next_attempt_at: i64,
 }
 
+#[cfg(test)]
 impl InventoryRetry {
     fn deferred(&self, signature: &str, now: i64) -> bool {
         self.version == 1
@@ -58,6 +61,7 @@ impl InventoryRetry {
     }
 }
 
+#[cfg(test)]
 fn inventory_retry_signature(
     config_hash: &str,
     candidates: &[crate::state::db::LegacyPreparationSnapshot],
@@ -114,6 +118,7 @@ enum LegacyFileError {
     SharedFileLinks,
 }
 
+#[cfg(test)]
 fn classify_legacy_file_error(error: &anyhow::Error) -> Option<&'static str> {
     match error.downcast_ref::<LegacyFileError>() {
         Some(LegacyFileError::SharedFileLinks) => Some("shared_file_links"),
@@ -123,16 +128,19 @@ fn classify_legacy_file_error(error: &anyhow::Error) -> Option<&'static str> {
 
 /// Only owning call sites supply these fixed labels. Private source errors stay
 /// in the chain for typed inventory/file classification, never ordinary logs.
+#[cfg(test)]
 #[derive(Debug, thiserror::Error)]
 #[error("Legacy current evidence refused ({0})")]
 struct LegacyProofRefusal(&'static str);
 
+#[cfg(test)]
 fn classify_legacy_proof_refusal(error: &anyhow::Error) -> &'static str {
     error
         .downcast_ref::<LegacyProofRefusal>()
         .map_or("unclassified", |refusal| refusal.0)
 }
 
+#[cfg(test)]
 pub(crate) fn log_preservation_hold(stage: &'static str, error: &anyhow::Error) {
     if let Some(diagnostic) = crate::icloud::photos::classify_legacy_inventory_error(error) {
         tracing::warn!(
@@ -228,457 +236,6 @@ fn check_link_count(
     Ok(())
 }
 
-#[derive(Default)]
-pub(crate) struct LegacyCycle {
-    preserved: Vec<LegacyPreservation>,
-    prepared_proofs: Vec<LegacyActivationProof>,
-    hardlink_trust: Option<Arc<HardlinkTrust>>,
-}
-
-impl LegacyCycle {
-    pub(crate) fn requires_inventory(&self) -> bool {
-        self.preserved
-            .iter()
-            .any(|record| record.active_generation.is_none())
-    }
-
-    /// Preparation is durable protection only. It never authorizes a checkpoint.
-    pub(crate) async fn begin(
-        db: &dyn DownloadStore,
-        config: &DownloadConfig,
-        album: &PhotoAlbum,
-        config_hash: &str,
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<Self> {
-        let hardlink_trust = config
-            .legacy_preservation_allow_hardlinks
-            .then(|| Arc::new(HardlinkTrust::default()));
-        let mut preserved = db.legacy_preservations(&config.library).await?;
-        for record in &mut preserved {
-            let dependencies = db
-                .legacy_dependency_evidence(&record.library, &record.asset_id)
-                .await?;
-            let files_valid = verify_files(
-                &record.files,
-                &config.temp_suffix,
-                cancel,
-                hardlink_trust.as_ref(),
-            )
-            .await;
-            let current_files_valid = if let Some(evidence) = &record.provider_evidence {
-                match provider_files(evidence) {
-                    Ok(files) => {
-                        verify_files(&files, &config.temp_suffix, cancel, hardlink_trust.as_ref())
-                            .await
-                    }
-                    Err(error) => Err(error),
-                }
-            } else {
-                Ok(())
-            };
-            if record.active_generation.is_some()
-                && (record.config_hash.as_deref() != Some(config_hash)
-                    || record.dependency_evidence.as_deref() != Some(dependencies.as_str())
-                    || files_valid.is_err()
-                    || current_files_valid.is_err())
-            {
-                db.reactivate_legacy_preservation(
-                    &record.library,
-                    &record.asset_id,
-                    record.active_generation,
-                )
-                .await?;
-                record.active_generation = None;
-            }
-            // Stop before ordinary replacement recovery can touch a protected path.
-            files_valid?;
-        }
-        let candidates = db.legacy_preparation_snapshots(&config.library, 64).await?;
-        if !candidates.is_empty() {
-            let retry_key = format!("{INVENTORY_RETRY_PREFIX}{}", config.library);
-            let signature = inventory_retry_signature(config_hash, &candidates)?;
-            let now = chrono::Utc::now().timestamp();
-            let deferred = db
-                .get_metadata(&retry_key)
-                .await?
-                .and_then(|encoded| serde_json::from_str::<InventoryRetry>(&encoded).ok())
-                .is_some_and(|retry| retry.deferred(&signature, now));
-            if deferred {
-                tracing::info!(
-                    stage = "preparation",
-                    reason = "inventory_retry_deferred",
-                    candidates = candidates.len(),
-                    "Legacy preservation discovery deferred; retaining attribution checkpoint hold"
-                );
-                return Ok(Self {
-                    preserved,
-                    prepared_proofs: Vec::new(),
-                    hardlink_trust,
-                });
-            }
-            let masters = candidates
-                .iter()
-                .map(|candidate| candidate.asset_id.clone())
-                .collect();
-            // Provider failures cannot relax existing capture/checkpoint guards.
-            match album.complete_legacy_inventory(&masters, cancel).await {
-                Ok(inventory) => {
-                    // A successful scan cannot borrow an earlier failure delay.
-                    db.set_metadata(&retry_key, "").await?;
-                    let mut no_current_child = 0usize;
-                    let mut invalid_original_files = 0usize;
-                    let mut shared_file_links = 0usize;
-                    let mut deferred_candidates = 0usize;
-                    for candidate in candidates {
-                        if !inventory
-                            .children
-                            .iter()
-                            .any(|child| child.id() == candidate.asset_id)
-                        {
-                            no_current_child += 1;
-                            continue;
-                        }
-                        let mut files = Vec::new();
-                        let mut valid = true;
-                        for path in &candidate.paths {
-                            for (path, required) in [(path.clone(), true), (sidecar(path), false)] {
-                                match fingerprint(
-                                    &config.directory,
-                                    &path,
-                                    required,
-                                    &config.temp_suffix,
-                                    cancel,
-                                    hardlink_trust.as_ref(),
-                                )
-                                .await
-                                {
-                                    Ok(file) => files.push(file),
-                                    Err(error) => {
-                                        if classify_legacy_file_error(&error).is_some() {
-                                            shared_file_links += 1;
-                                        }
-                                        valid = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            if !valid {
-                                break;
-                            }
-                        }
-                        let mut retained_current = Vec::new();
-                        if valid {
-                            // These bytes qualify only a historical catalogue claim;
-                            // they never become protected originals or provider proof.
-                            for claim in &candidate.historical_claims {
-                                let current = fingerprint(
-                                    &config.directory,
-                                    &claim.current_path,
-                                    true,
-                                    &config.temp_suffix,
-                                    cancel,
-                                    hardlink_trust.as_ref(),
-                                )
-                                .await;
-                                if !current.is_ok_and(|file| {
-                                    file.sha256.as_deref() == Some(claim.local_sha256.as_str())
-                                }) {
-                                    valid = false;
-                                    break;
-                                }
-                                let retained = super::file::retain_pending_file(
-                                    &config.directory,
-                                    &claim.current_path,
-                                )
-                                .await?;
-                                let Some(retained) = retained else {
-                                    valid = false;
-                                    break;
-                                };
-                                if data_encoding::HEXLOWER.encode(&retained.fingerprint.sha256)
-                                    != claim.local_sha256
-                                {
-                                    valid = false;
-                                    break;
-                                }
-                                retained_current.push(retained);
-                            }
-                        }
-                        if valid {
-                            let cancel = cancel.clone();
-                            let root = config.directory.to_path_buf();
-                            let suffix = config.temp_suffix.clone();
-                            let current_paths = candidate
-                                .historical_claims
-                                .iter()
-                                .map(|claim| claim.current_path.clone())
-                                .collect::<Vec<_>>();
-                            let allow_hardlinks = config.legacy_preservation_allow_hardlinks;
-                            let validate = Box::new(move || {
-                                if cancel.is_cancelled() {
-                                    return Err(crate::state::error::StateError::Invariant {
-                                        operation: "legacy_preservation",
-                                        detail: "historical claim validation cancelled".into(),
-                                    });
-                                }
-                                for (file, path) in retained_current.into_iter().zip(current_paths)
-                                {
-                                    let check = || -> anyhow::Result<()> {
-                                        for suffix in [suffix.as_ref(), ".part"] {
-                                            let mut temporary = path.as_os_str().to_owned();
-                                            temporary.push(suffix);
-                                            anyhow::ensure!(
-                                                !crate::fs_util::ConfinedPath::open(
-                                                    &root,
-                                                    Path::new(&temporary),
-                                                    crate::fs_util::ConfinedParents::Existing
-                                                )?
-                                                .entry_exists()?,
-                                                "Historical current temporary write is pending"
-                                            );
-                                        }
-                                        anyhow::ensure!(
-                                            !super::file::has_replacement_journal_blocking(
-                                                &root, &path
-                                            )?,
-                                            "Historical current replacement is pending"
-                                        );
-                                        let links = file.link_count()?;
-                                        anyhow::ensure!(
-                                            links == 1 || (allow_hardlinks && links > 0),
-                                            "Historical current hardlink policy changed"
-                                        );
-                                        file.validate_blocking()
-                                    };
-                                    check().map_err(|_private_error| {
-                                        crate::state::error::StateError::Invariant {
-                                            operation: "legacy_preservation",
-                                            detail: "historical claim file changed before commit"
-                                                .into(),
-                                        }
-                                    })?;
-                                }
-                                Ok(())
-                            });
-                            let prepared = if candidate.historical_claims.is_empty() {
-                                db.prepare_legacy_preservation(&candidate, &files).await?
-                            } else {
-                                db.prepare_legacy_preservation_validated(
-                                    &candidate, &files, validate,
-                                )
-                                .await?
-                            };
-                            if !prepared {
-                                deferred_candidates += 1;
-                            }
-                            if !candidate.historical_claims.is_empty() {
-                                tracing::info!(
-                                    diagnostic = "recovery_decision_v1",
-                                    mechanism = "historical_path",
-                                    decision = if prepared { "partial" } else { "unsupported" },
-                                    reason = if prepared {
-                                        "historical_claim_prepared"
-                                    } else {
-                                        "historical_claim_unverified"
-                                    },
-                                    "Historical path recovery retains original evidence and provider checkpoint obligations"
-                                );
-                            }
-                        } else {
-                            if !candidate.historical_claims.is_empty() {
-                                tracing::warn!(
-                                    diagnostic = "recovery_decision_v1",
-                                    mechanism = "historical_path",
-                                    decision = "unsupported",
-                                    reason = "historical_claim_unverified",
-                                    "Historical path recovery requires unchanged independent current files"
-                                );
-                            }
-                            invalid_original_files += 1;
-                        }
-                    }
-                    if no_current_child + invalid_original_files + deferred_candidates > 0 {
-                        tracing::warn!(
-                            stage = "preparation",
-                            no_current_child,
-                            invalid_original_files,
-                            shared_file_links,
-                            deferred_candidates,
-                            "Legacy preservation candidates remain unresolved; retaining attribution checkpoint hold"
-                        );
-                    }
-                    preserved = db.legacy_preservations(&config.library).await?;
-                }
-                Err(error) => {
-                    log_preservation_hold("preparation", &error);
-                    if !cancel.is_cancelled() {
-                        let retry = InventoryRetry {
-                            version: 1,
-                            signature,
-                            next_attempt_at: chrono::Utc::now()
-                                .timestamp()
-                                .saturating_add(INVENTORY_RETRY_SECONDS),
-                        };
-                        db.set_metadata(&retry_key, &serde_json::to_string(&retry)?)
-                            .await?;
-                    }
-                }
-            }
-        }
-        Ok(Self {
-            preserved,
-            prepared_proofs: Vec::new(),
-            hardlink_trust,
-        })
-    }
-
-    /// Run after normal inventory and before replay from the retained cursor.
-    /// The subsequent bridge may change dependencies, in which case activation
-    /// is rejected and a later complete inventory must prove the new family.
-    pub(crate) async fn certify(
-        &mut self,
-        db: &dyn DownloadStore,
-        config: &DownloadConfig,
-        album: &PhotoAlbum,
-        config_hash: &str,
-        prior_cursor: &str,
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<()> {
-        if !self.requires_inventory() {
-            return Ok(());
-        }
-        let masters = self
-            .preserved
-            .iter()
-            .filter(|r| r.active_generation.is_none())
-            .map(|r| r.asset_id.clone())
-            .collect();
-        let inventory = album.complete_legacy_inventory(&masters, cancel).await?;
-        anyhow::ensure!(
-            inventory.library == config.library.as_ref(),
-            LegacyProofRefusal("inventory_scope_changed")
-        );
-        for record in self
-            .preserved
-            .iter()
-            .filter(|record| record.active_generation.is_none())
-        {
-            verify_files(
-                &record.files,
-                &config.temp_suffix,
-                cancel,
-                self.hardlink_trust.as_ref(),
-            )
-            .await?;
-            let before = db
-                .legacy_dependency_evidence(&record.library, &record.asset_id)
-                .await?;
-            let provider_evidence = qualify_family(
-                db,
-                config,
-                record,
-                &inventory,
-                cancel,
-                self.hardlink_trust.as_ref(),
-            )
-            .await?;
-            anyhow::ensure!(
-                before
-                    == db
-                        .legacy_dependency_evidence(&record.library, &record.asset_id)
-                        .await?,
-                LegacyProofRefusal("dependencies_changed_during_qualification")
-            );
-            let mut expected_metadata = Vec::new();
-            for key in [
-                "enum_config_hash",
-                "pending_enum_config_hash",
-                "config_hash",
-                "pending_download_config_hash",
-            ] {
-                expected_metadata.push((key.to_owned(), db.get_metadata(key).await?));
-            }
-            self.prepared_proofs.push(LegacyActivationProof {
-                library: record.library.clone(),
-                asset_id: record.asset_id.clone(),
-                expected_original: record.original_evidence.clone(),
-                expected_dependencies: before,
-                provider_evidence,
-                expected_metadata,
-                expected_active_generation: record.active_generation,
-                config_hash: config_hash.to_owned(),
-                prior_cursor: prior_cursor.to_owned(),
-                next_cursor: String::new(),
-            });
-        }
-        Ok(())
-    }
-
-    /// Every prepared original needs a proof. Existing activated records are
-    /// revalidated too, so new evidence cannot borrow a previous generation.
-    pub(crate) async fn finish(
-        &self,
-        db: &dyn DownloadStore,
-        config: &DownloadConfig,
-        token: &str,
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<Vec<LegacyActivationProof>> {
-        let mut proofs = Vec::new();
-        for record in &self.preserved {
-            verify_files(
-                &record.files,
-                &config.temp_suffix,
-                cancel,
-                self.hardlink_trust.as_ref(),
-            )
-            .await?;
-            let current = db
-                .legacy_dependency_evidence(&record.library, &record.asset_id)
-                .await?;
-            if record.active_generation.is_some() {
-                let files = provider_files(
-                    record
-                        .provider_evidence
-                        .as_deref()
-                        .context(LegacyProofRefusal("current_file_evidence_missing"))?,
-                )?;
-                verify_files(
-                    &files,
-                    &config.temp_suffix,
-                    cancel,
-                    self.hardlink_trust.as_ref(),
-                )
-                .await?;
-                anyhow::ensure!(
-                    record.dependency_evidence.as_deref() == Some(current.as_str()),
-                    LegacyProofRefusal("active_dependencies_changed")
-                );
-            } else {
-                let mut proof = self
-                    .prepared_proofs
-                    .iter()
-                    .find(|proof| proof.asset_id == record.asset_id)
-                    .context(LegacyProofRefusal("current_proof_missing"))?
-                    .clone();
-                anyhow::ensure!(
-                    proof.expected_dependencies == current,
-                    LegacyProofRefusal("dependencies_changed_after_inventory")
-                );
-                verify_files(
-                    &provider_files(&proof.provider_evidence)?,
-                    &config.temp_suffix,
-                    cancel,
-                    self.hardlink_trust.as_ref(),
-                )
-                .await?;
-                proof.next_cursor = token.to_owned();
-                proofs.push(proof);
-            }
-        }
-        Ok(proofs)
-    }
-}
-
 fn sidecar(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".xmp");
@@ -765,6 +322,7 @@ async fn fingerprint(
     })
 }
 
+#[cfg(test)]
 async fn verify_files(
     files: &[LegacyFileEvidence],
     temp_suffix: &str,
@@ -789,159 +347,7 @@ async fn verify_files(
     Ok(())
 }
 
-async fn qualify_family(
-    db: &dyn DownloadStore,
-    config: &DownloadConfig,
-    record: &LegacyPreservation,
-    inventory: &CompleteLegacyInventory,
-    cancel: &CancellationToken,
-    hardlink_trust: Option<&Arc<HardlinkTrust>>,
-) -> anyhow::Result<String> {
-    let children: Vec<_> = inventory
-        .children
-        .iter()
-        .filter(|child| child.id() == record.asset_id)
-        .collect();
-    anyhow::ensure!(
-        !children.is_empty(),
-        LegacyProofRefusal("no_current_children")
-    );
-    let mut paths: FxHashSet<_> = record
-        .files
-        .iter()
-        .map(|file| crate::fs_util::confined_path_key(&file.path))
-        .collect::<Result<_, _>>()?;
-    let catalog = db
-        .get_reconciliation_catalog_paths()
-        .await
-        .context(LegacyProofRefusal("catalog_read_failed"))?;
-    let mut evidence = Vec::new();
-    for child in children {
-        anyhow::ensure!(
-            db.get_master_record_name_for_asset(&record.library, child.asset_record_name())
-                .await?
-                .as_deref()
-                == Some(record.asset_id.as_str()),
-            LegacyProofRefusal("child_mapping_missing")
-        );
-        anyhow::ensure!(
-            child.asset_record_name() != record.asset_id,
-            LegacyProofRefusal("child_identity_conflict")
-        );
-        anyhow::ensure!(
-            super::filter::is_asset_filtered(child, config).is_none(),
-            LegacyProofRefusal("child_policy_excluded")
-        );
-        let versions = super::filter::extract_skip_candidates(child, config);
-        anyhow::ensure!(
-            !versions.is_empty(),
-            LegacyProofRefusal("child_renditions_empty")
-        );
-        let receipts = db
-            .legacy_child_receipts(&record.library, child.asset_record_name())
-            .await
-            .context(LegacyProofRefusal("child_receipt_read_failed"))?;
-        for (version, checksum) in versions {
-            let Some(receipt) = receipts
-                .iter()
-                .find(|receipt| receipt.version_size == version)
-            else {
-                // This read only explains the refusal above. Never reuse its
-                // newer observations as acceptance evidence or retry the read.
-                let prerequisite = db
-                    .legacy_child_receipt_refusal(
-                        &record.library,
-                        child.asset_record_name(),
-                        version.as_str(),
-                    )
-                    .await
-                    .unwrap_or(crate::state::db::LegacyChildReceiptRefusal::Unavailable);
-                tracing::warn!(
-                    diagnostic = "legacy_receipt_prerequisite_v1",
-                    prerequisite = prerequisite.label(),
-                    "Required legacy current-child receipt is ineligible; retaining certification hold"
-                );
-                return Err(anyhow::Error::new(LegacyProofRefusal(
-                    "child_receipt_missing",
-                )));
-            };
-            anyhow::ensure!(
-                receipt.checksum.as_ref() == checksum
-                    && Some(receipt.created_at) == child.asset_date_evidence()
-                    && receipt.added_at == child.added_date_evidence(),
-                LegacyProofRefusal("child_receipt_provider_mismatch")
-            );
-            let metadata = super::filter::metadata_for_selected_version(child, config, version);
-            anyhow::ensure!(
-                receipt.metadata.compute_hash() == metadata.compute_hash(),
-                LegacyProofRefusal("child_metadata_mismatch")
-            );
-            let path = receipt
-                .local_path
-                .as_deref()
-                .context(LegacyProofRefusal("child_output_missing"))?;
-            anyhow::ensure!(
-                paths.insert(crate::fs_util::confined_path_key(path)?),
-                LegacyProofRefusal("output_path_conflict")
-            );
-            let key = crate::fs_util::confined_path_key(path)?;
-            for owner in &catalog {
-                anyhow::ensure!(
-                    crate::fs_util::confined_path_key(&owner.path)? != key
-                        || (owner.library.as_ref() == record.library
-                            && owner.asset_id.as_ref() == child.asset_record_name()),
-                    LegacyProofRefusal("output_catalog_conflict")
-                );
-            }
-            let file = fingerprint(
-                &config.directory,
-                path,
-                true,
-                &config.temp_suffix,
-                cancel,
-                hardlink_trust,
-            )
-            .await
-            .context(LegacyProofRefusal("current_file_unavailable"))?;
-            // The store qualified separate source provenance or explicit local
-            // acceptance for this exact binding. MMCS identifies a provider
-            // generation; it is never a local SHA-256 content hash.
-            anyhow::ensure!(
-                file.sha256 == receipt.local_checksum,
-                LegacyProofRefusal("child_content_unverified")
-            );
-            #[cfg(feature = "xmp")]
-            let sidecar_required = config.metadata.xmp_sidecar;
-            #[cfg(not(feature = "xmp"))]
-            let sidecar_required = false;
-            let sidecar_file = fingerprint(
-                &config.directory,
-                &sidecar(path),
-                sidecar_required,
-                &config.temp_suffix,
-                cancel,
-                hardlink_trust,
-            )
-            .await
-            .context(LegacyProofRefusal("current_sidecar_unavailable"))?;
-            anyhow::ensure!(
-                paths.insert(crate::fs_util::confined_path_key(&sidecar_file.path)?),
-                LegacyProofRefusal("sidecar_path_conflict")
-            );
-            let provenance = db
-                .legacy_child_provenance(
-                    &record.library,
-                    child.asset_record_name(),
-                    version.as_str(),
-                )
-                .await?
-                .context(LegacyProofRefusal("child_provenance_missing"))?;
-            evidence.push(json!({"child":child.asset_record_name(),"version":version.as_str(),"provider_checksum":checksum,"created_at":child.asset_date_evidence(),"added_at":child.added_date_evidence(),"metadata_hash":metadata.compute_hash(),"provenance":provenance,"files":[file,sidecar_file]}));
-        }
-    }
-    Ok(json!({"version":1,"library":inventory.library,"inventory_cursor":inventory.cursor,"master":record.asset_id,"children":evidence}).to_string())
-}
-
+#[cfg(test)]
 fn provider_files(evidence: &str) -> anyhow::Result<Vec<LegacyFileEvidence>> {
     let value: serde_json::Value = serde_json::from_str(evidence)?;
     anyhow::ensure!(

@@ -34,6 +34,7 @@ mod test_support;
 pub(super) use collisions::{NormalizedPath, PathPlanningMode, pre_ensure_asset_dir};
 pub(super) use config::folder_structure_for_pass;
 pub(crate) use config::{PathDerivationConfig, PathDerivationSource};
+pub(super) use eligibility::fallback_filename_excluded;
 pub(crate) use eligibility::{FilterReason, determine_media_type, is_asset_filtered};
 pub(super) use expected_paths::{
     DerivationContext, DerivedPath, MalformedTaskResource, derive_alternative_extra,

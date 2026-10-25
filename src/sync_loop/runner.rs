@@ -661,8 +661,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             && !config.runtime.only_print_filenames
             && let Some(db) = state_db.as_deref()
         {
-            include_pending_local_work(&mut watch_precheck, db, &config.metadata, &library_states)
-                .await;
+            include_pending_local_work(&mut watch_precheck, db, &library_states).await;
             include_pending_provider_work(
                 &mut watch_precheck,
                 &library_states,

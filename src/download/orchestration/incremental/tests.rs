@@ -2959,3 +2959,63 @@ async fn first_album_sync_keeps_capture_mtime_after_embedded_metadata_rewrite() 
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn v027_standalone_master_delta_holds_successor_without_shadow_fallback() {
+    for collecting in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open(&dir.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        let key = crate::sync_cycle::sync_token_key("PrimarySync");
+        db.set_metadata(&key, "before-master").await.unwrap();
+        let records = incremental_photo_records("master-without-child");
+        assert_eq!(records[0]["recordType"], "CPLMaster");
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album(
+                "",
+                changes_zone_session(Arc::new(AtomicUsize::new(0)), vec![records[0].clone()]),
+            ),
+            exclude_ids: Default::default(),
+        }];
+        let mut config = incremental_test_config(&dir);
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+        let result = if collecting {
+            super::download_photos_incremental_collecting(
+                &Client::new(),
+                &passes,
+                &config,
+                "before-master",
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+        } else {
+            download_photos_incremental(
+                &Client::new(),
+                &passes,
+                &config,
+                "before-master",
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+        }
+        .unwrap();
+        assert!(
+            result.sync_token.is_none(),
+            "standalone master has no admitted work: {result:?}"
+        );
+        assert!(result.checkpoint.sync_token_blocked);
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(
+            db.get_metadata(&key).await.unwrap().as_deref(),
+            Some("before-master")
+        );
+        assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
+    }
+}

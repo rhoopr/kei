@@ -939,6 +939,17 @@ fn parse_relation_delta(record: &Record, reason: ChangeReason) -> ChangeEvent {
     }
 }
 
+/// Unknown current records have no independent work owner in ordinary sync.
+/// Keep the affected cursor rather than silently treating them as excluded.
+pub(crate) fn delta_record_is_accountable(record: &Record) -> bool {
+    !record.record_name.trim().is_empty()
+        && (classify_change_reason(record) == ChangeReason::HardDeleted
+            || matches!(
+                record.record_type.as_str(),
+                "CPLMaster" | "CPLAsset" | "CPLAlbum" | "CPLContainerRelation"
+            ))
+}
+
 /// Buffers `CPLMaster` and `CPLAsset` records from `changes/zone` responses
 /// and pairs them into `ChangeEvent`s when both halves are available.
 ///
@@ -1086,11 +1097,15 @@ impl DeltaRecordBuffer {
 
         for (name, record) in self.pending_masters.drain() {
             let reason = classify_change_reason(&record);
-            events.push(ChangeEvent::new(
-                name.into_boxed_str(),
-                Some("CPLMaster".into()),
-                reason,
-            ));
+            let mut event =
+                ChangeEvent::new(name.into_boxed_str(), Some("CPLMaster".into()), reason);
+            if reason == ChangeReason::Created {
+                // A current master without a child cannot be selected or
+                // admitted as a downloadable identity. Retain the source
+                // cursor instead of silently consuming this observation.
+                event.token_unsafe_reason = Some("unpaired_current_master");
+            }
+            events.push(event);
         }
 
         for (master_ref, records) in self.pending_assets.drain() {

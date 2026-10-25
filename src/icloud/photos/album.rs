@@ -178,6 +178,14 @@ impl PhotoAlbum {
             .unwrap_or("")
     }
 
+    /// Album membership cannot change this unfiltered library query's rank.
+    pub(crate) fn has_collection_independent_rank(&self) -> bool {
+        self.list_type.as_ref() == QUERY_ALL_LIST
+            && self.query_filter.is_none()
+            && self.container_id.is_none()
+            && self.cross_zone_sources.is_empty()
+    }
+
     /// Provider scope used to bind durable selection recovery to its query owners.
     pub(crate) fn selection_scope(&self) -> Value {
         serde_json::json!({
@@ -564,11 +572,29 @@ impl PhotoAlbum {
     ///
     /// This method is inherently sequential -- each page's syncToken feeds the next request.
     /// No parallel fetchers.
+    pub(crate) fn changes_stream_observed(
+        &self,
+        sync_token: &str,
+        collection_independent: bool,
+    ) -> (
+        ChangeStream,
+        tokio::sync::oneshot::Receiver<String>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (stream, token) = self.stream_changes(
+            sync_token,
+            Some(Arc::clone(&observed)),
+            collection_independent,
+        );
+        (stream, token, observed)
+    }
+
     pub fn changes_stream(
         &self,
         sync_token: &str,
     ) -> (ChangeStream, tokio::sync::oneshot::Receiver<String>) {
-        self.stream_changes(sync_token)
+        self.stream_changes(sync_token, None, false)
     }
 }
 

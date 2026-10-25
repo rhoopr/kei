@@ -307,6 +307,7 @@ fn batch_forecast_decision_saturating_mul_never_overflows_warn_threshold() {
 #[test]
 fn test_producer_skip_summary_total() {
     let skips = ProducerSkipSummary {
+        uncertain: 0,
         by_state: 10,
         on_disk: 5,
         ampm_variant: 2,
@@ -325,6 +326,7 @@ fn test_producer_skip_summary_total() {
 #[test]
 fn test_producer_skip_summary_add_assign() {
     let mut a = ProducerSkipSummary {
+        uncertain: 0,
         by_state: 10,
         on_disk: 5,
         ampm_variant: 2,
@@ -338,6 +340,7 @@ fn test_producer_skip_summary_add_assign() {
         retry_only: 0,
     };
     let b = ProducerSkipSummary {
+        uncertain: 0,
         by_state: 1,
         on_disk: 2,
         ampm_variant: 3,
@@ -387,6 +390,7 @@ fn producer_skip_summary_records_every_filter_reason() {
 #[test]
 fn producer_skip_summary_converts_to_public_skip_breakdown() {
     let skips = ProducerSkipSummary {
+        uncertain: 0,
         by_state: 1,
         on_disk: 2,
         ampm_variant: 3,

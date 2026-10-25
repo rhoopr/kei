@@ -130,6 +130,60 @@ impl std::fmt::Debug for PhotoLibrary {
 }
 
 impl PhotoLibrary {
+    /// Obtain a fresh zone-history boundary in this exact database and zone.
+    /// This is a changes cursor, not a claim that rank queries form a snapshot.
+    pub(crate) async fn fresh_baseline_cursor(&self) -> anyhow::Result<String> {
+        let body = super::session::retry_post_changes_body(
+            self.session.as_ref(),
+            &format!("{}/zones/list", self.service_endpoint),
+            "{}",
+            &[("Content-type", "text/plain")],
+            &self.retry_config,
+        )
+        .await?;
+        let response = super::changes_json::parse(&body)?;
+        anyhow::ensure!(
+            response
+                .get("moreComing")
+                .is_none_or(|value| value.as_bool() == Some(false))
+                && response
+                    .get("continuationMarker")
+                    .is_none_or(Value::is_null),
+            "Incomplete zone metadata cannot establish a baseline boundary"
+        );
+        let zones = response
+            .get("zones")
+            .and_then(Value::as_array)
+            .context("Missing zone metadata for baseline boundary")?;
+        let mut matching = zones
+            .iter()
+            .filter(|zone| zone.get("zoneID") == Some(self.zone_id.as_ref()));
+        let zone = matching
+            .next()
+            .context("Baseline zone identity was not returned")?;
+        anyhow::ensure!(
+            matching.next().is_none(),
+            "Ambiguous baseline zone identity"
+        );
+        anyhow::ensure!(
+            zone.get("serverErrorCode").is_none_or(Value::is_null)
+                && zone.get("deleted").and_then(Value::as_bool) != Some(true),
+            "Baseline zone metadata is unavailable"
+        );
+        zone.get("syncToken")
+            .and_then(Value::as_str)
+            .filter(|token| !token.trim().is_empty())
+            .map(str::to_owned)
+            .context("Zone metadata did not provide a baseline cursor")
+    }
+
+    pub(crate) fn baseline_scope(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let encoded =
+            json!({"database": self.library_type.as_ref(), "zone": self.zone_id.as_ref()});
+        format!("{:x}", Sha256::digest(encoded.to_string().as_bytes()))
+    }
+
     /// Create a library with explicit FINISHED or provisional RUNNING readiness.
     pub async fn new(
         service_endpoint: String,

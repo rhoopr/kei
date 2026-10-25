@@ -1,5 +1,11 @@
 //! Provider errors whose meaning must survive orchestration boundaries.
 
+/// Current work without a scoped durable owner must retain its source cursor.
+/// A rank inventory cannot substitute for accounting for this observation.
+#[derive(Debug, thiserror::Error)]
+#[error("Current provider record has no scoped retry owner; retaining the source cursor")]
+pub(crate) struct UnaccountedChangeError;
+
 /// A refused observation cannot be recovered by an uncaptured rank inventory.
 /// Preserve the redacted underlying diagnostic while preventing static fallback.
 #[derive(Debug, thiserror::Error)]

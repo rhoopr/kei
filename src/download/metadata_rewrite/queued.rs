@@ -12,67 +12,12 @@ use super::planning::{CaptureTimestampRepair, MetadataFlags};
 #[cfg(feature = "xmp")]
 use super::sidecar::write_sidecar_metadata;
 use crate::download::filter::MetadataPayload;
-use crate::download::{DownloadConfig, DownloadContext};
-use crate::icloud::photos::PhotoAsset;
 use crate::state::db::{CaptureRepairReceipt, MetadataRewriteCompletion, MetadataRewriteQueue};
-use crate::state::{MembershipStore, MetadataRewriteStore, VersionSizeKey};
+use crate::state::{MembershipStore, MetadataRewriteStore};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-
-/// Persist a metadata-rewrite marker for each candidate version whose
-/// metadata drifted from the stored hash, or that already carries a marker
-/// from a prior sync. No-op when metadata writing is off or the state DB
-/// is absent.
-pub(in crate::download) async fn tag_if_needed<D>(
-    state_db: Option<&D>,
-    config: &DownloadConfig,
-    asset: &PhotoAsset,
-    candidates: &[(VersionSizeKey, &str)],
-    ctx: &DownloadContext,
-) where
-    D: MetadataRewriteStore + ?Sized,
-{
-    if !MetadataFlags::from(config).has_any_write() {
-        return;
-    }
-    let Some(db) = state_db else {
-        return;
-    };
-    let library = asset.source_zone().unwrap_or(config.library.as_ref());
-    let capture = crate::download::filter::metadata_capture(asset);
-    for &(vs, _) in candidates {
-        let checksum = ctx
-            .downloaded_checksums
-            .get(library)
-            .and_then(|assets| assets.get(asset.state_id()))
-            .and_then(|versions| versions.get(vs.as_str()))
-            .map_or("", AsRef::as_ref);
-        let metadata = capture.resolve(vs, checksum);
-        let new_hash = metadata.metadata_hash.as_deref();
-        if !ctx.needs_metadata_rewrite(library, asset.state_id(), vs, new_hash) {
-            continue;
-        }
-        tracing::info!(
-            target: "kei::download::metadata_rewrite",
-            asset_id = %asset.id(),
-            version_size = vs.as_str(),
-            "Metadata-only change detected; tagging for rewrite"
-        );
-        if let Err(e) = db
-            .record_metadata_write_failure(library, asset.state_id(), vs.as_str())
-            .await
-        {
-            tracing::warn!(
-                target: "kei::download::metadata_rewrite",
-                asset_id = %asset.id(),
-                error = %e,
-                "Failed to set metadata rewrite marker"
-            );
-        }
-    }
-}
 
 /// Maximum assets processed per metadata-rewrite invocation. Bounds worst-case
 /// tail work at sync end; anything beyond this rolls into the next sync.
@@ -268,6 +213,10 @@ where
             break;
         }
         if metadata_flags.uses_xmp_groupings()
+            && pending_rewrite
+                .selection_receipt
+                .as_ref()
+                .is_none_or(|receipt| receipt.frozen_groupings.is_none())
             && grouping_read_failures.contains(record.library.as_ref())
         {
             errored += 1;
@@ -332,12 +281,21 @@ where
         }
 
         let payload = Arc::new(
-            groupings_by_library
-                .get(record.library.as_ref())
-                .map_or_else(
-                    || MetadataPayload::from_metadata(&record.metadata),
-                    |groupings| groupings.metadata_payload(&record.id, &record.metadata),
-                ),
+            if let Some((albums, people)) = pending_rewrite
+                .selection_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.frozen_groupings.as_ref())
+            {
+                MetadataPayload::from_metadata(&record.metadata)
+                    .with_asset_groupings(albums, people)
+            } else {
+                groupings_by_library
+                    .get(record.library.as_ref())
+                    .map_or_else(
+                        || MetadataPayload::from_metadata(&record.metadata),
+                        |groupings| groupings.metadata_payload(&record.id, &record.metadata),
+                    )
+            },
         );
         let created_local = record.metadata.capture_local(record.created_at);
 

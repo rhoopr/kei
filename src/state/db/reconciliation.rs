@@ -151,8 +151,10 @@ impl ReconciliationStateStore for SqliteStateDb {
                     destination_path: PathBuf::from(row.get::<_, String>(5)?),
                 })
             })?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(StateError::from)
+            let mut reservations = rows.collect::<Result<Vec<_>, _>>()?;
+            reservations
+                .extend(super::provider_generations::pending_destination_reservations(conn)?);
+            Ok(reservations)
         })
         .await
     }

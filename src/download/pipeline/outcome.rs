@@ -196,13 +196,11 @@ pub(super) async fn finalize_streaming_download(
             Some(state_db_unwritable_error(final_state_flush.attempted));
     }
 
-    // Drain metadata-rewrite markers set earlier in this cycle (or left over
-    // from a previous one). This re-applies EXIF/XMP on the existing files
-    // without re-downloading bytes; the alternative was to leave markers
-    // accumulating in the DB forever.
+    // Existing files are rewritten only by an explicit metadata refresh.
+    // Normal sync retains older queued markers without executing their writers.
     if consumer.state_write_circuit_error.is_none()
         && !defer_metadata_drain
-        && !config.refresh_metadata
+        && config.refresh_metadata
         && let Some(db) = &state_db
     {
         let metadata_flags = MetadataFlags::from(config.as_ref());
@@ -412,7 +410,7 @@ pub(in crate::download) async fn build_download_result(
             tracing::info!(target: "kei::download::pipeline", destination = %config.directory.display(), "  destination");
         } else if streaming_result.url_expired_abort {
             tracing::warn!(target: "kei::download::pipeline", "Download batch aborted because signed iCloud URLs expired");
-        } else {
+        } else if stats.skipped.uncertain == 0 {
             tracing::info!(target: "kei::download::pipeline", "No new photos to download");
         }
         // A metadata-only edit cycle downloads nothing, so rewrite failures
@@ -561,11 +559,10 @@ pub(in crate::download) async fn build_download_result(
         "── Cleanup pass: re-fetching URLs and retrying failed downloads ──"
     );
 
-    let refresh = if streaming_result.url_expired_abort {
-        crate::download::CleanupUrlRefresh::Lookup
-    } else {
-        crate::download::CleanupUrlRefresh::Enumerate
-    };
+    // Failed tasks already retain exact provider identities and destinations.
+    // Refresh those identities even for ordinary transfer failures; a failed
+    // download is not evidence that the completed inventory must be repeated.
+    let refresh = crate::download::CleanupUrlRefresh::Lookup;
     let retry_plan = if let Some(context) = &config.selection_context {
         if let Some(run) = &config.selection_run {
             run.remember_retry_sources(&failed_tasks, passes, config)
@@ -744,6 +741,26 @@ fn finish_download_result(
     mut stats: crate::download::SyncStats,
     checkpoint: CheckpointEvidence,
 ) -> SyncResult {
+    // Uncertain content is durable pending work, never an already-downloaded
+    // skip or a successful complete backup. It does not revoke an accounted
+    // provider checkpoint or enter the transfer retry batch.
+    let outcome = if stats.skipped.uncertain > 0 {
+        tracing::warn!(
+            pending = stats.skipped.uncertain,
+            "Existing files still need reliable content evidence; pending work retained"
+        );
+        match outcome {
+            DownloadOutcome::Success => DownloadOutcome::PartialFailure {
+                failed_count: stats.skipped.uncertain,
+            },
+            DownloadOutcome::PartialFailure { failed_count } => DownloadOutcome::PartialFailure {
+                failed_count: failed_count.saturating_add(stats.skipped.uncertain),
+            },
+            expired @ DownloadOutcome::SessionExpired { .. } => expired,
+        }
+    } else {
+        outcome
+    };
     checkpoint.project(&mut stats);
     SyncResult {
         outcome,

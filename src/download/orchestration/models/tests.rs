@@ -73,6 +73,7 @@ fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
         downloaded: 4,
         failed: 1,
         skipped: SkipBreakdown {
+            uncertain: 0,
             by_state: 2,
             on_disk: 3,
             by_media_type: 4,
@@ -145,6 +146,7 @@ fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
         downloaded: 11,
         failed: 2,
         skipped: SkipBreakdown {
+            uncertain: 0,
             by_state: 1,
             on_disk: 1,
             by_media_type: 1,
@@ -414,6 +416,7 @@ fn sync_stats_accumulate_into_empty_is_copy() {
         downloaded: 2,
         failed: 1,
         skipped: SkipBreakdown {
+            uncertain: 0,
             duplicates: 7,
             ..SkipBreakdown::default()
         },
@@ -544,6 +547,7 @@ async fn sparse_receipts_survive_report_changes_and_inventory_bridge_composition
         SyncStats::default(),
         vec![proof.clone()],
         true,
+        true,
     );
     // Reporting snapshots cannot erase or create durable checkpoint receipts.
     delta.stats = SyncStats::default();
@@ -605,6 +609,7 @@ fn mixed_delta_completion_provenance_preserves_vetoes_and_does_not_invent_succes
             },
             Vec::new(),
             complete,
+            true,
         );
         let mut query = SyncResult::from_execution(
             DownloadOutcome::Success,

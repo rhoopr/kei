@@ -20,6 +20,10 @@ use super::rows::encode_asset_date;
 use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
 
+mod retirement;
+
+pub(super) use retirement::record_prepared as record_prepared_download_receipt;
+
 pub(crate) const MAX_GENERATION_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 // Original serialized inputs per validation operation, not an allocator or disk bound.
@@ -108,20 +112,73 @@ fn basis(conn: &Connection, scope: &str) -> Result<String, StateError> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
+// Legacy asset keys contain the zone name, not its database or owner.
+// Refuse a conflicting full scope before reusing those keys; equal provider
+// signatures do not make two provider identities interchangeable.
+fn guard_library_scope(conn: &Connection, scope: &str, library: &str) -> Result<(), StateError> {
+    let saved: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [format!("download_ledger_scope:{library}")],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if saved.as_deref().is_some_and(|saved| saved != scope) {
+        return Err(StateError::ProviderWorkConflict);
+    }
+    let compact_conflict: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM download_receipts WHERE library=?1 AND scope<>?2)",
+        params![library, scope],
+        |row| row.get(0),
+    )?;
+    if compact_conflict {
+        return Err(StateError::ProviderWorkConflict);
+    }
+    let conflict: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM provider_active_generations WHERE scope<>?1
+         AND json_extract(scope,'$.zone.zoneName')=?2)",
+        params![scope, library],
+        |row| row.get(0),
+    )?;
+    if conflict {
+        return Err(StateError::Invariant {
+            operation: "download ledger scope",
+            detail: "Distinct provider scopes share a legacy library key; progress is held".into(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_spec(spec: &GenerationSpec) -> Result<(), StateError> {
     let scope: Value = serde_json::from_str(&spec.scope)
         .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
-    if spec.format != 1
+    if !matches!(spec.format, 1 | 2)
         || spec.metadata_enabled != (spec.metadata_flags != 0)
         || spec.metadata_flags & !0b0011_1111 != 0
-        || scope.get("database").and_then(Value::as_str) != Some("private")
-        || spec.zone.get("ownerRecordName").and_then(Value::as_str) != Some("_defaultOwner")
+        || (spec.format == 1
+            && (scope.get("database").and_then(Value::as_str) != Some("private")
+                || spec.zone.get("ownerRecordName").and_then(Value::as_str)
+                    != Some("_defaultOwner")))
+        || (spec.format == 2
+            && (!matches!(
+                scope.get("database").and_then(Value::as_str),
+                Some("private" | "shared")
+            ) || spec
+                .zone
+                .get("ownerRecordName")
+                .and_then(Value::as_str)
+                .is_none_or(|owner| owner.trim().is_empty())))
         || spec.zone.get("zoneName") != scope.pointer("/zone/zoneName")
         || spec.zone.get("ownerRecordName") != scope.pointer("/zone/ownerRecordName")
         || [&spec.config_hash, &spec.basis]
             .iter()
             .any(|v| v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()))
-        || spec.profile.get("coverage").and_then(Value::as_str) != Some("observed_selection_window")
+        || spec.profile.get("coverage").and_then(Value::as_str)
+            != Some(if spec.format == 1 {
+                "observed_selection_window"
+            } else {
+                "selected_downloads"
+            })
     {
         return invalid();
     }
@@ -393,16 +450,24 @@ fn refresh_progress_hash(
     Ok(())
 }
 
-fn charge(conn: &Connection, additional: u64, capacity: u64) -> Result<(), StateError> {
-    let used:i64=conn.query_row("SELECT COALESCE((SELECT SUM(charged_bytes) FROM provider_active_generations),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_selection_rank_pages),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_active_decisions),0)",[],|r|r.get(0))?;
-    if additional
-        > capacity.saturating_sub(
-            u64::try_from(used).map_err(|_invalid| StateError::ProviderSelectionInvalid)?,
-        )
-    {
-        return Err(StateError::ProviderSelectionFull);
+fn charge(conn: &Connection, additional: u64, capacity: u64, format: u8) -> Result<(), StateError> {
+    if !matches!(format, 1 | 2) {
+        return invalid();
     }
-    Ok(())
+    loop {
+        let used:i64=conn.query_row("SELECT
+          COALESCE((SELECT SUM(g.charged_bytes) FROM provider_active_generations g WHERE json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)
+          +COALESCE((SELECT SUM(p.charged_bytes) FROM provider_selection_rank_pages p JOIN provider_active_generations g ON g.id=p.generation WHERE json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)
+          +COALESCE((SELECT SUM(d.charged_bytes) FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE d.compacted_hash IS NULL AND json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)",
+          [format],|r|r.get(0))?;
+        let used = u64::try_from(used).map_err(|_| StateError::ProviderSelectionInvalid)?;
+        if additional <= capacity.saturating_sub(used) {
+            return Ok(());
+        }
+        if format != 2 || conn.is_autocommit() || retirement::compact_batch(conn, None)? == 0 {
+            return Err(StateError::ProviderSelectionFull);
+        }
+    }
 }
 
 fn pass<'a>(root: &'a ActiveGeneration, key: &str) -> Result<&'a Value, StateError> {
@@ -683,7 +748,9 @@ fn validate_decision_with_pages(
     let decision = &manifest.decision;
     pass(root, &decision.pass_key)?;
     if decision.child.trim().is_empty()
-        || manifest.sources.is_empty()
+        || (root.spec.format == 1 && manifest.sources.is_empty())
+        || (root.spec.format == 2
+            && (!manifest.sources.is_empty() || decision.confirmation.is_none()))
         || decision.destinations.len() > 32
         || (decision.outcome == SelectionOutcome::Selected && !decision.reason.is_empty())
         || (decision.outcome != SelectionOutcome::Selected
@@ -760,6 +827,25 @@ fn validate_decision_with_pages(
     Ok(())
 }
 
+/// Exact legacy profiles remain compatible; new retry-policy keys must be
+/// well-formed digests on both sides before selection drift is permitted.
+pub(crate) fn retained_profiles_compatible(previous: &Value, current: &Value) -> bool {
+    let key = |profile: &Value| {
+        profile
+            .get("admitted_retry_policy")
+            .and_then(Value::as_str)
+            .filter(|key| {
+                key.len() == 64
+                    && key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .map(str::to_owned)
+    };
+    previous == current
+        || matches!((key(previous), key(current)), (Some(old), Some(new)) if old == new)
+}
+
 impl SqliteStateDb {
     pub(crate) async fn freeze_interrupted_selection(
         &self,
@@ -818,6 +904,49 @@ impl SqliteStateDb {
         .await
     }
 
+    /// New download work is selected by account, full provider scope and
+    /// configuration, never by a parallel catalog's observation fingerprint.
+    pub(crate) async fn current_download_generation(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        config_hash: String,
+    ) -> Result<Option<ActiveGeneration>, StateError> {
+        self.with_conn("reading current download ledger", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM provider_active_generations WHERE scope=?1 AND config_hash=?2
+                 AND json_extract(CAST(specification AS TEXT),'$.format')=2
+                 ORDER BY created_at DESC,id DESC LIMIT 1",
+                    params![scope, config_hash],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let root = id.map(|id| load_generation(conn, &id)).transpose()?;
+            if let Some(root) = &root
+                && root.sealed
+            {
+                let saved: String = conn.query_row(
+                    "SELECT seal_hash FROM provider_active_generations WHERE id=?1",
+                    [&root.id],
+                    |row| row.get(0),
+                )?;
+                if seal_hash(
+                    conn,
+                    root,
+                    root.checkpoint_ready,
+                    root.checkpoint_veto.as_deref(),
+                )? != saved
+                {
+                    return invalid();
+                }
+            }
+            Ok(root)
+        })
+        .await
+    }
+
     pub(crate) async fn current_selection_generation(
         &self,
         owner: account::AccountOwner,
@@ -851,6 +980,19 @@ impl SqliteStateDb {
         }).await
     }
 
+    pub(crate) async fn validate_download_scope(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        library: String,
+    ) -> Result<(), StateError> {
+        self.with_conn("validating download scope", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            guard_library_scope(conn, &scope, &library)
+        })
+        .await
+    }
+
     pub(crate) async fn begin_selection_generation(
         &self,
         owner: account::AccountOwner,
@@ -859,14 +1001,26 @@ impl SqliteStateDb {
     ) -> Result<ActiveGeneration, StateError> {
         self.with_conn_mut("starting selection generation",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;validate_spec(&spec)?;
-            if basis(&tx,&spec.scope)?!=spec.basis {return Err(StateError::ProviderWorkConflict)}
+            guard_library_scope(&tx, &spec.scope, spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?)?;
+            if spec.format == 2 {
+                tx.execute("INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",
+                    params![format!("download_ledger_scope:{}",spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?),spec.scope])?;
+            }
+            if spec.format == 1 && basis(&tx,&spec.scope)?!=spec.basis {return Err(StateError::ProviderWorkConflict)}
             freeze_interrupted_groupings(&tx, &spec.scope)?;
             let bytes=encode(&spec)?;let (account,provider)=owner_keys(&tx)?;
             let id=format!("{:032x}",rand::random::<u128>());
             let charged=u64::try_from(bytes.len()+id.len()+account.len()+provider.len()+spec.scope.len()+spec.config_hash.len()+spec.basis.len()+128).map_err(|_invalid|StateError::ProviderSelectionFull)?;
-            charge(&tx,charged,capacity)?;
+            charge(&tx,charged,capacity,spec.format)?;
             tx.execute("INSERT INTO provider_active_generations(id,account_key,provider_key,scope,config_hash,basis,specification,specification_hash,created_at,charged_bytes,metadata_enabled) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![id,account,provider,spec.scope,spec.config_hash,spec.basis,bytes,digest(&bytes),Utc::now().timestamp_millis(),i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?,spec.metadata_enabled])?;
-            let out=load_generation(&tx,&id)?;tx.commit()?;Ok(out)
+            if spec.format == 2 {
+                retirement::compact_batch(&tx,None)?;
+                retirement::retire_completed_roots(&tx,&id)?;
+            }
+            let out=load_generation(&tx,&id)?;tx.commit()?;
+            #[cfg(all(test,target_os="linux"))]
+            crate::test_helpers::process_death_point("completion-root-retired");
+            Ok(out)
         }).await
     }
 
@@ -890,7 +1044,7 @@ impl SqliteStateDb {
             if root.sealed {return invalid()}
             let records=response.get("records").and_then(Value::as_array).ok_or(StateError::ProviderSelectionInvalid)?;
             let charged=u64::try_from(request.len()+body.len()+generation.len()+key.len()+id.len()+records.iter().map(|r|r.get("recordName").and_then(Value::as_str).map_or(0,str::len)+r.get("recordType").and_then(Value::as_str).map_or(0,str::len)+id.len()+32).sum::<usize>()+256).map_err(|_invalid|StateError::ProviderSelectionFull)?;
-            charge(&tx,charged,capacity)?;
+            charge(&tx,charged,capacity,root.spec.format)?;
             tx.execute("INSERT INTO provider_selection_rank_pages(id,generation,pass_key,request,request_hash,body,body_hash,charged_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![id,generation,key,request,request_hash,body,body_hash,i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?])?;
             for (ordinal,record) in records.iter().enumerate() {
                 tx.execute("INSERT INTO provider_selection_rank_records(page_id,ordinal,record_name,record_type,deleted) VALUES(?1,?2,?3,?4,?5)",params![id,i64::try_from(ordinal).map_err(|_invalid|StateError::ProviderSelectionFull)?,record.get("recordName").and_then(Value::as_str),record.get("recordType").and_then(Value::as_str),record.get("deleted").and_then(Value::as_bool).unwrap_or(false)])?;
@@ -976,6 +1130,13 @@ fn load_decision_with_pages(
         || outcome != outcome_name(manifest.decision.outcome)
     {
         return invalid();
+    }
+    let compacted: Option<String> = conn.query_row(
+        "SELECT compacted_hash FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+        params![root.id,key,child], |row| row.get(0))?;
+    if let Some(compacted) = compacted {
+        retirement::validate_compacted(conn, root, &manifest, &compacted)?;
+        return Ok(manifest);
     }
     validate_decision_with_pages(conn, root, &manifest, verify_body, pages)?;
     validate_decision_rows(conn, root, &manifest)?;
@@ -1100,11 +1261,12 @@ fn validate_decision_rows(
         }
         let (group,intent,media,metadata,local,source,progress):DestinationProofRow=conn.query_row("SELECT grouping_hash,intent_hash,verified_media,verified_metadata,local_checksum,source_checksum,progress_hash FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![root.id,d.pass_key,d.child,destination.version_size,destination.path.key()?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
         match (&group, &intent) {
-            (None, None) if !root.sealed => {}
+            (None, None) if !root.sealed || root.spec.format == 2 => {}
             (Some(group), Some(stored))
                 if intent_hash(root, manifest, destination, group)? == *stored => {}
             _ => return invalid(),
         }
+        frozen_metadata(conn, root, manifest, destination)?;
         if prepared_metadata(conn, root, manifest, destination)?.is_some()
             && (!media || metadata || !root.spec.metadata_enabled || intent.is_none())
         {
@@ -1314,11 +1476,20 @@ impl SqliteStateDb {
         scope: String,
         config_hash: String,
         current: String,
+        compatible_profile: Option<Value>,
     ) -> Result<Option<ActiveGeneration>, StateError> {
         self.with_conn("scheduling retained selected work",move|conn|{
+            let profile = compatible_profile.as_ref().map(serde_json::to_string)
+                .transpose().map_err(|_| StateError::ProviderSelectionInvalid)?;
             account::validate_authenticated(conn,&owner)?;
-            let id:Option<String>=conn.query_row("SELECT g.id FROM provider_active_generations g WHERE g.scope=?1 AND g.config_hash=?2 AND g.id<>?3 AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.admission='deferred' AND d.next_retry_at<=?4) OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id AND w.admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=?4) AND (w.verified_media=0 OR (g.metadata_enabled=1 AND w.verified_metadata=0)))) ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT 1",params![scope,config_hash,current,Utc::now().timestamp()],|r|r.get(0)).optional()?;
-            id.map(|id|load_generation(conn,&id)).transpose()
+            let id:Option<String>=conn.query_row("SELECT g.id FROM provider_active_generations g WHERE g.scope=?1 AND (g.config_hash=?2 OR (?5 IS NOT NULL AND json_extract(CAST(g.specification AS TEXT),'$.format')=2 AND (json_extract(CAST(g.specification AS TEXT),'$.profile')=json(?5) OR (length(json_extract(?5,'$.admitted_retry_policy'))=64 AND json_extract(?5,'$.admitted_retry_policy') NOT GLOB '*[^0-9a-f]*' AND json_extract(CAST(g.specification AS TEXT),'$.profile.admitted_retry_policy')=json_extract(?5,'$.admitted_retry_policy'))))) AND g.id<>?3 AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.admission='deferred' AND d.next_retry_at<=?4) OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id AND w.admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=?4) AND w.verified_media=0)) ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT 1",params![scope,config_hash,current,Utc::now().timestamp(),profile],|r|r.get(0)).optional()?;
+            let root = id.map(|id|load_generation(conn,&id)).transpose()?;
+            if let Some(root) = &root
+                && root.spec.config_hash != config_hash
+                && (root.spec.format != 2 || !compatible_profile.as_ref()
+                    .is_some_and(|profile| retained_profiles_compatible(&root.spec.profile, profile)))
+            { return invalid(); }
+            Ok(root)
         }).await
     }
 
@@ -1333,7 +1504,7 @@ impl SqliteStateDb {
             let stored:Option<String>=tx.query_row("SELECT replay_after FROM provider_active_generations WHERE id=?1",[&generation],|r|r.get(0))?;
             let after:Option<(String,String)>=stored.as_deref().map(|value|serde_json::from_str(value).map_err(|_invalid|StateError::ProviderSelectionInvalid)).transpose()?;
             let query=|after:Option<&(String,String)>|->Result<Vec<(String,String,i64)>,StateError> {
-                Ok(tx.prepare("SELECT d.pass_key,d.child,length(d.manifest) FROM provider_active_decisions d WHERE d.generation=?1 AND (?2 IS NULL OR (d.pass_key,d.child)>(?2,?3)) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND (w.verified_media=0 OR (?5=1 AND w.verified_metadata=0)))) ORDER BY d.pass_key,d.child LIMIT 64")?.query_map(params![generation,after.map(|a|&a.0),after.map(|a|&a.1),Utc::now().timestamp(),root.spec.metadata_enabled],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?)
+                Ok(tx.prepare("SELECT d.pass_key,d.child,length(d.manifest) FROM provider_active_decisions d WHERE d.generation=?1 AND (?2 IS NULL OR (d.pass_key,d.child)>(?2,?3)) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND w.verified_media=0)) ORDER BY d.pass_key,d.child LIMIT 64")?.query_map(params![generation,after.map(|a|&a.0),after.map(|a|&a.1),Utc::now().timestamp()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?)
             };
             let mut keys=query(after.as_ref())?;if keys.is_empty() && after.is_some() {keys=query(None)?;}
             let mut bytes=0_usize;let mut decisions=Vec::new();let mut last=None;
@@ -1382,7 +1553,7 @@ impl SqliteStateDb {
     ) -> Result<(), StateError> {
         self.with_conn_mut("advancing synthetic selection retry clock",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
-            let keys:Vec<(String,String)>=tx.prepare("SELECT generation,pass_key FROM provider_active_decisions WHERE child=?1 AND admission='deferred'")?.query_map([&child],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
+            let keys:Vec<(String,String)>=tx.prepare("SELECT generation,pass_key FROM provider_active_decisions WHERE child=?1 AND next_retry_at>0")?.query_map([&child],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
             for (generation,key) in keys {
                 let root=load_generation(&tx,&generation)?;load_decision(&tx,&root,&key,&child)?;
                 tx.execute("UPDATE provider_active_decisions SET next_retry_at=1 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,key,child])?;
@@ -1402,7 +1573,7 @@ impl SqliteStateDb {
             let mut statement=conn.prepare("SELECT pass_key,child FROM provider_active_decisions WHERE generation=?1")?;
             let mut rows=statement.query([&generation])?;
             while let Some(row)=rows.next()? {let key:String=row.get(0)?;let child:String=row.get(1)?;load_decision_with_sources(conn,&root,&key,&child,false)?;}
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission<>'excluded' AND next_retry_at>?2) AND NOT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) AND NOT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND (verified_media=0 OR (?3=1 AND verified_metadata=0)))",params![generation,Utc::now().timestamp(),root.spec.metadata_enabled],|r|r.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission<>'excluded' AND next_retry_at>?2) AND NOT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) AND NOT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND verified_media=0)",params![generation,Utc::now().timestamp()],|r|r.get(0))?)
         }).await
     }
 
@@ -1448,13 +1619,20 @@ impl SqliteStateDb {
         self.with_conn_mut("projecting selection destinations",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
             let root=load_generation(&tx,&generation)?;
-            let changed_basis=basis(&tx,&root.spec.scope)?!=root.spec.basis;
+            let changed_basis=root.spec.format == 1 && basis(&tx,&root.spec.scope)?!=root.spec.basis;
             validate_decision(&tx,&root,&manifest,true)?;validate_records(&root,&manifest,&records)?;
             let d=&manifest.decision;let bytes=encode(&manifest)?;let hash=digest(&bytes);
             let existing:Option<(Vec<u8>,String)>=tx.query_row("SELECT manifest,admission FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             let mut resolving=false;
             if let Some((previous,admission))=&existing {
                 let old=load_decision(&tx,&root,&d.pass_key,&d.child)?;
+                let compacted:bool=tx.query_row("SELECT compacted_hash IS NOT NULL FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+                    params![generation,d.pass_key,d.child],|r|r.get(0))?;
+                if compacted {
+                    let mut normalized=manifest.clone();normalized.decision.confirmation=None;
+                    if normalized!=old {return Err(StateError::ProviderWorkConflict)}
+                    tx.commit()?;return Ok(GenerationProjection{admitted:admission=="admitted",reason:String::new()})
+                }
                 resolving=admission=="deferred" && old.decision.outcome==SelectionOutcome::Deferred && old.decision.confirmation.is_none() && manifest.decision.confirmation.is_some() && !root.sealed && old.sources.iter().all(|source|manifest.sources.contains(source));
                 if previous!=&bytes && !resolving {return Err(StateError::ProviderWorkConflict)}
                 if resolving {
@@ -1474,6 +1652,7 @@ impl SqliteStateDb {
                 }
                 if admission!="deferred" {tx.commit()?;return Ok(GenerationProjection {admitted:admission=="admitted",reason:String::new()})}
             } else if root.sealed {return invalid()} else if changed_basis {return Err(StateError::ProviderWorkConflict)}
+            freeze_metadata_identity(&tx,root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id)?;
             let mut reason=d.reason.clone();
             if d.outcome==SelectionOutcome::Selected {
                 let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM unattributed_legacy WHERE library=?1 AND asset_id IN (?2,?3))",params![root.spec.zone.get("zoneName").and_then(Value::as_str),manifest.state_id,d.master],|r|r.get(0))?;
@@ -1491,7 +1670,7 @@ impl SqliteStateDb {
             }
             if d.outcome==SelectionOutcome::Selected
                 && let Some(album)=pass(&root,&d.pass_key)?.pointer("/scope/name").and_then(Value::as_str).filter(|name|!name.is_empty()) {
-                let conflict:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND g.metadata_enabled=1 AND w.verified_metadata=0 AND w.grouping_hash IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM asset_albums WHERE library=?1 AND asset_id=?2 AND album_name=?3)",params![root.spec.zone.get("zoneName").and_then(Value::as_str),manifest.state_id,album],|r|r.get(0))?;
+                let conflict:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND g.metadata_enabled=1 AND w.verified_metadata=0 AND w.frozen_metadata IS NULL AND w.grouping_hash IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM asset_albums WHERE library=?1 AND asset_id=?2 AND album_name=?3)",params![root.spec.zone.get("zoneName").and_then(Value::as_str),manifest.state_id,album],|r|r.get(0))?;
                 if conflict {reason="unfinished_grouping_conflict".to_owned()}
             }
             let admitted=d.outcome==SelectionOutcome::Selected && reason.is_empty();
@@ -1499,7 +1678,7 @@ impl SqliteStateDb {
             if existing.is_none() || resolving {
                 let charged=u64::try_from(bytes.len()+manifest.sources.iter().map(|s|s.page_id.len()+generation.len()+d.pass_key.len()+d.child.len()+16).sum::<usize>()
                     + d.destinations.iter().map(|destination|destination.path.key().map(|path|path.len()+destination.path.to_path().to_string_lossy().len()+destination.checksum.len()+destination.metadata_hash.len()+generation.len()+d.pass_key.len()+d.child.len()+manifest.state_id.len()+destination.version_size.len()+d.master.as_ref().map_or(0,String::len)+root.spec.zone.get("zoneName").and_then(Value::as_str).map_or(0,str::len)+1024)).collect::<Result<Vec<_>,_>>()?.iter().sum::<usize>()+encode(&(&d.pass_key,&d.child))?.len()+256).map_err(|_invalid|StateError::ProviderSelectionFull)?;
-                charge(&tx,charged,capacity)?;
+                charge(&tx,charged,capacity,root.spec.format)?;
                 tx.execute("INSERT INTO provider_active_decisions(generation,pass_key,child,manifest,manifest_hash,outcome,admission,reason,charged_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(generation,pass_key,child) DO UPDATE SET manifest=excluded.manifest,manifest_hash=excluded.manifest_hash,outcome=excluded.outcome,admission=excluded.admission,reason=excluded.reason,attempts=CASE WHEN excluded.admission='deferred' THEN provider_active_decisions.attempts ELSE 0 END,next_retry_at=CASE WHEN excluded.admission='deferred' THEN provider_active_decisions.next_retry_at ELSE 0 END,charged_bytes=provider_active_decisions.charged_bytes+excluded.charged_bytes",params![generation,d.pass_key,d.child,bytes,hash,outcome_name(d.outcome),admission,reason,i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?])?;
                 for source in &manifest.sources {
                     tx.execute("INSERT OR IGNORE INTO provider_active_sources(generation,pass_key,child,page_id,ordinal) VALUES(?1,?2,?3,?4,?5)",params![generation,d.pass_key,d.child,source.page_id,source.ordinal])?;
@@ -1511,6 +1690,8 @@ impl SqliteStateDb {
                 }
             }
             refresh_admission_hash(&tx,&root,&d.pass_key,&d.child)?;
+            #[cfg(all(test, target_os = "linux"))]
+            crate::test_helpers::process_death_point("selection-admission-partial");
             if admitted {
                 let library=root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?;
                 let now=Utc::now().timestamp();
@@ -1534,7 +1715,10 @@ impl SqliteStateDb {
             // Consumption is the final write, and never means verified publication.
             tx.execute("UPDATE provider_active_decisions SET admission=?4,reason=?5,attempts=?6,next_retry_at=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child,admission,reason,if admission=="deferred" {attempts.saturating_add(1).min(32)} else {0},if admission=="deferred" {Utc::now().timestamp()+delay} else {0}])?;
             refresh_admission_hash(&tx,&root,&d.pass_key,&d.child)?;
-            tx.commit()?;Ok(GenerationProjection {admitted,reason})
+            tx.commit()?;
+            #[cfg(all(test, target_os = "linux"))]
+            crate::test_helpers::process_death_point("selection-work-committed");
+            Ok(GenerationProjection {admitted,reason})
         }).await
     }
 
@@ -1548,8 +1732,8 @@ impl SqliteStateDb {
         self.with_conn_mut("sealing observed selection coverage",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
             let root=load_generation(&tx,&generation)?;
-            if basis(&tx,&root.spec.scope)?!=root.spec.basis {return Err(StateError::ProviderWorkConflict)}
-            if !root.sealed {
+            if root.spec.format == 1 && basis(&tx,&root.spec.scope)?!=root.spec.basis {return Err(StateError::ProviderWorkConflict)}
+            if !root.sealed && root.spec.format == 1 {
                 let assets:Vec<(String,String)>=tx.prepare("SELECT DISTINCT library,asset_id FROM provider_active_destinations WHERE generation=?1")?.query_map([&generation],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
                 for (library,asset) in assets {
                     let hash=grouping_hash(&tx,&library,&asset)?;
@@ -1558,10 +1742,16 @@ impl SqliteStateDb {
                     freeze_asset_intents(&tx,&root,&library,&asset,&hash)?;
                 }
             }
+            if root.spec.format == 2 {
+                while retirement::compact_batch(&tx,Some(&root.id))? > 0 {}
+            }
             let hash=seal_hash(&tx,&root,checkpoint_ready,veto.as_deref())?;
             let header=seal_header(&root,checkpoint_ready,veto.as_deref(),&hash)?;
             tx.execute("UPDATE provider_active_generations SET sealed=1,checkpoint_ready=?2,checkpoint_veto=?3,seal_hash=?4,seal_header_hash=?5 WHERE id=?1",params![generation,checkpoint_ready,veto,hash,header])?;
-            tx.commit()?;Ok(())
+            tx.commit()?;
+            #[cfg(all(test,target_os="linux"))]
+            crate::test_helpers::process_death_point("completion-handoff-committed");
+            Ok(())
         }).await
     }
 
@@ -1575,7 +1765,7 @@ impl SqliteStateDb {
     ) -> Result<Vec<ActiveDecision>, StateError> {
         self.with_conn("reading unfinished selected destinations",move|conn|{
             account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;pass(&root,&key)?;
-            let children:Vec<String>=conn.prepare("SELECT d.child FROM provider_active_decisions d WHERE d.generation=?1 AND d.pass_key=?2 AND (?3 IS NULL OR d.child>?3) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND (w.verified_media=0 OR (?5=1 AND w.verified_metadata=0)))) ORDER BY d.child LIMIT ?6")?.query_map(params![generation,key,after,Utc::now().timestamp(),root.spec.metadata_enabled,limit],|r|r.get(0))?.collect::<Result<_,_>>()?;
+            let children:Vec<String>=conn.prepare("SELECT d.child FROM provider_active_decisions d WHERE d.generation=?1 AND d.pass_key=?2 AND (?3 IS NULL OR d.child>?3) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND w.verified_media=0)) ORDER BY d.child LIMIT ?5")?.query_map(params![generation,key,after,Utc::now().timestamp(),limit],|r|r.get(0))?.collect::<Result<_,_>>()?;
             children.iter().map(|child|load_decision(conn,&root,&key,child)).collect()
         }).await
     }
@@ -1587,7 +1777,7 @@ impl SqliteStateDb {
     ) -> Result<bool, StateError> {
         self.with_conn("inspecting destination wake-up",move|conn|{
             account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND (verified_media=0 OR (?3=1 AND verified_metadata=0)))",params![generation,Utc::now().timestamp(),root.spec.metadata_enabled],|r|r.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND verified_media=0)",params![generation,Utc::now().timestamp()],|r|r.get(0))?)
         }).await
     }
 }
@@ -1604,7 +1794,7 @@ fn seal_hash(
         .prepare("SELECT id FROM provider_selection_rank_pages WHERE generation=?1 ORDER BY id")?
         .query_map([&root.id], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
-    if pages.is_empty() {
+    if root.spec.format == 1 && pages.is_empty() {
         return invalid();
     }
     for page in pages {
@@ -1621,6 +1811,213 @@ fn seal_hash(
         hash.update(encode(&group)?);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+/// Original optional writer inputs remain on their existing destination owner.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenMetadata {
+    version: u8,
+    asset: AssetRecord,
+    albums: Vec<String>,
+    people: Vec<String>,
+}
+
+fn frozen_metadata(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    destination: &SelectionDestination,
+) -> Result<Option<(FrozenMetadata, String)>, StateError> {
+    let (length, hash_present): (Option<i64>, bool) = conn.query_row(
+        "SELECT length(frozen_metadata),frozen_metadata_hash IS NOT NULL FROM provider_active_destinations
+         WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+        params![root.id,manifest.decision.pass_key,manifest.decision.child,destination.version_size,destination.path.key()?],
+        |row| Ok((row.get(0)?,row.get(1)?)))?;
+    match length {
+        Some(length)
+            if length > 0
+                && usize::try_from(length).is_ok_and(|length| length <= MAX_CHUNK_BYTES)
+                && hash_present => {}
+        None if !hash_present => return Ok(None),
+        _ => return invalid(),
+    }
+    let (bytes, hash, group): (Option<Vec<u8>>, Option<String>, Option<String>) = conn.query_row(
+        "SELECT frozen_metadata,frozen_metadata_hash,grouping_hash FROM provider_active_destinations
+         WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+        params![root.id,manifest.decision.pass_key,manifest.decision.child,destination.version_size,destination.path.key()?],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+    let (bytes, hash) = match (bytes, hash) {
+        (Some(bytes), Some(hash)) if bytes.len() <= MAX_CHUNK_BYTES => (bytes, hash),
+        _ => return invalid(),
+    };
+    let snapshot: FrozenMetadata =
+        serde_json::from_slice(&bytes).map_err(|_| StateError::ProviderSelectionInvalid)?;
+    let group = group.ok_or(StateError::ProviderSelectionInvalid)?;
+    if root.spec.format != 1
+        || !root.spec.metadata_enabled
+        || snapshot.version != 1
+        || snapshot.asset.local_path.is_some()
+        || snapshot.asset.library.as_ref()
+            != root
+                .spec
+                .zone
+                .get("zoneName")
+                .and_then(Value::as_str)
+                .ok_or(StateError::ProviderSelectionInvalid)?
+        || snapshot.asset.id.as_ref() != manifest.state_id
+        || snapshot.asset.version_size.as_str() != destination.version_size
+        || snapshot.asset.checksum.as_ref() != destination.checksum
+        || snapshot.asset.size_bytes != destination.size
+        || snapshot.asset.metadata.metadata_hash.as_deref()
+            != Some(destination.metadata_hash.as_str())
+        || digest(&encode(&(&snapshot.albums, &snapshot.people))?) != group
+        || !snapshot.albums.windows(2).all(|pair| pair[0] <= pair[1])
+        || !snapshot.people.windows(2).all(|pair| pair[0] <= pair[1])
+        || digest(&encode(&(
+            1,
+            &root.id,
+            manifest,
+            destination,
+            &group,
+            &bytes,
+        ))?) != hash
+    {
+        return invalid();
+    }
+    let dates: bool = conn.query_row(
+        "SELECT created_at IS ?6 AND added_at IS ?7 FROM provider_active_destinations
+         WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+        params![
+            root.id,
+            manifest.decision.pass_key,
+            manifest.decision.child,
+            destination.version_size,
+            destination.path.key()?,
+            encode_asset_date(snapshot.asset.created_at),
+            snapshot.asset.added_at.map(encode_asset_date)
+        ],
+        |row| row.get(0),
+    )?;
+    if !dates {
+        return invalid();
+    }
+    Ok(Some((snapshot, hash)))
+}
+
+/// Called before mutation, never to authorize a write to old media.
+pub(super) fn freeze_metadata_identity(
+    conn: &Connection,
+    library: &str,
+    asset: &str,
+) -> Result<(), StateError> {
+    let keys: Vec<(String, String, String)> = conn
+        .prepare(
+            "SELECT DISTINCT w.generation,w.pass_key,w.child FROM provider_active_destinations w
+         JOIN provider_active_generations g ON g.id=w.generation
+         WHERE w.library=?1 AND (w.asset_id=?2 OR w.child=?2) AND w.admitted=1
+         AND w.verified_media=1 AND w.verified_metadata=0 AND g.metadata_enabled=1
+         AND json_extract(CAST(g.specification AS TEXT),'$.format')=1
+         ORDER BY w.generation,w.pass_key,w.child",
+        )?
+        .query_map(params![library, asset], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    for (generation, key, child) in keys {
+        let root = load_generation(conn, &generation)?;
+        let manifest = load_decision(conn, &root, &key, &child)?;
+        for destination in &manifest.decision.destinations {
+            let pending: bool = conn.query_row("SELECT admitted=1 AND verified_media=1 AND verified_metadata=0
+                FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+                params![generation,key,child,destination.version_size,destination.path.key()?],|row|row.get(0))?;
+            if !pending || frozen_metadata(conn, &root, &manifest, destination)?.is_some() {
+                continue;
+            }
+            let group = grouping_hash(conn, library, &manifest.state_id)?;
+            freeze_asset_intents(conn, &root, library, &manifest.state_id, &group)?;
+            let expected: String = conn.query_row(
+                "SELECT grouping_hash FROM provider_active_destinations
+                WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+                params![
+                    generation,
+                    key,
+                    child,
+                    destination.version_size,
+                    destination.path.key()?
+                ],
+                |row| row.get(0),
+            )?;
+            if group != expected {
+                return Err(StateError::ProviderWorkConflict);
+            }
+            let mut original = conn.query_row(
+                &format!(
+                    "SELECT {} FROM assets WHERE library=?1 AND id=?2
+                AND version_size=?3 AND checksum=?4 AND metadata_hash=?5 AND is_deleted=0",
+                    super::rows::ASSET_COLUMNS
+                ),
+                params![
+                    library,
+                    manifest.state_id,
+                    destination.version_size,
+                    destination.checksum,
+                    destination.metadata_hash
+                ],
+                super::rows::row_to_asset_record,
+            )?;
+            original.local_path = None;
+            let names = |table: &str, column: &str| -> Result<Vec<String>, StateError> {
+                Ok(conn.prepare(&format!("SELECT {column} FROM {table} WHERE library=?1 AND asset_id=?2 ORDER BY {column}"))?
+                    .query_map(params![library,manifest.state_id],|row|row.get(0))?.collect::<Result<_,_>>()?)
+            };
+            let snapshot = FrozenMetadata {
+                version: 1,
+                asset: original,
+                albums: names("asset_albums", "album_name")?,
+                people: names("asset_people", "person_name")?,
+            };
+            let bytes = encode(&snapshot)?;
+            let hash = digest(&encode(&(
+                1,
+                &root.id,
+                &manifest,
+                destination,
+                &group,
+                &bytes,
+            ))?);
+            let charged = u64::try_from(bytes.len() + hash.len())
+                .map_err(|_| StateError::ProviderSelectionFull)?;
+            // First freeze preserves an existing owner; it is not new work
+            // admission. encode()/frozen_metadata() bound and validate each
+            // snapshot, and the early already-frozen check prevents recharging.
+            // Keep exact accounting even if this finite preservation overhead
+            // crosses the historical admission quota.
+            conn.execute(
+                "UPDATE provider_active_destinations SET frozen_metadata=?6,frozen_metadata_hash=?7
+                WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+                params![
+                    generation,
+                    key,
+                    child,
+                    destination.version_size,
+                    destination.path.key()?,
+                    bytes,
+                    hash
+                ],
+            )?;
+            conn.execute(
+                "UPDATE provider_active_generations SET charged_bytes=charged_bytes+?2 WHERE id=?1",
+                params![
+                    generation,
+                    i64::try_from(charged).map_err(|_| StateError::ProviderSelectionFull)?
+                ],
+            )?;
+            frozen_metadata(conn, &root, &manifest, destination)?
+                .ok_or(StateError::ProviderSelectionInvalid)?;
+        }
+    }
+    Ok(())
 }
 
 /// Hash the same ordered grouping rows consumed by the existing metadata owner.
@@ -1676,6 +2073,13 @@ fn freeze_asset_intents(
 /// new selection root can mutate groupings. This is metadata intent only;
 /// inventory remains unsealed and cannot authorize source progress or absence.
 fn freeze_interrupted_groupings(conn: &Connection, scope: &str) -> Result<(), StateError> {
+    let identities: Vec<(String,String)> = conn.prepare("SELECT DISTINCT w.library,w.asset_id
+        FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation
+        WHERE g.scope=?1 AND g.metadata_enabled=1 AND w.admitted=1 AND w.verified_media=1 AND w.verified_metadata=0")?
+        .query_map([scope],|row|Ok((row.get(0)?,row.get(1)?)))?.collect::<Result<_,_>>()?;
+    for (library, asset) in identities {
+        freeze_metadata_identity(conn, &library, &asset)?;
+    }
     loop {
         let rows:Vec<(String,String,String)>=conn.prepare("SELECT DISTINCT w.generation,w.library,w.asset_id FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND g.sealed=0 AND g.metadata_enabled=1 AND w.admitted=1 AND w.verified_metadata=0 AND w.grouping_hash IS NULL ORDER BY w.generation,w.library,w.asset_id LIMIT 64")?.query_map([scope],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
         if rows.is_empty() {
@@ -1701,7 +2105,7 @@ pub(super) fn guard_groupings(
 ) -> Result<(), StateError> {
     validate_identity_decisions(conn, library, asset)?;
     let current = grouping_hash(conn, library, asset)?;
-    let conflict:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND g.metadata_enabled=1 AND w.verified_metadata=0 AND w.grouping_hash IS NOT NULL AND w.grouping_hash IS NOT ?3)",params![library,asset,current],|r|r.get(0))?;
+    let conflict:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND g.metadata_enabled=1 AND w.verified_metadata=0 AND w.frozen_metadata IS NULL AND w.grouping_hash IS NOT NULL AND w.grouping_hash IS NOT ?3)",params![library,asset,current],|r|r.get(0))?;
     if conflict {
         Err(StateError::ProviderWorkConflict)
     } else {
@@ -1724,15 +2128,92 @@ fn validate_identity_decisions(
         let key: String = row.get(1)?;
         let child: String = row.get(2)?;
         let root = load_generation(conn, &generation)?;
+        guard_library_scope(conn, &root.spec.scope, library)?;
         load_decision_with_sources(conn, &root, &key, &child, false)?;
     }
     Ok(())
 }
 
-const UNFINISHED: &str =
-    "w.admitted=1 AND (w.verified_media=0 OR (g.metadata_enabled=1 AND w.verified_metadata=0))";
+/// Feed existing collision planning from unfinished immutable destinations.
+/// This is a read projection of the ledger, not another durable queue.
+pub(super) fn pending_destination_reservations(
+    conn: &Connection,
+) -> Result<Vec<super::ReconciliationReservation>, StateError> {
+    let mut query = conn.prepare(
+        "SELECT DISTINCT w.generation,w.pass_key,w.child
+         FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation
+         WHERE w.admitted=1 AND w.verified_media=0
+           AND json_extract(CAST(g.specification AS TEXT),'$.format')=2
+         ORDER BY w.generation,w.pass_key,w.child",
+    )?;
+    let keys = query
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut reservations = Vec::new();
+    for (generation, key, child) in keys {
+        let root = load_generation(conn, &generation)?;
+        let manifest = load_decision(conn, &root, &key, &child)?;
+        let library = root
+            .spec
+            .zone
+            .get("zoneName")
+            .and_then(Value::as_str)
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        guard_library_scope(conn, &root.spec.scope, library)?;
+        for destination in &manifest.decision.destinations {
+            let pending: bool = conn.query_row(
+                "SELECT admitted=1 AND verified_media=0 FROM provider_active_destinations
+                 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+                params![
+                    generation,
+                    key,
+                    child,
+                    destination.version_size,
+                    destination.path.key()?
+                ],
+                |row| row.get(0),
+            )?;
+            if !pending {
+                continue;
+            }
+            let path = destination.path.to_path();
+            let path_key = crate::fs_util::confined_path_key(&path).map_err(|source| {
+                StateError::TempPath {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+            reservations.push(super::ReconciliationReservation {
+                library: Arc::from(library),
+                asset_id: manifest.state_id.clone().into_boxed_str(),
+                version_size: crate::state::VersionSizeKey::from_str(&destination.version_size)
+                    .ok_or(StateError::ProviderSelectionInvalid)?,
+                requested_path_key: super::ReconciliationPathKey(path_key.clone()),
+                destination_path_key: super::ReconciliationPathKey(path_key),
+                destination_path: path,
+                content: Some(super::ReconciliationContent {
+                    checksum: destination.checksum.clone().into_boxed_str(),
+                    size: destination.size,
+                }),
+            });
+        }
+    }
+    Ok(reservations)
+}
+
+// Format-2 tasks retain their complete immutable provider facts and native
+// destination. They do not borrow the current asset row to preserve old work.
+// Format-1 metadata still depends on mutable rows until its inputs are frozen.
+const UNFINISHED: &str = "json_extract(CAST(g.specification AS TEXT),'$.format')=1 AND w.admitted=1 AND (w.verified_media=0 OR (g.metadata_enabled=1 AND w.verified_metadata=0 AND w.frozen_metadata IS NULL))";
 
 pub(super) fn guard_generation(conn: &Connection, record: &AssetRecord) -> Result<(), StateError> {
+    freeze_metadata_identity(conn, &record.library, &record.id)?;
     validate_identity_decisions(conn, &record.library, &record.id)?;
     let pending:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND {UNFINISHED})"),params![record.library,record.id,record.version_size.as_str()],|row|row.get(0))?;
     if !pending {
@@ -1757,6 +2238,7 @@ pub(super) fn guard_mapping(
     child: &str,
     master: &str,
 ) -> Result<(), StateError> {
+    freeze_metadata_identity(conn, library, child)?;
     validate_identity_decisions(conn, library, child)?;
     let conflict:bool=conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.child=?2 AND w.master<>?3 AND {UNFINISHED})"),params![library,child,master],|r|r.get(0))?;
     if conflict {
@@ -1775,6 +2257,7 @@ pub(super) fn guard_metadata(
     created: f64,
     added: Option<f64>,
 ) -> Result<(), StateError> {
+    freeze_metadata_identity(conn, library, asset)?;
     validate_identity_decisions(conn, library, asset)?;
     let hash = metadata
         .metadata_hash
@@ -1825,6 +2308,7 @@ pub(super) fn record_layout_destination(
 
 enum VerifiedDestinationSource<'a> {
     PathPublication(&'a str),
+    ReadOnlyReceipt(&'a str),
     // Only the reuse owner constructs this after validating the retained
     // native generation/decision and exact source, path and local fingerprint.
     RetainedNative(&'a str),
@@ -1850,6 +2334,27 @@ pub(super) fn record_verified_destination(
     )
 }
 
+/// Complete media evidence without retiring a separately prepared rewrite.
+pub(super) fn record_readonly_destination(
+    conn: &Connection,
+    library: &str,
+    asset: &str,
+    version: &str,
+    path: &Path,
+    local: &str,
+    source: &str,
+) -> Result<(), StateError> {
+    record_destination_source(
+        conn,
+        library,
+        asset,
+        version,
+        path,
+        local,
+        VerifiedDestinationSource::ReadOnlyReceipt(source),
+    )
+}
+
 fn record_destination_source(
     conn: &Connection,
     library: &str,
@@ -1859,9 +2364,10 @@ fn record_destination_source(
     local: &str,
     source: VerifiedDestinationSource<'_>,
 ) -> Result<(), StateError> {
-    let (source, require_path_receipt) = match source {
-        VerifiedDestinationSource::PathPublication(source) => (source, true),
-        VerifiedDestinationSource::RetainedNative(source) => (source, false),
+    let (source, require_path_receipt, preserve_prepared) = match source {
+        VerifiedDestinationSource::PathPublication(source) => (source, true, false),
+        VerifiedDestinationSource::RetainedNative(source) => (source, false, false),
+        VerifiedDestinationSource::ReadOnlyReceipt(source) => (source, true, true),
     };
     validate_identity_decisions(conn, library, asset)?;
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND admitted=1)",params![library,asset,version],|r|r.get(0))?;
@@ -1900,7 +2406,7 @@ fn record_destination_source(
                 d.version_size == version && d.path.key().ok().as_deref() == Some(path.as_str())
             })
             .ok_or(StateError::ProviderSelectionInvalid)?;
-        conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,verified_media=1,local_checksum=?6,source_checksum=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,version,path,local,source])?;
+        conn.execute("UPDATE provider_active_destinations SET prepared_checksum=CASE WHEN ?8 THEN prepared_checksum ELSE NULL END,prepared_size=CASE WHEN ?8 THEN prepared_size ELSE NULL END,prepared_hash=CASE WHEN ?8 THEN prepared_hash ELSE NULL END,verified_media=1,local_checksum=?6,source_checksum=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,version,path,local,source,preserve_prepared])?;
         refresh_progress_hash(conn, &root, &manifest, destination)?;
     }
     Ok(())
@@ -1926,9 +2432,25 @@ impl SqliteStateDb {
             if !manifest.decision.destinations.iter().any(|d|d.path==path) {return invalid()}
             let native=path.to_path();
             let selected=manifest.decision.destinations.iter().find(|d|d.path==path).ok_or(StateError::ProviderSelectionInvalid)?;
+            let master=manifest.decision.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?;
+            for retained in super::download_receipts::matching_local(&tx,&root.spec.scope,&child,&path,&local)? {
+                if retained.master==master && retained.version_size==selected.version_size
+                    && retained.provider_checksum==selected.checksum && retained.provider_size==selected.size
+                    && (retained.source_checksum!=retained.local_checksum || size==retained.provider_size) {
+                    record_destination_source(&tx,root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,
+                        &manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::RetainedNative(&retained.source_checksum))?;
+                    retirement::receipt(&tx,&root,&manifest,selected)?.save(&tx)?;
+                    tx.commit()?;return Ok(true)
+                }
+            }
             let previous:Option<(String,String,String)>=tx.query_row("SELECT w.generation,w.source_checksum,w.pass_key FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.child=?3 AND w.version_size=?4 AND w.path=?5 AND w.checksum=?6 AND w.size_bytes=?7 AND w.master=?8 AND w.admitted=1 AND w.verified_media=1 AND (w.local_checksum=?9 OR (w.prepared_checksum=?9 AND w.prepared_size=?10)) ORDER BY g.created_at DESC LIMIT 1",params![root.spec.scope,key,child,selected.version_size,path.key()?,selected.checksum,i64::try_from(selected.size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,manifest.decision.master,local,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
             if let Some((previous,source,previous_key))=previous {
-                let previous_root=load_generation(&tx,&previous)?;load_decision(&tx,&previous_root,&previous_key,&child)?;
+                // Old progress can inherit a legacy source field. Modified
+                // output requires independently trusted compact proof above.
+                let previous_root=load_generation(&tx,&previous)?;
+                let previous_manifest=load_decision(&tx,&previous_root,&previous_key,&child)?;
+                let layout_bound:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM primary_layout_bindings WHERE library=?1 AND child IN (?2,?3))",params![root.spec.zone.get("zoneName").and_then(Value::as_str),manifest.state_id,previous_manifest.state_id],|row|row.get(0))?;
+                if source!=local || size!=selected.size || layout_bound {tx.commit()?;return Ok(false)}
                 let prepared:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND prepared_checksum=?6 AND prepared_size=?7)",params![previous,previous_key,child,selected.version_size,path.key()?,local,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|r.get(0))?;
                 if prepared {
                     let pending=metadata_receipt(&tx,&previous,&previous_key,&child,&selected.version_size,&path.key()?)?;
@@ -1937,8 +2459,12 @@ impl SqliteStateDb {
                 record_destination_source(&tx,root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::RetainedNative(&source))?;
                 tx.commit()?;return Ok(true)
             }
+            // Historical generic re-adoption could preserve an unrelated
+            // source_checksum. Only unchanged source bytes can use this legacy
+            // fallback; metadata-modified outputs need independent provenance.
+            if size != selected.size {tx.commit()?;return Ok(false)}
             let Some(text)=native.to_str() else {tx.commit()?;return Ok(false)};
-            let receipt:Option<String>=tx.query_row("SELECT p.source_checksum FROM asset_metadata_paths p JOIN assets a USING(library,id,version_size) WHERE p.library=?1 AND p.id=?2 AND p.local_path=?3 AND p.local_checksum=?4 AND p.source_checksum IS NOT NULL AND a.metadata_hash IS ?5 AND p.version_size=?6 AND p.provider_checksum=?7 AND a.checksum=p.provider_checksum",params![root.spec.zone.get("zoneName").and_then(Value::as_str),manifest.state_id,text,local,manifest.decision.destinations.iter().find(|d|d.path==path).map(|d|&d.metadata_hash),manifest.decision.destinations.iter().find(|d|d.path==path).map(|d|&d.version_size),selected.checksum],|r|r.get(0)).optional()?;
+            let receipt:Option<String>=tx.query_row("SELECT p.source_checksum FROM asset_metadata_paths p JOIN assets a USING(library,id,version_size) WHERE p.library=?1 AND p.id=?2 AND p.local_path=?3 AND p.local_checksum=?4 AND p.source_checksum IS NOT NULL AND a.metadata_hash IS ?5 AND p.version_size=?6 AND p.provider_checksum=?7 AND a.checksum=p.provider_checksum AND p.source_checksum=p.local_checksum AND a.size_bytes=?8 AND NOT EXISTS(SELECT 1 FROM primary_layout_bindings b WHERE b.library=p.library AND b.child=p.id)",params![root.spec.zone.get("zoneName").and_then(Value::as_str),manifest.state_id,text,local,manifest.decision.destinations.iter().find(|d|d.path==path).map(|d|&d.metadata_hash),manifest.decision.destinations.iter().find(|d|d.path==path).map(|d|&d.version_size),selected.checksum,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|r.get(0)).optional()?;
             if let Some(source)=receipt {
                 record_verified_destination(&tx,root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,
                     &manifest.decision.destinations.iter().find(|d|d.path==path).ok_or(StateError::ProviderSelectionInvalid)?.version_size,&native,&local,&source)?;
@@ -1964,6 +2490,9 @@ impl SqliteStateDb {
                     tx.execute("UPDATE provider_active_destinations SET verified_metadata=1 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND admitted=1 AND verified_media=1",params![generation,key,child])?;
                     for destination in &manifest.decision.destinations {refresh_progress_hash(&tx,&root,&manifest,destination)?;}
                 }
+            }
+            if root.spec.format==2 {
+                while retirement::compact_batch(&tx,Some(&root.id))?>0 {}
             }
             tx.commit()?;Ok(())
         }).await
@@ -1995,10 +2524,19 @@ pub(super) fn metadata_receipt(
         .get("zoneName")
         .and_then(Value::as_str)
         .ok_or(StateError::ProviderSelectionInvalid)?;
-    if grouping_hash(conn, library, &manifest.state_id)? != group {
+    let frozen = frozen_metadata(conn, &root, &manifest, destination)?;
+    if frozen.is_none() && grouping_hash(conn, library, &manifest.state_id)? != group {
         return Err(StateError::ProviderWorkConflict);
     }
-    let mut asset=conn.query_row(&format!("SELECT {} FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND checksum=?4 AND metadata_hash=?5 AND is_deleted=0",super::rows::ASSET_COLUMNS),params![library,manifest.state_id,version,destination.checksum,destination.metadata_hash],super::rows::row_to_asset_record)?;
+    let frozen_groupings = frozen
+        .as_ref()
+        .map(|(snapshot, _)| (snapshot.albums.clone(), snapshot.people.clone()));
+    let frozen_metadata_hash = frozen.as_ref().map(|(_, hash)| hash.clone());
+    let mut asset = if let Some((snapshot, _)) = frozen {
+        snapshot.asset
+    } else {
+        conn.query_row(&format!("SELECT {} FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND checksum=?4 AND metadata_hash=?5 AND is_deleted=0",super::rows::ASSET_COLUMNS),params![library,manifest.state_id,version,destination.checksum,destination.metadata_hash],super::rows::row_to_asset_record)?
+    };
     asset.local_path = Some(destination.path.to_path());
     asset.local_checksum = Some(local.clone());
     asset.download_checksum = Some(source.clone());
@@ -2012,6 +2550,8 @@ pub(super) fn metadata_receipt(
             pass_key: key.to_owned(),
             child: child.to_owned(),
             grouping_hash: group,
+            frozen_groupings,
+            frozen_metadata_hash,
             metadata_flags: root.spec.metadata_flags,
             prepared: prepared_metadata(conn, &root, &manifest, destination)?,
         }),
@@ -2033,7 +2573,9 @@ pub(super) fn finish_metadata_receipt(
     let root = load_generation(conn, &receipt.generation)?;
     let manifest = load_decision(conn, &root, &receipt.pass_key, &receipt.child)?;
     if root.spec.metadata_flags != receipt.metadata_flags
-        || grouping_hash(conn, &pending.asset.library, &manifest.state_id)? != receipt.grouping_hash
+        || (receipt.frozen_metadata_hash.is_none()
+            && grouping_hash(conn, &pending.asset.library, &manifest.state_id)?
+                != receipt.grouping_hash)
     {
         return Err(StateError::ProviderWorkConflict);
     }
@@ -2054,6 +2596,34 @@ pub(super) fn finish_metadata_receipt(
                 && d.path.key().ok().as_deref() == Some(path.as_str())
         })
         .ok_or(StateError::ProviderSelectionInvalid)?;
+    let original = metadata_receipt(
+        conn,
+        &receipt.generation,
+        &receipt.pass_key,
+        &receipt.child,
+        pending.asset.version_size.as_str(),
+        &path,
+    )?;
+    let original_receipt = original
+        .selection_receipt
+        .as_ref()
+        .ok_or(StateError::ProviderSelectionInvalid)?;
+    // Native destination identity was checked above without a lossy conversion.
+    // Serialize only the normalized writer inputs, never a potentially non-UTF-8 path.
+    let mut original_inputs = original.asset.clone();
+    let mut pending_inputs = pending.asset.clone();
+    if original_inputs.local_path != pending_inputs.local_path {
+        return invalid();
+    }
+    original_inputs.local_path = None;
+    pending_inputs.local_path = None;
+    if original_receipt.frozen_metadata_hash != receipt.frozen_metadata_hash
+        || original_receipt.frozen_groupings != receipt.frozen_groupings
+        || encode(&original_inputs)? != encode(&pending_inputs)?
+        || original.source_checksum != pending.source_checksum
+    {
+        return invalid();
+    }
     if prepared_metadata(conn, &root, &manifest, selected_destination)? != receipt.prepared {
         return Err(StateError::ProviderWorkConflict);
     }
@@ -2066,7 +2636,7 @@ pub(super) fn finish_metadata_receipt(
     {
         return invalid();
     }
-    let changed=conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,local_checksum=COALESCE(?8,local_checksum),verified_metadata=CASE WHEN ?9=1 THEN 1 ELSE verified_metadata END WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND local_checksum IS ?6 AND grouping_hash=?7 AND source_checksum IS ?10 AND metadata_hash IS ?11 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=provider_active_destinations.library AND a.id=provider_active_destinations.asset_id AND a.version_size=provider_active_destinations.version_size AND a.checksum=provider_active_destinations.checksum AND a.metadata_hash=provider_active_destinations.metadata_hash AND a.created_at IS provider_active_destinations.created_at AND a.added_at IS provider_active_destinations.added_at AND a.is_deleted=0)",params![receipt.generation,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path,pending.asset.local_checksum,receipt.grouping_hash,local,complete,pending.source_checksum,pending.asset.metadata.metadata_hash])?;
+    let changed=conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,local_checksum=COALESCE(?8,local_checksum),verified_metadata=CASE WHEN ?9=1 THEN 1 ELSE verified_metadata END WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND local_checksum IS ?6 AND grouping_hash=?7 AND source_checksum IS ?10 AND metadata_hash IS ?11 AND (frozen_metadata IS NOT NULL OR EXISTS(SELECT 1 FROM assets a WHERE a.library=provider_active_destinations.library AND a.id=provider_active_destinations.asset_id AND a.version_size=provider_active_destinations.version_size AND a.checksum=provider_active_destinations.checksum AND a.metadata_hash=provider_active_destinations.metadata_hash AND a.created_at IS provider_active_destinations.created_at AND a.added_at IS provider_active_destinations.added_at AND a.is_deleted=0))",params![receipt.generation,receipt.pass_key,receipt.child,pending.asset.version_size.as_str(),path,pending.asset.local_checksum,receipt.grouping_hash,local,complete,pending.source_checksum,pending.asset.metadata.metadata_hash])?;
     if changed > 0 {
         let destination = manifest
             .decision
@@ -2120,6 +2690,18 @@ pub(super) fn finish_metadata_receipt(
             if alias.decision.master != manifest.decision.master {
                 continue;
             }
+            let Some(alias_destination) = alias.decision.destinations.iter().find(|d| {
+                d.version_size == pending.asset.version_size.as_str()
+                    && d.path.key().ok().as_deref() == Some(path.as_str())
+            }) else {
+                return invalid();
+            };
+            if let Some((snapshot, _)) =
+                frozen_metadata(conn, &alias_root, &alias, alias_destination)?
+                && receipt.frozen_groupings.as_ref() != Some(&(snapshot.albums, snapshot.people))
+            {
+                continue;
+            }
             conn.execute("UPDATE provider_active_destinations SET prepared_checksum=NULL,prepared_size=NULL,prepared_hash=NULL,local_checksum=COALESCE(?6,local_checksum),verified_metadata=CASE WHEN ?10=1 THEN 1 ELSE verified_metadata END WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND local_checksum IS ?7 AND source_checksum IS ?8 AND grouping_hash=?9 AND verified_media=1 AND verified_metadata=0",params![generation,key,child,pending.asset.version_size.as_str(),path,local,pending.asset.local_checksum,pending.source_checksum,receipt.grouping_hash,complete])?;
             let destination = alias
                 .decision
@@ -2159,12 +2741,39 @@ impl SqliteStateDb {
                 let root=load_generation(conn,&generation)?;load_decision(conn,&root,&previous_key,&child)?;
                 paths.push(serde_json::from_str(&path).map_err(|_invalid|StateError::ProviderSelectionInvalid)?);
             }
+            let mut compact=super::download_receipts::matching(conn,&scope,&child,&master,&version,&checksum,size)?;
+            compact.sort_by_key(|receipt| !receipt.fulfills_pass(&key));
+            for receipt in compact {
+                if !paths.contains(&receipt.native_path) {paths.push(receipt.native_path);}
+            }
             Ok(paths)
         }).await
     }
 }
 
 impl SqliteStateDb {
+    /// Completed pass ownership preserves its original physical destination
+    /// when a later configuration changes the path template.
+    pub(crate) async fn selection_path_fulfills_pass(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        key: String,
+        child: String,
+        path: super::provider_selection::SelectionPath,
+    ) -> Result<bool, StateError> {
+        self.with_conn("checking fulfilled native pass ownership",move|conn|{
+            account::validate_authenticated(conn,&owner)?;
+            let ids:Vec<String>=conn.prepare("SELECT id FROM download_receipts WHERE scope=?1 AND child=?2 AND native_path=?3")?
+                .query_map(params![scope,child,path.key()?],|row|row.get(0))?.collect::<Result<_,_>>()?;
+            for id in ids {
+                let receipt=super::download_receipts::load(conn,&id)?.ok_or(StateError::ProviderSelectionInvalid)?;
+                if receipt.fulfills_pass(&key) { return Ok(true); }
+            }
+            Ok(false)
+        }).await
+    }
+
     pub(crate) async fn selection_path_matches_local(
         &self,
         owner: account::AccountOwner,
@@ -2178,7 +2787,9 @@ impl SqliteStateDb {
         self.with_conn("checking independent publication fingerprint",move|conn|{
             account::validate_authenticated(conn,&owner)?;
             let previous:Option<(String,String)>=conn.query_row("SELECT w.generation,w.pass_key FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.child=?3 AND w.path=?4 AND (w.local_checksum=?5 OR (w.prepared_checksum=?5 AND w.prepared_size=?6)) AND w.admitted=1 AND w.verified_media=1 ORDER BY (w.pass_key=?2) DESC,g.created_at DESC LIMIT 1",params![scope,key,child,path.key()?,local,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-            if let Some((generation,previous_key))=previous {let root=load_generation(conn,&generation)?;load_decision(conn,&root,&previous_key,&child)?;Ok(true)} else {Ok(false)}
+            if let Some((generation,previous_key))=previous {let root=load_generation(conn,&generation)?;load_decision(conn,&root,&previous_key,&child)?;return Ok(true)}
+            Ok(super::download_receipts::matching_local(conn,&scope,&child,&path,&local)?.iter()
+                .any(|receipt|receipt.source_checksum!=receipt.local_checksum || receipt.provider_size==size))
         }).await
     }
 }
@@ -2203,12 +2814,124 @@ impl SqliteStateDb {
                 let generation:String=row.get(0)?;let key:String=row.get(1)?;let child:String=row.get(2)?;
                 let root=load_generation(conn,&generation)?;load_decision_with_sources(conn,&root,&key,&child,false)?;
             }
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE g.scope=?1 AND d.admission='deferred') OR EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.admitted=1 AND (w.verified_media=0 OR (g.metadata_enabled=1 AND w.verified_metadata=0)))",[scope],|r|r.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE g.scope=?1 AND d.admission='deferred') OR EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.admitted=1 AND w.verified_media=0)",[scope],|r|r.get(0))?)
         }).await
     }
 }
 
+/// A different admitted physical copy cannot satisfy the current destination.
+/// Compatibility TEXT is usable only to exclude its uniquely bound receipt.
+#[derive(Debug, Default)]
+pub(crate) struct SelectedCopyScope {
+    pub(crate) admitted: bool,
+    pub(crate) other: Vec<(std::path::PathBuf, Option<super::BaselineReceipt>)>,
+}
+
 impl SqliteStateDb {
+    /// Distinguish an independently admitted physical destination from a
+    /// historical path hint. Revalidate its existing immutable owner first.
+    pub(crate) async fn selection_destination_scope(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        key: String,
+        child: String,
+        expected: (
+            String,
+            String,
+            super::provider_selection::SelectionPath,
+            String,
+            u64,
+        ),
+        requested: super::provider_selection::SelectionPath,
+    ) -> Result<SelectedCopyScope, StateError> {
+        self.with_conn("checking admitted selected destination", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let root = load_generation(conn, &generation)?;
+            pass(&root, &key)?;
+            let (state_id, version, path, checksum, size) = expected;
+            let declared: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3)",
+                params![generation,key,child], |row| row.get(0),
+            )?;
+            if declared && load_decision(conn, &root, &key, &child)?.state_id != state_id {
+                return Err(StateError::ProviderSelectionInvalid);
+            }
+            let size = i64::try_from(size).map_err(|_| StateError::ProviderSelectionInvalid)?;
+            let admitted: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1
+                 AND pass_key=?2 AND child=?3 AND asset_id=?4 AND version_size=?5 AND path=?6
+                 AND checksum=?7 AND size_bytes=?8 AND admitted=1)",
+                params![generation,key,child,state_id,version,path.key()?,checksum,size],
+                |row| row.get(0),
+            )?;
+            let mut scope = SelectedCopyScope { admitted, other: Vec::new() };
+            let library = root.spec.zone.get("zoneName").and_then(Value::as_str)
+                .ok_or(StateError::ProviderSelectionInvalid)?;
+            let rows = conn.prepare(
+                "SELECT pass_key,path,compat_path,local_checksum,source_checksum
+                 FROM provider_active_destinations WHERE generation=?1 AND pass_key<>?2
+                 AND child=?3 AND asset_id=?4 AND version_size=?5 AND checksum=?6
+                 AND size_bytes=?7 AND admitted=1 AND verified_media=1"
+            )?.query_map(params![generation,key,child,state_id,version,checksum,size], |row| {
+                Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,
+                    row.get::<_,String>(3)?,row.get::<_,String>(4)?))
+            })?.collect::<Result<Vec<_>,_>>()?;
+            for (other_key, encoded, compatibility, local, source) in rows {
+                let other = load_decision(conn, &root, &other_key, &child)?;
+                if other.state_id != state_id { return invalid(); }
+                let selected = other.decision.destinations.iter().find(|destination|
+                    destination.path.key().ok().as_deref() == Some(encoded.as_str())
+                    && destination.version_size == version && destination.checksum == checksum
+                    && destination.size == size as u64
+                ).ok_or(StateError::ProviderSelectionInvalid)?;
+                let native = selected.path.to_path();
+                if native == path.to_path() || native == requested.to_path() { continue; }
+                // Lossy compatibility paths are not native path identity. Only
+                // exclude a TEXT receipt when exactly one durable native path
+                // binds its identity, rendition, provider bytes and local hashes.
+                let unambiguous: bool = conn.query_row(
+                    "SELECT COUNT(DISTINCT path)=1 FROM provider_active_destinations
+                     WHERE library=?1 AND asset_id=?2 AND version_size=?3
+                     AND checksum=?4 AND size_bytes=?5 AND compat_path=?6
+                     AND local_checksum=?7 AND source_checksum=?8
+                     AND admitted=1 AND verified_media=1",
+                    params![library,state_id,version,checksum,size,compatibility,local,source],
+                    |row| row.get(0),
+                )?;
+                let compatible = if unambiguous
+                    && compatibility != path.to_path().to_string_lossy()
+                    && compatibility != requested.to_path().to_string_lossy()
+                {
+                    Some(super::BaselineReceipt {
+                        is_current_path: false, library: library.to_owned(), id: state_id.clone(),
+                        version_size: crate::state::VersionSizeKey::from_str(&version).ok_or(StateError::ProviderSelectionInvalid)?,
+                        provider_checksum: checksum.clone(), provider_size: size as u64,
+                        local_path: compatibility.into(), local_checksum: Some(local),
+                        source_checksum: Some(source),
+                    })
+                } else { None };
+                scope.other.push((native, compatible));
+            }
+            let compact:Vec<String>=conn.prepare("SELECT id FROM download_receipts WHERE scope=?1 AND child=?2
+                AND state_id=?3 AND version_size=?4 AND provider_checksum=?5 AND provider_size=?6")?
+                .query_map(params![root.spec.scope,child,state_id,version,checksum,size],|row|row.get(0))?.collect::<Result<_,_>>()?;
+            for id in compact {
+                let receipt=super::download_receipts::load(conn,&id)?.ok_or(StateError::ProviderSelectionInvalid)?;
+                let native=receipt.native_path.to_path();
+                if receipt.fulfills_pass(&key) {
+                    scope.other.retain(|(other,_)| other!=&native);
+                    continue;
+                }
+                if native!=path.to_path() && native!=requested.to_path()
+                    && !scope.other.iter().any(|(previous,_)|previous==&native) {
+                    scope.other.push((native,None));
+                }
+            }
+            Ok(scope)
+        }).await
+    }
+
     pub(crate) async fn selection_destination_verified(
         &self,
         owner: account::AccountOwner,

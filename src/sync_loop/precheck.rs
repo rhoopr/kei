@@ -81,37 +81,20 @@ impl WatchPrecheck {
 pub(super) async fn include_pending_local_work(
     watch_precheck: &mut WatchPrecheck,
     db: &dyn download::DownloadStore,
-    metadata: &config::MetadataConfig,
     library_states: &[LibraryState],
 ) {
-    let rewrite_writers_enabled = download::metadata_rewrite::writers_enabled(metadata);
     let mut local_work_zones = rustc_hash::FxHashSet::default();
     for library in library_states {
         let zone = library.zone_name.as_str();
-        let capture_pending = match db
-            .has_metadata_capture_work(&[zone], state::METADATA_CAPTURE_REVISION)
-            .await
-        {
+        let download_pending = match db.has_download_retry_work(zone).await {
             Ok(pending) => pending,
             Err(error) => {
-                tracing::warn!(error = %error, "Could not inspect metadata-capture work before watch pre-check");
+                tracing::warn!(error = %error, "Could not inspect download retries before watch pre-check");
                 true
             }
         };
-        let rewrite_pending = if rewrite_writers_enabled {
-            match db
-                .get_pending_metadata_rewrites_page(Some(&[zone]), 0, 1)
-                .await
-            {
-                Ok(rows) => !rows.is_empty(),
-                Err(error) => {
-                    tracing::warn!(error = %error, "Could not inspect metadata-rewrite work before watch pre-check");
-                    true
-                }
-            }
-        } else {
-            false
-        };
+        // Historical capture and optional rewrite queues are retained, but
+        // ordinary sync does not process them. They cannot wake a quiet loop.
         let identity_pending = match db.get_metadata(&state::unresolved_identity_key(zone)).await {
             Ok(marker) => marker.is_some(),
             Err(error) => {
@@ -136,12 +119,7 @@ pub(super) async fn include_pending_local_work(
                 true
             }
         };
-        if capture_pending
-            || rewrite_pending
-            || identity_pending
-            || layout_pending
-            || retained_checkpoint_pending
-        {
+        if download_pending || identity_pending || layout_pending || retained_checkpoint_pending {
             local_work_zones.insert(library.zone_name.clone());
         }
     }
@@ -216,7 +194,7 @@ const DB_SYNC_TOKEN_KEY: &str = "db_sync_token";
 
 const SCOPED_DB_SYNC_TOKEN_PROVIDER: &str = "icloud";
 
-const SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION: i64 = 1;
+const SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DbPrecheckScope {

@@ -200,6 +200,15 @@ impl SqliteStateDb {
             let tx = conn
                 .transaction()
                 .map_err(|e| StateError::query("mark_downloaded::begin", e))?;
+            let prepared_publications = super::temp_files::retire_prepared_receipt(
+                &tx,
+                &library,
+                &id,
+                &version_size,
+                &local_path,
+                &local_checksum,
+                source_checksum.as_deref(),
+            )?;
             let rows = update_status_to_downloaded(
                 &tx,
                 &library,
@@ -247,6 +256,10 @@ impl SqliteStateDb {
                     &local_checksum,
                     source,
                 )?;
+            }
+
+            for proof in &prepared_publications {
+                super::provider_generations::record_prepared_download_receipt(&tx, proof)?;
             }
 
             record_metadata_capture_revision(
@@ -1112,6 +1125,28 @@ impl SqliteStateDb {
 
 #[async_trait]
 impl DownloadStateStore for SqliteStateDb {
+    async fn defer_baseline_match(&self, record: &AssetRecord) -> Result<(), StateError> {
+        SqliteStateDb::defer_baseline_match(self, record).await
+    }
+
+    async fn adopt_baseline_receipt(
+        &self,
+        record: &AssetRecord,
+        receipt: &super::BaselineReceipt,
+        validate_file: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::adopt_baseline_receipt(self, record, receipt, validate_file).await
+    }
+
+    async fn adopt_provider_signature(
+        &self,
+        record: &AssetRecord,
+        receipt: &super::BaselineReceipt,
+        validate_file: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::adopt_provider_signature(self, record, receipt, validate_file).await
+    }
+
     #[cfg(test)]
     async fn should_download(
         &self,
@@ -1467,6 +1502,56 @@ impl DownloadStateStore for SqliteStateDb {
 
 #[async_trait]
 impl DownloadContextStateStore for SqliteStateDb {
+    async fn get_baseline_receipts(&self) -> Result<Vec<super::BaselineReceipt>, StateError> {
+        self.with_conn("get_baseline_receipts", |conn| {
+            let mut statement = conn.prepare_cached(
+                // Managed layout history can carry old download_checksum values
+                // as source evidence. Keep those candidates, but do not promote
+                // that provenance into baseline content proof. A legacy asset
+                // path without a receipt is still an uncertain candidate; its
+                // download checksum must never manufacture source evidence.
+                "SELECT p.library,p.id,p.version_size,p.provider_checksum,a.size_bytes,
+                        p.local_path,p.local_checksum,
+                        CASE WHEN EXISTS(SELECT 1 FROM primary_layout_bindings b
+                            WHERE b.library=p.library AND b.child=p.id)
+                          THEN NULL ELSE p.source_checksum END, (p.local_path IS a.local_path)
+                 FROM asset_metadata_paths p JOIN assets a
+                   ON a.library=p.library AND a.id=p.id AND a.version_size=p.version_size
+                 WHERE a.is_deleted=0 AND a.checksum=p.provider_checksum
+                   AND a.size_bytes>=0 AND a.downloaded_at IS NOT NULL
+                 UNION ALL
+                 SELECT a.library,a.id,a.version_size,a.checksum,a.size_bytes,
+                        a.local_path,a.local_checksum,NULL,1
+                 FROM assets a
+                 WHERE a.is_deleted=0 AND a.size_bytes>=0
+                   AND a.downloaded_at IS NOT NULL AND a.local_path IS NOT NULL
+                   AND NOT EXISTS(SELECT 1 FROM asset_metadata_paths p
+                       WHERE p.library=a.library AND p.id=a.id
+                         AND p.version_size=a.version_size
+                         AND p.local_path=a.local_path AND p.provider_checksum=a.checksum)
+                 ORDER BY 1,2,3,6",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(super::BaselineReceipt {
+                    is_current_path: row.get(8)?,
+                    library: row.get(0)?,
+                    id: row.get(1)?,
+                    version_size: VersionSizeKey::from_str(&row.get::<_, String>(2)?)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                    provider_checksum: row.get(3)?,
+                    provider_size: u64::try_from(row.get::<_, i64>(4)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    local_path: PathBuf::from(row.get::<_, String>(5)?),
+                    local_checksum: row.get(6)?,
+                    source_checksum: row.get(7)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(StateError::from)
+        })
+        .await
+    }
+
     async fn get_pending_publication(
         &self,
         library: &str,

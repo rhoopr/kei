@@ -301,6 +301,8 @@ impl PhotoAlbum {
     pub(super) fn stream_changes(
         &self,
         sync_token: &str,
+        observed: Option<Arc<std::sync::atomic::AtomicBool>>,
+        collection_independent: bool,
     ) -> (ChangeStream, tokio::sync::oneshot::Receiver<String>) {
         let (tx, rx) = mpsc::channel::<anyhow::Result<ChangeEvent>>(200);
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
@@ -372,24 +374,28 @@ impl PhotoAlbum {
                     break Some(shadow_error(error));
                 }
 
-                if let Some((capture, database)) = &shadow_capture {
-                    let page = capture
-                        .scope(database, &zone_result.zone_scope)
-                        .and_then(|scope| {
-                            zone_result.observed_page(raw_body, scope, &current_token)
-                        });
-                    let page = match page {
-                        Ok(page) => page,
-                        Err(error) => break Some(shadow_error(error)),
-                    };
-                    if tx.is_closed() {
-                        let _ = token_tx.send(current_token);
-                        return;
-                    }
-                    if let Err(error) = capture.capture(page).await {
-                        break Some(shadow_error(error));
-                    }
+                // Inspect raw records before pairing: a paired CPLAsset is
+                // emitted as a CPLMaster event, but can still move rank pages.
+                if zone_result.records.iter().any(|record| {
+                    !collection_independent
+                        || !matches!(
+                            record.record_type.as_str(),
+                            "CPLAlbum" | "CPLContainerRelation"
+                        )
+                }) && let Some(observed) = &observed
+                {
+                    observed.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                if zone_result.records.iter().any(|record| {
+                    !crate::icloud::photos::asset::delta_record_is_accountable(record)
+                }) {
+                    break Some(super::super::error::UnaccountedChangeError.into());
+                }
+
+                // New observations are admitted by the download ledger before
+                // their successor can be committed. Unknown/unaccountable input
+                // above keeps the affected cursor; old raw-page owners remain
+                // available through their separate upgrade replay path.
 
                 current_token = zone_result.sync_token;
                 let more_coming = zone_result.more_coming;
@@ -696,25 +702,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normal_changes_accepts_terminal_unchanged_token_and_unknown_records() {
+    async fn normal_changes_accepts_quiet_terminal_and_holds_unknown_current_work() {
         use tokio_stream::StreamExt;
 
-        for records in [
-            vec![],
-            vec![json!({
-                "recordName": "unknown-record", "recordType": "FutureProviderType", "fields": {"unknown": 1}
-            })],
-        ] {
+        // A quiet terminal page may reuse its opaque cursor. An unknown
+        // current record has no ledger owner, so even a new cursor must not
+        // discard it. Raw activity remains observable before that rejection.
+        for unknown in [false, true] {
+            let records = if unknown {
+                vec![json!({
+                    "recordName": "unknown-record", "recordType": "FutureProviderType", "fields": {"unknown": 1}
+                })]
+            } else {
+                vec![]
+            };
+            let successor = if unknown { "must-not-save" } else { "saved" };
             let album = make_album_with_session(
                 100,
                 Box::new(
-                    MockPhotosSession::new().ok(canned_changes_page(&records, "saved", false)),
+                    MockPhotosSession::new().ok(canned_changes_page(&records, successor, false)),
                 ),
             );
-            let (stream, token_rx) = album.changes_stream("saved");
+            let (stream, token_rx, observed) = album.changes_stream_observed("saved", false);
             let items: Vec<_> = stream.collect().await;
-            assert!(items.iter().all(Result::is_ok));
+            if unknown {
+                assert_eq!(items.len(), 1);
+                assert!(
+                    items[0]
+                        .as_ref()
+                        .unwrap_err()
+                        .downcast_ref::<super::super::super::error::UnaccountedChangeError>()
+                        .is_some()
+                );
+            } else {
+                assert!(items.is_empty());
+            }
+            assert_eq!(observed.load(std::sync::atomic::Ordering::Acquire), unknown);
             assert_eq!(token_rx.await.unwrap(), "saved");
+        }
+    }
+
+    #[tokio::test]
+    async fn baseline_rank_observation_keeps_media_changes_but_can_ignore_collection_only_chatter()
+    {
+        use tokio_stream::StreamExt;
+        for collection_independent in [false, true] {
+            for record_type in ["CPLAlbum", "CPLContainerRelation", "CPLMaster", "CPLAsset"] {
+                let records = if record_type == "CPLMaster" || record_type == "CPLAsset" {
+                    vec![
+                        changes_master("rank-master"),
+                        changes_asset("rank-child", "rank-master"),
+                    ]
+                } else {
+                    vec![
+                        json!({"recordName":"collection-change","recordType":record_type,"fields":{}}),
+                    ]
+                };
+                let album = make_album_with_session(
+                    100,
+                    Box::new(
+                        MockPhotosSession::new().ok(canned_changes_page(&records, "next", false)),
+                    ),
+                );
+                let (stream, token, changed) =
+                    album.changes_stream_observed("saved", collection_independent);
+                let items: Vec<_> = stream.collect().await;
+                assert!(items.iter().all(Result::is_ok));
+                assert!(
+                    !items.is_empty(),
+                    "collection work must still reach its normal ledger owner"
+                );
+                assert_eq!(token.await.unwrap(), "next");
+                assert_eq!(
+                    changed.load(std::sync::atomic::Ordering::Acquire),
+                    !collection_independent || matches!(record_type, "CPLMaster" | "CPLAsset"),
+                    "{record_type}, collection_independent={collection_independent}"
+                );
+            }
         }
     }
 

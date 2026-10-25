@@ -321,29 +321,87 @@ impl PendingRetryPlanning<'_> {
                     }
                     recovered
                 } else {
-                    pipeline::adopt_pending_on_disk_for_retry(
-                        self.db,
-                        pass_config,
-                        asset,
-                        self.task_planner,
-                        &plan.tasks,
-                        pipeline::PendingRetryFileEvidence {
-                            version_size: target.version_size,
-                            filename: &evidence.filename,
-                            checksum: &evidence.checksum,
-                            local_path: evidence.local_path_evidence_under(&pass_config.directory),
-                            cross_parent_recorded_file: evidence
-                                .downloaded_at
-                                .and(evidence.local_file.as_ref()),
-                            size: evidence.size_bytes,
-                        },
-                    )
-                    .await?
+                    let Some(task) = plan
+                        .tasks
+                        .iter()
+                        .find(|task| task.version_size == target.version_size)
+                    else {
+                        continue;
+                    };
+                    match self
+                        .task_planner
+                        .match_existing(asset, pass_config, task)
+                        .await
+                    {
+                        crate::download::baseline_matching::BaselineMatch::Present {
+                            receipt,
+                            file,
+                        } => {
+                            if self.run_mode.downloads_files() {
+                                let _guard = super::file::lock_download_destination(
+                                    &receipt.local_path,
+                                    self.shutdown,
+                                )
+                                .await?;
+                                let record =
+                                    planner::pending_record_for_task(pass_config, asset, task);
+                                match self.db.adopt_baseline_receipt(&record, &receipt, Box::new(move || {
+                                    file.validate_blocking().map_err(|_| crate::state::error::StateError::Invariant {
+                                        operation: "adopt_baseline_receipt",
+                                        detail: "existing retry file changed before receipt commit".into(),
+                                    })
+                                })).await {
+                                    Ok(()) => pipeline::PendingRetryAdoption::Adopted,
+                                    Err(_) => pipeline::PendingRetryAdoption::StateWriteFailed,
+                                }
+                            } else {
+                                pipeline::PendingRetryAdoption::Adopted
+                            }
+                        }
+                        decision => {
+                            // A saved pending path is another candidate even when today's
+                            // rendering chooses a different directory or collision suffix.
+                            let recorded_candidate = if let Some(path) =
+                                evidence.local_path_under(&pass_config.directory)
+                            {
+                                !matches!(
+                                    super::file::retain_pending_file(&pass_config.directory, path)
+                                        .await,
+                                    Ok(None)
+                                )
+                            } else {
+                                false
+                            };
+                            if matches!(
+                                decision,
+                                crate::download::baseline_matching::BaselineMatch::Uncertain
+                            ) || recorded_candidate
+                            {
+                                if self.run_mode.downloads_files() {
+                                    self.db
+                                        .defer_baseline_match(&planner::pending_record_for_task(
+                                            pass_config,
+                                            asset,
+                                            task,
+                                        ))
+                                        .await?;
+                                }
+                                // Remove only this invocation's transfer candidate. The ordinary
+                                // pending row and verification reason remain for a quiet cycle.
+                                self.pending_targets.remove(&target);
+                                tracing::warn!(
+                                    "Existing retry file match remains uncertain; pending work retained"
+                                );
+                                continue;
+                            }
+                            pipeline::PendingRetryAdoption::NotFound
+                        }
+                    }
                 };
                 match adoption {
                     pipeline::PendingRetryAdoption::Adopted => {
                         self.pending_targets.remove(&target);
-                        if !recovered_current {
+                        if !recovered_current && self.run_mode.downloads_files() {
                             self.db
                                 .clear_asset_verification(
                                     &target.library,
@@ -375,7 +433,9 @@ impl PendingRetryPlanning<'_> {
             }
             let mut retry_tasks = Vec::with_capacity(plan.tasks.len());
             for mut task in plan.tasks.into_iter().filter(|task| {
-                !state_write_failed_targets.contains(&PendingRetryTarget::from_task(task))
+                self.pending_targets
+                    .contains(&PendingRetryTarget::from_task(task))
+                    && !state_write_failed_targets.contains(&PendingRetryTarget::from_task(task))
             }) {
                 let target = PendingRetryTarget::from_task(&task);
                 if let Some(evidence) = self.pending_evidence.get(&target)

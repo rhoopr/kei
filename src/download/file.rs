@@ -13,6 +13,7 @@
 mod fingerprint;
 mod platform;
 pub(in crate::download) mod primary_layout;
+mod provider_signature;
 mod publication;
 mod reconciliation;
 mod replacement;
@@ -55,6 +56,7 @@ pub(super) use staging::{CleanupLeases, lock_download_destination};
 pub(super) use transfer::DownloadClient;
 pub(super) use transfer::DownloadLimits;
 pub(super) use transfer::DownloadOpts;
+pub(super) use transfer::DownloadedFile;
 pub(super) use transfer::download_file_with_mode;
 pub(super) use transfer::temp_download_path;
 pub(crate) use validation::LocalFileSizeExpectation;

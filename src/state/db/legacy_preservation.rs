@@ -635,7 +635,7 @@ pub(super) fn activate(conn: &Connection, proof: &LegacyActivationProof) -> Resu
     let prior: Option<String> = conn
         .query_row(
             "SELECT value FROM metadata WHERE key=?1",
-            [format!("sync_token:{}", proof.library)],
+            [crate::sync_cycle::sync_token_key(&proof.library)],
             |r| r.get(0),
         )
         .optional()?;
@@ -666,10 +666,15 @@ pub(super) fn activate(conn: &Connection, proof: &LegacyActivationProof) -> Resu
 }
 
 pub(super) fn checkpoint_library(key: &str) -> Option<&str> {
-    key.strip_prefix("sync_token:").or_else(|| {
-        key.strip_prefix("pending_sync_token:")
-            .and_then(|key| key.split_once(':').map(|(_, library)| library))
-    })
+    // Both epochs remain subject to identity/dependency guards. The sync
+    // orchestrator only reads current-epoch tokens.
+    key.strip_prefix("sync_token:v27:")
+        .or_else(|| key.strip_prefix("sync_token:"))
+        .or_else(|| {
+            key.strip_prefix("pending_sync_token:v27:")
+                .or_else(|| key.strip_prefix("pending_sync_token:"))
+                .and_then(|key| key.split_once(':').map(|(_, library)| library))
+        })
 }
 
 pub(super) fn invalid_checkpoint() -> StateError {

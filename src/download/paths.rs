@@ -591,20 +591,37 @@ pub(crate) fn normalize_ampm(s: &str) -> String {
 ///
 /// This is the blocking I/O primitive used by `DirCache`. Extracted so it can
 /// be called from both sync (`ensure_dir`) and async (`ensure_dir_async`) paths.
-fn read_dir_entries(dir: &Path) -> FxHashMap<String, u64> {
-    std::fs::read_dir(dir)
-        .ok()
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|e| {
-                    let name = e.file_name().to_str()?.to_string();
-                    let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-                    Some((name, size))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+fn read_dir_entries(dir: &Path) -> (FxHashMap<String, u64>, bool) {
+    let mut names = FxHashMap::default();
+    let mut complete = true;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => return (names, error.kind() == std::io::ErrorKind::NotFound),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            complete = false;
+            continue;
+        };
+        let size = match entry.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(_) => {
+                complete = false;
+                0
+            }
+        };
+        // Keep names even when sizing fails. Discovery must not hide plausible
+        // edited files, links or unsafe entries behind a size-only filter.
+        names.insert(name, size);
+    }
+    (names, complete)
 }
 
 /// Cached directory listing that amortizes filesystem syscalls.
@@ -621,6 +638,7 @@ fn read_dir_entries(dir: &Path) -> FxHashMap<String, u64> {
 pub(crate) struct DirCache {
     dirs: FxHashMap<PathBuf, FxHashMap<String, u64>>,
     import_names: FxHashMap<PathBuf, Vec<(String, String, u64)>>,
+    complete: FxHashMap<PathBuf, bool>,
 }
 
 impl DirCache {
@@ -628,6 +646,7 @@ impl DirCache {
         Self {
             dirs: FxHashMap::default(),
             import_names: FxHashMap::default(),
+            complete: FxHashMap::default(),
         }
     }
 
@@ -636,6 +655,7 @@ impl DirCache {
     pub fn clear(&mut self) {
         self.dirs.clear();
         self.import_names.clear();
+        self.complete.clear();
     }
 
     /// Pre-populate the cache for `dir` on the blocking threadpool.
@@ -648,15 +668,16 @@ impl DirCache {
             return;
         }
         let dir_buf = dir.to_path_buf();
-        let entries = tokio::task::spawn_blocking({
+        let (entries, complete) = tokio::task::spawn_blocking({
             let d = dir_buf.clone();
             move || read_dir_entries(&d)
         })
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(dir = %dir_buf.display(), error = %e, "Failed to read directory entries");
-            FxHashMap::default()
+            (FxHashMap::default(), false)
         });
+        self.complete.insert(dir_buf.clone(), complete);
         self.dirs.insert(dir_buf, entries);
     }
 
@@ -669,7 +690,7 @@ impl DirCache {
             return;
         }
         let entries = self.dirs.remove(dir).unwrap_or_default();
-        let (entries, names) = tokio::task::spawn_blocking(move || {
+        let indexed = tokio::task::spawn_blocking(move || {
             let mut names: Vec<_> = entries
                 .iter()
                 .map(|(name, bytes)| (normalize_ampm(name), name.clone(), *bytes))
@@ -677,9 +698,10 @@ impl DirCache {
             names.sort();
             (entries, names)
         })
-        .await
-        .unwrap_or_else(|error| {
+        .await;
+        let (entries, names) = indexed.unwrap_or_else(|error| {
             tracing::warn!(%error, "Failed to build import directory index");
+            self.complete.insert(dir.to_owned(), false);
             (FxHashMap::default(), Vec::new())
         });
         self.dirs.insert(dir.to_owned(), entries);
@@ -712,6 +734,32 @@ impl DirCache {
         paths.sort();
         paths.dedup();
         paths
+    }
+
+    /// Same-directory discovery without treating names or sizes as proof.
+    /// The caller checks family boundaries and verifies complete file bytes.
+    pub(in crate::download) async fn baseline_candidates(
+        &mut self,
+        dir: &Path,
+        prefixes: &[String],
+    ) -> (Vec<PathBuf>, bool) {
+        self.ensure_import_dir_async(dir).await;
+        let mut paths = Vec::new();
+        if let Some(names) = self.import_names.get(dir) {
+            for prefix in prefixes {
+                let start = names.partition_point(|(name, _, _)| name.as_str() < prefix.as_str());
+                paths.extend(
+                    names
+                        .iter()
+                        .skip(start)
+                        .take_while(|(name, _, _)| name.starts_with(prefix))
+                        .map(|(_, name, _)| dir.join(name)),
+                );
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        (paths, self.complete.get(dir).copied().unwrap_or(false))
     }
 
     /// Check whether `path` exists on disk, using cached directory listings.
@@ -778,9 +826,9 @@ impl DirCache {
             )]
             return &self.dirs[dir];
         }
-        self.dirs
-            .entry(dir.to_path_buf())
-            .or_insert_with(|| read_dir_entries(dir))
+        let (entries, complete) = read_dir_entries(dir);
+        self.complete.insert(dir.to_owned(), complete);
+        self.dirs.entry(dir.to_owned()).or_insert(entries)
     }
 }
 

@@ -858,13 +858,8 @@ async fn contract_source_checkpoint_requires_durable_recovery_primary_layout_aft
             "zone_token",
         );
         let mut precheck = crate::sync_loop::precheck::WatchPrecheck::SkipAll;
-        crate::sync_loop::precheck::include_pending_local_work(
-            &mut precheck,
-            &db,
-            &crate::config::MetadataConfig::default(),
-            &[selected],
-        )
-        .await;
+        crate::sync_loop::precheck::include_pending_local_work(&mut precheck, &db, &[selected])
+            .await;
         assert!(precheck.should_sync_zone("PrimarySync"));
         assert!(!precheck.should_sync_zone("SharedSync-unselected"));
         assert!(precheck.db_sync_token_after_success().is_none());

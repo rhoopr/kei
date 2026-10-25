@@ -74,7 +74,8 @@ impl SqliteStateDb {
         let key = key.to_owned();
         let value = value.to_owned();
         self.with_conn("set_metadata", move |conn| {
-            if let Some(library) = super::legacy_preservation::checkpoint_library(&key) {
+            if !crate::sync_cycle::is_current_zone_checkpoint(&key)
+                && let Some(library) = super::legacy_preservation::checkpoint_library(&key) {
                 let protected: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM unattributed_legacy WHERE library=?1)", [library], |row| row.get(0))?;
                 if protected { return Err(super::legacy_preservation::invalid_checkpoint()); }
             }
@@ -138,7 +139,9 @@ impl SqliteStateDb {
                 super::legacy_preservation::activate(&tx, proof)?;
             }
             for (key, _) in &transition.metadata_updates {
-                if let Some(library) = super::legacy_preservation::checkpoint_library(key) {
+                if !crate::sync_cycle::is_current_zone_checkpoint(key)
+                    && let Some(library) = super::legacy_preservation::checkpoint_library(key)
+                {
                     super::legacy_preservation::validate_checkpoint(
                         &tx,
                         library,
@@ -157,6 +160,11 @@ impl SqliteStateDb {
                     )?;
                 }
             }
+            #[cfg(all(test, target_os = "linux"))]
+            let writes_current_token = transition
+                .metadata_updates
+                .iter()
+                .any(|(key, _)| crate::sync_cycle::is_current_zone_checkpoint(key));
             for (key, value) in transition.metadata_updates {
                 tx.execute(
                     "INSERT INTO metadata (key, value) VALUES (?1, ?2) \
@@ -169,8 +177,16 @@ impl SqliteStateDb {
                 tx.execute("DELETE FROM metadata WHERE key = ?1", [key])
                     .map_err(|e| StateError::query("commit_checkpoint_transition::delete", e))?;
             }
+            #[cfg(all(test, target_os = "linux"))]
+            if writes_current_token {
+                crate::test_helpers::process_death_point("checkpoint-before-commit");
+            }
             tx.commit()
                 .map_err(|e| StateError::query("commit_checkpoint_transition::commit", e))?;
+            #[cfg(all(test, target_os = "linux"))]
+            if writes_current_token {
+                crate::test_helpers::process_death_point("checkpoint-after-commit");
+            }
             Ok(())
         })
         .await

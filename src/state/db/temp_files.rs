@@ -8,6 +8,10 @@ use chrono::Utc;
 use super::{OwnedTempFile, SqliteStateDb, TempFileOwnershipStore};
 use crate::state::error::StateError;
 
+mod prepared;
+pub(crate) use prepared::PreparedPublication;
+pub(super) use prepared::retire_prepared_receipt;
+
 #[derive(Debug, Clone)]
 struct OwnedTempPathKey(Vec<u8>);
 
@@ -69,6 +73,16 @@ impl SqliteStateDb {
         let path_key = OwnedTempPathKey::from_path(path)?.0;
         let claimed_at = Utc::now().timestamp();
         self.with_conn("claim_temp_file", move |conn| {
+            let prepared: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM owned_temp_files WHERE path=?1 AND publication IS NOT NULL)",
+                [&path_key], |row| row.get(0),
+            )?;
+            if prepared {
+                return Err(StateError::Invariant {
+                    operation: "claim_temp_file",
+                    detail: "prepared publication must be recovered before reusing its temporary file".into(),
+                });
+            }
             conn.execute(
                 "INSERT INTO owned_temp_files (path, claimed_at) VALUES (?1, ?2) \
                  ON CONFLICT(path) DO UPDATE SET claimed_at = excluded.claimed_at",
@@ -88,7 +102,7 @@ impl SqliteStateDb {
             let mut stmt = conn
                 .prepare(
                     "SELECT path, claimed_at FROM owned_temp_files \
-                     WHERE claimed_at < ?1 ORDER BY path",
+                     WHERE claimed_at < ?1 AND publication IS NULL ORDER BY path",
                 )
                 .map_err(|e| StateError::query("get_owned_temp_files_before", e))?;
             let rows = stmt
@@ -126,8 +140,11 @@ impl SqliteStateDb {
             let mut retired = 0u64;
             for path_key in path_keys {
                 retired = retired.saturating_add(
-                    tx.execute("DELETE FROM owned_temp_files WHERE path = ?1", [path_key])
-                        .map_err(|e| StateError::query("retire_temp_files", e))?
+                    tx.execute(
+                        "DELETE FROM owned_temp_files WHERE path = ?1 AND publication IS NULL",
+                        [path_key],
+                    )
+                    .map_err(|e| StateError::query("retire_temp_files", e))?
                         as u64,
                 );
             }
@@ -141,6 +158,23 @@ impl SqliteStateDb {
 
 #[async_trait]
 impl TempFileOwnershipStore for SqliteStateDb {
+    async fn prepare_temp_publication(
+        &self,
+        part: &Path,
+        proof: &PreparedPublication,
+    ) -> Result<(), StateError> {
+        self.prepare_publication(part, proof).await
+    }
+
+    async fn get_prepared_publications(
+        &self,
+        library: &str,
+        id: &str,
+        version: crate::state::VersionSizeKey,
+    ) -> Result<Vec<PreparedPublication>, StateError> {
+        self.prepared_publications(library, id, version).await
+    }
+
     async fn claim_temp_file(&self, path: &Path) -> Result<(), StateError> {
         SqliteStateDb::claim_temp_file(self, path).await
     }

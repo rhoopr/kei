@@ -646,3 +646,33 @@ fn fetcher_response_body_only_logs_at_trace() {
         "TRACE level should include the response body in the event; got: {out_trace}",
     );
 }
+
+#[tokio::test]
+async fn v027_full_query_unaccountable_records_hold_token() {
+    let mut missing = test_asset_record("missing-parent");
+    missing["fields"]
+        .as_object_mut()
+        .unwrap()
+        .remove("masterRef");
+    let mut blank = test_asset_record("blank-parent");
+    blank["fields"]["masterRef"]["value"]["recordName"] = json!(" ");
+    for record in [
+        json!({"recordName":"future-current","recordType":"FuturePhotoRecord","fields":{}}),
+        missing,
+        blank,
+    ] {
+        let mock = MockPhotosFlow::new()
+            .query_page(vec![record], Some("must-not-save"))
+            .build();
+        let album = make_album_with_session(1, Box::new(mock));
+        let (stream, token) = album.photo_stream_with_token(None, Some(1), 1);
+        let (ids, errors) = drain_photo_stream(stream).await;
+        assert!(ids.is_empty());
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("unsupported type or missing photo identity"))
+        );
+        assert_eq!(token.await.unwrap(), None);
+    }
+}

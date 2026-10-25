@@ -289,12 +289,35 @@ impl PhotoAlbum {
                             "Fetcher response contained blank syncToken; treating as unavailable"
                         );
                     } else {
-                        last_sync_token = Some(trimmed.to_string());
+                        last_sync_token = Some(token.to_owned());
                     }
                 }
 
                 let records = query.records;
                 let record_count = records.len();
+                // This query owns photo pairs only. Unknown current records or
+                // an asset without usable master identity cannot be accounted
+                // for by the download ledger; retain the source checkpoint.
+                if records.iter().any(|record| {
+                    record.record_name.trim().is_empty()
+                        || match record.record_type.as_str() {
+                            "CPLMaster" => false,
+                            "CPLAsset" => record
+                                .fields
+                                .get("masterRef")
+                                .and_then(|field| field.get("value"))
+                                .and_then(|value| value.get("recordName"))
+                                .and_then(Value::as_str)
+                                .is_none_or(|name| name.trim().is_empty()),
+                            _ => true,
+                        }
+                }) {
+                    enumeration_incomplete = true;
+                    let _ = tx.send(Err(anyhow::anyhow!(
+                        "Photo enumeration is incomplete: a current record has an unsupported type or missing photo identity."
+                    ))).await;
+                    break;
+                }
 
                 tracing::debug!(target: "kei::icloud::photos::album",
                     album = %name,

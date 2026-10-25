@@ -74,6 +74,36 @@ impl RetainedPendingFile {
         tokio::task::spawn_blocking(move || retained.validate_blocking()).await?
     }
 
+    /// Compare only the explicitly supported provider v1 signature over the
+    /// complete retained file. Unknown formats never become a positive match.
+    pub(in crate::download) async fn matches_provider_v1(
+        self: &Arc<Self>,
+        checksum: &str,
+    ) -> anyhow::Result<Option<bool>> {
+        let retained = Arc::clone(self);
+        let checksum = checksum.to_owned();
+        tokio::task::spawn_blocking(move || retained.matches_provider_v1_blocking(&checksum))
+            .await?
+    }
+
+    pub(in crate::download) fn matches_provider_v1_blocking(
+        &self,
+        checksum: &str,
+    ) -> anyhow::Result<Option<bool>> {
+        let Some(expected) = super::provider_signature::supported(checksum) else {
+            return Ok(None);
+        };
+        let identity = crate::fs_util::file_identity(&self.file)?;
+        let mut file = self.path.validate_identity(identity)?;
+        let (matches, fingerprint) = super::provider_signature::compare(&mut file, &expected)?;
+        anyhow::ensure!(
+            fingerprint == self.fingerprint,
+            "Existing file changed during provider signature comparison"
+        );
+        self.path.validate_identity(identity)?;
+        Ok(Some(matches))
+    }
+
     pub(in crate::download) fn link_count(&self) -> std::io::Result<u64> {
         crate::fs_util::file_link_count(&self.file)
     }
@@ -247,3 +277,51 @@ pub(super) fn fingerprint_regular_file_blocking(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod provider_signature_tests {
+    use super::*;
+    use sha1::{Digest, Sha1};
+
+    fn provider_signature(bytes: &[u8]) -> String {
+        let mut hash = Sha1::new();
+        hash.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+        hash.update(bytes);
+        data_encoding::BASE64.encode(&[vec![1], hash.finalize().to_vec()].concat())
+    }
+
+    #[tokio::test]
+    async fn retained_provider_signature_checks_whole_bytes_and_rechecks_before_adoption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.JPG");
+        let bytes = vec![61_u8; 65_537];
+        std::fs::write(&path, &bytes).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let file = retain_pending_file(dir.path(), &path)
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = provider_signature(&bytes);
+        assert_eq!(
+            file.matches_provider_v1(&expected).await.unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            file.matches_provider_v1("opaque-unknown").await.unwrap(),
+            None
+        );
+        let mut wrong = bytes.clone();
+        *wrong.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            file.matches_provider_v1(&provider_signature(&wrong))
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        std::fs::write(&path, &wrong).unwrap();
+        assert!(file.matches_provider_v1(&expected).await.is_err());
+        assert!(file.validate().await.is_err());
+    }
+}

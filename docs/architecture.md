@@ -20,8 +20,8 @@ match their headings, so searching a label finds the section.
 - [Command dispatch](#command-dispatch) and [Container startup](#container-startup): find entry points.
 - [Sync and provider checkpoints](#sync-and-provider-checkpoints) and [Full and incremental enumeration](#full-and-incremental-enumeration): trace source progress.
 - [Download and publication](#download-and-publication), [Durable pending retry](#durable-pending-retry), and [Import-existing](#import-existing): trace local work.
-- [Account ownership and legacy adoption](#account-ownership-and-legacy-adoption), [Transactional source catalog and replay](#transactional-source-catalog-and-replay), and [Current provider work admission](#current-provider-work-admission): trace durable source ownership.
-- [Selection generation shadow](#selection-generation-shadow), [Private selection and destination replay](#private-selection-and-destination-replay), and [Observed incremental shadow capture](#observed-incremental-shadow-capture): trace selection and destination projections.
+- [Account ownership and legacy adoption](#account-ownership-and-legacy-adoption), [Transactional source catalog and replay](#transactional-source-catalog-and-replay), and [Current provider work admission](#retained-provider-work-admission): trace durable source ownership.
+- [Selection generation shadow](#historical-selection-generation-shadow), [Private selection and destination replay](#format-1-selection-and-destination-replay), and [Observed incremental shadow capture](#historical-incremental-shadow-capture): trace selection and destination projections.
 - [Data-safety invariants](#data-safety-invariants), [Safety contract catalog](#safety-contract-catalog), and [Secrets and diagnostics](#secrets-and-diagnostics): find the required safety conditions.
 - [Change-impact traversal](#change-impact-traversal) and [Change-impact checklist](#change-impact-checklist): find related owners and consumers before editing.
 - [Tests](#tests): find proof entry points and the test guide.
@@ -341,7 +341,59 @@ Legacy session and encrypted credential files are preserved and ignored;
 keyring identity remains unchanged. See [account migration](account-state-migration.md)
 for operator steps and compatibility limits.
 
-### Observed incremental shadow capture
+### Normal v0.27 download ledger
+
+Owned single-scope passes use format-2 records in
+`provider_active_decisions` and `provider_active_destinations`. Each observation
+has validated provider identity/rendition facts and is excluded, completed, or
+retained as independently retryable work. Destination paths are immutable once
+admitted. Pending destinations feed existing generation-aware collision planning
+so a newer rendition cannot take an unfinished older rendition's path.
+
+The initial normal run ignores earlier token namespaces. It records a scoped
+zone boundary, compares current inventory against filesystem receipts, and
+consumes changes before saving a v27 token. Query cursors are opaque. Unknown
+records without a lossless retained obligation hold the affected cursor. A token
+means observed work is accounted for; pending transfers and optional historical
+metadata do not constitute a complete-backup assertion. New routed delta assets
+enter the same ledger directly; quiet cycles replay due destinations.
+
+New observations do not write the raw inbox, catalog projection, rank-page proof,
+or parity manifests described in the historical sections below. Their readers
+remain for already-recorded unfinished work. Format-1 metadata dependencies still
+require preservation before their mutable-row guards can be retired. Aggregate
+cross-zone routing and complete selection coverage remain under validation.
+
+Existing-file matching keeps current provider identity separate from content
+equivalence. Unchanged historical raw-file receipts require source SHA-256,
+recorded local SHA-256 and freshly read bytes to agree. Old source/local
+mismatches cannot certify metadata edits because older generic adoption could
+preserve a source hash while replacing the local hash with unrelated bytes.
+
+The selected resource's fileChecksum can independently verify raw local bytes
+for the explicitly supported MMCS v1 variant: strict Base64 of byte 0x01 followed
+by SHA1 of the two NUL-terminated Apple object salts and the complete plaintext.
+It is not ordinary SHA-1 or SHA-256, and the rule does not apply to arbitrary MMCS
+fields. Unknown versions and metadata-edited bytes receive no inferred proof.
+The matcher retains a confined file, computes a separate local SHA-256, and
+rechecks its complete bytes and namespace inside the adoption transaction.
+The provider path is enabled after independent source review and passing
+transaction rollback, retained-inode and reopened-cycle tests.
+
+Names, suffixes, size and old Primary/Shared labels locate candidates but cannot
+complete work. Read-only adoption preserves bytes, metadata, paths and modification
+times. Distinct provider identities retain separate obligations even when bytes
+coincide. Distinct database/owner scopes sharing a legacy zone-name key fail closed
+rather than merge identities. Completely unindexed arbitrary renames/moves remain
+outside the current candidate discovery coverage.
+
+Normal path reconciliation now recovers recorded journals only. It does not
+plan new layout convergence. Unfinished operations retain their bookkeeping and
+configuration/checkpoint guards. The removed LegacyCycle orchestrator no longer
+makes historical attribution or archive certification prerequisites for source
+progress.
+
+### Historical incremental shadow capture
 
 After opening an authenticated, account-owned database, sync attaches capture to
 its Photos service and libraries. Normal incremental `changes/zone` responses
@@ -435,7 +487,7 @@ recovery debt and filesystem guards retain checkpoint authority. Capturing a
 tombstone cannot authorize local media deletion. Existing download and metadata
 queues still consume the current stream. Capture alone cannot admit queue work;
 the bounded retained-source admission in
-[Current provider work admission](#current-provider-work-admission) is a
+[Current provider work admission](#retained-provider-work-admission) is a
 separately validated owner.
 
 Capture covers only incremental pages observed by existing sync in selected
@@ -445,7 +497,7 @@ plus a delta bridge is not an atomic snapshot or proof of absence. New future
 observations cannot retire old expired-epoch debt. Complete queue projection,
 capture-owned cursors, durable catalog selection and separate progress remain
 later stages; the bounded current-generation slice in
-[Current provider work admission](#current-provider-work-admission) does not
+[Current provider work admission](#retained-provider-work-admission) does not
 complete them. Historical-version retention, unrecoverable-debt acknowledgment,
 epoch recovery and compaction still require explicit policy and support proof.
 The additive migration preserves existing rows and uses the migration owner's
@@ -481,7 +533,7 @@ Receipt version 1 means source facts were indexed, including unresolved evidence
 it does not mean selected, downloaded, rewritten, verified, historically complete
 or acknowledged recovery debt. Existing queues also accept the bounded current
 work admission in
-[Current provider work admission](#current-provider-work-admission); source
+[Current provider work admission](#retained-provider-work-admission); source
 indexing alone cannot authorize it.
 
 Derived page facts have a 16 MiB logical charge limit and a separate 512 MiB
@@ -494,7 +546,7 @@ existing checkpoint evidence, publication receipts and metadata obligations are
 unchanged. Historical intermediate retention and unrecoverable-debt acknowledgment
 still require explicit policy decisions before dependent stages.
 
-### Current provider work admission
+### Retained provider work admission
 
 Schema 31 adds `provider_work_receipts`, generation-bound
 `provider_work_obligations`, and the `provider_work_scan` scheduling position.
@@ -610,7 +662,7 @@ unrecoverable debt, authorize local tombstone deletion or select a historical
 retention policy. Existing CheckpointEvidence, sparse/legacy proofs, opt-in
 metadata writes, publication guards and WAL NORMAL qualification remain in force.
 
-### Selection generation shadow
+### Historical selection generation shadow
 
 Schema 33 adds account-bound `provider_selection_generations`, source links in
 `provider_selection_sources`, per-pass `provider_selection_decisions`, and
@@ -655,7 +707,7 @@ This shadow storage is the first PR of the selection phase, not completion of
 replay-driven multi-pass materialization.
 
 
-### Private selection and destination replay
+### Format-1 selection and destination replay
 
 Schema 34 adds active generations in `provider_active_generations`, original
 validated rank pages and record indexes in `provider_selection_rank_pages` and
