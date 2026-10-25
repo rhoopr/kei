@@ -151,12 +151,45 @@ async fn v027_dependent_malformed_raw_history_preserves_retry_and_cursor_across_
                 .unwrap(),
         );
         let capture = ShadowCapture::new(db.clone(), baseline_owner(), "com");
+        let scope = capture.scope("private", &zone()).unwrap();
+        let hash = "a".repeat(64);
+        // Unselected scopes and changed configuration cannot inherit this
+        // source's error or consume its independent retry obligation.
+        for (selected_scope, selected_hash) in [
+            (capture.scope("shared", &zone()).unwrap(), hash.clone()),
+            (scope.clone(), "b".repeat(64)),
+        ] {
+            capture
+                .replay_due_catalog(selected_scope, selected_hash, 64, &CancellationToken::new())
+                .await
+                .unwrap();
+        }
+        {
+            let conn = db.acquire_lock("future retry remains independent").unwrap();
+            conn.execute(
+                "UPDATE provider_work_retries SET next_retry_at=?1",
+                [chrono::Utc::now().timestamp() + 3600],
+            )
+            .unwrap();
+        }
+        capture
+            .replay_due_catalog(scope.clone(), hash.clone(), 64, &CancellationToken::new())
+            .await
+            .unwrap();
+        {
+            let conn = db.acquire_lock("make retained retry due").unwrap();
+            conn.execute(
+                "UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1",
+                [],
+            )
+            .unwrap();
+        }
         assert!(
             capture
-                .replay_catalog(&CancellationToken::new())
+                .replay_due_catalog(scope, hash, 64, &CancellationToken::new())
                 .await
                 .is_err(),
-            "required evidence must fail before normal cycle dispatch"
+            "only this selected scope's due evidence must fail its preflight"
         );
         assert_eq!(
             db.get_metadata(&cursor).await.unwrap().as_deref(),

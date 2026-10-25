@@ -15,7 +15,6 @@ use super::asset_writes::{
 };
 use super::membership::refresh_asset_album_groupings_tx;
 use super::rows::decode_asset_date;
-#[cfg(test)]
 use super::rows::{ASSET_COLUMNS, row_to_asset_record};
 use super::{
     AssetVerificationState, DownloadContextStateStore, DownloadStateStore, DownloadedFileRecord,
@@ -1246,6 +1245,26 @@ impl DownloadStateStore for SqliteStateDb {
 
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
         <SqliteStateDb as ReportStateStore>::get_pending_page(self, 0, u32::MAX).await
+    }
+
+    async fn get_pending_retry_candidates(&self) -> Result<Vec<AssetRecord>, StateError> {
+        self.with_conn("reading independent pending retry owners", |conn| {
+            let sql = format!(
+                "SELECT {ASSET_COLUMNS} FROM assets
+                 WHERE status='pending' AND is_deleted=0
+                 AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w
+                     WHERE w.library=assets.library AND w.asset_id=assets.id
+                     AND w.version_size=assets.version_size
+                     AND w.checksum=assets.checksum AND w.size_bytes=assets.size_bytes
+                     AND w.admitted=1 AND (w.verified_media=0 OR w.verified_metadata=0))
+                 ORDER BY last_seen_at DESC"
+            );
+            Ok(conn
+                .prepare(&sql)?
+                .query_map([], row_to_asset_record)?
+                .collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
     }
 
     async fn get_policy_excluded_ids_for_revalidation(

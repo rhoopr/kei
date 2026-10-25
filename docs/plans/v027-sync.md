@@ -209,63 +209,38 @@ pre-upgrade rollback database remains intentionally retained.
 
 ### Current checkpoint and finite blockers
 
-Local commit 0b744f6a6518c701de1b8f427df69ec1a81c7363 contains the first
-implementation checkpoint. Receipt retirement, scoped publication provenance,
-recorded-only legacy scheduling, selected-scope coverage and removal of obsolete
-normal prerequisites are subsequent uncommitted work. No result below qualifies
-the eventual final head until repeated after that checkpoint.
+The resume retry slice separates generic asset retries from exact active-ledger
+owners. Existing transfer policy still permits one initial and one bounded
+cleanup attempt; a quiet reopen under backoff makes no attempt. A due older
+observation whose current confirmation differs remains visible, durable retry
+work without vetoing unrelated current enumeration. Authentication failures,
+new-observation refusal and failed durable writes still block progress.
 
-The integrated acceptance run exercised ordinary baseline plus reopened
-incremental flows, including cross-zone modified publications, selected albums,
-Hidden/Favorites, recent-window deletions, historical ambiguity, raw signature
-reuse, independent failed-transfer recovery and retirement. Its remaining
-failures were two explicit opt-in truncated-repair tests and two fixture
-integrity checks; the latter now pass after correcting their setup. Two separate
-Shared-key fixtures still fail at mocked baseline zone discovery. These must
-be corrected without weakening their distinct-identity assertions.
+Startup no longer projects all raw history. Selected-scope preflight considers
+only due recorded work with the matching configuration. Wrong scope, changed
+configuration and future backoff do not consume or fail that retained source.
+A malformed due source preserves its cursor and retry across reopen.
 
-A bounded live test passed selected Primary and Shared baseline plus two
-reopened incremental cycles using disposable local state/media. This is not
-evidence that the reporter's historical archive is fully covered.
+The resumed working-tree focused v027 run passed 103 tests with four explicit
+probes ignored. Scope/configuration/backoff controls, independent retry and
+failed-deferral-write controls passed. All-target/all-feature compilation,
+formatting and diff checks passed. This validation includes preserved
+uncommitted compaction/adoption edits, so it is not clean final-head evidence.
+Live validation was not repeated because this slice changed local retry
+accounting rather than provider transport or content comparison.
 
-Independent review identified ordinary runtime gaps still being resolved:
-unrelated current partial failure can starve older independent pending work;
-provisional indexing retains an obsolete managed-layout qualification; and
-startup still projects unrelated historical raw catalog pages before normal
-sync. Fixes must preserve current-observation token guards and dependent
-unfinished work while removing those global prerequisites.
+Remaining evidence and implementation gaps:
+- A simultaneous healthy/blocked two-library normal-cycle acceptance test for
+  the selected-scope startup change.
+- Finish and independently validate the preserved optional legacy-compaction
+  isolation changes, including malformed old roots and bounded capacity relief.
+- Measure the per-match pending-destination scan before a targeted scale fix.
+- Finish obsolete state-API removal and required lint/feature/platform checks;
+  classify relevant broad failures without restoring removed contracts.
+- Checkpoint a clean final candidate and perform exact-head acceptance and full
+  changed-file review. An actual PR review still requires a PR and its exact head.
 
-Required lint currently fails on obsolete unused certification APIs and a
-small set of code-style errors. Remove the obsolete APIs rather than suppress
-warnings or restore their normal-runtime callers. Historical fixture writers
-may remain test-only to exercise real upgrade/replay state. Broad failures
-remain a mix of removed contracts, outdated provider fixtures and potential
-regressions; they are not all classified or dismissed.
-
-Remaining qualification: finish these bounded integrity/runtime changes,
-checkpoint coherent commits, repeat outcome acceptance, run required lint and
-feature/platform checks, resolve relevant broad failures, and obtain independent
-exact-head review including every changed file and ledger retention. Historical
-edited files without independent provenance, unsupported resource signatures
+Historical edited files without independent provenance, unsupported signatures
 and arbitrary unindexed moves remain explicit evidence/discovery limits.
-Reporter resolution has not been established.
-
-
-### Validation checkpoint before final integrity fixes
-
-Frozen source cf1685e6d3d058c12279a6d6e8805317ffa2084ae46d0b4b4ba3687c464c7c12
-passed cargo check --all-targets --all-features. Its integrated v027 run passed
-98 cases, failed two and ignored four explicit probes. Counts are diagnostic,
-not readiness. New provisional indexing, raw orphan isolation, repair-race
-pending preservation and the previously demonstrated ordinary baseline and
-incremental outcomes passed. Opt-in collision repair still fails to transfer;
-independent legacy retry succeeds but causes an extra attempt of another failed
-transfer on one reopen, which must be fixed.
-
-Independent review additionally requires removing the remaining global startup
-veto from due historical projection, isolating optional legacy compaction from
-format2 capacity admission, and measuring the per-match scan of pending
-destinations. A suspected cross-parent finalizer is unreachable from current
-callers; remove its dead finalization branch and audit its remaining validation
-rather than introducing another adoption mechanism. This checkpoint is not
-review-ready or beta-ready.
+Reporter resolution has not been established. No branch push, PR creation or
+beta publication has occurred.

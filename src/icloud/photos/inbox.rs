@@ -77,6 +77,7 @@ impl ShadowCapture {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn replay_catalog(
         &self,
         cancel: &tokio_util::sync::CancellationToken,
@@ -90,6 +91,30 @@ impl ShadowCapture {
             let Some(source) = source else {
                 break;
             };
+            self.project(source).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn replay_due_catalog(
+        &self,
+        scope: String,
+        config_hash: String,
+        limit: u32,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
+        let pages = self
+            .db
+            .due_work_pages(self.owner.clone(), scope, config_hash, limit)
+            .await?;
+        for id in pages {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let source = self
+                .db
+                .catalog_source(self.owner.clone(), id, MAX_CHANGES_PAGE_BYTES)
+                .await?;
             self.project(source).await?;
         }
         Ok(())

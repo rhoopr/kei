@@ -1368,6 +1368,30 @@ pub(crate) async fn run_cycle(
             Arc::clone(&asset_groupings),
             Arc::from(lib_state.zone_name.as_str()),
         );
+        if let Err(error) = download::prepare_retained_sources(
+            &lib_state.plan.passes,
+            &download_config,
+            download_controls,
+            &shutdown_token,
+        )
+        .await
+        {
+            // Only this selected library's due historical hydration failed.
+            // Its source cursor and retry owners remain unchanged; other
+            // libraries retain their own independent checkpoint authority.
+            cycle_failed_count = cycle_failed_count.saturating_add(1);
+            cycle_stats.failed = cycle_stats.failed.saturating_add(1);
+            cycle_stats.sync_token_blocked = true;
+            cycle_stats
+                .sync_token_blocked_zone
+                .get_or_insert_with(|| lib_state.zone_name.clone());
+            db_sync_token_advance_safe = false;
+            path_reconciliation_complete = false;
+            path_reconciliation_cycle_safe = false;
+            tracing::warn!(error = %error, diagnostic = "retained_source_replay_failed",
+                "Selected library retains its cursor because due historical source evidence is invalid");
+            continue;
+        }
         let baseline_key = format!(
             "baseline_cursor:v27:{}:{}:{}",
             lib_state.library.baseline_scope(),
@@ -1997,13 +2021,11 @@ pub(crate) async fn run_cycle(
                 "indexing_reconciliation_required"
             });
             sync_result.stats.sync_token_blocked_source = Some("kei");
-            sync_result.stats.sync_token_blocked_explanation = Some(
-                if qualified {
-                    "full inventory qualified; the old trusted cursor is retained for the next incremental cycle"
-                } else {
-                    "a complete non-retry inventory from a FINISHED plan is still required"
-                },
-            );
+            sync_result.stats.sync_token_blocked_explanation = Some(if qualified {
+                "full inventory qualified; the old trusted cursor is retained for the next incremental cycle"
+            } else {
+                "a complete non-retry inventory from a FINISHED plan is still required"
+            });
             db_sync_token_advance_safe = false;
             path_reconciliation_complete = false;
             path_reconciliation_cycle_safe = false;

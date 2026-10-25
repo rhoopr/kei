@@ -387,10 +387,12 @@ where
                         let (current, body) = match run.confirm(key, asset).await {
                             Ok(confirmed) => confirmed,
                             Err(error) => {
-                                enum_errors_producer
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                match classify_selection_confirmation_error(&error) {
+                                let class = classify_selection_confirmation_error(&error);
+                                let mut retry_durable = true;
+                                match class {
                                     SelectionConfirmationErrorClass::SessionExpired => {
+                                        enum_errors_producer
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         provider_auth_errors
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         run.session_expired
@@ -405,6 +407,7 @@ where
                                         if let Err(state_error) =
                                             run.defer_confirmation(key, observed_child).await
                                         {
+                                            retry_durable = false;
                                             state_write_failures_producer
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             tracing::warn!(target: "kei::download::pipeline", %state_error,
@@ -413,6 +416,18 @@ where
                                     }
                                     SelectionConfirmationErrorClass::RetryDeferred => {}
                                 }
+                                if run.retained_retry && retry_durable {
+                                    // This older observation already has a durable owner.
+                                    // Refusing stale proof must not veto unrelated current
+                                    // enumeration; no producer mutation or completion follows.
+                                    skips.uncertain += 1;
+                                    tracing::warn!(target: "kei::download::pipeline",
+                                        "Previously selected work remains pending after confirmation refusal");
+                                    producer_pb.inc(1);
+                                    continue;
+                                }
+                                enum_errors_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 run.held.store(true, std::sync::atomic::Ordering::Relaxed);
                                 tracing::warn!(target: "kei::download::pipeline", %error,
                                     "Current selection confirmation refused producer mutation");

@@ -78,6 +78,22 @@ fn work_context(
     }))
 }
 
+/// Validate only this selected scope's due historical hydration dependencies.
+pub(crate) async fn prepare_retained_sources(
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let Some(context) = work_context(passes, config, controls)? else {
+        return Ok(());
+    };
+    context
+        .capture
+        .replay_due_catalog(context.scope, context.config_hash, 64, cancel)
+        .await
+}
+
 pub(crate) async fn has_due_retained_work(
     passes: &[AlbumPass],
     config: &DownloadConfig,

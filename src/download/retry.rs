@@ -846,7 +846,7 @@ pub(super) async fn build_pending_retry_download_tasks(
 
     revalidate_policy_excluded_assets(passes, config, &shutdown_token).await?;
 
-    let pending = db.get_pending().await?;
+    let pending = db.get_pending_retry_candidates().await?;
     let mut pending_targets: FxHashSet<PendingRetryTarget> = pending
         .iter()
         .filter(|record| record.library.as_ref() == config.library.as_ref())

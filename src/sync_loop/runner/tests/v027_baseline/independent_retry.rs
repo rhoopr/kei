@@ -80,11 +80,16 @@ impl PhotosSession for CurrentView {
 #[tokio::test]
 async fn v027_failed_current_transfer_does_not_starve_legacy_pending_retry() {
     for database in ["private", "shared"] {
-        historical_pending(database).await;
+        historical_pending(database, false).await;
     }
 }
 
-async fn historical_pending(database: &'static str) {
+#[tokio::test]
+async fn v027_retained_retry_deferral_write_failure_keeps_cursor() {
+    historical_pending("private", true).await;
+}
+
+async fn historical_pending(database: &'static str, fail_deferral: bool) {
     let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
     let server = crate::start_wiremock_or_skip!();
     for endpoint in ["/second", "/concurrent", "/legacy"] {
@@ -137,6 +142,24 @@ async fn historical_pending(database: &'static str) {
                 .await
                 .unwrap(),
         );
+        if cycle == 3 {
+            // Preserve one quiet reopen under backoff, then make the original
+            // owner due without changing its admission or destination.
+            db.make_selection_retry_due(baseline_owner(), "asset-first".into())
+                .await
+                .unwrap();
+            if fail_deferral {
+                db.acquire_lock("refuse retained retry write")
+                    .unwrap()
+                    .execute_batch(
+                        "CREATE TRIGGER refuse_retained_deferral BEFORE UPDATE OF next_retry_at
+                     ON provider_active_decisions
+                     WHEN NEW.reason='current_confirmation_unavailable' BEGIN
+                     SELECT RAISE(ABORT,'synthetic retained retry deferral failure'); END;",
+                    )
+                    .unwrap();
+            }
+        }
         if cycle == 1 {
             let record = crate::test_helpers::TestAssetRecord::new("asset-legacy")
                 .library(ZONE)
@@ -203,14 +226,63 @@ async fn historical_pending(database: &'static str) {
             &shared,
             &CancellationToken::new(),
         )
-        .await
-        .unwrap();
-        assert!(
-            result.failed_count > 0,
-            "current transfer must still fail: cycle {cycle}: {result:?}; trace={:?}",
-            trace.events()
-        );
+        .await;
+        if cycle == 3 && fail_deferral {
+            let error = result.expect_err("failed durable deferral must abort progress");
+            assert!(format!("{error:#}").contains("synthetic retained retry deferral failure"));
+            assert_eq!(
+                db.get_metadata(&key).await.unwrap(),
+                Some("v27-after-cycle-3".into())
+            );
+            let pending: i64 = db
+                .acquire_lock("failed deferral keeps owner")
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM provider_active_destinations WHERE library=?1
+                 AND asset_id='asset-first' AND admitted=1 AND verified_media=0",
+                    [ZONE],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(pending > 0);
+            assert!(!root.join("first.JPG").exists());
+            let (bytes, mtime) = legacy_publication.as_ref().unwrap();
+            assert_eq!(&std::fs::read(root.join("legacy.JPG")).unwrap(), bytes);
+            assert_eq!(
+                &std::fs::metadata(root.join("legacy.JPG"))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                mtime
+            );
+            assert_eq!(
+                std::fs::read(&sentinel).unwrap(),
+                b"existing untouched bytes"
+            );
+            assert_eq!(
+                std::fs::metadata(&sentinel).unwrap().modified().unwrap(),
+                sentinel_mtime
+            );
+            server.verify().await;
+            return;
+        }
+        let result = result.unwrap();
+        if cycle == 2 {
+            assert_eq!(result.failed_count, 0, "quiet owner is still under backoff");
+        } else {
+            assert!(
+                result.failed_count > 0,
+                "due current transfer must still fail: cycle {cycle}: {result:?}; trace={:?}",
+                trace.events()
+            );
+        }
         assert!(!result.stats.identity_incomplete, "{result:?}");
+        if cycle == 3 && !fail_deferral {
+            assert!(
+                result.stats.skipped.uncertain > 0,
+                "changed historical proof stays visible and pending: {result:?}"
+            );
+        }
         let requests = server.received_requests().await.unwrap();
         failed_attempts.push(requests.iter().filter(|r| r.url.path() == "/first").count());
         assert!(!root.join("first.JPG").exists());
@@ -257,7 +329,11 @@ async fn historical_pending(database: &'static str) {
             },
             "{result:?}"
         );
-        assert!(result.db_sync_token_advance_safe, "{result:?}");
+        assert!(
+            result.db_sync_token_advance_safe,
+            "cycle={cycle}: {result:?}; trace={:?}",
+            trace.events()
+        );
         assert_eq!(
             db.get_metadata(&key).await.unwrap(),
             Some(format!("v27-after-cycle-{}", cycle + 1))
@@ -274,11 +350,12 @@ async fn historical_pending(database: &'static str) {
     // Quiet cycles do not bypass the active generation's own attempt policy
     // when unrelated asset-ledger recovery becomes eligible.
     let retry_counts: Vec<_> = failed_attempts.windows(2).map(|w| w[1] - w[0]).collect();
-    assert_eq!(retry_counts[0], retry_counts[1], "{failed_attempts:?}");
-    assert_eq!(retry_counts[1], retry_counts[2], "{failed_attempts:?}");
-    assert!(
-        retry_counts.iter().all(|count| *count <= 1),
-        "{failed_attempts:?}"
+    assert_eq!(
+        retry_counts,
+        // One initial attempt and the existing bounded cleanup attempt,
+        // with no requests on the quiet reopen under backoff.
+        [2, 0, 2],
+        "independent legacy work cannot bypass current-owner backoff: {failed_attempts:?}"
     );
     server.verify().await;
 }

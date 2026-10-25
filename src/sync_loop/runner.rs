@@ -511,7 +511,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     );
 
     let shutdown_token = shutdown::install_signal_handler(sd_notifier, config.ui.personality_mode)?;
-    photos_service.replay_catalog(&shutdown_token).await?;
     if shutdown_token.is_cancelled() {
         return Ok(());
     }

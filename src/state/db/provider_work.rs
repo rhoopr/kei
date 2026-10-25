@@ -20,7 +20,7 @@ const MAX_RETRY_SECONDS: i64 = 24 * INITIAL_RETRY_SECONDS;
 
 // Bare historical catalog observations are not new v27 work. Only explicit
 // retained deferred admissions/retries retain this legacy hydration route.
-const DUE_SOURCE_SQL: &str = "SELECT c.page_id,c.ordinal FROM provider_catalog_records c JOIN provider_shadow_pages p ON p.id=c.page_id JOIN provider_catalog_pages projected ON projected.page_id=c.page_id AND projected.projector_version=1 AND projected.body_hash=p.body_hash WHERE p.scope=?1 AND c.kind='asset' AND c.deleted=0 AND (EXISTS(SELECT 1 FROM provider_work_receipts retained WHERE retained.page_id=c.page_id AND retained.ordinal=c.ordinal AND retained.config_hash=?2 AND retained.scope=?1 AND retained.state='deferred') OR EXISTS(SELECT 1 FROM provider_work_retries retained WHERE retained.page_id=c.page_id AND retained.ordinal=c.ordinal AND retained.config_hash=?2)) AND NOT EXISTS(SELECT 1 FROM provider_work_receipts w WHERE w.page_id=c.page_id AND w.ordinal=c.ordinal AND w.config_hash=?2 AND w.state='admitted') AND NOT EXISTS(SELECT 1 FROM provider_work_retries r WHERE r.page_id=c.page_id AND r.ordinal=c.ordinal AND r.config_hash=?2 AND r.next_retry_at>?3)";
+const DUE_SOURCE_SQL: &str = "SELECT c.page_id,c.ordinal FROM provider_catalog_records c JOIN provider_shadow_pages p ON p.id=c.page_id WHERE p.scope=?1 AND c.kind='asset' AND c.deleted=0 AND (EXISTS(SELECT 1 FROM provider_work_receipts retained WHERE retained.page_id=c.page_id AND retained.ordinal=c.ordinal AND retained.config_hash=?2 AND retained.scope=?1 AND retained.state='deferred') OR EXISTS(SELECT 1 FROM provider_work_retries retained WHERE retained.page_id=c.page_id AND retained.ordinal=c.ordinal AND retained.config_hash=?2)) AND NOT EXISTS(SELECT 1 FROM provider_work_receipts w WHERE w.page_id=c.page_id AND w.ordinal=c.ordinal AND w.config_hash=?2 AND w.state='admitted') AND NOT EXISTS(SELECT 1 FROM provider_work_retries r WHERE r.page_id=c.page_id AND r.ordinal=c.ordinal AND r.config_hash=?2 AND r.next_retry_at>?3)";
 
 const MAX_WORK_PLAN_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -163,6 +163,31 @@ impl SqliteStateDb {
         }).await
     }
 
+    /// The same due hydration owners as admission, before projection validation.
+    /// IDs only: read and validate response bodies one at a time.
+    pub(crate) async fn due_work_pages(
+        &self,
+        owner: account::AccountOwner,
+        scope: String,
+        config_hash: String,
+        limit: u32,
+    ) -> Result<Vec<super::provider_inbox::CapturedPageId>, StateError> {
+        self.with_conn("reading due retained projection owners", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let sql = format!(
+                "SELECT DISTINCT page_id FROM ({DUE_SOURCE_SQL}) ORDER BY page_id LIMIT ?4"
+            );
+            Ok(conn
+                .prepare(&sql)?
+                .query_map(
+                    params![scope, config_hash, Utc::now().timestamp(), limit],
+                    |row| Ok(super::provider_inbox::CapturedPageId(row.get(0)?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
     pub(crate) async fn next_work_source(
         &self,
         owner: account::AccountOwner,
@@ -176,7 +201,7 @@ impl SqliteStateDb {
             // scan position. A due early source cannot hide behind a growing tail.
             let id: Option<(i64, i64)> = tx
                 .query_row(
-                    &format!("{DUE_SOURCE_SQL} ORDER BY c.page_id,c.ordinal LIMIT 1"),
+                    &format!("{DUE_SOURCE_SQL} AND EXISTS(SELECT 1 FROM provider_catalog_pages projected WHERE projected.page_id=c.page_id AND projected.projector_version=1 AND projected.body_hash=p.body_hash) ORDER BY c.page_id,c.ordinal LIMIT 1"),
                     params![scope, config_hash, Utc::now().timestamp()],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )

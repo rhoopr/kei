@@ -34,6 +34,7 @@ pub(crate) struct CatalogPlan {
 }
 
 impl SqliteStateDb {
+    #[cfg(test)]
     pub(crate) async fn next_catalog_source(
         &self,
         owner: account::AccountOwner,
@@ -62,7 +63,6 @@ impl SqliteStateDb {
         }).await
     }
 
-    #[cfg(test)]
     pub(crate) async fn catalog_source(
         &self,
         owner: account::AccountOwner,

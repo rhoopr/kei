@@ -326,7 +326,7 @@ pub(crate) struct SelectionRun {
     pub(crate) held: AtomicBool,
     pub(crate) session_expired: AtomicBool,
     fresh_confirmation: bool,
-    retained_retry: bool,
+    pub(in crate::download) retained_retry: bool,
     retry_sources: Arc<std::sync::Mutex<SelectionRetrySources>>,
 }
 

@@ -587,6 +587,11 @@ pub trait DownloadStateStore: Send + Sync {
         error: &str,
     ) -> Result<(), StateError>;
     async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError>;
+    /// Pending asset-ledger owners not scheduled by the active destination ledger.
+    async fn get_pending_retry_candidates(&self) -> Result<Vec<AssetRecord>, StateError> {
+        self.get_pending().await
+    }
+
     /// Return live policy-excluded identities for targeted deletion revalidation.
     ///
     /// These identities are not actionable retry work. Callers must not plan
