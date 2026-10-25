@@ -81,8 +81,8 @@ impl SqliteStateDb {
             }
 
             conn.execute(
-                "INSERT INTO metadata (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                rusqlite::params![key, value],
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = CASE WHEN ?3 AND metadata.value=?4 THEN metadata.value ELSE excluded.value END",
+                rusqlite::params![key, value, key.starts_with(crate::state::UNRESOLVED_IDENTITY_PREFIX) && value == "1", crate::state::UNACCOUNTED_CURRENT_IDENTITY],
             )
             .map_err(|e| StateError::query("set_metadata", e))?;
 
@@ -146,6 +146,19 @@ impl SqliteStateDb {
                         &tx,
                         library,
                         transition.legacy_config_hash.as_deref(),
+                    )?;
+                }
+            }
+            // Recheck current obligations inside the token transaction. Historical
+            // evidence stays stored; no marker deletion certifies it.
+            for (key, _) in &transition.metadata_updates {
+                if crate::sync_cycle::is_current_zone_checkpoint(key)
+                    && let Some(library) = super::legacy_preservation::checkpoint_library(key)
+                {
+                    sparse_identity::clear_current_proven(
+                        &tx,
+                        library,
+                        &transition.sparse_identity_proofs,
                     )?;
                 }
             }

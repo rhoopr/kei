@@ -101,6 +101,7 @@ pub(crate) struct SparseIdentity {
     pub(crate) observed: SparseEvidence,
     pub(crate) lookup: Option<SparseEvidence>,
     pub(crate) generation: SparseGeneration,
+    pub(crate) origin: Option<String>,
     pub(crate) first_seen: DateTime<Utc>,
     pub(crate) last_attempt: Option<DateTime<Utc>>,
     pub(crate) next_retry: Option<DateTime<Utc>>,
@@ -108,6 +109,17 @@ pub(crate) struct SparseIdentity {
 }
 
 impl SparseIdentity {
+    pub(crate) fn matches_scope(&self, scope: &str) -> bool {
+        match self.origin.as_deref() {
+            None | Some("historical-v1") => true,
+            Some(encoded) => serde_json::from_str::<(String, String)>(encoded)
+                .is_ok_and(|(kind, stored)| kind == "current-v1" && stored == scope),
+        }
+    }
+
+    pub(crate) fn is_historical(&self) -> bool {
+        self.origin.as_deref() == Some("historical-v1")
+    }
     pub(crate) fn proof(&self) -> SparseIdentityProof {
         SparseIdentityProof {
             library: self.library.clone(),
@@ -191,6 +203,20 @@ pub(crate) trait SparseIdentityStore: Send + Sync {
         evidence: &SparseEvidence,
         now: DateTime<Utc>,
     ) -> Result<SparseIdentity, StateError>;
+    async fn observe_current_sparse_identity(
+        &self,
+        library: &str,
+        source: &SparseSourceId,
+        evidence: &SparseEvidence,
+        scope: &str,
+        now: DateTime<Utc>,
+    ) -> Result<SparseIdentity, StateError> {
+        // An adapter without atomic scope admission must not return a retained
+        // historical row as though it had accepted a current observation.
+        let _ = (library, source, evidence, scope, now);
+        Err(invariant("current sparse admission unavailable"))
+    }
+
     async fn record_sparse_attempt(
         &self,
         identity: &SparseIdentity,
@@ -236,7 +262,7 @@ fn read_rows(
     library: &str,
     source: Option<&str>,
 ) -> Result<Vec<SparseIdentity>, StateError> {
-    let mut stmt = conn.prepare("SELECT source_record_name, original_evidence, observed_evidence, lookup_evidence, generation, first_seen_at, next_retry_at, last_attempt_at, last_outcome FROM unresolved_sparse_identities WHERE library=?1 AND (?2 IS NULL OR source_record_name=?2) ORDER BY COALESCE(next_retry_at, first_seen_at), source_record_name")?;
+    let mut stmt = conn.prepare("SELECT source_record_name, original_evidence, observed_evidence, lookup_evidence, generation, first_seen_at, next_retry_at, last_attempt_at, last_outcome, observation_origin FROM unresolved_sparse_identities WHERE library=?1 AND (?2 IS NULL OR source_record_name=?2) ORDER BY COALESCE(next_retry_at, first_seen_at), source_record_name")?;
     let rows = stmt.query_map(params![library, source], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -248,11 +274,24 @@ fn read_rows(
             row.get::<_, Option<i64>>(6)?,
             row.get::<_, Option<i64>>(7)?,
             row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
         ))
     })?;
     let mut identities = Vec::new();
     for row in rows {
-        let (source, original, observed, lookup, generation, first, next, last, outcome) = row?;
+        let (source, original, observed, lookup, generation, first, next, last, outcome, origin) =
+            row?;
+        if let Some(encoded) = origin
+            .as_deref()
+            .filter(|origin| *origin != "historical-v1")
+        {
+            let (kind, scope): (String, String) = serde_json::from_str(encoded)
+                .map_err(|_invalid_origin| invariant("invalid sparse observation origin"))?;
+            if kind != "current-v1" {
+                return Err(invariant("unsupported sparse observation origin"));
+            }
+            validate_current_scope(conn, library, &scope)?;
+        }
         if source.trim().is_empty() || generation < 1 {
             return Err(invariant("invalid sparse identity row"));
         }
@@ -271,6 +310,7 @@ fn read_rows(
             observed: SparseEvidence::new(observed),
             lookup: lookup.map(SparseEvidence::new),
             generation: SparseGeneration(generation),
+            origin,
             first_seen,
             last_attempt: last
                 .map(|stamp| {
@@ -283,6 +323,81 @@ fn read_rows(
         });
     }
     Ok(identities)
+}
+
+fn validate_current_scope(conn: &Connection, library: &str, scope: &str) -> Result<(), StateError> {
+    let parsed: serde_json::Value = serde_json::from_str(scope)
+        .map_err(|_invalid_scope| invariant("invalid sparse observation scope"))?;
+    if parsed
+        .pointer("/zone/zoneName")
+        .and_then(serde_json::Value::as_str)
+        != Some(library)
+        || parsed
+            .pointer("/zone/ownerRecordName")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|s| s.trim().is_empty())
+        || !matches!(
+            parsed.get("database").and_then(serde_json::Value::as_str),
+            Some("private" | "shared")
+        )
+    {
+        return Err(invariant("invalid sparse observation scope"));
+    }
+    let owned: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM account_owner WHERE singleton=1)",
+        [],
+        |r| r.get(0),
+    )?;
+    if !owned {
+        return Err(invariant("sparse observation needs an owned account"));
+    }
+    super::provider_generations::guard_library_scope(conn, scope, library)
+}
+
+impl SqliteStateDb {
+    async fn observe_sparse_with_origin(
+        &self,
+        library: &str,
+        source: &SparseSourceId,
+        evidence: &SparseEvidence,
+        scope: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<SparseIdentity, StateError> {
+        let (library, source, evidence) = (library.to_owned(), source.clone(), evidence.clone());
+        self.with_conn_mut("observe_sparse_identity", move |conn| {
+            // Acquire the writer slot before reading generation evidence so
+            // another WAL writer cannot invalidate a deferred read snapshot.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(scope) = scope.as_deref() {
+                validate_current_scope(&tx, &library, scope)?;
+                tx.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES (?1,?2)",
+                    params![format!("download_ledger_scope:{library}"),scope])?;
+            }
+            if source.as_str().trim().is_empty() {
+                if scope.is_some() {
+                    tx.execute("INSERT INTO metadata(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        params![crate::state::unresolved_identity_key(&library),crate::state::UNACCOUNTED_CURRENT_IDENTITY])?;
+                    tx.commit()?;
+                }
+                return Err(invariant("empty sparse source identity"));
+            }
+            let origin = scope.as_ref().map(|scope| serde_json::json!(["current-v1",scope]).to_string());
+            let generation = next_generation(&tx)?;
+            tx.execute("INSERT INTO unresolved_sparse_identities (library, source_record_name, original_evidence, observed_evidence, generation, first_seen_at) VALUES (?1,?2,?3,?3,?5,?4) ON CONFLICT(library,source_record_name) DO UPDATE SET observed_evidence=excluded.observed_evidence, generation=excluded.generation, attempts=0, next_retry_at=NULL, last_outcome=NULL WHERE observed_evidence <> excluded.observed_evidence", params![library, source.as_str(), evidence.as_str(), now.timestamp(), generation])?;
+            if let Some(origin) = &origin {
+                tx.execute("UPDATE unresolved_sparse_identities SET observation_origin=?3,generation=?4 WHERE library=?1 AND source_record_name=?2 AND observation_origin IS NOT ?3",
+                    params![library,source.as_str(),origin,generation])?;
+            }
+            tx.execute("INSERT INTO metadata (key,value) VALUES (?1,'1') ON CONFLICT(key) DO UPDATE SET value=CASE WHEN metadata.value=?2 THEN metadata.value ELSE '1' END", params![crate::state::unresolved_identity_key(&library),crate::state::UNACCOUNTED_CURRENT_IDENTITY])?;
+            let row = read_rows(&tx, &library, Some(source.as_str()))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| invariant("sparse observation was not retained"))?;
+            tx.commit()?;
+            Ok(row)
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -315,25 +430,20 @@ impl SparseIdentityStore for SqliteStateDb {
         evidence: &SparseEvidence,
         now: DateTime<Utc>,
     ) -> Result<SparseIdentity, StateError> {
-        let (library, source, evidence) = (library.to_owned(), source.clone(), evidence.clone());
-        self.with_conn_mut("observe_sparse_identity", move |conn| {
-            if source.as_str().trim().is_empty() {
-                return Err(invariant("empty sparse source identity"));
-            }
-            // Acquire the writer slot before reading generation evidence so
-            // another WAL writer cannot invalidate a deferred read snapshot.
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let generation = next_generation(&tx)?;
-            tx.execute("INSERT INTO unresolved_sparse_identities (library, source_record_name, original_evidence, observed_evidence, generation, first_seen_at) VALUES (?1,?2,?3,?3,?5,?4) ON CONFLICT(library,source_record_name) DO UPDATE SET observed_evidence=excluded.observed_evidence, generation=excluded.generation, attempts=0, next_retry_at=NULL, last_outcome=NULL WHERE observed_evidence <> excluded.observed_evidence", params![library, source.as_str(), evidence.as_str(), now.timestamp(), generation])?;
-            tx.execute("INSERT INTO metadata (key,value) VALUES (?1,'1') ON CONFLICT(key) DO UPDATE SET value='1'", [crate::state::unresolved_identity_key(&library)])?;
-            let row = read_rows(&tx, &library, Some(source.as_str()))?
-                .into_iter()
-                .next()
-                .ok_or_else(|| invariant("sparse observation was not retained"))?;
-            tx.commit()?;
-            Ok(row)
-        })
-        .await
+        self.observe_sparse_with_origin(library, source, evidence, None, now)
+            .await
+    }
+
+    async fn observe_current_sparse_identity(
+        &self,
+        library: &str,
+        source: &SparseSourceId,
+        evidence: &SparseEvidence,
+        scope: &str,
+        now: DateTime<Utc>,
+    ) -> Result<SparseIdentity, StateError> {
+        self.observe_sparse_with_origin(library, source, evidence, Some(scope.to_owned()), now)
+            .await
     }
 
     async fn record_sparse_attempt(
@@ -464,7 +574,45 @@ pub(super) fn clear_proven(
     library: &str,
     proofs: &[SparseIdentityProof],
 ) -> Result<(), StateError> {
-    for identity in read_rows(tx, library, None)? {
+    clear_selected(tx, library, proofs, false)
+}
+
+pub(super) fn clear_current_proven(
+    tx: &Transaction<'_>,
+    library: &str,
+    proofs: &[SparseIdentityProof],
+) -> Result<(), StateError> {
+    clear_selected(tx, library, proofs, true)
+}
+
+fn clear_selected(
+    tx: &Transaction<'_>,
+    library: &str,
+    proofs: &[SparseIdentityProof],
+    preserve_history: bool,
+) -> Result<(), StateError> {
+    let rows = read_rows(tx, library, None)?;
+    let marker: Option<String> = tx
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [crate::state::unresolved_identity_key(library)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if marker.as_deref() == Some(crate::state::UNACCOUNTED_CURRENT_IDENTITY) {
+        return Err(invariant(
+            "current sparse observation has no usable source identity",
+        ));
+    }
+    if preserve_history && marker.is_some() && rows.is_empty() {
+        return Err(invariant("unattributed sparse marker has no current proof"));
+    }
+    let mut resolved = Vec::new();
+    for identity in rows {
+        if preserve_history && identity.is_historical() {
+            continue;
+        }
+
         let current = identity.proof();
         let proof = proofs
             .iter()
@@ -486,11 +634,27 @@ pub(super) fn clear_proven(
                 .as_ref()
                 .ok_or_else(|| invariant("sparse target file proof missing"))?()?;
         }
+        resolved.push(identity.source);
     }
-    tx.execute(
-        "DELETE FROM unresolved_sparse_identities WHERE library=?1",
-        [library],
-    )?;
+    for source in resolved {
+        tx.execute(
+            "DELETE FROM unresolved_sparse_identities WHERE library=?1 AND source_record_name=?2",
+            params![library, source.as_str()],
+        )?;
+    }
+    if preserve_history {
+        let retained: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM unresolved_sparse_identities WHERE library=?1)",
+            [library],
+            |r| r.get(0),
+        )?;
+        if !retained {
+            tx.execute(
+                "DELETE FROM metadata WHERE key=?1",
+                [crate::state::unresolved_identity_key(library)],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -1019,3 +1183,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod origin_tests;

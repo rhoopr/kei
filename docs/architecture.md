@@ -2570,3 +2570,40 @@ resource/path advance together, including completed destinations in otherwise
 unfinished roots. Pending destinations are unchanged. Old aggregate seals must
 validate before the handoff and remain identical afterward; receipt
 acknowledgement cannot re-seal damaged inventory.
+
+
+### Sparse observations across the v27 upgrade
+
+Sparse identity evidence remains in the existing retry table. Schema38 records
+whether a row is validated pre-epoch history or a current observed obligation.
+Unmarked development state and malformed evidence remain blocking. Historical
+rows are preserved, not certified, reassigned or deleted when the new baseline
+completes. Transfers, publication journals and prepared operations retain their
+independent ownership and recovery requirements.
+
+Every actual source observation promotes retained history atomically, including
+an asset-only response or identical evidence. Current obligations survive omitted
+responses and configuration changes. Checkpoint publication validates remaining
+current/unknown rows and generation-fenced resolution proofs in its transaction.
+Historical rows and their diagnostic marker may remain after current progress.
+Full account/database/zone scope remains fenced through the owned database and
+the existing download-ledger scope key.
+
+Supported stock upgrades cross schema37 and the origin marker in one savepoint.
+Existing schema37 databases cannot prove pre-epoch origin and remain conservative.
+Older binaries reject the new schema; rollback requires a consistent pre-upgrade
+state snapshot and matching binary, never manually lowering the schema version.
+
+
+An unresolved current CPLAsset with a usable source ID is admitted before lookup.
+The provider-owned V2 source-only encoding authorizes retrying that source in its
+original scope; it supplies no linked-target, content, ownership or completion
+proof. Existing stronger evidence is retained. An unusable source ID records a
+scoped unaccounted hold in the existing unresolved marker, which ordinary marker
+updates cannot clear. Such input remains an explicit incomplete run rather than
+a certified backup.
+
+Configuration reconciliation passes validated sparse proofs into its staged
+checkpoint transaction as well as final activation. Retirement and the durable
+pending cursor therefore commit together; activation still checks configuration,
+cursor fences and any newly observed obligation.

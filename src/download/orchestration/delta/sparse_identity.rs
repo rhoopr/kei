@@ -58,7 +58,16 @@ impl SparseRetryContext {
             .iter()
             .map(|event| event.record_name.clone())
             .collect();
-        for row in rows {
+        let current_scope = config
+            .selection_context
+            .as_ref()
+            .and_then(|c| c.current_sparse_scope());
+        for mut row in rows {
+            if current_scope.is_some_and(|scope| !row.matches_scope(scope)) {
+                state_failure(summary);
+                continue;
+            }
+
             if SparseShareEvidence::from_durable_key(&row.original).is_none()
                 || SparseShareEvidence::from_durable_key(&row.observed).is_none()
                 || row
@@ -68,6 +77,30 @@ impl SparseRetryContext {
             {
                 state_failure(summary);
                 continue;
+            }
+            if current_scope.is_some() && row.is_historical() && !seen.contains(row.source.as_str())
+            {
+                continue;
+            }
+            // Every actual source observation promotes retained history, even an
+            // asset-only or deleted record with no usable new sparse evidence.
+            if let Some(scope) = current_scope.filter(|_| seen.contains(row.source.as_str())) {
+                match db
+                    .observe_current_sparse_identity(
+                        &config.library,
+                        &row.source,
+                        &row.observed,
+                        scope,
+                        chrono::Utc::now(),
+                    )
+                    .await
+                {
+                    Ok(current) => row = current,
+                    Err(_) => {
+                        state_failure(summary);
+                        continue;
+                    }
+                }
             }
             if !seen.contains(row.source.as_str()) {
                 events.push(ChangeEvent {
@@ -96,25 +129,38 @@ impl SparseRetryContext {
             {
                 continue;
             }
+            let source = SparseSourceId::new(&event.record_name);
             let Some(key) = event
                 .sparse_share
                 .as_ref()
                 .and_then(SparseShareEvidence::durable_key)
+                .or_else(|| {
+                    current_scope
+                        .and_then(|_| context.rows.get(&source).map(|row| row.observed.clone()))
+                })
+                .or_else(|| {
+                    current_scope.and_then(|_| SparseShareEvidence::SourceOnly.durable_key())
+                })
             else {
                 continue;
             };
-            let source = SparseSourceId::new(&event.record_name);
-            if context
-                .rows
-                .get(&source)
-                .is_some_and(|row| row.observed == key)
+            if current_scope.is_none()
+                && context
+                    .rows
+                    .get(&source)
+                    .is_some_and(|row| row.observed == key)
             {
                 continue;
             }
-            match db
-                .observe_sparse_identity(&config.library, &source, &key, now)
-                .await
-            {
+            let observed =
+                if let Some(scope) = current_scope.filter(|_| seen.contains(source.as_str())) {
+                    db.observe_current_sparse_identity(&config.library, &source, &key, scope, now)
+                        .await
+                } else {
+                    db.observe_sparse_identity(&config.library, &source, &key, now)
+                        .await
+                };
+            match observed {
                 Ok(row) => {
                     context.rows.insert(source, row);
                 }
@@ -282,10 +328,18 @@ impl SparseRetryContext {
         if !self.rows.contains_key(&source)
             && let SparseAttemptOutcome::Unresolved(key) = &outcome
         {
-            match db
-                .observe_sparse_identity(&config.library, &source, key, now)
-                .await
+            let observed = if let Some(scope) = config
+                .selection_context
+                .as_ref()
+                .and_then(|c| c.current_sparse_scope())
             {
+                db.observe_current_sparse_identity(&config.library, &source, key, scope, now)
+                    .await
+            } else {
+                db.observe_sparse_identity(&config.library, &source, key, now)
+                    .await
+            };
+            match observed {
                 Ok(row) => {
                     self.rows.insert(source.clone(), row);
                 }

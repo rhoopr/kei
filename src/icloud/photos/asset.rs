@@ -49,6 +49,9 @@ pub(crate) enum MalformedRequiredAssetField {
 /// Sparse-share metadata is evidence, not a resolved master or deletion proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SparseShareEvidence {
+    /// Only the scoped source ID is known. This authorizes source lookup, never
+    /// linked-target lookup, file reuse, or completion.
+    SourceOnly,
     /// A sparse marker and structurally valid share link. The target is unverified.
     Linked(SparseShareLink),
     /// Share metadata was present but its marker, field types, or link was invalid.
@@ -144,6 +147,11 @@ impl SparseShareEvidence {
     }
 
     pub(crate) fn durable_key(&self) -> Option<crate::state::SparseEvidence> {
+        if matches!(self, Self::SourceOnly) {
+            return Some(crate::state::SparseEvidence::new(
+                r#"[2,"source_only"]"#.into(),
+            ));
+        }
         let Self::Linked(link) = self else {
             return None;
         };
@@ -159,6 +167,11 @@ impl SparseShareEvidence {
     }
 
     pub(crate) fn from_durable_key(key: &crate::state::SparseEvidence) -> Option<Self> {
+        if serde_json::from_str::<(u8, String)>(key.as_str())
+            .is_ok_and(|(version, kind)| version == 2 && kind == "source_only")
+        {
+            return Some(Self::SourceOnly);
+        }
         let (version, record, zone, owner): (u8, String, String, String) =
             serde_json::from_str(key.as_str()).ok()?;
         if version != 1
@@ -177,6 +190,7 @@ impl SparseShareEvidence {
 
     pub(crate) const fn diagnostic(&self) -> &'static str {
         match self {
+            Self::SourceOnly => "asset_identity_unresolved",
             Self::Linked(_) => "sparse_share_reference_unresolved",
             Self::Malformed => "sparse_share_reference_malformed",
         }
@@ -3554,5 +3568,31 @@ mod tests {
             deleted: None,
         };
         assert_eq!(classify_change_reason(&record), ChangeReason::Created);
+    }
+}
+
+#[cfg(test)]
+mod source_only_retry_tests {
+    use super::SparseShareEvidence;
+    use crate::state::SparseEvidence;
+
+    #[test]
+    fn source_only_retry_encoding_is_versioned_and_not_a_target_link() {
+        let key = SparseShareEvidence::SourceOnly.durable_key().unwrap();
+        assert_eq!(
+            SparseShareEvidence::from_durable_key(&key),
+            Some(SparseShareEvidence::SourceOnly)
+        );
+        for bad in [
+            r#"[2]"#,
+            r#"[2,"linked"]"#,
+            r#"[3,"source_only"]"#,
+            r#"[2,"source_only","extra"]"#,
+            "null",
+        ] {
+            assert!(
+                SparseShareEvidence::from_durable_key(&SparseEvidence::new(bad.into())).is_none()
+            );
+        }
     }
 }

@@ -340,6 +340,9 @@ pub(crate) struct SelectionRun {
 }
 
 impl SelectionContext {
+    pub(super) fn current_sparse_scope(&self) -> Option<&str> {
+        (self.format == 2).then_some(self.scope.as_str())
+    }
     pub(super) fn uses_download_ledger(&self) -> bool {
         self.format == 2
     }

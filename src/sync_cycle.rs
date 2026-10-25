@@ -57,6 +57,22 @@ const LAST_FULL_ENUMERATION_REASON_KEY: &str = "last_full_enumeration_reason";
 pub(crate) const SYNC_TOKEN_PREFIX: &str = "sync_token:v27:";
 
 /// Current observed-work checkpoints do not certify historical attribution.
+async fn sparse_identity_holds_current(
+    db: &dyn download::DownloadStore,
+    library: &str,
+    current_epoch: bool,
+) -> Result<bool, state::error::StateError> {
+    let marker = db
+        .get_metadata(&state::unresolved_identity_key(library))
+        .await?;
+    let marked = marker.is_some();
+    if !current_epoch || marker.as_deref() == Some(state::UNACCOUNTED_CURRENT_IDENTITY) {
+        return Ok(marked);
+    }
+    let rows = db.sparse_identities(library).await?;
+    Ok((marked && rows.is_empty()) || rows.iter().any(|row| !row.is_historical()))
+}
+
 pub(crate) fn is_current_zone_checkpoint(key: &str) -> bool {
     key.starts_with(SYNC_TOKEN_PREFIX) || key.starts_with(PENDING_ZONE_TOKEN_PREFIX)
 }
@@ -1554,9 +1570,12 @@ pub(crate) async fn run_cycle(
         // that inventory was running. Only the bridged token may replace the
         // active checkpoint.
         let unresolved_identity = if let Some(db) = state_db {
-            db.get_metadata(&state::unresolved_identity_key(&lib_state.zone_name))
-                .await?
-                .is_some()
+            sparse_identity_holds_current(
+                db,
+                &lib_state.zone_name,
+                is_current_zone_checkpoint(&lib_state.sync_token_key),
+            )
+            .await?
         } else {
             false
         };
@@ -2077,7 +2096,10 @@ pub(crate) async fn run_cycle(
                                 expected_metadata: zone_metadata_fence.clone(),
                                 legacy_preservation_proofs: legacy_proofs,
                                 legacy_config_hash: preservation_config_hash.clone(),
-                                sparse_identity_proofs: Vec::new(),
+                                sparse_identity_proofs: sync_result
+                                    .checkpoint
+                                    .sparse_identity_proofs
+                                    .clone(),
                                 metadata_updates: vec![(candidate_key, token)],
                                 metadata_deletes: vec![
                                     retained_checkpoint_hold_key(&lib_state.zone_name),
@@ -2128,14 +2150,20 @@ pub(crate) async fn run_cycle(
                                     .sparse_identity_proofs
                                     .clone(),
                                 metadata_updates,
-                                metadata_deletes: vec![
+                                metadata_deletes: [(!is_current_zone_checkpoint(
+                                    &lib_state.sync_token_key,
+                                ))
+                                .then(|| state::unresolved_identity_key(&lib_state.zone_name))]
+                                .into_iter()
+                                .flatten()
+                                .chain(vec![
                                     baseline_key.clone(),
-                                    state::unresolved_identity_key(&lib_state.zone_name),
                                     retained_checkpoint_hold_key(&lib_state.zone_name),
                                     indexing_key.clone(),
                                     replay_key.clone(),
                                     materialization_key.clone(),
-                                ],
+                                ])
+                                .collect(),
                             })
                             .await
                         {
@@ -2344,7 +2372,9 @@ pub(crate) async fn run_cycle(
                 active_cursor_fences.push((candidate_key.clone(), Some(token.clone())));
                 metadata_updates.push((lib_state.sync_token_key.clone(), token));
                 metadata_deletes.push(candidate_key);
-                metadata_deletes.push(state::unresolved_identity_key(&lib_state.zone_name));
+                if !is_current_zone_checkpoint(&lib_state.sync_token_key) {
+                    metadata_deletes.push(state::unresolved_identity_key(&lib_state.zone_name));
+                }
                 metadata_deletes.push(indexing_reconciliation_key(&lib_state.zone_name));
                 metadata_deletes.push(indexing_replay_key(&lib_state.zone_name));
                 metadata_deletes.push(indexing_materialization_key(&lib_state.zone_name));
@@ -2404,7 +2434,20 @@ pub(crate) async fn run_cycle(
 
     if let Some(db) = state_db {
         let summary = db.get_summary().await?;
-        if summary.unresolved_identity_zones > 0 {
+        let mut current_identity_hold = false;
+        for library in library_states
+            .iter()
+            .copied()
+            .filter(|library| has_active_passes(library))
+        {
+            current_identity_hold |= sparse_identity_holds_current(
+                db,
+                &library.zone_name,
+                is_current_zone_checkpoint(&library.sync_token_key),
+            )
+            .await?;
+        }
+        if current_identity_hold {
             download::block_sync_token_for_unresolved_identity(&mut cycle_stats);
             cycle_failed_count = cycle_failed_count.max(1);
             db_sync_token_advance_safe = false;

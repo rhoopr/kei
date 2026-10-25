@@ -754,6 +754,24 @@ impl crate::state::SparseIdentityStore for FailingMetadataSetDb {
             .observe_sparse_identity(library, source, evidence, now)
             .await
     }
+    async fn observe_current_sparse_identity(
+        &self,
+        library: &str,
+        source: &crate::state::SparseSourceId,
+        evidence: &crate::state::SparseEvidence,
+        scope: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::state::SparseIdentity, crate::state::error::StateError> {
+        if self
+            .failure
+            .matches(&state::unresolved_identity_key(library))
+        {
+            return Err(state::error::StateError::LockPoisoned(self.message.into()));
+        }
+        self.inner
+            .observe_current_sparse_identity(library, source, evidence, scope, now)
+            .await
+    }
     async fn record_sparse_attempt(
         &self,
         identity: &crate::state::SparseIdentity,

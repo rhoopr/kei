@@ -24,6 +24,9 @@ struct Session {
     unresolved: bool,
     observed_historical: bool,
     omit_after_first: bool,
+    plain_source: bool,
+    resolve_source: bool,
+    unrepresented: bool,
     inventories: Arc<AtomicUsize>,
     omissions: Arc<AtomicUsize>,
 }
@@ -88,9 +91,14 @@ impl PhotosSession for Session {
         }
         if url.contains("/changes/zone?") {
             assert_eq!(request["zones"][0]["zoneID"], zone());
-            let records = if self.observed_historical
+            let records = if self.resolve_source && self.cycle == 2 {
+                vec![
+                    json!({"recordName":"historical-source","recordType":null,"deleted":true,"recordChangeTag":"deleted-current"}),
+                ]
+            } else if self.observed_historical
                 && self.cycle > 0
                 && (!self.omit_after_first || self.cycle == 1)
+                && (!self.resolve_source || self.cycle == 1)
             {
                 let mut record = crate::test_helpers::sparse_shared_asset_record();
                 record["recordName"] = json!("historical-source");
@@ -98,6 +106,15 @@ impl PhotosSession for Session {
                 record["fields"]["linkedShareZoneName"]["value"] = json!("SharedSync-absent");
                 record["fields"]["linkedShareZoneOwner"]["value"]["recordName"] =
                     json!("historical-owner");
+                if self.plain_source {
+                    record = json!({"recordName":"historical-source","recordType":"CPLAsset","fields":{}});
+                }
+                if self.unrepresented {
+                    record["recordName"] = json!("new-unrepresented-source");
+                    if !self.plain_source {
+                        record["fields"]["linkedShareRecordName"]["value"] = json!(42);
+                    }
+                }
                 vec![record]
             } else {
                 Vec::new()
@@ -114,31 +131,50 @@ impl PhotosSession for Session {
 
 #[tokio::test]
 async fn v027_date_expansion_downloads_new_selection_then_two_quiet_reopens() {
-    expansion(false, false, false, false).await;
+    expansion(false, false, false, false, false, false, false).await;
 }
 #[tokio::test]
 async fn v027_date_expansion_unconfirmed_identity_holds_then_recovers() {
-    expansion(true, false, false, false).await;
+    expansion(true, false, false, false, false, false, false).await;
 }
 #[tokio::test]
-#[ignore = "known blocker: historical sparse obligations lack durable origin separation; do not bypass current replay safety"]
 async fn v027_date_expansion_preserves_historical_uncertainty_without_global_hold() {
-    expansion(false, true, false, false).await;
+    expansion(false, true, false, false, false, false, false).await;
 }
 
 #[tokio::test]
 async fn v027_current_sparse_source_observed_again_holds_current_cursor() {
-    expansion(false, false, true, false).await;
+    expansion(false, false, true, false, false, false, false).await;
 }
 #[tokio::test]
 async fn v027_current_sparse_source_omitted_on_replay_stays_pending() {
-    expansion(false, false, true, true).await;
+    expansion(false, false, true, true, false, false, false).await;
+}
+#[tokio::test]
+async fn v027_historical_asset_only_observation_then_omission_retains_current_work() {
+    expansion(false, true, true, true, true, false, false).await;
+}
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn v027_mixed_history_current_deletion_resolves_then_reopens_quietly() {
+    expansion(false, true, true, true, true, true, false).await;
+}
+#[tokio::test]
+async fn v027_new_plain_source_with_unrelated_history_survives_omitted_reopen() {
+    expansion(false, true, true, true, true, false, true).await;
+}
+#[tokio::test]
+async fn v027_malformed_new_source_with_history_survives_omitted_reopen() {
+    expansion(false, true, true, true, false, false, true).await;
 }
 async fn expansion(
     unavailable: bool,
     historical: bool,
     observed_historical: bool,
     omit_after_first: bool,
+    plain_source: bool,
+    resolve_source: bool,
+    unrepresented: bool,
 ) {
     let server = crate::start_wiremock_or_skip!();
     for name in ["april", "january"] {
@@ -208,7 +244,33 @@ async fn expansion(
             .unwrap();
         }
         if cycle == 0 && historical {
-            historical_before = db.sparse_identities(ZONE).await.unwrap().into_iter().next();
+            if resolve_source {
+                db.observe_sparse_identity(
+                    ZONE,
+                    &crate::state::SparseSourceId::new("other-history"),
+                    &crate::state::SparseEvidence::new(
+                        r#"[1,"other-child","SharedSync-absent","historical-owner"]"#.into(),
+                    ),
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap();
+            }
+            // Seed the exact output of the separately tested stock migration.
+            // New/unmarked observations are deliberately NOT historical.
+            rusqlite::Connection::open(&database)
+                .unwrap()
+                .execute(
+                    "UPDATE unresolved_sparse_identities SET observation_origin='historical-v1'",
+                    [],
+                )
+                .unwrap();
+            historical_before = db
+                .sparse_identities(ZONE)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|row| row.source.as_str() == "historical-source");
         }
         let prior_cursor = db.get_metadata(&key).await.unwrap();
         let session = Session {
@@ -217,6 +279,9 @@ async fn expansion(
             unresolved: unavailable && cycle == 1,
             observed_historical,
             omit_after_first,
+            plain_source,
+            resolve_source,
+            unrepresented,
             inventories: Arc::new(AtomicUsize::new(0)),
             omissions: Arc::new(AtomicUsize::new(0)),
         };
@@ -275,7 +340,7 @@ async fn expansion(
         }
         assert_eq!(Some(mtime), april_mtime);
         let january = root.join("january.JPG");
-        if observed_historical && cycle > 0 {
+        if observed_historical && cycle > 0 && (!resolve_source || cycle == 1) {
             assert!(!result.can_advance_database_checkpoint(), "{result:?}");
             assert!(
                 result.stats.identity_incomplete,
@@ -336,7 +401,9 @@ async fn expansion(
                 "expanded selection needs current inventory"
             );
         }
-        if !observed_historical && cycle >= if unavailable { 3 } else { 2 } {
+        if (!observed_historical || resolve_source && cycle >= 3)
+            && cycle >= if unavailable { 3 } else { 2 }
+        {
             assert_eq!(
                 session.inventories.load(Ordering::SeqCst),
                 0,
@@ -345,10 +412,39 @@ async fn expansion(
         }
         if historical {
             let rows = db.sparse_identities(ZONE).await.unwrap();
-            assert_eq!(rows.len(), 1);
+            if resolve_source && cycle >= 2 {
+                assert_eq!(rows.len(), 1);
+                assert!(rows[0].is_historical());
+                assert!(rows[0].source.as_str() == "other-history");
+                continue;
+            }
+            assert_eq!(
+                rows.len(),
+                if resolve_source || unrepresented && cycle > 0 {
+                    2
+                } else {
+                    1
+                }
+            );
+            if unrepresented && cycle > 0 {
+                let pending = rows
+                    .iter()
+                    .find(|row| row.source.as_str() == "new-unrepresented-source")
+                    .unwrap();
+                assert!(!pending.is_historical());
+                assert_eq!(pending.original.as_str(), r#"[2,"source_only"]"#);
+            }
             let before = historical_before.as_ref().unwrap();
-            let after = &rows[0];
+            let after = rows
+                .iter()
+                .find(|row| row.source.as_str() == "historical-source")
+                .unwrap();
             assert_eq!(after.library, before.library);
+            if observed_historical && cycle > 0 && !unrepresented {
+                assert!(after.source == before.source && after.original == before.original);
+                assert!(!after.is_historical(), "actual source must promote history");
+                continue;
+            }
             assert!(
                 after.source == before.source
                     && after.original == before.original
@@ -429,6 +525,9 @@ async fn v027_destination_root_replaced_during_transfer_preserves_work_and_reope
             unresolved: false,
             observed_historical: false,
             omit_after_first: false,
+            plain_source: false,
+            resolve_source: false,
+            unrepresented: false,
             inventories: Arc::new(AtomicUsize::new(0)),
             omissions: Arc::new(AtomicUsize::new(0)),
         };
