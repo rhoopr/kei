@@ -543,7 +543,7 @@ async fn download_photos_with_sync_inner(
                         backfill_passes = pass_indices.len(),
                         "Backfilling missing album snapshots before incremental routing"
                     );
-                    download_photos_incremental_with_targeted_album_backfill(
+                    Box::pin(download_photos_incremental_with_targeted_album_backfill(
                         download_client,
                         passes,
                         &config,
@@ -552,7 +552,7 @@ async fn download_photos_with_sync_inner(
                         shutdown_token.clone(),
                         &pass_indices,
                         reason,
-                    )
+                    ))
                     .await
                 }
                 IncrementalRoutingDecision::Safe => {

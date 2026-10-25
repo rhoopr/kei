@@ -802,6 +802,32 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         "Incremental routing phase complete"
     );
 
+    if config.selection_context.is_some() {
+        for (asset, index) in &mut downloadable_assets {
+            let Some(pass) = passes.get(*index) else {
+                continue;
+            };
+            if asset
+                .source_zone()
+                .is_some_and(|source| source != pass.album.zone_name())
+            {
+                match pass
+                    .album
+                    .confirm_delta_membership(asset.clone(), &change_events)
+                    .await
+                {
+                    Ok(confirmed) => *asset = confirmed,
+                    Err(error) => {
+                        delta.summary.auth_errors += usize::from(is_provider_session_error(&error));
+                        delta
+                            .summary
+                            .token_unsafe_reason
+                            .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
+                    }
+                }
+            }
+        }
+    }
     let delta_summary = delta.summary;
     let completed_delta_replay = delta_summary.sync_token.is_some();
     delta_summary.log_debug();

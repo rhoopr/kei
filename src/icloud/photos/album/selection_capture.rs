@@ -105,6 +105,27 @@ pub(crate) fn validated_rank_page(request: &Value, body: &[u8]) -> Result<Value>
 }
 
 impl PhotoAlbum {
+    /// A frozen task may refresh only through its original authenticated source.
+    /// The selecting album still owns its destination and membership policy.
+    pub(crate) fn task_source(&self, zone: &str) -> anyhow::Result<Option<Self>> {
+        if self.zone_name() == zone {
+            return Ok(Some(self.clone()));
+        }
+        let scopes = self.selector_sources()?;
+        if !scopes.iter().any(|(_, _, identity)| {
+            identity.get("zoneName").and_then(serde_json::Value::as_str) == Some(zone)
+        }) {
+            return Ok(None);
+        }
+        let mut sources = self
+            .cross_zone_sources
+            .iter()
+            .filter(|source| source.zone_name() == zone);
+        let source = sources.next();
+        anyhow::ensure!(sources.next().is_none(), "Ambiguous task source");
+        Ok(source.cloned())
+    }
+
     /// Resolve only authenticated sources already attached by album selection.
     /// Duplicate labels with distinct database/owner identities are ambiguous.
     pub(crate) fn publication_scope(
@@ -141,6 +162,33 @@ impl PhotoAlbum {
             }
         }
         Ok(found)
+    }
+
+    pub(crate) fn selector_sources(&self) -> Result<Vec<(ShadowCapture, String, Value)>> {
+        let Some(owner) = self.authenticated_publication_scope()? else {
+            return Ok(Vec::new());
+        };
+        let mut sources = vec![owner.clone()];
+        for source in &self.cross_zone_sources {
+            let candidate = source
+                .authenticated_publication_scope()?
+                .context("Selected source lacks authenticated ownership")?;
+            anyhow::ensure!(
+                owner.0.owner == candidate.0.owner
+                    && std::sync::Arc::ptr_eq(&owner.0.db, &candidate.0.db),
+                "Selected source account mismatch"
+            );
+            anyhow::ensure!(
+                sources.iter().all(|existing| existing.2.get("zoneName")
+                    != candidate.2.get("zoneName")
+                    || (existing.1 == candidate.1 && existing.2 == candidate.2)),
+                "Ambiguous selected source scope"
+            );
+            if !sources.iter().any(|existing| existing.1 == candidate.1) {
+                sources.push(candidate);
+            }
+        }
+        Ok(sources)
     }
 
     /// Scope new download work to the authenticated account and complete

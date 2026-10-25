@@ -199,7 +199,9 @@ pub(super) async fn route_incremental_asset_to_passes(
     let memberships = db
         .get_live_selected_album_memberships_for_asset(
             &config.library,
-            asset.asset_record_name(),
+            asset
+                .selector_child_in_zone(&config.library)
+                .unwrap_or_else(|| asset.asset_record_name()),
             selected_container_ids,
         )
         .await

@@ -15,6 +15,15 @@ pub(crate) struct AccountOwner {
 }
 
 impl AccountOwner {
+    pub(crate) fn authenticated_keys(&self) -> Result<(&str, &str), StateError> {
+        Ok((
+            &self.key,
+            self.provider
+                .as_deref()
+                .ok_or(StateError::AccountIdentityUnavailable)?,
+        ))
+    }
+
     #[must_use]
     pub(crate) fn configured(username: &str, realm: &str) -> Self {
         Self {

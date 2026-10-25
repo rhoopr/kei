@@ -278,6 +278,7 @@ pub struct PhotoAsset {
     asset_record_name: Arc<str>,
     state_record_name: Option<Arc<str>>,
     source_zone: Option<Arc<str>>,
+    selector_membership: Option<Arc<Value>>,
     filename: Option<Box<str>>,
     // Metadata behind Arc so downstream consumers (AssetRecord, the
     // pipeline's metadata-hash comparisons) can share the same
@@ -573,6 +574,7 @@ impl PhotoAsset {
             asset_record_name,
             state_record_name: None,
             source_zone: None,
+            selector_membership: None,
             filename,
             asset_metadata,
             rendition_facts,
@@ -647,6 +649,7 @@ impl PhotoAsset {
             asset_record_name: Arc::from(asset.record_name.as_str()),
             state_record_name: None,
             source_zone,
+            selector_membership: None,
             filename,
             asset_metadata,
             rendition_facts,
@@ -704,6 +707,32 @@ impl PhotoAsset {
     /// Return the CloudKit zone that produced this asset when known.
     pub(crate) fn source_zone(&self) -> Option<&str> {
         self.source_zone.as_deref()
+    }
+
+    pub(crate) fn selector_child_in_zone(&self, zone: &str) -> Option<&str> {
+        let witness = self.selector_membership()?;
+        (witness.get("version").and_then(Value::as_u64) == Some(2)
+            && witness
+                .pointer("/selector_zone/zoneName")
+                .and_then(Value::as_str)
+                == Some(zone)
+            && witness
+                .pointer("/source_zone/zoneName")
+                .and_then(Value::as_str)
+                == self.source_zone()
+            && witness.get("child").and_then(Value::as_str) == Some(self.asset_record_name()))
+        .then(|| witness.get("selector_child").and_then(Value::as_str))
+        .flatten()
+        .filter(|child| !child.is_empty())
+    }
+
+    pub(crate) fn selector_membership(&self) -> Option<&Value> {
+        self.selector_membership.as_deref()
+    }
+
+    pub(crate) fn with_selector_membership(mut self, witness: Value) -> Self {
+        self.selector_membership = Some(Arc::new(witness));
+        self
     }
 
     pub(crate) fn with_source_zone(mut self, source_zone: Arc<str>) -> Self {

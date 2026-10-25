@@ -93,6 +93,7 @@ pub(crate) struct SelectionContext {
     zone: Value,
     config_hash: String,
     profile: Value,
+    source_contexts: Vec<SelectionContext>,
     retry_sources: Arc<std::sync::Mutex<SelectionRetrySources>>,
 }
 
@@ -192,7 +193,43 @@ pub(crate) async fn context(
     config: &DownloadConfig,
     controls: DownloadControls,
 ) -> Result<Option<SelectionContext>> {
-    context_for_format(passes, config, controls, generation_format()).await
+    let format = generation_format();
+    let Some(mut context) = context_for_format(passes, config, controls, format).await? else {
+        return Ok(None);
+    };
+    if format == 2 {
+        let mut sources = BTreeMap::new();
+        for pass in passes {
+            for (_, scope, zone) in pass.album.selector_sources()? {
+                let name = zone
+                    .get("zoneName")
+                    .and_then(Value::as_str)
+                    .context("Missing selected source zone")?;
+                if name != config.library.as_ref() {
+                    sources.insert(name.to_owned(), scope);
+                }
+            }
+        }
+        for (name, _) in sources {
+            let mut selected = Vec::new();
+            for pass in passes {
+                if pass
+                    .album
+                    .selector_sources()?
+                    .iter()
+                    .any(|(_, _, zone)| zone.get("zoneName").and_then(Value::as_str) == Some(&name))
+                {
+                    selected.push(pass.clone());
+                }
+            }
+            let mut child = context_for_source(&selected, config, controls, format, Some(&name))
+                .await?
+                .context("Selected source could not bind download ledger")?;
+            child.retry_sources = Arc::clone(&context.retry_sources);
+            context.source_contexts.push(child);
+        }
+    }
+    Ok(Some(context))
 }
 
 async fn context_for_format(
@@ -200,6 +237,16 @@ async fn context_for_format(
     config: &DownloadConfig,
     controls: DownloadControls,
     format: u8,
+) -> Result<Option<SelectionContext>> {
+    context_for_source(passes, config, controls, format, None).await
+}
+
+async fn context_for_source(
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+    format: u8,
+    source: Option<&str>,
 ) -> Result<Option<SelectionContext>> {
     if !controls.run_mode.downloads_files()
         || config.retry_only
@@ -212,6 +259,7 @@ async fn context_for_format(
         return Ok(None);
     }
     let mut qualified = None;
+    let mut selector_binding = None;
     let mut profile = Vec::new();
     for pass in passes {
         if format == 1 && !matches!(pass.kind, PassKind::Album | PassKind::Unfiled) {
@@ -220,12 +268,38 @@ async fn context_for_format(
         let scope_owner = if format == 1 {
             pass.album.private_selection_scope()?
         } else {
-            pass.album.download_scope()?
+            let scopes = pass.album.selector_sources()?;
+            if let Some(source) = source {
+                let (selector, selector_scope, selector_zone) =
+                    scopes.first().context("Missing selector owner")?;
+                anyhow::ensure!(
+                    selector_zone.get("zoneName").and_then(Value::as_str)
+                        == Some(config.library.as_ref()),
+                    "Selector library mismatch"
+                );
+                let (account, provider) = selector.owner.authenticated_keys()?;
+                let binding = json!({"version":2,"account_key":account,"provider_key":provider,
+                    "scope":serde_json::from_str::<Value>(selector_scope)?,"zone":selector_zone});
+                anyhow::ensure!(
+                    selector_binding
+                        .as_ref()
+                        .is_none_or(|previous| previous == &binding),
+                    "Mixed selector owners"
+                );
+                selector_binding = Some(binding);
+                scopes.into_iter().find(|(_, _, zone)| {
+                    zone.get("zoneName").and_then(Value::as_str) == Some(source)
+                })
+            } else {
+                scopes.into_iter().next()
+            }
         };
         let Some((capture, scope, zone)) = scope_owner else {
             return Ok(None);
         };
-        if zone.get("zoneName").and_then(Value::as_str) != Some(config.library.as_ref()) {
+        if zone.get("zoneName").and_then(Value::as_str)
+            != Some(source.unwrap_or(config.library.as_ref()))
+        {
             return Ok(None);
         }
         let Some(store) = &config.state_db else {
@@ -259,15 +333,25 @@ async fn context_for_format(
     excludes.sort_unstable();
     let mut profile = json!({"format":format,"coverage":if format == 1 { "observed_selection_window" } else { "selected_downloads" },"passes":profile,
         "recent":config.recent,"recent_scope":format!("{:?}",config.recent_scope),"excludes":excludes});
+    if let Some(binding) = &selector_binding {
+        profile
+            .as_object_mut()
+            .context("Invalid selection profile")?
+            .insert("selector_binding".into(), binding.clone());
+    }
     let anchored_root = SelectionPath::from_path(&std::path::absolute(&config.directory)?);
     let policy = |paths: String| {
-        json!({"format":1,"scope":scope,"zone":zone,
+        let mut policy = json!({"format":1,"scope":scope,"zone":zone,
             "paths":paths,"anchored_root":anchored_root,
             "before":config.skip_created_before.map(crate::config::CreatedDateFilter::fingerprint),"after":config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
             "enum_hash":config.enum_config_hash.as_deref(),"metadata_flags":crate::download::pipeline::MetadataFlags::from(config).bits(),
             "capture_revision":crate::state::METADATA_CAPTURE_REVISION,"capture_repair":format!("{:?}",config.capture_timestamp_repair),
             "repair_truncated":config.repair_truncated,"attempt_limit":config.max_download_attempts,
-        })
+        });
+        if let (Some(binding), Some(object)) = (&selector_binding, policy.as_object_mut()) {
+            object.insert("selector_binding".into(), binding.clone());
+        }
+        policy
     };
     if format == 2 {
         // Folder templates cannot revoke already admitted destinations. Keep
@@ -319,6 +403,7 @@ async fn context_for_format(
         zone,
         config_hash,
         profile,
+        source_contexts: Vec::new(),
         retry_sources: Arc::new(std::sync::Mutex::new(rustc_hash::FxHashMap::default())),
     }))
 }
@@ -332,8 +417,9 @@ pub(crate) struct SelectionRun {
     pub(crate) capture: ShadowCapture,
     pub(crate) root: ActiveGeneration,
     albums: BTreeMap<String, PhotoAlbum>,
-    pub(crate) held: AtomicBool,
-    pub(crate) session_expired: AtomicBool,
+    pub(crate) held: Arc<AtomicBool>,
+    pub(crate) session_expired: Arc<AtomicBool>,
+    source_runs: BTreeMap<String, Arc<SelectionRun>>,
     fresh_confirmation: bool,
     pub(in crate::download) retained_retry: bool,
     retry_sources: Arc<std::sync::Mutex<SelectionRetrySources>>,
@@ -387,6 +473,50 @@ impl SelectionContext {
         passes: &[AlbumPass],
         config: &DownloadConfig,
     ) -> Result<Arc<SelectionRun>> {
+        let mut run = self.start_single(passes, config).await?;
+        for context in &self.source_contexts {
+            let selected = context.selected_passes(passes);
+            let mut child = context.start_single(&selected, config).await?;
+            let child_mut =
+                Arc::get_mut(&mut child).context("Shared source run before admission")?;
+            child_mut.held = Arc::clone(&run.held);
+            child_mut.session_expired = Arc::clone(&run.session_expired);
+            let zone = context
+                .zone
+                .get("zoneName")
+                .and_then(Value::as_str)
+                .context("Missing source zone")?
+                .to_owned();
+            Arc::get_mut(&mut run)
+                .context("Shared owner run before admission")?
+                .source_runs
+                .insert(zone, child);
+        }
+        Ok(run)
+    }
+
+    fn selected_passes(&self, passes: &[AlbumPass]) -> Vec<AlbumPass> {
+        passes
+            .iter()
+            .filter(|pass| {
+                self.profile
+                    .get("passes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item.get("key").and_then(Value::as_str) == Some(pass_key(pass).as_str())
+                        })
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
+    async fn start_single(
+        &self,
+        passes: &[AlbumPass],
+        config: &DownloadConfig,
+    ) -> Result<Arc<SelectionRun>> {
         let spec = GenerationSpec {
             format: self.format,
             scope: self.scope.clone(),
@@ -427,8 +557,9 @@ impl SelectionContext {
                 .iter()
                 .map(|pass| (pass_key(pass), pass.album.clone()))
                 .collect(),
-            held: AtomicBool::new(false),
-            session_expired: AtomicBool::new(false),
+            held: Arc::new(AtomicBool::new(false)),
+            session_expired: Arc::new(AtomicBool::new(false)),
+            source_runs: BTreeMap::new(),
             fresh_confirmation: false,
             retained_retry: false,
             retry_sources: Arc::clone(&self.retry_sources),
@@ -449,8 +580,9 @@ impl SelectionContext {
                 .iter()
                 .map(|pass| (pass_key(pass), pass.album.clone()))
                 .collect(),
-            held: AtomicBool::new(false),
-            session_expired: AtomicBool::new(false),
+            held: Arc::new(AtomicBool::new(false)),
+            session_expired: Arc::new(AtomicBool::new(false)),
+            source_runs: BTreeMap::new(),
             fresh_confirmation,
             retained_retry,
             retry_sources: Arc::clone(&self.retry_sources),
@@ -459,6 +591,27 @@ impl SelectionContext {
 }
 
 impl SelectionRun {
+    pub(in crate::download) fn for_asset(
+        self: &Arc<Self>,
+        asset: &PhotoAsset,
+    ) -> Result<Arc<Self>> {
+        let source = asset.source_zone().unwrap_or(
+            self.root
+                .spec
+                .zone
+                .get("zoneName")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
+        if self.root.spec.zone.get("zoneName").and_then(Value::as_str) == Some(source) {
+            return Ok(Arc::clone(self));
+        }
+        self.source_runs
+            .get(source)
+            .cloned()
+            .context("Observed asset has no authenticated source ledger")
+    }
+
     /// Capture only failed tasks' original selected provenance. This transient
     /// map supplements the exact frozen task, never changes its path or metadata,
     /// and ends with this sync invocation. Durable replay rebuilds it from SQLite.
@@ -471,14 +624,24 @@ impl SelectionRun {
         let mut sources = Vec::new();
         let mut deferred = std::collections::HashSet::new();
         for task in tasks {
+            let run = if self.root.spec.zone.get("zoneName").and_then(Value::as_str)
+                == Some(task.library.as_ref())
+            {
+                self
+            } else {
+                self.source_runs
+                    .get(task.library.as_ref())
+                    .map(AsRef::as_ref)
+                    .context("Failed task has no authenticated source root")?
+            };
             for (pass_index, pass) in passes.iter().enumerate() {
                 let key = pass_key(pass);
-                let Some(manifest) = self
+                let Some(manifest) = run
                     .capture
                     .db
                     .selection_decision(
-                        self.capture.owner.clone(),
-                        self.root.id.clone(),
+                        run.capture.owner.clone(),
+                        run.root.id.clone(),
                         key.clone(),
                         task.asset_record_name.to_string(),
                     )
@@ -496,14 +659,14 @@ impl SelectionRun {
                 {
                     continue;
                 }
-                if self.root.spec.format == 2
+                if run.root.spec.format == 2
                     && deferred.insert((key.clone(), task.asset_record_name.to_string()))
                 {
                     self.capture
                         .db
                         .defer_selection_confirmation(
-                            self.capture.owner.clone(),
-                            self.root.id.clone(),
+                            run.capture.owner.clone(),
+                            run.root.id.clone(),
                             key,
                             task.asset_record_name.to_string(),
                         )
@@ -515,7 +678,7 @@ impl SelectionRun {
                     continue;
                 };
                 let asset =
-                    current_asset(body, &manifest.decision.child, master, &self.root.spec.zone)?;
+                    current_asset(body, &manifest.decision.child, master, &run.root.spec.zone)?;
                 sources.push((
                     super::url_refresh::RetryTaskKey::from(task),
                     super::url_refresh::UrlRetrySource {
@@ -546,6 +709,16 @@ impl SelectionRun {
         key: &str,
         observed: PhotoAsset,
     ) -> Result<(PhotoAsset, SelectionConfirmation)> {
+        let membership = if self.root.spec.profile.get("selector_binding").is_some() {
+            Some(
+                observed
+                    .selector_membership()
+                    .cloned()
+                    .context("Missing current selecting album membership")?,
+            )
+        } else {
+            None
+        };
         if !self
             .capture
             .db
@@ -587,13 +760,35 @@ impl SelectionRun {
                     .albums
                     .get(key)
                     .context("Missing retained selection pass owner")?;
-                let current = album
-                    .confirm_catalog_asset(&previous.decision.child)
+                if let Some(witness) = &membership {
+                    album
+                        .confirm_selector_membership(witness, &previous.decision.child)
+                        .await?;
+                }
+                let mut current = album
+                    .confirm_layout_asset(
+                        &previous.decision.child,
+                        self.root
+                            .spec
+                            .zone
+                            .get("zoneName")
+                            .and_then(Value::as_str)
+                            .context("Missing source zone")?,
+                    )
                     .await?;
                 anyhow::ensure!(
                     same_selected_facts(&retained, &current.asset),
                     "Retained selected generation differs from current proof"
                 );
+                if let Some(witness) = &membership {
+                    let mut fresh: Value = serde_json::from_slice(&current.body)?;
+                    fresh
+                        .as_object_mut()
+                        .context("Invalid fresh source proof")?
+                        .insert("selector_membership".into(), witness.clone());
+                    current.body = serde_json::to_vec(&fresh)?;
+                    current.asset = current.asset.with_selector_membership(witness.clone());
+                }
                 return Ok((
                     current
                         .asset
@@ -616,13 +811,29 @@ impl SelectionRun {
             .albums
             .get(key)
             .context("Missing selection pass owner")?;
-        let current = album
-            .confirm_catalog_asset(observed.asset_record_name())
+        let mut current = album
+            .confirm_layout_asset(
+                observed.asset_record_name(),
+                self.root
+                    .spec
+                    .zone
+                    .get("zoneName")
+                    .and_then(Value::as_str)
+                    .context("Missing source zone")?,
+            )
             .await?;
         anyhow::ensure!(
             same_selected_facts(&current.asset, &observed),
             "Current confirmation changed selection facts"
         );
+        if let Some(witness) = membership {
+            let mut body: Value = serde_json::from_slice(&current.body)?;
+            body.as_object_mut()
+                .context("Invalid current source proof")?
+                .insert("selector_membership".into(), witness.clone());
+            current.body = serde_json::to_vec(&body)?;
+            current.asset = current.asset.with_selector_membership(witness);
+        }
         Ok((
             current.asset,
             SelectionConfirmation {
@@ -897,7 +1108,7 @@ impl SelectionRun {
                     .context("Missing selected metadata fingerprint")?;
                 records.push(
                     crate::state::AssetRecord::new_pending(
-                        Arc::clone(&config.library),
+                        Arc::from(asset.source_zone().unwrap_or(&config.library)),
                         asset.state_id().to_owned(),
                         derived.version_size,
                         derived.checksum.to_string(),
@@ -1045,36 +1256,41 @@ pub(crate) async fn has_due(
     let Some(context) = context(passes, config, controls).await? else {
         return Ok(None);
     };
-    let Some(root) = context.current().await? else {
-        return Ok(Some(true));
-    };
-    if !root.sealed
-        && !context
+    for context in std::iter::once(&context).chain(context.source_contexts.iter()) {
+        let Some(root) = context.current().await? else {
+            return Ok(Some(true));
+        };
+        if !root.sealed
+            && !context
+                .capture
+                .db
+                .selection_waiting_for_retry(context.capture.owner.clone(), root.id.clone())
+                .await?
+        {
+            return Ok(Some(true));
+        }
+        let pending = context
             .capture
             .db
-            .selection_waiting_for_retry(context.capture.owner.clone(), root.id.clone())
+            .has_pending_selection(context.capture.owner.clone(), root.id.clone())
+            .await?;
+        let retained = context
+            .capture
+            .db
+            .retained_selection_root(
+                context.capture.owner.clone(),
+                context.scope.clone(),
+                context.config_hash.clone(),
+                root.id,
+                (context.format == 2).then(|| context.profile.clone()),
+            )
             .await?
-    {
-        return Ok(Some(true));
+            .is_some();
+        if pending || retained {
+            return Ok(Some(true));
+        }
     }
-    let pending = context
-        .capture
-        .db
-        .has_pending_selection(context.capture.owner.clone(), root.id.clone())
-        .await?;
-    let retained = context
-        .capture
-        .db
-        .retained_selection_root(
-            context.capture.owner.clone(),
-            context.scope,
-            context.config_hash,
-            root.id,
-            (context.format == 2).then_some(context.profile),
-        )
-        .await?
-        .is_some();
-    Ok(Some(pending || retained))
+    Ok(Some(false))
 }
 
 pub(super) async fn inventory(
@@ -1180,8 +1396,41 @@ pub(super) async fn inventory(
                 context.capture.owner.clone(),
                 run.root.id.clone(),
                 query_checkpoint_ready,
-                query_veto,
+                query_veto.clone(),
             )
+            .await?;
+    }
+    for source in &context.source_contexts {
+        let zone = source
+            .zone
+            .get("zoneName")
+            .and_then(Value::as_str)
+            .context("Missing source zone")?;
+        let source_run = run
+            .source_runs
+            .get(zone)
+            .context("Missing started source root")?;
+        if covered {
+            source
+                .capture
+                .db
+                .seal_selection_generation(
+                    source.capture.owner.clone(),
+                    source_run.root.id.clone(),
+                    query_checkpoint_ready && !run.held.load(Ordering::Relaxed),
+                    query_veto.clone(),
+                )
+                .await?;
+        }
+        source
+            .capture
+            .db
+            .freeze_interrupted_selection(source.capture.owner.clone(), source.scope.clone())
+            .await?;
+        source
+            .capture
+            .db
+            .complete_selection_metadata(source.capture.owner.clone(), source_run.root.id.clone())
             .await?;
     }
     context
@@ -1496,6 +1745,18 @@ async fn replay(
     ))
     .await?;
     for pass in passes {
+        if !context
+            .profile
+            .get("passes")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("key").and_then(Value::as_str) == Some(pass_key(pass).as_str())
+                })
+            })
+        {
+            continue;
+        }
         if cancel.is_cancelled() || combined.provider_auth_errors > 0 {
             combined.enumeration_complete = false;
             break;
@@ -1589,6 +1850,55 @@ async fn replay(
 /// Deliver already-routed observations to the same immutable destination
 /// owner used by baseline inventory. A quiet delta replays due work only.
 async fn deliver_delta(
+    client: &Client,
+    passes: &[AlbumPass],
+    config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
+    cancel: CancellationToken,
+    assets: Vec<(PhotoAsset, usize)>,
+) -> Result<SyncResult> {
+    let owner = config
+        .selection_context
+        .as_ref()
+        .context("Missing download ledger context")?;
+    let mut combined: Option<SyncResult> = None;
+    for context in std::iter::once(owner.as_ref()).chain(owner.source_contexts.iter()) {
+        let mut single = context.clone();
+        single.source_contexts.clear();
+        let mut effective = config.as_ref().clone();
+        effective.selection_context = Some(Arc::new(single));
+        // Preserve original pass indexes for exact-task URL refresh. Source
+        // profiles choose eligible passes; another source cannot claim them.
+        let zone = context
+            .zone
+            .get("zoneName")
+            .and_then(Value::as_str)
+            .context("Missing source zone")?;
+        let selected = assets
+            .iter()
+            .filter(|(asset, _)| asset.source_zone().unwrap_or(config.library.as_ref()) == zone)
+            .cloned()
+            .collect();
+        let result = deliver_delta_single(
+            client,
+            passes,
+            &Arc::new(effective),
+            controls,
+            cancel.clone(),
+            selected,
+        )
+        .await?;
+        if let Some(previous) = &mut combined {
+            previous.outcome = merge_download_outcomes(&previous.outcome, &result.outcome);
+            previous.accumulate(&result);
+        } else {
+            combined = Some(result);
+        }
+    }
+    combined.context("Missing selected ledger result")
+}
+
+async fn deliver_delta_single(
     client: &Client,
     passes: &[AlbumPass],
     config: &Arc<DownloadConfig>,

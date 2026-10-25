@@ -369,7 +369,19 @@ where
 
                     assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let mut selected_plan = None;
-                    if let Some(run) = &config.selection_run {
+                    if let Some(owner_run) = &config.selection_run {
+                        let run = match owner_run.for_asset(&asset) {
+                            Ok(run) => run,
+                            Err(error) => {
+                                owner_run
+                                    .held
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                enum_errors_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::warn!(%error, "Selected source admission refused");
+                                continue;
+                            }
+                        };
                         if run
                             .session_expired
                             .load(std::sync::atomic::Ordering::Relaxed)

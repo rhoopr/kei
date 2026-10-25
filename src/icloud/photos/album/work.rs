@@ -87,13 +87,17 @@ pub(crate) fn current_asset(
     let master: cloudkit::Record = serde_json::from_value(master_value.clone())?;
     let child: cloudkit::Record = serde_json::from_value(child_value.clone())?;
     let photo = PhotoAsset::try_from_records(master, &child, RequiredAssetFields::Downloadable)?;
-    Ok(photo
+    let mut photo = photo
         .with_state_record_name(Arc::from(child.record_name))
         .with_source_zone(Arc::from(
             zone.get("zoneName")
                 .and_then(Value::as_str)
                 .context("Missing current lookup zone")?,
-        )))
+        ));
+    if let Some(witness) = changes_json::parse(body)?.get("selector_membership") {
+        photo = photo.with_selector_membership(witness.clone());
+    }
+    Ok(photo)
 }
 
 pub(crate) fn same_selected_facts(left: &PhotoAsset, right: &PhotoAsset) -> bool {
@@ -180,6 +184,184 @@ impl PhotoAlbum {
             "Primary layout has ambiguous provider source zones"
         );
         source.confirm_catalog_asset(child).await
+    }
+
+    /// Resolve only a current authenticated owner link, never an unscoped
+    /// record-name search across candidate zones.
+    pub(crate) async fn confirm_selector_target(
+        &self,
+        selector_child: &str,
+        expected: Option<&Value>,
+    ) -> Result<PhotoAsset> {
+        let scopes = self.selector_sources()?;
+        anyhow::ensure!(!scopes.is_empty(), "Missing authenticated selecting owner");
+        let body = self.current_lookup_body(&[selector_child]).await?;
+        let records = lookup_members(&body, &[selector_child], &self.zone_id)?;
+        let record = records.first().context("Missing selecting child")?;
+        anyhow::ensure!(
+            record.get("recordType").and_then(Value::as_str) == Some("CPLAsset"),
+            "Selecting child type mismatch"
+        );
+        let fields = record
+            .get("fields")
+            .context("Missing selecting child fields")?;
+        let evidence = crate::icloud::photos::asset::SparseShareEvidence::from_fields(fields);
+        let Some(crate::icloud::photos::asset::SparseShareEvidence::Linked(link)) = evidence else {
+            anyhow::ensure!(
+                evidence.is_none() && expected.is_none(),
+                "Unresolved selecting source link"
+            );
+            return Ok(self.confirm_catalog_asset(selector_child).await?.asset);
+        };
+        let mut targets = self.cross_zone_sources.iter().filter_map(|source| {
+            link.target_in_scope(&source.zone_id)
+                .map(|child| (source, child))
+        });
+        let (source, target) = targets
+            .next()
+            .context("Selecting link has no authenticated attached source")?;
+        anyhow::ensure!(
+            targets.next().is_none(),
+            "Selecting link has ambiguous attached source"
+        );
+        let (_, scope, zone) = scopes
+            .iter()
+            .find(|(_, _, zone)| zone == source.zone_id.as_ref())
+            .context("Selected source scope is unavailable")?;
+        let witness = json!({"version":2,"selector_zone":self.zone_id.as_ref(),"selector_child":selector_child,
+            "child":target.as_str(),"source_zone":zone,"source_scope":scope});
+        anyhow::ensure!(
+            expected.is_none_or(|prior| [
+                "selector_zone",
+                "selector_child",
+                "source_zone",
+                "source_scope",
+                "child"
+            ]
+            .into_iter()
+            .all(|key| prior.get(key) == witness.get(key))),
+            "Selecting source binding changed"
+        );
+        let asset = source.confirm_catalog_asset(target.as_str()).await?.asset;
+        Ok(asset.with_selector_membership(witness))
+    }
+
+    /// Carry the exact selecting relation through the delta routing boundary.
+    /// A child ID alone cannot supply membership for a different source.
+    pub(crate) async fn confirm_delta_membership(
+        &self,
+        asset: PhotoAsset,
+        events: &[crate::icloud::photos::asset::ChangeEvent],
+    ) -> Result<PhotoAsset> {
+        let container = self
+            .container_id
+            .as_deref()
+            .context("Missing selected album")?;
+        let source_witness = asset
+            .selector_membership()
+            .context("Missing authenticated source link")?;
+        let selector_child = source_witness
+            .get("selector_child")
+            .and_then(Value::as_str)
+            .context("Missing selecting child identity")?;
+        let mut relations = std::collections::BTreeMap::new();
+        for event in events {
+            // Last observation wins, including tombstones lacking fields.
+            relations.insert(event.record_name.as_ref(), event);
+        }
+        let event = relations
+            .values()
+            .find(|event| {
+                event.relation.as_ref().is_some_and(|relation| {
+                    !relation.is_deleted
+                        && relation.container_id.as_ref() == container
+                        && relation.asset_record_name.as_ref() == selector_child
+                })
+            })
+            .context("Missing current selected relation observation")?;
+        let mut witness = source_witness.clone();
+        let fields = witness
+            .as_object_mut()
+            .context("Invalid source link witness")?;
+        fields.insert("kind".into(), json!("relation_observation"));
+        fields.insert("container".into(), json!(container));
+        fields.insert("relation".into(), json!(event.record_name));
+        self.confirm_selector_membership(&witness, asset.asset_record_name())
+            .await?;
+        Ok(asset.with_selector_membership(witness))
+    }
+
+    /// Refresh membership for an existing fixed-source obligation. This lookup
+    /// does not discover or choose a resource source.
+    pub(crate) async fn confirm_selector_membership(
+        &self,
+        witness: &Value,
+        child: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            witness.get("version").and_then(Value::as_u64) == Some(2)
+                && witness.get("selector_zone") == Some(self.zone_id.as_ref())
+                && witness.get("container").and_then(Value::as_str) == self.container_id.as_deref()
+                && witness.get("child").and_then(Value::as_str) == Some(child),
+            "Selecting membership scope mismatch"
+        );
+        let selector_child = witness
+            .get("selector_child")
+            .and_then(Value::as_str)
+            .filter(|child| !child.is_empty())
+            .context("Missing selecting child")?;
+        let relation = witness
+            .get("relation")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .context("Missing retained relation identity")?;
+        let url = format!(
+            "{}/records/lookup?{}",
+            self.service_endpoint,
+            queries::encode_params(&self.params)
+        );
+        let request = json!({"zoneID":self.zone_id.as_ref(),"records":[{"recordName":relation}],"desiredKeys":["containerId","itemId"]});
+        let body = session::retry_post_changes_body(
+            self.session.as_ref(),
+            &url,
+            &request.to_string(),
+            &[("Content-type", "text/plain")],
+            &self.retry_config,
+        )
+        .await?;
+        let records = lookup_members(&body, &[relation], &self.zone_id)?;
+        let record = records.first().context("Missing current album relation")?;
+        anyhow::ensure!(
+            record.get("recordType").and_then(Value::as_str) == Some("CPLContainerRelation")
+                && record
+                    .pointer("/fields/containerId/value")
+                    .and_then(Value::as_str)
+                    == self.container_id.as_deref()
+                && record
+                    .pointer("/fields/itemId/value")
+                    .and_then(Value::as_str)
+                    == Some(selector_child),
+            "Current selecting membership differs"
+        );
+        let current = self
+            .confirm_selector_target(selector_child, Some(witness))
+            .await?;
+        let binding = current
+            .selector_membership()
+            .context("Selecting child no longer names the retained source")?;
+        anyhow::ensure!(
+            [
+                "selector_zone",
+                "selector_child",
+                "source_zone",
+                "source_scope",
+                "child"
+            ]
+            .into_iter()
+            .all(|key| binding.get(key) == witness.get(key)),
+            "Selecting source binding changed"
+        );
+        Ok(())
     }
 
     pub(crate) async fn confirm_catalog_asset(&self, child: &str) -> Result<CurrentCatalogAsset> {

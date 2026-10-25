@@ -95,9 +95,11 @@ async fn refresh_failed_download_urls(
                 .get(&RetryTaskKey::from(task))
                 .is_some_and(|source| {
                     source.asset_record_name == task.asset_record_name
-                        && passes
-                            .get(source.pass_index)
-                            .is_some_and(|pass| pass.album.zone_name() == task.library.as_ref())
+                        && passes.get(source.pass_index).is_some_and(|pass| {
+                            pass.album
+                                .task_source(task.library.as_ref())
+                                .is_ok_and(|source| source.is_some())
+                        })
                 })
         })
     };
@@ -123,11 +125,26 @@ async fn refresh_failed_download_urls(
         "Starting targeted download URL refresh"
     );
     let mut refreshed_zones = FxHashSet::default();
+    let mut source_albums = Vec::new();
     for pass in passes {
+        source_albums.push(pass.album.clone());
+    }
+    if let Some(sources) = retry_sources {
+        for task in failed_tasks {
+            if let Some(pass) = sources
+                .get(&RetryTaskKey::from(task))
+                .and_then(|source| passes.get(source.pass_index))
+                && let Ok(Some(album)) = pass.album.task_source(task.library.as_ref())
+            {
+                source_albums.push(album);
+            }
+        }
+    }
+    for album in &source_albums {
         if shutdown_token.is_cancelled() || pending_keys.is_empty() {
             break;
         }
-        let zone = pass.album.zone_name();
+        let zone = album.zone_name();
         if !refreshed_zones.insert(zone) {
             continue;
         }
@@ -143,7 +160,7 @@ async fn refresh_failed_download_urls(
         let resolutions = tokio::select! {
             biased;
             () = shutdown_token.cancelled() => break,
-            batch = pass.album.resolve_records(&requests) => batch,
+            batch = album.resolve_records(&requests) => batch,
         };
         retry.observe_lookup(&resolutions);
         child_lookup_results += resolutions.results.len();
@@ -210,7 +227,7 @@ async fn refresh_failed_download_urls(
         let resolutions = tokio::select! {
             biased;
             () = shutdown_token.cancelled() => break,
-            batch = pass.album.resolve_records(&paired) => batch,
+            batch = album.resolve_records(&paired) => batch,
         };
         retry.observe_lookup(&resolutions);
         paired_lookup_results += resolutions.results.len();

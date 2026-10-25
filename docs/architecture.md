@@ -343,12 +343,30 @@ for operator steps and compatibility limits.
 
 ### Normal v0.27 download ledger
 
-Owned single-scope passes use format-2 records in
+Owned passes use source-scoped format-2 records in
 `provider_active_decisions` and `provider_active_destinations`. Each observation
 has validated provider identity/rendition facts and is excluded, completed, or
 retained as independently retryable work. Destination paths are immutable once
 admitted. Pending destinations feed existing generation-aware collision planning
 so a newer rendition cannot take an unfinished older rendition's path.
+
+Named albums may select content from another authenticated source. Their existing
+source-scoped roots carry a version-2 selecting-owner binding, including the
+account, complete provider scope and selected pass. A current typed owner-side
+share link must identify the exact attached source zone, owner and child. Matching
+an unscoped child name in the first available zone is never admission authority.
+The selecting child and source child may have different names. Unknown or changed
+links remain unresolved without querying a guessed replacement source.
+
+The selecting owner authorizes album membership and destination paths; the source
+owns resource confirmation and URL refresh. Each pass and destination keeps its
+own existing ledger obligation. A compact relation witness accompanies unfinished
+cross-source work. Quiet replay rechecks the exact relation and fixed source link;
+removed membership or a changed source defers that destination without moving or
+retiring it. Completed witnesses retire with the existing completion receipts.
+Same-source profiles retain their previous interpretation. Unknown cross-source
+binding versions, including the unpublished version-1 draft, fail closed and are
+preserved; an older binary cannot consume new bindings as same-source work.
 
 The initial normal run ignores earlier token namespaces. It records a scoped
 zone boundary, compares current inventory against filesystem receipts, and

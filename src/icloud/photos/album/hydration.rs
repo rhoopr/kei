@@ -4,7 +4,7 @@ use super::planning::PhotoStreamProfile;
 use super::{PhotoAlbum, PhotoStream, ProviderRecordId, RecordLookupRequest, RecordResolution};
 use crate::icloud::photos::asset::{ChangeEvent, DeltaRecordBuffer, PhotoAsset};
 use crate::icloud::photos::hydration_progress::{self, Phase};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -38,8 +38,7 @@ impl PhotoAlbum {
             );
         };
         let album_name = Arc::clone(&self.name);
-        let sources = self.cross_zone_sources_for_task();
-        let owner = self.clone_for_task_without_sources();
+        let owner = self.clone();
 
         tokio::spawn(async move {
             use futures_util::StreamExt;
@@ -78,7 +77,7 @@ impl PhotoAlbum {
                 return;
             }
 
-            let relation_ids = match owner.album_relation_item_ids(&container_id).await {
+            let relations = match owner.album_relation_items(&container_id).await {
                 Ok(ids) => ids,
                 Err(e) => {
                     let _ = tx.send(Err(e)).await;
@@ -86,9 +85,10 @@ impl PhotoAlbum {
                     return;
                 }
             };
-            let mut missing: FxHashSet<String> = relation_ids
-                .into_iter()
-                .filter(|id| !seen_asset_records.contains(id))
+            let mut missing: FxHashSet<String> = relations
+                .keys()
+                .filter(|id| !seen_asset_records.contains(*id))
+                .cloned()
                 .collect();
             if missing.is_empty() {
                 let _ = token_tx.send(base_token);
@@ -103,25 +103,42 @@ impl PhotoAlbum {
             );
 
             let mut hydrated = 0usize;
-            for source in sources {
-                if missing.is_empty() {
-                    break;
-                }
-                let missing_before = missing.len();
-                match source.matching_assets_from_changes(&mut missing).await {
-                    Ok(assets) => {
-                        hydrated += missing_before.saturating_sub(missing.len());
-                        for asset in assets {
-                            if tx.send(Ok(asset)).await.is_err() {
-                                let _ = token_tx.send(None);
-                                return;
+            for selector_child in missing.clone() {
+                match owner.confirm_selector_target(&selector_child, None).await {
+                    Ok(asset) => {
+                        let Some(relation) = relations.get(&selector_child) else {
+                            continue;
+                        };
+                        let asset = if let Some(mut witness) = asset.selector_membership().cloned()
+                        {
+                            let Some(fields) = witness.as_object_mut() else {
+                                continue;
+                            };
+                            for key in ["kind", "container", "relation"] {
+                                if let Some(value) = relation.get(key) {
+                                    fields.insert(key.into(), value.clone());
+                                }
                             }
+                            asset.with_selector_membership(witness)
+                        } else {
+                            // A confirmed owner asset uses the ordinary owner root.
+                            asset
+                        };
+                        if tx.send(Ok(asset)).await.is_err() {
+                            let _ = token_tx.send(None);
+                            return;
                         }
+                        missing.remove(&selector_child);
+                        hydrated += 1;
                     }
-                    Err(e) => {
-                        let _ = tx.send(Err(e)).await;
-                        let _ = token_tx.send(None);
-                        return;
+                    Err(error) => {
+                        let authentication =
+                            crate::icloud::photos::session::is_session_error(&error);
+                        let _ = tx.send(Err(error)).await;
+                        if authentication {
+                            let _ = token_tx.send(None);
+                            return;
+                        }
                     }
                 }
             }
@@ -162,38 +179,49 @@ impl PhotoAlbum {
             .collect()
     }
 
-    async fn album_relation_item_ids(
+    async fn album_relation_items(
         &self,
         container_id: &str,
-    ) -> anyhow::Result<FxHashSet<String>> {
-        let mut ids = FxHashSet::default();
+    ) -> anyhow::Result<FxHashMap<String, Value>> {
+        // Only publish witnesses after the scoped scan completes. Repeated
+        // relation records supersede their earlier observation, including deletion.
+        let mut records = FxHashMap::<String, Option<String>>::default();
         self.scan_changes_zone(|record| {
             if record.record_type != "CPLContainerRelation" {
                 return true;
             }
             if record.deleted == Some(true) {
+                records.insert(record.record_name.clone(), None);
                 return true;
             }
             let container = record
                 .fields
                 .get("containerId")
-                .and_then(|f| f.get("value"))
+                .and_then(|field| field.get("value"))
                 .and_then(Value::as_str);
-            if container != Some(container_id) {
-                return true;
-            }
-            if let Some(item_id) = record
+            let item = record
                 .fields
                 .get("itemId")
-                .and_then(|f| f.get("value"))
-                .and_then(Value::as_str)
-            {
-                ids.insert(item_id.to_string());
-            }
+                .and_then(|field| field.get("value"))
+                .and_then(Value::as_str);
+            records.insert(
+                record.record_name.clone(),
+                (container == Some(container_id))
+                    .then_some(item)
+                    .flatten()
+                    .map(str::to_owned),
+            );
             true
         })
         .await?;
-        Ok(ids)
+        let mut items = FxHashMap::default();
+        for (relation, child) in records {
+            if let Some(child) = child {
+                items.insert(child.clone(), serde_json::json!({"version":1,"kind":"complete_relation_scan",
+                    "selector_zone":self.zone_id.as_ref(),"container":container_id,"child":child,"relation":relation}));
+            }
+        }
+        Ok(items)
     }
 
     pub(super) async fn hydrate_assets(
@@ -201,6 +229,15 @@ impl PhotoAlbum {
         missing_asset_record_names: &mut FxHashSet<String>,
     ) -> anyhow::Result<Vec<PhotoAsset>> {
         hydration_progress::observe(async {
+            if !self.cross_zone_sources.is_empty() {
+                let mut matched = Vec::new();
+                for selector_child in missing_asset_record_names.clone() {
+                    let asset = self.confirm_selector_target(&selector_child, None).await?;
+                    missing_asset_record_names.remove(&selector_child);
+                    matched.push(asset);
+                }
+                return Ok(matched);
+            }
             let sources: Vec<_> = std::iter::once(self.clone_for_task_without_sources())
                 .chain(self.cross_zone_sources_for_task())
                 .collect();

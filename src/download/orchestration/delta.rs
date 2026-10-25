@@ -1418,7 +1418,11 @@ pub(super) async fn hydrate_missing_selected_relation_assets(
                 .persist_asset_mapping_for_asset(&asset, config)
                 .await;
             let asset_record_name = asset.asset_record_name().to_string();
-            let pass_indices = pass_indices_by_asset.get(asset_record_name.as_str());
+            let pass_indices = pass_indices_by_asset.get(
+                asset
+                    .selector_child_in_zone(&config.library)
+                    .unwrap_or(asset_record_name.as_str()),
+            );
             let claim_mode = legacy_owner_claim_mode_for_configs(
                 context.claim_mode,
                 &asset,

@@ -495,8 +495,13 @@ impl AlbumSnapshotRecorder {
                 &self.library,
                 &self.container_id,
                 self.generation,
-                asset.asset_record_name(),
-                Some(asset.id()),
+                asset
+                    .selector_child_in_zone(&self.library)
+                    .unwrap_or_else(|| asset.asset_record_name()),
+                (asset
+                    .source_zone()
+                    .is_none_or(|source| source == self.library.as_ref()))
+                .then(|| asset.id()),
                 "icloud",
             )
             .await

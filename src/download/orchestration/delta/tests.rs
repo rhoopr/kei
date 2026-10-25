@@ -2698,7 +2698,7 @@ async fn issue958_album_groups_share_one_fallback_per_source() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn issue958_cross_zone_hydration_preserves_source_and_stops_at_match() {
+async fn cross_zone_hydration_without_authenticated_owner_keeps_target_pending() {
     let probe = AlbumScanProbe {
         params: Arc::default(),
         lookup_calls: Arc::default(),
@@ -2713,24 +2713,16 @@ async fn issue958_cross_zone_hydration_preserves_source_and_stops_at_match() {
     let album = scan_probe_album("PrimarySync", None, &probe)
         .with_cross_zone_sources(vec![scan_probe_album("SharedSync-synthetic", None, &probe)]);
     let mut missing = FxHashSet::from_iter(["asset-MATCH".to_owned()]);
-    let assets = album
+    let error = album
         .hydrate_matching_assets_from_changes(&mut missing)
         .await
-        .unwrap();
-    assert!(missing.is_empty());
-    assert_eq!(assets.len(), 1);
-    assert_eq!(assets[0].source_zone(), Some("SharedSync-synthetic"));
-    let calls = probe.calls.lock().unwrap();
-    assert_eq!(calls.len(), 5);
+        .unwrap_err();
+    assert_eq!(error.to_string(), "Missing authenticated selecting owner");
+    assert_eq!(missing, FxHashSet::from_iter(["asset-MATCH".to_owned()]));
+    assert!(probe.calls.lock().unwrap().is_empty());
     assert_eq!(
-        calls.iter().map(|(z, _)| z.as_str()).collect::<Vec<_>>(),
-        [
-            "PrimarySync",
-            "PrimarySync",
-            "PrimarySync",
-            "SharedSync-synthetic",
-            "SharedSync-synthetic"
-        ]
+        probe.lookup_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0
     );
 }
 

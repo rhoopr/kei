@@ -22,6 +22,7 @@ use crate::state::{AssetRecord, error::StateError};
 
 mod pending_path_cache;
 mod retirement;
+mod selector_binding;
 pub(super) use retirement::advance_completed_receipt;
 
 #[cfg(test)]
@@ -201,7 +202,7 @@ fn validate_spec(spec: &GenerationSpec) -> Result<(), StateError> {
             p.get("key")
                 .and_then(Value::as_str)
                 .is_none_or(|key| key.trim().is_empty())
-                || p.pointer("/scope/zone") != Some(&spec.zone)
+                || selector_binding::validate(spec, p).is_err()
         })
     {
         return invalid();
@@ -260,6 +261,7 @@ fn load_generation(conn: &Connection, id: &str) -> Result<ActiveGeneration, Stat
     let spec: GenerationSpec =
         serde_json::from_slice(&bytes).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
     validate_spec(&spec)?;
+    selector_binding::validate_owner(conn, &spec)?;
     let metadata_enabled: bool = conn.query_row(
         "SELECT metadata_enabled FROM provider_active_generations WHERE id=?1",
         [id],
@@ -767,6 +769,14 @@ fn validate_decision_with_pages(
     {
         return invalid();
     }
+    if let Some(body) = &decision.confirmation {
+        selector_binding::validate_membership(
+            &root.spec,
+            pass(root, &decision.pass_key)?,
+            &decision.child,
+            body,
+        )?;
+    }
     let mut sources = HashSet::new();
     for source in &manifest.sources {
         if !sources.insert((&source.page_id, source.ordinal)) {
@@ -851,8 +861,9 @@ pub(crate) fn retained_profiles_compatible(previous: &Value, current: &Value) ->
             })
             .map(str::to_owned)
     };
-    previous == current
-        || matches!((key(previous), key(current)), (Some(old), Some(new)) if old == new)
+    selector_binding::compatible(previous, current)
+        && (previous == current
+            || matches!((key(previous), key(current)), (Some(old), Some(new)) if old == new))
 }
 
 impl SqliteStateDb {
@@ -1009,7 +1020,7 @@ impl SqliteStateDb {
         capacity: u64,
     ) -> Result<ActiveGeneration, StateError> {
         self.with_conn_mut("starting selection generation",move|conn|{
-            let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;validate_spec(&spec)?;
+            let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;validate_spec(&spec)?;selector_binding::validate_owner(&tx,&spec)?;
             guard_library_scope(&tx, &spec.scope, spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?)?;
             if spec.format == 2 {
                 tx.execute("INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",
@@ -1563,7 +1574,7 @@ impl SqliteStateDb {
     ) -> Result<(), StateError> {
         self.with_conn_mut("advancing synthetic selection retry clock",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
-            let keys:Vec<(String,String)>=tx.prepare("SELECT generation,pass_key FROM provider_active_decisions WHERE child=?1 AND next_retry_at>0")?.query_map([&child],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
+            let keys:Vec<(String,String)>=tx.prepare("SELECT generation,pass_key FROM provider_active_decisions WHERE child=?1 AND next_retry_at>0 AND compacted_hash IS NULL AND (admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=provider_active_decisions.generation AND w.pass_key=provider_active_decisions.pass_key AND w.child=provider_active_decisions.child AND w.verified_media=0))")?.query_map([&child],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
             for (generation,key) in keys {
                 let root=load_generation(&tx,&generation)?;load_decision(&tx,&root,&key,&child)?;
                 tx.execute("UPDATE provider_active_decisions SET next_retry_at=1 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,key,child])?;

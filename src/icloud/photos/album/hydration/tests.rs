@@ -199,85 +199,44 @@ fn make_cross_zone_owner_album_with_source_kind(
     )
 }
 
+// Unauthenticated cross-zone scans cannot establish ownership. Authenticated positive
+// coverage lives in fallback_publication's two-album and owner-rank-omission flows.
 #[tokio::test]
-async fn photo_stream_hydrates_named_album_members_from_other_zones() {
+async fn photo_stream_keeps_visible_owner_assets_but_holds_unscoped_relations() {
     use tokio_stream::StreamExt;
-
-    let (owner, owner_query_calls, owner_changes_calls, source_changes_calls) =
-        make_cross_zone_owner_album();
-
-    let (stream, token_rx) = owner.photo_stream_with_token(None, Some(2), 1);
-    tokio::pin!(stream);
-
-    let mut assets = Vec::new();
-    while let Some(result) = stream.next().await {
-        assets.push(result.expect("photo asset should be Ok"));
+    for source_kind in [
+        CrossZoneSessionKind::Source,
+        CrossZoneSessionKind::EmptySource,
+    ] {
+        let (owner, owner_query_calls, owner_changes_calls, source_changes_calls) =
+            make_cross_zone_owner_album_with_source_kind(source_kind);
+        let (stream, token_rx) = owner.photo_stream_with_token(None, Some(2), 1);
+        tokio::pin!(stream);
+        let mut assets = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(asset) => assets.push(asset),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        assert_eq!(assets.len(), 1);
+        assert_eq!(
+            owner_query_calls.load(std::sync::atomic::Ordering::SeqCst),
+            6
+        );
+        assert_eq!(assets[0].id(), "master-owner");
+        assert_eq!(errors, ["Missing authenticated selecting owner"]);
+        assert_eq!(token_rx.await.expect("sync token sender"), None);
+        assert_eq!(
+            owner_changes_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            source_changes_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
-
-    assert_eq!(assets.len(), 2);
-    assert!(assets.iter().any(|asset| asset.id() == "master-owner"
-        && asset.asset_record_name() == "asset-master-owner"
-        && asset.source_zone().is_none()));
-    assert!(assets.iter().any(|asset| asset.id() == "master-shared"
-        && asset.asset_record_name() == "asset-master-shared"
-        && asset.source_zone() == Some("SharedSync-abc")));
-    assert_eq!(
-        token_rx.await.expect("sync token sender").as_deref(),
-        Some("owner-token"),
-        "fully resolved cross-zone hydration can keep the owner-zone token"
-    );
-    assert_eq!(
-        owner_query_calls.load(std::sync::atomic::Ordering::SeqCst),
-        6,
-        "base enumeration should stop after the owner page plus finite empty-tail proof"
-    );
-    assert_eq!(
-        owner_changes_calls.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "owner zone relation scan should run only when base enumeration is short"
-    );
-    assert_eq!(
-        source_changes_calls.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "source zone scan should be bounded to missing relation members"
-    );
-}
-
-#[tracing_test::traced_test]
-#[tokio::test]
-async fn photo_stream_warns_but_continues_for_unresolved_relation_members() {
-    use tokio_stream::StreamExt;
-
-    let (owner, _owner_query_calls, owner_changes_calls, source_changes_calls) =
-        make_cross_zone_owner_album_with_source_kind(CrossZoneSessionKind::EmptySource);
-
-    let (stream, token_rx) = owner.photo_stream_with_token(None, Some(2), 1);
-    tokio::pin!(stream);
-
-    let mut assets = Vec::new();
-    while let Some(result) = stream.next().await {
-        assets.push(result.expect("unresolved relation records should warn, not error"));
-    }
-
-    assert_eq!(assets.len(), 1);
-    assert_eq!(assets[0].id(), "master-owner");
-    assert_eq!(
-        token_rx.await.expect("sync token sender"),
-        None,
-        "unresolved relation records suppress owner-zone token advancement"
-    );
-    assert_eq!(
-        owner_changes_calls.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "owner relation scan should still run"
-    );
-    assert_eq!(
-        source_changes_calls.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "source zone scan should try to resolve relation members"
-    );
-    assert!(logs_contain("unresolved=1"));
-    assert!(logs_contain("Album has unresolved relation records"));
 }
 
 #[tokio::test]
@@ -602,7 +561,7 @@ async fn issue958_direct_relation_hydration_batches_and_keeps_missing_targets() 
 }
 
 #[tokio::test]
-async fn issue958_direct_cross_zone_lookup_preserves_source_priority() {
+async fn cross_zone_lookup_without_authenticated_owner_never_uses_source_priority() {
     use std::sync::atomic::Ordering;
     let owner = HydrationLookupSession::new(HydrationLookupReply::Omitted, 0);
     let mut source = HydrationLookupSession::new(HydrationLookupReply::Complete, 1);
@@ -615,18 +574,17 @@ async fn issue958_direct_cross_zone_lookup_preserves_source_priority() {
     let album = make_album_with_session(100, Box::new(owner.clone()))
         .with_cross_zone_sources(vec![source_album]);
     let mut missing = FxHashSet::from_iter(["asset-master-0".to_owned()]);
-    let assets = album
+    let error = album
         .hydrate_matching_assets_from_changes(&mut missing)
         .await
-        .unwrap();
-    assert!(missing.is_empty());
-    assert_eq!(assets.len(), 1);
-    assert_eq!(assets[0].source_zone(), Some("SharedSync-synthetic"));
-    assert_eq!(owner.requests.lock().unwrap().len(), 1);
-    assert_eq!(source.requests.lock().unwrap().len(), 2);
+        .unwrap_err();
+    assert_eq!(error.to_string(), "Missing authenticated selecting owner");
+    assert_eq!(missing, FxHashSet::from_iter(["asset-master-0".to_owned()]));
+    assert!(owner.requests.lock().unwrap().is_empty());
+    assert!(source.requests.lock().unwrap().is_empty());
     assert_eq!(
         owner.scans.load(Ordering::SeqCst) + source.scans.load(Ordering::SeqCst),
-        1
+        0
     );
 }
 
@@ -694,14 +652,14 @@ async fn issue958_inconclusive_owner_lookup_cannot_prefer_cross_zone_namesake() 
             make_cross_zone_album("SharedSync-synthetic", source.clone(), None, Vec::new()),
         ]);
     let mut missing = FxHashSet::from_iter(["asset-master-0".to_owned()]);
-    let assets = album
+    let error = album
         .hydrate_matching_assets_from_changes(&mut missing)
         .await
-        .unwrap();
-    assert!(missing.is_empty());
-    assert_eq!(assets.len(), 1);
-    assert_eq!(assets[0].source_zone(), Some("PrimarySync"));
-    assert_eq!(owner.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        .unwrap_err();
+    assert_eq!(error.to_string(), "Missing authenticated selecting owner");
+    assert_eq!(missing, FxHashSet::from_iter(["asset-master-0".to_owned()]));
+    assert!(owner.requests.lock().unwrap().is_empty());
+    assert_eq!(owner.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert!(source.requests.lock().unwrap().is_empty());
     assert_eq!(source.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
