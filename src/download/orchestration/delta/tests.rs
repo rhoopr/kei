@@ -2101,9 +2101,11 @@ async fn issue956_changed_master_confirmation_is_bounded_and_retains_unproven_ma
             .unwrap();
         let mut records = incremental_photo_records("CURRENT");
         let mut delta = records[1].clone();
-        delta["fields"].as_object_mut().unwrap().remove("masterRef");
+        // Exercise a current explicit reference redirect, not historical mapping fallback.
+        delta["fields"]["masterRef"]["value"]["recordName"] = json!("PREVIOUS");
         let mut buffer = DeltaRecordBuffer::new();
         let mut events = buffer.process_records(vec![serde_json::from_value(delta).unwrap()]);
+        events.extend(buffer.flush());
         let first = json!({"records":[{"recordName":"PREVIOUS","serverErrorCode":"NOT_FOUND"}, records[1].clone()]});
         let second = match fault {
             "omitted" => json!({"records":[records[1].clone()]}),
@@ -2273,14 +2275,19 @@ async fn issue956_mixed_changed_master_batch_confirms_only_one_exact_scoped_pair
     for (asset, old_master) in pairs {
         let mut record = incremental_photo_records(old_master)[1].clone();
         record["recordName"] = json!(asset);
-        record["fields"]
-            .as_object_mut()
-            .unwrap()
-            .remove("masterRef");
+        // Keep the current explicit reference; saved mappings are not lookup authority.
         records.push(record);
     }
     let mut buffer = DeltaRecordBuffer::new();
     let mut events = buffer.process_records(serde_json::from_value(Value::Array(records)).unwrap());
+    events.extend(buffer.flush());
+    // Buffer flush uses keyed storage; give this aggregate fixture a deterministic order.
+    events.sort_by_key(|event| {
+        pairs
+            .iter()
+            .position(|(child, _)| *child == event.record_name.as_ref())
+            .unwrap()
+    });
     assert_eq!(events.len(), 3);
 
     let changed_master = incremental_photo_records("NEW_CHANGED");

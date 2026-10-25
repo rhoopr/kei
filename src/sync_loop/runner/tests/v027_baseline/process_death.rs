@@ -76,6 +76,14 @@ impl PhotosSession for DeathProvider {
 }
 
 async fn death_cycle(root: &Path, url: &str, quiet: bool) -> usize {
+    reference_cycle(root, url, quiet, None).await
+}
+const CHANGED_MEDIA: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/data/media/metadata.jpg"
+));
+async fn reference_cycle(root: &Path, url: &str, quiet: bool, reference: Option<u8>) -> usize {
+    let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
     let mut inventory = pair(
         "current-existing",
         "existing.JPG",
@@ -88,6 +96,25 @@ async fn death_cycle(root: &Path, url: &str, quiet: bool) -> usize {
         &format!("{url}/missing"),
         2,
     ));
+    if let Some(phase) = reference {
+        inventory = pair(
+            "current-missing",
+            "missing.JPG",
+            &format!("{url}/{}", if phase == 0 { "blocked" } else { "missing" }),
+            2,
+        );
+        inventory[0]["fields"]["resOriginalVidComplRes"] = json!({"value":{"downloadURL":format!("{url}/motion"),"size":MEDIA.len(),"fileChecksum":generation(2)}});
+        inventory[0]["fields"]["resOriginalVidComplFileType"] =
+            json!({"value":"com.apple.quicktime-movie"});
+        if phase > 0 {
+            inventory[0]["recordName"] = json!("new-current-master");
+            inventory[1]["fields"]["masterRef"]["value"]["recordName"] =
+                json!("new-current-master");
+            inventory[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(CHANGED_MEDIA.len());
+            inventory[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+                json!(generation(3));
+        }
+    }
     let provider = DeathProvider {
         quiet,
         base: BaselineSession {
@@ -108,6 +135,11 @@ async fn death_cycle(root: &Path, url: &str, quiet: bool) -> usize {
             .await
             .unwrap(),
     );
+    if reference.is_some_and(|phase| phase > 0) {
+        db.make_selection_retry_due(baseline_owner(), "asset-current-missing".into())
+            .await
+            .unwrap();
+    }
     let mut library = PhotoLibrary::new(
         "https://synthetic.example/database/1/photos/production/private".into(),
         Arc::new(std::collections::HashMap::new()),
@@ -137,6 +169,9 @@ async fn death_cycle(root: &Path, url: &str, quiet: bool) -> usize {
         let mut config = (*base(mode, excluded, groupings, zone)).clone();
         config.folder_structure = "none".into();
         config.concurrent_downloads = 1;
+        if reference.is_some() {
+            config.media.live_photos = true;
+        }
         config.retry.max_retries = 0;
         Arc::new(config)
     };
@@ -153,9 +188,21 @@ async fn death_cycle(root: &Path, url: &str, quiet: bool) -> usize {
     )
     .await
     .unwrap();
-    assert_eq!(result.failed_count, 0, "{result:?}");
+    assert_eq!(
+        result.failed_count,
+        usize::from(reference == Some(0)),
+        "{result:?} events={:?}",
+        trace.events()
+    );
     assert!(result.db_sync_token_advance_safe, "{result:?}");
     assert_eq!(db.get_metadata(&key).await.unwrap().as_deref(), Some(AFTER));
+    if reference.is_some_and(|phase| phase > 0) {
+        assert_eq!(
+            provider.base.inventory_queries.load(Ordering::SeqCst),
+            0,
+            "reference retry must not repeat inventory"
+        );
+    }
     if quiet {
         assert_eq!(provider.base.inventory_queries.load(Ordering::SeqCst), 0);
         assert_eq!(result.stats.downloaded, 0);
@@ -308,4 +355,176 @@ async fn v027_death_worker() {
     let url = std::env::var("KEI_V027_DEATH_URL").unwrap();
     death_cycle(&root, &url, false).await;
     panic!("worker completed without requested hook");
+}
+
+const REFERENCE_WORKER: &str =
+    "sync_loop::runner::tests::v027_baseline::process_death::v027_reference_death_worker";
+fn completed_reference_rows(root: &Path) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn = rusqlite::Connection::open(root.join("state.db")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT * FROM download_receipts WHERE master='current-missing' ORDER BY id")
+        .unwrap();
+    let n = stmt.column_count();
+    stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+#[tokio::test]
+async fn changed_reference_sigkill_transfers_new_bytes_without_repeating_completed_motion() {
+    for point in [
+        "selection-reference-transferred",
+        "selection-reference-committed",
+    ] {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/blocked"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/motion"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/missing"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(CHANGED_MEDIA))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("fixture-owner"),
+            b"kei-synthetic-process-death",
+        )
+        .unwrap();
+        assert_eq!(
+            reference_cycle(root.path(), &server.uri(), false, Some(0)).await,
+            1
+        );
+        let completed = completed_reference_rows(root.path());
+        assert_eq!(completed.len(), 1);
+        let files: Vec<_> = std::fs::read_dir(root.path().join("media"))
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+                (path, bytes, stamp)
+            })
+            .collect();
+        assert_eq!(files.len(), 1);
+        let log = std::fs::File::create(root.path().join("worker.log")).unwrap();
+        let mut worker = Worker(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", REFERENCE_WORKER, "--ignored", "--nocapture"])
+                .env("KEI_TEST_PROCESS_DEATH_ROOT", root.path())
+                .env("KEI_TEST_PROCESS_DEATH_POINT", point)
+                .env("KEI_V027_DEATH_URL", server.uri())
+                .stdout(Stdio::from(log.try_clone().unwrap()))
+                .stderr(Stdio::from(log))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while !root.path().join("ready").exists() {
+            assert!(
+                worker.0.try_wait().unwrap().is_none(),
+                "worker exited: {}",
+                std::fs::read_to_string(root.path().join("worker.log")).unwrap()
+            );
+            assert!(Instant::now() < deadline, "worker timeout at {point}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("ready")).unwrap(),
+            point
+        );
+        worker.0.kill().unwrap();
+        assert_eq!(worker.0.wait().unwrap().signal(), Some(9));
+        {
+            let db = SqliteStateDb::open_owned(&root.path().join("state.db"), &baseline_owner())
+                .await
+                .unwrap();
+            let conn = db
+                .acquire_lock("one unfinished reservation survives SIGKILL")
+                .unwrap();
+            let pending:Vec<(String,String)>=conn.prepare("SELECT master,compat_path FROM provider_active_destinations WHERE verified_media=0").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+            assert_eq!(
+                pending,
+                vec![(
+                    if point == "selection-reference-transferred" {
+                        "current-missing"
+                    } else {
+                        "new-current-master"
+                    }
+                    .to_owned(),
+                    root.path()
+                        .join("media/missing.JPG")
+                        .to_string_lossy()
+                        .into_owned()
+                )]
+            );
+        }
+        assert_eq!(completed_reference_rows(root.path()), completed);
+        assert_eq!(
+            reference_cycle(root.path(), &server.uri(), false, Some(1)).await,
+            1
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                reference_cycle(root.path(), &server.uri(), true, Some(2)).await,
+                0
+            );
+        }
+        assert_eq!(completed_reference_rows(root.path()), completed);
+        for (path, bytes, stamp) in files {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), stamp);
+        }
+        assert_eq!(
+            std::fs::read(root.path().join("media/missing.JPG")).unwrap(),
+            CHANGED_MEDIA
+        );
+        let db = SqliteStateDb::open_owned(&root.path().join("state.db"), &baseline_owner())
+            .await
+            .unwrap();
+        {
+            let conn = db
+                .acquire_lock("all obligations settled after killed reference refresh")
+                .unwrap();
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_active_destinations WHERE verified_media=0",
+                    [],
+                    |r| r.get(0)
+                )
+                .unwrap(),
+                0
+            );
+            let receipt:(String,i64,String,String)=conn.query_row("SELECT provider_checksum,provider_size,source_checksum,local_checksum FROM download_receipts WHERE child='asset-current-missing' AND master='new-current-master' AND version_size='original'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            use sha2::{Digest, Sha256};
+            let hash = format!("{:x}", Sha256::digest(CHANGED_MEDIA));
+            assert_eq!(
+                receipt,
+                (
+                    generation(3),
+                    i64::try_from(CHANGED_MEDIA.len()).unwrap(),
+                    hash.clone(),
+                    hash
+                )
+            );
+        }
+        server.verify().await;
+    }
+}
+#[tokio::test]
+#[ignore = "dedicated reference transition subprocess killed by parent"]
+async fn v027_reference_death_worker() {
+    let root = PathBuf::from(std::env::var_os("KEI_TEST_PROCESS_DEATH_ROOT").unwrap());
+    let url = std::env::var("KEI_V027_DEATH_URL").unwrap();
+    reference_cycle(&root, &url, false, Some(1)).await;
+    panic!("reference worker missed requested hook");
 }
