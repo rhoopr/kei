@@ -282,6 +282,40 @@ pub(super) fn make_run_cycle_library_state_with_album(
     )
 }
 
+/// A zone-history cursor before inventory, distinct from rank query tokens.
+pub(super) fn baseline_zone_response(zone: &str) -> Value {
+    json!({"zones":[{"zoneID":{"zoneName":zone},
+        "syncToken":"fixture-zone-history-boundary","deleted":false}]})
+}
+
+#[derive(Clone)]
+struct BaselineBoundarySession {
+    zone: String,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for BaselineBoundarySession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        anyhow::ensure!(
+            url.ends_with("/zones/list"),
+            "unexpected library fixture endpoint: {url}"
+        );
+        anyhow::ensure!(
+            serde_json::from_str::<Value>(&body)? == json!({}),
+            "unexpected zone boundary request"
+        );
+        Ok(baseline_zone_response(&self.zone))
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
 pub(super) fn make_run_cycle_library_state_with_passes(
     zone: &str,
     sync_token_key: &str,
@@ -289,7 +323,9 @@ pub(super) fn make_run_cycle_library_state_with_passes(
 ) -> LibraryState {
     LibraryState {
         library: crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
-            Box::new(crate::test_helpers::MockPhotosSession::new()),
+            Box::new(BaselineBoundarySession {
+                zone: zone.to_owned(),
+            }),
             zone,
         ),
         pass_scope: PassScope {

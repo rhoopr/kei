@@ -2797,9 +2797,10 @@ async fn destination_reopen_fixture_with_signature(
             );
         }
     }
-    f.config.sync_mode = crate::download::SyncMode::Incremental {
-        zone_sync_token: "old-cursor".into(),
-    };
+    // A historical raw capture and A-only transfer did not admit B. The
+    // first v27 invocation must compare current selected inventory before
+    // a quiet incremental feed can be meaningful.
+    f.config.sync_mode = crate::download::SyncMode::Full;
     drop(passes);
     f.config.state_db = None;
     drop(f.capture);
@@ -2827,7 +2828,7 @@ async fn destination_reopen_fixture_with_signature(
     assert_eq!(
         result.stats.downloaded,
         1,
-        "canonical A completion must not suppress selected B after quiet reopen: result={result:?}; queue={:?}; receipts={:?}; decisions={:?}",
+        "canonical A completion must not suppress selected B in the first current comparison: result={result:?}; queue={:?}; receipts={:?}; decisions={:?}",
         f.queue(),
         f.db.get_baseline_receipts().await.unwrap(),
         f.db.acquire_lock("selected copy failure")
@@ -2861,13 +2862,34 @@ async fn destination_reopen_fixture_with_signature(
                 |r| r.get(0),
             )
             .unwrap();
-    assert_eq!(roots, if native { 2 } else { 1 });
+    // The completed A-only generation is reclaimable after its receipt is
+    // durable. Retention of that old root is not a completion requirement.
+    assert_eq!(roots, 1);
+    if native {
+        let conn =
+            f.db.acquire_lock("retired generation preserves exact local proof")
+                .unwrap();
+        for path in [&a, &b] {
+            let encoded = serde_json::to_string(
+                &crate::state::db::provider_selection::SelectionPath::from_path(path),
+            )
+            .unwrap();
+            let count: i64 = conn.query_row(
+                "SELECT count(*) FROM download_receipts WHERE child='asset-m' AND native_path=?1 AND local_checksum=?2",
+                rusqlite::params![encoded, format!("{:x}", Sha256::digest(media))],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(
+                count, 1,
+                "each selected physical path retains its own receipt"
+            );
+        }
+    }
     let destinations=f.db.acquire_lock("independent verified paths").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_media=1",[],|r|r.get(0)).unwrap();
     let proof_rows = f.db.acquire_lock("destination proof diagnostic").unwrap().prepare("SELECT pass_key,path,verified_media,source_checksum,local_checksum FROM provider_active_destinations").unwrap().query_map([],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
     let path_rows = f.db.acquire_lock("legacy receipt diagnostic").unwrap().prepare("SELECT local_path,source_checksum,local_checksum FROM asset_metadata_paths WHERE id='asset-m'").unwrap().query_map([],|r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
     assert_eq!(
-        destinations,
-        if native { 3 } else { 2 },
+        destinations, 2,
         "active: {proof_rows:?}, legacy: {path_rows:?}"
     );
     if metadata {
@@ -2894,7 +2916,7 @@ async fn destination_reopen_fixture_with_signature(
                 .unwrap();
         assert_eq!(
             complete,
-            if native { 3 } else { 2 },
+            2,
             "actual configured rewrite must finish both exact destinations; result: {result:?}; rows: {diagnostic_rows:?}; offset: {offset:?}; events: {:?}",
             trace
                 .events()
@@ -2914,6 +2936,17 @@ async fn destination_reopen_fixture_with_signature(
             );
         }
     }
+    let rank_requests = f.session.rank_calls.load(Ordering::SeqCst);
+    assert!(
+        rank_requests > 0,
+        "selected comparison must enumerate current inventory"
+    );
+    f.config.sync_mode = crate::download::SyncMode::Incremental {
+        zone_sync_token: result
+            .sync_token
+            .clone()
+            .expect("completed selected inventory cursor"),
+    };
     drop(passes);
     for _ in 0..2 {
         f.config.state_db = None;
@@ -2939,6 +2972,11 @@ async fn destination_reopen_fixture_with_signature(
         .await
         .unwrap();
         assert_eq!(quiet.stats.downloaded, 0);
+        assert_eq!(
+            f.session.rank_calls.load(Ordering::SeqCst),
+            rank_requests,
+            "quiet incremental replay must not enumerate inventory again"
+        );
         assert_eq!(
             f.session.calls.load(Ordering::SeqCst),
             requests,

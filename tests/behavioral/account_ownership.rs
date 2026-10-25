@@ -170,7 +170,12 @@ impl Respond for OfflinePhotos {
         let path = request.url.path();
         let label = path.split('/').nth(1).unwrap();
         let value = if path.ends_with("/zones/list") {
-            json!({"zones":[]})
+            // Discovery and the pre-inventory boundary use the same scoped
+            // provider zone. Shared database enumeration stays empty.
+            json!({"zones":if path.contains("/private/") {
+                vec![json!({"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+                    "syncToken":format!("{label}-baseline"),"deleted":false})]
+            } else {vec![]}})
         } else if body
             .get("query")
             .and_then(|query| query.get("recordType"))

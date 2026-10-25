@@ -77,6 +77,12 @@ impl PhotosSession for Session {
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
         let request: Value = serde_json::from_str(&body)?;
+        if url.ends_with("/zones/list") {
+            assert_eq!(request, json!({}));
+            return Ok(crate::sync_loop::test_support::baseline_zone_response(
+                "PrimarySync",
+            ));
+        }
         if request["query"]["recordType"] == "CheckIndexingState" {
             return Ok(
                 json!({"records":[{"fields":{"state":{"value":*self.indexing.as_ref().unwrap().readiness.lock().unwrap()}}}]}),
