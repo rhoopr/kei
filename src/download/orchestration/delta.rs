@@ -961,29 +961,10 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
             continue;
         }
 
-        let master_record_name = if let Some(master) = event.master_record_name.as_deref() {
-            Some(master.to_string())
-        } else if let Some(db) = &config.state_db {
-            match db
-                .get_master_record_name_for_asset(&config.library, &event.record_name)
-                .await
-            {
-                Ok(master) => master,
-                Err(e) => {
-                    summary.state_transition_failures += 1;
-                    summary.block_identity();
-                    tracing::warn!(
-                        asset_record_name = %event.record_name,
-                        library = %config.library,
-                        error = %e,
-                        "Failed to resolve asset-only delta through persisted mapping"
-                    );
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
+        // A saved mapping describes an earlier observation. Missing current
+        // masterRef must use the same scoped source lookup and retry budget as
+        // any other unresolved source, without changing the historical mapping.
+        let master_record_name = event.master_record_name.as_deref().map(str::to_owned);
 
         match master_record_name {
             Some(master_record_name) => {

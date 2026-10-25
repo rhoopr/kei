@@ -2793,3 +2793,134 @@ async fn issue958_cancel_paged_scan_explains_orphan_buffer_warning() {
 
 #[path = "album_progress_tests.rs"]
 mod album_progress_tests;
+
+#[tokio::test]
+async fn mapped_unresolved_source_honors_saved_retry_deadline() {
+    use crate::icloud::photos::asset::DeltaRecordBuffer;
+    use crate::state::SparseIdentityStore as _;
+    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+    let record = crate::test_helpers::sparse_shared_asset_record();
+    let mut buffer = DeltaRecordBuffer::new();
+    let mut events = buffer.process_records(vec![serde_json::from_value(record.clone()).unwrap()]);
+    let key = events[0]
+        .sparse_share
+        .as_ref()
+        .unwrap()
+        .durable_key()
+        .unwrap();
+    let source = crate::state::SparseSourceId::new("private-sparse-child");
+    let now = chrono::Utc::now();
+    let row = db
+        .observe_sparse_identity("PrimarySync", &source, &key, now)
+        .await
+        .unwrap();
+    db.record_sparse_attempt(
+        &row,
+        crate::state::SparseAttemptOutcome::Unresolved(key),
+        now,
+    )
+    .await
+    .unwrap();
+    assert!(
+        db.sparse_identities("PrimarySync").await.unwrap()[0]
+            .next_retry
+            .unwrap()
+            > now
+    );
+    db.upsert_asset_master_mapping("PrimarySync", "private-sparse-child", "old-master")
+        .await
+        .unwrap();
+    let session = changes_zone_session_with_query_page(
+        Arc::new(AtomicUsize::new(0)),
+        vec![],
+        json!({"records":[record]}),
+        0,
+    );
+    let probe = session.clone();
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: changes_album("", session),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let mut config = test_config();
+    config.state_db = Some(db.clone() as Arc<dyn DownloadStore>);
+    let mut summary = IncrementalDeltaSummary::default();
+    hydrate_unpaired_created_asset_deltas(
+        &mut events,
+        Some(&pass),
+        &config,
+        &mut summary,
+        DownloadRunMode::Download,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(
+        probe.records_query_count(),
+        0,
+        "historical mapping bypassed a saved future retry deadline"
+    );
+}
+
+#[tokio::test]
+async fn unresolved_current_source_does_not_trust_saved_master_mapping() {
+    use crate::icloud::photos::asset::DeltaRecordBuffer;
+    #[derive(Clone)]
+    struct CurrentSource(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl crate::icloud::photos::PhotosSession for CurrentSource {
+        async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+            assert!(url.contains("/records/lookup?"));
+            let request: Value = serde_json::from_str(&body)?;
+            assert_eq!(request["records"], json!([{"recordName":"current-child"}]));
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"records":[]}))
+        }
+        fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+    db.upsert_asset_master_mapping("PrimarySync", "current-child", "old-master")
+        .await
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let album = changes_album("", CurrentSource(calls.clone()));
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::default(),
+    };
+    let mut buffer = DeltaRecordBuffer::new();
+    let mut events = buffer.process_records(vec![
+        serde_json::from_value(json!({
+            "recordName":"current-child","recordType":"CPLAsset","fields":{}
+        }))
+        .unwrap(),
+    ]);
+    let mut config = test_config();
+    config.state_db = Some(db.clone() as Arc<dyn DownloadStore>);
+    let mut summary = IncrementalDeltaSummary::default();
+    hydrate_unpaired_created_asset_deltas(
+        &mut events,
+        Some(&pass),
+        &config,
+        &mut summary,
+        DownloadRunMode::Download,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(events.iter().all(|event| event.asset.is_none()));
+    assert!(summary.identity_incomplete);
+    assert_eq!(
+        summary.token_unsafe_reason,
+        Some(ASSET_DELTA_HYDRATION_INCOMPLETE_REASON)
+    );
+    assert_eq!(
+        db.get_master_record_name_for_asset("PrimarySync", "current-child")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("old-master")
+    );
+}

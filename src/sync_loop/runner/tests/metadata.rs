@@ -3127,7 +3127,7 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
                 .map(|record| record["recordName"].as_str().unwrap())
                 .collect();
             names.sort_unstable();
-            assert_eq!(names, ["asset-recovered", "recovered"]);
+            assert!(names == ["asset-recovered"] || names == ["asset-recovered", "recovered"]);
             self.lookups
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(serde_json::json!({"records":self.records}))
@@ -3191,12 +3191,12 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
                 db.record_sparse_attempt(
                     &row,
                     SparseAttemptOutcome::Unresolved(evidence.clone()),
-                    Utc::now(),
+                    Utc::now() - chrono::TimeDelta::hours(2),
                 )
                 .await
                 .unwrap();
-                // Exact source identity bypasses a future deadline. The absent
-                // linked zone is never queried and supplies no identity proof.
+                // Make this retry due so the injected write/cancellation boundary runs.
+                // The saved mapping cannot bypass a future deadline or prove identity.
                 db.upsert_asset_master_mapping("PrimarySync", source.as_str(), "recovered")
                     .await
                     .unwrap();
@@ -3298,7 +3298,8 @@ async fn sparse_retry_omitted_source_preserves_failed_work_then_recovers_media()
                     }
                 }
             }
-            assert_eq!(lookups.load(std::sync::atomic::Ordering::Relaxed), 2);
+            // Each due attempt confirms the current child before fetching its pair.
+            assert_eq!(lookups.load(std::sync::atomic::Ordering::Relaxed), 4);
             server.verify().await;
         }
     }

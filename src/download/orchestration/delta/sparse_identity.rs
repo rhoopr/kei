@@ -252,8 +252,8 @@ impl SparseRetryContext {
         )
     }
 
-    // Select after authoritative mappings have been removed from the source-only
-    // work. Otherwise recovered rows could monopolize a held library's budget.
+    // Budget all unresolved sources. A historical mapping does not establish
+    // a current pair and cannot exempt a source from durable retry scheduling.
     pub(super) fn select_due(&mut self, sources: &FxHashMap<String, Vec<usize>>) {
         let now = Utc::now();
         let mut due: Vec<_> = self
@@ -296,7 +296,13 @@ impl SparseRetryContext {
             events
                 .get(*index)
                 .and_then(|event| event.sparse_share.as_ref())
-                .and_then(SparseShareEvidence::durable_key)
+                .and_then(|evidence| evidence.durable_key())
+                .or_else(|| {
+                    events
+                        .get(*index)
+                        .filter(|event| event.sparse_share.is_none())
+                        .map(|_| row.observed.clone())
+                })
                 .as_ref()
                 != Some(&row.observed)
         }) {
@@ -440,11 +446,19 @@ mod tests {
         for index in 0..events.len() {
             let source = events[index].record_name.as_ref();
             assert_eq!(context.permits(source, &events, &[index]), index < 100);
+            let source = source.to_owned();
+            let hint = events[index].sparse_share.take();
+            assert_eq!(
+                context.permits(&source, &events, &[index]),
+                index < 100,
+                "omitting a hint is not changed evidence or extra retry budget"
+            );
+            events[index].sparse_share = hint;
             if index < 100 {
                 // Even inconclusive (no backoff) results yield to older waiting work.
                 context
                     .record(
-                        source,
+                        &source,
                         SparseAttemptOutcome::Inconclusive,
                         &config,
                         &mut summary,
@@ -513,6 +527,12 @@ mod tests {
         context.select_due(&sources(&events));
         assert_eq!(events.len(), 1);
         assert!(!context.permits("source", &events, &[0]));
+        let hint = events[0].sparse_share.take();
+        assert!(
+            !context.permits("source", &events, &[0]),
+            "absent hint cannot bypass a saved deadline"
+        );
+        events[0].sparse_share = hint;
         assert_eq!(db.get_summary().await.unwrap().deferred_sparse_records, 1);
         events[0].sparse_share = Some(SparseShareEvidence::Malformed);
         assert!(context.permits("source", &events, &[0]));
