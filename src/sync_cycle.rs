@@ -364,7 +364,6 @@ pub(crate) enum CheckpointHoldReason {
     EnumerationIncomplete,
     StateNotDurable,
     TokenProofIncomplete,
-    LegacyPreservationIncomplete,
 }
 
 impl CheckpointHoldReason {
@@ -377,7 +376,6 @@ impl CheckpointHoldReason {
             Self::EnumerationIncomplete => "enumeration_incomplete",
             Self::StateNotDurable => "state_not_durable",
             Self::TokenProofIncomplete => "token_proof_incomplete",
-            Self::LegacyPreservationIncomplete => "legacy_preservation_incomplete",
         }
     }
 }
@@ -1404,14 +1402,9 @@ pub(crate) async fn run_cycle(
         // full scope and its final readiness check have qualified.
         Arc::make_mut(&mut download_config).provisional =
             indexing_reconciliation || !indexing_finished;
-        let managed_indexing_recovery = indexing_reconciliation
-            && (download_config.edited_naming == crate::types::EditedNaming::Primary
-                || match state_db {
-                    Some(db) => db.has_primary_layouts(&lib_state.zone_name).await?,
-                    None => false,
-                });
-        Arc::make_mut(&mut download_config).indexing_inventory_only =
-            managed_indexing_recovery && indexing_finished;
+        // Indexing recovery uses ordinary append-only matching and downloads.
+        // Historical layout bindings do not require an inventory-only pass.
+        Arc::make_mut(&mut download_config).indexing_inventory_only = false;
         if pending_download_config_hash.is_some() && path_reconciliation_has_smart_folders {
             Arc::make_mut(&mut download_config).complete_path_selection = true;
         }
@@ -1573,7 +1566,18 @@ pub(crate) async fn run_cycle(
                         lib_state.plan_is_stale,
                         CheckpointBasis::CompleteInventory,
                     );
-                    if matches!(inventory_decision, SourceCheckpointDecision::Advance { .. }) {
+                    let complete_selected_window = sync_result.checkpoint.selection_window_complete
+                        && !config.runtime.dry_run
+                        && !sync_result.checkpoint.sync_token_blocked
+                        && !sync_result.checkpoint.identity_incomplete
+                        && !sync_result.checkpoint.enumeration_incomplete
+                        && sync_result.checkpoint.enumeration_errors == 0
+                        && sync_result.checkpoint.state_write_failures == 0
+                        && !sync_result.checkpoint.interrupted
+                        && !lib_state.plan_is_stale;
+                    if matches!(inventory_decision, SourceCheckpointDecision::Advance { .. })
+                        || complete_selected_window
+                    {
                         let mut bridge_config = build_download_config(
                             download::SyncMode::Incremental {
                                 zone_sync_token: prior_token.clone(),
@@ -1952,19 +1956,11 @@ pub(crate) async fn run_cycle(
                 && indexing_finished
                 && sync_result.full_enumeration_ran
                 && library_completed_without_errors
-                && (!managed_indexing_recovery
-                    || (matches!(readiness_after, Some(Ok(true)))
-                        && download_config.recent.is_none()
-                        && download_config.skip_created_before.is_none()
-                        && download_config.skip_created_after.is_none()))
                 && let Some(db) = state_db
             {
-                // Qualify coverage without adopting its cursor. Managed
-                // inventory queued no files, so retain separate full-work debt.
-                let mut obligations = vec![(replay_key.clone(), "1".to_owned())];
-                if managed_indexing_recovery {
-                    obligations.push((materialization_key.clone(), "1".to_owned()));
-                }
+                // Qualify coverage without adopting its cursor. The next
+                // cycle still bridges the retained provider checkpoint.
+                let obligations = vec![(replay_key.clone(), "1".to_owned())];
                 match db
                     .commit_checkpoint_transition(state::CheckpointTransition {
                         expected_metadata: zone_metadata_fence.clone(),
@@ -2002,9 +1998,7 @@ pub(crate) async fn run_cycle(
             });
             sync_result.stats.sync_token_blocked_source = Some("kei");
             sync_result.stats.sync_token_blocked_explanation = Some(
-                if qualified && managed_indexing_recovery {
-                    "managed inventory qualified; full protected materialization and retained-cursor replay are still required"
-                } else if qualified {
+                if qualified {
                     "full inventory qualified; the old trusted cursor is retained for the next incremental cycle"
                 } else {
                     "a complete non-retry inventory from a FINISHED plan is still required"
@@ -2760,13 +2754,13 @@ mod tests {
     }
 
     #[test]
-    fn metadata_capture_hold_survives_report_changes_and_result_composition() {
+    fn unresolved_identity_hold_survives_report_changes_and_result_composition() {
         let mut result = download::SyncResult::from_execution(
             download::DownloadOutcome::Success,
             Some("zone-token-next".to_string()),
             download::SyncStats::default(),
         );
-        result.block_for_metadata_capture();
+        result.block_for_unresolved_identity();
         result.stats = download::SyncStats::default();
         result.accumulate(&download::SyncResult::from_execution(
             download::DownloadOutcome::Success,

@@ -562,7 +562,6 @@ pub(in crate::download) async fn build_download_result(
     // Failed tasks already retain exact provider identities and destinations.
     // Refresh those identities even for ordinary transfer failures; a failed
     // download is not evidence that the completed inventory must be repeated.
-    let refresh = crate::download::CleanupUrlRefresh::Lookup;
     let retry_plan = if let Some(context) = &config.selection_context {
         if let Some(run) = &config.selection_run {
             run.remember_retry_sources(&failed_tasks, passes, config)
@@ -577,14 +576,8 @@ pub(in crate::download) async fn build_download_result(
         )
         .await
     } else {
-        crate::download::build_retry_download_tasks(
-            passes,
-            config,
-            &failed_tasks,
-            refresh,
-            shutdown_token.clone(),
-        )
-        .await?
+        crate::download::build_retry_download_tasks(passes, &failed_tasks, shutdown_token.clone())
+            .await?
     };
     tracing::debug!(target: "kei::download::pipeline",
         count = retry_plan.tasks.len(),

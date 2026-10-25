@@ -31,8 +31,6 @@ pub(super) use planning::MetadataFlags;
 pub(super) use queued::{
     RewritePass, run_pending, run_pending_budget, run_pending_page, run_pending_rows,
 };
-#[cfg(feature = "xmp")]
-pub(super) use sidecar::write_reconciled_sidecar;
 
 #[cfg(all(test, feature = "xmp"))]
 pub(in crate::download) use embedded::publication_pause;

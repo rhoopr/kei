@@ -402,10 +402,66 @@ impl TaskPlanner {
             .plan_download_asset_with_replay(asset, config, ReservedReplay::RequestedDirectory)
             .await?;
         self.include_existing_comparison_tasks(asset, config, &mut plan);
+        self.bind_publication_tasks(asset, config, &mut plan)
+            .await?;
         if matches!(self.path_mode, PathPlanningMode::Download) && !self.managed_plan {
             self.relocate_protected_tasks(&mut plan, config).await?;
         }
         Ok(plan)
+    }
+
+    async fn bind_publication_tasks(
+        &self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        plan: &mut AssetTaskPlan,
+    ) -> Result<()> {
+        if plan.tasks.is_empty() {
+            return Ok(());
+        }
+        let (Some(album), Some(pass), Some(db)) = (
+            &config.primary_layout_source,
+            &config.primary_layout_pass,
+            &config.state_db,
+        ) else {
+            return Ok(());
+        };
+        let library = asset.source_zone().unwrap_or(config.library.as_ref());
+        let Some((capture, scope, _zone)) = album.publication_scope(library)? else {
+            return Ok(());
+        };
+        let concrete = Arc::clone(&capture.db) as Arc<dyn DownloadStore>;
+        anyhow::ensure!(
+            Arc::ptr_eq(db, &concrete),
+            "Publication source database context mismatch"
+        );
+        let binding = capture
+            .db
+            .bind_publication(
+                capture.owner,
+                crate::state::db::PublicationBinding {
+                    account_key: String::new(),
+                    provider_key: String::new(),
+                    scope,
+                    library: library.to_owned(),
+                    child: asset.asset_record_name().to_owned(),
+                    master: asset.id().to_owned(),
+                    state_id: asset.state_id().to_owned(),
+                    origin_pass: pass.clone(),
+                },
+            )
+            .await?;
+        let binding = Arc::new(binding);
+        for task in &mut plan.tasks {
+            anyhow::ensure!(
+                task.library.as_ref() == library
+                    && task.asset_id.as_ref() == asset.state_id()
+                    && task.asset_record_name.as_ref() == asset.asset_record_name(),
+                "Publication task identity differs from selected source"
+            );
+            task.publication_binding = Some(Arc::clone(&binding));
+        }
+        Ok(())
     }
 
     /// Include occupied selected paths in the comparison. Path occupancy cannot
@@ -436,6 +492,7 @@ impl TaskPlanner {
                 url: derived.url,
                 download_path: derived.path,
                 replacement_fingerprint: None,
+                publication_binding: None,
                 pending_cross_parent_root: None,
                 checksum: derived.checksum,
                 asset_id: asset.state_id_arc(),
@@ -545,6 +602,62 @@ impl TaskPlanner {
         config: &DownloadConfig,
         task: &DownloadTask,
     ) -> super::baseline_matching::BaselineMatch {
+        // Fresh fallback publications carry an authenticated compact receipt even
+        // when no active selection generation was created (for example cross-zone albums).
+        if let (Some(binding), Some(album)) =
+            (&task.publication_binding, &config.primary_layout_source)
+        {
+            let capture = match album.publication_scope(&task.library) {
+                Ok(Some((capture, scope, _))) if scope == binding.scope => capture,
+                _ => return super::baseline_matching::BaselineMatch::Uncertain,
+            };
+            let db = &capture.db;
+            match db
+                .bound_download_receipts(
+                    binding.as_ref().clone(),
+                    task.version_size.as_str().into(),
+                    task.checksum.to_string(),
+                    task.size,
+                )
+                .await
+            {
+                Ok(receipts) => {
+                    for receipt in receipts {
+                        if self.has_durable_destination(task)
+                            && task.download_path != receipt.native_path.to_path()
+                        {
+                            return super::baseline_matching::BaselineMatch::Uncertain;
+                        }
+                        match super::file::retain_pending_file(
+                            &config.directory,
+                            &receipt.native_path.to_path(),
+                        )
+                        .await
+                        {
+                            Ok(None) => continue,
+                            Ok(Some(file))
+                                if data_encoding::HEXLOWER.encode(&file.fingerprint.sha256)
+                                    == receipt.local_checksum
+                                    && (receipt.source_checksum != receipt.local_checksum
+                                        || file.fingerprint.size == task.size) =>
+                            {
+                                return super::baseline_matching::BaselineMatch::RecordedPresent {
+                                    receipt,
+                                    file,
+                                };
+                            }
+                            // A saved scoped native destination remains a candidate after
+                            // compatibility rows retire or the configured template changes.
+                            // Changed bytes and unreadable paths must not become new downloads.
+                            Ok(Some(_)) | Err(_) => {
+                                return super::baseline_matching::BaselineMatch::Uncertain;
+                            }
+                        }
+                    }
+                }
+                Err(_) => return super::baseline_matching::BaselineMatch::Uncertain,
+            }
+        }
         let derived = super::filter::derive_expected_paths(asset, config);
         let requested = derived
             .iter()
@@ -692,6 +805,8 @@ impl TaskPlanner {
             .plan_download_asset_with_replay(asset, config, ReservedReplay::PendingRetry)
             .await?;
         self.include_existing_comparison_tasks(asset, config, &mut plan);
+        self.bind_publication_tasks(asset, config, &mut plan)
+            .await?;
         Ok(plan)
     }
 
@@ -988,35 +1103,6 @@ impl TaskPlanner {
             .expect("ordinary download planning uses infallible spelling-only path keys")
     }
 
-    pub(super) async fn plan_reconciliation_asset(
-        &mut self,
-        asset: &PhotoAsset,
-        config: &DownloadConfig,
-    ) -> Result<AssetTaskPlan> {
-        let primary_path = if let Some(primary) =
-            super::filter::derive_expected_paths(asset, config)
-                .iter()
-                .find(|path| path.version_size.is_primary_media())
-        {
-            self.verified_downloaded_path(asset, config, primary.version_size)
-                .await
-        } else {
-            None
-        };
-        let primary_filename = primary_path
-            .as_deref()
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str());
-        self.plan_owned_asset(
-            asset,
-            config,
-            PathPlanningMode::Reconciliation,
-            primary_filename,
-            ReservedReplay::RequestedDirectory,
-        )
-        .await
-    }
-
     async fn plan_owned_asset(
         &mut self,
         asset: &PhotoAsset,
@@ -1214,31 +1300,6 @@ impl TaskPlanner {
         })
     }
 
-    pub(super) fn existing_path_match(&mut self, path: &Path) -> ExistingPathMatch {
-        match self.existing_path(path) {
-            Some(found) if found == path => ExistingPathMatch::Exact,
-            Some(_) => ExistingPathMatch::AmpmVariant,
-            None => ExistingPathMatch::Missing,
-        }
-    }
-
-    pub(super) fn existing_path(&mut self, path: &Path) -> Option<std::path::PathBuf> {
-        self.existing_path_with_size(path).map(|(path, _)| path)
-    }
-
-    pub(super) fn existing_path_with_size(
-        &mut self,
-        path: &Path,
-    ) -> Option<(std::path::PathBuf, u64)> {
-        if let Some(size) = self.dir_cache.file_size(path) {
-            Some((path.to_path_buf(), size))
-        } else {
-            let variant = self.dir_cache.find_ampm_variant(path)?;
-            let size = self.dir_cache.file_size(&variant)?;
-            Some((variant, size))
-        }
-    }
-
     pub(super) async fn prepare_path_parent(&mut self, path: &Path) {
         if let Some(parent) = path.parent() {
             self.dir_cache.ensure_dir_async(parent).await;
@@ -1385,13 +1446,6 @@ pub(super) struct AssetTaskPlan {
     pub(super) tasks: Vec<DownloadTask>,
     pub(super) filter_reason: Option<FilterReason>,
     pub(super) malformed_resource: Option<MalformedTaskResource>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ExistingPathMatch {
-    Exact,
-    AmpmVariant,
-    Missing,
 }
 
 /// Persist the pending state row that a later `mark_downloaded` /
@@ -1733,57 +1787,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconciliation_planner_reuses_each_live_photo_family_across_passes() {
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(tmp.path());
-        let first_asset = TestPhotoAsset::new("FIRST")
-            .filename("IMG_0001.JPG")
-            .live_photo(
-                "https://p01.icloud-content.com/first.mov",
-                "first-motion",
-                1000,
-            )
-            .build();
-        let second_asset = TestPhotoAsset::new("SECOND")
-            .filename("IMG_0001.JPG")
-            .live_photo(
-                "https://p01.icloud-content.com/second.mov",
-                "second-motion",
-                1000,
-            )
-            .build();
-        let mut planner = TaskPlanner::for_reconciliation(Vec::new(), Vec::new()).unwrap();
-        let first = planner
-            .plan_reconciliation_asset(&first_asset, &config)
-            .await
-            .unwrap();
-        let second = planner
-            .plan_reconciliation_asset(&second_asset, &config)
-            .await
-            .unwrap();
-        assert_eq!(first.tasks.len(), 2);
-        assert_eq!(second.tasks.len(), 2);
-        let paths: FxHashSet<_> = first
-            .tasks
-            .iter()
-            .chain(&second.tasks)
-            .map(|task| &task.download_path)
-            .collect();
-        assert_eq!(paths.len(), 4);
-        for (asset, previous) in [(&second_asset, &second), (&first_asset, &first)] {
-            let repeated = planner
-                .plan_reconciliation_asset(asset, &config)
-                .await
-                .unwrap();
-            assert_eq!(repeated.tasks.len(), previous.tasks.len());
-            for (actual, expected) in repeated.tasks.iter().zip(&previous.tasks) {
-                assert_eq!(actual.version_size, expected.version_size);
-                assert_eq!(actual.download_path, expected.download_path);
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn planner_routes_existing_same_size_file_to_identity_path() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -2073,10 +2076,7 @@ mod tests {
         let config = test_config(root.path());
         let asset = TestPhotoAsset::new("LEGACY").filename("legacy.JPG").build();
         let mut planner = TaskPlanner::for_reconciliation(Vec::new(), Vec::new()).unwrap();
-        let initial = planner
-            .plan_reconciliation_asset(&asset, &config)
-            .await
-            .unwrap();
+        let initial = planner.plan_download_asset(&asset, &config).await.unwrap();
         let task = &initial.tasks[0];
         let legacy_path = task.download_path.clone();
         let mut legacy = planner.reconciliation_reservations()[0].clone();
@@ -2139,10 +2139,7 @@ mod tests {
             .clone()
             .with_source_zone(Arc::from("SharedSync-abc"));
         let mut planner = TaskPlanner::for_reconciliation(Vec::new(), Vec::new()).unwrap();
-        let initial = planner
-            .plan_reconciliation_asset(&shared, &config)
-            .await
-            .unwrap();
+        let initial = planner.plan_download_asset(&shared, &config).await.unwrap();
         let shared_path = initial.tasks[0].download_path.clone();
         db.reserve_reconciliation_paths(planner.reconciliation_reservations())
             .await
@@ -2235,3 +2232,7 @@ mod tests {
 #[cfg(test)]
 #[path = "planner/baseline_discovery_tests.rs"]
 mod baseline_discovery_tests;
+
+#[cfg(test)]
+#[path = "planner/compact_receipt_tests.rs"]
+mod compact_receipt_tests;

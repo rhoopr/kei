@@ -78,6 +78,7 @@ fn task(path: std::path::PathBuf, id: &str, size: u64) -> DownloadTask {
         url: "synthetic".into(),
         download_path: path,
         replacement_fingerprint: None,
+        publication_binding: None,
         pending_cross_parent_root: None,
         checksum: "AAAA".into(),
         asset_id: id.into(),

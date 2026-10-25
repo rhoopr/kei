@@ -14,7 +14,7 @@ use wiremock::{Mock, ResponseTemplate};
 use crate::commands::{AlbumPass, PassKind};
 use crate::download;
 use crate::icloud::photos::{PhotoLibrary, PhotosSession};
-use crate::state::{DownloadStateStore, MetadataRewriteStore, SqliteStateDb};
+use crate::state::{DownloadStateStore, SqliteStateDb};
 use crate::sync_cycle::{run_cycle, sync_token_key};
 use crate::sync_loop::test_support::{
     album_count_response, full_album_page_with_download, make_run_cycle_config,
@@ -591,6 +591,10 @@ async fn baseline_contract(
         }];
         let mut selected = make_run_cycle_library_state_with_passes(ZONE, &token_key, passes);
         selected.library = library;
+        if cycle == 0 {
+            recorded_only::seed(&selected.library, db.as_ref()).await;
+            raw_replay::seed(&selected.library, db.as_ref()).await;
+        }
         let base_builder = make_run_cycle_download_config_builder(&root, db.clone());
         if primary_template_change && cycle == 0 {
             // Persist the genuine prior path configuration through the existing
@@ -649,12 +653,16 @@ async fn baseline_contract(
             if primary_template_change {
                 configured.edited_naming = crate::types::EditedNaming::Primary;
             }
+            if recorded_only::enabled() && cycle == 2 {
+                configured.folder_structure = "changed-template".into();
+            }
             configured.metadata.xmp_sidecar = metadata_enabled;
             if initial_failure {
                 configured.retry.max_retries = 0;
             }
             Arc::new(configured)
         };
+        raw_replay::startup(&selected.library).await;
         let result = run_cycle(
             &[&selected],
             &config,
@@ -717,6 +725,7 @@ async fn baseline_contract(
                 assert_eq!(std::fs::read(stage).unwrap(), *bytes);
             }
         }
+        recorded_only::assert_unadmitted(db.as_ref());
         assert_eq!(std::fs::read(&old_path).unwrap(), MEDIA);
         assert_eq!(
             std::fs::metadata(&old_path).unwrap().modified().unwrap(),
@@ -987,6 +996,17 @@ async fn baseline_contract(
             .iter()
             .all(|(_, b)| !b.to_string().contains(OLD_TOKEN))
     );
+    if recorded_only::enabled() {
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(url, body)| !url.contains("/records/lookup")
+                    || !body.to_string().contains("old-only-unadmitted")),
+            "legacy catalog alone must never cause current lookup"
+        );
+    }
     server.verify().await;
 }
 
@@ -1113,3 +1133,21 @@ async fn v027_bound_baseline_unaccountable_inventory_keeps_cursor_unset() {
 
 #[path = "v027_provider_signature.rs"]
 mod provider_signature;
+
+mod recorded_only;
+
+mod modified_publication;
+
+mod fallback_publication;
+
+mod selected_coverage;
+
+mod selected_albums;
+
+mod historical_pending;
+
+mod independent_retry;
+
+mod raw_replay;
+
+mod indexing_layout;

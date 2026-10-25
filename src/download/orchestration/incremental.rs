@@ -16,8 +16,7 @@ use crate::download::metadata_rewrite::CaptureTimestampRepair;
 use crate::download::pipeline::{
     AUTH_ERROR_THRESHOLD, MetadataFlags, PassConfig, StreamRuntime, build_download_outcome,
     format_duration, log_sync_summary, mark_reserved_pending_task, run_download_pass,
-    state_confirmed_current_path_exists, stream_and_download_from_stream,
-    validate_enumerated_reserved_pending,
+    stream_and_download_from_stream, validate_enumerated_reserved_pending,
 };
 use crate::download::{filter, metadata_rewrite, planner};
 use crate::icloud::photos::PhotoAsset;
@@ -678,6 +677,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
 
     let phase_started = Instant::now();
     let downloadable_before_relation_hydration = downloadable_assets.len();
+    let complete_before_relation_hydration = complete_delta_assets.len();
     {
         let mut hydration_context = IncrementalAssetHydrationContext {
             asset_to_master: &mut delta.asset_to_master,
@@ -760,6 +760,38 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                     .summary
                     .token_unsafe_reason
                     .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
+            }
+        }
+    }
+    if config.selection_context.is_some() {
+        for asset in complete_delta_assets
+            .iter()
+            .skip(complete_before_relation_hydration)
+        {
+            match route_incremental_asset_to_passes(
+                asset,
+                &routing,
+                &selected_container_ids,
+                config,
+            )
+            .await
+            {
+                Ok(indices) => {
+                    for index in indices {
+                        if !downloadable_assets.iter().any(|(prior, pass)| {
+                            *pass == index && prior.asset_record_name() == asset.asset_record_name()
+                        }) {
+                            downloadable_assets.push((asset.clone(), index));
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Failed to route current relation target");
+                    delta
+                        .summary
+                        .token_unsafe_reason
+                        .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
+                }
             }
         }
     }
@@ -1125,43 +1157,62 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         }
 
         let mut state_skipped = 0usize;
+        let mut uncertain_matches = 0usize;
         let planned_tasks = std::mem::take(&mut plan.tasks);
         plan.tasks.reserve(planned_tasks.len());
         for task in planned_tasks {
-            let keep = match download_ctx.should_download_fast(
-                &task.library,
-                &task.asset_id,
-                task.version_size,
-                &task.checksum,
-                false,
-            ) {
-                Some(false) => {
-                    state_skipped = state_skipped.saturating_add(1);
-                    false
-                }
-                None => {
-                    let exists = state_confirmed_current_path_exists(
-                        &download_ctx,
-                        effective_config,
-                        asset,
-                        &task,
-                        &mut task_planner,
-                    )
-                    .await
-                    .is_some();
-                    if exists {
-                        state_skipped = state_skipped.saturating_add(1);
+            let decision = task_planner
+                .match_existing(asset, effective_config, &task)
+                .await;
+            match decision {
+                crate::download::baseline_matching::BaselineMatch::Missing => plan.tasks.push(task),
+                crate::download::baseline_matching::BaselineMatch::Uncertain => {
+                    uncertain_matches = uncertain_matches.saturating_add(1);
+                    if controls.run_mode.downloads_files() {
+                        if let Some(db) = &effective_config.state_db {
+                            if db
+                                .defer_baseline_match(&planner::pending_record_for_task(
+                                    effective_config,
+                                    asset,
+                                    &task,
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                planning_state_write_failures =
+                                    planning_state_write_failures.saturating_add(1);
+                            }
+                        } else {
+                            planning_state_write_failures =
+                                planning_state_write_failures.saturating_add(1);
+                        }
                     }
-                    !exists
+                    tracing::warn!(
+                        "Existing collecting file match remains uncertain; retaining pending work"
+                    );
                 }
-                Some(true) => true,
-            };
-            if keep {
-                plan.tasks.push(task);
+                positive => {
+                    state_skipped = state_skipped.saturating_add(1);
+                    if controls.run_mode.downloads_files()
+                        && let Err(error) = crate::download::baseline_matching::commit_match(
+                            positive,
+                            effective_config,
+                            asset,
+                            &task,
+                            &shutdown_token,
+                        )
+                        .await
+                    {
+                        planning_state_write_failures =
+                            planning_state_write_failures.saturating_add(1);
+                        tracing::warn!(%error,"Collecting existing-file receipt remains pending");
+                    }
+                }
             }
         }
         skip_breakdown.by_state = skip_breakdown.by_state.saturating_add(state_skipped);
-        if plan.tasks.is_empty() && state_skipped == 0 {
+        skip_breakdown.uncertain = skip_breakdown.uncertain.saturating_add(uncertain_matches);
+        if plan.tasks.is_empty() && state_skipped == 0 && uncertain_matches == 0 {
             skip_breakdown.on_disk += 1;
         }
 

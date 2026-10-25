@@ -7,7 +7,6 @@ use crate::icloud::photos::album::test_support::{
     canned_changes_page, changes_asset, changes_master, default_zone, make_album_with_session,
 };
 use crate::icloud::photos::session::{DiagnosticLookupError, PhotosSession};
-use crate::test_helpers::TracingCapture;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::{
@@ -183,7 +182,6 @@ impl PhotosSession for Session {
 }
 
 async fn run_case(mode: &'static str, replacement: bool, reply: Value) -> (Value, usize) {
-    let (capture, _guard) = TracingCapture::install();
     let mut sparse = child("master");
     sparse["fields"]
         .as_object_mut()
@@ -252,32 +250,34 @@ async fn run_case(mode: &'static str, replacement: bool, reply: Value) -> (Value
         cancel: cancel.clone(),
     };
     let album = make_album_with_session(100, Box::new(session));
-    let error = album
-        .legacy_preservation_inventory(
+    let inventory = album
+        .scan_legacy_preservation_records(
             &masters(),
             &cancel,
-            if mode == "tracking_limit" {
-                super::super::InventoryBudget {
-                    records: 200,
-                    retained_bytes: 128 * 1024,
-                    ..BUDGET
-                }
-            } else {
-                BUDGET
+            super::super::InventoryBudget {
+                records: 200,
+                retained_bytes: 128 * 1024,
+                ..BUDGET
             },
+            &mut super::super::LegacyInventoryDiagnostic::default(),
         )
         .await
-        .unwrap_err();
-    let d = super::super::classify_legacy_inventory_error(&error).unwrap();
-    assert_eq!(d.subreason, "child_master_reference_missing");
-    assert!(d.eof_observed);
-    assert_eq!(d.family_context, "unknown");
-    let events = capture.events();
-    let event = events
-        .iter()
-        .find(|e| e.field("diagnostic") == Some("support_missing_reference_v1"))
         .unwrap();
-    let fields: Value = serde_json::from_str(event.field("support_fields").unwrap()).unwrap();
+    let (record, _, observation) = inventory
+        .latest
+        .values()
+        .filter(|(record, _, _)| {
+            record.record_type == "CPLAsset" && record.fields.pointer("/masterRef/value").is_none()
+        })
+        .min_by_key(|(record, _, _)| &record.record_name)
+        .unwrap();
+    let lookup = album
+        .lookup_missing_reference(&record.record_name, &masters(), &cancel)
+        .await;
+    let fields = json!({"record_history":observation.history,"prior_reference":observation.prior_reference,
+        "sparse_marker":observation.sparse_marker,"linkage":observation.linkage,
+        "lookup_outcome":lookup.outcome,"lookup_family":lookup.family,
+        "lookup_scope":lookup.scope,"lookup_shape":lookup.shape});
     let printed = fields.to_string();
     assert!(!printed.contains("private"));
     assert!(!printed.contains("secret"));
@@ -286,7 +286,7 @@ async fn run_case(mode: &'static str, replacement: bool, reply: Value) -> (Value
 
 #[tokio::test]
 async fn missing_reference_lookup_is_bounded_and_never_repairs_inventory() {
-    // Both a useful lookup and every failure leave the same original refusal.
+    // Lookup observations never mutate or hydrate the retained scan records.
     for (mode, reply, expected) in [
         ("ok", json!({"records":[]}), "omitted"),
         ("ok", json!({"records":[child("master")]}), "live_reference"),
@@ -332,7 +332,7 @@ fn missing_reference_observations_describe_only_immediate_retained_history() {
 }
 
 #[tokio::test]
-async fn missing_reference_replacement_lookup_keeps_original_refusal() {
+async fn missing_reference_replacement_lookup_keeps_original_observation() {
     let (fields, calls) = run_case("ok", true, json!({"records":[child("master")]})).await;
     assert_eq!(calls, 1);
     assert_eq!(fields["record_history"], "replacement");
@@ -371,7 +371,6 @@ async fn missing_reference_regression_observations_cover_tracking_and_identity_l
 
 #[tokio::test]
 async fn missing_reference_precancelled_probe_starts_no_request() {
-    let (capture, _guard) = TracingCapture::install();
     let calls = Arc::new(AtomicUsize::new(0));
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -383,16 +382,11 @@ async fn missing_reference_precancelled_probe_starts_no_request() {
         cancel: cancel.clone(),
     };
     let album = make_album_with_session(100, Box::new(session));
-    let record = serde_json::from_value(child("master")).unwrap();
-    album
-        .observe_missing_reference(&record, Observation::unavailable(), &masters(), &cancel)
+    let result = album
+        .lookup_missing_reference("private-child", &masters(), &cancel)
         .await;
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(capture.events().iter().any(|event| {
-        event
-            .field("support_fields")
-            .is_some_and(|value| value.contains("cancelled"))
-    }));
+    assert_eq!(result.outcome, "cancelled");
 }
 
 #[test]
@@ -436,7 +430,6 @@ fn issue845f_compaction_preserves_references_and_valid_sparse_link_is_not_member
 #[tokio::test]
 async fn missing_reference_regression_observations_cover_every_live_eof_candidate() {
     for seed in 0..8 {
-        let (capture, _guard) = TracingCapture::install();
         let records: Vec<Value> = (0..128)
             .map(|index| {
                 let mut record = child("master");
@@ -462,32 +455,12 @@ async fn missing_reference_regression_observations_cover_every_live_eof_candidat
             cancel: cancel.clone(),
         };
         let album = make_album_with_session(100, Box::new(session));
-        let error = album
-            .legacy_preservation_inventory(
-                &masters(),
-                &cancel,
-                super::super::InventoryBudget {
-                    records: 200,
-                    retained_bytes: 128 * 1024,
-                    ..BUDGET
-                },
-            )
-            .await
-            .unwrap_err();
-        let diagnostic = super::super::classify_legacy_inventory_error(&error).unwrap();
-        assert_eq!(diagnostic.subreason, "child_master_reference_missing");
-        assert!(diagnostic.eof_observed);
-        assert_eq!(diagnostic.records, 128);
+        let report = album.missing_reference_inventory(&cancel).await;
+        assert_eq!(report["scan"], "eof_observed");
+        assert_eq!(report["counts"]["records"], 128);
+        assert_eq!(report["missing_references"], 128);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let events = capture.events();
-        let event = events
-            .iter()
-            .find(|event| event.field("diagnostic") == Some("support_missing_reference_v1"))
-            .unwrap();
-        let fields: Value = serde_json::from_str(event.field("support_fields").unwrap()).unwrap();
-        assert_eq!(fields["record_history"], "first_seen");
-        assert_eq!(fields["sparse_marker"], "true");
-        assert_eq!(fields["linkage"], "partial_fields");
+        assert!(!report.to_string().contains("private-link"));
     }
 }
 

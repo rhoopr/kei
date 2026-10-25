@@ -35,7 +35,7 @@ fn parity_rows(f: &Fixture) -> Vec<Vec<rusqlite::types::Value>> {
 }
 
 #[tokio::test]
-async fn v027_current_admission_does_not_require_new_parity_shadow_writes() {
+async fn v027_retained_retry_does_not_require_new_parity_shadow_writes() {
     let mut f = Fixture::new().await;
     f.capture(
         records("m", OLD, "historical observation"),
@@ -74,6 +74,12 @@ async fn v027_current_admission_does_not_require_new_parity_shadow_writes() {
         f.db.capture_selection_shadow(owner(), manifest.clone(), MAX_SELECTION_BYTES)
             .await
             .unwrap();
+    // Compatibility admission resumes an explicitly recorded retry. A bare
+    // historical catalog observation must not schedule fresh work.
+    f.db.acquire_lock("seed already-recorded retry").unwrap().execute(
+        "INSERT INTO provider_work_retries(page_id,ordinal,config_hash,attempts,last_attempt_at,next_retry_at) VALUES(?1,?2,?3,1,0,1)",
+        rusqlite::params![plan.source.page.id.0, plan.source.ordinal, plan.config_hash],
+    ).unwrap();
     let old_parity = parity_rows(&f);
     assert!(!old_parity.is_empty());
     *f.session.records.lock().unwrap() = records("m", CURRENT, "new current confirmation");
@@ -144,9 +150,15 @@ async fn v027_current_admission_does_not_require_new_parity_shadow_writes() {
         "invalid current master-child pair entered queue"
     );
     assert_eq!(f.queue(), queue);
-    assert!(
-        f.count("provider_work_retries") > 0,
-        "unresolved source lost independent retry"
+    assert_eq!(
+        f.count("provider_work_retries"),
+        0,
+        "unadmitted historical source must not create fresh retry work"
+    );
+    assert_eq!(
+        f.session.calls.load(Ordering::SeqCst),
+        calls,
+        "unadmitted historical source must not trigger provider lookup"
     );
     assert!(parity_rows(&f) == old_parity);
     f.preserved().await;

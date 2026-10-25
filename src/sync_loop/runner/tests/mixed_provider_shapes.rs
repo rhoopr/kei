@@ -1013,9 +1013,9 @@ fn mixed_history_replay_round_trip() {
     assert_eq!(CYCLES, 6, "replay cannot extend the cycle cap");
 }
 
-// Reduction: one zone, no albums or Live Photo, one reconciliation call.
+// Recorded-journal recovery must preserve unrelated historical ownership debt.
 #[tokio::test]
-async fn mixed_legacy_reservation_blocks_preparation_repro() {
+async fn mixed_recorded_recovery_preserves_legacy_debt_without_new_reservations() {
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("state.db");
     let media = dir.path().join("media");
@@ -1111,15 +1111,22 @@ async fn mixed_legacy_reservation_blocks_preparation_repro() {
         Arc::new(Default::default()),
         Arc::from(ZONES[0]),
     );
-    let result =
-        crate::download::reconcile_catalog_paths(&passes, config, CancellationToken::new())
-            .await
-            .unwrap();
+    let result = crate::download::recover_recorded_sources(
+        &reqwest::Client::new(),
+        &passes,
+        config,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert!(
         result.complete,
-        "independent catalogue paths are reconciled"
+        "recorded journal recovery finishes without layout planning"
     );
-    assert_eq!(result.stats.downloaded, 0, "independent receipt is reused");
+    assert_eq!(
+        result.stats.downloaded, 0,
+        "recovery does not copy existing media"
+    );
     assert_eq!(
         rows(
             &database,
@@ -1127,7 +1134,7 @@ async fn mixed_legacy_reservation_blocks_preparation_repro() {
         )
         .len(),
         1,
-        "path completion cannot clear the legacy capture hold"
+        "journal recovery cannot clear historical capture debt"
     );
     drop(build);
     drop(db);

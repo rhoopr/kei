@@ -1,20 +1,8 @@
-//! Preserve historical evidence without assigning it to a current provider child.
-//! Retained paths and source journals keep their existing safety checks.
-//! Normal source progress no longer requires historical archive certification.
-
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-
-use anyhow::Context;
-use rustc_hash::FxHashSet;
-#[cfg(test)]
-use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use sha2::{Digest, Sha256};
-use tokio_util::sync::CancellationToken;
-
+//! Read-only file and path guards for retained historical work.
 use super::{DownloadConfig, DownloadStore};
 use crate::state::LegacyFileEvidence;
+use std::path::{Path, PathBuf};
+use tokio_util::sync::CancellationToken;
 
 /// Recovery scans a shared root, so its deny set must include every library.
 pub(crate) async fn protected_replacement_paths(
@@ -37,205 +25,6 @@ pub(in crate::download) async fn current_path_is_independent(
             != crate::state::db::SourceMetadataRecovery::ProtectedLegacy)
 }
 
-#[cfg(test)]
-const INVENTORY_RETRY_PREFIX: &str = "legacy_preservation_inventory_retry:";
-#[cfg(test)]
-const INVENTORY_RETRY_SECONDS: i64 = 60 * 60;
-
-#[cfg(test)]
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InventoryRetry {
-    version: u8,
-    signature: String,
-    next_attempt_at: i64,
-}
-
-#[cfg(test)]
-impl InventoryRetry {
-    fn deferred(&self, signature: &str, now: i64) -> bool {
-        self.version == 1
-            && self.signature == signature
-            && self.next_attempt_at > now
-            && self.next_attempt_at <= now.saturating_add(INVENTORY_RETRY_SECONDS)
-    }
-}
-
-#[cfg(test)]
-fn inventory_retry_signature(
-    config_hash: &str,
-    candidates: &[crate::state::db::LegacyPreparationSnapshot],
-) -> anyhow::Result<String> {
-    let mut evidence = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let mut original: serde_json::Value = serde_json::from_str(&candidate.evidence)?;
-        let tables = original
-            .get_mut("evidence")
-            .and_then(serde_json::Value::as_object_mut)
-            .context("Missing legacy preparation evidence")?;
-        // Retry timestamps and cycle counters do not change the historical
-        // family. All original receipt, owner, path and relationship facts stay
-        // in the signature; preparation still compares the entire snapshot.
-        tables.remove("metadata_capture_retries");
-        tables.remove("capture_state_at_preparation");
-        if let Some(history) = tables.get_mut("family_history")
-            && let Some(index) = history
-                .get("columns")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|columns| {
-                    columns
-                        .iter()
-                        .position(|column| column.as_str() == Some("updated_at"))
-                })
-        {
-            // Replaying an unchanged child refreshes this bookkeeping timestamp.
-            // Preserve relation identities in the signature, and retain the full
-            // unmodified table in the eventual preparation snapshot.
-            let rows = history
-                .get_mut("rows")
-                .and_then(serde_json::Value::as_array_mut)
-                .context("Missing legacy family history rows")?;
-            for row in rows {
-                *row.as_array_mut()
-                    .and_then(|values| values.get_mut(index))
-                    .context("Invalid legacy family history row")? = serde_json::Value::Null;
-            }
-        }
-        evidence.push(original);
-    }
-    let encoded = serde_json::to_vec(&(
-        1,
-        config_hash,
-        crate::state::METADATA_CAPTURE_REVISION,
-        evidence,
-    ))?;
-    Ok(data_encoding::HEXLOWER.encode(&Sha256::digest(encoded)))
-}
-
-#[derive(Debug, thiserror::Error)]
-enum LegacyFileError {
-    #[error("Legacy preservation requires independent file objects")]
-    SharedFileLinks,
-}
-
-#[cfg(test)]
-fn classify_legacy_file_error(error: &anyhow::Error) -> Option<&'static str> {
-    match error.downcast_ref::<LegacyFileError>() {
-        Some(LegacyFileError::SharedFileLinks) => Some("shared_file_links"),
-        None => None,
-    }
-}
-
-/// Only owning call sites supply these fixed labels. Private source errors stay
-/// in the chain for typed inventory/file classification, never ordinary logs.
-#[cfg(test)]
-#[derive(Debug, thiserror::Error)]
-#[error("Legacy current evidence refused ({0})")]
-struct LegacyProofRefusal(&'static str);
-
-#[cfg(test)]
-fn classify_legacy_proof_refusal(error: &anyhow::Error) -> &'static str {
-    error
-        .downcast_ref::<LegacyProofRefusal>()
-        .map_or("unclassified", |refusal| refusal.0)
-}
-
-#[cfg(test)]
-pub(crate) fn log_preservation_hold(stage: &'static str, error: &anyhow::Error) {
-    if let Some(diagnostic) = crate::icloud::photos::classify_legacy_inventory_error(error) {
-        tracing::warn!(
-            stage,
-            reason = diagnostic.reason,
-            diagnostic = "legacy_inventory_failure_v2",
-            phase = diagnostic.phase,
-            subreason = diagnostic.subreason,
-            eof_observed = diagnostic.eof_observed,
-            family_context = diagnostic.family_context,
-            child_soft_deleted = diagnostic.child_soft_deleted,
-            pages = diagnostic.pages,
-            records = diagnostic.records,
-            transferred_bytes = diagnostic.transferred_bytes,
-            retained_bytes = diagnostic.retained_bytes,
-            scope_mismatch_component = diagnostic.scope_mismatch_component,
-            expected_owner = diagnostic.expected_owner,
-            expected_owner_type = diagnostic.expected_owner_type,
-            supplied_owner = diagnostic.supplied_owner,
-            supplied_owner_type = diagnostic.supplied_owner_type,
-            elapsed_secs = diagnostic.elapsed_secs,
-            page_budget = diagnostic.page_budget,
-            record_budget = diagnostic.record_budget,
-            page_byte_budget = diagnostic.page_byte_budget,
-            retained_byte_budget = diagnostic.retained_byte_budget,
-            "Legacy preservation inventory unavailable; retaining attribution checkpoint hold"
-        );
-    } else if let Some(reason) = classify_legacy_file_error(error) {
-        tracing::warn!(
-            stage,
-            reason,
-            "Legacy preservation files unavailable; retaining attribution checkpoint hold"
-        );
-    } else {
-        // Provider errors and file/state errors can contain private identifiers,
-        // URLs or paths. Only a fixed category reaches ordinary logs.
-        tracing::warn!(
-            stage,
-            reason = "current_evidence_incomplete",
-            diagnostic = "legacy_certification_refusal_v1",
-            subreason = classify_legacy_proof_refusal(error),
-            "Legacy preservation evidence incomplete; retaining attribution checkpoint hold"
-        );
-    }
-}
-
-/// The opt-in trusts every alias of these qualified evidence paths. Counts
-/// describe paths, not physical files. Last-owner Drop also covers early exits
-/// and cancellation while an actual blocking check still owns the tracker.
-#[derive(Default)]
-struct HardlinkTrust {
-    paths: Mutex<FxHashSet<PathBuf>>,
-}
-
-impl Drop for HardlinkTrust {
-    fn drop(&mut self) {
-        let affected_paths = self
-            .paths
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len();
-        if affected_paths != 0 {
-            tracing::warn!(
-                affected_paths,
-                diagnostic = "legacy_preservation_hardlink_trust",
-                "Legacy preservation hardlink trust used in one library cycle; coordination of file contents, metadata and managed names is assumed"
-            );
-        }
-    }
-}
-
-fn check_link_count(
-    result: std::io::Result<u64>,
-    path: &Path,
-    trust: Option<&Arc<HardlinkTrust>>,
-) -> anyhow::Result<()> {
-    let links = result?;
-    anyhow::ensure!(links > 0, "Legacy preservation file has no live links");
-    if links > 1 {
-        let trust = trust.ok_or(LegacyFileError::SharedFileLinks)?;
-        let first_use = trust
-            .paths
-            .lock()
-            .map_err(|_poison| anyhow::anyhow!("Legacy hardlink trust tracker unavailable"))?
-            .insert(path.to_path_buf());
-        if first_use {
-            tracing::debug!(
-                link_count = links,
-                "Legacy preservation used explicit hardlink trust for a qualified evidence path"
-            );
-        }
-    }
-    Ok(())
-}
-
 fn sidecar(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".xmp");
@@ -255,7 +44,6 @@ pub(in crate::download) async fn strict_current_file(
         required,
         &config.temp_suffix,
         cancel,
-        None,
     )
     .await
 }
@@ -266,7 +54,6 @@ async fn fingerprint(
     required: bool,
     temp_suffix: &str,
     cancel: &CancellationToken,
-    hardlink_trust: Option<&Arc<HardlinkTrust>>,
 ) -> anyhow::Result<LegacyFileEvidence> {
     anyhow::ensure!(!cancel.is_cancelled(), "Legacy preservation cancelled");
     anyhow::ensure!(
@@ -276,7 +63,6 @@ async fn fingerprint(
     let root_owned = root.to_path_buf();
     let path_owned = path.to_path_buf();
     let suffix = temp_suffix.to_owned();
-    let hardlink_trust = hardlink_trust.cloned();
     let present = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let confined = crate::fs_util::ConfinedPath::open(
             &root_owned,
@@ -298,11 +84,11 @@ async fn fingerprint(
         }
         let file = confined.open_optional_regular()?;
         if let Some(file) = &file {
-            check_link_count(
-                crate::fs_util::file_link_count(file),
-                &path_owned,
-                hardlink_trust.as_ref(),
-            )?;
+            let links = crate::fs_util::file_link_count(file)?;
+            anyhow::ensure!(
+                links == 1,
+                "Strict recovery requires an independent file object"
+            );
         }
         Ok(file.is_some())
     })
@@ -323,137 +109,52 @@ async fn fingerprint(
 }
 
 #[cfg(test)]
-async fn verify_files(
-    files: &[LegacyFileEvidence],
-    temp_suffix: &str,
-    cancel: &CancellationToken,
-    hardlink_trust: Option<&Arc<HardlinkTrust>>,
-) -> anyhow::Result<()> {
-    for expected in files {
-        let actual = fingerprint(
-            &expected.root,
-            &expected.path,
-            expected.sha256.is_some(),
-            temp_suffix,
-            cancel,
-            hardlink_trust,
-        )
-        .await?;
-        anyhow::ensure!(
-            &actual == expected,
-            "Preserved legacy bytes or sidecar presence changed"
-        );
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn provider_files(evidence: &str) -> anyhow::Result<Vec<LegacyFileEvidence>> {
-    let value: serde_json::Value = serde_json::from_str(evidence)?;
-    anyhow::ensure!(
-        value.get("version").and_then(serde_json::Value::as_u64) == Some(1),
-        "Unsupported legacy current proof version"
-    );
-    let mut files = Vec::new();
-    for child in value
-        .get("children")
-        .and_then(serde_json::Value::as_array)
-        .context("Missing legacy current children")?
-    {
-        for file in child
-            .get("files")
-            .and_then(serde_json::Value::as_array)
-            .context("Missing legacy current files")?
-        {
-            files.push(serde_json::from_value(file.clone())?);
-        }
-    }
-    anyhow::ensure!(
-        !files.is_empty(),
-        LegacyProofRefusal("current_file_evidence_missing")
-    );
-    Ok(files)
-}
-
-#[cfg(test)]
 mod tests {
-    use super::{fingerprint, provider_files, sidecar, verify_files};
+    use super::{fingerprint, sidecar};
     use tokio_util::sync::CancellationToken;
 
-    #[test]
-    fn certification_refusal_labels_never_log_private_error_context() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("warnings.log");
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .without_time()
-            .with_writer(std::sync::Mutex::new(std::fs::File::create(&path).unwrap()))
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            for reason in [
-                "child_receipt_missing",
-                "child_receipt_provider_mismatch",
-                "child_metadata_mismatch",
-                "child_content_unverified",
-                "output_path_conflict",
-                "current_file_unavailable",
-            ] {
-                let error = anyhow::anyhow!("private provider id, URL and path")
-                    .context(super::LegacyProofRefusal(reason))
-                    .context("private outer context");
-                super::log_preservation_hold("certification", &error);
-            }
-            super::log_preservation_hold(
-                "certification",
-                &anyhow::anyhow!("private unknown error"),
-            );
-        });
-        let warnings = std::fs::read_to_string(path).unwrap();
-        assert_eq!(
-            warnings.matches("legacy_certification_refusal_v1").count(),
-            7
-        );
-        assert!(warnings.contains("subreason=\"child_receipt_missing\""));
-        assert!(warnings.contains("subreason=\"unclassified\""));
-        assert!(!warnings.contains("private"));
-    }
-
     #[tokio::test]
-    async fn preservation_file_evidence_detects_changes_and_never_writes() {
+    async fn strict_file_evidence_detects_changes_without_writing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let path = root.join("original.jpg");
-        std::fs::write(&path, b"synthetic original").unwrap();
+        std::fs::write(&path, b"original bytes").unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
         let cancel = CancellationToken::new();
-        let media = fingerprint(root, &path, true, ".kei-tmp", &cancel, None)
+        let original = fingerprint(root, &path, true, ".kei-tmp", &cancel)
             .await
             .unwrap();
-        let absent = fingerprint(root, &sidecar(&path), false, ".kei-tmp", &cancel, None)
+        let absent = fingerprint(root, &sidecar(&path), false, ".kei-tmp", &cancel)
             .await
             .unwrap();
-        let files = vec![media, absent];
-        verify_files(&files, ".kei-tmp", &cancel, None)
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"synthetic original");
+        assert_eq!(
+            fingerprint(root, &path, true, ".kei-tmp", &cancel)
+                .await
+                .unwrap(),
+            original
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        assert!(absent.sha256.is_none());
         assert!(!sidecar(&path).exists());
         std::fs::write(sidecar(&path), b"new sidecar").unwrap();
-        assert!(
-            verify_files(&files, ".kei-tmp", &cancel, None)
+        assert_ne!(
+            fingerprint(root, &sidecar(&path), false, ".kei-tmp", &cancel)
                 .await
-                .is_err()
+                .unwrap(),
+            absent
         );
+        std::fs::write(&path, b"changed bytes").unwrap();
+        assert_ne!(
+            fingerprint(root, &path, true, ".kei-tmp", &cancel)
+                .await
+                .unwrap(),
+            original
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"changed bytes");
         assert_eq!(std::fs::read(sidecar(&path)).unwrap(), b"new sidecar");
-        std::fs::write(&path, b"changed original").unwrap();
-        assert!(
-            verify_files(&files, ".kei-tmp", &cancel, None)
-                .await
-                .is_err()
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), b"changed original");
         cancel.cancel();
         assert!(
-            fingerprint(root, &path, true, ".kei-tmp", &cancel, None)
+            fingerprint(root, &path, true, ".kei-tmp", &cancel)
                 .await
                 .is_err()
         );
@@ -469,7 +170,7 @@ mod tests {
         let linked = root.join("alias.jpg");
         std::fs::hard_link(&path, &linked).unwrap();
         assert!(
-            fingerprint(root, &path, true, ".kei-tmp", &cancel, None)
+            fingerprint(root, &path, true, ".kei-tmp", &cancel)
                 .await
                 .is_err()
         );
@@ -478,7 +179,7 @@ mod tests {
         {
             std::os::unix::fs::symlink(&path, &linked).unwrap();
             assert!(
-                fingerprint(root, &linked, true, ".kei-tmp", &cancel, None)
+                fingerprint(root, &linked, true, ".kei-tmp", &cancel)
                     .await
                     .is_err()
             );
@@ -486,7 +187,7 @@ mod tests {
         let temporary = root.join("original.jpg.kei-tmp");
         std::fs::write(&temporary, b"pending").unwrap();
         assert!(
-            fingerprint(root, &path, true, ".kei-tmp", &cancel, None)
+            fingerprint(root, &path, true, ".kei-tmp", &cancel)
                 .await
                 .is_err()
         );
@@ -495,492 +196,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preservation_shared_file_links_are_typed_and_redacted() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let cancel = CancellationToken::new();
-        // The same helper guards originals and independently owned current outputs.
-        for name in [
-            "private-original.jpg",
-            "private-current-child.jpg",
-            "private-sidecar.xmp",
-        ] {
-            let path = root.join(name);
-            std::fs::write(&path, b"verified synthetic bytes").unwrap();
-            let evidence = fingerprint(root, &path, true, ".kei-tmp", &cancel, None)
-                .await
-                .unwrap();
-            let alias = root.join(format!("{name}.alias"));
-            std::fs::hard_link(&path, &alias).unwrap();
-            let error = verify_files(&[evidence], ".kei-tmp", &cancel, None)
-                .await
-                .unwrap_err()
-                .context("private-provider-id/private-path");
-            assert_eq!(
-                super::classify_legacy_file_error(&error),
-                Some("shared_file_links")
-            );
-            let log = root.join("warning.log");
-            let subscriber = tracing_subscriber::fmt()
-                .with_ansi(false)
-                .without_time()
-                .with_max_level(tracing::Level::WARN)
-                .with_writer(std::sync::Mutex::new(std::fs::File::create(&log).unwrap()))
-                .finish();
-            tracing::subscriber::with_default(subscriber, || {
-                super::log_preservation_hold("certification", &error);
-                super::log_preservation_hold("checkpoint", &error);
-            });
-            let output = std::fs::read_to_string(log).unwrap();
-            assert!(output.contains("stage=\"certification\""));
-            assert!(output.contains("stage=\"checkpoint\""));
-            assert_eq!(output.matches("reason=\"shared_file_links\"").count(), 2);
-            assert!(!output.contains("private"));
-            assert!(!output.contains(&root.display().to_string()));
-            assert_eq!(std::fs::read(&path).unwrap(), b"verified synthetic bytes");
-            assert_eq!(std::fs::read(&alias).unwrap(), b"verified synthetic bytes");
-        }
-        assert_eq!(
-            super::classify_legacy_file_error(&anyhow::anyhow!("shared_file_links")),
-            None
-        );
-    }
-
-    #[test]
-    fn preservation_file_evidence_roundtrip_retains_absent_sidecars_and_rejects_unknown_fields() {
-        let files = vec![crate::state::LegacyFileEvidence {
-            root: "/synthetic".into(),
-            path: "/synthetic/image.jpg.xmp".into(),
-            sha256: None,
-            size: None,
-        }];
-        let encoded = serde_json::to_string(&files).unwrap();
-        let decoded: Vec<crate::state::LegacyFileEvidence> =
-            serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, files);
-        let mut value = serde_json::to_value(&files[0]).unwrap();
-        value["unknown"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<crate::state::LegacyFileEvidence>(value).is_err());
-    }
-
-    #[test]
-    fn preservation_current_file_evidence_rejects_unsupported_shapes() {
-        for evidence in [
-            "{}",
-            "null",
-            "[]",
-            "{\"version\":2,\"children\":[]}",
-            "{\"version\":1,\"children\":[]}",
-            "{\"version\":1,\"children\":[{}]}",
-        ] {
-            assert!(provider_files(evidence).is_err(), "{evidence}");
-        }
-    }
-    #[tokio::test]
-    async fn preservation_inventory_retry_roundtrip_is_bounded_and_evidence_fenced() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let key = format!("{}PrimarySync", super::INVENTORY_RETRY_PREFIX);
-        let retry = super::InventoryRetry {
-            version: 1,
-            signature: "original-evidence".into(),
-            next_attempt_at: 4600,
-        };
-        {
-            let db = crate::state::SqliteStateDb::open(&path).await.unwrap();
-            db.set_metadata(&key, &serde_json::to_string(&retry).unwrap())
-                .await
-                .unwrap();
-            db.set_metadata("sync_token:PrimarySync", "held")
-                .await
-                .unwrap();
-        }
-        let db = crate::state::SqliteStateDb::open(&path).await.unwrap();
-        let decoded: super::InventoryRetry =
-            serde_json::from_str(&db.get_metadata(&key).await.unwrap().unwrap()).unwrap();
-        assert!(decoded.deferred("original-evidence", 1000));
-        assert!(!decoded.deferred("changed-evidence", 1000));
-        assert!(!decoded.deferred("original-evidence", 4600));
-        assert!(!decoded.deferred("original-evidence", 999));
-        let unsupported = super::InventoryRetry {
-            version: 2,
-            ..decoded
-        };
-        assert!(!unsupported.deferred("original-evidence", 1000));
-        assert_eq!(
-            db.get_metadata("sync_token:PrimarySync")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("held")
-        );
-        assert!(
-            serde_json::from_str::<super::InventoryRetry>(
-                r#"{"version":1,"signature":"x","next_attempt_at":1,"unexpected":true}"#
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn preservation_inventory_retry_signature_keeps_original_facts_and_config() {
-        let original = serde_json::json!({"version":1,"library":"PrimarySync","asset_id":"master","evidence":{
-            "assets":{"added_at":123,"checksum":"original"},
-            "family_history":{"columns":["library","child","master","updated_at"],"rows":[["PrimarySync","child-a","master",1000],["PrimarySync","child-b","master",1000]]},
-            "owners":[],
-            "metadata_capture_retries":{"next_retry_at":1000},
-            "capture_state_at_preparation":{"processed":5}
-        }});
-        let snapshot = |value: serde_json::Value| crate::state::db::LegacyPreparationSnapshot {
-            library: "PrimarySync".into(),
-            asset_id: "master".into(),
-            evidence: value.to_string(),
-            paths: Vec::new(),
-            historical_claims: Vec::new(),
-        };
-        let baseline =
-            super::inventory_retry_signature("config-a", &[snapshot(original.clone())]).unwrap();
-        let mut counters = original.clone();
-        counters["evidence"]["metadata_capture_retries"]["next_retry_at"] = serde_json::json!(2000);
-        counters["evidence"]["capture_state_at_preparation"]["processed"] = serde_json::json!(6);
-        counters["evidence"]["family_history"]["rows"][0][3] = serde_json::json!(2000);
-        assert_eq!(
-            baseline,
-            super::inventory_retry_signature("config-a", &[snapshot(counters)]).unwrap()
-        );
-        assert_ne!(
-            baseline,
-            super::inventory_retry_signature("config-b", &[snapshot(original.clone())]).unwrap()
-        );
-        for field in ["assets", "family_history", "owners"] {
-            let mut changed = original.clone();
-            changed["evidence"][field] = serde_json::json!("changed");
-            assert_ne!(
-                baseline,
-                super::inventory_retry_signature("config-a", &[snapshot(changed)]).unwrap(),
-                "{field}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn preservation_hardlink_opt_in_checks_original_current_media_and_sidecars() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let cancel = CancellationToken::new();
-        let trust = std::sync::Arc::new(super::HardlinkTrust::default());
-        let mut files = Vec::new();
-        for name in [
-            "original.jpg",
-            "original.jpg.xmp",
-            "current.jpg",
-            "current.jpg.xmp",
-        ] {
-            let path = root.join(name);
-            std::fs::write(&path, b"qualified bytes").unwrap();
-            let alias = root.join(format!("{name}.external-alias"));
-            std::fs::hard_link(&path, &alias).unwrap();
-            let error = fingerprint(root, &path, true, ".kei-tmp", &cancel, None)
-                .await
-                .unwrap_err();
-            assert_eq!(
-                super::classify_legacy_file_error(&error),
-                Some("shared_file_links")
-            );
-            let evidence = fingerprint(root, &path, true, ".kei-tmp", &cancel, Some(&trust))
-                .await
-                .unwrap();
-            assert_eq!(evidence.size, Some(15));
-            assert!(evidence.sha256.is_some());
-            assert_eq!(std::fs::read(&path).unwrap(), b"qualified bytes");
-            assert_eq!(std::fs::read(&alias).unwrap(), b"qualified bytes");
-            files.push(evidence);
-        }
-        assert_eq!(trust.paths.lock().unwrap().len(), 4);
-        assert!(
-            verify_files(&files, ".kei-tmp", &cancel, None)
-                .await
-                .is_err()
-        );
-        verify_files(&files, ".kei-tmp", &cancel, Some(&trust))
-            .await
-            .unwrap();
-        verify_files(&files, ".kei-tmp", &cancel, Some(&trust))
-            .await
-            .unwrap();
-        assert_eq!(
-            trust.paths.lock().unwrap().len(),
-            4,
-            "reverification counts each evidence path once"
-        );
-        // Mutation through an external alias still fails the unchanged byte proof.
-        std::fs::write(root.join("current.jpg.external-alias"), b"changed bytes").unwrap();
-        assert!(
-            verify_files(&files, ".kei-tmp", &cancel, Some(&trust))
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            std::fs::read(root.join("current.jpg")).unwrap(),
-            b"changed bytes"
-        );
-        assert_eq!(
-            std::fs::read(root.join("original.jpg")).unwrap(),
-            b"qualified bytes"
-        );
-    }
-
-    #[test]
-    fn preservation_hardlink_trust_requires_positive_successful_link_queries() {
-        let path = std::path::Path::new("/private-provider-id/private-path");
-        let trust = std::sync::Arc::new(super::HardlinkTrust::default());
-        super::check_link_count(Ok(1), path, None).unwrap();
-        super::check_link_count(Ok(1), path, Some(&trust)).unwrap();
-        for enabled in [None, Some(&trust)] {
-            assert!(super::check_link_count(Ok(0), path, enabled).is_err());
-            let error = super::check_link_count(
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "private-provider-id/private-path",
-                )),
-                path,
-                enabled,
-            )
-            .unwrap_err();
-            assert_eq!(
-                error.downcast_ref::<std::io::Error>().unwrap().kind(),
-                std::io::ErrorKind::PermissionDenied
-            );
-        }
-        assert!(
-            trust.paths.lock().unwrap().is_empty(),
-            "zero and unknown links are never waived"
-        );
-        let error = super::check_link_count(Ok(2), path, None).unwrap_err();
-        assert_eq!(
-            super::classify_legacy_file_error(&error),
-            Some("shared_file_links")
-        );
-        super::check_link_count(Ok(2), path, Some(&trust)).unwrap();
-        super::check_link_count(Ok(100), path, Some(&trust)).unwrap();
-        assert_eq!(trust.paths.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn preservation_hardlink_warning_is_actual_use_only_deduplicated_and_redacted() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("trust.log");
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .without_time()
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(std::sync::Mutex::new(std::fs::File::create(&log).unwrap()))
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            let unused = std::sync::Arc::new(super::HardlinkTrust::default());
-            super::check_link_count(Ok(1), std::path::Path::new("private-unused"), Some(&unused))
-                .unwrap();
-            drop(unused);
-            assert!(std::fs::read_to_string(&log).unwrap().is_empty());
-            let trust = std::sync::Arc::new(super::HardlinkTrust::default());
-            for path in [
-                "private-provider-id/original.jpg",
-                "private-provider-id/original.jpg",
-                "private-provider-id/current.jpg.xmp",
-            ] {
-                super::check_link_count(Ok(2), std::path::Path::new(path), Some(&trust)).unwrap();
-            }
-            let actual_worker_owner = std::sync::Arc::clone(&trust);
-            drop(trust);
-            assert!(
-                std::fs::read_to_string(&log).unwrap().is_empty(),
-                "actual worker ownership delays the aggregate"
-            );
-            drop(actual_worker_owner);
-        });
-        let output = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(
-            output.matches("legacy_preservation_hardlink_trust").count(),
-            1
-        );
-        assert!(output.contains("affected_paths=2"));
-        assert!(output.contains("one library cycle"));
-        assert!(output.contains("contents, metadata and managed names"));
-        assert!(!output.contains("private"));
-        assert!(!output.contains(&dir.path().display().to_string()));
-    }
-
-    #[tokio::test]
-    async fn preservation_hardlink_opt_in_keeps_hash_absence_temp_and_cancellation_guards() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let path = root.join("original.jpg");
-        let alias = root.join("external-alias.jpg");
-        std::fs::write(&path, b"original bytes").unwrap();
-        std::fs::hard_link(&path, &alias).unwrap();
-        let cancel = CancellationToken::new();
-        let trust = std::sync::Arc::new(super::HardlinkTrust::default());
-        let media = fingerprint(root, &path, true, ".kei-tmp", &cancel, Some(&trust))
-            .await
-            .unwrap();
-        let missing_sidecar = fingerprint(
-            root,
-            &sidecar(&path),
-            false,
-            ".kei-tmp",
-            &cancel,
-            Some(&trust),
-        )
-        .await
-        .unwrap();
-        assert!(missing_sidecar.sha256.is_none());
-        assert!(
-            fingerprint(
-                root,
-                &root.join("missing.jpg"),
-                true,
-                ".kei-tmp",
-                &cancel,
-                Some(&trust)
-            )
-            .await
-            .is_err()
-        );
-        for suffix in [".kei-tmp", ".part"] {
-            let pending = root.join(format!("original.jpg{suffix}"));
-            std::fs::write(&pending, b"pending bytes").unwrap();
-            assert!(
-                fingerprint(root, &path, true, ".kei-tmp", &cancel, Some(&trust))
-                    .await
-                    .is_err()
-            );
-            assert_eq!(std::fs::read(&pending).unwrap(), b"pending bytes");
-            std::fs::remove_file(pending).unwrap();
-        }
-        verify_files(
-            &[media.clone(), missing_sidecar.clone()],
-            ".kei-tmp",
-            &cancel,
-            Some(&trust),
-        )
-        .await
-        .unwrap();
-        std::fs::write(sidecar(&path), b"new sidecar").unwrap();
-        assert!(
-            verify_files(&[missing_sidecar], ".kei-tmp", &cancel, Some(&trust))
-                .await
-                .is_err()
-        );
-        std::fs::write(&alias, b"changed through alias").unwrap();
-        assert!(
-            verify_files(&[media], ".kei-tmp", &cancel, Some(&trust))
-                .await
-                .is_err()
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), b"changed through alias");
-        cancel.cancel();
-        assert!(
-            fingerprint(root, &path, true, ".kei-tmp", &cancel, Some(&trust))
-                .await
-                .is_err()
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn preservation_hardlink_opt_in_keeps_symlink_special_and_parent_guards() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn strict_file_evidence_rejects_missing_and_unconfined_paths() {
+        let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let path = root.join("original.jpg");
-        std::fs::write(&path, b"original bytes").unwrap();
+        let path = outside.path().join("foreign.jpg");
+        std::fs::write(&path, b"outside unchanged").unwrap();
         let cancel = CancellationToken::new();
-        let trust = std::sync::Arc::new(super::HardlinkTrust::default());
-        let leaf_alias = root.join("leaf-alias.jpg");
-        std::os::unix::fs::symlink(&path, &leaf_alias).unwrap();
         assert!(
-            fingerprint(root, &leaf_alias, true, ".kei-tmp", &cancel, Some(&trust))
+            fingerprint(root.path(), &path, true, ".kei-tmp", &cancel)
                 .await
                 .is_err()
         );
-        std::os::unix::fs::symlink(&path, sidecar(&path)).unwrap();
         assert!(
             fingerprint(
-                root,
-                &sidecar(&path),
-                false,
-                ".kei-tmp",
-                &cancel,
-                Some(&trust)
-            )
-            .await
-            .is_err()
-        );
-        std::os::unix::fs::symlink(outside.path(), root.join("parent-alias")).unwrap();
-        std::fs::write(outside.path().join("original.jpg"), b"outside bytes").unwrap();
-        assert!(
-            fingerprint(
-                root,
-                &root.join("parent-alias/original.jpg"),
+                root.path(),
+                &root.path().join("missing.jpg"),
                 true,
                 ".kei-tmp",
-                &cancel,
-                Some(&trust)
+                &cancel
             )
             .await
             .is_err()
         );
-        std::fs::create_dir(root.join("special.jpg")).unwrap();
-        assert!(
-            fingerprint(
-                root,
-                &root.join("special.jpg"),
-                true,
-                ".kei-tmp",
-                &cancel,
-                Some(&trust)
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            trust.paths.lock().unwrap().is_empty(),
-            "unsafe entries never reach a trust waiver"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn preservation_hardlink_opt_in_keeps_replacement_journal_guard() {
-        use sha2::{Digest, Sha256};
-        use std::os::unix::ffi::OsStrExt;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let path = root.join("original.jpg");
-        std::fs::write(&path, b"original bytes").unwrap();
-        std::fs::hard_link(&path, root.join("external-alias.jpg")).unwrap();
-        let cancel = CancellationToken::new();
-        let trust = std::sync::Arc::new(super::HardlinkTrust::default());
-        // Existing production journal codec: .kei-replace- + SHA256(native leaf).
-        let digest =
-            data_encoding::HEXLOWER.encode(&Sha256::digest(path.file_name().unwrap().as_bytes()));
-        let journal = root.join(format!(".kei-replace-{digest}"));
-        std::fs::create_dir(&journal).unwrap();
-        assert!(
-            super::super::file::has_replacement_journal(root, &path)
-                .await
-                .unwrap()
-        );
-        assert!(
-            fingerprint(root, &path, true, ".kei-tmp", &cancel, Some(&trust))
-                .await
-                .is_err()
-        );
-        assert!(journal.is_dir());
-        assert!(
-            trust.paths.lock().unwrap().is_empty(),
-            "journal holds before a waiver is used"
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), b"original bytes");
+        assert_eq!(std::fs::read(&path).unwrap(), b"outside unchanged");
     }
 }

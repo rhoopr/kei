@@ -511,6 +511,7 @@ async fn prepared_first_publication_reopens_before_rename_without_http_or_metada
         let record =
             asset_record_for_derived_path(Arc::from("PrimarySync"), &asset, &derived, &config);
         let proof = PreparedPublication {
+            binding: None,
             library: "PrimarySync".into(),
             id: asset.state_id().into(),
             version: "original".into(),

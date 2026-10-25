@@ -267,9 +267,15 @@ pub(crate) async fn context(
         retained_policy.folder_structure.clear();
         retained_policy.folder_structure_albums = Arc::from("");
         retained_policy.folder_structure_smart_folders = Arc::from("");
-        profile["retry_policy"] = json!(digest(&serde_json::to_vec(&policy(
-            hash_download_config(&retained_policy)
-        ))?));
+        profile
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Invalid selection profile"))?
+            .insert(
+                "retry_policy".into(),
+                json!(digest(&serde_json::to_vec(&policy(hash_download_config(
+                    &retained_policy
+                )))?)),
+            );
         // Admission freezes destinations, not current selection eligibility.
         // Keep root/rendition/metadata policy strict while allowing membership,
         // date and filename filters to change. Current filters are checked on
@@ -278,13 +284,24 @@ pub(crate) async fn context(
         retained_policy.skip_created_after = None;
         retained_policy.filename_exclude = Arc::from([]);
         let mut retry_policy = policy(hash_download_config(&retained_policy));
-        retry_policy["before"] = Value::Null;
-        retry_policy["after"] = Value::Null;
-        retry_policy["enum_hash"] = Value::Null;
-        profile["admitted_retry_policy"] = json!(digest(&serde_json::to_vec(&retry_policy)?));
+        for key in ["before", "after", "enum_hash"] {
+            *retry_policy
+                .get_mut(key)
+                .ok_or_else(|| anyhow::anyhow!("Invalid retry policy"))? = Value::Null;
+        }
+        profile
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Invalid selection profile"))?
+            .insert(
+                "admitted_retry_policy".into(),
+                json!(digest(&serde_json::to_vec(&retry_policy)?)),
+            );
     }
     let mut fingerprint = policy(hash_download_config(config));
-    fingerprint["profile"] = profile.clone();
+    fingerprint
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Invalid selection policy"))?
+        .insert("profile".into(), profile.clone());
     let config_hash = digest(&serde_json::to_vec(&fingerprint)?);
     Ok(Some(SelectionContext {
         format,
@@ -734,11 +751,10 @@ impl SelectionRun {
                     receipt,
                     ..
                 } = planner.match_existing(asset, config, task).await
+                    && task.download_path != receipt.local_path
                 {
-                    if task.download_path != receipt.local_path {
-                        planner.release_unpublished_task_claim(task);
-                        task.download_path = receipt.local_path;
-                    }
+                    planner.release_unpublished_task_claim(task);
+                    task.download_path = receipt.local_path;
                 }
             }
         }
@@ -774,7 +790,20 @@ impl SelectionRun {
                             candidate.clone(),
                         )
                         .await?;
+                    let unfiled = self
+                        .root
+                        .spec
+                        .profile
+                        .get("passes")
+                        .and_then(Value::as_array)
+                        .is_some_and(|passes| {
+                            passes.iter().any(|pass| {
+                                pass.get("key").and_then(Value::as_str) == Some(key)
+                                    && pass.get("kind").and_then(Value::as_str) == Some("Unfiled")
+                            })
+                        });
                     if (fulfilled
+                        || unfiled
                         || filter::stored_path_matches_download_family(
                             asset.state_id(),
                             derived,
@@ -1100,7 +1129,19 @@ pub(super) async fn inventory(
         cancel.clone(),
     ))
     .await?;
-    let query_checkpoint_ready = result.sync_token.is_some()
+    if context.format == 2
+        && result.checkpoint.selection_window_complete
+        && !run.held.load(Ordering::Relaxed)
+        && result.stats.sync_token_blocked_reason
+            == Some(super::models::RECENT_LIMITED_FULL_ENUMERATION_REASON)
+    {
+        // A completed bounded selection is not a source cursor. Only the
+        // preserved-boundary changes stream may supply its eventual token.
+        result.sync_token = None;
+        result.clear_full_query_token_block();
+    }
+    let query_checkpoint_ready = (result.sync_token.is_some()
+        || result.checkpoint.selection_window_complete)
         && !result.checkpoint.sync_token_blocked
         && !result.checkpoint.identity_incomplete;
     let query_veto = result.stats.sync_token_blocked_reason.map(str::to_owned);
@@ -1633,9 +1674,14 @@ pub(super) async fn after_delta(
         .await
         .map_err(super::recent::RecentSelectionError)?;
     let repeat_inventory = recent
-        && super::recent::needs_inventory(passes, config, prior_cursor, false)
-            .await
-            .map_err(super::recent::RecentSelectionError)?;
+        && super::recent::needs_inventory(
+            passes,
+            config,
+            prior_cursor,
+            delta.inventory_rank_changed,
+        )
+        .await
+        .map_err(super::recent::RecentSelectionError)?;
     if recent {
         super::recent::record(passes, config, prior_cursor, false)
             .await
@@ -1675,6 +1721,34 @@ pub(super) async fn after_delta(
     } else {
         selection?
     };
+    if context.format == 2 && delta.inventory_rank_changed && !repeat_inventory {
+        let smart_passes: Vec<_> = passes
+            .iter()
+            .filter(|pass| pass.kind == PassKind::SmartFolder)
+            .cloned()
+            .collect();
+        if !smart_passes.is_empty() && !cancel.is_cancelled() {
+            // Zone deltas do not establish smart-folder membership. A sparse
+            // Hidden/favorite edit can select an unchanged asset, so query only
+            // the selected smart folders before acknowledging that delta.
+            // Quiet cycles continue through durable retries without inventory.
+            let mut smart_config = config.as_ref().clone();
+            smart_config.selection_context = self::context(&smart_passes, config, controls)
+                .await?
+                .map(Arc::new);
+            let smart_config = Arc::new(smart_config);
+            let refreshed = inventory(
+                client,
+                &smart_passes,
+                &smart_config,
+                controls,
+                cancel.clone(),
+            )
+            .await?;
+            selected.outcome = merge_download_outcomes(&selected.outcome, &refreshed.outcome);
+            selected.accumulate(&refreshed);
+        }
+    }
     let mut stats = SyncStats {
         state_write_failures: delta.state_transition_failures,
         identity_incomplete: delta.identity_incomplete,
@@ -1716,10 +1790,8 @@ pub(super) async fn after_delta(
         selected.sync_token = delta.sync_token;
         if recent && let Some(successor) = selected.sync_token.as_deref() {
             super::recent::record(
-                passes,
-                config,
-                successor,
-                matches!(selected.outcome, DownloadOutcome::Success),
+                passes, config, successor,
+                true, // The guarded successor means selected work is durably accounted.
             )
             .await
             .map_err(super::recent::RecentSelectionError)?;

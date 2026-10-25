@@ -239,6 +239,7 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
         url: format!("{}/{asset_id}.jpg", server.uri()).into(),
         download_path: download_path.clone(),
         replacement_fingerprint: None,
+        publication_binding: None,
         pending_cross_parent_root: None,
         checksum: base64::engine::general_purpose::STANDARD
             .encode([checksum_byte; 32])
@@ -488,7 +489,8 @@ async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() 
     }
 }
 #[tokio::test]
-async fn temporary_ownership_retires_after_publish_and_interruption() {
+async fn unscoped_publication_proof_survives_finalization_and_other_transfer_interruption() {
+    use crate::state::db::TempFileOwnershipStore;
     use base64::Engine as _;
 
     let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
@@ -507,6 +509,7 @@ async fn temporary_ownership_retires_after_publish_and_interruption() {
         url: format!("https://example.invalid/{name}.jpg").into(),
         download_path: dir.path().join(format!("{name}.jpg")),
         replacement_fingerprint: None,
+        publication_binding: None,
         pending_cross_parent_root: None,
         checksum: base64::engine::general_purpose::STANDARD
             .encode([checksum_byte; 32])
@@ -522,8 +525,21 @@ async fn temporary_ownership_retires_after_publish_and_interruption() {
     };
     let published = make_task("published", 0x41);
     let running = CancellationToken::new();
+    db.upsert_seen(&crate::state::AssetRecord::new_pending(
+        published.library.clone(),
+        published.asset_id.to_string(),
+        published.version_size,
+        published.checksum.to_string(),
+        "published.jpg".into(),
+        published.created_local.with_timezone(&chrono::Utc),
+        None,
+        published.size,
+        published.media_type,
+    ))
+    .await
+    .unwrap();
 
-    download_single_task(
+    let (exif_ok, local_checksum, source_checksum, _, _, retained) = download_single_task(
         &client,
         &published,
         &retry,
@@ -540,12 +556,43 @@ async fn temporary_ownership_retires_after_publish_and_interruption() {
     .await
     .unwrap();
     assert!(published.download_path.exists());
-    assert!(
-        db.get_owned_temp_files_before(i64::MAX)
-            .await
-            .unwrap()
-            .is_empty(),
-        "published download must retire ownership"
+    assert_eq!(
+        db.get_prepared_publications(
+            &published.library,
+            &published.asset_id,
+            published.version_size
+        )
+        .await
+        .unwrap()
+        .len(),
+        1,
+        "published bytes retain their proof until the durable receipt commits"
+    );
+    assert!(matches!(
+        crate::download::finalize::finalize_downloaded_with_proof(
+            &db,
+            &published.library,
+            &published,
+            local_checksum,
+            source_checksum,
+            exif_ok,
+            false,
+            retained,
+        )
+        .await,
+        crate::download::finalize::DownloadedFinalization::Persisted
+    ));
+    assert_eq!(
+        db.get_prepared_publications(
+            &published.library,
+            &published.asset_id,
+            published.version_size
+        )
+        .await
+        .unwrap()
+        .len(),
+        1,
+        "an unscoped legacy proof cannot retire without a scoped successor receipt"
     );
 
     let interrupted = make_task("interrupted", 0x42);
@@ -571,12 +618,23 @@ async fn temporary_ownership_retires_after_publish_and_interruption() {
         classify_download_task_error(&error),
         DownloadTaskErrorClass::Interrupted
     );
+    assert_eq!(
+        db.get_prepared_publications(
+            &published.library,
+            &published.asset_id,
+            published.version_size
+        )
+        .await
+        .unwrap()
+        .len(),
+        1,
+        "cancelled transfer preserves the unrelated published proof"
+    );
     assert!(
         db.get_owned_temp_files_before(i64::MAX)
             .await
             .unwrap()
-            .is_empty(),
-        "graceful interruption must retire ownership"
+            .is_empty()
     );
 }
 

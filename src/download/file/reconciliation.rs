@@ -3,40 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Context;
-
 use crate::fs_util::{ConfinedParents, ConfinedPath, FileIdentity, file_identity};
 
 use super::fingerprint::{ExistingFileFingerprint, fingerprint_open_file_snapshot_blocking};
 use super::platform::{PublishResult, publish_reconciliation_part_blocking};
-
-/// Validate source and destination ancestors before path-aware planning.
-#[must_use = "unsafe reconciliation paths must keep the old state path"]
-pub(in crate::download) async fn validate_reconciliation_paths(
-    root: &Path,
-    source: Option<&Path>,
-    destination: &Path,
-) -> anyhow::Result<()> {
-    let root = root.to_path_buf();
-    let source = source.map(Path::to_path_buf);
-    let destination = destination.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        if let Some(source) = source {
-            let source_root = reconciliation_source_root(&root, &source)?;
-            match ConfinedPath::open(&source_root, &source, ConfinedParents::Existing)
-                .and_then(|path| path.open_optional_regular())
-            {
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        ConfinedPath::open(&root, &destination, ConfinedParents::Create)?
-            .open_optional_regular()?;
-        Ok(())
-    })
-    .await?
-}
 
 /// Retain verified files and directory capabilities through state finalization.
 #[derive(Debug)]
@@ -49,70 +19,9 @@ pub(crate) struct ReconciledFile {
 }
 
 impl ReconciledFile {
-    pub(in crate::download) fn checksum(&self) -> &str {
-        &self.checksum
-    }
-
-    /// Both paths have passed confined traversal and absolute normalization.
-    #[must_use]
-    pub(in crate::download) fn is_same_path(&self) -> bool {
-        self.source.path() == self.destination.path()
-    }
-
     pub(in crate::download) async fn validate(self: &Arc<Self>) -> anyhow::Result<()> {
         let copy = Arc::clone(self);
         tokio::task::spawn_blocking(move || copy.validate_blocking()).await?
-    }
-
-    pub(in crate::download) async fn set_capture_time(
-        self: &Arc<Self>,
-        timestamp: i64,
-    ) -> anyhow::Result<()> {
-        let copy = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
-            copy.validate_blocking()?;
-            let file = copy
-                .destination
-                .validate_for_metadata(file_identity(&copy.destination_file)?)?;
-            anyhow::ensure!(
-                file_identity(&copy.source_file)? != file_identity(&file)?,
-                "Reconciliation destination aliases the source file"
-            );
-            use std::time::{Duration, UNIX_EPOCH};
-            let duration = Duration::from_secs(timestamp.unsigned_abs());
-            let time = if timestamp >= 0 {
-                UNIX_EPOCH
-                    .checked_add(duration)
-                    .context("Capture mtime is out of range")?
-            } else {
-                UNIX_EPOCH.checked_sub(duration).unwrap_or(UNIX_EPOCH)
-            };
-            file.set_times(
-                std::fs::FileTimes::new()
-                    .set_modified(time)
-                    .set_accessed(time),
-            )?;
-            #[cfg(not(windows))]
-            file.sync_all()?;
-            copy.destination
-                .validate_identity(file_identity(&copy.destination_file)?)?;
-            Ok(())
-        })
-        .await?
-    }
-
-    #[cfg(feature = "xmp")]
-    pub(in crate::download) fn open_source_for_metadata(&self) -> anyhow::Result<std::fs::File> {
-        let mut file = self
-            .source
-            .validate_identity(file_identity(&self.source_file)?)?;
-        let fingerprint =
-            fingerprint_open_file_snapshot_blocking(&mut file, self.source.path())?.fingerprint;
-        anyhow::ensure!(
-            data_encoding::HEXLOWER.encode(&fingerprint.sha256) == self.checksum,
-            "Reconciliation source changed before metadata planning"
-        );
-        Ok(file)
     }
 
     pub(in crate::download) fn validate_blocking(&self) -> anyhow::Result<()> {
@@ -528,7 +437,7 @@ mod tests {
                 copy_local_file_no_replace(dir.path(), &source, &destination, ".part")
                     .await
                     .unwrap()
-                    .map(|copy| copy.checksum().to_owned()),
+                    .map(|copy| copy.checksum.clone()),
                 Some(expected.clone())
             );
         }
@@ -633,7 +542,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
             copy.validate().await.unwrap();
-            assert_eq!(copy.checksum(), compute_sha256(&source).await.unwrap());
+            assert_eq!(
+                copy.checksum.as_str(),
+                compute_sha256(&source).await.unwrap()
+            );
         }
         assert_eq!(
             std::fs::read_dir(destination.parent().unwrap())

@@ -221,7 +221,7 @@ mod independent_vectors {
 "
             ),
             format!("{valid}="),
-            valid[..valid.len() - 1].to_owned(),
+            valid.get(..valid.len() - 1).unwrap().to_owned(),
             "AQ--________________________".into(),
             "01".repeat(21),
             "é".repeat(21),

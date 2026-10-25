@@ -1,4 +1,4 @@
-//! Format-2 completion handoff. Unfinished and format-1 owners stay untouched.
+//! Completion handoff. Unfinished owners retain their original dependencies.
 use super::{
     ActiveDecision, ActiveGeneration, digest, encode, guard_library_scope, invalid, load_decision,
     load_generation, owner_keys, pass, refresh_admission_hash, refresh_progress_hash, seal_hash,
@@ -91,8 +91,8 @@ pub(super) fn validate_compacted(
     manifest: &ActiveDecision,
     stored: &str,
 ) -> Result<(), StateError> {
-    if root.spec.format != 2
-        || root.spec.metadata_enabled
+    if !matches!(root.spec.format, 1 | 2)
+        || (root.spec.format == 1 && !root.sealed)
         || manifest.decision.confirmation.is_some()
         || !manifest.sources.is_empty()
         || manifest.decision.outcome == SelectionOutcome::Deferred
@@ -109,6 +109,11 @@ pub(super) fn validate_compacted(
         return invalid();
     }
     for destination in &manifest.decision.destinations {
+        let complete:bool=conn.query_row("SELECT admitted=1 AND verified_media=1 AND verified_metadata=1 AND prepared_hash IS NULL AND frozen_metadata IS NULL FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+            params![root.id,manifest.decision.pass_key,manifest.decision.child,destination.version_size,destination.path.key()?],|row|row.get(0))?;
+        if !complete {
+            return invalid();
+        }
         let expected = receipt(conn, root, manifest, destination)?;
         let actual = download_receipts::load(conn, &expected.id()?)?
             .ok_or(StateError::ProviderSelectionInvalid)?;
@@ -131,7 +136,7 @@ pub(in crate::state::db) fn record_prepared(
         WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3 AND w.path=?4
           AND w.checksum=?5 AND w.size_bytes=?6 AND w.local_checksum=?7 AND w.source_checksum=?8
           AND w.admitted=1 AND w.verified_media=1 AND json_extract(CAST(g.specification AS TEXT),'$.format')=2")?
-        .query_map(params![proof.library,proof.id,proof.version,path,proof.provider_checksum,i64::try_from(proof.provider_size).map_err(|_|StateError::ProviderSelectionInvalid)?,proof.local_checksum,proof.source_checksum],
+        .query_map(params![proof.library,proof.id,proof.version,path,proof.provider_checksum,i64::try_from(proof.provider_size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,proof.local_checksum,proof.source_checksum],
             |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
     for (generation, key, child) in keys {
         let root = load_generation(conn, &generation)?;
@@ -152,10 +157,11 @@ pub(super) fn compact_batch(conn: &Connection, only: Option<&str>) -> Result<usi
     let keys:Vec<(String,String,String)>=conn.prepare("SELECT d.generation,d.pass_key,d.child FROM provider_active_decisions d
         JOIN provider_active_generations g ON g.id=d.generation
         WHERE d.compacted_hash IS NULL AND (?1 IS NULL OR d.generation=?1)
-          AND json_extract(CAST(g.specification AS TEXT),'$.format')=2 AND g.metadata_enabled=0
+          AND ((json_extract(CAST(g.specification AS TEXT),'$.format')=2 AND g.metadata_enabled=0)
+            OR (json_extract(CAST(g.specification AS TEXT),'$.format')=1 AND g.sealed=1))
           AND (d.admission='excluded' OR (d.admission='admitted'
             AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child
-                AND (w.admitted=0 OR w.verified_media=0 OR w.prepared_hash IS NOT NULL OR w.frozen_metadata IS NOT NULL))))
+                AND (w.admitted=0 OR w.verified_media=0 OR (g.metadata_enabled=1 AND w.verified_metadata=0) OR w.prepared_hash IS NOT NULL OR w.frozen_metadata IS NOT NULL))))
           AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w
             WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child
               AND ((w.source_checksum<>w.local_checksum OR EXISTS(SELECT 1 FROM primary_layout_bindings b WHERE b.library=w.library AND b.child=w.asset_id))
@@ -170,8 +176,26 @@ pub(super) fn compact_batch(conn: &Connection, only: Option<&str>) -> Result<usi
         .query_map([only],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
     let mut compacted = 0;
     let mut changed_roots = HashSet::new();
+    let mut validated_legacy_roots = HashSet::new();
     for (generation, key, child) in keys {
         let root = load_generation(conn, &generation)?;
+        if root.spec.format == 1 && validated_legacy_roots.insert(generation.clone()) {
+            let saved: String = conn.query_row(
+                "SELECT seal_hash FROM provider_active_generations WHERE id=?1",
+                [&generation],
+                |row| row.get(0),
+            )?;
+            if !root.sealed
+                || seal_hash(
+                    conn,
+                    &root,
+                    root.checkpoint_ready,
+                    root.checkpoint_veto.as_deref(),
+                )? != saved
+            {
+                return invalid();
+            }
+        }
         let mut manifest = load_decision(conn, &root, &key, &child)?;
         let mut receipts = Vec::new();
         let mut eligible = true;
@@ -214,6 +238,11 @@ pub(super) fn compact_batch(conn: &Connection, only: Option<&str>) -> Result<usi
         #[cfg(all(test, target_os = "linux"))]
         crate::test_helpers::process_death_point("completion-receipts-saved");
         manifest.decision.confirmation = None;
+        manifest.sources.clear();
+        conn.execute(
+            "DELETE FROM provider_active_sources WHERE generation=?1 AND pass_key=?2 AND child=?3",
+            params![generation, key, child],
+        )?;
         let bytes = encode(&manifest)?;
         conn.execute(
             "UPDATE provider_active_decisions SET manifest=?4,manifest_hash=?5,charged_bytes=?6
@@ -224,7 +253,8 @@ pub(super) fn compact_batch(conn: &Connection, only: Option<&str>) -> Result<usi
                 child,
                 bytes,
                 digest(&bytes),
-                i64::try_from(bytes.len() + 256).map_err(|_| StateError::ProviderSelectionFull)?
+                i64::try_from(bytes.len() + 256)
+                    .map_err(|_invalid| StateError::ProviderSelectionFull)?
             ],
         )?;
         refresh_admission_hash(conn, &root, &key, &child)?;
@@ -271,14 +301,16 @@ pub(super) fn compact_batch(conn: &Connection, only: Option<&str>) -> Result<usi
 /// Called only after a successor root exists, before that root is handed to
 /// the producer. Coverage cursors live in checkpoint metadata, not these rows.
 pub(super) fn retire_completed_roots(conn: &Connection, keep: &str) -> Result<(), StateError> {
-    let ids:Vec<String>=conn.prepare("SELECT g.id FROM provider_active_generations g
+    let ids:Vec<String>=conn.prepare(&format!("SELECT g.id FROM provider_active_generations g
         WHERE g.id<>?1 AND g.scope=(SELECT scope FROM provider_active_generations WHERE id=?1)
-          AND json_extract(CAST(g.specification AS TEXT),'$.format')=2
-          AND g.metadata_enabled=0
+          AND ((json_extract(CAST(g.specification AS TEXT),'$.format')=2 AND g.metadata_enabled=0)
+            OR (json_extract(CAST(g.specification AS TEXT),'$.format')=1 AND g.sealed=1))
           AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.compacted_hash IS NOT NULL)
                OR NOT EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id))
-          AND NOT EXISTS(SELECT 1 FROM provider_selection_rank_pages p WHERE p.generation=g.id)
-        ORDER BY g.created_at,g.id LIMIT 64")?.query_map([keep],|r|r.get(0))?.collect::<Result<_,_>>()?;
+          AND (json_extract(CAST(g.specification AS TEXT),'$.format')=1
+            OR NOT EXISTS(SELECT 1 FROM provider_selection_rank_pages p WHERE p.generation=g.id))
+          AND (json_extract(CAST(g.specification AS TEXT),'$.format')=2 OR ({LEGACY_RANK_ACCOUNTED}))
+        ORDER BY g.created_at,g.id LIMIT 64"))?.query_map([keep],|r|r.get(0))?.collect::<Result<_,_>>()?;
     for id in ids {
         let root = load_generation(conn, &id)?;
         let actual = seal_hash(
@@ -297,6 +329,12 @@ pub(super) fn retire_completed_roots(conn: &Connection, keep: &str) -> Result<()
                 return invalid();
             }
         }
+        if root.spec.format == 1 && !legacy_rank_fully_accounted(conn, &root)? {
+            // Master reconstruction can depend on pages not listed in a
+            // decision's active_sources. Mixed roots keep every rank page and
+            // compact marker until all observed work is positively accounted.
+            continue;
+        }
         let library = root
             .spec
             .zone
@@ -310,6 +348,12 @@ pub(super) fn retire_completed_roots(conn: &Connection, keep: &str) -> Result<()
         )?;
         #[cfg(all(test, target_os = "linux"))]
         crate::test_helpers::process_death_point("completion-before-root-retirement");
+        // A retired completed row cannot remain the restart cursor for a
+        // mixed root. Resetting replay only revisits independently owned work.
+        conn.execute("UPDATE provider_active_generations SET replay_after=NULL WHERE id=?1 AND EXISTS(
+            SELECT 1 FROM provider_active_decisions d WHERE d.generation=?1 AND d.compacted_hash IS NOT NULL
+            AND d.pass_key=json_extract(provider_active_generations.replay_after,'$[0]')
+            AND d.child=json_extract(provider_active_generations.replay_after,'$[1]'))",[&id])?;
         conn.execute("DELETE FROM provider_active_destinations WHERE generation=?1 AND EXISTS(
             SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation
             AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child
@@ -321,6 +365,13 @@ pub(super) fn retire_completed_roots(conn: &Connection, keep: &str) -> Result<()
             |r| r.get(0),
         )?;
         if !remaining {
+            if root.spec.format == 1 {
+                conn.execute("DELETE FROM provider_selection_rank_records WHERE page_id IN (SELECT id FROM provider_selection_rank_pages WHERE generation=?1)",[&id])?;
+                conn.execute(
+                    "DELETE FROM provider_selection_rank_pages WHERE generation=?1",
+                    [&id],
+                )?;
+            }
             conn.execute("DELETE FROM provider_active_generations WHERE id=?1", [&id])?;
         } else if root.sealed {
             let hash = seal_hash(
@@ -341,3 +392,36 @@ pub(super) fn retire_completed_roots(conn: &Connection, keep: &str) -> Result<()
     }
     Ok(())
 }
+
+/// A seal proves the retained representation, not that every rank item was
+/// admitted. Require a positive terminal owner for assets and their masters;
+/// unfamiliar records and interrupted partial admission keep the whole root.
+fn legacy_rank_fully_accounted(
+    conn: &Connection,
+    root: &ActiveGeneration,
+) -> Result<bool, StateError> {
+    if !root.sealed {
+        return Ok(false);
+    }
+    conn.query_row(
+        &format!("SELECT {LEGACY_RANK_ACCOUNTED} FROM provider_active_generations g WHERE g.id=?1"),
+        [&root.id],
+        |row| row.get(0),
+    )
+    .map_err(StateError::from)
+}
+
+const LEGACY_RANK_ACCOUNTED: &str = r"
+        NOT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=g.id AND compacted_hash IS NULL)
+        AND NOT EXISTS(SELECT 1 FROM provider_active_sources WHERE generation=g.id)
+        AND EXISTS(SELECT 1 FROM provider_selection_rank_pages WHERE generation=g.id)
+        AND NOT EXISTS(
+            SELECT 1 FROM provider_selection_rank_records r JOIN provider_selection_rank_pages p ON p.id=r.page_id
+            WHERE p.generation=g.id AND NOT COALESCE((
+                (r.record_type='CPLAsset' AND EXISTS(
+                    SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.pass_key=p.pass_key AND d.child=r.record_name AND d.compacted_hash IS NOT NULL))
+                OR (r.record_type='CPLMaster' AND EXISTS(
+                    SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.pass_key=p.pass_key AND d.compacted_hash IS NOT NULL
+                    AND json_extract(CAST(d.manifest AS TEXT),'$.decision.master')=r.record_name))
+            ),0)
+        )";

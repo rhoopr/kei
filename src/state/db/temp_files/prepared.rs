@@ -9,9 +9,233 @@ use super::{OwnedTempPathKey, SqliteStateDb};
 use crate::state::db::provider_selection::SelectionPath;
 use crate::state::{VersionSizeKey, error::StateError};
 
+/// Authenticated source and selected pass for a fresh publication. This is
+/// carried only from the selected album owner, never inferred from old hashes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PublicationBinding {
+    pub(crate) account_key: String,
+    pub(crate) provider_key: String,
+    pub(crate) scope: String,
+    pub(crate) library: String,
+    pub(crate) child: String,
+    pub(crate) master: String,
+    pub(crate) state_id: String,
+    pub(crate) origin_pass: String,
+}
+
+impl PublicationBinding {
+    fn validate(&self, conn: &rusqlite::Connection) -> Result<(), StateError> {
+        let owner: (String, String) = conn.query_row(
+            "SELECT account_key,provider_key FROM account_owner WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if owner != (self.account_key.clone(), self.provider_key.clone())
+            || [
+                &self.library,
+                &self.child,
+                &self.master,
+                &self.state_id,
+                &self.origin_pass,
+            ]
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err(invalid());
+        }
+        let scope: serde_json::Value =
+            serde_json::from_str(&self.scope).map_err(|_redacted_error| invalid())?;
+        if !matches!(
+            scope.get("database").and_then(serde_json::Value::as_str),
+            Some("private" | "shared")
+        ) || scope
+            .pointer("/zone/zoneName")
+            .and_then(serde_json::Value::as_str)
+            != Some(self.library.as_str())
+            || scope
+                .pointer("/zone/ownerRecordName")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|v| v.trim().is_empty())
+        {
+            return Err(invalid());
+        }
+        super::super::provider_generations::guard_library_scope(conn, &self.scope, &self.library)
+    }
+}
+
+impl SqliteStateDb {
+    pub(crate) async fn bound_download_receipts(
+        &self,
+        binding: PublicationBinding,
+        version: String,
+        checksum: String,
+        size: u64,
+    ) -> Result<Vec<super::super::download_receipts::DownloadReceipt>, StateError> {
+        self.with_conn("read bound completed downloads", move |conn| {
+            binding.validate(conn)?;
+            Ok(super::super::download_receipts::matching(
+                conn,
+                &binding.scope,
+                &binding.child,
+                &binding.master,
+                &version,
+                &checksum,
+                size,
+            )?
+            .into_iter()
+            .filter(|receipt| {
+                receipt.library == binding.library
+                    && receipt.state_id == binding.state_id
+                    && receipt.fulfills_pass(&binding.origin_pass)
+            })
+            .collect())
+        })
+        .await
+    }
+
+    pub(crate) async fn reuse_bound_download(
+        &self,
+        binding: PublicationBinding,
+        receipt: super::super::download_receipts::DownloadReceipt,
+        record: crate::state::AssetRecord,
+        validate_file: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
+    ) -> Result<(), StateError> {
+        self.with_conn_mut("reuse bound completed download", move |conn| {
+            let tx=conn.transaction()?;
+            binding.validate(&tx)?;
+            if receipt.scope != binding.scope || receipt.library != binding.library
+                || receipt.child != binding.child || receipt.master != binding.master
+                || receipt.state_id != binding.state_id || !receipt.fulfills_pass(&binding.origin_pass)
+                || record.library.as_ref()!=receipt.library || record.id.as_ref()!=receipt.state_id
+                || record.version_size.as_str()!=receipt.version_size
+                || record.checksum.as_ref()!=receipt.provider_checksum || record.size_bytes!=receipt.provider_size
+                || super::super::download_receipts::load(&tx,&receipt.id()?)?.as_ref()!=Some(&receipt)
+            { return Err(invalid()); }
+            let current: Option<(String,i64,bool)> = tx.query_row(
+                "SELECT checksum,size_bytes,is_deleted FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
+                params![receipt.library,receipt.state_id,receipt.version_size],
+                |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+            if current.as_ref().is_none_or(|(checksum,size,deleted)|
+                checksum!=&receipt.provider_checksum || u64::try_from(*size).ok()!=Some(receipt.provider_size) || *deleted)
+            { return Err(invalid()); }
+            let path=receipt.native_path.to_path();
+            let mapped:Option<String>=tx.query_row(
+                "SELECT master_record_name FROM asset_master_mappings WHERE library=?1 AND asset_record_name=?2",
+                params![receipt.library,receipt.child],|row|row.get(0)).optional()?;
+            if mapped.as_deref().is_some_and(|master|master!=receipt.master) {return Err(invalid());}
+            let chosen=super::super::primary_layout::path_key(&path)?;
+            let collision_key=crate::fs_util::confined_path_key(&path).map_err(|_redacted_error|invalid())?;
+            let foreign:bool=tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM reconciliation_paths WHERE destination_path_key=?1
+                 AND (library<>?2 OR id<>?3 OR version_size<>?4 OR provider_checksum<>?5 OR provider_size<>?6))",
+                params![collision_key,receipt.library,receipt.state_id,receipt.version_size,
+                    receipt.provider_checksum,i64::try_from(receipt.provider_size).map_err(|_redacted_error|invalid())?],
+                |row|row.get(0))?;
+            if foreign {return Err(invalid());}
+            for reservation in super::super::provider_generations::pending_destination_reservations(&tx)? {
+                if super::super::primary_layout::path_key(&reservation.destination_path)?==chosen
+                    && (reservation.library.as_ref()!=receipt.library
+                        || reservation.asset_id.as_ref()!=receipt.state_id
+                        || reservation.version_size.as_str()!=receipt.version_size
+                        || reservation.content.as_ref().is_none_or(|content|
+                            content.checksum.as_ref()!=receipt.provider_checksum || content.size!=receipt.provider_size))
+                {return Err(invalid());}
+            }
+
+            let reservations=tx.prepare("SELECT destination_path,provider_checksum,provider_size FROM reconciliation_paths
+                WHERE library=?1 AND id=?2 AND version_size=?3 AND
+                ((provider_checksum=?4 AND provider_size=?5) OR (provider_checksum='' AND provider_size=-1))")?
+                .query_map(params![receipt.library,receipt.state_id,receipt.version_size,receipt.provider_checksum,
+                    i64::try_from(receipt.provider_size).map_err(|_redacted_error|invalid())?],
+                    |row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?)))?
+                .collect::<Result<Vec<_>,_>>()?;
+            for (reserved,checksum,size) in reservations {
+                if checksum.is_empty() || size<0 || super::super::primary_layout::path_key(Path::new(&reserved))?!=chosen {
+                    return Err(invalid());
+                }
+            }
+            super::super::primary_layout::guard_slot(&tx,&receipt.library,&receipt.state_id,
+                &receipt.version_size,&receipt.provider_checksum,&path)?;
+            super::super::primary_layout::guard_downloaded_checksum(&tx,&path,&receipt.local_checksum)?;
+            validate_file()?;
+            // The compact receipt already owns this exact pass and native destination.
+            // Preserve completed rows and optional metadata; only finish outstanding retry status.
+            let pending: bool=tx.query_row("SELECT status!='downloaded' FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
+                params![receipt.library,receipt.state_id,receipt.version_size],|row|row.get(0))?;
+            if pending {
+                super::super::asset_writes::update_status_to_downloaded(&tx,&receipt.library,&receipt.state_id,
+                    &receipt.version_size,&path,&receipt.local_checksum,Some(&receipt.source_checksum),false,
+                    chrono::Utc::now().timestamp())?;
+                tx.execute("DELETE FROM asset_verifications WHERE library=?1 AND id=?2 AND version_size=?3",
+                    params![receipt.library,receipt.state_id,receipt.version_size])?;
+            }
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
+    pub(crate) async fn bind_publication(
+        &self,
+        owner: crate::state::db::account::AccountOwner,
+        mut binding: PublicationBinding,
+    ) -> Result<PublicationBinding, StateError> {
+        self.with_conn("bind authenticated publication", move |conn| {
+            super::super::account::validate_authenticated(conn, &owner)?;
+            (binding.account_key, binding.provider_key) = conn.query_row(
+                "SELECT account_key,provider_key FROM account_owner WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            binding.validate(conn)?;
+            Ok(binding)
+        })
+        .await
+    }
+}
+
+pub(in crate::state::db) fn record_bound_receipt(
+    conn: &rusqlite::Connection,
+    proof: &PreparedPublication,
+) -> Result<(), StateError> {
+    let Some(binding) = &proof.binding else {
+        return Ok(());
+    };
+    binding.validate(conn)?;
+    if binding.library != proof.library || binding.state_id != proof.id {
+        return Err(invalid());
+    }
+    let conflicting_master: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM asset_master_mappings WHERE library=?1 AND asset_record_name=?2 AND master_record_name<>?3)",
+        params![binding.library,binding.child,binding.master],|row|row.get(0))?;
+    if conflicting_master {
+        return Err(invalid());
+    }
+    super::super::download_receipts::DownloadReceipt {
+        account_key: binding.account_key.clone(),
+        provider_key: binding.provider_key.clone(),
+        scope: binding.scope.clone(),
+        library: proof.library.clone(),
+        child: binding.child.clone(),
+        master: binding.master.clone(),
+        state_id: proof.id.clone(),
+        origin_pass: binding.origin_pass.clone(),
+        version_size: proof.version.clone(),
+        provider_checksum: proof.provider_checksum.clone(),
+        provider_size: proof.provider_size,
+        native_path: proof.destination.clone(),
+        source_checksum: proof.source_checksum.clone(),
+        local_checksum: proof.local_checksum.clone(),
+    }
+    .save(conn)?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PreparedPublication {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) binding: Option<PublicationBinding>,
     pub(crate) library: String,
     pub(crate) id: String,
     pub(crate) version: String,
@@ -23,6 +247,8 @@ pub(crate) struct PreparedPublication {
     pub(crate) source_checksum: String,
 }
 
+// Return the typed invariant without exposing provider scope or native paths
+// from parsing and confinement errors.
 fn invalid() -> StateError {
     StateError::Invariant {
         operation: "prepared_publication",
@@ -48,8 +274,9 @@ impl PreparedPublication {
         {
             return Err(invalid());
         }
-        crate::fs_util::confined_path_key(&self.destination.to_path()).map_err(|_| invalid())?;
-        crate::fs_util::confined_path_key(&self.temporary.to_path()).map_err(|_| invalid())?;
+        crate::fs_util::confined_path_key(&self.destination.to_path())
+            .map_err(|_error| invalid())?;
+        crate::fs_util::confined_path_key(&self.temporary.to_path()).map_err(|_error| invalid())?;
         Ok(())
     }
 }
@@ -66,12 +293,18 @@ impl SqliteStateDb {
             return Err(invalid());
         }
         let proof = proof.clone();
-        let encoded = serde_json::to_string(&proof).map_err(|_| invalid())?;
+        let encoded = serde_json::to_string(&proof).map_err(|_error| invalid())?;
         if encoded.len() > 64 * 1024 {
             return Err(invalid());
         }
         self.with_conn_mut("prepare_temp_publication", move |conn| {
             let tx = conn.transaction()?;
+            if let Some(binding)=&proof.binding {
+                binding.validate(&tx)?;
+                if binding.library != proof.library || binding.state_id != proof.id { return Err(invalid()); }
+                tx.execute("INSERT INTO metadata(key,value) VALUES(?1,?2) ON CONFLICT(key) DO NOTHING",
+                    params![format!("download_ledger_scope:{}",binding.library),binding.scope])?;
+            }
             let current: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND version_size=?3
                  AND checksum=?4 AND size_bytes=?5 AND is_deleted=0 AND status IN ('pending','failed','downloaded'))",
@@ -114,7 +347,7 @@ impl SqliteStateDb {
             let encoded = statement.query_map(params![library,id,version.as_str()], |row| row.get::<_,String>(0))?;
             let mut proofs = Vec::new();
             for value in encoded {
-                let proof: PreparedPublication = serde_json::from_str(&value?).map_err(|_| invalid())?;
+                let proof: PreparedPublication = serde_json::from_str(&value?).map_err(|_error| invalid())?;
                 proof.validate()?;
                 proofs.push(proof);
             }
@@ -134,7 +367,8 @@ pub(in crate::state::db) fn retire_prepared_receipt(
     local_checksum: &str,
     source_checksum: Option<&str>,
 ) -> Result<Vec<PreparedPublication>, StateError> {
-    let destination_key = crate::fs_util::confined_path_key(destination).map_err(|_| invalid())?;
+    let destination_key =
+        crate::fs_util::confined_path_key(destination).map_err(|_error| invalid())?;
     let mut statement = conn.prepare_cached(
         "SELECT path,publication FROM owned_temp_files WHERE publication IS NOT NULL
          AND json_extract(publication,'$.library')=?1 AND json_extract(publication,'$.id')=?2
@@ -143,16 +377,17 @@ pub(in crate::state::db) fn retire_prepared_receipt(
     let rows = statement.query_map(params![library, id, version], |row| {
         Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
     })?;
-    let mut retire = Vec::new();
     let mut proofs = Vec::new();
     for row in rows {
         let (key, encoded) = row?;
-        let proof: PreparedPublication = serde_json::from_str(&encoded).map_err(|_| invalid())?;
+        let proof: PreparedPublication =
+            serde_json::from_str(&encoded).map_err(|_error| invalid())?;
         proof.validate()?;
         if OwnedTempPathKey::from_path(&proof.temporary.to_path())?.0 != key {
             return Err(invalid());
         }
-        if crate::fs_util::confined_path_key(&proof.destination.to_path()).map_err(|_| invalid())?
+        if crate::fs_util::confined_path_key(&proof.destination.to_path())
+            .map_err(|_error| invalid())?
             != destination_key
         {
             continue;
@@ -178,19 +413,61 @@ pub(in crate::state::db) fn retire_prepared_receipt(
             return Err(invalid());
         }
         proofs.push(proof);
-        retire.push((key, encoded));
-    }
-    drop(statement);
-    for (key, encoded) in retire {
-        if conn.execute(
-            "DELETE FROM owned_temp_files WHERE path=?1 AND publication=?2",
-            params![key, encoded],
-        )? != 1
-        {
-            return Err(invalid());
-        }
     }
     Ok(proofs)
+}
+
+/// Retire only after an independently validated compact successor exists.
+/// Unscoped older prepared rows keep their genuine publication lineage.
+pub(in crate::state::db) fn retire_handed_off_publication(
+    conn: &rusqlite::Connection,
+    proof: &PreparedPublication,
+) -> Result<(), StateError> {
+    let ids: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM download_receipts WHERE library=?1 AND state_id=?2 AND version_size=?3
+         AND provider_checksum=?4 AND provider_size=?5 AND native_path=?6
+         AND local_checksum=?7 AND source_checksum=?8",
+        )?
+        .query_map(
+            params![
+                proof.library,
+                proof.id,
+                proof.version,
+                proof.provider_checksum,
+                proof.provider_size as i64,
+                proof.destination.key()?,
+                proof.local_checksum,
+                proof.source_checksum
+            ],
+            |row| row.get(0),
+        )?
+        .collect::<Result<_, _>>()?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    for id in ids {
+        super::super::download_receipts::load(conn, &id)?.ok_or_else(invalid)?;
+    }
+    let key = OwnedTempPathKey::from_path(&proof.temporary.to_path())?.0;
+    let encoded: String = conn.query_row(
+        "SELECT publication FROM owned_temp_files WHERE path=?1",
+        [&key],
+        |row| row.get(0),
+    )?;
+    let saved: PreparedPublication =
+        serde_json::from_str(&encoded).map_err(|_redacted_error| invalid())?;
+    if saved != *proof {
+        return Err(invalid());
+    }
+    if conn.execute(
+        "DELETE FROM owned_temp_files WHERE path=?1 AND publication=?2",
+        params![key, encoded],
+    )? != 1
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -213,6 +490,7 @@ mod tests {
         db.upsert_seen(&record).await.unwrap();
         db.claim_temp_file(&part).await.unwrap();
         let proof = PreparedPublication {
+            binding: None,
             library: record.library.to_string(),
             id: record.id.to_string(),
             version: record.version_size.as_str().to_owned(),
@@ -270,6 +548,7 @@ mod tests {
         db.upsert_seen(&record).await.unwrap();
         db.claim_temp_file(&part).await.unwrap();
         let proof = PreparedPublication {
+            binding: None,
             library: record.library.to_string(),
             id: record.id.to_string(),
             version: record.version_size.as_str().to_owned(),
@@ -306,7 +585,7 @@ mod finalization_tests {
     use crate::state::{SqliteStateDb, VersionSizeKey};
 
     #[tokio::test]
-    async fn prepared_transfer_retirement_and_receipt_commit_are_atomic() {
+    async fn prepared_transfer_unscoped_receipt_commit_is_atomic_and_keeps_lineage() {
         let root = tempfile::tempdir().unwrap();
         let part = root.path().join("pending.part");
         let destination = root.path().join("photo.JPG");
@@ -318,6 +597,7 @@ mod finalization_tests {
         db.upsert_seen(&record).await.unwrap();
         db.claim_temp_file(&part).await.unwrap();
         let proof = PreparedPublication {
+            binding: None,
             library: record.library.to_string(),
             id: record.id.to_string(),
             version: record.version_size.as_str().to_owned(),
@@ -391,11 +671,12 @@ mod finalization_tests {
         )
         .await
         .unwrap();
-        assert!(
+        assert_eq!(
             db.get_prepared_publications(&record.library, &record.id, VersionSizeKey::Original)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            vec![proof.clone()],
+            "unscoped completion cannot discard its only genuine modified-byte lineage"
         );
         assert!(db.get_pending().await.unwrap().is_empty());
         let source: String = db
@@ -408,5 +689,176 @@ mod finalization_tests {
             )
             .unwrap();
         assert_eq!(source, proof.source_checksum);
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::{PreparedPublication, PublicationBinding};
+    use crate::state::db::{
+        DownloadStateStore, TempFileOwnershipStore, account::AccountOwner,
+        provider_selection::SelectionPath,
+    };
+    use crate::state::{SqliteStateDb, VersionSizeKey};
+
+    fn owner() -> AccountOwner {
+        AccountOwner::authenticated(
+            "publication@example.invalid",
+            "com",
+            &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"publication-test"}}))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+    async fn fixture(
+        db: &SqliteStateDb,
+        root: &std::path::Path,
+        bound: bool,
+    ) -> PreparedPublication {
+        let record = crate::test_helpers::TestAssetRecord::new("child")
+            .checksum("opaque-generation")
+            .size(4)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        let temporary = root.join("owned.part");
+        db.claim_temp_file(&temporary).await.unwrap();
+        let binding = if bound {
+            Some(db.bind_publication(owner(),PublicationBinding {
+                account_key:String::new(),provider_key:String::new(),
+                scope:serde_json::json!({"format":1,"realm":"com","container":"com.apple.photos.cloud",
+                    "environment":"production","database":"private","zone":{"zoneName":record.library.as_ref(),"ownerRecordName":"_defaultOwner"}}).to_string(),
+                library:record.library.to_string(),child:"child".into(),master:"master".into(),
+                state_id:"child".into(),origin_pass:"selected-pass".into(),
+            }).await.unwrap())
+        } else {
+            None
+        };
+        PreparedPublication {
+            binding,
+            library: record.library.to_string(),
+            id: "child".into(),
+            version: "original".into(),
+            provider_checksum: "opaque-generation".into(),
+            provider_size: 4,
+            temporary: SelectionPath::from_path(&temporary),
+            destination: SelectionPath::from_path(&root.join("photo.JPG")),
+            local_checksum: "a".repeat(64),
+            source_checksum: "b".repeat(64),
+        }
+    }
+    async fn finish(
+        db: &SqliteStateDb,
+        proof: &PreparedPublication,
+    ) -> Result<(), crate::state::error::StateError> {
+        db.mark_verified_download(
+            &proof.library,
+            &proof.id,
+            "original",
+            &proof.destination.to_path(),
+            &proof.local_checksum,
+            Some(&proof.source_checksum),
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn v027_old_unscoped_prepared_proof_roundtrips_and_survives_completion_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let db = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        let proof = fixture(&db, root.path(), false).await;
+        let encoded = serde_json::to_value(&proof).unwrap();
+        assert!(
+            encoded.get("binding").is_none(),
+            "old format remains decodable"
+        );
+        assert_eq!(
+            serde_json::from_value::<PreparedPublication>(encoded.clone()).unwrap(),
+            proof
+        );
+        let mut unknown = encoded;
+        unknown["invented_scope"] = serde_json::json!("untrusted");
+        assert!(serde_json::from_value::<PreparedPublication>(unknown).is_err());
+        db.prepare_temp_publication(&proof.temporary.to_path(), &proof)
+            .await
+            .unwrap();
+        finish(&db, &proof).await.unwrap();
+        drop(db);
+        let db = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_prepared_publications(&proof.library, &proof.id, VersionSizeKey::Original)
+                .await
+                .unwrap(),
+            vec![proof]
+        );
+        assert!(
+            db.get_owned_temp_files_before(i64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn v027_bound_receipt_failure_rolls_back_asset_and_keeps_prepared_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let db = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        let proof = fixture(&db, root.path(), true).await;
+        let mut tampered = proof.clone();
+        tampered.binding.as_mut().unwrap().provider_key = "foreign-provider".into();
+        assert!(
+            db.prepare_temp_publication(&proof.temporary.to_path(), &tampered)
+                .await
+                .is_err()
+        );
+        db.prepare_temp_publication(&proof.temporary.to_path(), &proof)
+            .await
+            .unwrap();
+        db.acquire_lock("fail successor receipt").unwrap().execute_batch(
+            "CREATE TRIGGER fail_bound_receipt BEFORE INSERT ON download_receipts BEGIN SELECT RAISE(ABORT,'injected'); END;"
+        ).unwrap();
+        assert!(finish(&db, &proof).await.is_err());
+        drop(db);
+        let db = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        assert_eq!(db.get_pending().await.unwrap().len(), 1);
+        assert_eq!(
+            db.get_prepared_publications(&proof.library, &proof.id, VersionSizeKey::Original)
+                .await
+                .unwrap(),
+            vec![proof.clone()]
+        );
+        db.acquire_lock("allow receipt")
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_bound_receipt")
+            .unwrap();
+        finish(&db, &proof).await.unwrap();
+        drop(db);
+        let db = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        assert!(
+            db.get_prepared_publications(&proof.library, &proof.id, VersionSizeKey::Original)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.acquire_lock("receipt survives reopen")
+                .unwrap()
+                .query_row::<i64, _, _>("SELECT count(*) FROM download_receipts", [], |row| row
+                    .get(0))
+                .unwrap(),
+            1
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! Source-aware sidecar planning and execution, including reconciliation.
+//! Source-aware sidecar planning and execution.
 
 use super::capture::fingerprint_checksum;
 use super::planning::{gps_from_payload, offset_time_original};
@@ -84,60 +84,6 @@ pub(super) async fn write_sidecar_metadata(
             false
         }
     }
-}
-
-/// Read source GPS before publishing any generated sidecar. A transient read
-/// failure must not leave an incomplete packet that prevents a corrected retry.
-#[cfg(feature = "xmp")]
-pub(in crate::download) async fn write_reconciled_sidecar(
-    copy: Arc<crate::download::file::ReconciledFile>,
-    payload: Arc<MetadataPayload>,
-    created_local: DateTime<FixedOffset>,
-    temp_suffix: String,
-) -> anyhow::Result<Arc<crate::download::metadata::ReconciledSidecar>> {
-    write_reconciled_sidecar_with_reader(
-        copy,
-        payload,
-        created_local,
-        temp_suffix,
-        crate::download::metadata::read_source_gps_from_file,
-    )
-    .await
-}
-
-#[cfg(feature = "xmp")]
-async fn write_reconciled_sidecar_with_reader(
-    copy: Arc<crate::download::file::ReconciledFile>,
-    payload: Arc<MetadataPayload>,
-    created_local: DateTime<FixedOffset>,
-    temp_suffix: String,
-    read_gps: fn(
-        &mut std::fs::File,
-        &Path,
-    ) -> anyhow::Result<crate::download::metadata::SourceGpsMetadata>,
-) -> anyhow::Result<Arc<crate::download::metadata::ReconciledSidecar>> {
-    tokio::task::spawn_blocking(move || {
-        copy.validate_blocking()?;
-        crate::download::metadata::write_reconciled_sidecar(
-            &copy,
-            || {
-                let mut source = copy.open_source_for_metadata()?;
-                let gps = read_gps(&mut source, copy.source.path())?;
-                copy.validate_blocking()?;
-                // Reconciliation does not invent original-byte provenance from a
-                // recovered local checksum. Existing source packets are preserved.
-                Ok(plan_sidecar_from_gps(
-                    &payload,
-                    &created_local,
-                    gps,
-                    NativeAccuracy::Unknown,
-                    None,
-                ))
-            },
-            &temp_suffix,
-        )
-    })
-    .await?
 }
 
 /// Comprehensive snapshot of every field a payload can contribute. Used as

@@ -50,13 +50,9 @@ pub use orchestration::models::{
 };
 pub(crate) use orchestration::queue_projection::has_due_retained_work;
 pub(crate) use orchestration::recent::requires_recovery as recent_selection_requires_recovery;
-#[cfg(test)]
-pub(crate) use orchestration::reconciliation::reconcile_catalog_paths;
 pub(crate) use orchestration::reconciliation::recover_recorded_sources;
 use orchestration::selection::build_pass_configs_resolving_deferred_excludes;
-use orchestration::url_refresh::{
-    CleanupUrlRefresh, RetryTaskKey, UrlRetrySource, build_retry_download_tasks,
-};
+use orchestration::url_refresh::{RetryTaskKey, UrlRetrySource, build_retry_download_tasks};
 
 #[expect(
     unused_imports,

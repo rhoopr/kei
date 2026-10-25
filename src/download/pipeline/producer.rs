@@ -96,8 +96,6 @@ enum AssetDisposition {
     Unresolved,
     RetryOnly,
     RetryExhausted,
-    StateSkip,
-    AmpmVariant,
     OnDisk,
     Uncertain,
     Forwarded,
@@ -880,49 +878,12 @@ where
                                 continue;
                             }
 
-                            let provider_verified = matches!(
-                                &existing_match,
-                                crate::download::baseline_matching::BaselineMatch::ProviderPresent { .. }
-                            );
                             match existing_match {
-                                crate::download::baseline_matching::BaselineMatch::Present {
-                                    receipt, file,
-                                } | crate::download::baseline_matching::BaselineMatch::ProviderPresent {
-                                    receipt, file,
-                                } => {
-                                    let adoption = async {
-                                        let _guard = crate::download::file::lock_download_destination(
-                                            &receipt.local_path, &producer_shutdown,
-                                        ).await?;
-                                        let db = producer_state_db.as_deref().ok_or_else(|| anyhow::anyhow!(
-                                            "Existing-file adoption requires durable state"
-                                        ))?;
-                                        let record = planner::pending_record_for_task(config, &asset, &task);
-                                        let expected_checksum = task.checksum.to_string();
-                                        let expected_size = task.size;
-                                        let validate: Box<dyn FnOnce() -> Result<(), crate::state::error::StateError> + Send> =
-                                            Box::new(move || {
-                                                let valid = if provider_verified {
-                                                    file.fingerprint.size == expected_size
-                                                        && matches!(file.matches_provider_v1_blocking(&expected_checksum), Ok(Some(true)))
-                                                } else {
-                                                    file.validate_blocking().is_ok()
-                                                };
-                                                if !valid {
-                                                    return Err(crate::state::error::StateError::Invariant {
-                                                        operation: "adopt_baseline_receipt",
-                                                        detail: "existing file changed before receipt commit".into(),
-                                                    });
-                                                }
-                                                Ok(())
-                                            });
-                                        if provider_verified {
-                                            db.adopt_provider_signature(&record, &receipt, validate).await?;
-                                        } else {
-                                            db.adopt_baseline_receipt(&record, &receipt, validate).await?;
-                                        }
-                                        Ok::<(), anyhow::Error>(())
-                                    }.await;
+                                decision @ (crate::download::baseline_matching::BaselineMatch::Present { .. }
+                                    | crate::download::baseline_matching::BaselineMatch::ProviderPresent { .. }
+                                    | crate::download::baseline_matching::BaselineMatch::RecordedPresent { .. }) => {
+                                    let adoption=crate::download::baseline_matching::commit_match(
+                                        decision,config,&asset,&task,&producer_shutdown).await;
                                     match adoption {
                                         Ok(()) => {
                                             disposition = disposition.max(AssetDisposition::OnDisk)
@@ -987,8 +948,6 @@ where
                             AssetDisposition::Forwarded => assets_forwarded += 1,
                             AssetDisposition::OnDisk => skips.on_disk += 1,
                             AssetDisposition::Uncertain => skips.uncertain += 1,
-                            AssetDisposition::AmpmVariant => skips.ampm_variant += 1,
-                            AssetDisposition::StateSkip => skips.by_state += 1,
                             AssetDisposition::RetryExhausted => skips.retry_exhausted += 1,
                             AssetDisposition::RetryOnly => skips.retry_only += 1,
                             AssetDisposition::Unresolved => {

@@ -15,16 +15,35 @@ use wiremock::{Mock, ResponseTemplate};
 use crate::icloud::photos::{PhotoLibrary, PhotosSession};
 use crate::sync_loop::test_support::{
     RunCycleDownloadConfigOptions, album_count_response, full_album_page_with_download,
-    make_full_album_with_boxed_session, make_run_cycle_config,
-    make_run_cycle_download_config_builder, make_run_cycle_download_config_builder_with_options,
-    make_run_cycle_library_state_with_album, make_shared_session_for_run_cycle,
-    run_cycle_expected_date_dir,
+    make_run_cycle_config, make_run_cycle_download_config_builder,
+    make_run_cycle_download_config_builder_with_options, make_run_cycle_library_state_with_album,
+    make_shared_session_for_run_cycle, run_cycle_expected_date_dir,
 };
 use crate::{download, state};
 
 const PRIMARY: &str = "PrimarySync";
 const SHARED: &str = "SharedSync-SYNTHETIC-KEYS";
 const SHARED_TOKEN: &str = "sync_token:SharedSync-SYNTHETIC-KEYS";
+
+fn scoped_shared_album(session: Box<dyn PhotosSession>) -> crate::icloud::photos::PhotoAlbum {
+    crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: "https://synthetic.example/database/1/photos/production/shared"
+                .into(),
+            name: "TestAlbum".into(),
+            list_type: "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
+            obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":SHARED,"ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        session,
+    )
+}
 
 #[derive(Clone, Debug)]
 struct Provider {
@@ -36,6 +55,18 @@ struct Provider {
 impl PhotosSession for Provider {
     async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
         let request: Value = serde_json::from_str(&body)?;
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(
+                json!({"records":[{"recordName":"index-state","recordType":"CheckIndexingState",
+                "fields":{"state":{"value":"FINISHED"}}}]}),
+            );
+        }
+        if url.contains("/zones/list") {
+            return Ok(json!({"zones":[{
+                "zoneID":{"zoneName":self.zone,"ownerRecordName":"_defaultOwner"},
+                "syncToken":"shared-before-inventory"
+            }]}));
+        }
         if url.contains("/records/query/batch") {
             return Ok(album_count_response(
                 self.records
@@ -84,7 +115,7 @@ impl PhotosSession for Provider {
             self.records.clone()
         };
         Ok(json!({"zones":[{
-            "zoneID":{"zoneName":self.zone,"ownerRecordName":"shared-owner"},
+            "zoneID":{"zoneName":self.zone,"ownerRecordName":"_defaultOwner"},
             "syncToken":if delta {"shared-delta-after"} else {"shared-inventory-after"},
             "moreComing":false,
             "records":records
@@ -363,9 +394,18 @@ async fn selected_shared_cycle_from_genuine_v28_adds_exact_child_keys_without_co
         let mut shared = make_run_cycle_library_state_with_album(
             SHARED,
             SHARED_TOKEN,
-            make_full_album_with_boxed_session(SHARED, Box::new(provider.clone())),
+            scoped_shared_album(Box::new(provider.clone())),
         );
-        shared.library = PhotoLibrary::new_stub_with_zone(Box::new(provider), SHARED);
+        shared.library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/shared".into(),
+            Arc::new(std::collections::HashMap::new()),
+            Box::new(provider),
+            Arc::new(json!({"zoneName":SHARED,"ownerRecordName":"_defaultOwner"})),
+            "shared".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
         let builder = make_run_cycle_download_config_builder_with_options(
             &media,
             store.clone(),
@@ -725,9 +765,18 @@ async fn existing_exact_selected_shared_child_is_not_redownloaded() {
         let mut shared = make_run_cycle_library_state_with_album(
             SHARED,
             SHARED_TOKEN,
-            make_full_album_with_boxed_session(SHARED, Box::new(provider.clone())),
+            scoped_shared_album(Box::new(provider.clone())),
         );
-        shared.library = PhotoLibrary::new_stub_with_zone(Box::new(provider), SHARED);
+        shared.library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/shared".into(),
+            Arc::new(std::collections::HashMap::new()),
+            Box::new(provider),
+            Arc::new(json!({"zoneName":SHARED,"ownerRecordName":"_defaultOwner"})),
+            "shared".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
         let builder = make_run_cycle_download_config_builder(&media, store.clone());
         let result = crate::sync_cycle::run_cycle(
             &[&shared],

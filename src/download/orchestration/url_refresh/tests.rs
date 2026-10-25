@@ -30,42 +30,27 @@ use super::super::test_support::{
     incremental_photo_records_with_url, mock_album, relation_delta_record, retry_test_task,
     seed_complete_album_snapshot, test_config,
 };
-use super::{RetryTaskKey, take_matching_retry_tasks};
+use super::RetryTaskKey;
 
 #[test]
-fn cleanup_retry_filter_keeps_only_exact_failed_task_keys() {
+fn cleanup_retry_key_preserves_identity_rendition_library_and_destination() {
     let failed = retry_test_task("ASSET_A", VersionSizeKey::Original, "a.jpg");
-    let matching_refresh = DownloadTask {
+    let refreshed = DownloadTask {
         url: "https://p01.icloud-content.com/fresh-a".into(),
         ..failed.clone()
     };
-    let wrong_version = retry_test_task("ASSET_A", VersionSizeKey::Medium, "a.jpg");
-    let wrong_path = retry_test_task("ASSET_A", VersionSizeKey::Original, "elsewhere/a.jpg");
-    let unrelated = retry_test_task("ASSET_B", VersionSizeKey::Original, "b.jpg");
-    let mut pending_keys: FxHashSet<RetryTaskKey> =
-        std::iter::once(RetryTaskKey::from(&failed)).collect();
-    let mut out = Vec::new();
-
-    take_matching_retry_tasks(
-        vec![
-            wrong_version,
-            wrong_path,
-            unrelated,
-            matching_refresh.clone(),
-        ],
-        &mut pending_keys,
-        &mut out,
-    );
-
-    assert!(pending_keys.is_empty());
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].asset_id.as_ref(), "ASSET_A");
-    assert_eq!(out[0].version_size, VersionSizeKey::Original);
-    assert_eq!(out[0].download_path, matching_refresh.download_path);
-    assert_eq!(
-        out[0].url.as_ref(),
-        "https://p01.icloud-content.com/fresh-a"
-    );
+    assert_eq!(RetryTaskKey::from(&failed), RetryTaskKey::from(&refreshed));
+    for changed in [
+        retry_test_task("ASSET_A", VersionSizeKey::Medium, "a.jpg"),
+        retry_test_task("ASSET_A", VersionSizeKey::Original, "elsewhere/a.jpg"),
+        retry_test_task("ASSET_B", VersionSizeKey::Original, "a.jpg"),
+        DownloadTask {
+            library: Arc::from("SharedSync"),
+            ..failed.clone()
+        },
+    ] {
+        assert_ne!(RetryTaskKey::from(&failed), RetryTaskKey::from(&changed));
+    }
 }
 
 #[derive(Clone, Debug)]

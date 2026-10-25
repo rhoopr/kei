@@ -126,10 +126,6 @@ pub(crate) struct DownloadContext {
     /// Nested map: `library` -> `asset_id` -> (`version_size` -> checksum).
     /// Used to detect checksum changes (CloudKit asset updated) without DB queries.
     pub(in crate::download) downloaded_checksums: LibraryAssetVersionValueMap,
-    /// Nested map: `library` -> `asset_id` -> (`version_size` -> local file).
-    /// Used to validate path-aware filesystem skips after state says the
-    /// remote bytes are unchanged.
-    pub(in crate::download) downloaded_files: LibraryAssetVersionFileMap,
     /// Nested map: `library` -> `asset_id` -> (`version_size` -> metadata_hash).
     /// Used to detect metadata-only changes (favorite toggle, keywords, GPS
     /// edit, etc.) when file bytes are unchanged but CloudKit has newer
@@ -151,10 +147,6 @@ pub(crate) struct DownloadContext {
     /// the expected file is already on disk instead of promoting them back to
     /// failed after the producer skips the duplicate path.
     pub(in crate::download) pending_ids: LibraryAssetVersionSet,
-    /// Nested map: `library` -> `asset_id` -> (`version_size` -> filename)
-    /// for pending rows. Pending on-disk adoption uses this to avoid adopting
-    /// a same-name/same-size collision that belongs to a different asset.
-    pub(in crate::download) pending_filenames: LibraryAssetVersionValueMap,
     /// Provider checksums for pending rows. Identity stabilization uses these
     /// to retain a compatible legacy master-keyed retry without merging a
     /// different sibling into it.
@@ -301,7 +293,6 @@ impl DownloadContext {
         let mut legacy_added_dates = LegacyAddedDates::default();
         let mut downloaded_ids: LibraryAssetVersionSet = FxHashMap::default();
         let mut downloaded_checksums: LibraryAssetVersionValueMap = FxHashMap::default();
-        let mut downloaded_files: LibraryAssetVersionFileMap = FxHashMap::default();
         for record in downloaded_records {
             let crate::state::DownloadedFileRecord {
                 is_preserved_history: _,
@@ -311,9 +302,9 @@ impl DownloadContext {
                 id,
                 version_size,
                 checksum,
-                local_path,
-                local_checksum,
-                download_checksum,
+                local_path: _,
+                local_checksum: _,
+                download_checksum: _,
             } = record;
             let lib = intern_id(&mut interner, library);
             let id = intern_id(&mut interner, id);
@@ -333,21 +324,6 @@ impl DownloadContext {
                 .entry(Arc::clone(&id))
                 .or_default()
                 .insert(version_size.clone(), checksum.into_boxed_str());
-            if let Some(path) = local_path {
-                downloaded_files
-                    .entry(lib)
-                    .or_default()
-                    .entry(id)
-                    .or_default()
-                    .insert(
-                        version_size,
-                        RecordedLocalFile {
-                            path,
-                            local_checksum: local_checksum.map(String::into_boxed_str),
-                            download_checksum: download_checksum.map(String::into_boxed_str),
-                        },
-                    );
-            }
         }
 
         let mut soft_deleted_ids: LibraryAssetSet = FxHashMap::default();
@@ -385,7 +361,6 @@ impl DownloadContext {
         }
 
         let mut pending_ids: LibraryAssetVersionSet = FxHashMap::default();
-        let mut pending_filenames: LibraryAssetVersionValueMap = FxHashMap::default();
         let mut pending_checksums: LibraryAssetVersionValueMap = FxHashMap::default();
         let mut pending_files: LibraryAssetVersionFileMap = FxHashMap::default();
         for record in pending {
@@ -394,7 +369,6 @@ impl DownloadContext {
                 id,
                 version_size,
                 checksum,
-                filename,
                 local_path,
                 local_checksum,
                 download_checksum,
@@ -414,12 +388,6 @@ impl DownloadContext {
                 .entry(Arc::clone(&id))
                 .or_default()
                 .insert(version_size.clone());
-            pending_filenames
-                .entry(Arc::clone(&lib))
-                .or_default()
-                .entry(Arc::clone(&id))
-                .or_default()
-                .insert(version_size.clone(), filename);
             pending_checksums
                 .entry(Arc::clone(&lib))
                 .or_default()
@@ -532,12 +500,10 @@ impl DownloadContext {
         Self {
             downloaded_ids,
             downloaded_checksums,
-            downloaded_files,
             downloaded_metadata_hashes,
             metadata_retry_markers,
             soft_deleted_ids,
             pending_ids,
-            pending_filenames,
             pending_checksums,
             pending_files,
             asset_master_mappings,
@@ -561,45 +527,6 @@ impl DownloadContext {
             .get(library)
             .and_then(|assets| assets.get(asset_id))
             .copied()
-    }
-
-    /// Whether a downloaded asset-version needs a metadata-only rewrite:
-    /// the caller has already matched checksums (bytes unchanged) and now
-    /// checks whether (a) the stored metadata_hash differs from the new
-    /// one or (b) a persisted retry marker is set from a prior sync where
-    /// the writer failed after bytes landed.
-    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    pub(in crate::download) fn needs_metadata_rewrite(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: VersionSizeKey,
-        new_metadata_hash: Option<&str>,
-    ) -> bool {
-        if self.is_soft_deleted(library, asset_id) {
-            return false;
-        }
-        let vs_str = version_size.as_str();
-        let has_retry_marker = self
-            .metadata_retry_markers
-            .get(library)
-            .and_then(|m| m.get(asset_id))
-            .is_some_and(|vsset| vsset.contains(vs_str));
-        if has_retry_marker {
-            return true;
-        }
-        let Some(new_hash) = new_metadata_hash else {
-            return false;
-        };
-        match self
-            .downloaded_metadata_hashes
-            .get(library)
-            .and_then(|m| m.get(asset_id))
-            .and_then(|map| map.get(vs_str))
-        {
-            Some(stored) => stored.as_ref() != new_hash,
-            None => true, // downloaded row has no stored hash yet -- refresh
-        }
     }
 
     /// Whether the provider reported this asset deleted while its downloaded
@@ -653,7 +580,7 @@ impl DownloadContext {
 
     /// Whether any live downloaded version of this asset carries a metadata
     /// rewrite retry marker. Asset-level counterpart to the per-version
-    /// `needs_metadata_rewrite`, for callers that decide once per asset.
+    /// explicit metadata work, for callers that decide once per asset.
     pub(in crate::download) fn has_downloaded_metadata_retry_marker(
         &self,
         library: &str,
@@ -917,90 +844,6 @@ impl DownloadContext {
             operation: "select_asset_state_record_name_for_download",
             detail: "legacy owner claim retry loop ran no attempts".into(),
         })
-    }
-
-    /// Check if an asset should be downloaded based on pre-loaded state.
-    ///
-    /// Returns:
-    /// - `Some(true)` — definitely needs download (not in DB or checksum changed)
-    /// - `Some(false)` — hard skip, DB confirms downloaded with matching checksum
-    ///   (only when `trust_state` is true)
-    /// - `None` — downloaded with matching checksum but needs filesystem check
-    ///   to confirm file is still on disk (when `trust_state` is false)
-    ///
-    /// `trust_state=true` skips the filesystem stat: only `--only-print-filenames`
-    /// uses it (no side effects, the user just wants to preview). The real-sync
-    /// path uses `trust_state=false` — see PR #318 for why.
-    ///
-    /// Uses borrowed `&str` keys for zero-allocation lookups.
-    pub(in crate::download) fn should_download_fast(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: VersionSizeKey,
-        checksum: &str,
-        trust_state: bool,
-    ) -> Option<bool> {
-        if checksum.is_empty() {
-            tracing::warn!(
-                asset_id,
-                version_size = %version_size.as_str(),
-                "Empty remote checksum cannot be trusted for skip decisions"
-            );
-            return Some(true);
-        }
-
-        let version_size_str = version_size.as_str();
-
-        // Borrowed `&str` keys at every level — no allocation per probe.
-        let is_downloaded = self
-            .downloaded_ids
-            .get(library)
-            .and_then(|m| m.get(asset_id))
-            .is_some_and(|versions| versions.contains(version_size_str));
-
-        if !is_downloaded {
-            // Not in downloaded set — needs download
-            return Some(true);
-        }
-
-        // Check if checksum changed (also zero-allocation lookup). Track
-        // whether a stored checksum is present at all so we can audit the
-        // "no stored checksum" path, which pre-v3 rows fall into.
-        let stored_checksum = self
-            .downloaded_checksums
-            .get(library)
-            .and_then(|m| m.get(asset_id))
-            .and_then(|versions| versions.get(version_size_str));
-        if let Some(stored) = stored_checksum {
-            if stored.as_ref() != checksum {
-                return Some(true);
-            }
-        } else {
-            // Pre-v3 row with no stored local_checksum. Audit so operators can
-            // correlate unexpected "skipped" counts with missing checksum
-            // history (the row will gain a checksum on next download).
-            tracing::debug!(
-                asset_id = asset_id,
-                version_size = %version_size_str,
-                trust_state = trust_state,
-                "no stored checksum for downloaded asset-version; skip decision uses trust_state only"
-            );
-        }
-
-        if trust_state { Some(false) } else { None }
-    }
-
-    pub(in crate::download) fn downloaded_file(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: VersionSizeKey,
-    ) -> Option<&RecordedLocalFile> {
-        self.downloaded_files
-            .get(library)
-            .and_then(|m| m.get(asset_id))
-            .and_then(|versions| versions.get(version_size.as_str()))
     }
 
     pub(in crate::download) fn pending_file(

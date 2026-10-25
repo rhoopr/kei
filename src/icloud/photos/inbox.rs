@@ -5,10 +5,13 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::state::SqliteStateDb;
-use crate::state::db::{account::AccountOwner, provider_inbox::ObservedPage};
+use crate::state::db::account::AccountOwner;
+#[cfg(test)]
+use crate::state::db::provider_inbox::ObservedPage;
 
 /// Operational safety bounds. Observations are retained, never evicted to fit.
 pub(crate) const MAX_CHANGES_PAGE_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(test)]
 const MAX_SHADOW_INBOX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CATALOG_INDEX_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -17,6 +20,7 @@ pub(crate) struct ShadowCapture {
     pub(crate) db: Arc<SqliteStateDb>,
     pub(crate) owner: AccountOwner,
     realm: Arc<str>,
+    #[cfg(test)]
     pub(crate) capacity: u64,
     pub(crate) catalog_capacity: u64,
 }
@@ -27,6 +31,7 @@ impl ShadowCapture {
             db,
             owner,
             realm: Arc::from(realm),
+            #[cfg(test)]
             capacity: MAX_SHADOW_INBOX_BYTES,
             catalog_capacity: MAX_CATALOG_INDEX_BYTES,
         }
@@ -90,6 +95,8 @@ impl ShadowCapture {
         Ok(())
     }
 
+    // Historical fixture construction only; normal observations use the download ledger.
+    #[cfg(test)]
     pub(crate) async fn capture(&self, page: ObservedPage) -> anyhow::Result<()> {
         let id = self
             .db

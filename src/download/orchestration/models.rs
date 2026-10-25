@@ -209,6 +209,9 @@ pub(crate) struct CheckpointEvidence {
     /// reached proven EOF with usable unanimous tokens, but the selected work
     /// excluded a tail. This certifies local work only, never a source cursor.
     pub(crate) bounded_path_selection_complete: bool,
+    /// The configured recent window was observed and durably accounted for.
+    /// This authorizes only a preserved-boundary bridge, never a query token.
+    pub(crate) selection_window_complete: bool,
     pub(crate) state_write_failures: usize,
     pub(crate) enumeration_errors: usize,
     pub(crate) enumeration_incomplete: bool,
@@ -248,6 +251,12 @@ impl CheckpointEvidence {
     fn accumulate(&mut self, other: &Self) {
         // Additional work may veto the original query proof, but cannot create it.
         self.bounded_path_selection_complete &= !other.sync_token_blocked
+            && !other.enumeration_incomplete
+            && !other.identity_incomplete
+            && !other.interrupted
+            && other.enumeration_errors == 0
+            && other.state_write_failures == 0;
+        self.selection_window_complete &= !other.sync_token_blocked
             && !other.enumeration_incomplete
             && !other.identity_incomplete
             && !other.interrupted
@@ -328,12 +337,6 @@ impl SyncResult {
         // import a later smart refresh, targeted retry, or bridge measurement.
     }
 
-    pub(crate) fn block_for_metadata_capture(&mut self) {
-        self.checkpoint.identity_incomplete = true;
-        self.checkpoint.sync_token_blocked = true;
-        block_sync_token_for_metadata_capture(&mut self.stats);
-    }
-
     pub(crate) fn block_for_unresolved_identity(&mut self) {
         self.checkpoint.identity_incomplete = true;
         self.checkpoint.sync_token_blocked = true;
@@ -344,6 +347,7 @@ impl SyncResult {
         // A later veto is independent of the original structural bounds hold.
         // In particular, retained selection debt must also hold path promotion.
         self.checkpoint.bounded_path_selection_complete = false;
+        self.checkpoint.selection_window_complete = false;
         self.checkpoint.sync_token_blocked = true;
         block_sync_token_for_incremental_delta(&mut self.stats, reason);
     }
@@ -995,11 +999,6 @@ pub(super) fn set_full_enumeration_reason(result: &mut SyncResult, reason: FullE
     if result.full_enumeration_ran && result.stats.full_enumeration_reason.is_none() {
         result.stats.full_enumeration_reason = Some(reason);
     }
-}
-
-pub(crate) fn block_sync_token_for_metadata_capture(stats: &mut SyncStats) {
-    stats.identity_incomplete = true;
-    block_sync_token_for_incremental_delta(stats, METADATA_CAPTURE_REPAIR_FAILED_REASON);
 }
 
 pub(crate) fn block_sync_token_for_unresolved_identity(stats: &mut SyncStats) {

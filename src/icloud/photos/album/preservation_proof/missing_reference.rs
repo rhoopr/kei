@@ -269,28 +269,6 @@ fn classify(
 }
 
 impl PhotoAlbum {
-    // One lookup operation at the first refusal, no application retries or paired fetch,
-    // no returned record retention and no input to inventory/proof policy.
-    pub(super) async fn observe_missing_reference(
-        &self,
-        record: &Record,
-        observation: Observation,
-        masters: &FxHashSet<String>,
-        cancel: &CancellationToken,
-    ) {
-        let lookup = self
-            .lookup_missing_reference(&record.record_name, masters, cancel)
-            .await;
-        crate::support::observe(
-            "support_missing_reference_v1",
-            json!({
-                "record_history":observation.history, "prior_reference":observation.prior_reference,
-                "sparse_marker":observation.sparse_marker, "linkage":observation.linkage,
-                "lookup_outcome":lookup.outcome, "lookup_family":lookup.family,
-                "lookup_scope":lookup.scope, "lookup_shape":lookup.shape,
-            }),
-        );
-    }
     pub(super) async fn lookup_missing_reference(
         &self,
         child: &str,

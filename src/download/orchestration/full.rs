@@ -380,11 +380,34 @@ async fn receive_pass_token(
     }
 }
 
+type RecentObserved = Arc<std::sync::Mutex<Vec<FxHashSet<String>>>>;
+
+fn observe_recent_prefix(
+    stream: DownloadPhotoStream,
+    observed: RecentObserved,
+    index: usize,
+    limit: Option<u32>,
+) -> DownloadPhotoStream {
+    let Some(limit) = limit else {
+        return stream;
+    };
+    Box::pin(stream.inspect(move |item| {
+        if let Ok(asset) = item
+            && let Ok(mut passes) = observed.lock()
+            && let Some(ids) = passes.get_mut(index)
+            && ids.len() < limit as usize
+        {
+            ids.insert(asset.asset_record_name().to_owned());
+        }
+    }))
+}
+
 struct RecentFrontier {
     asset_ids: Arc<FxHashSet<String>>,
     oldest_created: Option<DateTime<Utc>>,
     query_token: Option<String>,
     truncated: bool,
+    window_complete: bool,
 }
 
 struct FullPassStreamOptions {
@@ -612,9 +635,12 @@ async fn build_recent_frontier(
     } else {
         None
     };
+    let window_complete = !shutdown_token.is_cancelled()
+        && (asset_ids.len() >= recent as usize || query_token.is_some());
     Ok(Some(RecentFrontier {
         asset_ids: Arc::new(asset_ids),
         oldest_created,
+        window_complete,
         truncated: prefix_ended || query_token.is_none(),
         query_token,
     }))
@@ -991,7 +1017,10 @@ pub(super) async fn download_photos_full_with_token_policy(
 ) -> Result<SyncResult> {
     let started = Instant::now();
     let record_album_snapshots = should_record_album_snapshots(passes, config, controls);
-    let needs_per_pass = config.requires_per_pass_paths() || record_album_snapshots;
+    let needs_per_pass = config.requires_per_pass_paths() || record_album_snapshots
+        // A fallback pass still owns the authenticated source for fresh
+        // publication receipts, even when rendered directories are identical.
+        || (config.state_db.is_some() && config.selection_context.is_none());
 
     // Mark every unique zone as in-progress so an interrupted full
     // enumeration leaves a trail the next startup can surface to the
@@ -1019,6 +1048,9 @@ pub(super) async fn download_photos_full_with_token_policy(
     let len_errors = pass_count_plan.len_errors;
     let display_total = display_total_for_recent_scope(&pass_counts, config);
     let deferred_unfiled = deferred_unfiled_index(passes);
+    let recent_observed: RecentObserved = Arc::new(std::sync::Mutex::new(
+        (0..passes.len()).map(|_| FxHashSet::default()).collect(),
+    ));
     let recent_frontier =
         build_recent_frontier(passes, config, controls, shutdown_token.clone()).await?;
     let bounds_truncated = Arc::new(AtomicBool::new(
@@ -1105,6 +1137,7 @@ pub(super) async fn download_photos_full_with_token_policy(
                 let download_ctx = shared_download_ctx.clone();
                 let bounds_truncated = Arc::clone(&bounds_truncated);
                 let initial_order = initial_order.clone();
+                let recent_observed = Arc::clone(&recent_observed);
                 async move {
                     let album_snapshot = if record_album_snapshots {
                         AlbumSnapshotRecorder::start_for_pass(
@@ -1126,7 +1159,7 @@ pub(super) async fn download_photos_full_with_token_policy(
                         strict_empty_tail_errors,
                     );
                     let stream = filter_stream_to_enumeration_bounds(
-                        stream,
+                        observe_recent_prefix(stream, recent_observed, pass_index, config.recent),
                         config,
                         recent_frontier,
                         Arc::clone(&bounds_truncated),
@@ -1258,7 +1291,12 @@ pub(super) async fn download_photos_full_with_token_policy(
                     );
                     let library = Arc::<str>::from(pass.album.zone_name());
                     let stream = filter_stream_to_enumeration_bounds(
-                        stream,
+                        observe_recent_prefix(
+                            stream,
+                            Arc::clone(&recent_observed),
+                            index,
+                            config.recent,
+                        ),
                         config,
                         recent_frontier.as_ref(),
                         Arc::clone(&bounds_truncated),
@@ -1361,7 +1399,12 @@ pub(super) async fn download_photos_full_with_token_policy(
                 });
                 initial_order.wrap(
                     filter_stream_to_enumeration_bounds(
-                        stream,
+                        observe_recent_prefix(
+                            stream,
+                            Arc::clone(&recent_observed),
+                            pass_index,
+                            config.recent,
+                        ),
                         config,
                         recent_frontier.as_ref(),
                         Arc::clone(&bounds_truncated),
@@ -1480,6 +1523,7 @@ pub(super) async fn download_photos_full_with_token_policy(
     let mut same_cycle_recovery_successes = 0usize;
     let mut checkpoint_retry_passes = Vec::new();
     let mut path_selection_queries_complete = false;
+    let mut selected_window_complete = false;
     let sync_token = if token_attempt_allowed && streaming_result.provider_auth_errors == 0 {
         let expected_token_count = token_receivers.len();
         token_expected_receivers = Some(expected_token_count);
@@ -1526,6 +1570,27 @@ pub(super) async fn download_photos_full_with_token_policy(
         token_receivers_blank = Some(blank_tokens);
         token_receivers_dropped = Some(dropped_receivers);
         token_unique_values = Some(unique_token_count);
+        selected_window_complete = config.recent.is_some()
+            && !observations.is_empty()
+            && streaming_result.enumeration_complete
+            && streaming_result.enumeration_errors == 0
+            && !shutdown_token.is_cancelled()
+            && observations
+                .iter()
+                .all(|observation| match &observation.result {
+                    PassTokenResult::Present(_) => true,
+                    PassTokenResult::Missing => recent_observed.lock().ok().is_some_and(|counts| {
+                        counts.get(observation.pass.index).is_some_and(|ids| {
+                            config
+                                .recent
+                                .is_some_and(|limit| ids.len() >= limit as usize)
+                        })
+                    }),
+                    _ => false,
+                })
+            && recent_frontier
+                .as_ref()
+                .is_none_or(|frontier| frontier.window_complete);
         path_selection_queries_complete = config.complete_path_selection
             && streaming_result.enumeration_complete
             && streaming_result.enumeration_errors == 0
@@ -1975,6 +2040,13 @@ pub(super) async fn download_photos_full_with_token_policy(
         }
     }
 
+    checkpoint.selection_window_complete = selected_window_complete
+        && stats.sync_token_blocked_reason == Some(RECENT_LIMITED_FULL_ENUMERATION_REASON)
+        && !checkpoint.identity_incomplete
+        && !checkpoint.enumeration_incomplete
+        && checkpoint.enumeration_errors == 0
+        && checkpoint.state_write_failures == 0
+        && !checkpoint.interrupted;
     checkpoint.project(stats);
     result.sync_token = sync_token;
     result.full_enumeration_ran = true;

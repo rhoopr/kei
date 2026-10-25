@@ -1,20 +1,32 @@
-//! Account-bound shadow selection manifests. No queue or checkpoint authority.
+//! Shared lossless selection values. Legacy shadow writers exist only for upgrade fixtures.
 
+#[cfg(test)]
 use std::collections::HashSet;
 
+#[cfg(test)]
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
 use super::provider_inbox::{CapturedPageId, load_page};
+#[cfg(test)]
 use super::{SqliteStateDb, account};
-use crate::state::{VersionSizeKey, error::StateError};
+#[cfg(test)]
+use crate::state::VersionSizeKey;
+use crate::state::error::StateError;
+#[cfg(test)]
 use crate::support::{StorageComponent, StorageOutcome};
 
+#[cfg(test)]
 pub(crate) const MAX_SELECTION_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(test)]
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(test)]
 const MANIFEST_VERSION: i64 = 1;
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SelectionSource {
     pub(crate) page_id: i64,
@@ -101,6 +113,7 @@ pub(crate) struct SelectionDecision {
     pub(crate) destinations: Vec<SelectionDestination>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SelectionManifest {
     pub(crate) scope: String,
@@ -113,10 +126,12 @@ pub(crate) struct SelectionManifest {
     pub(crate) decisions: Vec<SelectionDecision>,
 }
 
+#[cfg(test)]
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[cfg(test)]
 fn invalid<T>() -> Result<T, StateError> {
     Err(StateError::ProviderSelectionInvalid)
 }
@@ -125,6 +140,7 @@ fn invalid<T>() -> Result<T, StateError> {
 /// the current one. Every non-confirmation field stays exact. A paired lookup
 /// confirmation may differ only in validated private `ASSETID` URL tokens
 /// classified by the provider-owned transport evidence rule.
+#[cfg(test)]
 fn manifest_equivalent(stored: &SelectionManifest, current: &SelectionManifest) -> bool {
     if stored == current {
         return true;
@@ -189,6 +205,7 @@ fn manifest_equivalent(stored: &SelectionManifest, current: &SelectionManifest) 
 /// through the strict provider-owned equivalence rule before any new charge.
 /// The full matching set is scanned so a legitimate class is never treated as
 /// absent merely because it sorts after an arbitrary prefix.
+#[cfg(test)]
 fn equivalent_generation(
     tx: &rusqlite::Transaction<'_>,
     manifest: &SelectionManifest,
@@ -258,6 +275,7 @@ fn equivalent_generation(
     Ok(None)
 }
 
+#[cfg(test)]
 fn validate(conn: &Connection, manifest: &SelectionManifest) -> Result<(), StateError> {
     if manifest.config_hash.len() != 64
         || !manifest.config_hash.bytes().all(|b| b.is_ascii_hexdigit())
@@ -383,6 +401,7 @@ fn validate(conn: &Connection, manifest: &SelectionManifest) -> Result<(), State
     Ok(())
 }
 
+#[cfg(test)]
 impl SqliteStateDb {
     /// Atomic shadow evidence only. An exact replay is possible at capacity.
     #[cfg(test)]
@@ -501,6 +520,7 @@ impl SqliteStateDb {
     }
 }
 
+#[cfg(test)]
 fn load_shadow(
     conn: &Connection,
     owner: &account::AccountOwner,
@@ -541,6 +561,7 @@ fn load_shadow(
     Ok(manifest)
 }
 
+#[cfg(test)]
 fn outcome_name(outcome: SelectionOutcome) -> &'static str {
     match outcome {
         SelectionOutcome::Selected => "selected",
@@ -549,6 +570,7 @@ fn outcome_name(outcome: SelectionOutcome) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn validate_rows(
     conn: &Connection,
     id: &str,

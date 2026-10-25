@@ -122,7 +122,7 @@ impl SqliteStateDb {
                    AND p.local_checksum=?7 AND p.source_checksum=?8)",
                 params![receipt.library,receipt.id,receipt.version_size.as_str(),
                     path_text,receipt.provider_checksum,
-                    i64::try_from(receipt.provider_size).map_err(|_| refuse())?,local,source],
+                    i64::try_from(receipt.provider_size).map_err(|_error| refuse())?,local,source],
                 |row| row.get(0),
             )?;
             if !unchanged {
@@ -161,7 +161,7 @@ impl SqliteStateDb {
                 )?;
                 let reservations = statement.query_map(
                     params![record.library.as_ref(),record.id.as_ref(),record.version_size.as_str(),
-                        record.checksum.as_ref(),i64::try_from(record.size_bytes).map_err(|_| refuse())?],
+                        record.checksum.as_ref(),i64::try_from(record.size_bytes).map_err(|_error| refuse())?],
                     |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?)),
                 )?;
                 for reservation in reservations {
@@ -182,7 +182,7 @@ impl SqliteStateDb {
                  AND local_path=?5 AND local_checksum=?6)",
                 params![record.library.as_ref(),record.id.as_ref(),record.version_size.as_str(),
                     record.checksum.as_ref(),path_text,local,
-                    i64::try_from(record.size_bytes).map_err(|_| refuse())?],
+                    i64::try_from(record.size_bytes).map_err(|_error| refuse())?],
                 |row| row.get(0),
             )?;
             if !already_present {

@@ -20,7 +20,8 @@ impl PhotosSession for ReadOnlyProbe {
         body: String,
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
-        let parsed = reqwest::Url::parse(url).map_err(|_| anyhow::anyhow!("invalid read URL"))?;
+        let parsed =
+            reqwest::Url::parse(url).map_err(|_error| anyhow::anyhow!("invalid read URL"))?;
         anyhow::ensure!(
             [
                 "/records/query",
@@ -45,10 +46,10 @@ impl PhotosSession for ReadOnlyProbe {
             8 * 1024 * 1024,
         )
         .await
-        .map_err(|_| anyhow::anyhow!("private provider read failed"))?;
+        .map_err(|_error| anyhow::anyhow!("private provider read failed"))?;
         self.3.fetch_add(bytes.len(), Ordering::Relaxed);
         serde_json::from_slice(&bytes)
-            .map_err(|_| anyhow::anyhow!("private provider response invalid"))
+            .map_err(|_error| anyhow::anyhow!("private provider response invalid"))
     }
     fn clone_box(&self) -> Box<dyn PhotosSession> {
         Box::new(self.clone())
@@ -81,7 +82,7 @@ async fn existing_session_primary_and_shared_samples_download_once_then_reuse_af
                 &[("Content-type", "text/plain")],
             )
             .await
-            .map_err(|_| "Photos discovery read failed")?;
+            .map_err(|_error| "Photos discovery read failed")?;
         let zones = listing
             .get("zones")
             .and_then(Value::as_array)
@@ -134,7 +135,7 @@ async fn existing_session_primary_and_shared_samples_download_once_then_reuse_af
             crate::retry::RetryConfig::default(),
         )
         .await
-        .map_err(|_| "selected Photos library could not be initialized")?;
+        .map_err(|_error| "selected Photos library could not be initialized")?;
         // Small asset pages and a bounded request budget. The selected rendition
         // sizes advertised by the provider must total at most 32 MiB.
         let album = crate::icloud::photos::PhotoAlbum::new(
@@ -156,7 +157,7 @@ async fn existing_session_primary_and_shared_samples_download_once_then_reuse_af
         let candidates = album
             .photos(Some(3))
             .await
-            .map_err(|_| "bounded Photos sample read failed")?;
+            .map_err(|_error| "bounded Photos sample read failed")?;
         let asset = candidates
             .into_iter()
             .find(|asset| {
@@ -168,7 +169,7 @@ async fn existing_session_primary_and_shared_samples_download_once_then_reuse_af
                         .is_some_and(|size| size > 0 && size <= 32 * 1024 * 1024)
             })
             .ok_or("no bounded downloadable media sample available")?;
-        let isolated = tempfile::tempdir().map_err(|_| "isolated sample directory failed")?;
+        let isolated = tempfile::tempdir().map_err(|_error| "isolated sample directory failed")?;
         let directory = isolated.path().join("media");
         let state = isolated.path().join("state.sqlite");
         let mut snapshot = Vec::new();
@@ -177,7 +178,7 @@ async fn existing_session_primary_and_shared_samples_download_once_then_reuse_af
             let db = Arc::new(
                 SqliteStateDb::open(&state)
                     .await
-                    .map_err(|_| "isolated sample state failed")?,
+                    .map_err(|_error| "isolated sample state failed")?,
             );
             let config = Arc::new(DownloadConfig {
                 directory: directory.clone().into(),
@@ -197,7 +198,7 @@ async fn existing_session_primary_and_shared_samples_download_once_then_reuse_af
                 super::pipeline::StreamRuntime::new(None, None),
             )
             .await
-            .map_err(|_| "isolated sample pipeline failed")?;
+            .map_err(|_error| "isolated sample pipeline failed")?;
             if !result.failed.is_empty()
                 || result.state_write_failures != 0
                 || result.enumeration_errors != 0
@@ -212,15 +213,15 @@ async fn existing_session_primary_and_shared_samples_download_once_then_reuse_af
                 let rows = db
                     .get_downloaded_page(0, 100)
                     .await
-                    .map_err(|_| "isolated sample receipt read failed")?;
+                    .map_err(|_error| "isolated sample receipt read failed")?;
                 for row in rows {
                     let path = row.local_path.ok_or("live receipt has no path")?;
                     let sha = super::file::compute_sha256(&path)
                         .await
-                        .map_err(|_| "live sample hash failed")?;
+                        .map_err(|_error| "live sample hash failed")?;
                     let mtime = std::fs::metadata(&path)
                         .and_then(|value| value.modified())
-                        .map_err(|_| "live sample timestamp read failed")?;
+                        .map_err(|_error| "live sample timestamp read failed")?;
                     snapshot.push((path, sha, mtime));
                 }
             } else {
@@ -233,11 +234,11 @@ async fn existing_session_primary_and_shared_samples_download_once_then_reuse_af
                 for (path, sha, mtime) in &snapshot {
                     if super::file::compute_sha256(path)
                         .await
-                        .map_err(|_| "reopened sample hash failed")?
+                        .map_err(|_error| "reopened sample hash failed")?
                         != *sha
                         || std::fs::metadata(path)
                             .and_then(|value| value.modified())
-                            .map_err(|_| "reopened timestamp read failed")?
+                            .map_err(|_error| "reopened timestamp read failed")?
                             != *mtime
                     {
                         return Err("existing live sample changed during reuse");
@@ -269,7 +270,7 @@ impl TransferBudget {
         let scope = (root, Arc::new(AtomicUsize::new(0)));
         TRANSFER_SCOPES
             .lock()
-            .map_err(|_| "test transfer budget unavailable")?
+            .map_err(|_error| "test transfer budget unavailable")?
             .push(scope.clone());
         Ok(Self(scope))
     }
@@ -291,14 +292,14 @@ impl Drop for TransferBudget {
 pub(crate) fn admit_transfer_chunk(path: &std::path::Path, bytes: usize) -> std::io::Result<()> {
     let scopes = TRANSFER_SCOPES
         .lock()
-        .map_err(|_| std::io::Error::other("test transfer budget unavailable"))?;
+        .map_err(|_error| std::io::Error::other("test transfer budget unavailable"))?;
     for (_, used) in scopes.iter().filter(|(root, _)| path.starts_with(root)) {
         used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
             total
                 .checked_add(bytes)
                 .filter(|total| *total <= CYCLE_TRANSFER_CAP)
         })
-        .map_err(|_| std::io::Error::other("isolated live transfer budget exceeded"))?;
+        .map_err(|_error| std::io::Error::other("isolated live transfer budget exceeded"))?;
     }
     Ok(())
 }
@@ -335,7 +336,7 @@ impl CycleProbeState {
         let mut stored = self
             .bounds
             .lock()
-            .map_err(|_| anyhow::anyhow!("probe bounds unavailable"))?;
+            .map_err(|_error| anyhow::anyhow!("probe bounds unavailable"))?;
         let mut next = stored.clone();
         for record in records {
             let kind = record.get("recordType").and_then(Value::as_str);
@@ -410,9 +411,9 @@ impl PhotosSession for CycleProbe {
             "old token escaped test state"
         );
         let parsed =
-            reqwest::Url::parse(url).map_err(|_| anyhow::anyhow!("invalid provider URL"))?;
-        let request: Value =
-            serde_json::from_str(&body).map_err(|_| anyhow::anyhow!("invalid read request"))?;
+            reqwest::Url::parse(url).map_err(|_error| anyhow::anyhow!("invalid provider URL"))?;
+        let request: Value = serde_json::from_str(&body)
+            .map_err(|_error| anyhow::anyhow!("invalid read request"))?;
         let inventory = parsed.path().ends_with("/records/query")
             && request.pointer("/query/recordType").and_then(Value::as_str)
                 != Some("CheckIndexingState");
@@ -421,7 +422,7 @@ impl PhotosSession for CycleProbe {
                 .state
                 .collection
                 .lock()
-                .map_err(|_| anyhow::anyhow!("probe state unavailable"))?
+                .map_err(|_error| anyhow::anyhow!("probe state unavailable"))?
                 .as_ref()
             {
                 anyhow::ensure!(
@@ -459,7 +460,7 @@ impl PhotosSession for CycleProbe {
             .state
             .collection
             .lock()
-            .map_err(|_| anyhow::anyhow!("probe state unavailable"))?
+            .map_err(|_error| anyhow::anyhow!("probe state unavailable"))?
             .is_some();
         if selected {
             let mut batches: Vec<&Value> = response
@@ -487,7 +488,7 @@ impl PhotosSession for CycleProbe {
                     .state
                     .field_presence
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("probe evidence unavailable"))?;
+                    .map_err(|_error| anyhow::anyhow!("probe evidence unavailable"))?;
                 if record.get("recordChangeTag").is_some() {
                     *presence.entry("recordChangeTag").or_default() += 1;
                 }
@@ -508,7 +509,7 @@ impl PhotosSession for CycleProbe {
                         .state
                         .evidence
                         .lock()
-                        .map_err(|_| anyhow::anyhow!("probe evidence unavailable"))?;
+                        .map_err(|_error| anyhow::anyhow!("probe evidence unavailable"))?;
                     for &field in crate::icloud::photos::queries::DESIRED_KEYS
                         .iter()
                         .filter(|field| field.ends_with("Res"))
@@ -579,7 +580,8 @@ impl PhotosSession for CycleProbe {
                 .state
                 .last_token
                 .lock()
-                .map_err(|_| anyhow::anyhow!("probe state unavailable"))? = Some(token.to_owned());
+                .map_err(|_error| anyhow::anyhow!("probe state unavailable"))? =
+                Some(token.to_owned());
         }
         Ok(response)
     }
@@ -611,7 +613,7 @@ async fn normal_cycle_validation(digest_probe: bool) -> Result<(), &'static str>
         return Err("private request dumping is incompatible with this validation");
     }
     let username =
-        std::env::var("ICLOUD_USERNAME").map_err(|_| "validated username unavailable")?;
+        std::env::var("ICLOUD_USERNAME").map_err(|_error| "validated username unavailable")?;
     let readonly = ReadOnlyProbe(
         session.http_client().clone(),
         Arc::new(AtomicUsize::new(0)),
@@ -630,7 +632,7 @@ async fn normal_cycle_validation(digest_probe: bool) -> Result<(), &'static str>
                 &[("Content-type", "text/plain")],
             )
             .await
-            .map_err(|_| "bounded scope discovery failed")?;
+            .map_err(|_error| "bounded scope discovery failed")?;
         for zone in listing
             .get("zones")
             .and_then(Value::as_array)
@@ -705,14 +707,14 @@ async fn normal_cycle_validation(digest_probe: bool) -> Result<(), &'static str>
             let count = album
                 .len()
                 .await
-                .map_err(|_| "bounded collection count unavailable")?;
+                .map_err(|_error| "bounded collection count unavailable")?;
             if !(1..=3).contains(&count) {
                 continue;
             }
             let assets = album
                 .photos(None)
                 .await
-                .map_err(|_| "bounded collection preflight failed")?;
+                .map_err(|_error| "bounded collection preflight failed")?;
             let size = assets
                 .iter()
                 .flat_map(|asset| asset.versions())
@@ -731,11 +733,12 @@ async fn normal_cycle_validation(digest_probe: bool) -> Result<(), &'static str>
             .state
             .collection
             .lock()
-            .map_err(|_| "probe state unavailable")? = Some((
+            .map_err(|_error| "probe state unavailable")? = Some((
             definition.list_type.to_owned(),
             definition.query_filter.as_deref().cloned(),
         ));
-        let isolated = tempfile::tempdir().map_err(|_| "isolated cycle directory unavailable")?;
+        let isolated =
+            tempfile::tempdir().map_err(|_error| "isolated cycle directory unavailable")?;
         let directory = isolated.path().join("media");
         let state_path = isolated.path().join("state.sqlite");
         let budget = TransferBudget::new(directory.clone())?;
@@ -750,7 +753,7 @@ async fn normal_cycle_validation(digest_probe: bool) -> Result<(), &'static str>
             crate::cli::SyncArgs::default(),
             None,
         )
-        .map_err(|_| "isolated cycle configuration invalid")?;
+        .map_err(|_error| "isolated cycle configuration invalid")?;
         config.download.directory = directory.clone();
         config.runtime = crate::config::RuntimeConfig {
             dry_run: false,
@@ -780,7 +783,7 @@ async fn normal_cycle_validation(digest_probe: bool) -> Result<(), &'static str>
             let db = Arc::new(
                 SqliteStateDb::open_owned(&state_path, &owner)
                     .await
-                    .map_err(|_| "isolated owned database failed")?,
+                    .map_err(|_error| "isolated owned database failed")?,
             );
             let mut library = PhotoLibrary::new(
                 endpoint.clone(),
@@ -791,7 +794,7 @@ async fn normal_cycle_validation(digest_probe: bool) -> Result<(), &'static str>
                 crate::retry::RetryConfig::default(),
             )
             .await
-            .map_err(|_| "selected library unavailable")?;
+            .map_err(|_error| "selected library unavailable")?;
             let capture = ShadowCapture::new(db.clone(), owner.clone(), "com");
             library.shadow_capture = Some(capture.clone());
             let mut album = PhotoAlbum::new(
@@ -816,7 +819,7 @@ async fn normal_cycle_validation(digest_probe: bool) -> Result<(), &'static str>
             if cycle == 0 {
                 db.set_metadata(&format!("sync_token:{zone_name}"), LEGACY_PROBE_TOKEN)
                     .await
-                    .map_err(|_| "legacy token seed failed")?;
+                    .map_err(|_error| "legacy token seed failed")?;
             }
             let selected = LibraryState {
                 library,
@@ -870,19 +873,19 @@ async fn normal_cycle_validation(digest_probe: bool) -> Result<(), &'static str>
                 &CancellationToken::new(),
             )
             .await
-            .map_err(|_| "bounded normal cycle failed; no completion claimed")?;
+            .map_err(|_error| "bounded normal cycle failed; no completion claimed")?;
             if result.failed_count != 0
                 || result.session_expired
                 || !result.db_sync_token_advance_safe
                 || !db
                     .get_pending()
                     .await
-                    .map_err(|_| "pending accounting unavailable")?
+                    .map_err(|_error| "pending accounting unavailable")?
                     .is_empty()
                 || !db
                     .get_failed()
                     .await
-                    .map_err(|_| "failed accounting unavailable")?
+                    .map_err(|_error| "failed accounting unavailable")?
                     .is_empty()
             {
                 eprintln!(
@@ -895,11 +898,11 @@ async fn normal_cycle_validation(digest_probe: bool) -> Result<(), &'static str>
                     result.stats.downloaded,
                     db.get_pending()
                         .await
-                        .map_err(|_| "pending accounting unavailable")?
+                        .map_err(|_error| "pending accounting unavailable")?
                         .len(),
                     db.get_failed()
                         .await
-                        .map_err(|_| "failed accounting unavailable")?
+                        .map_err(|_error| "failed accounting unavailable")?
                         .len()
                 );
                 eprintln!(
@@ -926,19 +929,19 @@ async fn normal_cycle_validation(digest_probe: bool) -> Result<(), &'static str>
             let (_, ledger_scope, _) = selected.plan.passes[0]
                 .album
                 .download_scope()
-                .map_err(|_| "selected ledger scope unavailable")?
+                .map_err(|_error| "selected ledger scope unavailable")?
                 .ok_or("selected ledger is not bound to authenticated state")?;
             if db
                 .unfinished_selection_debt(owner.clone(), ledger_scope)
                 .await
-                .map_err(|_| "selected ledger accounting invalid")?
+                .map_err(|_error| "selected ledger accounting invalid")?
             {
                 return Err("selected ledger retains pending work; no completion claimed");
             }
             if db
                 .get_metadata(&format!("sync_token:{}", selected.zone_name))
                 .await
-                .map_err(|_| "legacy token retention unavailable")?
+                .map_err(|_error| "legacy token retention unavailable")?
                 .as_deref()
                 != Some(LEGACY_PROBE_TOKEN)
             {
@@ -948,13 +951,13 @@ async fn normal_cycle_validation(digest_probe: bool) -> Result<(), &'static str>
                 .state
                 .last_token
                 .lock()
-                .map_err(|_| "token observation unavailable")?
+                .map_err(|_error| "token observation unavailable")?
                 .clone();
             if exact.is_none()
                 || db
                     .get_metadata(&key)
                     .await
-                    .map_err(|_| "checkpoint unavailable")?
+                    .map_err(|_error| "checkpoint unavailable")?
                     != exact
                 || probe.state.changes_calls.load(Ordering::Relaxed) == changes_before
             {
@@ -967,15 +970,15 @@ async fn normal_cycle_validation(digest_probe: bool) -> Result<(), &'static str>
                 for row in db
                     .get_downloaded_page(0, 100)
                     .await
-                    .map_err(|_| "receipt read failed")?
+                    .map_err(|_error| "receipt read failed")?
                 {
                     let path = row.local_path.ok_or("downloaded receipt has no path")?;
                     let hash = super::file::compute_sha256(&path)
                         .await
-                        .map_err(|_| "sample hash failed")?;
+                        .map_err(|_error| "sample hash failed")?;
                     let modified = std::fs::metadata(&path)
                         .and_then(|metadata| metadata.modified())
-                        .map_err(|_| "sample timestamp unavailable")?;
+                        .map_err(|_error| "sample timestamp unavailable")?;
                     snapshot.push((path, hash, modified));
                 }
                 if digest_probe {
@@ -990,11 +993,11 @@ async fn normal_cycle_validation(digest_probe: bool) -> Result<(), &'static str>
             for (path, hash, modified) in &snapshot {
                 if super::file::compute_sha256(path)
                     .await
-                    .map_err(|_| "reopened sample hash failed")?
+                    .map_err(|_error| "reopened sample hash failed")?
                     != *hash
                     || std::fs::metadata(path)
                         .and_then(|metadata| metadata.modified())
-                        .map_err(|_| "reopened timestamp unavailable")?
+                        .map_err(|_error| "reopened timestamp unavailable")?
                         != *modified
                 {
                     return Err("existing isolated media changed");
@@ -1113,7 +1116,7 @@ async fn report_v1_digest_evidence(
     let rows = db
         .get_downloaded_page(0, 100)
         .await
-        .map_err(|_| "digest sample receipt read failed")?;
+        .map_err(|_error| "digest sample receipt read failed")?;
     if rows.is_empty() || rows.len() >= 100 {
         return Err("digest sample receipt bound unavailable");
     }
@@ -1127,7 +1130,7 @@ async fn report_v1_digest_evidence(
         let path = row.local_path.ok_or("digest sample native path missing")?;
         let bytes = tokio::fs::read(path)
             .await
-            .map_err(|_| "digest sample read failed")?;
+            .map_err(|_error| "digest sample read failed")?;
         sampled_bytes = sampled_bytes
             .checked_add(bytes.len() as u64)
             .ok_or("digest sample size overflow")?;
@@ -1146,7 +1149,7 @@ async fn report_v1_digest_evidence(
             .state
             .evidence
             .lock()
-            .map_err(|_| "digest evidence unavailable")?;
+            .map_err(|_error| "digest evidence unavailable")?;
         let candidates: Vec<_> = evidence
             .iter()
             .filter(|e| e.checksum == row.checksum.as_ref() && e.size == row.size_bytes)
@@ -1174,7 +1177,7 @@ async fn report_v1_digest_evidence(
             .state
             .field_presence
             .lock()
-            .map_err(|_| "field presence unavailable")?
+            .map_err(|_error| "field presence unavailable")?
     );
     checksums.report(category, "fileChecksum");
     fingerprints.report(category, "resFingerprint");
@@ -1304,7 +1307,7 @@ async fn existing_session_bounded_primary_shared_rendition_signature_samples()
                 &[("Content-type", "text/plain")],
             )
             .await
-            .map_err(|_| "sample scope discovery failed")?;
+            .map_err(|_error| "sample scope discovery failed")?;
         for zone in listing
             .get("zones")
             .and_then(Value::as_array)
@@ -1370,7 +1373,7 @@ async fn existing_session_bounded_primary_shared_rendition_signature_samples()
         let candidates = album
             .photos(Some(3))
             .await
-            .map_err(|_| "bounded rendition sample query failed")?;
+            .map_err(|_error| "bounded rendition sample query failed")?;
         if candidates.len() > 3 {
             return Err("sample query exceeded asset bound");
         }
@@ -1397,15 +1400,16 @@ async fn existing_session_bounded_primary_shared_rendition_signature_samples()
             .state
             .collection
             .lock()
-            .map_err(|_| "sample state unavailable")? = Some((list_type.to_owned(), None));
+            .map_err(|_error| "sample state unavailable")? = Some((list_type.to_owned(), None));
         let confirmed = album
             .confirm_catalog_asset(selected.asset_record_name())
             .await
-            .map_err(|_| "targeted current sample confirmation failed")?;
+            .map_err(|_error| "targeted current sample confirmation failed")?;
         if !eligible(&confirmed.asset) {
             return Err("confirmed sample exceeds advertised byte bound");
         }
-        let isolated = tempfile::tempdir().map_err(|_| "isolated sample directory unavailable")?;
+        let isolated =
+            tempfile::tempdir().map_err(|_error| "isolated sample directory unavailable")?;
         let directory = isolated.path().join("media");
         let state_path = isolated.path().join("state.sqlite");
         let budget = TransferBudget::new(directory.clone())?;
@@ -1417,7 +1421,7 @@ async fn existing_session_bounded_primary_shared_rendition_signature_samples()
             let db = Arc::new(
                 SqliteStateDb::open_owned(&state_path, &owner)
                     .await
-                    .map_err(|_| "owned sample state unavailable")?,
+                    .map_err(|_error| "owned sample state unavailable")?,
             );
             let mut config = DownloadConfig::test_default();
             config.directory = directory.clone().into();
@@ -1443,7 +1447,7 @@ async fn existing_session_bounded_primary_shared_rendition_signature_samples()
                 super::pipeline::StreamRuntime::new(None, None),
             )
             .await
-            .map_err(|_| "isolated rendition sample transfer failed")?;
+            .map_err(|_error| "isolated rendition sample transfer failed")?;
             if !result.failed.is_empty()
                 || result.state_write_failures != 0
                 || result.enumeration_errors != 0
@@ -1453,7 +1457,7 @@ async fn existing_session_bounded_primary_shared_rendition_signature_samples()
         }
         let db = SqliteStateDb::open_owned(&state_path, &owner)
             .await
-            .map_err(|_| "sample reopen failed")?;
+            .map_err(|_error| "sample reopen failed")?;
         report_v1_digest_evidence(&probe, &db, category).await?;
         if budget.used() == 0 {
             return Err("no rendition bytes sampled");

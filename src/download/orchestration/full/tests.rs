@@ -2473,6 +2473,7 @@ fn stream_created_lower_bound_uses_the_stricter_date_or_recent_frontier() {
         ),
     ] {
         let frontier = RecentFrontier {
+            window_complete: false,
             query_token: None,
             truncated: false,
             asset_ids: Arc::new(FxHashSet::default()),

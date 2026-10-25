@@ -26,9 +26,8 @@ mod test_support;
 
 pub(super) use crate::download::metadata_rewrite::MetadataFlags;
 pub(super) use adoption::{
-    PendingRetryAdoption, PendingRetryLocalPath, mark_reserved_pending_task,
-    recorded_current_path_exists, recover_current_pending_publication,
-    state_confirmed_current_path_exists, validate_enumerated_reserved_pending,
+    PendingRetryAdoption, mark_reserved_pending_task, recover_current_pending_publication,
+    validate_enumerated_reserved_pending,
 };
 pub(super) use outcome::{StreamingResult, build_download_outcome, build_download_result};
 pub(super) use pass::{PassConfig, PassResult, run_download_pass};

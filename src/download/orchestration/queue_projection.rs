@@ -1,4 +1,4 @@
-//! Current-config admission from retained provider sources into existing queues.
+//! Retry explicitly retained legacy admissions; bare catalog history creates no new work.
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};

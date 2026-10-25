@@ -20,12 +20,14 @@ pub(crate) async fn existing_session_and_owner_for_validation() -> Result<
         return Err("explicit session probe opt-in is missing");
     }
     let env_path = std::env::var("KEI_SESSION_PROBE_ENV")
-        .map_err(|_| "documented test environment path missing")?;
-    dotenvy::from_path(env_path).map_err(|_| "documented test environment unavailable")?;
-    let username = std::env::var("ICLOUD_USERNAME").map_err(|_| "test username unavailable")?;
+        .map_err(|_error| "documented test environment path missing")?;
+    dotenvy::from_path(env_path).map_err(|_error| "documented test environment unavailable")?;
+    let username =
+        std::env::var("ICLOUD_USERNAME").map_err(|_error| "test username unavailable")?;
     let cookie_dir = std::env::var("KEI_SESSION_PROBE_COOKIE_DIR")
-        .map_err(|_| "existing test session directory missing")?;
-    let endpoints = super::Endpoints::for_domain("com").map_err(|_| "test realm unavailable")?;
+        .map_err(|_error| "existing test session directory missing")?;
+    let endpoints =
+        super::Endpoints::for_domain("com").map_err(|_error| "test realm unavailable")?;
     let mut session = super::session::Session::new(
         std::path::Path::new(&cookie_dir),
         &username,
@@ -33,7 +35,7 @@ pub(crate) async fn existing_session_and_owner_for_validation() -> Result<
         Some(30),
     )
     .await
-    .map_err(|_| "existing session could not be opened; no login attempted")?;
+    .map_err(|_error| "existing session could not be opened; no login attempted")?;
     if !session.loaded_persisted_auth() {
         return Err("saved authenticated session was not loaded; no login attempted");
     }
@@ -47,20 +49,20 @@ pub(crate) async fn existing_session_and_owner_for_validation() -> Result<
         .body("null")
         .send()
         .await
-        .map_err(|_| "session validation request failed; no login attempted")?;
+        .map_err(|_error| "session validation request failed; no login attempted")?;
     if !response.status().is_success() {
         return Err("saved session validation rejected; no login attempted");
     }
     let data: super::AccountLoginResponse = response
         .json()
         .await
-        .map_err(|_| "session validation response invalid")?;
+        .map_err(|_error| "session validation response invalid")?;
     if super::check_requires_2fa(&data) || data.has_error || data.i_cdp_enabled {
         return Err("saved session is not usable for this read-only check; no login attempted");
     }
     session
         .bind_principal(&data, None)
-        .map_err(|_| "authenticated principal validation failed")?;
+        .map_err(|_error| "authenticated principal validation failed")?;
     let root = data
         .webservices
         .as_ref()
@@ -68,7 +70,7 @@ pub(crate) async fn existing_session_and_owner_for_validation() -> Result<
         .map(|endpoint| endpoint.url.clone())
         .ok_or("validated Photos endpoint missing")?;
     let owner = crate::state::db::account::AccountOwner::authenticated(&username, "com", &data)
-        .map_err(|_| "authenticated state owner unavailable")?;
+        .map_err(|_error| "authenticated state owner unavailable")?;
     Ok((session, root, owner))
 }
 
@@ -90,9 +92,9 @@ async fn existing_session_zone_cursor_is_accepted_without_reauthentication()
             1024 * 1024,
         )
         .await
-        .map_err(|_| "scoped zone-list read failed")?;
+        .map_err(|_error| "scoped zone-list read failed")?;
         let listing: Value =
-            serde_json::from_slice(&raw).map_err(|_| "scoped zone-list response invalid")?;
+            serde_json::from_slice(&raw).map_err(|_error| "scoped zone-list response invalid")?;
         let zones = listing
             .get("zones")
             .and_then(Value::as_array)
@@ -156,9 +158,9 @@ async fn existing_session_zone_cursor_is_accepted_without_reauthentication()
                 1024 * 1024,
             )
             .await
-            .map_err(|_| "read-only changes cursor request failed")?;
+            .map_err(|_error| "read-only changes cursor request failed")?;
             let response: Value =
-                serde_json::from_slice(&raw).map_err(|_| "changes response invalid")?;
+                serde_json::from_slice(&raw).map_err(|_error| "changes response invalid")?;
             let returned = response
                 .get("zones")
                 .and_then(Value::as_array)

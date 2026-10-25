@@ -45,7 +45,6 @@ impl PendingRetryTarget {
 struct PendingRetryEvidence {
     added_at: Option<chrono::DateTime<chrono::Utc>>,
     checksum: Arc<str>,
-    filename: Arc<str>,
     local_file: Option<RecordedLocalFile>,
     downloaded_at: Option<chrono::DateTime<chrono::Utc>>,
     size_bytes: u64,
@@ -57,7 +56,6 @@ impl PendingRetryEvidence {
         Self {
             added_at: record.added_at,
             checksum: Arc::from(record.checksum.as_ref()),
-            filename: Arc::from(record.filename.as_ref()),
             local_file: record.local_path.clone().map(|path| RecordedLocalFile {
                 path,
                 local_checksum: record.local_checksum.as_deref().map(Into::into),
@@ -124,24 +122,6 @@ impl PendingRetryEvidence {
             .as_ref()
             .map(|file| file.path.as_path())
             .filter(|path| path.starts_with(directory))
-    }
-
-    fn local_path_evidence_under<'a>(
-        &'a self,
-        directory: &Path,
-    ) -> pipeline::PendingRetryLocalPath<'a> {
-        let Some(file) = self
-            .local_file
-            .as_ref()
-            .filter(|file| file.path.starts_with(directory))
-        else {
-            return pipeline::PendingRetryLocalPath::Unrecorded;
-        };
-        if self.downloaded_at.is_some() {
-            pipeline::PendingRetryLocalPath::Current(file)
-        } else {
-            pipeline::PendingRetryLocalPath::Historical
-        }
     }
 }
 
@@ -268,8 +248,10 @@ impl PendingRetryPlanning<'_> {
     async fn plan_resolved_asset(&mut self, asset: &PhotoAsset, state_id: &str) -> Result<()> {
         let mut malformed_targets = FxHashSet::default();
         let mut state_write_failed_targets = FxHashSet::default();
+        let mut retained_targets = FxHashSet::default();
         let mut filter_reasons = Vec::<filter::FilterReason>::new();
         for (pass_index, pass_config) in self.pass_configs.iter().enumerate() {
+            let mut authorized_repairs = FxHashMap::default();
             if !self
                 .pending_targets
                 .iter()
@@ -328,37 +310,35 @@ impl PendingRetryPlanning<'_> {
                     else {
                         continue;
                     };
-                    match self
+                    let decision = self
                         .task_planner
                         .match_existing(asset, pass_config, task)
-                        .await
-                    {
-                        crate::download::baseline_matching::BaselineMatch::Present {
-                            receipt,
-                            file,
-                        } => {
-                            if self.run_mode.downloads_files() {
-                                let _guard = super::file::lock_download_destination(
-                                    &receipt.local_path,
-                                    self.shutdown,
-                                )
-                                .await?;
-                                let record =
-                                    planner::pending_record_for_task(pass_config, asset, task);
-                                match self.db.adopt_baseline_receipt(&record, &receipt, Box::new(move || {
-                                    file.validate_blocking().map_err(|_| crate::state::error::StateError::Invariant {
-                                        operation: "adopt_baseline_receipt",
-                                        detail: "existing retry file changed before receipt commit".into(),
-                                    })
-                                })).await {
-                                    Ok(()) => pipeline::PendingRetryAdoption::Adopted,
-                                    Err(_) => pipeline::PendingRetryAdoption::StateWriteFailed,
-                                }
-                            } else {
-                                pipeline::PendingRetryAdoption::Adopted
-                            }
+                        .await;
+                    match decision {
+                        decision @ (crate::download::baseline_matching::BaselineMatch::Present { .. }
+                            | crate::download::baseline_matching::BaselineMatch::ProviderPresent { .. }
+                            | crate::download::baseline_matching::BaselineMatch::RecordedPresent { .. }) => {
+                            if !self.run_mode.downloads_files() || crate::download::baseline_matching::commit_match(
+                                decision,pass_config,asset,task,self.shutdown).await.is_ok()
+                            { pipeline::PendingRetryAdoption::Adopted }
+                            else { pipeline::PendingRetryAdoption::StateWriteFailed }
                         }
-                        decision => {
+                        decision @ (crate::download::baseline_matching::BaselineMatch::Missing
+                            | crate::download::baseline_matching::BaselineMatch::Uncertain) => {
+                            // Only an explicitly marked, same-generation truncated target can
+                            // proceed past uncertainty. The later claim still authorizes the
+                            // exact destination and carries the fresh replacement fingerprint.
+                            let authorized_repair = if let Some(local_path)=evidence.local_path_under(&pass_config.directory) {
+                                if evidence.matches_provider_version(task)
+                                    && (!self.task_planner.has_durable_destination(task) || task.download_path==local_path)
+                                    && self.task_planner.retry_path_allowed(&task.library,&task.asset_id,
+                                        task.version_size,&task.checksum,task.size,local_path) {
+                                    evidence.truncated_repair_fingerprint(pass_config.repair_truncated).await?
+                                } else { None }
+                            } else { None };
+                            if let Some(fingerprint)=authorized_repair {
+                                authorized_repairs.insert(target.clone(),fingerprint);
+                            }
                             // A saved pending path is another candidate even when today's
                             // rendering chooses a different directory or collision suffix.
                             let recorded_candidate = if let Some(path) =
@@ -372,10 +352,10 @@ impl PendingRetryPlanning<'_> {
                             } else {
                                 false
                             };
-                            if matches!(
+                            if authorized_repair.is_none() && (matches!(
                                 decision,
                                 crate::download::baseline_matching::BaselineMatch::Uncertain
-                            ) || recorded_candidate
+                            ) || recorded_candidate)
                             {
                                 if self.run_mode.downloads_files() {
                                     self.db
@@ -431,6 +411,10 @@ impl PendingRetryPlanning<'_> {
                         .cloned(),
                 );
             }
+            #[cfg(test)]
+            {
+                let _ = AFTER_REPAIR_MATCH.try_with(|hook| hook());
+            }
             let mut retry_tasks = Vec::with_capacity(plan.tasks.len());
             for mut task in plan.tasks.into_iter().filter(|task| {
                 self.pending_targets
@@ -438,6 +422,21 @@ impl PendingRetryPlanning<'_> {
                     && !state_write_failed_targets.contains(&PendingRetryTarget::from_task(task))
             }) {
                 let target = PendingRetryTarget::from_task(&task);
+                if let Some(expected) = authorized_repairs.get(&target) {
+                    let evidence = self
+                        .pending_evidence
+                        .get(&target)
+                        .context("Missing authorized repair evidence")?;
+                    if evidence
+                        .truncated_repair_fingerprint(pass_config.repair_truncated)
+                        .await?
+                        != Some(*expected)
+                    {
+                        tracing::warn!("Recorded repair target changed; pending work retained");
+                        retained_targets.insert(target);
+                        continue;
+                    }
+                }
                 if let Some(evidence) = self.pending_evidence.get(&target)
                     && let Some(local_path) = evidence.local_path_under(&pass_config.directory)
                     && (!self.task_planner.has_durable_destination(&task)
@@ -456,6 +455,13 @@ impl PendingRetryPlanning<'_> {
                             .truncated_repair_fingerprint(pass_config.repair_truncated)
                             .await?
                     {
+                        if authorized_repairs
+                            .get(&target)
+                            .is_some_and(|expected| *expected != fingerprint)
+                        {
+                            retained_targets.insert(target);
+                            continue;
+                        }
                         if !self
                             .task_planner
                             .claim_recorded_repair_path(local_path, &task)
@@ -467,11 +473,16 @@ impl PendingRetryPlanning<'_> {
                                 path = %local_path.display(),
                                 "Could not reserve the recorded truncated path; retaining pending work"
                             );
+                            retained_targets.insert(target);
                             continue;
                         }
                         task.download_path = local_path.to_path_buf();
                         task.replacement_fingerprint = Some(Arc::new(fingerprint));
                     } else {
+                        if authorized_repairs.contains_key(&target) {
+                            retained_targets.insert(target);
+                            continue;
+                        }
                         let Some(retry_path) = self
                             .task_planner
                             .resolve_recorded_retry_path(local_path, &task)
@@ -483,6 +494,7 @@ impl PendingRetryPlanning<'_> {
                                 path = %local_path.display(),
                                 "Could not choose a safe sibling for the recorded retry path; retaining pending work"
                             );
+                            retained_targets.insert(target);
                             continue;
                         };
                         task.download_path = retry_path;
@@ -558,6 +570,7 @@ impl PendingRetryPlanning<'_> {
             .filter(|target| {
                 !malformed_targets.contains(*target)
                     && !state_write_failed_targets.contains(*target)
+                    && !retained_targets.contains(*target)
             })
             .cloned()
             .collect();
@@ -1656,7 +1669,6 @@ mod tests {
         let mut evidence = PendingRetryEvidence {
             added_at: None,
             checksum: Arc::from("provider-checksum"),
-            filename: Arc::from("photo.jpg"),
             local_file: Some(RecordedLocalFile {
                 path,
                 local_checksum: Some(actual_checksum.into()),
@@ -1700,3 +1712,8 @@ mod tests {
 #[cfg(test)]
 #[path = "retry/current_publication_tests.rs"]
 mod current_publication_tests;
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(in crate::download) static AFTER_REPAIR_MATCH: Arc<dyn Fn() + Send + Sync>;
+}

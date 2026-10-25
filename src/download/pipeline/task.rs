@@ -228,6 +228,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
         if let Some(db) = context.state_db {
             let fingerprint = downloaded.fingerprint().await?;
             let proof = crate::state::db::PreparedPublication {
+                binding: task.publication_binding.as_deref().cloned(),
                 library: task.library.to_string(),
                 id: task.asset_id.to_string(),
                 version: task.version_size.as_str().to_owned(),

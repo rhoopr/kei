@@ -116,6 +116,25 @@ async fn admission_with_legacy_state(
             .unwrap(),
         })
         .collect();
+    let format:i64=db.acquire_lock("fixture generation format").unwrap().query_row(
+        "SELECT json_extract(CAST(specification AS TEXT),'$.format') FROM provider_active_generations WHERE id=?1",[root],|row|row.get(0)).unwrap();
+    let sources = if format == 1 {
+        db.capture_selection_rank_page(
+            owner(),
+            root.into(),
+            "pass".into(),
+            legacy_rank_request(),
+            body.clone(),
+            capacity,
+        )
+        .await
+        .unwrap();
+        db.selection_rank_sources(owner(), root.into(), "pass".into(), child.clone())
+            .await
+            .unwrap()
+    } else {
+        Vec::new()
+    };
     let manifest = ActiveDecision {
         decision: SelectionDecision {
             pass_key: "pass".into(),
@@ -126,7 +145,7 @@ async fn admission_with_legacy_state(
             reason: String::new(),
             destinations,
         },
-        sources: Vec::new(),
+        sources,
         state_id: if legacy { master } else { child },
     };
     assert!(
@@ -248,34 +267,53 @@ async fn v027_active_baseline_compacts_above_budget_and_preserves_pending_compan
         stored.decision.confirmation.is_some(),
         "pending companion still owns its useful original evidence"
     );
+    db.acquire_lock("completed predecessor is the interrupted replay cursor")
+        .unwrap()
+        .execute(
+            "UPDATE provider_active_generations SET replay_after=?2 WHERE id=?1",
+            rusqlite::params![
+                root.id,
+                serde_json::to_string(&("pass", "asset-compact-13")).unwrap()
+            ],
+        )
+        .unwrap();
     let next = db
         .begin_selection_generation(owner(), spec(), BUDGET)
         .await
         .unwrap();
-    let conn = db
-        .acquire_lock("predecessor retains only unfinished work")
-        .unwrap();
-    let previous: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM provider_active_decisions WHERE generation=?1",
-            [&root.id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(previous, 1);
-    assert_eq!(
-        conn.query_row("SELECT count(*) FROM download_receipts", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
-        13
-    );
-    assert_eq!(std::fs::read(&first).unwrap(), RAW);
-    assert_eq!(
-        std::fs::metadata(&first).unwrap().modified().unwrap(),
-        mtime
-    );
-    assert_ne!(root.id, next.id);
-    drop(conn);
+    {
+        let conn = db
+            .acquire_lock("predecessor retains only unfinished work")
+            .unwrap();
+        let previous: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM provider_active_decisions WHERE generation=?1",
+                [&root.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(previous, 1);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM download_receipts", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            13
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), RAW);
+        assert_eq!(
+            std::fs::metadata(&first).unwrap().modified().unwrap(),
+            mtime
+        );
+        assert_ne!(root.id, next.id);
+        assert!(
+            conn.query_row(
+                "SELECT replay_after IS NULL FROM provider_active_generations WHERE id=?1",
+                [&root.id],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap()
+        );
+    }
     drop(db);
     let reopened = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
         .await
@@ -467,7 +505,7 @@ async fn v027_compact_native_receipts_remain_reachable_beyond_sixty_four_copies(
 
 #[cfg(target_os = "linux")]
 mod process_death {
-    use super::{BUDGET, RAW, admission, owner, publish, spec};
+    use super::{BUDGET, MAX_GENERATION_BYTES, RAW, admission, legacy_spec, owner, publish, spec};
     use crate::state::SqliteStateDb;
     use crate::state::db::provider_selection::SelectionPath;
     use sha2::{Digest, Sha256};
@@ -601,6 +639,109 @@ mod process_death {
     }
 
     #[tokio::test]
+    async fn v027_legacy_completion_sigkill_preserves_rank_owner_or_receipt() {
+        for point in [
+            "completion-receipts-saved",
+            "completion-manifest-retired",
+            "completion-before-root-retirement",
+            "completion-root-retired",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("fixture-owner"),
+                b"kei-synthetic-process-death",
+            )
+            .unwrap();
+            let db = Arc::new(
+                SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+                    .await
+                    .unwrap(),
+            );
+            let root = db
+                .begin_selection_generation(owner(), legacy_spec(), MAX_GENERATION_BYTES)
+                .await
+                .unwrap();
+            let (_, tasks, _) = admission(
+                &db,
+                &root.id,
+                &dir.path().join("media"),
+                1,
+                false,
+                MAX_GENERATION_BYTES,
+            )
+            .await;
+            publish(&db, &tasks[0]).await;
+            db.seal_selection_generation(owner(), root.id.clone(), true, None)
+                .await
+                .unwrap();
+            let media = tasks[0].download_path.clone();
+            let mtime = std::fs::metadata(&media).unwrap().modified().unwrap();
+            drop(db);
+            let log = std::fs::File::create(dir.path().join("worker.log")).unwrap();
+            let mut worker = Worker(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", WORKER, "--ignored", "--nocapture"])
+                    .env("KEI_TEST_PROCESS_DEATH_ROOT", dir.path())
+                    .env("KEI_TEST_PROCESS_DEATH_POINT", point)
+                    .env("KEI_LEGACY_RETIREMENT", "1")
+                    .stdout(Stdio::from(log.try_clone().unwrap()))
+                    .stderr(Stdio::from(log))
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !dir.path().join("ready").exists() {
+                assert!(
+                    worker.0.try_wait().unwrap().is_none(),
+                    "worker exited at {point}: {}",
+                    std::fs::read_to_string(dir.path().join("worker.log")).unwrap()
+                );
+                assert!(Instant::now() < deadline, "worker timeout at {point}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            worker.0.kill().unwrap();
+            assert_eq!(worker.0.wait().unwrap().signal(), Some(9));
+            let db = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+                .await
+                .unwrap();
+            {
+                let conn = db.acquire_lock("legacy crash ownership").unwrap();
+                let old: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM provider_active_sources WHERE generation=?1)",
+                        [&root.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let complete:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM download_receipts WHERE child='asset-compact-1')",[],|row|row.get(0)).unwrap();
+                assert!(
+                    old || complete,
+                    "neither source evidence nor completion survived"
+                );
+            }
+            db.begin_selection_generation(owner(), spec(), MAX_GENERATION_BYTES)
+                .await
+                .unwrap();
+            assert_eq!(
+                db.acquire_lock("legacy retry finishes atomic retirement")
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(*) FROM provider_active_generations WHERE id=?1",
+                        [&root.id],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(std::fs::read(&media).unwrap(), RAW);
+            assert_eq!(
+                std::fs::metadata(&media).unwrap().modified().unwrap(),
+                mtime
+            );
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "subprocess worker selected by the parent crash test"]
     async fn v027_retirement_death_worker() {
         let directory =
@@ -613,7 +754,7 @@ mod process_death {
             .await
             .unwrap();
         let point = std::env::var("KEI_TEST_PROCESS_DEATH_POINT").unwrap();
-        if point.contains("root") {
+        if point.contains("root") || std::env::var_os("KEI_LEGACY_RETIREMENT").is_some() {
             db.begin_selection_generation(owner(), spec(), BUDGET)
                 .await
                 .unwrap();
@@ -659,6 +800,7 @@ async fn v027_modified_completion_compacts_only_with_prepared_transfer_provenanc
             db.prepare_temp_publication(
                 &part,
                 &PreparedPublication {
+                    binding: None,
                     library: "PrimarySync".into(),
                     id: task.asset_id.to_string(),
                     version: task.version_size.as_str().into(),
@@ -693,22 +835,23 @@ async fn v027_modified_completion_compacts_only_with_prepared_transfer_provenanc
         db.begin_selection_generation(owner(), spec(), BUDGET)
             .await
             .unwrap();
-        let conn = db
-            .acquire_lock("only trustworthy modified source is compacted")
-            .unwrap();
-        assert_eq!(
-            conn.query_row("SELECT count(*) FROM download_receipts", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            i64::from(proven)
-        );
-        let retained:i64=conn.query_row("SELECT count(*) FROM provider_active_decisions WHERE generation=?1 AND compacted_hash IS NULL",[&root.id],|r|r.get(0)).unwrap();
-        assert_eq!(
-            retained,
-            i64::from(!proven),
-            "unproven historical evidence must remain owned"
-        );
-        drop(conn);
+        {
+            let conn = db
+                .acquire_lock("only trustworthy modified source is compacted")
+                .unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM download_receipts", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                i64::from(proven)
+            );
+            let retained:i64=conn.query_row("SELECT count(*) FROM provider_active_decisions WHERE generation=?1 AND compacted_hash IS NULL",[&root.id],|r|r.get(0)).unwrap();
+            assert_eq!(
+                retained,
+                i64::from(!proven),
+                "unproven historical evidence must remain owned"
+            );
+        }
         if proven {
             assert!(
                 db.selection_path_matches_local(
@@ -1043,4 +1186,300 @@ async fn v027_layout_master_predecessor_cannot_launder_child_publication() {
         .unwrap()
     );
     assert_eq!(std::fs::read(path).unwrap(), RAW);
+}
+
+fn legacy_spec() -> GenerationSpec {
+    let mut legacy = spec();
+    legacy.format = 1;
+    legacy.basis = format!("{:x}", Sha256::digest(b""));
+    legacy.profile["coverage"] = json!("observed_selection_window");
+    legacy.profile["passes"][0]["scope"]["list_type"] =
+        json!("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted");
+    legacy.profile["passes"][0]["scope"]["query_filter"] = Value::Null;
+    legacy
+}
+
+fn legacy_rank_request() -> Value {
+    json!({"zoneID":spec().zone,"resultsLimit":200,
+    "query":{"recordType":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted","filterBy":[
+        {"fieldName":"startRank","fieldValue":{"type":"INT64","value":0},"comparator":"EQUALS"},
+        {"fieldName":"direction","fieldValue":{"type":"STRING","value":"ASCENDING"},"comparator":"EQUALS"}
+    ]}})
+}
+
+#[tokio::test]
+async fn v027_sealed_legacy_completion_retires_only_after_pending_rank_owners_finish() {
+    for unaccounted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+                .await
+                .unwrap(),
+        );
+        let root = db
+            .begin_selection_generation(owner(), legacy_spec(), MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+        let (_, done, _) = admission(
+            &db,
+            &root.id,
+            &dir.path().join("media"),
+            1,
+            false,
+            MAX_GENERATION_BYTES,
+        )
+        .await;
+        let (pending, tasks, _) = admission(
+            &db,
+            &root.id,
+            &dir.path().join("media"),
+            2,
+            false,
+            MAX_GENERATION_BYTES,
+        )
+        .await;
+        publish(&db, &done[0]).await;
+        if unaccounted {
+            let body = serde_json::to_vec(
+                &json!({"records":records("unadmitted",CURRENT,"unfinished admission")}),
+            )
+            .unwrap();
+            db.capture_selection_rank_page(
+                owner(),
+                root.id.clone(),
+                "pass".into(),
+                legacy_rank_request(),
+                body,
+                MAX_GENERATION_BYTES,
+            )
+            .await
+            .unwrap();
+        }
+        db.seal_selection_generation(owner(), root.id.clone(), true, None)
+            .await
+            .unwrap();
+        let pages_before: i64 = db
+            .acquire_lock("original rank owner count")
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM provider_selection_rank_pages WHERE generation=?1",
+                [&root.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.begin_selection_generation(owner(), spec(), MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+        {
+            let conn = db
+                .acquire_lock("mixed legacy owners retain all rank evidence")
+                .unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM download_receipts", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM provider_selection_rank_pages WHERE generation=?1",
+                    [&root.id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                pages_before
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM provider_active_sources WHERE generation=?1",
+                    [&root.id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                pending.sources.len() as i64
+            );
+        }
+        drop(db);
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+                .await
+                .unwrap(),
+        );
+        assert!(
+            db.has_pending_selection(owner(), root.id.clone())
+                .await
+                .unwrap()
+        );
+        publish(&db, &tasks[0]).await;
+        db.begin_selection_generation(owner(), spec(), MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+        let conn = db
+            .acquire_lock("positive census controls final legacy retirement")
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM download_receipts", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM provider_active_generations WHERE id=?1",
+                [&root.id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            i64::from(unaccounted)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM provider_selection_rank_pages WHERE generation=?1",
+                [&root.id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            if unaccounted { pages_before } else { 0 }
+        );
+        assert_eq!(std::fs::read(&done[0].download_path).unwrap(), RAW);
+        assert_eq!(std::fs::read(&tasks[0].download_path).unwrap(), RAW);
+    }
+}
+
+#[tokio::test]
+async fn v027_unsealed_legacy_completion_keeps_original_observation_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    let root = db
+        .begin_selection_generation(owner(), legacy_spec(), MAX_GENERATION_BYTES)
+        .await
+        .unwrap();
+    let (_, tasks, _) = admission(
+        &db,
+        &root.id,
+        &dir.path().join("media"),
+        1,
+        false,
+        MAX_GENERATION_BYTES,
+    )
+    .await;
+    publish(&db, &tasks[0]).await;
+    db.begin_selection_generation(owner(), spec(), MAX_GENERATION_BYTES)
+        .await
+        .unwrap();
+    let conn = db
+        .acquire_lock("no seal invented for interrupted coverage")
+        .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM download_receipts", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM provider_active_sources WHERE generation=?1)",
+            [&root.id],
+            |row| row.get::<_, bool>(0)
+        )
+        .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn v027_retained_mixed_legacy_roots_cannot_starve_newer_completed_retirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    let mut mixed = Vec::new();
+    for index in 0..65 {
+        let root = db
+            .begin_selection_generation(owner(), legacy_spec(), MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+        let (_, done, _) = admission(
+            &db,
+            &root.id,
+            &dir.path().join("media"),
+            index * 2,
+            false,
+            MAX_GENERATION_BYTES,
+        )
+        .await;
+        admission(
+            &db,
+            &root.id,
+            &dir.path().join("media"),
+            index * 2 + 1,
+            false,
+            MAX_GENERATION_BYTES,
+        )
+        .await;
+        publish(&db, &done[0]).await;
+        db.seal_selection_generation(owner(), root.id.clone(), true, None)
+            .await
+            .unwrap();
+        mixed.push(root.id);
+    }
+    let complete = db
+        .begin_selection_generation(owner(), legacy_spec(), MAX_GENERATION_BYTES)
+        .await
+        .unwrap();
+    let (_, tasks, _) = admission(
+        &db,
+        &complete.id,
+        &dir.path().join("media"),
+        1000,
+        false,
+        MAX_GENERATION_BYTES,
+    )
+    .await;
+    publish(&db, &tasks[0]).await;
+    db.seal_selection_generation(owner(), complete.id.clone(), true, None)
+        .await
+        .unwrap();
+    // Two bounded compaction batches must reach all 66 completed decisions.
+    for _ in 0..2 {
+        db.begin_selection_generation(owner(), spec(), MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+    }
+    let conn = db
+        .acquire_lock("positive census eligibility precedes retirement batch limit")
+        .unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM provider_active_generations WHERE id=?1",
+            [&complete.id],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    for id in mixed {
+        assert!(
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_active_generations WHERE id=?1)",
+                [&id],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap()
+        );
+        assert!(
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_selection_rank_pages WHERE generation=?1)",
+                [&id],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap()
+        );
+    }
+    assert_eq!(std::fs::read(&tasks[0].download_path).unwrap(), RAW);
 }

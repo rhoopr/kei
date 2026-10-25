@@ -259,7 +259,9 @@ impl SqliteStateDb {
             }
 
             for proof in &prepared_publications {
+                super::temp_files::record_bound_receipt(&tx, proof)?;
                 super::provider_generations::record_prepared_download_receipt(&tx, proof)?;
+                super::temp_files::retire_handed_off_publication(&tx, proof)?;
             }
 
             record_metadata_capture_revision(
@@ -1540,7 +1542,7 @@ impl DownloadContextStateStore for SqliteStateDb {
                         .ok_or(rusqlite::Error::InvalidQuery)?,
                     provider_checksum: row.get(3)?,
                     provider_size: u64::try_from(row.get::<_, i64>(4)?)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        .map_err(|_error| rusqlite::Error::InvalidQuery)?,
                     local_path: PathBuf::from(row.get::<_, String>(5)?),
                     local_checksum: row.get(6)?,
                     source_checksum: row.get(7)?,

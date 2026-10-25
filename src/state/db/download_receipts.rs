@@ -39,7 +39,7 @@ fn invalid() -> StateError {
     StateError::ProviderSelectionInvalid
 }
 fn hash(value: &impl Serialize) -> Result<String, StateError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| invalid())?;
+    let bytes = serde_json::to_vec(value).map_err(|_invalid| invalid())?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 impl DownloadReceipt {
@@ -52,10 +52,13 @@ impl DownloadReceipt {
             }
             return Ok(vec![self.origin_pass.clone()]);
         }
-        let passes: Vec<String> = serde_json::from_str(&self.origin_pass).map_err(|_| invalid())?;
+        let passes: Vec<String> =
+            serde_json::from_str(&self.origin_pass).map_err(|_invalid| invalid())?;
         if passes.is_empty()
             || passes.iter().any(|pass| pass.trim().is_empty())
-            || !passes.windows(2).all(|pair| pair[0] < pair[1])
+            || !passes
+                .windows(2)
+                .all(|pair| matches!(pair, [left, right] if left < right))
         {
             return Err(invalid());
         }
@@ -72,7 +75,8 @@ impl DownloadReceipt {
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        let scope: serde_json::Value = serde_json::from_str(&self.scope).map_err(|_| invalid())?;
+        let scope: serde_json::Value =
+            serde_json::from_str(&self.scope).map_err(|_invalid| invalid())?;
         if owner != (self.account_key.clone(), self.provider_key.clone())
             || !matches!(
                 scope.get("database").and_then(serde_json::Value::as_str),
@@ -134,7 +138,8 @@ impl DownloadReceipt {
             passes.dedup();
             if passes != old_passes {
                 let mut merged = previous;
-                merged.origin_pass = serde_json::to_string(&passes).map_err(|_| invalid())?;
+                merged.origin_pass =
+                    serde_json::to_string(&passes).map_err(|_invalid| invalid())?;
                 conn.execute(
                     "UPDATE download_receipts SET origin_pass=?2,proof_hash=?3 WHERE id=?1",
                     params![id, merged.origin_pass, hash(&merged)?],
@@ -150,8 +155,8 @@ impl DownloadReceipt {
 pub(super) fn load(conn: &Connection, id: &str) -> Result<Option<DownloadReceipt>, StateError> {
     let saved:Option<(DownloadReceipt,String)>=conn.query_row("SELECT account_key,provider_key,scope,library,child,master,state_id,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,origin_pass FROM download_receipts WHERE id=?1",[id],|r| {
         let path:String=r.get(10)?;
-        let path=serde_json::from_str(&path).map_err(|_|rusqlite::Error::InvalidQuery)?;
-        Ok((DownloadReceipt{account_key:r.get(0)?,provider_key:r.get(1)?,scope:r.get(2)?,library:r.get(3)?,child:r.get(4)?,master:r.get(5)?,state_id:r.get(6)?,origin_pass:r.get(14)?,version_size:r.get(7)?,provider_checksum:r.get(8)?,provider_size:u64::try_from(r.get::<_,i64>(9)?).map_err(|_|rusqlite::Error::InvalidQuery)?,native_path:path,source_checksum:r.get(11)?,local_checksum:r.get(12)?},r.get(13)?))
+        let path=serde_json::from_str(&path).map_err(|_invalid|rusqlite::Error::InvalidQuery)?;
+        Ok((DownloadReceipt{account_key:r.get(0)?,provider_key:r.get(1)?,scope:r.get(2)?,library:r.get(3)?,child:r.get(4)?,master:r.get(5)?,state_id:r.get(6)?,origin_pass:r.get(14)?,version_size:r.get(7)?,provider_checksum:r.get(8)?,provider_size:u64::try_from(r.get::<_,i64>(9)?).map_err(|_invalid|rusqlite::Error::InvalidQuery)?,native_path:path,source_checksum:r.get(11)?,local_checksum:r.get(12)?},r.get(13)?))
     }).optional()?;
     let Some((receipt, proof)) = saved else {
         return Ok(None);
@@ -172,7 +177,7 @@ pub(super) fn matching(
     size: u64,
 ) -> Result<Vec<DownloadReceipt>, StateError> {
     let ids:Vec<String>=conn.prepare("SELECT id FROM download_receipts WHERE scope=?1 AND child=?2 AND master=?3 AND version_size=?4 AND provider_checksum=?5 AND provider_size=?6 ORDER BY native_path")?
-        .query_map(params![scope,child,master,version,checksum,i64::try_from(size).map_err(|_|invalid())?],|r|r.get(0))?.collect::<Result<_,_>>()?;
+        .query_map(params![scope,child,master,version,checksum,i64::try_from(size).map_err(|_invalid|invalid())?],|r|r.get(0))?.collect::<Result<_,_>>()?;
     ids.into_iter()
         .map(|id| load(conn, &id)?.ok_or_else(invalid))
         .collect()

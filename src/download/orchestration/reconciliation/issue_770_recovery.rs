@@ -1,7 +1,7 @@
 //! Durable pending recovery retains recorded choices without changing reconciliation policy.
 use super::{
     DownloadControls, DownloadOutcome, album_with_session, download_photos_with_sync,
-    incremental_photo_records_with_url, reconcile_catalog_paths, test_config,
+    incremental_photo_records_with_url, test_config,
 };
 use crate::commands::{AlbumPass, PassKind};
 use crate::download::planner::TaskPlanner;
@@ -517,48 +517,6 @@ async fn issue_770_recovery_both_pass_orders_match_without_ledger_changes() {
     );
 }
 
-#[tokio::test]
-async fn issue_770_recovery_preserves_smart_selection_completeness_veto() {
-    let root = TempDir::new().unwrap();
-    let (config, records, old_path) = issue_770_seed(&root).await;
-    std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
-    std::fs::write(&old_path, vec![7u8; 1024]).unwrap();
-    let local = file::compute_sha256(&old_path).await.unwrap();
-    let db = config.state_db.as_ref().unwrap();
-    db.mark_downloaded(
-        "PrimarySync",
-        "PENDING",
-        "original",
-        &old_path,
-        &local,
-        None,
-    )
-    .await
-    .unwrap();
-    let unfiled = issue_770_pass(PassKind::Unfiled, &records);
-    let hidden = issue_770_pass(PassKind::SmartFolder, &records);
-    for _ in 0..2 {
-        let result = reconcile_catalog_paths(
-            &[unfiled.clone(), hidden.clone()],
-            Arc::new(config.clone()),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert!(!result.complete);
-        assert!(result.complete_after_smart_query);
-        assert_eq!(result.stats.failed, 0);
-        assert_eq!(std::fs::read(&old_path).unwrap(), vec![7u8; 1024]);
-    }
-    let control = reconcile_catalog_paths(&[unfiled], Arc::new(config), CancellationToken::new())
-        .await
-        .unwrap();
-    assert!(control.complete, "{control:?}");
-    assert!(!control.complete_after_smart_query);
-    assert_eq!(control.stats.failed, 0);
-    assert_eq!(control.stats.downloaded, 0);
-}
-
 struct RecoveryFixture {
     root: TempDir,
     db: Arc<SqliteStateDb>,
@@ -846,9 +804,7 @@ async fn issue_770_recovery_refuses_ordinary_cross_parent_replay_and_outside_roo
     for reconciliation in [false, true] {
         let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
         let plan = if reconciliation {
-            planner
-                .plan_reconciliation_asset(&asset, &hidden_config)
-                .await
+            planner.plan_download_asset(&asset, &hidden_config).await
         } else {
             planner.plan_download_asset(&asset, &hidden_config).await
         };
@@ -1983,15 +1939,10 @@ async fn issue_770_recovery_enumerated_cleanup_preserves_required_publication_pr
             enumerate: true,
         }),
     );
-    for mode in [
-        crate::download::CleanupUrlRefresh::Enumerate,
-        crate::download::CleanupUrlRefresh::Lookup,
-    ] {
+    {
         let retry = crate::download::build_retry_download_tasks(
             &[pass.clone()],
-            &config,
             &failed,
-            mode,
             CancellationToken::new(),
         )
         .await
@@ -2000,7 +1951,7 @@ async fn issue_770_recovery_enumerated_cleanup_preserves_required_publication_pr
         assert_eq!(retry.tasks[0].download_path, failed[0].download_path);
         assert_eq!(
             retry.tasks[0].pending_cross_parent_root, failed[0].pending_cross_parent_root,
-            "both cleanup routes must retain the affected task's required publication proof"
+            "targeted cleanup must retain the affected task's required publication proof"
         );
     }
     // Ordinary failures retain their ordinary finalization policy.
@@ -2008,9 +1959,7 @@ async fn issue_770_recovery_enumerated_cleanup_preserves_required_publication_pr
     ordinary[0].pending_cross_parent_root = None;
     let retry = crate::download::build_retry_download_tasks(
         &[pass.clone()],
-        &config,
         &ordinary,
-        crate::download::CleanupUrlRefresh::Enumerate,
         CancellationToken::new(),
     )
     .await
@@ -2048,9 +1997,7 @@ async fn issue_770_recovery_enumerated_cleanup_preserves_required_publication_pr
         assert_eq!(plan.tasks[0].download_path, failed[0].download_path);
         let retry = crate::download::build_retry_download_tasks(
             &[changed_pass],
-            &fresh_config,
             &failed,
-            crate::download::CleanupUrlRefresh::Enumerate,
             CancellationToken::new(),
         )
         .await
@@ -2202,3 +2149,6 @@ async fn issue_770_recovery_collecting_incremental_retains_unreceipted_reserved_
         fixture.assert_preserved().await;
     }
 }
+
+#[path = "reservation_integrity.rs"]
+mod reservation_integrity;

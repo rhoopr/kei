@@ -43,6 +43,7 @@ pub(in crate::download) struct DownloadTask {
     /// through finalization; ordinary task policy is unchanged. Clones share
     /// the original current-root association.
     pub(in crate::download) pending_cross_parent_root: Option<Arc<PathBuf>>,
+    pub(in crate::download) publication_binding: Option<Arc<crate::state::db::PublicationBinding>>,
     pub(in crate::download) checksum: Box<str>,
     /// iCloud asset ID for state tracking. Shared with the producer's
     /// dedup set and any deferred state writes via refcount bump.
@@ -162,6 +163,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 url: d.url,
                 download_path: d.path,
                 replacement_fingerprint: None,
+                publication_binding: None,
                 pending_cross_parent_root: None,
                 checksum: d.checksum,
                 asset_id: asset.state_id_arc(),
@@ -237,6 +239,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 url,
                 download_path: p,
                 replacement_fingerprint: None,
+                publication_binding: None,
                 pending_cross_parent_root: None,
                 checksum,
                 asset_id: asset.state_id_arc(),
@@ -306,6 +309,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 url,
                 download_path: p,
                 replacement_fingerprint: None,
+                publication_binding: None,
                 pending_cross_parent_root: None,
                 checksum,
                 asset_id: asset.state_id_arc(),
@@ -370,6 +374,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 url,
                 download_path: p,
                 replacement_fingerprint: None,
+                publication_binding: None,
                 pending_cross_parent_root: None,
                 checksum,
                 asset_id: asset.state_id_arc(),

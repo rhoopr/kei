@@ -277,7 +277,7 @@ fn guard_recorded_catalogue(conn: &Connection, op: &LayoutOperation) -> Result<(
                     .deleted_at
                     .and_then(|date| chrono::DateTime::from_timestamp(date.timestamp(), 0));
                 serde_json::to_value(metadata)
-                    .map_err(|_| invalid("invalid journal metadata snapshot"))
+                    .map_err(|_error| invalid("invalid journal metadata snapshot"))
             };
             if current.checksum != expected.checksum
                 || current.filename != expected.filename

@@ -1329,11 +1329,19 @@ pub(super) async fn hydrate_missing_selected_relation_assets(
         let Some(relation) = &event.relation else {
             continue;
         };
-        if relation.is_deleted {
+        let Some(album_indices) = routing.album_passes_for_container(&relation.container_id) else {
             continue;
-        }
-        let Some(pass_indices) = routing.album_passes_for_container(&relation.container_id) else {
-            continue;
+        };
+        let pass_indices = if relation.is_deleted {
+            // Removing the last selected membership can expose an unchanged
+            // asset to Unfiled. Re-read its current provider facts; route only
+            // after the complete relation batch has updated membership.
+            if config.selection_context.is_none() || routing.unfiled_passes.is_empty() {
+                continue;
+            }
+            routing.unfiled_passes.as_slice()
+        } else {
+            album_indices
         };
         let Some(pass_index) = pass_indices.first().copied() else {
             continue;
@@ -1451,7 +1459,9 @@ pub(super) async fn hydrate_missing_selected_relation_assets(
                 .asset_to_master
                 .insert(asset_record_name.clone(), asset.id().to_string());
             context.complete_delta_assets.push(asset.clone());
-            if let Some(pass_indices) = pass_indices {
+            if config.selection_context.is_none()
+                && let Some(pass_indices) = pass_indices
+            {
                 for pass_index in pass_indices {
                     context
                         .downloadable_assets

@@ -36,16 +36,6 @@ pub(super) use fingerprint::{RetainedPendingFile, retain_pending_file};
 pub(super) use fingerprint::{fingerprint_downloaded_path, fingerprint_regular_file};
 #[cfg(test)]
 pub(super) use publication::rename_part_to_final;
-#[cfg_attr(
-    not(feature = "xmp"),
-    allow(
-        unused_imports,
-        reason = "Preserve the file facade type without XMP callers"
-    )
-)]
-pub(crate) use reconciliation::ReconciledFile;
-pub(crate) use reconciliation::copy_local_file_no_replace;
-pub(super) use reconciliation::validate_reconciliation_paths;
 pub(super) use replacement::ConditionalPublishTargetChanged;
 pub(super) use replacement::FinalPublication;
 pub(super) use replacement::classify_conditional_publish_error;
@@ -71,9 +61,8 @@ pub(crate) use validation::local_file_size_matches_state;
 pub(super) use self::{
     fingerprint::ExistingFileSnapshot, fingerprint::fingerprint_file,
     fingerprint::fingerprint_regular_file_snapshot_blocking, platform::PublishResult,
-    platform::publish_reconciliation_part_blocking, publication::FinalPathCollision,
-    publication::publish_part_to_final, replacement::ConditionalPublishErrorDisposition,
-    transfer::DownloadResponse,
+    publication::FinalPathCollision, publication::publish_part_to_final,
+    replacement::ConditionalPublishErrorDisposition, transfer::DownloadResponse,
 };
 
 /// Recover interrupted fallback publications before normal download work.

@@ -12,11 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::download::filter::DownloadTask;
 use crate::download::pipeline::PassResult;
-use crate::download::planner;
 use crate::state::VersionSizeKey;
 
-use super::config::DownloadConfig;
-use super::selection::build_pass_configs_resolving_deferred_excludes;
 
 pub(super) const INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
 
@@ -45,42 +42,6 @@ impl From<&DownloadTask> for RetryTaskKey {
             download_path: task.download_path.clone(),
         }
     }
-}
-
-fn retry_state_ids_by_asset_record(tasks: &[DownloadTask]) -> FxHashMap<Arc<str>, Arc<str>> {
-    tasks
-        .iter()
-        .map(|task| {
-            (
-                Arc::clone(&task.asset_record_name),
-                Arc::clone(&task.asset_id),
-            )
-        })
-        .collect()
-}
-
-fn take_matching_retry_tasks<I>(
-    tasks: I,
-    pending_keys: &mut FxHashSet<RetryTaskKey>,
-    out: &mut Vec<DownloadTask>,
-) where
-    I: IntoIterator<Item = DownloadTask>,
-{
-    for task in tasks {
-        let key = RetryTaskKey::from(&task);
-        if pending_keys.remove(&key) {
-            out.push(task);
-            if pending_keys.is_empty() {
-                break;
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(in crate::download) enum CleanupUrlRefresh {
-    Enumerate,
-    Lookup,
 }
 
 #[derive(Default)]
@@ -394,89 +355,13 @@ async fn refresh_failed_download_urls(
 /// that failed so the retry pass starts consuming refreshed URLs quickly.
 pub(in crate::download) async fn build_retry_download_tasks(
     passes: &[crate::commands::AlbumPass],
-    config: &DownloadConfig,
     failed_tasks: &[DownloadTask],
-    refresh: CleanupUrlRefresh,
     shutdown_token: CancellationToken,
 ) -> Result<CleanupRetryPlan> {
     if failed_tasks.is_empty() || shutdown_token.is_cancelled() {
         return Ok(CleanupRetryPlan::default());
     }
-
-    if matches!(refresh, CleanupUrlRefresh::Lookup) {
-        return Ok(refresh_failed_download_urls(passes, failed_tasks, &shutdown_token, None).await);
-    }
-
-    let mut pending_keys: FxHashSet<RetryTaskKey> =
-        failed_tasks.iter().map(RetryTaskKey::from).collect();
-    // Re-enumeration builds new tasks, so it must preserve the affected
-    // failure's publication-proof requirement instead of falling back to an
-    // ordinary hash-only finalization. This does not authorize a new provider
-    // generation under the old reserved failure.
-    let retained_pending_failures: FxHashMap<_, _> = failed_tasks
-        .iter()
-        .filter(|task| task.pending_cross_parent_root.is_some())
-        .map(|task| (RetryTaskKey::from(task), task))
-        .collect();
-    let retry_state_ids = retry_state_ids_by_asset_record(failed_tasks);
-    let requested_count = pending_keys.len();
-    let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
-    let mut retry = CleanupRetryPlan {
-        tasks: Vec::with_capacity(requested_count),
-        ..CleanupRetryPlan::default()
-    };
-    let mut task_planner = planner::TaskPlanner::for_download(config.state_db.as_deref()).await?;
-
-    for (pass_index, pass) in passes.iter().enumerate() {
-        if pending_keys.is_empty() || shutdown_token.is_cancelled() {
-            break;
-        }
-
-        let assets = pass.album.photos(config.recent).await?;
-        #[allow(
-            clippy::indexing_slicing,
-            reason = "pass_index comes from enumerate() over `passes`; pass_configs is \
-                      built 1:1 from the same slice"
-        )]
-        let pass_config = &pass_configs[pass_index];
-
-        for asset in &assets {
-            if pending_keys.is_empty() || shutdown_token.is_cancelled() {
-                break;
-            }
-            let Some(state_id) = retry_state_ids.get(asset.asset_record_name()) else {
-                continue;
-            };
-            let asset = asset.clone().with_state_record_name(Arc::clone(state_id));
-            let plan = task_planner
-                .plan_download_asset(&asset, pass_config)
-                .await?;
-            if plan.filter_reason.is_some() {
-                continue;
-            }
-            let tasks = plan.tasks.into_iter().filter_map(|mut task| {
-                if let Some(failed) = retained_pending_failures.get(&RetryTaskKey::from(&task)) {
-                    if task.checksum != failed.checksum || task.size != failed.size {
-                        return None;
-                    }
-                    task.pending_cross_parent_root = failed.pending_cross_parent_root.clone();
-                }
-                Some(task)
-            });
-            take_matching_retry_tasks(tasks, &mut pending_keys, &mut retry.tasks);
-        }
-    }
-
-    if !pending_keys.is_empty() {
-        tracing::warn!(
-            requested = requested_count,
-            refreshed = retry.tasks.len(),
-            missing = pending_keys.len(),
-            "Cleanup pass could not refresh every failed task; unmatched failures remain pending"
-        );
-    }
-
-    Ok(retry)
+    Ok(refresh_failed_download_urls(passes, failed_tasks, &shutdown_token, None).await)
 }
 
 /// Refresh exact selected resources through the authenticated source zone's

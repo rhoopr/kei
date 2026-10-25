@@ -17,7 +17,6 @@ use super::full::{
     download_photos_full_with_token_policy,
 };
 use super::incremental::download_photos_incremental;
-use super::maintenance::MetadataCaptureRepair;
 use super::models::{
     DownloadControls, DownloadOutcome, FullEnumerationReason, SMART_FOLDER_REFRESH_FAILED_REASON,
     SyncMode, SyncResult, SyncStats, TARGETED_ALBUM_BACKFILL_FAILED_REASON,
@@ -324,19 +323,21 @@ async fn download_photos_with_sync_inner(
     controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
+    // Naming controls new filenames, never convergence of an existing archive.
+    let primary_layout_active = false;
+    let config = Arc::new(DownloadConfig {
+        primary_layout_active: false,
+        primary_layout_preview: false,
+        ..config.as_ref().clone()
+    });
     if config.provisional {
+        // Finish only previously recorded operations. Incomplete provider
+        // listings cannot authorize new layout plans or checkpoint retirement.
+        if controls.run_mode.downloads_files() {
+            super::primary_layout::recover(download_client, passes, &config, &shutdown_token).await?;
+        }
         // Do not turn incomplete listings/lookups into deletion, membership,
         // generation activation, retry retirement, or incremental evidence.
-        // Managed replacement needs independently certified current coverage.
-        let managed = config.edited_naming == crate::types::EditedNaming::Primary
-            || match &config.state_db {
-                Some(db) => db.has_primary_layouts(&config.library).await?,
-                None => false,
-            };
-        anyhow::ensure!(
-            !managed || config.indexing_inventory_only,
-            "Unqualified indexing recovery cannot certify managed primary replacement coverage"
-        );
         return download_photos_full_with_token_policy(
             download_client,
             passes,
@@ -347,14 +348,6 @@ async fn download_photos_with_sync_inner(
         )
         .await;
     }
-    // Primary naming controls new filenames. Ordinary sync uses the shared
-    // matcher and append-only transfer path, never archive layout convergence.
-    let primary_layout_active = false;
-    let config = Arc::new(DownloadConfig {
-        primary_layout_active: false,
-        primary_layout_preview: false,
-        ..config.as_ref().clone()
-    });
     let sync_started_at = chrono::Utc::now().timestamp();
     super::generation::freeze_before_sync(passes, &config, controls).await?;
     if matches!(controls.run_mode, super::models::DownloadRunMode::Download) {
@@ -376,22 +369,6 @@ async fn download_photos_with_sync_inner(
     {
         backfill_asset_master_mappings_from_album_history(db.as_ref()).await;
     }
-    // Historical metadata queues retain their existing records. They do not
-    // hydrate or rewrite the archive as a prerequisite of normal v27 sync.
-    let metadata_capture_repair = MetadataCaptureRepair::default();
-    if metadata_capture_repair.auth_errors > 0 {
-        return Ok(SyncResult {
-            outcome: DownloadOutcome::SessionExpired {
-                auth_error_count: metadata_capture_repair.auth_errors,
-            },
-            sync_token: None,
-            stats: metadata_capture_repair.stats,
-            checkpoint: metadata_capture_repair.checkpoint,
-            full_enumeration_ran: false,
-            inventory: None,
-        });
-    }
-
     // Give every non-downloaded asset a fresh start this sync:
     // failed -> pending (with attempts reset), and stale attempt counts on
     // pending assets cleared so the per-sync cap starts from zero.
@@ -638,31 +615,6 @@ async fn download_photos_with_sync_inner(
         result,
     )
     .await?;
-
-    let repair_outcome = if metadata_capture_repair.failures > 0
-        || metadata_capture_repair.stats.metadata_capture_unresolved > 0
-    {
-        DownloadOutcome::PartialFailure {
-            failed_count: metadata_capture_repair.failures.max(1),
-        }
-    } else {
-        DownloadOutcome::Success
-    };
-    let repair = SyncResult {
-        outcome: repair_outcome,
-        sync_token: None,
-        stats: metadata_capture_repair.stats,
-        checkpoint: metadata_capture_repair.checkpoint,
-        full_enumeration_ran: false,
-        inventory: None,
-    };
-    if matches!(repair.outcome, DownloadOutcome::PartialFailure { .. }) {
-        result.outcome = merge_download_outcomes(&result.outcome, &repair.outcome);
-    }
-    result.accumulate(&repair);
-    if repair.checkpoint.sync_token_blocked {
-        result.sync_token = None;
-    }
 
     // Managed publication can complete the newly captured source in this cycle.
     // Keep the existing bounded admission owner, but run it after capture so an

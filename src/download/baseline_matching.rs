@@ -27,8 +27,99 @@ pub(in crate::download) enum BaselineMatch {
         receipt: BaselineReceipt,
         file: Arc<RetainedPendingFile>,
     },
+    RecordedPresent {
+        receipt: crate::state::db::download_receipts::DownloadReceipt,
+        file: Arc<RetainedPendingFile>,
+    },
     Missing,
     Uncertain,
+}
+
+/// Commit only positive matches through their original durable proof owner.
+pub(in crate::download) async fn commit_match(
+    decision: BaselineMatch,
+    config: &super::DownloadConfig,
+    asset: &crate::icloud::photos::PhotoAsset,
+    task: &DownloadTask,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    let db = config
+        .state_db
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Existing-file reuse requires durable state"))?;
+    let record = super::planner::pending_record_for_task(config, asset, task);
+    match decision {
+        BaselineMatch::RecordedPresent { receipt, file } => {
+            let _guard =
+                super::file::lock_download_destination(&receipt.native_path.to_path(), shutdown)
+                    .await?;
+            let binding = task
+                .publication_binding
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Missing publication scope"))?
+                .clone();
+            let album = config
+                .primary_layout_source
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Missing authenticated source"))?;
+            let (capture, scope, _) = album
+                .publication_scope(&task.library)?
+                .ok_or_else(|| anyhow::anyhow!("Missing authenticated scope"))?;
+            anyhow::ensure!(scope == binding.scope, "Publication scope changed");
+            capture
+                .db
+                .reuse_bound_download(
+                    binding,
+                    receipt,
+                    record,
+                    Box::new(move || {
+                        file.validate_blocking()
+                            // Filesystem errors may contain private archive paths.
+                            .map_err(|_private_error| {
+                                crate::state::error::StateError::ProviderSelectionInvalid
+                            })
+                    }),
+                )
+                .await?;
+        }
+        decision => {
+            let provider = matches!(&decision, BaselineMatch::ProviderPresent { .. });
+            let (receipt, file) = match decision {
+                BaselineMatch::Present { receipt, file }
+                | BaselineMatch::ProviderPresent { receipt, file } => (receipt, file),
+                _ => anyhow::bail!("Nonpositive existing-file decision cannot be committed"),
+            };
+            let _guard =
+                super::file::lock_download_destination(&receipt.local_path, shutdown).await?;
+            let checksum = task.checksum.to_string();
+            let size = task.size;
+            let validate: Box<dyn FnOnce() -> Result<(), crate::state::error::StateError> + Send> =
+                Box::new(move || {
+                    let valid = if provider {
+                        file.fingerprint.size == size
+                            && matches!(
+                                file.matches_provider_v1_blocking(&checksum),
+                                Ok(Some(true))
+                            )
+                    } else {
+                        file.validate_blocking().is_ok()
+                    };
+                    if valid {
+                        Ok(())
+                    } else {
+                        Err(crate::state::error::StateError::ProviderSelectionInvalid)
+                    }
+                });
+            if provider {
+                db.adopt_provider_signature(&record, &receipt, validate)
+                    .await?;
+            } else {
+                db.adopt_baseline_receipt(&record, &receipt, validate)
+                    .await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Checked discovery only locates candidates; complete provider proof is still required.
@@ -94,7 +185,7 @@ impl BaselineMatcher {
             false,
             &SelectedCopyScope {
                 admitted: false,
-                other: (&[]).to_vec(),
+                other: [].to_vec(),
             },
             &BaselineCandidates::default(),
         )
@@ -867,7 +958,7 @@ mod selected_destination_tests {
                     true,
                     &SelectedCopyScope {
                         admitted: false,
-                        other: (&[]).to_vec()
+                        other: [].to_vec()
                     },
                     &BaselineCandidates::default()
                 )
@@ -883,7 +974,7 @@ mod selected_destination_tests {
                     true,
                     &SelectedCopyScope {
                         admitted: true,
-                        other: (&[]).to_vec()
+                        other: [].to_vec()
                     },
                     &BaselineCandidates::default()
                 )
@@ -901,7 +992,7 @@ mod selected_destination_tests {
                     true,
                     &SelectedCopyScope {
                         admitted: true,
-                        other: (&[]).to_vec()
+                        other: [].to_vec()
                     },
                     &BaselineCandidates::default()
                 )
@@ -942,7 +1033,7 @@ mod selected_copy_scope_tests {
                     false,
                     &SelectedCopyScope {
                         admitted: true,
-                        other: (&[(native.clone(), None)]).to_vec()
+                        other: [(native.clone(), None)].to_vec()
                     },
                     &BaselineCandidates::default()
                 )
@@ -962,7 +1053,7 @@ mod selected_copy_scope_tests {
                     false,
                     &SelectedCopyScope {
                         admitted: true,
-                        other: (&[(native.clone(), Some(candidate.clone()))]).to_vec()
+                        other: [(native.clone(), Some(candidate.clone()))].to_vec()
                     },
                     &BaselineCandidates::default()
                 )
@@ -981,7 +1072,7 @@ mod selected_copy_scope_tests {
                     false,
                     &SelectedCopyScope {
                         admitted: true,
-                        other: (&[(native.clone(), Some(unrelated))]).to_vec()
+                        other: [(native.clone(), Some(unrelated))].to_vec()
                     },
                     &BaselineCandidates::default()
                 )

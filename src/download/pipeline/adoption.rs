@@ -1,13 +1,11 @@
 //! Existing and pending local-file evidence and adoption.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rustc_hash::FxHashSet;
 
-use crate::download::file::{LocalFileSizeExpectation, local_file_size_matches_state};
-use crate::download::filter::stored_path_matches_current_collision_family;
 use crate::download::filter::{
     DerivedPath, DownloadTask, derive_expected_paths, determine_media_type,
 };
@@ -270,12 +268,6 @@ pub(in crate::download) struct PendingRetryFileEvidence<'a> {
     pub(in crate::download) size: u64,
 }
 
-pub(in crate::download) enum PendingRetryLocalPath<'a> {
-    Unrecorded,
-    Current(&'a RecordedLocalFile),
-    Historical,
-}
-
 /// Saved provider generations identify ownership, not hashes of local bytes.
 /// Never mint proof from the file that this route is deciding whether to adopt.
 async fn adopt_cross_parent_pending_file(
@@ -394,146 +386,5 @@ async fn adopt_cross_parent_pending_file(
     Ok(PendingRetryAdoption::Adopted)
 }
 
-async fn state_path_size_allows_skip(
-    asset: &PhotoAsset,
-    version_size: VersionSizeKey,
-    path: &Path,
-    on_disk_size: u64,
-    expected_size: u64,
-    recorded_file: &RecordedLocalFile,
-) -> bool {
-    let result = local_file_size_matches_state(
-        path,
-        on_disk_size,
-        LocalFileSizeExpectation::AtLeastProvider(expected_size),
-        recorded_file.local_checksum.as_deref(),
-        recorded_file.download_checksum.as_deref(),
-    )
-    .await;
-    match result {
-        Ok(true) => true,
-        Ok(false) => {
-            tracing::warn!(target: "kei::download::pipeline",
-                asset_id = %asset.id(),
-                version_size = %version_size.as_str(),
-                path = %path.display(),
-                on_disk_size,
-                expected_size,
-                "State path is smaller than expected; re-downloading instead of skipping"
-            );
-            false
-        }
-        Err(error) => {
-            tracing::warn!(target: "kei::download::pipeline",
-                asset_id = %asset.id(),
-                version_size = %version_size.as_str(),
-                path = %path.display(),
-                error = %error,
-                "Failed to verify size-divergent state path; re-downloading instead of skipping"
-            );
-            false
-        }
-    }
-}
-
-pub(in crate::download) async fn recorded_current_path_exists(
-    config: &DownloadConfig,
-    asset: &PhotoAsset,
-    version_size: VersionSizeKey,
-    task_planner: &mut TaskPlanner,
-    recorded_file: &RecordedLocalFile,
-) -> Option<PathBuf> {
-    let stored_path = &recorded_file.path;
-    if let Some(db) = config.state_db.as_deref()
-        && !crate::download::legacy_preservation::current_path_is_independent(db, stored_path)
-            .await
-            .ok()?
-    {
-        return None;
-    }
-    let derived_paths = derive_expected_paths(asset, config);
-
-    for derived in &derived_paths {
-        if derived.version_size != version_size {
-            continue;
-        }
-        let Some((existing_path, existing_size)) =
-            task_planner.existing_path_with_size(&derived.path)
-        else {
-            continue;
-        };
-        if existing_path.as_path() == stored_path.as_path() {
-            if state_path_size_allows_skip(
-                asset,
-                derived.version_size,
-                &existing_path,
-                existing_size,
-                derived.size,
-                recorded_file,
-            )
-            .await
-            {
-                return Some(existing_path);
-            }
-            return None;
-        }
-    }
-
-    for derived in &derived_paths {
-        if derived.version_size != version_size {
-            continue;
-        }
-        if !stored_path_matches_current_collision_family(
-            asset.state_id(),
-            derived,
-            &derived_paths,
-            config,
-            stored_path,
-        ) {
-            continue;
-        }
-        let (existing_path, existing_size) = task_planner.existing_path_with_size(stored_path)?;
-        if state_path_size_allows_skip(
-            asset,
-            version_size,
-            &existing_path,
-            existing_size,
-            derived.size,
-            recorded_file,
-        )
-        .await
-        {
-            return Some(existing_path);
-        }
-        return None;
-    }
-
-    None
-}
-
-pub(in crate::download) async fn state_confirmed_current_path_exists(
-    ctx: &DownloadContext,
-    config: &DownloadConfig,
-    asset: &PhotoAsset,
-    task: &DownloadTask,
-    task_planner: &mut TaskPlanner,
-) -> Option<PathBuf> {
-    if let Some(recorded_file) =
-        ctx.downloaded_file(&task.library, &task.asset_id, task.version_size)
-        && let Some(path) = recorded_current_path_exists(
-            config,
-            asset,
-            task.version_size,
-            task_planner,
-            recorded_file,
-        )
-        .await
-    {
-        return Some(path);
-    }
-    task_planner
-        .verified_downloaded_path(asset, config, task.version_size)
-        .await
-}
 #[cfg(test)]
 mod tests;

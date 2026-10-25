@@ -18,7 +18,9 @@ pub(crate) const MAX_WORK_BYTES: u64 = 512 * 1024 * 1024;
 const INITIAL_RETRY_SECONDS: i64 = 60 * 60;
 const MAX_RETRY_SECONDS: i64 = 24 * INITIAL_RETRY_SECONDS;
 
-const DUE_SOURCE_SQL: &str = "SELECT c.page_id,c.ordinal FROM provider_catalog_records c JOIN provider_shadow_pages p ON p.id=c.page_id JOIN provider_catalog_pages projected ON projected.page_id=c.page_id AND projected.projector_version=1 AND projected.body_hash=p.body_hash WHERE p.scope=?1 AND c.kind='asset' AND c.deleted=0 AND NOT EXISTS(SELECT 1 FROM provider_work_receipts w WHERE w.page_id=c.page_id AND w.ordinal=c.ordinal AND w.config_hash=?2 AND w.state='admitted') AND NOT EXISTS(SELECT 1 FROM provider_work_retries r WHERE r.page_id=c.page_id AND r.ordinal=c.ordinal AND r.config_hash=?2 AND r.next_retry_at>?3)";
+// Bare historical catalog observations are not new v27 work. Only explicit
+// retained deferred admissions/retries retain this legacy hydration route.
+const DUE_SOURCE_SQL: &str = "SELECT c.page_id,c.ordinal FROM provider_catalog_records c JOIN provider_shadow_pages p ON p.id=c.page_id JOIN provider_catalog_pages projected ON projected.page_id=c.page_id AND projected.projector_version=1 AND projected.body_hash=p.body_hash WHERE p.scope=?1 AND c.kind='asset' AND c.deleted=0 AND (EXISTS(SELECT 1 FROM provider_work_receipts retained WHERE retained.page_id=c.page_id AND retained.ordinal=c.ordinal AND retained.config_hash=?2 AND retained.scope=?1 AND retained.state='deferred') OR EXISTS(SELECT 1 FROM provider_work_retries retained WHERE retained.page_id=c.page_id AND retained.ordinal=c.ordinal AND retained.config_hash=?2)) AND NOT EXISTS(SELECT 1 FROM provider_work_receipts w WHERE w.page_id=c.page_id AND w.ordinal=c.ordinal AND w.config_hash=?2 AND w.state='admitted') AND NOT EXISTS(SELECT 1 FROM provider_work_retries r WHERE r.page_id=c.page_id AND r.ordinal=c.ordinal AND r.config_hash=?2 AND r.next_retry_at>?3)";
 
 const MAX_WORK_PLAN_BYTES: u64 = 16 * 1024 * 1024;
 

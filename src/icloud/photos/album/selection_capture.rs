@@ -105,9 +105,54 @@ pub(crate) fn validated_rank_page(request: &Value, body: &[u8]) -> Result<Value>
 }
 
 impl PhotoAlbum {
+    /// Resolve only authenticated sources already attached by album selection.
+    /// Duplicate labels with distinct database/owner identities are ambiguous.
+    pub(crate) fn publication_scope(
+        &self,
+        library: &str,
+    ) -> Result<Option<(ShadowCapture, String, Value)>> {
+        let sources: Vec<_> = std::iter::once(self)
+            .chain(self.cross_zone_sources.iter())
+            .filter(|source| source.zone_name() == library)
+            .collect();
+        // Unowned direct transfer APIs cannot mint scoped receipts. Preserve
+        // their existing prepared owner without inventing authentication.
+        if sources.iter().all(|source| source.shadow_capture.is_none()) {
+            return Ok(None);
+        }
+        let mut found: Option<(ShadowCapture, String, Value)> = None;
+        for source in sources {
+            if source.zone_name() != library {
+                continue;
+            }
+            let candidate = source
+                .authenticated_publication_scope()?
+                .context("Matching publication source lacks authenticated scope")?;
+            if let Some(previous) = &found {
+                anyhow::ensure!(
+                    previous.0.owner == candidate.0.owner
+                        && std::sync::Arc::ptr_eq(&previous.0.db, &candidate.0.db)
+                        && previous.1 == candidate.1
+                        && previous.2 == candidate.2,
+                    "Ambiguous authenticated publication source"
+                );
+            } else {
+                found = Some(candidate);
+            }
+        }
+        Ok(found)
+    }
+
     /// Scope new download work to the authenticated account and complete
     /// provider database/zone identity. Rank proof is not an admission owner.
     pub(crate) fn download_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {
+        if !self.cross_zone_sources.is_empty() {
+            return Ok(None);
+        }
+        self.authenticated_publication_scope()
+    }
+
+    fn authenticated_publication_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {
         let Some((capture, database)) = &self.shadow_capture else {
             return Ok(None);
         };
@@ -117,7 +162,6 @@ impl PhotoAlbum {
                 .get("ownerRecordName")
                 .and_then(Value::as_str)
                 .is_none_or(|owner| owner.trim().is_empty())
-            || !self.cross_zone_sources.is_empty()
         {
             return Ok(None);
         }
@@ -190,3 +234,7 @@ impl PhotoAlbum {
         self
     }
 }
+
+#[cfg(test)]
+#[path = "publication_scope_tests.rs"]
+mod publication_scope_tests;

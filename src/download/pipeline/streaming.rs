@@ -226,7 +226,8 @@ where
                     for task in &plan.tasks {
                         match task_planner.match_existing(&asset, config, task).await {
                             crate::download::baseline_matching::BaselineMatch::Present { .. }
-                            | crate::download::baseline_matching::BaselineMatch::ProviderPresent { .. } => continue,
+                            | crate::download::baseline_matching::BaselineMatch::ProviderPresent { .. }
+                            | crate::download::baseline_matching::BaselineMatch::RecordedPresent { .. } => continue,
                             crate::download::baseline_matching::BaselineMatch::Uncertain => {
                                 tracing::warn!(
                                     "Existing file match is uncertain; no duplicate download planned"
@@ -305,7 +306,8 @@ where
                     for task in &plan.tasks {
                         match task_planner.match_existing(&asset, config, task).await {
                             crate::download::baseline_matching::BaselineMatch::Present { .. }
-                            | crate::download::baseline_matching::BaselineMatch::ProviderPresent { .. } => {}
+                            | crate::download::baseline_matching::BaselineMatch::ProviderPresent { .. }
+                            | crate::download::baseline_matching::BaselineMatch::RecordedPresent { .. } => {}
                             crate::download::baseline_matching::BaselineMatch::Uncertain => {
                                 tracing::warn!(
                                     "Existing file match is uncertain; no duplicate download planned"

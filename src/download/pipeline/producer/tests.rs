@@ -429,13 +429,9 @@ fn test_producer_skip_summary_default_is_zero() {
 /// If variant order changes, `.max()` silently picks the wrong winner.
 #[test]
 fn test_asset_disposition_ordering() {
-    use AssetDisposition::{
-        AmpmVariant, Forwarded, OnDisk, RetryExhausted, RetryOnly, StateSkip, Unresolved,
-    };
+    use AssetDisposition::{Forwarded, OnDisk, RetryExhausted, RetryOnly, Unresolved};
     assert!(Forwarded > OnDisk);
-    assert!(OnDisk > AmpmVariant);
-    assert!(AmpmVariant > StateSkip);
-    assert!(StateSkip > RetryExhausted);
+    assert!(OnDisk > RetryExhausted);
     assert!(RetryExhausted > RetryOnly);
     assert!(RetryOnly > Unresolved);
 

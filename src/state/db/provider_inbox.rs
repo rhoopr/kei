@@ -1,10 +1,14 @@
 //! Additive observations; these receipts never authorize a legacy checkpoint.
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+#[cfg(test)]
+use rusqlite::TransactionBehavior;
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
 use super::{SqliteStateDb, account};
 use crate::state::error::StateError;
+#[cfg(test)]
 use crate::support::{StorageComponent, StorageOutcome};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -695,6 +699,8 @@ thread_local! {
     pub(crate) static TEST_ABORT_AFTER_ALIASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// Seed already-existing raw evidence in upgrade/replay fixtures only.
+#[cfg(test)]
 impl SqliteStateDb {
     pub(crate) async fn capture_shadow_page(
         &self,

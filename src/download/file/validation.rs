@@ -51,8 +51,6 @@ pub(crate) fn is_heif_content(bytes: &[u8]) -> bool {
 pub(crate) enum LocalFileSizeExpectation {
     /// The local file must not be shorter than the provider download.
     AtLeastProvider(u64),
-    /// The local file must have the same size as the provider download.
-    ExactProvider(u64),
 }
 
 impl LocalFileSizeExpectation {
@@ -61,7 +59,6 @@ impl LocalFileSizeExpectation {
             Self::AtLeastProvider(provider_size) => {
                 provider_size == 0 || actual_size >= provider_size
             }
-            Self::ExactProvider(provider_size) => actual_size == provider_size,
         }
     }
 }

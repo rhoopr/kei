@@ -42,8 +42,18 @@ impl SqliteStateDb {
         self.with_conn("reading pending catalog source", move |conn| {
             let tx = conn.unchecked_transaction()?;
             account::validate(&tx, &owner)?;
+            // Bare observations and diagnostic selection shadows own no work.
+            // Keep every explicit obligation conservative: its old schema has
+            // no independently validated terminal marker. Do not infer
+            // completion from absent/superseded current asset rows.
             let id: Option<i64> = tx.query_row(
-                "SELECT p.id FROM provider_shadow_pages p LEFT JOIN provider_catalog_pages c ON c.page_id=p.id WHERE c.page_id IS NULL OR c.projector_version<>?1 ORDER BY p.id LIMIT 1",
+                "SELECT p.id FROM provider_shadow_pages p
+                 LEFT JOIN provider_catalog_pages c ON c.page_id=p.id
+                 WHERE (c.page_id IS NULL OR c.projector_version<>?1)
+                 AND (EXISTS(SELECT 1 FROM provider_work_retries r WHERE r.page_id=p.id)
+                   OR EXISTS(SELECT 1 FROM provider_work_receipts r WHERE r.page_id=p.id AND r.state='deferred')
+                   OR EXISTS(SELECT 1 FROM provider_work_obligations w WHERE w.page_id=p.id))
+                 ORDER BY p.id LIMIT 1",
                 [PROJECTOR_VERSION], |row| row.get(0),
             ).optional()?;
             let source = id.map(|id| load_page(&tx,CapturedPageId(id),max_body_bytes)).transpose()?;
@@ -52,6 +62,7 @@ impl SqliteStateDb {
         }).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn catalog_source(
         &self,
         owner: account::AccountOwner,

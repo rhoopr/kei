@@ -9,8 +9,10 @@ use super::{OwnedTempFile, SqliteStateDb, TempFileOwnershipStore};
 use crate::state::error::StateError;
 
 mod prepared;
-pub(crate) use prepared::PreparedPublication;
-pub(super) use prepared::retire_prepared_receipt;
+pub(crate) use prepared::{PreparedPublication, PublicationBinding};
+pub(super) use prepared::{
+    record_bound_receipt, retire_handed_off_publication, retire_prepared_receipt,
+};
 
 #[derive(Debug, Clone)]
 struct OwnedTempPathKey(Vec<u8>);

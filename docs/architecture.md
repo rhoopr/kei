@@ -92,7 +92,7 @@ match their headings, so searching a label finds the section.
 | Full enumeration | `src/download/orchestration/full.rs` | Owns bounded enumeration, album snapshots, pass counts, and token evidence. |
 | Incremental enumeration | `src/download/orchestration/incremental.rs`, `src/download/orchestration/delta.rs` | Runs separate streaming and collecting strategies with one shared delta-state owner for provider-event bookkeeping and routing facts. |
 | Download recovery | `src/download/orchestration/recovery.rs`, `src/download/orchestration/url_refresh.rs` | Runs durable pending recovery and refreshes exact download tasks with current provider URLs. |
-| Local catalog maintenance | `src/download/orchestration/reconciliation.rs`, `src/download/orchestration/cleanup.rs`, `src/download/orchestration/maintenance.rs` | Reconciles catalog paths, removes durably owned stale temporary files, and repairs metadata-capture revisions. |
+| Recorded local work | `src/download/orchestration/reconciliation.rs`, `src/download/orchestration/cleanup.rs`, `src/download/orchestration/maintenance.rs` | Recovers recorded file journals, removes durably owned stale temporary files, and drains metadata rewrites only for explicit refresh. |
 | Asset planning | `src/download/planner.rs` | Applies filters, derives tasks, records dispatched pending work, and persists membership and identity mappings. |
 | Filter facade and configuration | `src/download/filter.rs`, `src/download/filter/config.rs` | Preserves filter entry points and shares path and filter settings between sync and import. |
 | Asset eligibility | `src/download/filter/eligibility.rs` | Owns content, date, and filename filters and media classification, without path or filesystem decisions. |
@@ -550,9 +550,11 @@ still require explicit policy decisions before dependent stages.
 
 Schema 31 adds `provider_work_receipts`, generation-bound
 `provider_work_obligations`, and the `provider_work_scan` scheduling position.
-Before normal dispatch, up to 64 retained, indexed CPLAsset observations per
-cycle can trigger scoped child lookup followed by a complete current child/master
-lookup. Original bounded confirmation bytes and source page/ordinal provenance
+Before normal dispatch, up to 64 explicitly deferred or retry-owned legacy
+CPLAsset observations per cycle can trigger scoped child lookup followed by a
+complete current child/master lookup. Bare catalog history does not create new
+work, including after configuration changes. The retained obligation keeps its
+original configuration binding and backoff. Original bounded confirmation bytes and source page/ordinal provenance
 are retained. Duplicate keys, duplicate or omitted records, provider errors,
 wrong owners, wrong zones and changed child/master relationships cannot confirm
 work. Provider confirmation is an observation, not an atomic provider snapshot.
@@ -978,23 +980,13 @@ the existing bounded retry queue. This does not delete or retire legacy rows,
 replace saved owners, or restore dates overwritten by an earlier repair.
 Recovery of those rows requires separately preserved historical evidence.
 
-Ambiguous metadata-capture repairs retain a schema-27 retry row keyed by
-library, catalogue asset ID, and target capture revision. An unchanged failure
-retries after one hour, doubling up to 24 hours. Changed catalogue identity or
-rendition evidence is eligible immediately. A durable generation rejects stale
-attempts; its counter survives retry retirement. The state reader excludes
-deferred candidates before applying the existing 500-identity batch limit.
-Unresolved and deferred counts are separate from failed repair attempts.
-Deferred work keeps the capture revision pending and its checkpoint blocked,
-even when a cycle makes no repair attempt. The cycle checks each library
-before committing inventory anchors or provider checkpoints, including
-`--refresh-metadata` runs that bypass automatic capture repair. Idle health
-and other-library success cannot turn retained ambiguity into a successful
-backup. Completion retires retry rows only after the existing repair or
-source-deletion rules remove the stale work. Retry scheduling does not select a child or authorize
-metadata rewrites, deletion, or checkpoint advancement.
-The download owners store these holds in `CheckpointEvidence`. Report counter
-changes and result composition cannot clear them.
+Historical metadata-capture retry rows retain their original library, identity,
+generation and retry deadlines. Normal v0.27 sync does not resume automatic
+capture repair or require these rows to be complete before saving source progress.
+Report counts do not certify or discard their contents. Explicit metadata refresh
+continues to use the durable rewrite queue and its per-file publication guards.
+New incomplete provider observations remain subject to the current admission and
+checkpoint rules below.
 
 Unresolved asset-only delta hydration is incomplete work, even when no media
 transfer fails. The producer records `unresolved_asset_identity:<zone> = 1` in
@@ -2305,7 +2297,6 @@ Stable IDs connect safety rules to production owners and focused tests.
 | `HEIF_EMBED_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/heif.rs`, `src/download/metadata.rs`, `src/download/file.rs`, `src/download/metadata_rewrite.rs` | A HEIF-family embedded rewrite accepts tone-map insertion only when `dimg` and primary Exif `cdsc` relationships prove the exact target and no existing XMP owns that tone map, prepares a uniquely owned sibling, and replaces the media only while both the destination and prepared bytes match their approved fingerprints. Failure preserves concurrent edits and durable retry evidence. |
 | `XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs` | An existing XMP sidecar is replaced only when it parses and its bytes still match the writer's initial read. Failure preserves the sidecar and durable rewrite marker. |
 | `XMP_GPS_ACCURACY_REQUIRES_MATCHING_LOCATION` | `src/download/metadata.rs`, `src/download/metadata_rewrite.rs`, `src/state/db.rs` | Native horizontal accuracy requires valid native latitude and longitude equal to the exported provider coordinates, plus a matching verified-download source checksum. Recovered local or download checksums cannot establish native provenance. Readable missing, invalid, or mismatched evidence omits accuracy and clears only obsolete kei-owned values. Source I/O failure preserves unknown fields and durable retry evidence. |
-| `METADATA_CAPTURE_REVISION_REPAIR_IS_DURABLE` | `src/download/orchestration/maintenance.rs`, `src/state/db.rs` | Revision repair updates catalogue metadata and configured rewrite evidence before promotion, stays library-scoped, and preserves the provider checkpoint on unresolved work. |
 
 ## Change-impact traversal
 

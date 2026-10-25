@@ -785,6 +785,7 @@ fn task_for(
         url: url.into(),
         download_path: path.to_owned(),
         replacement_fingerprint: None,
+        publication_binding: None,
         pending_cross_parent_root: None,
         checksum: checksum.into(),
         asset_id: asset.state_id_arc(),

@@ -35,6 +35,8 @@ pub enum StateError {
         "Provider catalog source provenance or projection is inconsistent; retaining observations and the current checkpoint."
     )]
     ProviderCatalogInvalid,
+    // New sync writes no shadow inbox; historical fixture admission remains test-only.
+    #[cfg(test)]
     #[error(
         "Provider shadow inbox is full; retaining observations and the current checkpoint. No automatic pruning is permitted."
     )]

@@ -128,8 +128,10 @@ impl StorageReuse {
         budget: Option<(u64, u64)>,
     ) {
         let counters = match component {
+            #[cfg(test)]
             StorageComponent::Inbox => &mut self.inbox,
             StorageComponent::Catalogue => &mut self.catalogue,
+            #[cfg(test)]
             StorageComponent::Selection => &mut self.selection,
             StorageComponent::Work => &mut self.work,
         };
@@ -164,8 +166,11 @@ impl ReuseCounters {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StorageComponent {
+    // Only historical fixture writers emit these events; stored counters remain readable.
+    #[cfg(test)]
     Inbox,
     Catalogue,
+    #[cfg(test)]
     Selection,
     Work,
 }

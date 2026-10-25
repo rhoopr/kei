@@ -47,6 +47,16 @@ async fn run_targeted_recovery_pass(
     } = plan;
     let unmatched = unmatched_targets.len();
 
+    // These identities came from the durable pending ledger, not from newly
+    // observed provider records. Keep uncertainty visible without adding a
+    // current-source accounting veto: their retry owners remain after reopen.
+    if identity_incomplete {
+        tracing::warn!(
+            unmatched,
+            "Retained pending identity remains unresolved; durable retry work is preserved"
+        );
+    }
+
     if requested == 0 {
         return Ok(pending_retry_no_download_result(
             &started,
@@ -89,10 +99,12 @@ async fn run_targeted_recovery_pass(
     }
 
     if tasks.is_empty() {
-        let mut result = pending_retry_no_download_result(&started, &shutdown_token, unmatched, 0);
-        result.checkpoint.identity_incomplete = identity_incomplete;
-        result.checkpoint.project(&mut result.stats);
-        return Ok(result);
+        return Ok(pending_retry_no_download_result(
+            &started,
+            &shutdown_token,
+            unmatched,
+            0,
+        ));
     }
 
     let pass_config = PassConfig {
@@ -179,7 +191,6 @@ async fn run_targeted_recovery_pass(
         .collect();
 
     let checkpoint = CheckpointEvidence {
-        identity_incomplete,
         state_write_failures: pass_result.state_write_failures,
         interrupted: shutdown_token.is_cancelled()
             || (pass_result.auth_errors >= AUTH_ERROR_THRESHOLD || provider_auth_errors > 0),
@@ -264,7 +275,11 @@ pub(super) async fn append_targeted_recovery_to_sync_result(
     shutdown_token: CancellationToken,
     mut sync_result: SyncResult,
 ) -> Result<SyncResult> {
-    if !matches!(sync_result.outcome, DownloadOutcome::Success)
+    // Independent pending owners must not wait for unrelated current transfers
+    // to succeed. Preserve current checkpoint evidence and stop when continuing
+    // would ignore authentication, cancellation, or a failed durable write.
+    if matches!(sync_result.outcome, DownloadOutcome::SessionExpired { .. })
+        || sync_result.checkpoint.state_write_failures > 0
         || sync_result.checkpoint.interrupted
         || shutdown_token.is_cancelled()
     {
@@ -282,8 +297,16 @@ pub(super) async fn append_targeted_recovery_to_sync_result(
     {
         Ok(result) => result,
         Err(e) => {
+            // A failed durable marker/write is still an accounting failure.
+            // Do not disguise it as ordinary retained provider ambiguity.
+            let state_write_failures = usize::from(
+                e.downcast_ref::<crate::state::error::StateError>()
+                    .is_some(),
+            );
             let stats = SyncStats {
                 failed: 1,
+                state_write_failures,
+                interrupted: shutdown_token.is_cancelled(),
                 elapsed_secs: 0.0,
                 ..SyncStats::default()
             };

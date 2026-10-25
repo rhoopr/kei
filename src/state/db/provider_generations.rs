@@ -115,7 +115,11 @@ fn basis(conn: &Connection, scope: &str) -> Result<String, StateError> {
 // Legacy asset keys contain the zone name, not its database or owner.
 // Refuse a conflicting full scope before reusing those keys; equal provider
 // signatures do not make two provider identities interchangeable.
-fn guard_library_scope(conn: &Connection, scope: &str, library: &str) -> Result<(), StateError> {
+pub(super) fn guard_library_scope(
+    conn: &Connection,
+    scope: &str,
+    library: &str,
+) -> Result<(), StateError> {
     let saved: Option<String> = conn
         .query_row(
             "SELECT value FROM metadata WHERE key=?1",
@@ -460,7 +464,7 @@ fn charge(conn: &Connection, additional: u64, capacity: u64, format: u8) -> Resu
           +COALESCE((SELECT SUM(p.charged_bytes) FROM provider_selection_rank_pages p JOIN provider_active_generations g ON g.id=p.generation WHERE json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)
           +COALESCE((SELECT SUM(d.charged_bytes) FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE d.compacted_hash IS NULL AND json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)",
           [format],|r|r.get(0))?;
-        let used = u64::try_from(used).map_err(|_| StateError::ProviderSelectionInvalid)?;
+        let used = u64::try_from(used).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
         if additional <= capacity.saturating_sub(used) {
             return Ok(());
         }
@@ -1480,7 +1484,7 @@ impl SqliteStateDb {
     ) -> Result<Option<ActiveGeneration>, StateError> {
         self.with_conn("scheduling retained selected work",move|conn|{
             let profile = compatible_profile.as_ref().map(serde_json::to_string)
-                .transpose().map_err(|_| StateError::ProviderSelectionInvalid)?;
+                .transpose().map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
             account::validate_authenticated(conn,&owner)?;
             let id:Option<String>=conn.query_row("SELECT g.id FROM provider_active_generations g WHERE g.scope=?1 AND (g.config_hash=?2 OR (?5 IS NOT NULL AND json_extract(CAST(g.specification AS TEXT),'$.format')=2 AND (json_extract(CAST(g.specification AS TEXT),'$.profile')=json(?5) OR (length(json_extract(?5,'$.admitted_retry_policy'))=64 AND json_extract(?5,'$.admitted_retry_policy') NOT GLOB '*[^0-9a-f]*' AND json_extract(CAST(g.specification AS TEXT),'$.profile.admitted_retry_policy')=json_extract(?5,'$.admitted_retry_policy'))))) AND g.id<>?3 AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.admission='deferred' AND d.next_retry_at<=?4) OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id AND w.admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=?4) AND w.verified_media=0)) ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT 1",params![scope,config_hash,current,Utc::now().timestamp(),profile],|r|r.get(0)).optional()?;
             let root = id.map(|id|load_generation(conn,&id)).transpose()?;
@@ -1776,7 +1780,7 @@ impl SqliteStateDb {
         generation: String,
     ) -> Result<bool, StateError> {
         self.with_conn("inspecting destination wake-up",move|conn|{
-            account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;
+            account::validate_authenticated(conn,&owner)?;load_generation(conn,&generation)?;
             Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND verified_media=0)",params![generation,Utc::now().timestamp()],|r|r.get(0))?)
         }).await
     }
@@ -1852,7 +1856,7 @@ fn frozen_metadata(
         _ => return invalid(),
     };
     let snapshot: FrozenMetadata =
-        serde_json::from_slice(&bytes).map_err(|_| StateError::ProviderSelectionInvalid)?;
+        serde_json::from_slice(&bytes).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
     let group = group.ok_or(StateError::ProviderSelectionInvalid)?;
     if root.spec.format != 1
         || !root.spec.metadata_enabled
@@ -1872,8 +1876,14 @@ fn frozen_metadata(
         || snapshot.asset.metadata.metadata_hash.as_deref()
             != Some(destination.metadata_hash.as_str())
         || digest(&encode(&(&snapshot.albums, &snapshot.people))?) != group
-        || !snapshot.albums.windows(2).all(|pair| pair[0] <= pair[1])
-        || !snapshot.people.windows(2).all(|pair| pair[0] <= pair[1])
+        || !snapshot
+            .albums
+            .windows(2)
+            .all(|pair| matches!(pair, [left, right] if left <= right))
+        || !snapshot
+            .people
+            .windows(2)
+            .all(|pair| matches!(pair, [left, right] if left <= right))
         || digest(&encode(&(
             1,
             &root.id,
@@ -1987,7 +1997,7 @@ pub(super) fn freeze_metadata_identity(
                 &bytes,
             ))?);
             let charged = u64::try_from(bytes.len() + hash.len())
-                .map_err(|_| StateError::ProviderSelectionFull)?;
+                .map_err(|_invalid| StateError::ProviderSelectionFull)?;
             // First freeze preserves an existing owner; it is not new work
             // admission. encode()/frozen_metadata() bound and validate each
             // snapshot, and the early already-frozen check prevents recharging.
@@ -2010,7 +2020,7 @@ pub(super) fn freeze_metadata_identity(
                 "UPDATE provider_active_generations SET charged_bytes=charged_bytes+?2 WHERE id=?1",
                 params![
                     generation,
-                    i64::try_from(charged).map_err(|_| StateError::ProviderSelectionFull)?
+                    i64::try_from(charged).map_err(|_invalid| StateError::ProviderSelectionFull)?
                 ],
             )?;
             frozen_metadata(conn, &root, &manifest, destination)?
@@ -2857,7 +2867,8 @@ impl SqliteStateDb {
             if declared && load_decision(conn, &root, &key, &child)?.state_id != state_id {
                 return Err(StateError::ProviderSelectionInvalid);
             }
-            let size = i64::try_from(size).map_err(|_| StateError::ProviderSelectionInvalid)?;
+            let provider_size = size;
+            let size = i64::try_from(size).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
             let admitted: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1
                  AND pass_key=?2 AND child=?3 AND asset_id=?4 AND version_size=?5 AND path=?6
@@ -2883,7 +2894,7 @@ impl SqliteStateDb {
                 let selected = other.decision.destinations.iter().find(|destination|
                     destination.path.key().ok().as_deref() == Some(encoded.as_str())
                     && destination.version_size == version && destination.checksum == checksum
-                    && destination.size == size as u64
+                    && destination.size == provider_size
                 ).ok_or(StateError::ProviderSelectionInvalid)?;
                 let native = selected.path.to_path();
                 if native == path.to_path() || native == requested.to_path() { continue; }
@@ -2906,7 +2917,7 @@ impl SqliteStateDb {
                     Some(super::BaselineReceipt {
                         is_current_path: false, library: library.to_owned(), id: state_id.clone(),
                         version_size: crate::state::VersionSizeKey::from_str(&version).ok_or(StateError::ProviderSelectionInvalid)?,
-                        provider_checksum: checksum.clone(), provider_size: size as u64,
+                        provider_checksum: checksum.clone(), provider_size,
                         local_path: compatibility.into(), local_checksum: Some(local),
                         source_checksum: Some(source),
                     })

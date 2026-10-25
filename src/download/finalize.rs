@@ -427,6 +427,7 @@ mod tests {
             url: "https://example.test/photo.jpg".into(),
             download_path: path,
             replacement_fingerprint: None,
+            publication_binding: None,
             pending_cross_parent_root: None,
             checksum: "remote_checksum".into(),
             asset_id: Arc::from(asset_id),

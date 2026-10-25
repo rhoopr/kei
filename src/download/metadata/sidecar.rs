@@ -7,7 +7,6 @@ use super::xmp_fields::{
 };
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use xmp_toolkit::{FromStrOptions, XmpErrorType, XmpMeta};
 
 static SIDECAR_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -41,107 +40,6 @@ impl ReconciledSidecarSnapshot {
         self.path.validate_identity(identity)?;
         Ok(())
     }
-}
-
-/// Keep source and destination sidecar evidence live through catalogue finalization.
-pub(in crate::download) struct ReconciledSidecar {
-    source_path: crate::fs_util::ConfinedPath,
-    source: Option<ReconciledSidecarSnapshot>,
-    destination: ReconciledSidecarSnapshot,
-}
-
-impl ReconciledSidecar {
-    pub(in crate::download) async fn validate(self: &Arc<Self>) -> Result<()> {
-        let sidecar = Arc::clone(self);
-        tokio::task::spawn_blocking(move || sidecar.validate_blocking()).await?
-    }
-
-    fn validate_blocking(&self) -> Result<()> {
-        if let Some(source) = &self.source {
-            source.validate()?;
-        } else {
-            anyhow::ensure!(
-                self.source_path.open_optional_regular()?.is_none(),
-                "Source sidecar appeared during reconciliation"
-            );
-        }
-        self.destination.validate()
-    }
-}
-
-/// Preserve an existing packet byte-for-byte. Generate a configured packet only
-/// when no source sidecar exists. Never overwrite a conflicting destination.
-pub(in crate::download) fn write_reconciled_sidecar(
-    copy: &crate::download::file::ReconciledFile,
-    write_missing: impl FnOnce() -> Result<MetadataWrite>,
-    temp_suffix: &str,
-) -> Result<Arc<ReconciledSidecar>> {
-    fn sidecar_name(path: &Path) -> Result<PathBuf> {
-        let mut name = path
-            .file_name()
-            .context("Reconciled media has no filename")?
-            .to_os_string();
-        name.push(".xmp");
-        Ok(path.with_file_name(name))
-    }
-    let source_path = copy.source.sibling(&sidecar_name(copy.source.path())?)?;
-    // Sibling creates a second retained capability without resolving ancestors.
-    let source = ReconciledSidecarSnapshot::read(copy.source.sibling(source_path.path())?)?;
-    let bytes = if let Some(source) = &source {
-        ensure_initialized();
-        parse_existing_sidecar(
-            std::str::from_utf8(&source.bytes).context("Source sidecar is not UTF-8")?,
-        )?;
-        source.bytes.clone()
-    } else {
-        let write = write_missing()?;
-        ensure_initialized();
-        let mut meta = XmpMeta::new().context("creating reconciled XMP packet")?;
-        apply_to_owned_sidecar(&mut meta, &write)?;
-        meta.to_string().into_bytes()
-    };
-    if let Some(source) = &source {
-        source.validate()?;
-    }
-    copy.validate_blocking()?;
-    let destination = copy
-        .destination
-        .sibling(&sidecar_name(copy.destination.path())?)?;
-    // CONTRACT: FILE_PUBLISH_NO_OVERWRITE
-    let existing = ReconciledSidecarSnapshot::read(copy.destination.sibling(destination.path())?)?;
-    let destination = if let Some(existing) = existing {
-        anyhow::ensure!(
-            existing.bytes == bytes,
-            "Reconciled sidecar destination conflicts with source metadata"
-        );
-        existing
-    } else {
-        let temp_path = destination.path().with_file_name(format!(
-            ".kei-xmp-reconcile-{}{temp_suffix}",
-            uuid::Uuid::new_v4()
-        ));
-        let temp = destination.sibling(&temp_path)?;
-        let mut file = temp.create_new_regular()?;
-        std::io::Write::write_all(&mut file, &bytes)?;
-        file.sync_all()?;
-        temp.validate_identity(crate::fs_util::file_identity(&file)?)?;
-        crate::download::file::publish_reconciliation_part_blocking(&temp, &destination)?;
-        let installed = ReconciledSidecarSnapshot::read(destination)?
-            .context("Reconciled sidecar disappeared")?;
-        anyhow::ensure!(
-            installed.bytes == bytes,
-            "Reconciled sidecar changed during publication"
-        );
-        installed
-    };
-    destination.path.sync_parent()?;
-    let receipt = Arc::new(ReconciledSidecar {
-        source_path,
-        source,
-        destination,
-    });
-    receipt.validate_blocking()?;
-    Ok(receipt)
 }
 
 /// Write `write` as a `.xmp` sidecar next to the media file with guarded publication.

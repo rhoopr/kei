@@ -50,7 +50,7 @@ pub(crate) use sparse_identity::{
 mod rows;
 mod temp_files;
 mod upgrade;
-pub(crate) use temp_files::PreparedPublication;
+pub(crate) use temp_files::{PreparedPublication, PublicationBinding};
 
 pub use contracts::{
     AlbumMembershipRecord, CaptureRepairReceipt, DownloadStateStore, ImportStateStore,
