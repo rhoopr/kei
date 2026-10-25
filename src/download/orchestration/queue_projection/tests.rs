@@ -5919,7 +5919,27 @@ async fn private_expired_url_refresh_preserves_frozen_resource_identity_then_rec
         .unwrap();
         if matches!(drift, "checksum" | "master") {
             assert_eq!(first.stats.downloaded, 0, "{first:?}");
-            assert!(first.sync_token.is_none());
+            assert!(matches!(
+                first.outcome,
+                crate::download::DownloadOutcome::PartialFailure { .. }
+            ));
+            assert_eq!(first.stats.failed, 1);
+            assert!(!first.stats.enumeration_incomplete);
+            assert!(
+                first.sync_token.is_some(),
+                "completed inventory may advance with durable unfinished work"
+            );
+            assert_eq!(
+                f.db.acquire_lock("resource drift retains the current destination")
+                    .unwrap()
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM provider_active_destinations WHERE verified_media=0",
+                        [],
+                        |r| r.get(0)
+                    )
+                    .unwrap(),
+                1
+            );
             assert_eq!(
                 f.db.acquire_lock("resource drift cannot obtain active publication proof")
                     .unwrap()
@@ -5937,6 +5957,11 @@ async fn private_expired_url_refresh_preserves_frozen_resource_identity_then_rec
                 json!(data_encoding::BASE64.encode(&Sha256::digest(media)));
             *f.session.corrupt.lock().unwrap() = None;
             f = reopen_destination_fixture(f).await;
+            // Reopen does not erase the durable retry backoff. Advance only the
+            // test clock for this pending child; retain its original work/proof.
+            f.db.make_selection_retry_due(owner(), "asset-m".into())
+                .await
+                .unwrap();
             let recovered = crate::download::download_photos_with_sync(
                 &reqwest::Client::new(),
                 std::slice::from_ref(&f.pass),

@@ -561,6 +561,15 @@ async fn storage_contract(fault: Fault) {
                     "retirement rollback must preserve owners, receipts and seals"
                 );
             } else {
+                assert!(
+                    server
+                        .received_requests()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .all(|request| request.url.path() != "/live-2"),
+                    "failed admission must prevent even starting the affected transfer"
+                );
                 let conn = db.acquire_lock("admission rolled back").unwrap();
                 assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE child='asset-live-2'",[],|r|r.get(0)).unwrap(),0);
                 assert_eq!(
