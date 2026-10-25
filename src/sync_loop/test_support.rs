@@ -1628,3 +1628,34 @@ pub(super) fn make_library_state(zone: &str, sync_token_key: &str) -> LibrarySta
         cross_zone_libraries: Vec::new(),
     }
 }
+
+#[cfg(feature = "xmp")]
+pub(crate) async fn run_prepared_fixture_cycle(
+    db: Arc<crate::state::SqliteStateDb>,
+    passes: Vec<crate::commands::AlbumPass>,
+    base: crate::download::DownloadConfig,
+) -> crate::sync_cycle::CycleResult {
+    let key = crate::sync_cycle::sync_token_key(&base.library);
+    let selected = make_run_cycle_library_state_with_passes(&base.library, &key, passes);
+    let (_dir, shared) = make_shared_session_for_run_cycle().await;
+    let builder = move |mode, excludes, groups, library| {
+        let mut config = base.clone();
+        config.sync_mode = mode;
+        config.exclude_asset_ids = excludes;
+        config.asset_groupings = groups;
+        config.library = library;
+        Arc::new(config)
+    };
+    crate::sync_cycle::run_cycle(
+        &[&selected],
+        &make_run_cycle_config(),
+        Some(db.as_ref()),
+        false,
+        &builder,
+        crate::download::DownloadControls::download_hidden(),
+        &shared,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+}

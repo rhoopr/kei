@@ -306,14 +306,46 @@ pub async fn download_photos_with_sync(
 ) -> Result<SyncResult> {
     // Bound the complete cycle's new selection/replay state at its owner,
     // preserving one opaque public future and avoiding caller-specific boxing.
-    Box::pin(download_photos_with_sync_inner(
+    // Settle published output before baseline matching snapshots receipts.
+    // Otherwise a valid interrupted metadata output appears as local drift.
+    let mut remaining = match super::generation::finish_prepared(
+        passes,
+        &config,
+        controls,
+        &shutdown_token,
+    )
+    .await
+    {
+        Ok(remaining) => remaining,
+        Err(error) => {
+            tracing::warn!(%error, "Prepared operation recovery remains pending");
+            1
+        }
+    };
+    let mut result = Box::pin(download_photos_with_sync_inner(
         download_client,
         passes,
-        config,
+        config.clone(),
         controls,
         shutdown_token,
     ))
-    .await
+    .await?;
+    if remaining > 0 {
+        // Explicit work inside the cycle may have settled the same old owner.
+        remaining = super::generation::prepared_remaining(passes, &config)
+            .await
+            .unwrap_or(remaining);
+    }
+    if remaining > 0 {
+        result.stats.exif_failures += remaining;
+        result.outcome = merge_download_outcomes(
+            &result.outcome,
+            &DownloadOutcome::PartialFailure {
+                failed_count: remaining,
+            },
+        );
+    }
+    Ok(result)
 }
 
 async fn download_photos_with_sync_inner(

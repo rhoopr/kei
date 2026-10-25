@@ -897,6 +897,30 @@ impl SqliteStateDb {
         .await
     }
 
+    /// Only durable prepared owners, never ordinary optional rewrite markers.
+    pub(crate) async fn prepared_selection_page(
+        &self,
+        owner: super::account::AccountOwner,
+        scope: String,
+        config_hash: String,
+        offset: usize,
+    ) -> Result<(Vec<Result<PendingMetadataRewrite, StateError>>, usize), StateError> {
+        self.with_conn("reading prepared selection owners", move |conn| {
+            super::account::validate_authenticated(conn, &owner)?;
+            let predicate = "FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.prepared_hash IS NOT NULL AND w.verified_metadata=0";
+            let total: i64 = conn.query_row(&format!("SELECT count(*) {predicate}"), [&scope], |r| r.get(0))?;
+            let mut statement = conn.prepare(&format!("SELECT w.generation,w.pass_key,w.child,w.version_size,w.path,g.config_hash {predicate} ORDER BY w.generation,w.pass_key,w.child,w.version_size,w.path LIMIT 250 OFFSET ?2"))?;
+            let keys = statement.query_map(rusqlite::params![scope, if i64::try_from(offset).unwrap_or(i64::MAX) < total {i64::try_from(offset).unwrap_or(0)} else {0}], |r| {
+                Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?))
+            })?.collect::<Result<Vec<_>,_>>()?;
+            let pending = keys.into_iter().map(|(generation,key,child,version,path,hash)| {
+                if hash != config_hash { return Err(StateError::ProviderWorkConflict); }
+                super::provider_generations::metadata_receipt(conn,&generation,&key,&child,&version,&path)
+            }).collect();
+            Ok((pending,usize::try_from(total).map_err(|_invalid_count| StateError::ProviderSelectionInvalid)?))
+        }).await
+    }
+
     pub(crate) async fn finish_metadata_rewrite(
         &self,
         pending: &PendingMetadataRewrite,
@@ -904,6 +928,26 @@ impl SqliteStateDb {
         local_checksum: Option<&str>,
         pre_rewrite_checksum: Option<&str>,
         completion: MetadataRewriteCompletion,
+    ) -> Result<bool, StateError> {
+        self.finish_metadata_rewrite_checked(
+            pending,
+            selected_queue,
+            local_checksum,
+            pre_rewrite_checksum,
+            completion,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_metadata_rewrite_checked(
+        &self,
+        pending: &PendingMetadataRewrite,
+        selected_queue: MetadataRewriteQueue,
+        local_checksum: Option<&str>,
+        pre_rewrite_checksum: Option<&str>,
+        completion: MetadataRewriteCompletion,
+        validate_file: Option<Box<dyn FnOnce() -> Result<(), StateError> + Send>>,
     ) -> Result<bool, StateError> {
         let metadata_hash = pending
             .asset
@@ -987,8 +1031,11 @@ impl SqliteStateDb {
         let selection_pending = pending.clone();
         self.with_conn_mut("finish_metadata_rewrite", move |conn| {
             let tx = conn
-                .transaction()
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|e| StateError::query("finish_metadata_rewrite::begin", e))?;
+            if let Some(validate_file) = validate_file {
+                validate_file()?;
+            }
             let target = metadata_rewrite_target(&tx, &library, &asset_id, &version_size, &path)?;
             let updated = if let Some(target) = target {
                 let (table, evidence) = target.sql();

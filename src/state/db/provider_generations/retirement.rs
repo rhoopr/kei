@@ -477,3 +477,113 @@ pub(crate) fn take_legacy_compaction_validation_count(generation: &str) -> usize
         .and_then(|mut counts| counts.remove(generation))
         .unwrap_or_default()
 }
+
+/// A validated prepared rewrite advances the same physical resource's completion
+/// proof. Retained compact owners must move in the same transaction as its receipt.
+pub(in crate::state::db) fn advance_completed_receipt(
+    conn: &Connection,
+    previous: &DownloadReceipt,
+    completed: &DownloadReceipt,
+) -> Result<(), StateError> {
+    if conn.is_autocommit() {
+        return invalid();
+    }
+    let keys: Vec<(String,String,String)> = conn.prepare(
+        "SELECT w.generation,w.pass_key,w.child FROM provider_active_destinations w
+         JOIN provider_active_generations g ON g.id=w.generation
+         JOIN provider_active_decisions d ON d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child
+         WHERE g.scope=?1 AND w.child=?2 AND w.master=?3 AND w.version_size=?4
+           AND w.checksum=?5 AND w.size_bytes=?6 AND w.path=?7
+           AND w.admitted=1 AND w.verified_media=1 AND w.verified_metadata=1
+           AND w.prepared_hash IS NULL AND w.frozen_metadata IS NULL"
+    )?.query_map(params![previous.scope,previous.child,previous.master,previous.version_size,
+        previous.provider_checksum,previous.provider_size as i64,previous.native_path.key()?],
+        |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
+    // Validate all owners against the old receipt before changing any proof.
+    let mut owners = Vec::with_capacity(keys.len());
+    let mut seals = std::collections::BTreeMap::new();
+    for (id, key, child) in keys {
+        let root = load_generation(conn, &id)?;
+        if root.sealed && !seals.contains_key(&id) {
+            let saved: String = conn.query_row(
+                "SELECT seal_hash FROM provider_active_generations WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )?;
+            if seal_hash(
+                conn,
+                &root,
+                root.checkpoint_ready,
+                root.checkpoint_veto.as_deref(),
+            )? != saved
+            {
+                return invalid();
+            }
+            seals.insert(id.clone(), saved);
+        }
+        let manifest = load_decision(conn, &root, &key, &child)?;
+        let destination = manifest
+            .decision
+            .destinations
+            .iter()
+            .find(|d| d.version_size == previous.version_size && d.path == previous.native_path)
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        let owner_receipt = receipt(conn, &root, &manifest, destination)?;
+        if !same_receipt(&owner_receipt, previous) && !same_receipt(&owner_receipt, completed) {
+            return invalid();
+        }
+        let compacted: bool = conn.query_row(
+            "SELECT compacted_hash IS NOT NULL FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+            params![id,key,child], |r|r.get(0))?;
+        owners.push((root, manifest, compacted));
+    }
+    for (root, manifest, compacted) in &owners {
+        let destination = manifest
+            .decision
+            .destinations
+            .iter()
+            .find(|d| d.version_size == previous.version_size && d.path == previous.native_path)
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        conn.execute(
+            "UPDATE provider_active_destinations SET local_checksum=?6
+            WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+            params![
+                root.id,
+                manifest.decision.pass_key,
+                manifest.decision.child,
+                previous.version_size,
+                previous.native_path.key()?,
+                completed.local_checksum
+            ],
+        )?;
+        refresh_progress_hash(conn, root, manifest, destination)?;
+        if *compacted {
+            conn.execute(
+                "UPDATE provider_active_decisions SET compacted_hash=?4
+            WHERE generation=?1 AND pass_key=?2 AND child=?3",
+                params![
+                    root.id,
+                    manifest.decision.pass_key,
+                    manifest.decision.child,
+                    marker_hash(conn, root, manifest)?
+                ],
+            )?;
+        }
+    }
+    download_receipts::replace_validated_local(conn, previous, &completed.local_checksum)?;
+    // Only completion hashes changed, not coverage or frozen groupings.
+    // Preserve the original seal; never re-seal potentially damaged inventory.
+    for (id, saved) in seals {
+        let root = load_generation(conn, &id)?;
+        if seal_hash(
+            conn,
+            &root,
+            root.checkpoint_ready,
+            root.checkpoint_veto.as_deref(),
+        )? != saved
+        {
+            return invalid();
+        }
+    }
+    Ok(())
+}

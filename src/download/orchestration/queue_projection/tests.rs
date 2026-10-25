@@ -3159,7 +3159,7 @@ async fn private_metadata_recovery_fixture_with_signature(
         f.config.metadata.embed_xmp = false;
         let primed = crate::download::download_photos_with_sync(
             &reqwest::Client::new(),
-            std::slice::from_ref(&passes[0]),
+            &passes,
             Arc::new(f.config.clone()),
             controls(),
             CancellationToken::new(),
@@ -3264,7 +3264,48 @@ async fn private_metadata_recovery_fixture_with_signature(
             "a normalized output checksum without matching intent/input proof cannot authorize recovery"
         );
         f.db.acquire_lock("restore exact synthetic proof").unwrap().execute("UPDATE provider_active_destinations SET prepared_checksum=?4 WHERE generation=?1 AND pass_key=?2 AND child=?3",rusqlite::params![generation,key,child,prepared]).unwrap();
+        let pending =
+            f.db.pending_selection_metadata(owner(), generation.clone(), 250)
+                .await
+                .unwrap()
+                .remove(0);
+        let held = crate::download::file::retain_pending_file(&f.config.directory, &written_path)
+            .await
+            .unwrap()
+            .unwrap();
+        // Simulate replacement after inspection, before the SQLite transaction.
         std::fs::write(&written_path, b"unrelated synthetic damage").unwrap();
+        let rejected =
+            f.db.finish_metadata_rewrite_checked(
+                &pending,
+                crate::state::db::MetadataRewriteQueue::Ordinary,
+                Some(&prepared),
+                pending.asset.local_checksum.as_deref(),
+                crate::state::db::MetadataRewriteCompletion::Ordinary,
+                Some(Box::new(move || {
+                    held.validate_blocking().map_err(|_changed| {
+                        crate::state::error::StateError::Invariant {
+                            operation: "prepared_race_test",
+                            detail: "changed before transaction".into(),
+                        }
+                    })
+                })),
+            )
+            .await
+            .unwrap_err();
+        assert!(rejected.to_string().contains("changed before transaction"));
+        assert_eq!(
+            crate::download::orchestration::generation::finish_prepared(
+                &passes,
+                &f.config,
+                controls(),
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap(),
+            1,
+            "wrong bytes must remain visible without entering a writer"
+        );
         let negative = crate::download::metadata_rewrite::run_pending_budget(
             f.db.as_ref(),
             crate::download::pipeline::MetadataFlags::from(&f.config),
@@ -3285,10 +3326,124 @@ async fn private_metadata_recovery_fixture_with_signature(
         );
         assert_eq!(f.db.acquire_lock("negative cannot acknowledge aliases").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap(),2);
         std::fs::write(&written_path, &own_output).unwrap();
+        let mut incompatible = f.config.clone();
+        incompatible.folder_structure_albums = "different-layout".into();
+        assert_eq!(
+            crate::download::orchestration::generation::finish_prepared(
+                &passes,
+                &incompatible,
+                controls(),
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        incompatible = f.config.clone();
+        incompatible.retry_only = true;
+        assert_eq!(
+            crate::download::orchestration::generation::finish_prepared(
+                &passes,
+                &incompatible,
+                controls(),
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap(),
+            1
+        );
         f.db.acquire_lock("remove only metadata state fault")
             .unwrap()
             .execute_batch("DROP TRIGGER interrupt_metadata_finish")
             .unwrap();
+        if native {
+            let snapshot = || {
+                let conn = f.db.acquire_lock("snapshot compact ownership").unwrap();
+                assert!(conn.query_row::<i64,_,_>(
+                    "SELECT count(*) FROM provider_active_decisions WHERE compacted_hash IS NOT NULL",
+                    [], |r| r.get(0)).unwrap() > 0);
+                [
+                    "SELECT json_array(id,seal_hash,seal_header_hash) FROM provider_active_generations ORDER BY id",
+                    "SELECT json_array(generation,pass_key,child,local_checksum,progress_hash,prepared_hash,verified_metadata) FROM provider_active_destinations ORDER BY generation,pass_key,child,path",
+                    "SELECT json_array(generation,pass_key,child,compacted_hash) FROM provider_active_decisions ORDER BY generation,pass_key,child",
+                    "SELECT json_array(id,local_checksum,proof_hash,origin_pass) FROM download_receipts ORDER BY id",
+                ].iter().map(|sql| conn.prepare(sql).unwrap().query_map([], |r|r.get::<_,String>(0))
+                    .unwrap().collect::<Result<Vec<_>,_>>().unwrap()).collect::<Vec<_>>()
+            };
+            let before = snapshot();
+            {
+                let conn =
+                    f.db.acquire_lock("remove an aggregate coverage dependency")
+                        .unwrap();
+                conn.execute_batch("CREATE TEMP TABLE saved_prepared_decision AS
+                    SELECT * FROM provider_active_decisions WHERE compacted_hash IS NOT NULL ORDER BY generation,pass_key LIMIT 1;
+                    CREATE TEMP TABLE saved_prepared_destination AS SELECT w.* FROM provider_active_destinations w
+                    JOIN saved_prepared_decision d ON d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child;
+                    DELETE FROM provider_active_destinations WHERE (generation,pass_key,child) IN
+                        (SELECT generation,pass_key,child FROM saved_prepared_decision);
+                    DELETE FROM provider_active_decisions WHERE (generation,pass_key,child) IN
+                        (SELECT generation,pass_key,child FROM saved_prepared_decision);").unwrap();
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        "SELECT count(*) FROM saved_prepared_decision",
+                        [],
+                        |r| r.get(0)
+                    )
+                    .unwrap(),
+                    1
+                );
+            }
+            let damaged = snapshot();
+            assert_eq!(
+                crate::download::orchestration::generation::finish_prepared(
+                    &passes,
+                    &f.config,
+                    controls(),
+                    &CancellationToken::new()
+                )
+                .await
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                snapshot(),
+                damaged,
+                "a damaged old seal must not be repaired by receipt acknowledgement"
+            );
+            f.db.acquire_lock("restore exact synthetic coverage dependency")
+                .unwrap()
+                .execute_batch(
+                    "INSERT INTO provider_active_decisions SELECT * FROM saved_prepared_decision;
+                 INSERT INTO provider_active_destinations SELECT * FROM saved_prepared_destination;
+                 DROP TABLE saved_prepared_decision; DROP TABLE saved_prepared_destination;",
+                )
+                .unwrap();
+            assert_eq!(snapshot(), before);
+            f.db.acquire_lock("interrupt compact receipt handoff").unwrap().execute_batch(
+                "CREATE TRIGGER fail_compact_handoff BEFORE UPDATE OF local_checksum ON download_receipts
+                 BEGIN SELECT RAISE(ABORT,'synthetic compact handoff failure'); END;"
+            ).unwrap();
+            assert_eq!(
+                crate::download::orchestration::generation::finish_prepared(
+                    &passes,
+                    &f.config,
+                    controls(),
+                    &CancellationToken::new()
+                )
+                .await
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                snapshot(),
+                before,
+                "failed handoff must roll back prepared proof, old compact owners, seals and receipts together"
+            );
+            f.db.acquire_lock("remove compact handoff fault")
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_compact_handoff")
+                .unwrap();
+        }
     } else {
         let first = first.unwrap();
         let proof_rows=f.db.acquire_lock("actual shared writer evidence").unwrap().prepare("SELECT path,local_checksum,source_checksum,verified_metadata FROM provider_active_destinations").unwrap().query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,bool>(3)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
@@ -3391,6 +3546,59 @@ async fn private_metadata_recovery_fixture_with_signature(
             json!({"value":"new-explicit-title","type":"STRING"});
         f.config.refresh_metadata = true;
         f.config.sync_mode = crate::download::SyncMode::Full;
+    }
+    if PREPARED_NORMAL_RUNNER
+        .try_with(|enabled| *enabled)
+        .unwrap_or(false)
+    {
+        let token_key = crate::sync_cycle::sync_token_key("PrimarySync");
+        f.db.set_metadata("sync_token:PrimarySync", "old-cursor")
+            .await
+            .unwrap();
+        assert!(f.db.get_metadata(&token_key).await.unwrap().is_none());
+        let initial_ranks = f.session.rank_calls.load(Ordering::SeqCst);
+        let first = crate::sync_loop::run_prepared_fixture_cycle(
+            f.db.clone(),
+            passes.clone(),
+            f.config.clone(),
+        )
+        .await;
+        assert_eq!(first.failed_count, 0, "{first:?}");
+        assert!(first.db_sync_token_advance_safe, "{first:?}");
+        assert_eq!(
+            f.db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("old-cursor"),
+            "upgrade must leave historical token untouched"
+        );
+        assert!(
+            f.db.get_metadata(&token_key).await.unwrap().is_some(),
+            "fresh baseline establishes a v27 cursor"
+        );
+        assert!(
+            f.session.rank_calls.load(Ordering::SeqCst) > initial_ranks,
+            "absence of a v27 token must run the actual initial inventory"
+        );
+        let ranks = f.session.rank_calls.load(Ordering::SeqCst);
+        let reopened = Arc::new(
+            SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+                .await
+                .unwrap(),
+        );
+        let capture = ShadowCapture::new(reopened.clone(), owner(), "com");
+        let mut config = f.config.clone();
+        config.state_db = Some(reopened.clone() as Arc<dyn DownloadStore>);
+        let next_passes = vec![
+            destination_pass_with(&f.session, &capture, "A"),
+            destination_pass_with(&f.session, &capture, "B"),
+        ];
+        let next =
+            crate::sync_loop::run_prepared_fixture_cycle(reopened, next_passes, config).await;
+        assert_eq!(next.failed_count, 0, "{next:?}");
+        assert_eq!(next.stats.downloaded, 0);
+        assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), ranks);
     }
     let recovered = crate::download::download_photos_with_sync(
         &reqwest::Client::new(),
@@ -6906,3 +7114,23 @@ async fn v027_frozen_optional_metadata_native_receipt_finishes_after_reopen() {
 mod provider_adoption;
 
 mod recorded_only;
+
+#[cfg(feature = "xmp")]
+tokio::task_local! { static PREPARED_NORMAL_RUNNER: bool; }
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn v027_prepared_operation_upgrade_normal_runner_and_quiet_reopen() {
+    PREPARED_NORMAL_RUNNER
+        .scope(
+            true,
+            private_metadata_recovery_fixture(
+                true,
+                false,
+                false,
+                false,
+                MetadataStateFault::AfterWrite,
+            ),
+        )
+        .await;
+}

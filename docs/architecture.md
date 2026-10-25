@@ -2541,3 +2541,27 @@ provider evidence records `verified_source` or `trusted_legacy_file` explicitly.
 No-acceptance dependency serialization is unchanged. Native source verification,
 GPS and ordinary adoption retain their verified-source requirements. See
 [Trusted Legacy Files](trusted-legacy-files.md) for the command boundary.
+
+
+### Prepared selected metadata acknowledgement
+
+Ordinary download orchestration may acknowledge an already-published prepared
+metadata output. It never invokes an optional metadata writer for this step.
+The state owner selects at most 250 prepared rows in the authenticated provider
+scope and validates the exact historical configuration and immutable operation
+receipt. A scoped metadata cursor rotates past incompatible or damaged rows;
+it schedules retries and is not completion evidence.
+
+The finalizer holds the destination lock, checks the prepared output hash and
+size, and rechecks the retained file and namespace inside the existing completion
+transaction before consuming proof and settling compatible aliases. Native
+paths retain their lossless ownership. Mismatched configuration, corrupt proof,
+changed files and failed transactions stay durable and produce a partial
+outcome. They do not become global prerequisites for provider-token advancement.
+
+The same transaction preserves the raw source checksum while advancing the
+operation-bound local-output receipt. Existing completed owners of that exact
+resource/path advance together, including completed destinations in otherwise
+unfinished roots. Pending destinations are unchanged. Old aggregate seals must
+validate before the handoff and remain identical afterward; receipt
+acknowledgement cannot re-seal damaged inventory.

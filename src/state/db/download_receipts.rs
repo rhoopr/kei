@@ -152,6 +152,46 @@ impl DownloadReceipt {
         Ok(id)
     }
 }
+/// Called only after an operation's prepared proof was validated in this transaction.
+pub(super) fn save_prepared_rewrite(
+    conn: &Connection,
+    completed: &DownloadReceipt,
+    input_checksum: &str,
+) -> Result<(), StateError> {
+    if conn.is_autocommit() {
+        return Err(invalid());
+    }
+    let id = completed.id()?;
+    if let Some(previous) = load(conn, &id)? {
+        let mut expected = completed.clone();
+        expected.origin_pass = previous.origin_pass.clone();
+        expected.local_checksum = previous.local_checksum.clone();
+        if expected != previous
+            || (previous.local_checksum != input_checksum
+                && previous.local_checksum != completed.local_checksum)
+        {
+            return Err(StateError::ProviderWorkConflict);
+        }
+        super::provider_generations::advance_completed_receipt(conn, &previous, completed)?;
+    }
+    completed.save(conn)?;
+    Ok(())
+}
+
+pub(super) fn replace_validated_local(
+    conn: &Connection,
+    previous: &DownloadReceipt,
+    local: &str,
+) -> Result<(), StateError> {
+    let mut updated = previous.clone();
+    updated.local_checksum = local.to_owned();
+    conn.execute(
+        "UPDATE download_receipts SET local_checksum=?2,proof_hash=?3 WHERE id=?1",
+        params![updated.id()?, updated.local_checksum, hash(&updated)?],
+    )?;
+    Ok(())
+}
+
 pub(super) fn load(conn: &Connection, id: &str) -> Result<Option<DownloadReceipt>, StateError> {
     let saved:Option<(DownloadReceipt,String)>=conn.query_row("SELECT account_key,provider_key,scope,library,child,master,state_id,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,origin_pass FROM download_receipts WHERE id=?1",[id],|r| {
         let path:String=r.get(10)?;

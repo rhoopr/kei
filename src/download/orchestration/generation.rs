@@ -23,6 +23,7 @@ use crate::download::planner::{AssetTaskPlan, TaskPlanner};
 use crate::icloud::photos::{
     PhotoAlbum, PhotoAsset, current_asset, inbox::ShadowCapture, same_selected_facts,
 };
+use crate::state::db::MetadataRewriteStore;
 use crate::state::db::provider_generations::{
     ActiveDecision, ActiveGeneration, GenerationSpec, MAX_GENERATION_BYTES,
 };
@@ -191,6 +192,15 @@ pub(crate) async fn context(
     config: &DownloadConfig,
     controls: DownloadControls,
 ) -> Result<Option<SelectionContext>> {
+    context_for_format(passes, config, controls, generation_format()).await
+}
+
+async fn context_for_format(
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+    format: u8,
+) -> Result<Option<SelectionContext>> {
     if !controls.run_mode.downloads_files()
         || config.retry_only
         || passes.is_empty()
@@ -201,7 +211,6 @@ pub(crate) async fn context(
     {
         return Ok(None);
     }
-    let format = generation_format();
     let mut qualified = None;
     let mut profile = Vec::new();
     for pass in passes {
@@ -1798,4 +1807,142 @@ pub(super) async fn after_delta(
         }
     }
     Ok(selected)
+}
+
+/// Acknowledge only an already published, operation-bound output. No writer runs.
+pub(super) async fn finish_prepared(
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+    cancel: &CancellationToken,
+) -> Result<usize> {
+    if !controls.run_mode.downloads_files() {
+        return Ok(0);
+    }
+    let Some(context) = context_for_format(passes, config, controls, 1).await? else {
+        return prepared_remaining(passes, config).await;
+    };
+    let db = &context.capture.db;
+    let cursor_key = format!(
+        "prepared_metadata_offset:{}",
+        digest(context.scope.as_bytes())
+    );
+    let offset = db
+        .get_metadata(&cursor_key)
+        .await?
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let (pending, total) = db
+        .prepared_selection_page(
+            context.capture.owner.clone(),
+            context.scope.clone(),
+            context.config_hash.clone(),
+            offset,
+        )
+        .await?;
+    if total == 0 {
+        return Ok(0);
+    }
+    let fetched = pending.len();
+    for pending in pending {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let Ok(pending) = pending else { continue };
+        let Some((checksum, size)) = pending
+            .selection_receipt
+            .as_ref()
+            .and_then(|r| r.prepared.as_ref())
+        else {
+            continue;
+        };
+        let Some(path) = pending.asset.local_path.as_deref() else {
+            continue;
+        };
+        let Ok(_guard) = crate::download::file::lock_download_destination(path, cancel).await
+        else {
+            continue;
+        };
+        if db.guard_primary_writer(path).await.is_err() {
+            continue;
+        }
+        let Ok(Some(file)) =
+            crate::download::file::retain_pending_file(&config.directory, path).await
+        else {
+            continue;
+        };
+        if file.fingerprint.size != *size
+            || data_encoding::HEXLOWER.encode(&file.fingerprint.sha256) != *checksum
+        {
+            continue;
+        }
+        if file.validate_blocking().is_err() {
+            continue;
+        }
+        let _finished = db
+            .finish_metadata_rewrite_checked(
+                &pending,
+                crate::state::db::MetadataRewriteQueue::Ordinary,
+                Some(checksum),
+                pending.asset.local_checksum.as_deref(),
+                crate::state::db::MetadataRewriteCompletion::Ordinary,
+                Some(Box::new(move || {
+                    file.validate_blocking().map_err(|_changed| {
+                        crate::state::error::StateError::Invariant {
+                            operation: "finish_prepared",
+                            detail: "prepared destination changed before acknowledgement".into(),
+                        }
+                    })
+                })),
+            )
+            .await;
+    }
+    let (_, remaining) = db
+        .prepared_selection_page(context.capture.owner, context.scope, context.config_hash, 0)
+        .await?;
+    let removed = total.saturating_sub(remaining);
+    let next = (if offset < total { offset } else { 0 })
+        .saturating_add(fetched)
+        .saturating_sub(removed);
+    db.set_metadata(
+        &cursor_key,
+        &if next < remaining {
+            next.to_string()
+        } else {
+            "0".into()
+        },
+    )
+    .await?;
+    Ok(remaining)
+}
+
+/// Reporting is scope-bound even when current settings prohibit acknowledgement.
+pub(super) async fn prepared_remaining(
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+) -> Result<usize> {
+    let mut scopes = std::collections::HashSet::new();
+    let mut remaining = 0;
+    for pass in passes {
+        let Some((capture, scope, _)) = pass.album.download_scope()? else {
+            continue;
+        };
+        if !scopes.insert(scope.clone()) {
+            continue;
+        }
+        let Some(store) = &config.state_db else {
+            continue;
+        };
+        let concrete = Arc::clone(&capture.db) as Arc<dyn super::models::DownloadStore>;
+        anyhow::ensure!(
+            Arc::ptr_eq(store, &concrete),
+            "Selection database context mismatch"
+        );
+        remaining += capture
+            .db
+            .prepared_selection_page(capture.owner, scope, String::new(), 0)
+            .await?
+            .1;
+    }
+    Ok(remaining)
 }

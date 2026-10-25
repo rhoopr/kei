@@ -22,6 +22,7 @@ use crate::state::{AssetRecord, error::StateError};
 
 mod pending_path_cache;
 mod retirement;
+pub(super) use retirement::advance_completed_receipt;
 
 #[cfg(test)]
 pub(crate) use retirement::take_legacy_compaction_validation_count;
@@ -2783,6 +2784,23 @@ pub(super) fn finish_metadata_receipt(
             })
             .ok_or(StateError::ProviderSelectionInvalid)?;
         refresh_progress_hash(conn, &root, &manifest, destination)?;
+        if complete
+            && receipt
+                .prepared
+                .as_ref()
+                .is_some_and(|(output, _)| Some(output.as_str()) == local)
+        {
+            let completed = retirement::receipt(conn, &root, &manifest, destination)?;
+            super::download_receipts::save_prepared_rewrite(
+                conn,
+                &completed,
+                pending
+                    .asset
+                    .local_checksum
+                    .as_deref()
+                    .ok_or(StateError::ProviderSelectionInvalid)?,
+            )?;
+        }
     }
     if changed > 0 && (complete || local != pending.asset.local_checksum.as_deref()) {
         // A single physical write can satisfy multiple passes only when every
@@ -2848,6 +2866,23 @@ pub(super) fn finish_metadata_receipt(
                 })
                 .ok_or(StateError::ProviderSelectionInvalid)?;
             refresh_progress_hash(conn, &alias_root, &alias, destination)?;
+            if complete
+                && receipt
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|(output, _)| Some(output.as_str()) == local)
+            {
+                let completed = retirement::receipt(conn, &alias_root, &alias, destination)?;
+                super::download_receipts::save_prepared_rewrite(
+                    conn,
+                    &completed,
+                    pending
+                        .asset
+                        .local_checksum
+                        .as_deref()
+                        .ok_or(StateError::ProviderSelectionInvalid)?,
+                )?;
+            }
         }
     }
     Ok(Some(changed > 0 && complete))

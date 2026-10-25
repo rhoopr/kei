@@ -53,3 +53,6 @@ pub(crate) struct SyncArgs {
     /// Whether startup detected a terminal on stdin.
     pub input_mode: crate::InputMode,
 }
+
+#[cfg(all(test, feature = "xmp"))]
+pub(crate) use test_support::run_prepared_fixture_cycle;
