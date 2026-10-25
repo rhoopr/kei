@@ -650,6 +650,17 @@ async fn build_recent_frontier(
 /// enumeration bound.  Capture offsets can move the local midnight by almost
 /// a day, so stopping at the unadjusted UTC midnight could omit valid assets.
 fn enumeration_created_lower_bound(config: &DownloadConfig) -> Option<DateTime<Utc>> {
+    // The current ledger's initial/configuration comparison accounts for the
+    // complete inventory, including explicitly date-excluded assets. Stopping
+    // early cannot establish that comparison. Download eligibility still uses
+    // the unchanged date filter, and the eventual cursor comes from the bridge.
+    if config
+        .selection_context
+        .as_ref()
+        .is_some_and(|context| context.uses_download_ledger())
+    {
+        return None;
+    }
     config
         .skip_created_before
         .map(crate::config::CreatedDateFilter::conservative_utc_lower_bound)

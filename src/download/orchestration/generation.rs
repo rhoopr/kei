@@ -340,6 +340,10 @@ pub(crate) struct SelectionRun {
 }
 
 impl SelectionContext {
+    pub(super) fn uses_download_ledger(&self) -> bool {
+        self.format == 2
+    }
+
     pub(in crate::download) fn exact_retry_sources(
         &self,
     ) -> Result<
