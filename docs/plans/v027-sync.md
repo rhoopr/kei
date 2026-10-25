@@ -241,8 +241,9 @@ change; a test-only export supplies the real retained-work configuration hash.
 Remaining evidence and implementation gaps:
 - Independently review the now-tested optional legacy-compaction isolation and
   cross-parent adoption simplification at the final candidate head.
-- Address the measured per-match pending-destination scan with a narrowly scoped
-  ownership-preserving optimization, then rerun the scale fixture.
+- Qualify remaining pending-count scaling in an optimized build; the path-specific
+  lookup now avoids full validation of unrelated provider obligations but still
+  hashes their saved manifests.
 - Finish obsolete state-API removal and required lint/feature/platform checks;
   classify relevant broad failures without restoring removed contracts.
 - Checkpoint a clean final candidate and perform exact-head acceptance and full
@@ -297,6 +298,44 @@ regression fixture uses 0/10/100 items without a flaky timing assertion.
 Next bounded option: select potential conflicting destinations before loading
 their manifests, while preserving canonical/native path collision semantics and
 transactional ownership checks. Do not simply filter on the serialized path key
-or cache away the commit-time guard. This optimization has not been implemented.
+or cache away the commit-time guard. The following checkpoint implements this conservative path-specific filtering.
 Full final lint, feature/platform gates and exact-head independent review remain
 outstanding. No live validation or publication was repeated in this unit.
+
+
+### Path-specific reservation lookup
+
+Compact receipt reuse now asks for possible owners of its destination inside the
+existing transaction. The filter checks each pending manifest's saved hash,
+extracts its path declarations without decoding unrelated provider response byte
+arrays, and checks those declarations against the destination table. Unknown,
+malformed, noncanonical or contradictory path evidence fails closed. Exclusion
+does not certify unrelated provider content, complete work or retire evidence.
+Possible collisions still use the original full root, provider, row and scope
+validation.
+
+The filter uses the same native/case/AM-PM collision key as the final ownership
+check. It deliberately does not filter by library or configuration: an older
+configuration or another library may still own the physical destination. No
+schema, durable index, queue or cache was added. Existing all-reservation readers
+remain unchanged. Tests cover case, dot and AM/PM aliases, non-UTF-8 paths,
+contradictory destination rows, damaged manifest hashes, malformed matching
+provider evidence, and ownership after a configuration change and reopen.
+
+Paired timings exercise both readers against the same 0/10/100-item fixture in
+the same debug binary. They measure helper work, not full sync or production
+latency. There is no cached release build, so optimized-build qualification is
+deferred rather than launching an unrelated full release build. The algorithm
+still scans and hashes pending manifests per reuse; this bounded change does not
+remove that scaling term. Before considering an authenticated path summary or a
+cache with transaction invalidation, measure the optimized build and review
+whether those larger changes are justified.
+
+Final standalone paired debug measurements (ten calls each):
+- 0 pending: full reader 1.368 ms; path-specific reader 1.055 ms.
+- 10 pending: full reader 264.252 ms; path-specific reader 157.972 ms.
+- 100 pending: full reader 2,849.692 ms; path-specific reader 1,428.930 ms.
+
+The affected v027 acceptance slice passed 110 tests with four explicit probes or
+subprocess workers ignored. Formatting and diff checks passed. This is focused
+qualification, not final broad lint/platform validation or independent PR review.

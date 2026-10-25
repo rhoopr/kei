@@ -1777,5 +1777,170 @@ async fn v027_pending_reservation_reader_cost_with_unrelated_blocked_work() {
             "measured reservation reader: pending={count}, calls=10, elapsed_us={}",
             started.elapsed().as_micros()
         );
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            let conn = db
+                .acquire_lock("measure path-specific pending reservations")
+                .unwrap();
+            assert!(
+                crate::state::db::provider_generations::pending_destination_reservations_for_path(
+                    &conn,
+                    &dir.path().join("unrelated.JPG")
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+        eprintln!(
+            "measured path-specific reservation reader: pending={count}, calls=10, elapsed_us={}",
+            started.elapsed().as_micros()
+        );
     }
+}
+
+#[tokio::test]
+async fn v027_path_lookup_keeps_collision_aliases_and_rejects_uncertain_projections() {
+    use crate::state::db::provider_generations::pending_destination_reservations_for_path;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open_owned(&db_path, &owner()).await.unwrap());
+    let root = db
+        .begin_selection_generation(owner(), spec(), BUDGET)
+        .await
+        .unwrap();
+    let (manifest, tasks, _) = admission(
+        &db,
+        &root.id,
+        &dir.path().join("media 1.30 PM"),
+        0,
+        true,
+        BUDGET,
+    )
+    .await;
+    let path = &tasks[0].download_path;
+    let original = serde_json::to_vec(&manifest).unwrap();
+    {
+        let conn = db
+            .acquire_lock("collision equivalence and damaged projection controls")
+            .unwrap();
+        for alias in [
+            path.to_path_buf(),
+            path.parent()
+                .unwrap()
+                .join(".")
+                .join(path.file_name().unwrap()),
+            std::path::PathBuf::from(path.to_str().unwrap().to_uppercase()),
+            std::path::PathBuf::from(path.to_str().unwrap().replace(" PM", " PM")),
+            std::path::PathBuf::from(path.to_str().unwrap().replace(" PM", "PM")),
+        ] {
+            assert!(
+                !pending_destination_reservations_for_path(&conn, &alias)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(
+            pending_destination_reservations_for_path(&conn, &dir.path().join("unrelated"))
+                .unwrap()
+                .is_empty()
+        );
+        // A missing/mutated summary cannot hide a saved manifest destination.
+        conn.execute_batch("SAVEPOINT damaged_path").unwrap();
+        conn.execute(
+            "UPDATE provider_active_destinations SET path='{}' WHERE generation=?1",
+            [&root.id],
+        )
+        .unwrap();
+        assert!(pending_destination_reservations_for_path(&conn, path).is_err());
+        assert!(
+            pending_destination_reservations_for_path(&conn, &dir.path().join("unrelated"))
+                .is_err()
+        );
+        conn.execute_batch("ROLLBACK TO damaged_path; RELEASE damaged_path")
+            .unwrap();
+        // Even an unrelated manifest must be hash-checked before excluding it.
+        conn.execute_batch("SAVEPOINT damaged_manifest").unwrap();
+        conn.execute(
+            "UPDATE provider_active_decisions SET manifest_hash='invalid' WHERE generation=?1",
+            [&root.id],
+        )
+        .unwrap();
+        assert!(
+            pending_destination_reservations_for_path(&conn, &dir.path().join("unrelated"))
+                .is_err()
+        );
+        conn.execute_batch("ROLLBACK TO damaged_manifest; RELEASE damaged_manifest")
+            .unwrap();
+        // A matching candidate still requires the original complete validation.
+        conn.execute_batch("SAVEPOINT damaged_body").unwrap();
+        let mut damaged = manifest.clone();
+        damaged.decision.confirmation = Some(b"{}".to_vec());
+        let bytes = serde_json::to_vec(&damaged).unwrap();
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        conn.execute(
+            "UPDATE provider_active_decisions SET manifest=?2,manifest_hash=?3 WHERE generation=?1",
+            rusqlite::params![root.id, bytes, hash],
+        )
+        .unwrap();
+        assert!(pending_destination_reservations_for_path(&conn, path).is_err());
+        conn.execute_batch("ROLLBACK TO damaged_body; RELEASE damaged_body")
+            .unwrap();
+        let retained: Vec<u8> = conn
+            .query_row(
+                "SELECT manifest FROM provider_active_decisions WHERE generation=?1",
+                [&root.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, original);
+    }
+    let mut changed = spec();
+    changed.config_hash = "c".repeat(64);
+    db.begin_selection_generation(owner(), changed, BUDGET)
+        .await
+        .unwrap();
+    drop(db);
+    let reopened = SqliteStateDb::open_owned(&db_path, &owner()).await.unwrap();
+    let conn = reopened
+        .acquire_lock("pending ownership survives reopen")
+        .unwrap();
+    assert!(
+        !pending_destination_reservations_for_path(&conn, path)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(tasks.iter().all(|task| !task.download_path.exists()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn v027_path_lookup_keeps_native_non_utf8_collision_owners() {
+    use crate::state::db::provider_generations::pending_destination_reservations_for_path;
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    let root = db
+        .begin_selection_generation(owner(), spec(), BUDGET)
+        .await
+        .unwrap();
+    let media = dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"media-\xff".to_vec()));
+    let (_, tasks, _) = admission(&db, &root.id, &media, 0, false, BUDGET).await;
+    let conn = db.acquire_lock("native path lookup").unwrap();
+    assert_eq!(
+        pending_destination_reservations_for_path(&conn, &tasks[0].download_path)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        pending_destination_reservations_for_path(&conn, &dir.path().join("other"))
+            .unwrap()
+            .is_empty()
+    );
 }

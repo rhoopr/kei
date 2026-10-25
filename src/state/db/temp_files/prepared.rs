@@ -133,7 +133,7 @@ impl SqliteStateDb {
                     receipt.provider_checksum,i64::try_from(receipt.provider_size).map_err(|_redacted_error|invalid())?],
                 |row|row.get(0))?;
             if foreign {return Err(invalid());}
-            for reservation in super::super::provider_generations::pending_destination_reservations(&tx)? {
+            for reservation in super::super::provider_generations::pending_destination_reservations_for_path(&tx, &path)? {
                 if super::super::primary_layout::path_key(&reservation.destination_path)?==chosen
                     && (reservation.library.as_ref()!=receipt.library
                         || reservation.asset_id.as_ref()!=receipt.state_id

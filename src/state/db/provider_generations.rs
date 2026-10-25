@@ -2153,6 +2153,91 @@ fn validate_identity_decisions(
 pub(super) fn pending_destination_reservations(
     conn: &Connection,
 ) -> Result<Vec<super::ReconciliationReservation>, StateError> {
+    pending_reservations(conn, None)
+}
+
+/// Exclude only destinations proven disjoint by the hash-checked saved manifest.
+/// Candidate ownership is still fully validated by the ordinary reader below.
+/// No configuration/library filter is safe here: another scope can own this path.
+pub(crate) fn pending_destination_reservations_for_path(
+    conn: &Connection,
+    path: &Path,
+) -> Result<Vec<super::ReconciliationReservation>, StateError> {
+    let chosen = super::primary_layout::path_key(path)?;
+    pending_reservations(conn, Some(&chosen))
+}
+
+fn pending_manifest_may_collide(
+    conn: &Connection,
+    generation: &str,
+    key: &str,
+    child: &str,
+    chosen: &str,
+) -> Result<bool, StateError> {
+    let (length, hash): (i64, String) = conn.query_row(
+        "SELECT length(manifest),manifest_hash FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+        params![generation,key,child], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    if usize::try_from(length).map_or(true, |length| length > MAX_CHUNK_BYTES) {
+        return invalid();
+    }
+    let bytes: Vec<u8> = conn.query_row(
+        "SELECT manifest FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+        params![generation,key,child], |row| row.get(0))?;
+    if digest(&bytes) != hash {
+        return invalid();
+    }
+    // The hash binds the complete saved evidence, but exclusion only needs
+    // destination declarations. Skip decoding unrelated provider byte arrays;
+    // possible collisions still receive full typed/provider validation.
+    #[derive(Deserialize)]
+    struct ManifestPaths {
+        decision: DecisionPaths,
+    }
+    #[derive(Deserialize)]
+    struct DecisionPaths {
+        pass_key: String,
+        child: String,
+        outcome: SelectionOutcome,
+        destinations: Vec<SelectionDestination>,
+    }
+    let manifest: ManifestPaths =
+        serde_json::from_slice(&bytes).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+    if manifest.decision.pass_key != key
+        || manifest.decision.child != child
+        || manifest.decision.outcome != SelectionOutcome::Selected
+        || manifest.decision.destinations.is_empty()
+    {
+        return invalid();
+    }
+    let mut declared = HashSet::new();
+    let mut collision = false;
+    for destination in &manifest.decision.destinations {
+        let path = destination.path.to_path();
+        if super::provider_selection::SelectionPath::from_path(&path) != destination.path {
+            return invalid();
+        }
+        crate::fs_util::confined_path_key(&path)
+            .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+        collision |= super::primary_layout::path_key(&path)? == chosen;
+        if !declared.insert((destination.version_size.clone(), destination.path.key()?)) {
+            return invalid();
+        }
+    }
+    // Never trust a damaged destination projection to hide a manifest owner.
+    let saved: HashSet<(String,String)> = conn.prepare(
+        "SELECT version_size,path FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3")?
+        .query_map(params![generation,key,child], |row| Ok((row.get(0)?,row.get(1)?)))?
+        .collect::<Result<_,_>>()?;
+    if saved != declared {
+        return invalid();
+    }
+    Ok(collision)
+}
+
+fn pending_reservations(
+    conn: &Connection,
+    chosen: Option<&str>,
+) -> Result<Vec<super::ReconciliationReservation>, StateError> {
     let mut query = conn.prepare(
         "SELECT DISTINCT w.generation,w.pass_key,w.child
          FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation
@@ -2171,6 +2256,11 @@ pub(super) fn pending_destination_reservations(
         .collect::<Result<Vec<_>, _>>()?;
     let mut reservations = Vec::new();
     for (generation, key, child) in keys {
+        if let Some(chosen) = chosen
+            && !pending_manifest_may_collide(conn, &generation, &key, &child, chosen)?
+        {
+            continue;
+        }
         let root = load_generation(conn, &generation)?;
         let manifest = load_decision(conn, &root, &key, &child)?;
         let library = root
