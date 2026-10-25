@@ -457,3 +457,77 @@ async fn baseline_stream_enabled_metadata_writers_preserve_existing_media_and_si
 mod album_tests;
 
 mod provider_signature;
+
+#[tokio::test]
+async fn baseline_stream_uncertain_still_and_downloaded_motion_reports_partial() {
+    let server = crate::start_wiremock_or_skip!();
+    mount(&server, 1).await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("photos");
+    let media = root.join("IMG_0001.JPG");
+    let db_path = directory.path().join("state.db");
+    seed(&db_path, &media).await;
+    let mut changed = STILL.to_vec();
+    *changed.last_mut().unwrap() ^= 1;
+    std::fs::write(&media, &changed).unwrap();
+    let before = old_rows(&db_path);
+    let mtime = std::fs::metadata(&media).unwrap().modified().unwrap();
+    for cycle in 0..2 {
+        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let preview = run(
+            &root,
+            db.clone(),
+            vec![asset(&server, true)],
+            DownloadRunMode::PrintFilenames,
+        )
+        .await;
+        assert_eq!(preview.printed_filenames.len(), usize::from(cycle == 0));
+        assert_eq!(old_rows(&db_path), before);
+        let result = run(
+            &root,
+            db,
+            vec![asset(&server, true)],
+            DownloadRunMode::Download,
+        )
+        .await;
+        assert_eq!(result.downloaded, usize::from(cycle == 0));
+        assert!(result.failed.is_empty());
+        assert_eq!(result.state_write_failures, 0);
+        assert_eq!(
+            result.skip_summary.uncertain, 1,
+            "cycle {cycle}: {result:?}"
+        );
+        // Despite its historical name this helper passes the complete result to
+        // build_download_outcome; no failed tasks means it performs no retry I/O.
+        let (outcome, stats) =
+            crate::download::pipeline::test_support::build_zero_download_outcome(
+                result,
+                DownloadControls::download_hidden(),
+            )
+            .await;
+        assert!(matches!(
+            outcome,
+            crate::download::DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert_eq!(stats.skipped.uncertain, 1);
+        assert!(!stats.sync_token_blocked);
+        let rows = current_rows(&db_path);
+        assert!(
+            rows.iter()
+                .any(|row| row.0 == "original" && row.1 == "pending")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.0 == VersionSizeKey::LiveOriginal.as_str() && row.1 == "downloaded")
+        );
+        assert_eq!(std::fs::read(&media).unwrap(), changed);
+        assert_eq!(
+            std::fs::metadata(&media).unwrap().modified().unwrap(),
+            mtime
+        );
+        assert_eq!(old_rows(&db_path), before);
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/motion");
+}

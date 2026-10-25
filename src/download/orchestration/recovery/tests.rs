@@ -2257,3 +2257,156 @@ async fn hidden_invalid_capture_date_preserves_pending_recovery() {
         }
     }
 }
+
+#[tokio::test]
+async fn v027_targeted_mixed_renditions_keep_uncertainty_visible_after_reopen() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    #[derive(Clone)]
+    struct SelectedRetrySession(PendingLookupSession);
+    #[async_trait::async_trait]
+    impl PhotosSession for SelectedRetrySession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/internal/records/query/batch") {
+                return Ok(json!({"batch":[{"records":[{"fields":{"itemCount":{"value":1}}}]}]}));
+            }
+            self.0.post(url, body, headers).await
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+    let server = crate::start_wiremock_or_skip!();
+    let still = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    let motion = include_bytes!("../../../../tests/data/media/pattern.mov");
+    Mock::given(method("GET"))
+        .and(path("/motion"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(motion.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/still"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(still.to_vec()))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let mut records = incremental_photo_records_with_url(
+        "mixed",
+        "mixed.JPG",
+        &format!("{}/still", server.uri()),
+        still.len() as u64,
+    );
+    records[0]["fields"]["resOriginalVidComplRes"] = json!({"value":{
+        "downloadURL":format!("{}/motion",server.uri()),
+        "size":motion.len(),"fileChecksum":data_encoding::BASE64.encode(&[0x72; 21])}});
+    records[0]["fields"]["resOriginalVidComplFileType"] =
+        json!({"value":"com.apple.quicktime-movie"});
+    let asset = PhotoAsset::new(records[0].clone(), records[1].clone())
+        .with_state_record_name(Arc::from("asset-mixed"));
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("state.db");
+    let root = dir.path().join("media");
+    let mut config = test_config();
+    config.directory = Arc::from(root.as_path());
+    config.folder_structure = "none".into();
+    config.folder_structure_albums = Arc::from("{album}");
+    let paths = filter::derive_expected_paths(&asset, &config);
+    assert_eq!(paths.len(), 2);
+    let still_path = paths
+        .iter()
+        .find(|p| p.version_size == VersionSizeKey::Original)
+        .unwrap()
+        .path
+        .clone();
+    std::fs::create_dir_all(still_path.parent().unwrap()).unwrap();
+    let mut changed = still.to_vec();
+    *changed.last_mut().unwrap() ^= 1;
+    std::fs::write(&still_path, &changed).unwrap();
+    let before_mtime = std::fs::metadata(&still_path).unwrap().modified().unwrap();
+    {
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        for p in &paths {
+            db.upsert_seen(
+                &TestAssetRecord::new(asset.state_id())
+                    .filename("mixed.JPG")
+                    .checksum(&p.checksum)
+                    .size(p.size)
+                    .version_size(p.version_size)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        }
+        db.upsert_asset_master_mapping("PrimarySync", asset.asset_record_name(), asset.id())
+            .await
+            .unwrap();
+    }
+    let mut passes = vec![AlbumPass {
+        kind: PassKind::Unfiled,
+        album: album_with_session(
+            "PrimarySync",
+            "",
+            Box::new(PendingLookupSession {
+                records: Arc::new(records.clone()),
+            }),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    }];
+    // A later selected pass renders another missing destination. It must
+    // not turn an uncertain rendition into a duplicate transfer.
+    passes.push(AlbumPass {
+        kind: PassKind::Album,
+        album: album_with_session(
+            "PrimarySync",
+            "Other",
+            Box::new(SelectedRetrySession(PendingLookupSession {
+                records: Arc::new(records),
+            })),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    });
+    for cycle in 0..3 {
+        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        config.state_db = Some(db.clone());
+        let result = super::run_targeted_recovery_pass(
+            &Client::new(),
+            &passes,
+            &Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.stats.downloaded,
+            usize::from(cycle == 0),
+            "{result:?}"
+        );
+        assert!(
+            matches!(
+                result.outcome,
+                DownloadOutcome::PartialFailure { failed_count: 1 }
+            ),
+            "{result:?}"
+        );
+        assert!(!result.checkpoint.sync_token_blocked);
+        assert_eq!(result.checkpoint.state_write_failures, 0);
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].version_size, VersionSizeKey::Original);
+        assert_eq!(db.get_downloaded_page(0, 10).await.unwrap().len(), 1);
+        assert_eq!(std::fs::read(&still_path).unwrap(), changed);
+        assert_eq!(
+            std::fs::metadata(&still_path).unwrap().modified().unwrap(),
+            before_mtime
+        );
+        config.state_db = None;
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}

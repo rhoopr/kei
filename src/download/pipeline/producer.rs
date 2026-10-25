@@ -103,7 +103,8 @@ enum AssetDisposition {
 
 /// Breakdown of assets skipped during the producer phase.
 ///
-/// Every asset from the API stream must be accounted for: either it ends up
+/// Uncertainty may overlap a forwarded sibling rendition. Otherwise every
+/// asset from the API stream must be accounted for: either it ends up
 /// in one of these skip buckets, gets sent for download (showing up in
 /// `downloaded` / `failed`), or was an enumeration error.
 #[derive(Debug, Default, Clone)]
@@ -835,6 +836,7 @@ where
                         producer_pb.inc(1);
                     } else {
                         let mut disposition = AssetDisposition::Unresolved;
+                        let mut uncertain_rendition = false;
 
                         for (mut task, existing_match) in
                             plan.tasks.into_iter().zip(existing_matches)
@@ -906,6 +908,7 @@ where
                                         Err(error) => {
                                             state_write_failures_producer
                                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            uncertain_rendition = true;
                                             disposition =
                                                 disposition.max(AssetDisposition::Uncertain);
                                             tracing::warn!(%error, "Existing-file receipt remains pending");
@@ -913,6 +916,7 @@ where
                                     }
                                 }
                                 crate::download::baseline_matching::BaselineMatch::Uncertain => {
+                                    uncertain_rendition = true;
                                     disposition = disposition.max(AssetDisposition::Uncertain);
                                     let retained = if let Some(db) = &producer_state_db {
                                         db.defer_baseline_match(&planner::pending_record_for_task(
@@ -944,6 +948,7 @@ where
                                     {
                                         state_write_failures_producer
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        uncertain_rendition = true;
                                         disposition = disposition.max(AssetDisposition::Uncertain);
                                         continue;
                                     }
@@ -959,10 +964,15 @@ where
                             }
                         }
 
+                        // Uncertainty is independent of a healthy sibling being
+                        // forwarded; count it once per asset, not per rendition.
+                        if uncertain_rendition {
+                            skips.uncertain += 1;
+                        }
                         match disposition {
                             AssetDisposition::Forwarded => assets_forwarded += 1,
                             AssetDisposition::OnDisk => skips.on_disk += 1,
-                            AssetDisposition::Uncertain => skips.uncertain += 1,
+                            AssetDisposition::Uncertain => {}
                             AssetDisposition::RetryExhausted => skips.retry_exhausted += 1,
                             AssetDisposition::RetryOnly => skips.retry_only += 1,
                             AssetDisposition::Unresolved => {

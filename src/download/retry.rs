@@ -249,6 +249,7 @@ impl PendingRetryPlanning<'_> {
         let mut malformed_targets = FxHashSet::default();
         let mut state_write_failed_targets = FxHashSet::default();
         let mut retained_targets = FxHashSet::default();
+        let mut uncertain_targets = FxHashSet::default();
         let mut filter_reasons = Vec::<filter::FilterReason>::new();
         for (pass_index, pass_config) in self.pass_configs.iter().enumerate() {
             let mut authorized_repairs = FxHashMap::default();
@@ -366,9 +367,10 @@ impl PendingRetryPlanning<'_> {
                                         ))
                                         .await?;
                                 }
-                                // Remove only this invocation's transfer candidate. The ordinary
-                                // pending row and verification reason remain for a quiet cycle.
-                                self.pending_targets.remove(&target);
+                                // Keep uncertainty in the returned unresolved plan, but
+                                // exclude it from transfers and policy retirement. A healthy
+                                // sibling must not turn this invocation into false success.
+                                uncertain_targets.insert(target.clone());
                                 tracing::warn!(
                                     "Existing retry file match remains uncertain; pending work retained"
                                 );
@@ -420,6 +422,7 @@ impl PendingRetryPlanning<'_> {
                 self.pending_targets
                     .contains(&PendingRetryTarget::from_task(task))
                     && !state_write_failed_targets.contains(&PendingRetryTarget::from_task(task))
+                    && !uncertain_targets.contains(&PendingRetryTarget::from_task(task))
             }) {
                 let target = PendingRetryTarget::from_task(&task);
                 if let Some(expected) = authorized_repairs.get(&target) {
@@ -571,6 +574,7 @@ impl PendingRetryPlanning<'_> {
                 !malformed_targets.contains(*target)
                     && !state_write_failed_targets.contains(*target)
                     && !retained_targets.contains(*target)
+                    && !uncertain_targets.contains(*target)
             })
             .cloned()
             .collect();
