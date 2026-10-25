@@ -24,6 +24,15 @@ fn config_hash(config: &DownloadConfig, zone: &serde_json::Value) -> String {
     format!("{:x}", Sha256::digest(value.to_string().as_bytes()))
 }
 
+/// Seed upgrade fixtures with the real retained-work fingerprint.
+#[cfg(test)]
+pub(crate) fn retained_work_config_hash_for_test(
+    config: &DownloadConfig,
+    zone: &serde_json::Value,
+) -> String {
+    config_hash(config, zone)
+}
+
 struct WorkContext {
     capture: crate::icloud::photos::inbox::ShadowCapture,
     scope: String,

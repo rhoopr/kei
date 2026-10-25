@@ -229,9 +229,16 @@ uncommitted compaction/adoption edits, so it is not clean final-head evidence.
 Live validation was not repeated because this slice changed local retry
 accounting rather than provider transport or content comparison.
 
+The subsequent two-library normal-cycle proof passes in both processing orders
+through a baseline and two reopened incremental cycles. A malformed due source
+preserves its exact retry, raw bytes and zone cursor; the healthy library
+downloads once, advances its own zone cursor, and performs no later inventory
+or media transfer. Existing file bytes and timestamps stay unchanged. The
+database-wide cursor remains conservatively held while one library is blocked.
+The three adjacent raw-replay tests pass. This proof required no runtime behavior
+change; a test-only export supplies the real retained-work configuration hash.
+
 Remaining evidence and implementation gaps:
-- A simultaneous healthy/blocked two-library normal-cycle acceptance test for
-  the selected-scope startup change.
 - Finish and independently validate the preserved optional legacy-compaction
   isolation changes, including malformed old roots and bounded capacity relief.
 - Measure the per-match pending-destination scan before a targeted scale fix.

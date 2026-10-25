@@ -204,3 +204,5 @@ async fn v027_dependent_malformed_raw_history_preserves_retry_and_cursor_across_
         assert_eq!(counts, (1, 1, 0));
     }
 }
+
+mod two_library;

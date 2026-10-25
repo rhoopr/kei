@@ -48,6 +48,8 @@ pub(crate) use orchestration::models::{
 pub use orchestration::models::{
     DownloadOutcome, FullEnumerationReason, SkipBreakdown, SyncMode, SyncResult, SyncStats,
 };
+#[cfg(test)]
+pub(crate) use orchestration::queue_projection::retained_work_config_hash_for_test;
 pub(crate) use orchestration::queue_projection::{has_due_retained_work, prepare_retained_sources};
 pub(crate) use orchestration::recent::requires_recovery as recent_selection_requires_recovery;
 pub(crate) use orchestration::reconciliation::recover_recorded_sources;
