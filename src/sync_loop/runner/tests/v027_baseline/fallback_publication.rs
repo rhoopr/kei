@@ -531,9 +531,23 @@ async fn run_cross_zone_case(
                 .await
                 .unwrap(),
         );
+        let mut current_records = records.clone();
+        if CHANGED_MASTER.try_with(|enabled| *enabled).unwrap_or(false) && cycle > 0 {
+            for record in &mut current_records {
+                if record["zoneID"]["zoneName"] == SOURCE {
+                    if record["recordType"] == "CPLMaster" {
+                        record["recordName"] = json!("shared-updated");
+                    }
+                    if record["recordType"] == "CPLAsset" {
+                        record["fields"]["masterRef"]["value"]["recordName"] =
+                            json!("shared-updated");
+                    }
+                }
+            }
+        }
         let base_session = CrossZoneSession {
             cycle,
-            records: Arc::new(records.clone()),
+            records: Arc::new(current_records),
             requests: Arc::default(),
         };
         let requests = Arc::clone(&base_session.requests);
@@ -953,4 +967,12 @@ async fn owner_rank_omission_recovers_without_cross_source_witness() {
             .iter()
             .any(|(_, body)| body["zoneID"]["zoneName"] == SOURCE)
     );
+}
+
+tokio::task_local! { static CHANGED_MASTER: bool; }
+#[tokio::test]
+async fn changed_master_two_albums_keep_completed_destination() {
+    CHANGED_MASTER
+        .scope(true, run_cross_zone_case(false, false, None))
+        .await;
 }

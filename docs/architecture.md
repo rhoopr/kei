@@ -343,6 +343,27 @@ for operator steps and compatibility limits.
 
 ### Normal v0.27 download ledger
 
+Current retry confirms the same authenticated child and source before following
+an updated master reference. If selected unfinished renditions still exist, one
+SQLite transaction transfers their original destination reservations to a
+successor decision. Retained and current provider rendition keys come from the
+existing RAW selection policy; resource comparisons never alias Original and
+Alternative. New selected renditions, missing required renditions, or changed
+completed content remain visible pending work rather than authorizing a rewrite.
+Metadata-only changes do not impose a historical repair prerequisite.
+Completed destinations keep their original master, provider
+proof and download receipts. The predecessor is resealed only after its saved
+seal and dependent proofs have been validated. No provider checkpoint is created
+by this transfer. Replay uses the successor's destination subset and reloads
+reservations before publishing through the existing no-overwrite writer.
+
+Prepared publications, unfinished metadata writes, conflicting path owners and
+legacy state aliases prevent transfer. Expected refusal retains the original
+work for independent retry; it does not settle the obligation or authorize a
+new path. Other current format-2 passes retain their own proof and selection
+checks. Capacity is checked against the committed split after ordinary completed
+proof compaction, with rollback preserving the original owners on failure.
+
 Owned passes use source-scoped format-2 records in
 `provider_active_decisions` and `provider_active_destinations`. Each observation
 has validated provider identity/rendition facts and is excluded, completed, or

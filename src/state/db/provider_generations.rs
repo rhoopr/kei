@@ -21,6 +21,7 @@ use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
 
 mod pending_path_cache;
+mod reference_refresh;
 mod retirement;
 mod selector_binding;
 pub(super) use retirement::advance_completed_receipt;
@@ -472,7 +473,7 @@ fn charge(conn: &Connection, additional: u64, capacity: u64, format: u8) -> Resu
           +COALESCE((SELECT SUM(d.charged_bytes) FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE d.compacted_hash IS NULL AND json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)",
           [format],|r|r.get(0))?;
         let used = u64::try_from(used).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
-        if additional <= capacity.saturating_sub(used) {
+        if used <= capacity && additional <= capacity - used {
             return Ok(());
         }
         if format != 2 || conn.is_autocommit() || retirement::compact_batch(conn, None, 2)? == 0 {
@@ -1392,6 +1393,49 @@ fn observed_asset(
     Ok(observed)
 }
 
+fn decision_charge(root: &ActiveGeneration, manifest: &ActiveDecision) -> Result<u64, StateError> {
+    let bytes = encode(manifest)?;
+    let generation = &root.id;
+    let d = &manifest.decision;
+    u64::try_from(
+        bytes.len()
+            + manifest
+                .sources
+                .iter()
+                .map(|s| s.page_id.len() + generation.len() + d.pass_key.len() + d.child.len() + 16)
+                .sum::<usize>()
+            + d.destinations
+                .iter()
+                .map(|destination| {
+                    destination.path.key().map(|path| {
+                        path.len()
+                            + destination.path.to_path().to_string_lossy().len()
+                            + destination.checksum.len()
+                            + destination.metadata_hash.len()
+                            + generation.len()
+                            + d.pass_key.len()
+                            + d.child.len()
+                            + manifest.state_id.len()
+                            + destination.version_size.len()
+                            + d.master.as_ref().map_or(0, String::len)
+                            + root
+                                .spec
+                                .zone
+                                .get("zoneName")
+                                .and_then(Value::as_str)
+                                .map_or(0, str::len)
+                            + 1024
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .sum::<usize>()
+            + encode(&(&d.pass_key, &d.child))?.len()
+            + 256,
+    )
+    .map_err(|_invalid| StateError::ProviderSelectionFull)
+}
+
 fn validate_records(
     root: &ActiveGeneration,
     manifest: &ActiveDecision,
@@ -1697,8 +1741,7 @@ impl SqliteStateDb {
             let admitted=d.outcome==SelectionOutcome::Selected && reason.is_empty();
             let admission=if admitted {"admitted"} else if d.outcome==SelectionOutcome::Excluded {"excluded"} else {"deferred"};
             if existing.is_none() || resolving {
-                let charged=u64::try_from(bytes.len()+manifest.sources.iter().map(|s|s.page_id.len()+generation.len()+d.pass_key.len()+d.child.len()+16).sum::<usize>()
-                    + d.destinations.iter().map(|destination|destination.path.key().map(|path|path.len()+destination.path.to_path().to_string_lossy().len()+destination.checksum.len()+destination.metadata_hash.len()+generation.len()+d.pass_key.len()+d.child.len()+manifest.state_id.len()+destination.version_size.len()+d.master.as_ref().map_or(0,String::len)+root.spec.zone.get("zoneName").and_then(Value::as_str).map_or(0,str::len)+1024)).collect::<Result<Vec<_>,_>>()?.iter().sum::<usize>()+encode(&(&d.pass_key,&d.child))?.len()+256).map_err(|_invalid|StateError::ProviderSelectionFull)?;
+                let charged=decision_charge(&root,&manifest)?;
                 charge(&tx,charged,capacity,root.spec.format)?;
                 tx.execute("INSERT INTO provider_active_decisions(generation,pass_key,child,manifest,manifest_hash,outcome,admission,reason,charged_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(generation,pass_key,child) DO UPDATE SET manifest=excluded.manifest,manifest_hash=excluded.manifest_hash,outcome=excluded.outcome,admission=excluded.admission,reason=excluded.reason,attempts=CASE WHEN excluded.admission='deferred' THEN provider_active_decisions.attempts ELSE 0 END,next_retry_at=CASE WHEN excluded.admission='deferred' THEN provider_active_decisions.next_retry_at ELSE 0 END,charged_bytes=provider_active_decisions.charged_bytes+excluded.charged_bytes",params![generation,d.pass_key,d.child,bytes,hash,outcome_name(d.outcome),admission,reason,i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?])?;
                 for source in &manifest.sources {

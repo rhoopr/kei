@@ -252,6 +252,8 @@ fn owner_snapshot(db: &SqliteStateDb) -> Vec<Vec<rusqlite::types::Value>> {
     reason = "synthetic storage measurements are test evidence"
 )]
 async fn storage_contract(fault: Fault) {
+    let refresh_fault = ASSESS_REFRESH_FAULT.try_with(|point| *point).unwrap_or(0);
+    let partial = ASSESS_PARTIAL.try_with(|enabled| *enabled).unwrap_or(false);
     let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
     let server = crate::start_wiremock_or_skip!();
     for i in 0..4 {
@@ -273,6 +275,14 @@ async fn storage_contract(fault: Fault) {
         .respond_with(ResponseTemplate::new(503))
         .mount(&server)
         .await;
+    if partial {
+        Mock::given(method("GET"))
+            .and(path("/completed-motion"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("photos");
     std::fs::create_dir(&root).unwrap();
@@ -287,8 +297,13 @@ async fn storage_contract(fault: Fault) {
     let mut published = Vec::new();
     let mut stable_pending = None;
     let mut stable_overhead = None;
-    for step in 0..if fault == Fault::None { 7 } else { 8 } {
-        let cycle = if fault != Fault::None && step >= 3 {
+    let mut completed_companion_receipt = None;
+    for step in 0..if fault == Fault::None && refresh_fault == 0 {
+        7
+    } else {
+        8
+    } {
+        let cycle = if (refresh_fault > 0 && step >= 6) || (fault != Fault::None && step >= 3) {
             step - 1
         } else {
             step
@@ -350,6 +365,22 @@ async fn storage_contract(fault: Fault) {
             ),
             88,
         );
+        if cycle >= 5
+            && ASSESS_MASTER_CHANGE
+                .try_with(|enabled| *enabled)
+                .unwrap_or(false)
+        {
+            pending[0]["recordName"] = json!("master-live-blocked-replaced");
+            pending[1]["fields"]["masterRef"]["value"]["recordName"] =
+                json!("master-live-blocked-replaced");
+        }
+        if partial {
+            pending[0]["fields"]["resOriginalVidComplRes"] = json!({"value":{
+                "downloadURL":format!("{}/completed-motion",server.uri()),
+                "size":MEDIA.len(),"fileChecksum":pending[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"]}});
+            pending[0]["fields"]["resOriginalVidComplFileType"] =
+                json!({"value":"com.apple.quicktime-movie"});
+        }
         pending[0]["fields"]["syntheticUnusedPadding"] = json!({"value":"u".repeat(8192)});
         pending[1]["fields"]["masterRef"]["value"]["zoneID"] = healthy_zone();
         records.extend(pending);
@@ -395,6 +426,28 @@ async fn storage_contract(fault: Fault) {
                 .await
                 .unwrap();
         }
+        if refresh_fault > 0 && step == 5 {
+            let sql = if refresh_fault == 1 {
+                "CREATE TRIGGER reference_fault BEFORE UPDATE OF manifest ON provider_active_decisions WHEN OLD.child='asset-live-blocked' AND NEW.manifest<>OLD.manifest BEGIN SELECT RAISE(ABORT,'reference transfer rollback'); END;"
+            } else {
+                "CREATE TRIGGER reference_fault BEFORE UPDATE OF sealed ON provider_active_generations WHEN NEW.sealed=1 AND OLD.sealed=0 AND EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=NEW.id AND child='asset-live-blocked') BEGIN SELECT RAISE(ABORT,'reference transfer rollback'); END;"
+            };
+            db.acquire_lock("install reference transaction fault")
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap();
+        }
+        if refresh_fault > 0 && step == 6 {
+            db.acquire_lock("remove reference fault after reopen")
+                .unwrap()
+                .execute_batch("DROP TRIGGER reference_fault")
+                .unwrap();
+        }
+        let prior_reference = if refresh_fault > 0 && step == 5 {
+            Some(reference_snapshot(&db))
+        } else {
+            None
+        };
         let prior_owners = owner_snapshot(&db);
         let prior_cursor = db.get_metadata(&sync_token_key(HEALTHY)).await.unwrap();
         let result = run_cycle(
@@ -408,6 +461,25 @@ async fn storage_contract(fault: Fault) {
             &CancellationToken::new(),
         )
         .await;
+        if let Some(before) = prior_reference {
+            assert!(
+                format!("{result:?} {:?}", trace.events()).contains("reference transfer rollback"),
+                "fault must reach the successor transaction"
+            );
+            let after = reference_snapshot(&db);
+            assert_eq!(
+                after.len(),
+                before.len(),
+                "rollback preserves owner row count"
+            );
+            for (index, (actual, expected)) in after.iter().zip(&before).enumerate() {
+                assert!(
+                    actual == expected,
+                    "rollback changed reference owner row {index}"
+                );
+            }
+            continue;
+        }
         if step == 2 && fault != Fault::None {
             let expected = if fault == Fault::Admission {
                 "storage admission fault"
@@ -466,6 +538,32 @@ async fn storage_contract(fault: Fault) {
             continue;
         }
         let result = result.unwrap();
+        if partial {
+            let conn = db
+                .acquire_lock("original completed companion receipt stays unchanged")
+                .unwrap();
+            let mut stmt = conn.prepare("SELECT * FROM download_receipts WHERE child='asset-live-blocked' AND master='live-blocked' ORDER BY id").unwrap();
+            let columns = stmt.column_count();
+            let receipts: Vec<Vec<rusqlite::types::Value>> = stmt
+                .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            if let Some(original) = &completed_companion_receipt {
+                assert_eq!(
+                    &receipts, original,
+                    "refresh must never relabel the completed companion receipt"
+                );
+            } else {
+                assert_eq!(
+                    receipts.len(),
+                    1,
+                    "fixture must have one completed companion and one pending rendition"
+                );
+                completed_companion_receipt = Some(receipts);
+            }
+        }
+
         assert_eq!(
             db.get_metadata(&sync_token_key(HEALTHY)).await.unwrap(),
             Some(format!("healthy-cycle-{}", cycle + 1)),
@@ -473,7 +571,7 @@ async fn storage_contract(fault: Fault) {
         );
         assert_eq!(
             result.stats.downloaded,
-            usize::from(cycle < 4 || cycle == 5)
+            usize::from(cycle < 4 || cycle == 5) + usize::from(partial && cycle == 0)
         );
         if cycle > 0 {
             assert_eq!(session.inventory.load(Ordering::SeqCst), 0);
@@ -528,10 +626,15 @@ async fn storage_contract(fault: Fault) {
         );
         assert_eq!(
             sample["receipts"],
-            json!(if cycle >= 5 { 5 } else { cycle.min(3) + 1 })
+            json!((if cycle >= 5 { 5 } else { cycle.min(3) + 1 }) + usize::from(partial))
         );
         assert!(
-            sample["compacted_rows"].as_u64().unwrap() <= if cycle >= 5 { 2 } else { 1 },
+            sample["compacted_rows"].as_u64().unwrap()
+                <= if cycle >= 5 {
+                    2 + u64::from(ASSESS_MASTER_CHANGE.try_with(|v| *v).unwrap_or(false))
+                } else {
+                    1
+                },
             "completed bookkeeping must remain bounded, including the newly resolved retry: {sample}"
         );
         let pending = (
@@ -568,7 +671,22 @@ async fn storage_contract(fault: Fault) {
         if cycle >= 2 {
             let prior = stable_overhead.unwrap();
             assert!(
-                overhead.0 <= prior.0 && overhead.1 <= prior.1,
+                overhead.0
+                    <= prior.0
+                        + if cycle >= 5 && ASSESS_MASTER_CHANGE.try_with(|v| *v).unwrap_or(false) {
+                            8192
+                        } else {
+                            0
+                        }
+                    && overhead.1
+                        <= prior.1
+                            + if cycle >= 5
+                                && ASSESS_MASTER_CHANGE.try_with(|v| *v).unwrap_or(false)
+                            {
+                                4096
+                            } else {
+                                0
+                            },
                 "distinct completed changes must not accumulate bulky manifests: {sample}"
             );
         }
@@ -581,4 +699,73 @@ async fn storage_contract(fault: Fault) {
     }
     println!("STORAGE_MEASUREMENTS {fault:?} {}", json!(measurements));
     server.verify().await;
+}
+
+tokio::task_local! { static ASSESS_MASTER_CHANGE: bool; }
+
+#[tokio::test]
+async fn pr1038_assessment_quiet_current_ledger_retry_follows_same_child_new_master() {
+    ASSESS_MASTER_CHANGE
+        .scope(true, storage_contract(Fault::None))
+        .await;
+}
+
+tokio::task_local! { static ASSESS_PARTIAL: bool; }
+#[tokio::test]
+async fn changed_master_partial_completion_keeps_completed_companion() {
+    ASSESS_PARTIAL
+        .scope(
+            true,
+            ASSESS_MASTER_CHANGE.scope(true, storage_contract(Fault::None)),
+        )
+        .await;
+}
+
+fn reference_snapshot(db: &SqliteStateDb) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn = db
+        .acquire_lock("snapshot conserved reference work")
+        .unwrap();
+    let mut out = Vec::new();
+    for sql in [
+        "SELECT id,specification,seal_hash,seal_header_hash,charged_bytes FROM provider_active_generations g WHERE EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.child='asset-live-blocked') ORDER BY id",
+        "SELECT * FROM provider_active_decisions WHERE child='asset-live-blocked' ORDER BY generation,pass_key,child",
+        "SELECT * FROM provider_active_destinations WHERE child='asset-live-blocked' ORDER BY generation,pass_key,child,version_size,path",
+        "SELECT * FROM download_receipts WHERE child='asset-live-blocked' ORDER BY id",
+        "SELECT * FROM asset_master_mappings WHERE asset_record_name='asset-live-blocked' ORDER BY library,asset_record_name",
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let n = stmt.column_count();
+        out.extend(
+            stmt.query_map([], |row| (0..n).map(|i| row.get(i)).collect())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+    }
+    out
+}
+tokio::task_local! { static ASSESS_REFRESH_FAULT: u8; }
+#[tokio::test]
+async fn changed_master_partial_transfer_rollback_reopens() {
+    ASSESS_REFRESH_FAULT
+        .scope(
+            1,
+            ASSESS_PARTIAL.scope(
+                true,
+                ASSESS_MASTER_CHANGE.scope(true, storage_contract(Fault::None)),
+            ),
+        )
+        .await;
+}
+#[tokio::test]
+async fn changed_master_partial_seal_rollback_reopens() {
+    ASSESS_REFRESH_FAULT
+        .scope(
+            2,
+            ASSESS_PARTIAL.scope(
+                true,
+                ASSESS_MASTER_CHANGE.scope(true, storage_contract(Fault::None)),
+            ),
+        )
+        .await;
 }

@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 
+tokio::task_local! { static REFERENCE_RAW: bool; }
+
 const RAW: &[u8] = b"raw fixture bytes";
 const BUDGET: u64 = 64 * 1024;
 
@@ -92,6 +94,10 @@ async fn admission_with_planner(
         values[0]["fields"]["resOriginalVidComplFileType"] =
             json!({"value":"com.apple.quicktime-movie"});
     }
+    if REFERENCE_RAW.try_get().unwrap_or(false) {
+        values[0]["fields"]["resOriginalAltRes"] = json!({"value":{"downloadURL":"https://p01.icloud-content.com/alternate.dng","size":RAW.len(),"fileChecksum":super::OLD}});
+        values[0]["fields"]["resOriginalAltFileType"] = json!({"value":"com.adobe.raw-image"});
+    }
     let body =
         serde_json::to_vec(&json!({"records":values,"synthetic_padding":"x".repeat(4*1024)}))
             .unwrap();
@@ -106,6 +112,9 @@ async fn admission_with_planner(
     config.directory = media.join(index.to_string()).into();
     config.folder_structure = "none".into();
     config.media.live_photos = companion;
+    if REFERENCE_RAW.try_get().unwrap_or(false) {
+        config.raw_policy = crate::types::RawPolicy::PreferRaw;
+    }
     config.state_db = Some(db.clone() as Arc<dyn DownloadStore>);
     let mut plan = planner.plan_download_asset(&asset, &config).await.unwrap();
     if legacy {
@@ -2095,4 +2104,334 @@ async fn v027_path_cache_absence_invalidates_on_local_external_and_rolled_back_c
     );
     assert!(!first.exists());
     assert_eq!(std::fs::read(second).unwrap(), RAW);
+}
+
+fn reference_version(
+    version: &str,
+) -> (
+    String,
+    crate::state::VersionSizeKey,
+    crate::state::VersionSizeKey,
+) {
+    let key = crate::state::VersionSizeKey::from_str(version).unwrap();
+    (version.to_owned(), key, key)
+}
+fn refreshed_reference(original: &ActiveDecision) -> ActiveDecision {
+    let mut updated = original.clone();
+    let master = "refreshed-current-master";
+    let mut body: Value =
+        serde_json::from_slice(updated.decision.confirmation.as_ref().unwrap()).unwrap();
+    for record in body["records"].as_array_mut().unwrap() {
+        if record["recordType"] == "CPLMaster" {
+            record["recordName"] = json!(master);
+        }
+        if record["recordType"] == "CPLAsset" {
+            record["fields"]["masterRef"]["value"]["recordName"] = json!(master);
+        }
+    }
+    updated.decision.master = Some(master.into());
+    updated.decision.confirmation = Some(serde_json::to_vec(&body).unwrap());
+    updated
+}
+fn current_charge(db: &SqliteStateDb) -> u64 {
+    let conn = db.acquire_lock("current reference charge").unwrap();
+    let value:i64=conn.query_row("SELECT COALESCE((SELECT SUM(charged_bytes) FROM provider_active_generations),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_active_decisions WHERE compacted_hash IS NULL),0)",[],|r|r.get(0)).unwrap();
+    value.try_into().unwrap()
+}
+#[tokio::test]
+async fn changed_master_capacity_uses_committed_charge_and_rolls_back_overflow() {
+    let mut fitting = None;
+    for mode in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+                .await
+                .unwrap(),
+        );
+        let root = db
+            .begin_selection_generation(owner(), spec(), BUDGET)
+            .await
+            .unwrap();
+        let (old, _, rows) =
+            admission(&db, &root.id, &dir.path().join("media"), 0, false, BUDGET).await;
+        db.seal_selection_generation(owner(), root.id.clone(), true, None)
+            .await
+            .unwrap();
+        let updated = refreshed_reference(&old);
+        let before = current_charge(&db);
+        let limit = match mode {
+            0 => BUDGET,
+            1 => fitting.unwrap(),
+            _ => fitting.unwrap() - 1,
+        };
+        let outcome = db
+            .refresh_selection_reference(
+                owner(),
+                root.id.clone(),
+                old.clone(),
+                updated,
+                (
+                    rows,
+                    old.decision
+                        .destinations
+                        .iter()
+                        .map(|d| reference_version(&d.version_size))
+                        .collect(),
+                ),
+                limit,
+            )
+            .await;
+        if mode == 2 {
+            assert!(matches!(
+                outcome,
+                Err(crate::state::error::StateError::ProviderSelectionFull)
+            ));
+            assert_eq!(current_charge(&db), before);
+            assert_eq!(
+                db.selection_decision(
+                    owner(),
+                    root.id.clone(),
+                    "pass".into(),
+                    old.decision.child.clone()
+                )
+                .await
+                .unwrap(),
+                Some(old)
+            );
+            assert_eq!(
+                db.acquire_lock("no leaked successor")
+                    .unwrap()
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM provider_active_generations",
+                        [],
+                        |r| r.get(0)
+                    )
+                    .unwrap(),
+                1
+            );
+        } else {
+            outcome.unwrap();
+            let after = current_charge(&db);
+            if mode == 0 {
+                fitting = Some(after);
+            } else {
+                assert_eq!(after, limit);
+            }
+        }
+    }
+}
+#[tokio::test]
+async fn changed_master_partial_preserves_merged_receipt_and_refuses_bad_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    let root = db
+        .begin_selection_generation(owner(), spec(), BUDGET)
+        .await
+        .unwrap();
+    let (old, tasks, rows) =
+        admission(&db, &root.id, &dir.path().join("media"), 0, true, BUDGET).await;
+    assert_eq!(tasks.len(), 2);
+    publish(&db, &tasks[0]).await;
+    db.seal_selection_generation(owner(), root.id.clone(), true, None)
+        .await
+        .unwrap();
+    let saved = {
+        let conn = db.acquire_lock("merge fulfilled receipt origins").unwrap();
+        SqliteStateDb::merge_test_completed_origin(
+            &conn,
+            &root.id,
+            "pass",
+            &old.decision.child,
+            "other-selected-pass",
+        )
+        .unwrap()
+    };
+    for mode in 0..6 {
+        let mut updated = refreshed_reference(&old);
+        let mut body: Value =
+            serde_json::from_slice(updated.decision.confirmation.as_ref().unwrap()).unwrap();
+        match mode {
+            0 => {
+                body["records"][1]["zoneID"] =
+                    json!({"zoneName":"foreign","ownerRecordName":"other"})
+            }
+            1 => body["records"][1]["recordName"] = json!("redirected-child"),
+            2 => body["records"][1]["deleted"] = json!(true),
+            3 => {
+                let duplicate = body["records"][1].clone();
+                body["records"].as_array_mut().unwrap().push(duplicate);
+            }
+            _ => {}
+        }
+        if mode == 4 {
+            assert_eq!(tasks[0].version_size.as_str(), "original");
+            body["records"][0]["fields"]["resOriginalRes"]["value"]["size"] = json!(RAW.len() + 1);
+        }
+        updated.decision.confirmation = Some(serde_json::to_vec(&body).unwrap());
+        assert!(
+            db.refresh_selection_reference(
+                owner(),
+                root.id.clone(),
+                old.clone(),
+                updated,
+                (
+                    rows.clone(),
+                    if mode == 5 {
+                        vec![
+                            reference_version("original"),
+                            reference_version("live_original"),
+                            reference_version("medium"),
+                        ]
+                    } else {
+                        old.decision
+                            .destinations
+                            .iter()
+                            .map(|d| reference_version(&d.version_size))
+                            .collect()
+                    }
+                ),
+                BUDGET
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            db.selection_decision(
+                owner(),
+                root.id.clone(),
+                "pass".into(),
+                old.decision.child.clone()
+            )
+            .await
+            .unwrap(),
+            Some(old.clone())
+        );
+    }
+    let successor = db
+        .refresh_selection_reference(
+            owner(),
+            root.id.clone(),
+            old.clone(),
+            refreshed_reference(&old),
+            (
+                rows.clone(),
+                old.decision
+                    .destinations
+                    .iter()
+                    .map(|d| reference_version(&d.version_size))
+                    .collect(),
+            ),
+            BUDGET,
+        )
+        .await
+        .unwrap();
+    let current = db
+        .selection_decision(
+            owner(),
+            successor.id.clone(),
+            "pass".into(),
+            old.decision.child.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let mut next = current.clone();
+    let mut body: Value =
+        serde_json::from_slice(next.decision.confirmation.as_ref().unwrap()).unwrap();
+    body["records"][0]["recordName"] = json!("second-current-master");
+    body["records"][1]["fields"]["masterRef"]["value"]["recordName"] =
+        json!("second-current-master");
+    // Metadata-only evolution does not reopen completed media obligations.
+    body["records"][1]["fields"]["captionEnc"] = json!({"type":"STRING","value":"new caption"});
+    next.decision.master = Some("second-current-master".into());
+    next.decision.confirmation = Some(serde_json::to_vec(&body).unwrap());
+    let photo = crate::icloud::photos::current_asset(
+        next.decision.confirmation.as_ref().unwrap(),
+        &next.decision.child,
+        next.decision.master.as_deref().unwrap(),
+        &spec().zone,
+    )
+    .unwrap();
+    let rows: Vec<_> = rows
+        .into_iter()
+        .map(|row| {
+            let metadata = photo.metadata_arc(row.version_size);
+            row.with_metadata_arc(metadata)
+        })
+        .collect();
+    for destination in &mut next.decision.destinations {
+        destination.metadata_hash = photo
+            .metadata_arc(
+                crate::state::VersionSizeKey::from_str(&destination.version_size).unwrap(),
+            )
+            .metadata_hash
+            .clone()
+            .unwrap();
+    }
+    let successor = db
+        .refresh_selection_reference(
+            owner(),
+            successor.id.clone(),
+            current,
+            next,
+            (
+                rows,
+                old.decision
+                    .destinations
+                    .iter()
+                    .map(|d| reference_version(&d.version_size))
+                    .collect(),
+            ),
+            BUDGET,
+        )
+        .await
+        .unwrap();
+    let conn = db
+        .acquire_lock("completed receipt preserved exactly")
+        .unwrap();
+    let preserved = SqliteStateDb::merge_test_completed_origin(
+        &conn,
+        &root.id,
+        "pass",
+        &old.decision.child,
+        "other-selected-pass",
+    )
+    .unwrap();
+    assert_eq!(preserved, saved);
+    assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND verified_media=0",[successor.id],|r|r.get(0)).unwrap(),1);
+    assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND verified_media=1",[root.id],|r|r.get(0)).unwrap(),1);
+}
+
+#[tokio::test]
+async fn changed_master_raw_mapping_preserves_completed_resource() {
+    REFERENCE_RAW.scope(true, async {
+        let dir=tempfile::tempdir().unwrap();
+        let db=Arc::new(SqliteStateDb::open_owned(&dir.path().join("state.db"),&owner()).await.unwrap());
+        let root=db.begin_selection_generation(owner(),spec(),BUDGET).await.unwrap();
+        let (old,tasks,rows)=admission(&db,&root.id,&dir.path().join("media"),0,true,BUDGET).await;
+        let completed=tasks.iter().find(|t|t.version_size.as_str()=="original").unwrap();
+        assert_eq!(completed.checksum.as_ref(),super::OLD, "logical Original must select provider Alternative RAW");
+        publish(&db,completed).await;
+        db.seal_selection_generation(owner(),root.id.clone(),true,None).await.unwrap();
+        let receipt={let conn=db.acquire_lock("RAW completion proof").unwrap();SqliteStateDb::merge_test_completed_origin(&conn,&root.id,"pass",&old.decision.child,"pass").unwrap()};
+        let selected=old.decision.destinations.iter().map(|d| {
+            let key=if d.version_size=="original" {crate::state::VersionSizeKey::Alternative} else {crate::state::VersionSizeKey::from_str(&d.version_size).unwrap()};
+            (d.version_size.clone(),key,key)
+        }).collect::<Vec<_>>();
+        let mut changed=refreshed_reference(&old);
+        let mut body:Value=serde_json::from_slice(changed.decision.confirmation.as_ref().unwrap()).unwrap();
+        body["records"][0]["fields"]["resOriginalAltRes"]["value"]["size"]=json!(RAW.len()+1);
+        changed.decision.confirmation=Some(serde_json::to_vec(&body).unwrap());
+        assert!(db.refresh_selection_reference(owner(),root.id.clone(),old.clone(),changed,(rows.clone(),selected.clone()),BUDGET).await.is_err());
+        assert_eq!(db.selection_decision(owner(),root.id.clone(),"pass".into(),old.decision.child.clone()).await.unwrap(),Some(old.clone()));
+        let successor=db.refresh_selection_reference(owner(),root.id.clone(),old.clone(),refreshed_reference(&old),(rows,selected),BUDGET).await.unwrap();
+        let conn=db.acquire_lock("RAW exact receipt survives").unwrap();
+        assert_eq!(SqliteStateDb::merge_test_completed_origin(&conn,&root.id,"pass",&old.decision.child,"pass").unwrap(),receipt);
+        assert!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND verified_media=0",[successor.id],|r|r.get(0)).unwrap()>0);
+        assert_eq!(std::fs::read(&completed.download_path).unwrap(),RAW);
+    }).await;
 }

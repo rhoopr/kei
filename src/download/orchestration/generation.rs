@@ -51,6 +51,10 @@ fn generation_format() -> u8 {
 #[error("Selected identity retry is not due")]
 pub(in crate::download) struct SelectionRetryDeferred;
 
+#[derive(Debug, thiserror::Error)]
+#[error("Current retry lacks selected rendition")]
+struct SelectionReferenceUnavailable;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::download) enum SelectionConfirmationErrorClass {
     SessionExpired,
@@ -612,6 +616,214 @@ impl SelectionRun {
             .context("Observed asset has no authenticated source ledger")
     }
 
+    async fn prepare_replay_or_retain(
+        self: &Arc<Self>,
+        decision: &ActiveDecision,
+        asset: PhotoAsset,
+        config: &DownloadConfig,
+    ) -> Result<(Arc<Self>, PhotoAsset)> {
+        match self.prepare_replay(decision, asset.clone(), config).await {
+            Ok(value) => Ok(value),
+            Err(error)
+                if error
+                    .downcast_ref::<crate::state::error::StateError>()
+                    .is_some_and(|error| {
+                        matches!(
+                            error,
+                            crate::state::error::StateError::ProviderWorkConflict
+                                | crate::state::error::StateError::ProviderSelectionFull
+                        )
+                    })
+                    || error
+                        .downcast_ref::<SelectionReferenceUnavailable>()
+                        .is_some() =>
+            {
+                // The existing producer refusal path owns durable backoff and
+                // incomplete reporting for this still-original task.
+                Ok((self.clone(), asset))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn prepare_replay(
+        self: &Arc<Self>,
+        decision: &ActiveDecision,
+        asset: PhotoAsset,
+        config: &DownloadConfig,
+    ) -> Result<(Arc<Self>, PhotoAsset)> {
+        if self.root.spec.format != 2 || !self.fresh_confirmation {
+            return Ok((self.clone(), asset));
+        }
+        let key = &decision.decision.pass_key;
+        if !self
+            .capture
+            .db
+            .selection_attempt_due(
+                self.capture.owner.clone(),
+                self.root.id.clone(),
+                key.clone(),
+                decision.decision.child.clone(),
+            )
+            .await?
+        {
+            return Ok((self.clone(), asset));
+        }
+        let album = self.albums.get(key).context("Missing current retry pass")?;
+        if let Some(witness) = asset.selector_membership()
+            && let Err(error) = album
+                .confirm_selector_membership(witness, &decision.decision.child)
+                .await
+        {
+            if crate::icloud::photos::session::is_session_error(&error) {
+                return Err(error);
+            }
+            return Ok((self.clone(), asset));
+        }
+        let mut current = match album
+            .confirm_layout_asset(
+                &decision.decision.child,
+                asset.source_zone().context("Missing retry source")?,
+            )
+            .await
+        {
+            Ok(current) => current,
+            Err(error) if crate::icloud::photos::session::is_session_error(&error) => {
+                return Err(error);
+            }
+            Err(_) => return Ok((self.clone(), asset)),
+        };
+        if current.asset.id() == asset.id()
+            || filter::is_asset_filtered(&current.asset, config).is_some()
+        {
+            return Ok((self.clone(), asset));
+        }
+        if let Some(witness) = asset.selector_membership() {
+            let mut body: Value = serde_json::from_slice(&current.body)?;
+            body.as_object_mut()
+                .context("Invalid current retry proof")?
+                .insert("selector_membership".into(), witness.clone());
+            current.body = serde_json::to_vec(&body)?;
+            current.asset = current.asset.with_selector_membership(witness.clone());
+        }
+        let mut replacement = decision.clone();
+        replacement.decision.master = Some(current.asset.id().to_owned());
+        replacement.decision.confirmation = Some(current.body);
+        replacement.decision.destinations.clear();
+        let paths = filter::derive_expected_paths(&current.asset, config);
+        let previous_paths = filter::derive_expected_paths(&asset, config);
+        let selected_versions: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                (
+                    path.version_size.as_str().to_owned(),
+                    filter::provider_version_for_selected(&asset, config, path.version_size),
+                    filter::provider_version_for_selected(
+                        &current.asset,
+                        config,
+                        path.version_size,
+                    ),
+                )
+            })
+            .collect();
+        if selected_versions.iter().any(|(version, _, _)| {
+            !previous_paths
+                .iter()
+                .any(|path| path.version_size.as_str() == version)
+        }) {
+            return Err(SelectionReferenceUnavailable.into());
+        }
+
+        let mut records = Vec::new();
+        for old in &decision.decision.destinations {
+            if self
+                .capture
+                .db
+                .selection_destination_verified(
+                    self.capture.owner.clone(),
+                    self.root.id.clone(),
+                    key.clone(),
+                    decision.decision.child.clone(),
+                    old.version_size.clone(),
+                )
+                .await?
+            {
+                continue;
+            }
+            let derived = paths
+                .iter()
+                .find(|path| path.version_size.as_str() == old.version_size)
+                .ok_or(SelectionReferenceUnavailable)?;
+            let metadata =
+                filter::metadata_for_selected_version(&current.asset, config, derived.version_size);
+            let path = old.path.to_path();
+            records.push(
+                crate::state::AssetRecord::new_pending(
+                    Arc::from(
+                        current
+                            .asset
+                            .source_zone()
+                            .context("Missing current source")?,
+                    ),
+                    decision.state_id.clone(),
+                    derived.version_size,
+                    derived.checksum.to_string(),
+                    path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_owned(),
+                    current.asset.created(),
+                    Some(current.asset.added_date()),
+                    derived.size,
+                    filter::determine_media_type(derived.version_size, &current.asset),
+                )
+                .with_metadata_arc(metadata.clone()),
+            );
+            replacement
+                .decision
+                .destinations
+                .push(SelectionDestination {
+                    version_size: old.version_size.clone(),
+                    path: old.path.clone(),
+                    checksum: derived.checksum.to_string(),
+                    size: derived.size,
+                    metadata_hash: metadata
+                        .metadata_hash
+                        .clone()
+                        .context("Missing current retry metadata")?,
+                });
+        }
+        let root = self
+            .capture
+            .db
+            .refresh_selection_reference(
+                self.capture.owner.clone(),
+                self.root.id.clone(),
+                decision.clone(),
+                replacement,
+                (records, selected_versions),
+                MAX_GENERATION_BYTES,
+            )
+            .await?;
+        let run = Arc::new(Self {
+            capture: self.capture.clone(),
+            root,
+            albums: self.albums.clone(),
+            held: self.held.clone(),
+            session_expired: self.session_expired.clone(),
+            source_runs: BTreeMap::new(),
+            fresh_confirmation: true,
+            retained_retry: self.retained_retry,
+            retry_sources: self.retry_sources.clone(),
+        });
+        Ok((
+            run,
+            current
+                .asset
+                .with_state_record_name(Arc::from(decision.state_id.clone())),
+        ))
+    }
+
     /// Capture only failed tasks' original selected provenance. This transient
     /// map supplements the exact frozen task, never changes its path or metadata,
     /// and ends with this sync invocation. Durable replay rebuilds it from SQLite.
@@ -990,6 +1202,18 @@ impl SelectionRun {
         if reason.is_empty() {
             let derived_paths = filter::derive_expected_paths(asset, config);
             for derived in &derived_paths {
+                if self.fresh_confirmation
+                    && previous.as_ref().is_some_and(|old| {
+                        old.decision.confirmation.is_some()
+                            && !old
+                                .decision
+                                .destinations
+                                .iter()
+                                .any(|d| d.version_size == derived.version_size.as_str())
+                    })
+                {
+                    continue;
+                }
                 let mut retained = None;
                 let candidates = self
                     .capture
@@ -1213,6 +1437,15 @@ impl SelectionRun {
         }
         let mut retained_tasks = Vec::with_capacity(plan.tasks.len());
         for mut task in std::mem::take(&mut plan.tasks) {
+            if self.fresh_confirmation
+                && !manifest
+                    .decision
+                    .destinations
+                    .iter()
+                    .any(|d| d.version_size == task.version_size.as_str())
+            {
+                continue;
+            }
             if self
                 .capture
                 .db
@@ -1654,7 +1887,8 @@ async fn recover_retained(
             break;
         }
         let key = pass_key(pass);
-        let mut assets = Vec::new();
+        let mut groups: BTreeMap<String, (Arc<SelectionRun>, Vec<Result<PhotoAsset>>)> =
+            BTreeMap::new();
         for decision in decisions
             .iter()
             .filter(|decision| decision.decision.pass_key == key)
@@ -1685,33 +1919,46 @@ async fn recover_retained(
                 }
             };
             if let Some(asset) = asset {
-                assets.push(Ok(
-                    asset.with_state_record_name(Arc::from(decision.state_id.clone()))
-                ));
+                let asset = asset.with_state_record_name(Arc::from(decision.state_id.clone()));
+                let (owner, asset) = run
+                    .prepare_replay_or_retain(decision, asset, &config.with_pass(pass))
+                    .await?;
+                groups
+                    .entry(owner.root.id.clone())
+                    .or_insert_with(|| (owner, Vec::new()))
+                    .1
+                    .push(Ok(asset));
             } else {
                 run.defer_confirmation(&key, decision.decision.child.clone())
                     .await?;
             }
         }
-        if assets.is_empty() {
-            continue;
-        }
-        let mut effective = config.with_pass(pass);
-        effective.selection_run = Some(run.clone());
-        effective.selection_pass = Some(key);
-        let result = crate::download::pipeline::stream_and_download_from_stream(
-            client,
-            futures_util::stream::iter(assets),
-            &Arc::new(effective),
-            controls,
-            0,
-            cancel.clone(),
-            crate::download::pipeline::StreamRuntime::new(None, None).deferring_metadata_drain(),
-        )
-        .await?;
-        run.remember_retry_sources(&result.failed, passes, config)
+        for (_, (run, assets)) in groups {
+            let mut effective = config.with_pass(pass);
+            effective.selection_run = Some(run.clone());
+            effective.selection_pass = Some(key.clone());
+            let result = crate::download::pipeline::stream_and_download_from_stream(
+                client,
+                futures_util::stream::iter(assets),
+                &Arc::new(effective),
+                controls,
+                0,
+                cancel.clone(),
+                crate::download::pipeline::StreamRuntime::new(None, None)
+                    .deferring_metadata_drain(),
+            )
             .await?;
-        super::models::merge_streaming_result(&mut combined, result);
+            run.remember_retry_sources(&result.failed, passes, config)
+                .await?;
+            if run.root.id != root.id {
+                context
+                    .capture
+                    .db
+                    .complete_selection_metadata(context.capture.owner.clone(), run.root.id.clone())
+                    .await?;
+            }
+            super::models::merge_streaming_result(&mut combined, result);
+        }
     }
     context
         .capture
@@ -1779,39 +2026,56 @@ async fn replay(
                 break;
             }
             after = decisions.last().map(|d| d.decision.child.clone());
-            let mut assets = Vec::new();
+            let mut groups: BTreeMap<String, (Arc<SelectionRun>, Vec<Result<PhotoAsset>>)> =
+                BTreeMap::new();
             for decision in decisions {
                 if let (Some(body), Some(master)) =
                     (&decision.decision.confirmation, &decision.decision.master)
                 {
-                    assets.push(Ok(current_asset(
-                        body,
-                        &decision.decision.child,
-                        master,
-                        &root.spec.zone,
-                    )?
-                    .with_state_record_name(Arc::from(decision.state_id))));
+                    let asset =
+                        current_asset(body, &decision.decision.child, master, &root.spec.zone)?
+                            .with_state_record_name(Arc::from(decision.state_id.clone()));
+                    let (owner, asset) = run
+                        .prepare_replay_or_retain(&decision, asset, &config.with_pass(pass))
+                        .await?;
+                    groups
+                        .entry(owner.root.id.clone())
+                        .or_insert_with(|| (owner, Vec::new()))
+                        .1
+                        .push(Ok(asset));
                 } else {
                     run.held.store(true, Ordering::Relaxed);
                 }
             }
-            let mut effective = config.with_pass(pass);
-            effective.selection_run = Some(run.clone());
-            effective.selection_pass = Some(key.clone());
-            let result = crate::download::pipeline::stream_and_download_from_stream(
-                client,
-                futures_util::stream::iter(assets),
-                &Arc::new(effective),
-                controls,
-                0,
-                cancel.clone(),
-                crate::download::pipeline::StreamRuntime::new(None, None)
-                    .deferring_metadata_drain(),
-            )
-            .await?;
-            run.remember_retry_sources(&result.failed, passes, config)
+            for (_, (run, assets)) in groups {
+                let mut effective = config.with_pass(pass);
+                effective.selection_run = Some(run.clone());
+                effective.selection_pass = Some(key.clone());
+                let result = crate::download::pipeline::stream_and_download_from_stream(
+                    client,
+                    futures_util::stream::iter(assets),
+                    &Arc::new(effective),
+                    controls,
+                    0,
+                    cancel.clone(),
+                    crate::download::pipeline::StreamRuntime::new(None, None)
+                        .deferring_metadata_drain(),
+                )
                 .await?;
-            super::models::merge_streaming_result(&mut combined, result);
+                run.remember_retry_sources(&result.failed, passes, config)
+                    .await?;
+                if run.root.id != root.id {
+                    context
+                        .capture
+                        .db
+                        .complete_selection_metadata(
+                            context.capture.owner.clone(),
+                            run.root.id.clone(),
+                        )
+                        .await?;
+                }
+                super::models::merge_streaming_result(&mut combined, result);
+            }
         }
     }
     combined.exif_failures += metadata_tail(config, &cancel, context, &run.root.id).await?;
