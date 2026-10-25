@@ -1091,23 +1091,26 @@ opaque and their debug output is redacted. Lookup changes do not overwrite the
 original delta evidence. A link alone does not authorize a target lookup.
 
 Selected sparse-target recovery is owned by
-`src/download/sparse_target.rs`. The cycle supplies only current selected,
-unrestricted full-library plans; it does not search an unselected library or
-infer membership for album, rank, bounded, managed-primary or provisional
-selections. A fresh source lookup must agree with its retained link. The Photos
-adapter qualifies target owner/zone and the exact child/master pair before the
-normal target download pipeline can materialize missing selected renditions.
-Ordinary downloadable validation remains strict; no deletion exception is added.
+`src/download/sparse_target.rs`. The cycle supplies independently selected
+ordinary-library and Hidden passes. It does not search an unselected library or
+infer named-album membership. A fresh source lookup must agree with its retained
+link; the Photos adapter qualifies the target owner, zone and exact child/master
+pair. The target's normal selected sync remains responsible for downloading work.
 
-A target receipt is useful only with exact current identity, metadata, source
-provenance and independent protected-path-safe files. Trusted Legacy File
-acceptance does not satisfy this source proof. The source checkpoint transaction
-revalidates the source generation, target catalogue/configuration snapshot and
-held target files. Partial downloads retain the source obligation. Existing
-bounded source retry selection remains authoritative; no general retry budget,
-checkpoint reset or debt-backed advancement is introduced. Recovery decisions
-use fixed allowlisted labels in retained support history; a target-ready or
-prepared historical file is partial work, not a complete backup.
+For current-ledger selections, completed download receipts account for every
+required rendition at its selected destination. Matching uses the normal planner
+and verified retained files. This coverage does not require historical metadata
+attribution and never reassigns the Primary source's historical master mapping.
+The source checkpoint transaction reloads receipts and configuration fences,
+checks the exact canonical destination against pending work, publication/layout
+owners and reconciliation reservations (including same-owner redirects), and
+revalidates retained files. Other selected copies do not invalidate coverage
+merely because they use another path. Missing, changed or unfinished targets
+retain the source obligation and bounded retry schedule; independently selected
+healthy libraries continue their own progress. No Hidden exception is added to
+the older non-ledger recovery path, which retains its existing provenance rules.
+A completed target settles only the covered current sparse obligation, not
+historical attribution or all optional metadata work.
 
 Schema 26 adds `unresolved_sparse_identities`, keyed by library and source
 record in the account-scoped database. `src/state/db/sparse_identity.rs` stores

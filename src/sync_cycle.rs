@@ -1453,49 +1453,54 @@ pub(crate) async fn run_cycle(
         // sparse target without inventing album/rank membership.
         let mut sparse_targets = Vec::new();
         if download_controls.run_mode.downloads_files() && !is_retry_failed {
-            for target in library_states.iter().copied().filter(|target| {
-                target.zone_name != lib_state.zone_name
-                    && !target.plan_is_stale
-                    && target.plan.passes.len() == 1
-            }) {
-                let Some(pass) = target.plan.passes.first() else {
-                    continue;
-                };
-                if pass.kind != crate::commands::PassKind::Unfiled || !pass.exclude_ids.is_empty() {
-                    continue;
+            for target in library_states
+                .iter()
+                .copied()
+                .filter(|target| target.zone_name != lib_state.zone_name && !target.plan_is_stale)
+            {
+                for pass in &target.plan.passes {
+                    if (!pass.album.has_collection_independent_rank()
+                        && !pass.album.is_hidden_media_selection())
+                        || !pass.exclude_ids.is_empty()
+                    {
+                        continue;
+                    }
+                    #[cfg(feature = "xmp")]
+                    let target_groupings =
+                        if config.metadata.embed_xmp || config.metadata.xmp_sidecar {
+                            preload_asset_groupings(state_db, &target.zone_name).await
+                        } else {
+                            Arc::new(download::AssetGroupings::default())
+                        };
+                    #[cfg(not(feature = "xmp"))]
+                    let target_groupings = Arc::new(download::AssetGroupings::default());
+                    let target_config = build_download_config(
+                        download::SyncMode::Full,
+                        Arc::clone(&pass.exclude_ids),
+                        target_groupings,
+                        Arc::from(target.zone_name.as_str()),
+                    );
+                    if target_config.recent.is_some()
+                        || target_config.skip_created_before.is_some()
+                        || target_config.skip_created_after.is_some()
+                        || target_config.retry_only
+                        || target_config.edited_naming == crate::types::EditedNaming::Primary
+                    {
+                        continue;
+                    }
+                    let mut target_config = target_config.with_pass(pass);
+                    // A full-library path label is not evidence of album membership.
+                    if pass.kind == crate::commands::PassKind::Unfiled {
+                        target_config.album_name = None;
+                    }
+                    sparse_targets.push(download::sparse_target::SelectedSparseTarget {
+                        library: target.library.clone(),
+                        album: pass.album.clone(),
+                        config: Arc::new(target_config),
+                        client: download_client.clone(),
+                        controls: download_controls,
+                    });
                 }
-                #[cfg(feature = "xmp")]
-                let target_groupings = if config.metadata.embed_xmp || config.metadata.xmp_sidecar {
-                    preload_asset_groupings(state_db, &target.zone_name).await
-                } else {
-                    Arc::new(download::AssetGroupings::default())
-                };
-                #[cfg(not(feature = "xmp"))]
-                let target_groupings = Arc::new(download::AssetGroupings::default());
-                let target_config = build_download_config(
-                    download::SyncMode::Full,
-                    Arc::clone(&pass.exclude_ids),
-                    target_groupings,
-                    Arc::from(target.zone_name.as_str()),
-                );
-                if target_config.recent.is_some()
-                    || target_config.skip_created_before.is_some()
-                    || target_config.skip_created_after.is_some()
-                    || target_config.retry_only
-                    || target_config.edited_naming == crate::types::EditedNaming::Primary
-                {
-                    continue;
-                }
-                let mut target_config = target_config.with_pass(pass);
-                // A full-library path label is not evidence of album membership.
-                target_config.album_name = None;
-                sparse_targets.push(download::sparse_target::SelectedSparseTarget {
-                    library: target.library.clone(),
-                    album: pass.album.clone(),
-                    config: Arc::new(target_config),
-                    client: download_client.clone(),
-                    controls: download_controls,
-                });
             }
         }
         Arc::make_mut(&mut download_config).sparse_targets = sparse_targets.into();

@@ -1181,3 +1181,5 @@ mod raw_replay;
 mod indexing_layout;
 
 mod configuration_safety;
+
+mod current_sparse_coverage;

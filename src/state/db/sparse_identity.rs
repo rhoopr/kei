@@ -144,6 +144,8 @@ pub(crate) struct SparseTargetState {
     master: String,
     evidence: String,
     validate_files: Option<Arc<SparseFileValidation>>,
+    current_receipts: Vec<super::download_receipts::DownloadReceipt>,
+    config_fences: Vec<(String, Option<String>)>,
 }
 type SparseFileValidation = dyn Fn() -> Result<(), StateError> + Send + Sync;
 impl PartialEq for SparseTargetState {
@@ -152,10 +154,77 @@ impl PartialEq for SparseTargetState {
             && self.child == other.child
             && self.master == other.master
             && self.evidence == other.evidence
+            && self.current_receipts == other.current_receipts
+            && self.config_fences == other.config_fences
     }
 }
 impl Eq for SparseTargetState {}
 impl SparseTargetState {
+    pub(crate) fn current_coverage(
+        receipts: Vec<super::download_receipts::DownloadReceipt>,
+        config_fences: Vec<(String, Option<String>)>,
+    ) -> Result<Self, StateError> {
+        let first = receipts
+            .first()
+            .ok_or_else(|| invariant("empty current target coverage"))?;
+        if receipts.iter().any(|receipt| {
+            receipt.scope != first.scope
+                || receipt.library != first.library
+                || receipt.child != first.child
+                || receipt.master != first.master
+                || receipt.account_key != first.account_key
+                || receipt.provider_key != first.provider_key
+        }) {
+            return Err(invariant("mixed current target coverage"));
+        }
+        Ok(Self {
+            library: first.library.clone(),
+            child: first.child.clone(),
+            master: first.master.clone(),
+            evidence: String::new(),
+            validate_files: None,
+            current_receipts: receipts,
+            config_fences,
+        })
+    }
+
+    fn validate_current(&self, conn: &Connection) -> Result<(), StateError> {
+        for receipt in &self.current_receipts {
+            let path = receipt.native_path.to_path();
+            let path_key = crate::fs_util::confined_path_key(&path)
+                .map_err(|_invalid| invariant("invalid current target path"))?;
+            super::primary_layout::guard_writer(conn, &path)?;
+            super::legacy_preservation::guard_writer(conn, &path)?;
+            if super::provider_generations::pending_destination_reservations_for_path(conn, &path)?
+                .iter()
+                .any(|reservation| reservation.destination_path_key.0 == path_key)
+            {
+                return Err(invariant(
+                    "current target still has pending destination authority",
+                ));
+            }
+            let competing:bool=conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM reconciliation_paths WHERE (requested_path_key=?1 OR destination_path_key=?1) AND (destination_path_key<>?1 OR library<>?2 OR id<>?3 OR version_size<>?4 OR provider_checksum IS NULL OR provider_checksum<>?5 OR provider_size IS NULL OR provider_size<>?6)) OR EXISTS(SELECT 1 FROM owned_temp_files WHERE publication IS NOT NULL AND json_extract(publication,'$.library')=?2 AND json_extract(publication,'$.id')=?3)",
+                params![path_key,receipt.library,receipt.state_id,receipt.version_size,receipt.provider_checksum,i64::try_from(receipt.provider_size).map_err(|_invalid|invariant("invalid current target size"))?],|row|row.get(0))?;
+            if competing {
+                return Err(invariant("current target destination authority changed"));
+            }
+            if super::download_receipts::load(conn, &receipt.id()?)?.as_ref() != Some(receipt) {
+                return Err(invariant("current target receipt changed"));
+            }
+        }
+        for (key, expected) in &self.config_fences {
+            let actual: Option<String> = conn
+                .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            if &actual != expected {
+                return Err(invariant("current target configuration changed"));
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn with_file_validation(mut self, validation: Arc<SparseFileValidation>) -> Self {
         self.validate_files = Some(validation);
         self
@@ -517,6 +586,8 @@ fn target_state(
         master: master.into(),
         evidence,
         validate_files: None,
+        current_receipts: Vec::new(),
+        config_fences: Vec::new(),
     }))
 }
 
@@ -615,11 +686,16 @@ fn clear_selected(
                     && proof.generation == current.generation
             })
             .ok_or_else(|| invariant("checkpoint lacks current sparse identity proof"))?;
-        if let Some(target) = &proof.target
-            && target_state(tx, &target.library, &target.child, &target.master)?.as_ref()
-                != Some(target)
-        {
-            return Err(invariant("sparse target receipt state changed"));
+        if let Some(target) = &proof.target {
+            if target.current_receipts.is_empty() {
+                if target_state(tx, &target.library, &target.child, &target.master)?.as_ref()
+                    != Some(target)
+                {
+                    return Err(invariant("sparse target receipt state changed"));
+                }
+            } else {
+                target.validate_current(tx)?;
+            }
         }
         if let Some(target) = &proof.target {
             target
@@ -1179,3 +1255,149 @@ mod tests {
 
 #[cfg(test)]
 mod origin_tests;
+
+#[cfg(test)]
+impl SqliteStateDb {
+    pub(crate) async fn test_current_coverage_checkpoint_fences(&self, child: &str) {
+        use crate::state::CheckpointTransition;
+        let receipt = self
+            .with_conn("real completed coverage receipt", {
+                let child = child.to_owned();
+                move |conn| {
+                    let id: String = conn.query_row(
+                        "SELECT id FROM download_receipts WHERE child=?1 LIMIT 1",
+                        [child],
+                        |r| r.get(0),
+                    )?;
+                    Ok(super::download_receipts::load(conn, &id)?.unwrap())
+                }
+            })
+            .await
+            .unwrap();
+        let path = receipt.native_path.to_path();
+        let original = std::fs::read(&path).unwrap();
+        let key = crate::fs_util::confined_path_key(&path).unwrap();
+        let identity = self
+            .observe_sparse_identity(
+                "ProofSource",
+                &SparseSourceId::new("proof-source"),
+                &SparseEvidence("synthetic-proof-evidence".into()),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        self.set_metadata("sync_token:v27:ProofSource", "before")
+            .await
+            .unwrap();
+        for fault in [
+            "config",
+            "receipt",
+            "redirect",
+            "competitor",
+            "file",
+            "checkpoint",
+            "none",
+        ] {
+            let expected = self.get_metadata("config_hash").await.unwrap();
+            let validation =
+                crate::download::sparse_target::test_current_file_validation(&path).await;
+            let target = SparseTargetState::current_coverage(
+                vec![receipt.clone()],
+                vec![("config_hash".into(), expected.clone())],
+            )
+            .unwrap()
+            .with_file_validation(validation);
+            let proof = identity.proof().with_target(target);
+            {
+                let conn = self
+                    .acquire_lock("mutate after proof construction")
+                    .unwrap();
+                match fault {
+                    "config"=>{conn.execute("INSERT INTO metadata(key,value) VALUES('config_hash','changed') ON CONFLICT(key) DO UPDATE SET value='changed'",[]).unwrap();}
+                    "receipt"=>{conn.execute("DELETE FROM download_receipts WHERE id=?1",[receipt.id().unwrap()]).unwrap();}
+                    "redirect"|"competitor"=>{
+                        let destination=if fault=="redirect" {path.with_file_name("redirected.JPG")} else {path.clone()};
+                        let destination_key=crate::fs_util::confined_path_key(&destination).unwrap();
+                        conn.execute("INSERT INTO reconciliation_paths(library,id,version_size,requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![if fault=="competitor" {"OtherLibrary"} else {&receipt.library},receipt.state_id,receipt.version_size,key,destination_key,destination.to_str().unwrap(),receipt.provider_checksum,receipt.provider_size as i64]).unwrap();
+                    }
+                    "file"=>std::fs::write(&path,b"external replacement").unwrap(),
+                    "checkpoint"=>conn.execute_batch("CREATE TRIGGER coverage_token_failure BEFORE UPDATE ON metadata WHEN NEW.key='sync_token:v27:ProofSource' BEGIN SELECT RAISE(ABORT,'coverage token failure'); END;").unwrap(),
+                    _=>{}
+                }
+            }
+            let result = self
+                .commit_checkpoint_transition(CheckpointTransition {
+                    expected_metadata: Vec::new(),
+                    legacy_preservation_proofs: Vec::new(),
+                    legacy_config_hash: None,
+                    sparse_identity_proofs: vec![proof],
+                    metadata_updates: vec![("sync_token:v27:ProofSource".into(), "after".into())],
+                    metadata_deletes: vec![crate::state::unresolved_identity_key("ProofSource")],
+                })
+                .await;
+            if fault == "none" {
+                result.unwrap();
+                assert!(
+                    self.sparse_identities("ProofSource")
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            } else {
+                assert!(result.is_err(), "{fault} must invalidate checkpoint");
+                assert_eq!(
+                    self.get_metadata("sync_token:v27:ProofSource")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("before"),
+                    "{fault}"
+                );
+                assert_eq!(
+                    self.sparse_identities("ProofSource").await.unwrap().len(),
+                    1,
+                    "{fault}"
+                );
+                assert!(
+                    self.get_metadata(&crate::state::unresolved_identity_key("ProofSource"))
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "{fault}"
+                );
+            }
+            let conn = self.acquire_lock("restore one synthetic mutation").unwrap();
+            match fault {
+                "config" => match expected {
+                    Some(value) => {
+                        conn.execute(
+                            "UPDATE metadata SET value=?1 WHERE key='config_hash'",
+                            [value],
+                        )
+                        .unwrap();
+                    }
+                    None => {
+                        conn.execute("DELETE FROM metadata WHERE key='config_hash'", [])
+                            .unwrap();
+                    }
+                },
+                "receipt" => {
+                    receipt.save(&conn).unwrap();
+                }
+                "redirect" | "competitor" => {
+                    conn.execute(
+                        "DELETE FROM reconciliation_paths WHERE requested_path_key=?1",
+                        [&key],
+                    )
+                    .unwrap();
+                }
+                "file" => std::fs::write(&path, &original).unwrap(),
+                "checkpoint" => conn
+                    .execute_batch("DROP TRIGGER coverage_token_failure")
+                    .unwrap(),
+                _ => {}
+            }
+        }
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+}

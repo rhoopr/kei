@@ -162,6 +162,76 @@ async fn receipts(
         Ok(())
     }))))
 }
+// Current coverage proves selected files, not historical source attribution.
+async fn current_receipts(
+    target: &SelectedSparseTarget,
+    asset: &PhotoAsset,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<SparseTargetState>> {
+    let config = &target.config;
+    let Some(db) = config.state_db.as_deref() else {
+        return Ok(None);
+    };
+    let mut fences = Vec::new();
+    for key in [
+        "enum_config_hash",
+        "config_hash",
+        "pending_enum_config_hash",
+        "pending_download_config_hash",
+    ] {
+        fences.push((key.to_owned(), db.get_metadata(key).await?));
+    }
+    let mut planner = super::planner::TaskPlanner::for_download(Some(db)).await?;
+    let plan = planner.plan_pending_retry_asset(asset, config).await?;
+    if plan.filter_reason.is_some() || plan.malformed_resource.is_some() || plan.tasks.is_empty() {
+        return Ok(None);
+    }
+    let mut receipts = Vec::new();
+    let mut retained = Vec::new();
+    let mut paths = Vec::new();
+    for task in &plan.tasks {
+        let decision = planner.match_existing(asset, config, task).await;
+        let super::baseline_matching::BaselineMatch::RecordedPresent { receipt, file } = decision
+        else {
+            return Ok(None);
+        };
+        if !config
+            .primary_layout_pass
+            .as_deref()
+            .is_some_and(|pass| receipt.fulfills_pass(pass))
+        {
+            return Ok(None);
+        }
+        paths.push((receipt.native_path.to_path(), true));
+        receipts.push(receipt);
+        retained.push(file);
+    }
+    let proof = SparseTargetState::current_coverage(receipts, fences)?;
+    let cancel = cancel.clone();
+    let root = config.directory.to_path_buf();
+    let suffix = config.temp_suffix.clone();
+    Ok(Some(proof.with_file_validation(Arc::new(move || {
+        if cancel.is_cancelled() {
+            return Err(StateError::Invariant {
+                operation: "current_target_coverage",
+                detail: "coverage validation cancelled".into(),
+            });
+        }
+        validate_paths(&root, &paths, &suffix).map_err(|_invalid| StateError::Invariant {
+            operation: "current_target_coverage",
+            detail: "target publication changed".into(),
+        })?;
+        for file in &retained {
+            file.validate_blocking()
+                .map_err(|_invalid| StateError::Invariant {
+                    operation: "current_target_coverage",
+                    detail: "target file changed".into(),
+                })?;
+        }
+        Ok(())
+    }))))
+}
+
 pub(crate) async fn recover(
     evidence: &SparseShareEvidence,
     config: &DownloadConfig,
@@ -171,16 +241,12 @@ pub(crate) async fn recover(
     let SparseShareEvidence::Linked(link) = evidence else {
         return Ok(unsupported("target_scope_unqualified"));
     };
-    let mut matched = None;
-    for target in config.sparse_targets.iter() {
-        if target.album.sparse_link_matches(link) {
-            if matched.is_some() {
-                return Ok(unsupported("target_scope_unqualified"));
-            }
-            matched = Some(target);
-        }
-    }
-    let Some(target) = matched else {
+    let matched: Vec<_> = config
+        .sparse_targets
+        .iter()
+        .filter(|target| target.album.sparse_link_matches(link))
+        .collect();
+    let Some(target) = matched.first().copied() else {
         return Ok(unsupported("target_not_selected"));
     };
     let Some(db) = &target.config.state_db else {
@@ -196,7 +262,6 @@ pub(crate) async fn recover(
             ))
             .await?
             .is_some()
-        || db.has_primary_layouts(&target.config.library).await?
     {
         return Ok(unsupported("target_policy_unsupported"));
     }
@@ -205,7 +270,29 @@ pub(crate) async fn recover(
         RecordResolution::TransientFailure(error) => return Err(error.into()),
         _ => return Ok(unsupported("target_pair_unresolved")),
     };
-    if asset.metadata().is_hidden
+    let matched_count = matched.len();
+    let selected: Vec<_> = matched
+        .into_iter()
+        .filter(|target| target.album.is_hidden_media_selection() == asset.metadata().is_hidden)
+        .collect();
+    let [target] = selected.as_slice() else {
+        return Ok(unsupported("target_scope_unqualified"));
+    };
+    if target.album.download_scope()?.is_some() {
+        if asset.metadata().is_deleted
+            || cancel.is_cancelled()
+            || super::filter::is_asset_filtered(&asset, target.config.as_ref()).is_some()
+        {
+            return Ok(unsupported("target_policy_unsupported"));
+        }
+        let child = Arc::from(asset.asset_record_name());
+        let asset = asset.with_state_record_name(child);
+        return current_receipts(target, &asset, cancel).await;
+    }
+    // Current-ledger coverage does not relax legacy target ambiguity rules.
+    if matched_count != 1
+        || db.has_primary_layouts(&target.config.library).await?
+        || asset.metadata().is_hidden
         || asset.metadata().is_deleted
         || cancel.is_cancelled()
         || super::filter::is_asset_filtered(&asset, target.config.as_ref()).is_some()
@@ -314,6 +401,23 @@ fn validate_paths(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn test_current_file_validation(
+    path: &std::path::Path,
+) -> Arc<dyn Fn() -> Result<(), StateError> + Send + Sync> {
+    let held = super::file::retain_pending_file(path.parent().unwrap(), path)
+        .await
+        .unwrap()
+        .unwrap();
+    Arc::new(move || {
+        held.validate_blocking()
+            .map_err(|_invalid| StateError::Invariant {
+                operation: "test_current_coverage",
+                detail: "retained file changed".into(),
+            })
+    })
 }
 
 #[cfg(test)]

@@ -185,6 +185,13 @@ impl PhotoAlbum {
             && self.cross_zone_sources.is_empty()
     }
 
+    pub(crate) fn is_hidden_media_selection(&self) -> bool {
+        self.list_type.as_ref() == "CPLAssetAndMasterHiddenByAssetDate"
+            && self.query_filter.is_none()
+            && self.container_id.is_none()
+            && self.cross_zone_sources.is_empty()
+    }
+
     /// Provider scope used to bind durable selection recovery to its query owners.
     pub(crate) fn selection_scope(&self) -> Value {
         serde_json::json!({
