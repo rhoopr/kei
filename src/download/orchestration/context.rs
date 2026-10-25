@@ -67,10 +67,6 @@ pub(in crate::download) struct RecordedLocalFile {
     pub(in crate::download) download_checksum: Option<Box<str>>,
 }
 
-/// `library -> asset_id -> (version_size -> recorded local-file evidence)`.
-type LibraryAssetVersionFileMap =
-    FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashMap<Box<str>, RecordedLocalFile>>>;
-
 /// `library -> master_record_name -> asset_record_names`. Full enumeration
 /// uses this durable family history to keep a legacy master-keyed state row
 /// attached to the same child when CloudKit changes record order or page
@@ -151,9 +147,6 @@ pub(crate) struct DownloadContext {
     /// to retain a compatible legacy master-keyed retry without merging a
     /// different sibling into it.
     pub(in crate::download) pending_checksums: LibraryAssetVersionValueMap,
-    /// Current recorded local files for pending rows. A provider checksum
-    /// change clears `downloaded_at`, so historical paths are excluded.
-    pub(in crate::download) pending_files: LibraryAssetVersionFileMap,
     /// Provider identity families recorded before this pipeline started.
     /// `None` disables legacy adoption after a mapping query failure. The
     /// snapshot intentionally excludes mappings discovered during the current
@@ -362,17 +355,12 @@ impl DownloadContext {
 
         let mut pending_ids: LibraryAssetVersionSet = FxHashMap::default();
         let mut pending_checksums: LibraryAssetVersionValueMap = FxHashMap::default();
-        let mut pending_files: LibraryAssetVersionFileMap = FxHashMap::default();
         for record in pending {
             let crate::state::AssetRecord {
                 library,
                 id,
                 version_size,
                 checksum,
-                local_path,
-                local_checksum,
-                download_checksum,
-                downloaded_at,
                 added_at,
                 ..
             } = record;
@@ -393,24 +381,7 @@ impl DownloadContext {
                 .or_default()
                 .entry(Arc::clone(&id))
                 .or_default()
-                .insert(version_size.clone(), checksum);
-            if downloaded_at.is_some()
-                && let Some(path) = local_path
-            {
-                pending_files
-                    .entry(lib)
-                    .or_default()
-                    .entry(id)
-                    .or_default()
-                    .insert(
-                        version_size,
-                        RecordedLocalFile {
-                            path,
-                            local_checksum: local_checksum.map(String::into_boxed_str),
-                            download_checksum: download_checksum.map(String::into_boxed_str),
-                        },
-                    );
-            }
+                .insert(version_size, checksum);
         }
 
         let asset_master_mappings = mapping_rows
@@ -505,7 +476,6 @@ impl DownloadContext {
             soft_deleted_ids,
             pending_ids,
             pending_checksums,
-            pending_files,
             asset_master_mappings,
             legacy_master_state_owners,
             legacy_added_dates,
@@ -844,36 +814,6 @@ impl DownloadContext {
             operation: "select_asset_state_record_name_for_download",
             detail: "legacy owner claim retry loop ran no attempts".into(),
         })
-    }
-
-    pub(in crate::download) fn pending_file(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: VersionSizeKey,
-    ) -> Option<&RecordedLocalFile> {
-        self.pending_files
-            .get(library)
-            .and_then(|m| m.get(asset_id))
-            .and_then(|versions| versions.get(version_size.as_str()))
-    }
-
-    pub(in crate::download) fn pending_file_matching_checksum(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: VersionSizeKey,
-        provider_checksum: &str,
-    ) -> Option<&RecordedLocalFile> {
-        let stored_checksum = self
-            .pending_checksums
-            .get(library)
-            .and_then(|assets| assets.get(asset_id))
-            .and_then(|versions| versions.get(version_size.as_str()))?;
-        if stored_checksum.as_ref() != provider_checksum {
-            return None;
-        }
-        self.pending_file(library, asset_id, version_size)
     }
 
     pub(in crate::download) fn has_downloaded_without_metadata_hash(&self) -> bool {

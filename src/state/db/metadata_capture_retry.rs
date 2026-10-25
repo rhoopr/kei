@@ -1,7 +1,10 @@
 //! Durable retry scheduling for ambiguous metadata-capture identities.
 
+#[cfg(test)]
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
+#[cfg(test)]
+use rusqlite::OptionalExtension;
+use rusqlite::{Connection, params};
 use serde_json::json;
 
 use super::SqliteStateDb;
@@ -11,9 +14,13 @@ use crate::state::types::{
     MetadataCaptureCandidate, MetadataCaptureVersionEvidence, VersionSizeKey,
 };
 
+#[cfg(test)]
 const INITIAL_RETRY_SECONDS: i64 = 60 * 60;
+#[cfg(test)]
 const MAX_RETRY_SECONDS: i64 = 24 * INITIAL_RETRY_SECONDS;
+#[cfg(test)]
 const MAX_BACKOFF_SHIFT: u32 = 5;
+#[cfg(test)]
 const GENERATION_KEY: &str = "metadata_capture_retry_generation";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +29,7 @@ pub(crate) struct MetadataCaptureRetryGeneration(i64);
 struct Retry {
     evidence: String,
     target_revision: i64,
+    #[cfg(test)]
     attempts: u32,
     next_retry_at: i64,
 }
@@ -137,6 +145,7 @@ fn visit(
                 Some(_) => Some(Retry {
                     evidence: row.get(6)?,
                     target_revision: row.get(10)?,
+                    #[cfg(test)]
                     attempts: row.get(8)?,
                     next_retry_at: row.get(9)?,
                 }),
@@ -183,6 +192,7 @@ fn visit(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn candidates(
     conn: &Connection,
     library: &str,
@@ -230,6 +240,7 @@ pub(super) fn counts(
     Ok(counts)
 }
 
+#[cfg(test)]
 pub(super) fn retire_completed(conn: &Connection, library: &str) -> Result<(), StateError> {
     conn.execute(r"DELETE FROM metadata_capture_retries AS r WHERE r.library=?1 AND NOT EXISTS(SELECT 1 FROM unattributed_legacy p WHERE p.library=r.library AND p.asset_id=r.asset_id) AND NOT EXISTS (
         SELECT 1 FROM assets a LEFT JOIN asset_metadata_capture_revisions v ON v.library=a.library AND v.asset_id=a.id
@@ -243,6 +254,7 @@ impl SqliteStateDb {
     /// Retain ambiguity only while the selected identity, renditions, and retry
     /// generation still match. Returns false for stale or completed work.
     /// Database or generation errors leave the transaction unchanged.
+    #[cfg(test)]
     pub(crate) async fn defer_metadata_capture_ambiguity(
         &self,
         candidate: &MetadataCaptureCandidate,

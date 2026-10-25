@@ -223,7 +223,10 @@ async fn prove_isolation(blocked_first: bool) {
         let builder = |mode, excludes, groups, name| {
             let mut config = (*base(mode, excludes, groups, name)).clone();
             config.folder_structure = "none".into();
-            config.metadata.xmp_sidecar = false;
+            #[cfg(feature = "xmp")]
+            {
+                config.metadata.xmp_sidecar = false;
+            }
             Arc::new(config)
         };
         if cycle == 0 {

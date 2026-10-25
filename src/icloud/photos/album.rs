@@ -291,6 +291,7 @@ impl PhotoAlbum {
     /// sentinel string is enough for the operator to know the enumeration
     /// was incomplete and to correlate with the fetcher's prior
     /// `tracing::error!` log line.
+    #[cfg(test)]
     pub async fn photos(&self, limit: Option<u32>) -> anyhow::Result<Vec<PhotoAsset>> {
         use tokio_stream::StreamExt;
         let (stream, panic_rx) = self.photo_stream(limit, None, 1);

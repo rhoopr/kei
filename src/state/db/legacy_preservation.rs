@@ -14,6 +14,7 @@ use crate::state::error::StateError;
 const EVIDENCE_VERSION: i64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct LegacyPreparationSnapshot {
     pub(crate) library: String,
     pub(crate) asset_id: String,
@@ -25,6 +26,7 @@ pub(crate) struct LegacyPreparationSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct LegacyHistoricalClaim {
     pub(crate) child: String,
     pub(crate) rendition: String,
@@ -45,6 +47,7 @@ pub(crate) struct LegacyFileEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct LegacyPreservation {
     pub(crate) library: String,
     pub(crate) asset_id: String,
@@ -154,6 +157,7 @@ pub(super) fn snapshot_rows(
     Ok(json!({"columns":columns,"rows":rows}))
 }
 
+#[cfg(test)]
 fn original_evidence(conn: &Connection, library: &str, id: &str) -> Result<String, StateError> {
     let mut evidence = serde_json::Map::new();
     for (table, key) in [
@@ -238,6 +242,7 @@ pub(super) fn dependencies(
 /// child/rendition has a separate finalized source-backed current receipt.
 /// File verification remains with the download owner; this snapshot is compared
 /// again in the preparation transaction, including all family dependencies.
+#[cfg(test)]
 fn historical_claims(
     conn: &Connection,
     library: &str,
@@ -297,6 +302,7 @@ fn historical_claims(
     Ok(claims)
 }
 
+#[cfg(test)]
 fn preparation_snapshot(
     conn: &Connection,
     library: &str,
@@ -336,6 +342,7 @@ fn preparation_snapshot(
 /// Diagnostic-only snapshot after an already refused selected receipt. It never
 /// grants qualification, even if another writer has since made the row eligible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum LegacyChildReceiptRefusal {
     ChildNotReady,
     RenditionMissing,
@@ -347,6 +354,7 @@ pub(crate) enum LegacyChildReceiptRefusal {
     Unavailable,
 }
 
+#[cfg(test)]
 impl LegacyChildReceiptRefusal {
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -415,6 +423,7 @@ impl SqliteStateDb {
 
     /// Explain a missing selected receipt without writing state or changing the
     /// acceptance query. These observations can differ from the preceding read.
+    #[cfg(test)]
     pub(crate) async fn legacy_child_receipt_refusal(
         &self,
         library: &str,
@@ -463,6 +472,7 @@ impl SqliteStateDb {
         }).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn legacy_preparation_snapshots(
         &self,
         library: &str,
@@ -478,6 +488,7 @@ impl SqliteStateDb {
         }).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn prepare_legacy_preservation(
         &self,
         expected: &LegacyPreparationSnapshot,
@@ -492,6 +503,7 @@ impl SqliteStateDb {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn prepare_legacy_preservation_validated(
         &self,
         expected: &LegacyPreparationSnapshot,
@@ -556,6 +568,7 @@ impl SqliteStateDb {
         }).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn legacy_preservations(
         &self,
         library: &str,
@@ -574,6 +587,7 @@ impl SqliteStateDb {
         }).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn legacy_dependency_evidence(
         &self,
         library: &str,
@@ -587,6 +601,7 @@ impl SqliteStateDb {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn reactivate_legacy_preservation(
         &self,
         library: &str,

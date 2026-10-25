@@ -10,8 +10,7 @@ use chrono::{DateTime, Utc};
 use super::SparseIdentityProof;
 use crate::state::error::StateError;
 use crate::state::types::{
-    AssetRecord, MetadataCapture, MetadataCaptureCandidate, MetadataCaptureStatus, SyncRunStats,
-    SyncSummary, VersionSizeKey,
+    AssetRecord, MetadataCapture, SyncRunStats, SyncSummary, VersionSizeKey,
 };
 
 fn unsupported_album_membership_api(operation: &'static str) -> StateError {
@@ -1088,79 +1087,6 @@ pub trait MetadataRewriteStore: Send + Sync {
             detail: "legacy preservation is unsupported by this store".into(),
         })
     }
-    /// Diagnostic-only explanation after a selected receipt was refused. This
-    /// cannot supply a receipt or authorize progress; unsupported stores retain
-    /// the ordinary refusal without requiring a new implementation.
-    async fn legacy_child_receipt_refusal(
-        &self,
-        _library: &str,
-        _id: &str,
-        _version_size: &str,
-    ) -> Result<super::LegacyChildReceiptRefusal, StateError> {
-        Ok(super::LegacyChildReceiptRefusal::Unavailable)
-    }
-    async fn legacy_preparation_snapshots(
-        &self,
-        _library: &str,
-        _limit: usize,
-    ) -> Result<Vec<super::LegacyPreparationSnapshot>, StateError> {
-        Err(StateError::Invariant {
-            operation: "legacy_preparation_snapshots",
-            detail: "legacy preservation is unsupported by this store".into(),
-        })
-    }
-    async fn prepare_legacy_preservation(
-        &self,
-        _snapshot: &super::LegacyPreparationSnapshot,
-        _files: &[super::LegacyFileEvidence],
-    ) -> Result<bool, StateError> {
-        Err(StateError::Invariant {
-            operation: "prepare_legacy_preservation",
-            detail: "legacy preservation is unsupported by this store".into(),
-        })
-    }
-    /// Historical-claim exceptions retain verified file handles through commit.
-    async fn prepare_legacy_preservation_validated(
-        &self,
-        _snapshot: &super::LegacyPreparationSnapshot,
-        _files: &[super::LegacyFileEvidence],
-        _validate_files: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
-    ) -> Result<bool, StateError> {
-        Err(StateError::Invariant {
-            operation: "prepare_legacy_preservation_validated",
-            detail: "state store does not support validated historical claims".into(),
-        })
-    }
-    async fn legacy_preservations(
-        &self,
-        _library: &str,
-    ) -> Result<Vec<super::LegacyPreservation>, StateError> {
-        Err(StateError::Invariant {
-            operation: "legacy_preservations",
-            detail: "legacy preservation is unsupported by this store".into(),
-        })
-    }
-    async fn legacy_dependency_evidence(
-        &self,
-        _library: &str,
-        _id: &str,
-    ) -> Result<String, StateError> {
-        Err(StateError::Invariant {
-            operation: "legacy_dependency_evidence",
-            detail: "legacy preservation is unsupported by this store".into(),
-        })
-    }
-    async fn reactivate_legacy_preservation(
-        &self,
-        _library: &str,
-        _id: &str,
-        _expected_generation: Option<i64>,
-    ) -> Result<(), StateError> {
-        Err(StateError::Invariant {
-            operation: "reactivate_legacy_preservation",
-            detail: "legacy preservation is unsupported by this store".into(),
-        })
-    }
 
     async fn record_metadata_write_failure(
         &self,
@@ -1183,12 +1109,6 @@ pub trait MetadataRewriteStore: Send + Sync {
     async fn get_metadata_retry_markers(
         &self,
     ) -> Result<HashSet<(String, String, String)>, StateError>;
-    async fn get_pending_metadata_rewrites_page(
-        &self,
-        library_scope: Option<&[&str]>,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<AssetRecord>, StateError>;
     async fn get_pending_metadata_rewrites_page_for_queue(
         &self,
         queue: MetadataRewriteQueue,
@@ -1220,76 +1140,6 @@ pub trait MetadataRewriteStore: Send + Sync {
         pre_rewrite_checksum: Option<&str>,
         completion: MetadataRewriteCompletion,
     ) -> Result<bool, StateError>;
-    /// Check for live downloaded rows without a metadata hash in `library`.
-    ///
-    /// # Errors
-    /// Returns a state error if the catalogue query fails.
-    async fn has_downloaded_without_metadata_hash(&self, library: &str)
-    -> Result<bool, StateError>;
-    async fn begin_metadata_capture_revision(
-        &self,
-        _library: &str,
-        _target_revision: i64,
-    ) -> Result<MetadataCaptureStatus, StateError> {
-        Err(StateError::Invariant {
-            operation: "begin_metadata_capture_revision",
-            detail: "metadata-capture revision state is not implemented by this store".into(),
-        })
-    }
-    async fn get_metadata_capture_candidates(
-        &self,
-        _library: &str,
-        _target_revision: i64,
-        _limit: usize,
-    ) -> Result<Vec<MetadataCaptureCandidate>, StateError> {
-        Err(StateError::Invariant {
-            operation: "get_metadata_capture_candidates",
-            detail: "metadata-capture candidate reads are not implemented by this store".into(),
-        })
-    }
-    /// Persist an ambiguity schedule without accepting identity or completing work.
-    /// Returns false when the candidate is stale; errors leave work pending.
-    async fn defer_metadata_capture_ambiguity(
-        &self,
-        _candidate: &MetadataCaptureCandidate,
-        _revision: i64,
-    ) -> Result<bool, StateError> {
-        Err(StateError::Invariant {
-            operation: "defer_metadata_capture_ambiguity",
-            detail: "metadata-capture retry state is not implemented by this store".into(),
-        })
-    }
-    async fn record_metadata_capture_failure(
-        &self,
-        _library: &str,
-        _target_revision: i64,
-        _error: &str,
-    ) -> Result<(), StateError> {
-        Err(StateError::Invariant {
-            operation: "record_metadata_capture_failure",
-            detail: "metadata-capture failure state is not implemented by this store".into(),
-        })
-    }
-    async fn complete_metadata_capture_revision(
-        &self,
-        _library: &str,
-        _target_revision: i64,
-    ) -> Result<MetadataCaptureStatus, StateError> {
-        Err(StateError::Invariant {
-            operation: "complete_metadata_capture_revision",
-            detail: "metadata-capture completion is not implemented by this store".into(),
-        })
-    }
-    async fn has_metadata_capture_work(
-        &self,
-        _libraries: &[&str],
-        _target_revision: i64,
-    ) -> Result<bool, StateError> {
-        Err(StateError::Invariant {
-            operation: "has_metadata_capture_work",
-            detail: "metadata-capture work checks are not implemented by this store".into(),
-        })
-    }
 }
 
 /// One row from the read-only local manifest export.

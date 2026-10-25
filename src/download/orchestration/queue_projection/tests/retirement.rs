@@ -907,7 +907,7 @@ async fn v027_modified_completion_compacts_only_with_prepared_transfer_provenanc
 }
 
 #[tokio::test]
-async fn v027_successor_cleanup_does_not_retire_another_librarys_active_root() {
+async fn v027_successor_cleanup_does_not_retire_another_library_active_root() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(
         SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())

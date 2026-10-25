@@ -1457,82 +1457,6 @@ impl state::MetadataRewriteStore for FailingMetadataSetDb {
     ) -> Result<Vec<crate::state::AssetRecord>, crate::state::error::StateError> {
         self.inner.legacy_child_receipts(library, id).await
     }
-    async fn legacy_child_receipt_refusal(
-        &self,
-        library: &str,
-        id: &str,
-        version_size: &str,
-    ) -> Result<state::db::LegacyChildReceiptRefusal, state::error::StateError> {
-        if let Some(result) = self.receipt_diagnostic {
-            return result
-                .map_err(|message| state::error::StateError::LockPoisoned(message.into()));
-        }
-        self.inner
-            .legacy_child_receipt_refusal(library, id, version_size)
-            .await
-    }
-    async fn legacy_preparation_snapshots(
-        &self,
-        library: &str,
-        limit: usize,
-    ) -> Result<Vec<state::LegacyPreparationSnapshot>, state::error::StateError> {
-        self.inner
-            .legacy_preparation_snapshots(library, limit)
-            .await
-    }
-    async fn prepare_legacy_preservation(
-        &self,
-        snapshot: &state::LegacyPreparationSnapshot,
-        files: &[state::LegacyFileEvidence],
-    ) -> Result<bool, state::error::StateError> {
-        self.inner
-            .prepare_legacy_preservation(snapshot, files)
-            .await
-    }
-    async fn prepare_legacy_preservation_validated(
-        &self,
-        snapshot: &crate::state::db::LegacyPreparationSnapshot,
-        files: &[crate::state::db::LegacyFileEvidence],
-        validate_files: Box<dyn FnOnce() -> Result<(), crate::state::error::StateError> + Send>,
-    ) -> Result<bool, crate::state::error::StateError> {
-        if self.replace_historical_current {
-            let path = &snapshot
-                .historical_claims
-                .first()
-                .expect("qualified historical claim")
-                .current_path;
-            let bytes = std::fs::read(path).expect("current file");
-            // The production retained handle keeps the old inode alive.
-            std::fs::remove_file(path).expect("unlink current namespace entry");
-            std::fs::write(path, bytes).expect("replace current namespace entry");
-        }
-        self.inner
-            .prepare_legacy_preservation_validated(snapshot, files, validate_files)
-            .await
-    }
-    async fn legacy_preservations(
-        &self,
-        library: &str,
-    ) -> Result<Vec<state::LegacyPreservation>, state::error::StateError> {
-        self.inner.legacy_preservations(library).await
-    }
-    async fn legacy_dependency_evidence(
-        &self,
-        library: &str,
-        id: &str,
-    ) -> Result<String, state::error::StateError> {
-        self.inner.legacy_dependency_evidence(library, id).await
-    }
-    async fn reactivate_legacy_preservation(
-        &self,
-        library: &str,
-        id: &str,
-        expected_generation: Option<i64>,
-    ) -> Result<(), state::error::StateError> {
-        self.inner
-            .reactivate_legacy_preservation(library, id, expected_generation)
-            .await
-    }
 
     async fn record_metadata_write_failure(
         &self,
@@ -1588,21 +1512,6 @@ impl state::MetadataRewriteStore for FailingMetadataSetDb {
         self.inner.get_metadata_retry_markers().await
     }
 
-    async fn get_pending_metadata_rewrites_page(
-        &self,
-        library_scope: Option<&[&str]>,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
-        if offset == 0 {
-            self.drains
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        self.inner
-            .get_pending_metadata_rewrites_page(library_scope, offset, limit)
-            .await
-    }
-
     async fn get_pending_metadata_rewrites_page_for_queue(
         &self,
         queue: state::db::MetadataRewriteQueue,
@@ -1649,77 +1558,6 @@ impl state::MetadataRewriteStore for FailingMetadataSetDb {
                 pre_rewrite_checksum,
                 completion,
             )
-            .await
-    }
-
-    async fn has_downloaded_without_metadata_hash(
-        &self,
-        library: &str,
-    ) -> Result<bool, state::error::StateError> {
-        self.inner
-            .has_downloaded_without_metadata_hash(library)
-            .await
-    }
-
-    async fn begin_metadata_capture_revision(
-        &self,
-        library: &str,
-        target_revision: i64,
-    ) -> Result<state::MetadataCaptureStatus, state::error::StateError> {
-        self.inner
-            .begin_metadata_capture_revision(library, target_revision)
-            .await
-    }
-
-    async fn get_metadata_capture_candidates(
-        &self,
-        library: &str,
-        target_revision: i64,
-        limit: usize,
-    ) -> Result<Vec<state::MetadataCaptureCandidate>, state::error::StateError> {
-        self.inner
-            .get_metadata_capture_candidates(library, target_revision, limit)
-            .await
-    }
-
-    async fn defer_metadata_capture_ambiguity(
-        &self,
-        candidate: &state::MetadataCaptureCandidate,
-        revision: i64,
-    ) -> Result<bool, state::error::StateError> {
-        self.inner
-            .defer_metadata_capture_ambiguity(candidate, revision)
-            .await
-    }
-
-    async fn record_metadata_capture_failure(
-        &self,
-        library: &str,
-        target_revision: i64,
-        error: &str,
-    ) -> Result<(), state::error::StateError> {
-        self.inner
-            .record_metadata_capture_failure(library, target_revision, error)
-            .await
-    }
-
-    async fn complete_metadata_capture_revision(
-        &self,
-        library: &str,
-        target_revision: i64,
-    ) -> Result<state::MetadataCaptureStatus, state::error::StateError> {
-        self.inner
-            .complete_metadata_capture_revision(library, target_revision)
-            .await
-    }
-
-    async fn has_metadata_capture_work(
-        &self,
-        libraries: &[&str],
-        target_revision: i64,
-    ) -> Result<bool, state::error::StateError> {
-        self.inner
-            .has_metadata_capture_work(libraries, target_revision)
             .await
     }
 }

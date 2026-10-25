@@ -609,7 +609,10 @@ async fn baseline_contract(
             .clone();
             previous.folder_structure = "none".into();
             previous.edited_naming = crate::types::EditedNaming::Suffix;
-            previous.metadata.xmp_sidecar = false;
+            #[cfg(feature = "xmp")]
+            {
+                previous.metadata.xmp_sidecar = false;
+            }
             db.set_metadata(
                 download::DOWNLOAD_CONFIG_HASH_KEY,
                 &download::hash_download_config(&previous),
@@ -656,7 +659,10 @@ async fn baseline_contract(
             if recorded_only::enabled() && cycle == 2 {
                 configured.folder_structure = "changed-template".into();
             }
-            configured.metadata.xmp_sidecar = metadata_enabled;
+            #[cfg(feature = "xmp")]
+            {
+                configured.metadata.xmp_sidecar = metadata_enabled;
+            }
             if initial_failure {
                 configured.retry.max_retries = 0;
             }

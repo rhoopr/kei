@@ -20,22 +20,19 @@ pub(crate) use db::{
 pub use db::ImportedRecord;
 pub(crate) use db::{
     AssetVerificationState, CheckpointTransition, DownloadContextStateStore, DownloadedFileRecord,
-    LegacyFileEvidence, LegacyPreservation, OwnedTempFile, PendingPublicationRecord,
-    ReconciliationCatalogPath, ReconciliationContent, ReconciliationPathKey,
-    ReconciliationReservation, ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken,
-    TempFileOwnershipStore,
+    LegacyFileEvidence, OwnedTempFile, PendingPublicationRecord, ReconciliationCatalogPath,
+    ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
+    ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken, TempFileOwnershipStore,
 };
 pub use db::{
     DownloadStateStore, ImportStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore,
     SqliteStateDb, SyncTokenStore,
 };
-#[cfg(test)]
-pub(crate) use types::MetadataCaptureStatus;
+pub(crate) use types::METADATA_CAPTURE_REVISION;
 pub use types::{
     AssetMetadata, AssetRecord, AssetStatus, MediaType, MetadataCapture, RenditionMetadata,
     SyncRunStats, VersionSizeKey,
 };
-pub(crate) use types::{METADATA_CAPTURE_REVISION, MetadataCaptureCandidate};
 
 /// Durable per-zone evidence of asset deltas that cannot yet be hydrated.
 /// Cleared atomically with a proven replacement provider checkpoint only.
@@ -44,6 +41,3 @@ pub(crate) const UNRESOLVED_IDENTITY_PREFIX: &str = "unresolved_asset_identity:"
 pub(crate) fn unresolved_identity_key(zone: &str) -> String {
     format!("{UNRESOLVED_IDENTITY_PREFIX}{zone}")
 }
-
-#[cfg(test)]
-pub(crate) use db::LegacyPreparationSnapshot;

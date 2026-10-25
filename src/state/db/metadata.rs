@@ -21,9 +21,9 @@ use super::{
     PendingMetadataRewrite, SqliteStateDb,
 };
 use crate::state::error::StateError;
-use crate::state::types::{
-    AssetRecord, MetadataCapture, MetadataCaptureCandidate, MetadataCaptureStatus, VersionSizeKey,
-};
+#[cfg(test)]
+use crate::state::types::{AssetRecord, MetadataCaptureCandidate};
+use crate::state::types::{MetadataCapture, MetadataCaptureStatus, VersionSizeKey};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetadataRewriteTarget {
@@ -846,6 +846,7 @@ impl SqliteStateDb {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn get_pending_metadata_rewrites_page(
         &self,
         library_scope: Option<&[&str]>,
@@ -1091,6 +1092,7 @@ impl SqliteStateDb {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn has_downloaded_without_metadata_hash(
         &self,
         library: &str,
@@ -1110,6 +1112,7 @@ impl SqliteStateDb {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn begin_metadata_capture_revision(
         &self,
         library: &str,
@@ -1176,6 +1179,7 @@ impl SqliteStateDb {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn get_metadata_capture_candidates(
         &self,
         library: &str,
@@ -1195,6 +1199,7 @@ impl SqliteStateDb {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_metadata_capture_failure(
         &self,
         library: &str,
@@ -1216,6 +1221,7 @@ impl SqliteStateDb {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn complete_metadata_capture_revision(
         &self,
         library: &str,
@@ -1251,6 +1257,7 @@ impl SqliteStateDb {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn has_metadata_capture_work(
         &self,
         libraries: &[&str],
@@ -1459,58 +1466,6 @@ impl MetadataRewriteStore for SqliteStateDb {
     ) -> Result<Vec<crate::state::AssetRecord>, crate::state::error::StateError> {
         SqliteStateDb::legacy_child_receipts(self, library, id).await
     }
-    async fn legacy_child_receipt_refusal(
-        &self,
-        library: &str,
-        id: &str,
-        version_size: &str,
-    ) -> Result<super::LegacyChildReceiptRefusal, StateError> {
-        SqliteStateDb::legacy_child_receipt_refusal(self, library, id, version_size).await
-    }
-    async fn legacy_preparation_snapshots(
-        &self,
-        library: &str,
-        limit: usize,
-    ) -> Result<Vec<super::LegacyPreparationSnapshot>, StateError> {
-        SqliteStateDb::legacy_preparation_snapshots(self, library, limit).await
-    }
-    async fn prepare_legacy_preservation(
-        &self,
-        snapshot: &super::LegacyPreparationSnapshot,
-        files: &[super::LegacyFileEvidence],
-    ) -> Result<bool, StateError> {
-        SqliteStateDb::prepare_legacy_preservation(self, snapshot, files).await
-    }
-    async fn prepare_legacy_preservation_validated(
-        &self,
-        snapshot: &crate::state::db::LegacyPreparationSnapshot,
-        files: &[crate::state::db::LegacyFileEvidence],
-        validate_files: Box<dyn FnOnce() -> Result<(), crate::state::error::StateError> + Send>,
-    ) -> Result<bool, crate::state::error::StateError> {
-        SqliteStateDb::prepare_legacy_preservation_validated(self, snapshot, files, validate_files)
-            .await
-    }
-    async fn legacy_preservations(
-        &self,
-        library: &str,
-    ) -> Result<Vec<super::LegacyPreservation>, StateError> {
-        SqliteStateDb::legacy_preservations(self, library).await
-    }
-    async fn legacy_dependency_evidence(
-        &self,
-        library: &str,
-        id: &str,
-    ) -> Result<String, StateError> {
-        SqliteStateDb::legacy_dependency_evidence(self, library, id).await
-    }
-    async fn reactivate_legacy_preservation(
-        &self,
-        library: &str,
-        id: &str,
-        expected_generation: Option<i64>,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::reactivate_legacy_preservation(self, library, id, expected_generation).await
-    }
 
     async fn record_metadata_write_failure(
         &self,
@@ -1552,15 +1507,6 @@ impl MetadataRewriteStore for SqliteStateDb {
         &self,
     ) -> Result<HashSet<(String, String, String)>, StateError> {
         SqliteStateDb::get_metadata_retry_markers(self).await
-    }
-
-    async fn get_pending_metadata_rewrites_page(
-        &self,
-        library_scope: Option<&[&str]>,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        SqliteStateDb::get_pending_metadata_rewrites_page(self, library_scope, offset, limit).await
     }
 
     async fn get_pending_metadata_rewrites_page_for_queue(
@@ -1622,63 +1568,6 @@ impl MetadataRewriteStore for SqliteStateDb {
             completion,
         )
         .await
-    }
-
-    async fn has_downloaded_without_metadata_hash(
-        &self,
-        library: &str,
-    ) -> Result<bool, StateError> {
-        SqliteStateDb::has_downloaded_without_metadata_hash(self, library).await
-    }
-
-    async fn begin_metadata_capture_revision(
-        &self,
-        library: &str,
-        target_revision: i64,
-    ) -> Result<MetadataCaptureStatus, StateError> {
-        SqliteStateDb::begin_metadata_capture_revision(self, library, target_revision).await
-    }
-
-    async fn get_metadata_capture_candidates(
-        &self,
-        library: &str,
-        target_revision: i64,
-        limit: usize,
-    ) -> Result<Vec<MetadataCaptureCandidate>, StateError> {
-        SqliteStateDb::get_metadata_capture_candidates(self, library, target_revision, limit).await
-    }
-
-    async fn defer_metadata_capture_ambiguity(
-        &self,
-        candidate: &MetadataCaptureCandidate,
-        revision: i64,
-    ) -> Result<bool, StateError> {
-        SqliteStateDb::defer_metadata_capture_ambiguity(self, candidate, revision).await
-    }
-
-    async fn record_metadata_capture_failure(
-        &self,
-        library: &str,
-        target_revision: i64,
-        error: &str,
-    ) -> Result<(), StateError> {
-        SqliteStateDb::record_metadata_capture_failure(self, library, target_revision, error).await
-    }
-
-    async fn complete_metadata_capture_revision(
-        &self,
-        library: &str,
-        target_revision: i64,
-    ) -> Result<MetadataCaptureStatus, StateError> {
-        SqliteStateDb::complete_metadata_capture_revision(self, library, target_revision).await
-    }
-
-    async fn has_metadata_capture_work(
-        &self,
-        libraries: &[&str],
-        target_revision: i64,
-    ) -> Result<bool, StateError> {
-        SqliteStateDb::has_metadata_capture_work(self, libraries, target_revision).await
     }
 }
 

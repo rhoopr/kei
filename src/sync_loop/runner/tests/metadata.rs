@@ -1973,7 +1973,12 @@ async fn run_cycle_full_enumeration_reports_a_failed_rewrite_once() {
         );
         assert!(
             !inner
-                .get_pending_metadata_rewrites_page(None, 0, 10)
+                .get_pending_metadata_rewrites_page_for_queue(
+                    crate::state::db::MetadataRewriteQueue::Ordinary,
+                    None,
+                    0,
+                    10
+                )
                 .await
                 .expect("read markers")
                 .is_empty(),
@@ -2230,7 +2235,12 @@ async fn run_cycle_full_enumeration_writes_no_metadata_in_read_only_modes() {
         );
         assert!(
             !inner
-                .get_pending_metadata_rewrites_page(None, 0, 10)
+                .get_pending_metadata_rewrites_page_for_queue(
+                    crate::state::db::MetadataRewriteQueue::Ordinary,
+                    None,
+                    0,
+                    10
+                )
                 .await
                 .expect("read markers")
                 .is_empty(),

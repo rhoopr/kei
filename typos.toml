@@ -1,6 +1,10 @@
 # Typos configuration
 # https://github.com/crate-ci/typos
 
+[default.extend-identifiers]
+# Fixed independently generated MMCS signature vector; never respell encoded bytes.
+AdUe8DVoya7UFYhP4m3tMm6E5HAS = "AdUe8DVoya7UFYhP4m3tMm6E5HAS"
+
 [default.extend-words]
 # HSA = Apple's authentication system term (Hardware Security Authentication)
 hsa = "hsa"

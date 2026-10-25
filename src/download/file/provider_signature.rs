@@ -2,7 +2,7 @@
 //!
 //! OpenBubbles/rustpush prepare_cloudkit_put uses prefix 0x01 with SHA-1
 //! over two NUL-terminated salts followed by every plaintext byte:
-//! https://github.com/OpenBubbles/rustpush/blob/b3c96c23e1aae78d1229ebaccb12027624f1eaff/src/icloud/mmcs.rs
+//! <https://github.com/OpenBubbles/rustpush/blob/b3c96c23e1aae78d1229ebaccb12027624f1eaff/src/icloud/mmcs.rs>
 //! This is NOT raw SHA-1 or local SHA-256. Keyed prefix 0x04 and unknown
 //! encodings are unsupported. Current provider identity is checked separately.
 //! Interpret this only as the selected resource's fileChecksum: other MMCS

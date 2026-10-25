@@ -387,6 +387,18 @@ coincide. Distinct database/owner scopes sharing a legacy zone-name key fail clo
 rather than merge identities. Completely unindexed arbitrary renames/moves remain
 outside the current candidate discovery coverage.
 
+Fallback receipt commits use a disposable connection-local TEMP index of pending
+path candidates. It follows the existing protected-path cache protocol: writes
+to generation, decision or destination rows invalidate it transactionally;
+external commits, schema changes and reopen require rebuilding. Candidate hits
+still receive full ownership validation in the commit transaction. It holds no
+completion proof and adds no persistent ledger.
+
+Historical attribution and automatic metadata-capture constructors are compiled
+only for old-state fixtures. Their production trait surfaces have been removed;
+retained retry counts, explicit metadata queues and unfinished-operation guards
+remain live.
+
 Normal path reconciliation now recovers recorded journals only. It does not
 plan new layout convergence. Unfinished operations retain their bookkeeping and
 configuration/checkpoint guards. The removed LegacyCycle orchestrator no longer

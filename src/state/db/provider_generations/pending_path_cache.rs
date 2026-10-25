@@ -13,7 +13,8 @@ struct Version {
 }
 
 fn version(conn: &Connection) -> Result<Version, StateError> {
-    let cwd = std::env::current_dir().map_err(|_| StateError::ProviderSelectionInvalid)?;
+    let cwd =
+        std::env::current_dir().map_err(|_private_error| StateError::ProviderSelectionInvalid)?;
     Ok(Version {
         data: conn.query_row("PRAGMA main.data_version", [], |r| r.get(0))?,
         schema: conn.query_row("PRAGMA main.schema_version", [], |r| r.get(0))?,

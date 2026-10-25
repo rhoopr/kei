@@ -259,7 +259,10 @@ async fn selected_contract(selection: Selection, incomplete_window: bool) {
             let mut config = (*base(mode, exclude, groups, zone)).clone();
             config.folder_structure = "none".into();
             config.folder_structure_smart_folders = "selected".into();
-            config.metadata.xmp_sidecar = false;
+            #[cfg(feature = "xmp")]
+            {
+                config.metadata.xmp_sidecar = false;
+            }
             if matches!(selection, Selection::Recent) {
                 config.recent = Some(if incomplete_window { 2 } else { 1 });
             }

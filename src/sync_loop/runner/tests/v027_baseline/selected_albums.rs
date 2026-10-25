@@ -240,7 +240,10 @@ async fn v027_album_relation_only_changes_route_new_copies_and_unfiled_after_reo
             let mut config = (*base(mode, exclude, groups, zone)).clone();
             config.folder_structure = "unfiled".into();
             config.folder_structure_albums = "albums/{album}".into();
-            config.metadata.xmp_sidecar = false;
+            #[cfg(feature = "xmp")]
+            {
+                config.metadata.xmp_sidecar = false;
+            }
             Arc::new(config)
         };
         let result = run_cycle(

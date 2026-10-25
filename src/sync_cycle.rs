@@ -1372,7 +1372,7 @@ pub(crate) async fn run_cycle(
             &lib_state.plan.passes,
             &download_config,
             download_controls,
-            &shutdown_token,
+            shutdown_token,
         )
         .await
         {

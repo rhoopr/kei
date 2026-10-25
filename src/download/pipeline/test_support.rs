@@ -457,15 +457,6 @@ impl MetadataRewriteStore for FailingDownloadStore {
         Ok(HashSet::new())
     }
 
-    async fn get_pending_metadata_rewrites_page(
-        &self,
-        _: Option<&[&str]>,
-        _: usize,
-        _: usize,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        Ok(Vec::new())
-    }
-
     async fn get_pending_metadata_rewrites_page_for_queue(
         &self,
         _: crate::state::db::MetadataRewriteQueue,
@@ -505,61 +496,6 @@ impl MetadataRewriteStore for FailingDownloadStore {
                     | crate::state::db::MetadataRewriteCompletion::Both
             )
         ))
-    }
-
-    async fn has_downloaded_without_metadata_hash(&self, _: &str) -> Result<bool, StateError> {
-        Ok(false)
-    }
-
-    async fn begin_metadata_capture_revision(
-        &self,
-        library: &str,
-        target_revision: i64,
-    ) -> Result<crate::state::MetadataCaptureStatus, StateError> {
-        Ok(crate::state::MetadataCaptureStatus {
-            unattributed_legacy_assets: 0,
-            unattributed_legacy_pending: 0,
-            library: library.to_owned(),
-            active_revision: target_revision,
-            pending_revision: None,
-            processed_assets: 0,
-            failed_assets: 0,
-            remaining_assets: 0,
-            unresolved_assets: 0,
-            deferred_assets: 0,
-            last_error: None,
-        })
-    }
-
-    async fn get_metadata_capture_candidates(
-        &self,
-        _: &str,
-        _: i64,
-        _: usize,
-    ) -> Result<Vec<crate::state::MetadataCaptureCandidate>, StateError> {
-        Ok(Vec::new())
-    }
-
-    async fn record_metadata_capture_failure(
-        &self,
-        _: &str,
-        _: i64,
-        _: &str,
-    ) -> Result<(), StateError> {
-        Ok(())
-    }
-
-    async fn complete_metadata_capture_revision(
-        &self,
-        library: &str,
-        target_revision: i64,
-    ) -> Result<crate::state::MetadataCaptureStatus, StateError> {
-        self.begin_metadata_capture_revision(library, target_revision)
-            .await
-    }
-
-    async fn has_metadata_capture_work(&self, _: &[&str], _: i64) -> Result<bool, StateError> {
-        Ok(false)
     }
 }
 

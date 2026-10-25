@@ -801,13 +801,9 @@ async fn issue_770_recovery_refuses_ordinary_cross_parent_replay_and_outside_roo
     let hidden_config = config.with_pass(&hidden);
     let db = config.state_db.as_ref().unwrap();
     let ledger = db.get_reconciliation_reservations().await.unwrap();
-    for reconciliation in [false, true] {
+    {
         let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
-        let plan = if reconciliation {
-            planner.plan_download_asset(&asset, &hidden_config).await
-        } else {
-            planner.plan_download_asset(&asset, &hidden_config).await
-        };
+        let plan = planner.plan_download_asset(&asset, &hidden_config).await;
         let error = plan.err().unwrap();
         assert!(
             error.to_string().contains("left its requested directory"),

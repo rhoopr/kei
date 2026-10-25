@@ -29,26 +29,16 @@ struct InventoryBudget {
 /// Only fixed categories and aggregate counts may reach normal logs.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LegacyInventoryDiagnostic {
-    pub(crate) reason: &'static str,
     pub(crate) phase: &'static str,
     pub(crate) subreason: &'static str,
     pub(crate) eof_observed: bool,
-    pub(crate) family_context: &'static str,
-    pub(crate) child_soft_deleted: bool,
     pub(crate) pages: usize,
     pub(crate) records: usize,
     pub(crate) transferred_bytes: usize,
     pub(crate) retained_bytes: usize,
     pub(crate) scope_mismatch_component: &'static str,
-    pub(crate) expected_owner: &'static str,
-    pub(crate) expected_owner_type: &'static str,
     pub(crate) supplied_owner: &'static str,
     pub(crate) supplied_owner_type: &'static str,
-    pub(crate) elapsed_secs: f64,
-    pub(crate) page_budget: usize,
-    pub(crate) record_budget: usize,
-    pub(crate) page_byte_budget: usize,
-    pub(crate) retained_byte_budget: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -96,7 +86,6 @@ pub(crate) fn classify_legacy_inventory_error(
     error
         .downcast_ref::<InventoryFailureKind>()
         .map(|kind| LegacyInventoryDiagnostic {
-            reason: kind.as_str(),
             subreason: kind.subreason(),
             ..LegacyInventoryDiagnostic::default()
         })
