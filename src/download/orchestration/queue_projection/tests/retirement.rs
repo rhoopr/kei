@@ -1970,3 +1970,129 @@ async fn v027_path_lookup_keeps_native_non_utf8_collision_owners() {
 }
 
 mod lookup_measurement;
+
+#[tokio::test]
+async fn v027_path_cache_absence_invalidates_on_local_external_and_rolled_back_changes() {
+    use crate::state::db::provider_generations::pending_destination_reservations_for_path;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open_owned(&db_path, &owner()).await.unwrap());
+    let root = db
+        .begin_selection_generation(owner(), spec(), BUDGET)
+        .await
+        .unwrap();
+    let media = dir.path().join("media");
+    let first = media.join("0/changed.JPG");
+    let second = media.join("1/changed.JPG");
+    {
+        let conn = db.acquire_lock("prime empty candidate cache").unwrap();
+        assert!(
+            pending_destination_reservations_for_path(&conn, &first)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let (_, tasks, _) = admission(&db, &root.id, &media, 0, false, BUDGET).await;
+    assert_eq!(tasks[0].download_path, first);
+    {
+        let conn = db
+            .acquire_lock("local insertion replaces cached absence")
+            .unwrap();
+        assert_eq!(
+            pending_destination_reservations_for_path(&conn, &first)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            pending_destination_reservations_for_path(&conn, &second)
+                .unwrap()
+                .is_empty()
+        );
+        conn.execute_batch("SAVEPOINT malformed_pending").unwrap();
+        conn.execute(
+            "UPDATE provider_active_decisions SET manifest_hash='invalid' WHERE generation=?1",
+            [&root.id],
+        )
+        .unwrap();
+        assert!(pending_destination_reservations_for_path(&conn, &second).is_err());
+        conn.execute_batch("ROLLBACK TO malformed_pending; RELEASE malformed_pending")
+            .unwrap();
+        assert_eq!(
+            pending_destination_reservations_for_path(&conn, &first)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    let other = Arc::new(SqliteStateDb::open_owned(&db_path, &owner()).await.unwrap());
+    let (_, external, _) = admission(&other, &root.id, &media, 1, false, BUDGET).await;
+    assert_eq!(external[0].download_path, second);
+    {
+        let conn = db
+            .acquire_lock("external insertion invalidates cached absence")
+            .unwrap();
+        assert_eq!(
+            pending_destination_reservations_for_path(&conn, &second)
+                .unwrap()
+                .len(),
+            1
+        );
+        conn.execute_batch("CREATE TABLE measurement_schema_drift(value TEXT)")
+            .unwrap();
+        assert_eq!(
+            pending_destination_reservations_for_path(&conn, &first)
+                .unwrap()
+                .len(),
+            1
+        );
+        conn.execute_batch("PRAGMA query_only=ON").unwrap();
+        assert_eq!(
+            pending_destination_reservations_for_path(&conn, &second)
+                .unwrap()
+                .len(),
+            1
+        );
+        conn.execute_batch("PRAGMA query_only=OFF").unwrap();
+    }
+    publish(&other, &external[0]).await;
+    {
+        let conn = db
+            .acquire_lock("external completion retires only completed candidate")
+            .unwrap();
+        assert!(
+            pending_destination_reservations_for_path(&conn, &second)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            pending_destination_reservations_for_path(&conn, &first)
+                .unwrap()
+                .len(),
+            1
+        );
+        let durable_cache: i64 = conn.query_row(
+            "SELECT count(*) FROM main.sqlite_master WHERE name LIKE 'pending_path_candidates%'",
+            [],|r|r.get(0)).unwrap();
+        assert_eq!(durable_cache, 0);
+    }
+    drop(other);
+    drop(db);
+    let reopened = SqliteStateDb::open_owned(&db_path, &owner()).await.unwrap();
+    let conn = reopened
+        .acquire_lock("reopen rebuilds only disposable candidates")
+        .unwrap();
+    assert_eq!(
+        pending_destination_reservations_for_path(&conn, &first)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        pending_destination_reservations_for_path(&conn, &second)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!first.exists());
+    assert_eq!(std::fs::read(second).unwrap(), RAW);
+}

@@ -405,3 +405,65 @@ acceptance slice in 21.51s, with five explicit probes/workers ignored (including
 the measurement workload already run separately). Formatting and diff checks
 passed. Final broad lint/features/platform checks and independent exact-head
 review are still outstanding.
+
+### Bounded fallback candidate-cache change
+
+The fallback receipt commit now reuses a connection-local TEMP candidate index,
+following the repository's existing protected-path cache protocol. It is derived
+from the original hash-checked manifest path declarations; it is not a second
+durable ledger, receipt owner or completion proof. Every possible collision still
+runs full current manifest/root/scope validation inside the caller transaction.
+
+TEMP triggers invalidate on any insert, update or delete in the three active
+generation/decision/destination tables. Their invalidation rolls back with the
+underlying write. External commits, main-schema changes and working-directory
+changes also invalidate; reopening has no cached state. Query-only connections
+use the uncached path. Candidate reads outside a caller transaction now take one
+read transaction so exclusion and authoritative validation share a snapshot.
+Routine asset/master mapping updates do not invalidate pending path evidence;
+their identity checks remain live in the existing commit path.
+
+The focused controls cover cached absence followed by local and external
+admission, malformed evidence with rollback, external completion, schema drift,
+query-only use, configuration changes, case/dot/AM-PM/native aliases and reopen.
+No persistent schema or general cache API was introduced. Stable pending work
+can reuse the index; real changes to pending evidence deliberately rebuild it.
+Performance with a constantly changing pending set is not claimed constant.
+
+Population terminology: this lookup considers distinct current-format decisions
+with an admitted, unverified destination, not total scanned files or all old
+recovery obligations. Completed destinations leave that set during baseline;
+completed bulky evidence also drains. No historical reporter counter establishes
+40,000 simultaneous pending candidates. The earlier 97-minute arithmetic used
+40,000 calls at a fixed 1,000-pending population. A hypothetical linear projection
+of the old 145ms/call to 40,000 pending gives 5.8s/call and about 64 hours for 40,000
+calls with that population held constant. Those are unobserved arithmetic
+scenarios; a growing/draining population has a different cumulative cost, and
+the disposable index changes repeated-call behavior when pending evidence is
+stable.
+
+Same optimized six-case workload after the disposable candidate index:
+
+| Pending | Ten path lookups before | Ten path lookups after | Fallback two-pass baseline before | Fallback two-pass baseline after |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 0.000320s | 0.001106s | 0.018539s | 0.018579s |
+| 100 | 0.138566s | 0.022067s | 0.366401s | 0.307232s |
+| 1,000 | 1.451884s | 0.163807s | 2.543877s | 2.303657s |
+
+The ten-call after measurement includes the initial candidate rebuild plus
+subsequent cached queries; it is not a separately measured warm-call latency.
+Do not multiply its average by 40,000 to produce a new ETA. Stable repeated
+lookups no longer rehash unrelated manifests on every call. Real pending changes
+still invalidate that index. The two-pass fallback still performs three
+unchanged full-reader startup calls, explaining its smaller total improvement.
+Selected-ledger baseline and quiet timings remain similar (1,000 pending:
+1.180s baseline; 15-16ms quiet). Fallback quiet remains about 512ms at that size
+and makes neither reservation reader call.
+
+The workload passed with media/no-repeat-transfer and pending-conservation
+assertions. The same optimized binary passed 111 affected v027 tests with five
+explicit probes/workers ignored. Focused cached-absence invalidation tests,
+formatting and diff checks passed. No 40,000-item experiment, live account call,
+schema migration or publication occurred. Further broad qualification and
+independent review remain required; this checkpoint addresses the demonstrated
+stable-pending fallback rescan rather than expanding into other startup costs.

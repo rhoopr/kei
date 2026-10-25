@@ -20,6 +20,7 @@ use super::rows::encode_asset_date;
 use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
 
+mod pending_path_cache;
 mod retirement;
 
 #[cfg(test)]
@@ -2168,7 +2169,14 @@ pub(crate) fn pending_destination_reservations_for_path(
     #[cfg(test)]
     PATH_RESERVATION_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let chosen = super::primary_layout::path_key(path)?;
-    pending_reservations(conn, Some(&chosen))
+    if conn.is_autocommit() {
+        let tx = conn.unchecked_transaction()?;
+        let result = pending_reservations(&tx, Some(&chosen))?;
+        tx.commit()?;
+        Ok(result)
+    } else {
+        pending_reservations(conn, Some(&chosen))
+    }
 }
 
 #[cfg(test)]
@@ -2188,13 +2196,12 @@ pub(crate) fn take_reservation_read_counts() -> (usize, usize) {
     )
 }
 
-fn pending_manifest_may_collide(
+fn pending_manifest_paths(
     conn: &Connection,
     generation: &str,
     key: &str,
     child: &str,
-    chosen: &str,
-) -> Result<bool, StateError> {
+) -> Result<Vec<String>, StateError> {
     let (length, hash): (i64, String) = conn.query_row(
         "SELECT length(manifest),manifest_hash FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
         params![generation,key,child], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -2231,7 +2238,7 @@ fn pending_manifest_may_collide(
         return invalid();
     }
     let mut declared = HashSet::new();
-    let mut collision = false;
+    let mut paths = Vec::new();
     for destination in &manifest.decision.destinations {
         let path = destination.path.to_path();
         if super::provider_selection::SelectionPath::from_path(&path) != destination.path {
@@ -2239,7 +2246,7 @@ fn pending_manifest_may_collide(
         }
         crate::fs_util::confined_path_key(&path)
             .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
-        collision |= super::primary_layout::path_key(&path)? == chosen;
+        paths.push(super::primary_layout::path_key(&path)?);
         if !declared.insert((destination.version_size.clone(), destination.path.key()?)) {
             return invalid();
         }
@@ -2252,13 +2259,10 @@ fn pending_manifest_may_collide(
     if saved != declared {
         return invalid();
     }
-    Ok(collision)
+    Ok(paths)
 }
 
-fn pending_reservations(
-    conn: &Connection,
-    chosen: Option<&str>,
-) -> Result<Vec<super::ReconciliationReservation>, StateError> {
+fn pending_keys(conn: &Connection) -> Result<Vec<(String, String, String)>, StateError> {
     let mut query = conn.prepare(
         "SELECT DISTINCT w.generation,w.pass_key,w.child
          FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation
@@ -2275,13 +2279,19 @@ fn pending_reservations(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    Ok(keys)
+}
+
+fn pending_reservations(
+    conn: &Connection,
+    chosen: Option<&str>,
+) -> Result<Vec<super::ReconciliationReservation>, StateError> {
+    let keys = match chosen {
+        Some(chosen) => pending_path_cache::candidates(conn, chosen)?,
+        None => pending_keys(conn)?,
+    };
     let mut reservations = Vec::new();
     for (generation, key, child) in keys {
-        if let Some(chosen) = chosen
-            && !pending_manifest_may_collide(conn, &generation, &key, &child, chosen)?
-        {
-            continue;
-        }
         let root = load_generation(conn, &generation)?;
         let manifest = load_decision(conn, &root, &key, &child)?;
         let library = root
