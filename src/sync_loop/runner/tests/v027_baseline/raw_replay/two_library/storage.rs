@@ -252,14 +252,20 @@ fn owner_snapshot(db: &SqliteStateDb) -> Vec<Vec<rusqlite::types::Value>> {
     reason = "synthetic storage measurements are test evidence"
 )]
 async fn storage_contract(fault: Fault) {
+    let fairness = ASSESS_FAIRNESS
+        .try_with(|enabled| *enabled)
+        .unwrap_or(false);
     let refresh_fault = ASSESS_REFRESH_FAULT.try_with(|point| *point).unwrap_or(0);
     let partial = ASSESS_PARTIAL.try_with(|enabled| *enabled).unwrap_or(false);
     let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
     let server = crate::start_wiremock_or_skip!();
+    let expiry_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     for i in 0..4 {
         Mock::given(method("GET"))
             .and(path(format!("/live-{i}")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA).set_delay(
+                std::time::Duration::from_millis(if fairness { 150 } else { 0 }),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -272,7 +278,13 @@ async fn storage_contract(fault: Fault) {
         .await;
     Mock::given(method("GET"))
         .and(path("/blocked"))
-        .respond_with(ResponseTemplate::new(503))
+        .respond_with({
+            let seen = expiry_seen.clone();
+            move |_: &wiremock::Request| {
+                seen.store(true, Ordering::SeqCst);
+                ResponseTemplate::new(if fairness { 410 } else { 503 })
+            }
+        })
         .mount(&server)
         .await;
     if partial {
@@ -392,12 +404,39 @@ async fn storage_contract(fault: Fault) {
             changes: Arc::new(AtomicUsize::new(0)),
             boundaries: Arc::new(AtomicUsize::new(0)),
         };
-        let healthy = selected(db.clone(), healthy_zone(), Box::new(session.clone())).await;
+        let mut healthy = selected(db.clone(), healthy_zone(), Box::new(session.clone())).await;
+        if fairness {
+            let mut album = crate::icloud::photos::PhotoAlbum::new(
+                crate::icloud::photos::PhotoAlbumConfig {
+                    params: Arc::default(),
+                    service_endpoint:
+                        "https://synthetic.example/database/1/photos/production/private".into(),
+                    name: "".into(),
+                    list_type: "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
+                    obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
+                    query_filter: None,
+                    page_size: 1,
+                    zone_id: Arc::new(healthy_zone()),
+                    retry_config: crate::retry::RetryConfig::default(),
+                    container_id: None,
+                    cross_zone_sources: Vec::new(),
+                },
+                Box::new(FairPaged(session.clone(), expiry_seen.clone())),
+            );
+            album.set_shadow_capture(
+                ShadowCapture::new(db.clone(), baseline_owner(), "com"),
+                "private".into(),
+            );
+            healthy.plan.passes[0].album = album;
+        }
         let blocked = selected(db.clone(), zone(), Box::new(Unavailable)).await;
         let base = make_run_cycle_download_config_builder(&root, db.clone());
         let builder = |mode, exclude, groups, name| {
             let mut config = (*base(mode, exclude, groups, name)).clone();
             configure(&mut config);
+            if fairness {
+                config.concurrent_downloads = 2;
+            }
             Arc::new(config)
         };
         if step == 2 && fault != Fault::None {
@@ -421,7 +460,7 @@ async fn storage_contract(fault: Fault) {
                 .execute_batch("DROP TRIGGER storage_fault")
                 .unwrap();
         }
-        if cycle == 5 {
+        if cycle == 5 || (fairness && cycle > 0) {
             db.make_selection_retry_due(baseline_owner(), "asset-live-blocked".into())
                 .await
                 .unwrap();
@@ -698,6 +737,19 @@ async fn storage_contract(fault: Fault) {
         measurements.push(sample);
     }
     println!("STORAGE_MEASUREMENTS {fault:?} {}", json!(measurements));
+    if fairness {
+        let expired = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/blocked")
+            .count();
+        assert!(
+            (5..=10).contains(&expired),
+            "five failing cycles retain bounded first+cleanup attempts: {expired}"
+        );
+    }
     server.verify().await;
 }
 
@@ -768,4 +820,55 @@ async fn changed_master_partial_seal_rollback_reopens() {
             ),
         )
         .await;
+}
+
+tokio::task_local! {static ASSESS_FAIRNESS: bool;}
+#[tokio::test]
+async fn v027_persistent_expiry_keeps_delayed_peers_progressing_across_quiet_reopen() {
+    ASSESS_FAIRNESS
+        .scope(true, storage_contract(Fault::None))
+        .await;
+}
+
+#[derive(Clone)]
+struct FairPaged(HealthySession, Arc<std::sync::atomic::AtomicBool>);
+#[async_trait::async_trait]
+impl PhotosSession for FairPaged {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        if url.contains("/records/query?") && request["query"]["recordType"] != "CheckIndexingState"
+        {
+            self.0.inventory.fetch_add(1, Ordering::SeqCst);
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["fieldName"] == "startRank")
+                .and_then(|f| f["fieldValue"]["value"].as_u64())
+                .unwrap_or(0) as usize;
+            let mut pairs: Vec<_> = self.0.records.chunks_exact(2).collect();
+            pairs.sort_by_key(|pair| pair[0]["recordName"] != "live-blocked");
+            if offset > 0 {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !self.1.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("later inventory page must follow actual expired transfer");
+            }
+            return Ok(
+                json!({"records":pairs.get(offset).map_or_else(Vec::new,|pair|pair.to_vec()),"syncToken":"healthy-query"}),
+            );
+        }
+        self.0.post(url, body, headers).await
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
 }

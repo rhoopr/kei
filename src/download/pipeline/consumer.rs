@@ -208,10 +208,9 @@ pub(super) async fn consume_stream_download_tasks(
                 match classify_download_task_error(&e) {
                     DownloadTaskErrorClass::Interrupted => {
                         log_interrupted_download(pb, &task, &e);
-                        // URL expiry cancels the whole bounded queue, not just
-                        // the task that saw 410. Keep its unstarted work for
-                        // the same cleanup attempt. User shutdown still gates
-                        // cleanup lookup and dispatch through the parent token.
+                        // Preserve interrupted peers if expiry was observed.
+                        // User shutdown still gates cleanup through the parent
+                        // token; expiry itself does not cancel healthy work.
                         if url_expired_abort {
                             failed.push(task);
                         }
@@ -246,11 +245,12 @@ pub(super) async fn consume_stream_download_tasks(
                                 asset_id = %task.asset_id,
                                 path = %task.download_path.display(),
                                 error = %e,
-                                "Download URL expired; aborting current URL batch"
+                                "Download URL expired; retaining task for bounded refresh"
                             );
                         });
                         failed.push(task);
-                        pipeline_shutdown.cancel();
+                        // A stale URL belongs to this task. Continue admitting
+                        // and transferring healthy peers in the same inventory.
                         continue;
                     }
                     DownloadTaskErrorClass::Other => {

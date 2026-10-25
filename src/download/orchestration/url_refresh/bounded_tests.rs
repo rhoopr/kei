@@ -67,6 +67,7 @@ impl PhotosSession for BoundedSession {
 
 #[tokio::test]
 async fn persistent_expiry_does_not_starve_delayed_healthy_peer() {
+    let (trace, _guard) = crate::test_helpers::TracingCapture::install();
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
     let server = crate::start_wiremock_or_skip!();
@@ -93,6 +94,7 @@ async fn persistent_expiry_does_not_starve_delayed_healthy_peer() {
     for name in ["poison", "healthy"] {
         let record = TestAssetRecord::new(name)
             .filename(&format!("{name}.jpg"))
+            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
             .size(8)
             .build();
         db.upsert_seen(&record).await.unwrap();
@@ -130,8 +132,10 @@ async fn persistent_expiry_does_not_starve_delayed_healthy_peer() {
     )
     .await;
     assert_eq!(
-        result.downloaded, 1,
-        "persistent 410 must not cancel the healthy peer"
+        result.downloaded,
+        1,
+        "persistent 410 must not cancel the healthy peer: {result:?}, events={:?}",
+        trace.events()
     );
     assert_eq!(result.failed.len(), 1);
     assert_eq!(result.failed[0].asset_id.as_ref(), "poison");

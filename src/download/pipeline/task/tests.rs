@@ -363,7 +363,7 @@ async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() 
         Mock::given(method("GET"))
             .and(path("/expired.jpg"))
             .respond_with(ResponseTemplate::new(410))
-            .expect(if user_shutdown { 0 } else { 1 })
+            .expect(if user_shutdown { 0 } else { 2 })
             .mount(&server)
             .await;
         Mock::given(method("GET"))

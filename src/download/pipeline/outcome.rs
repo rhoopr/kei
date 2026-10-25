@@ -141,8 +141,7 @@ pub(super) async fn finalize_streaming_download(
                     .provider_auth_errors
                     .load(std::sync::atomic::Ordering::Relaxed)
                     > 0
-                || producer_panicked
-                || consumer.url_expired_abort,
+                || producer_panicked,
             ..Default::default()
         };
         match db.complete_sync_run(run_id, &stats).await {
@@ -268,10 +267,7 @@ fn producer_enumeration_incomplete(
     result: &StreamingResult,
     shutdown_token: &CancellationToken,
 ) -> bool {
-    !result.enumeration_complete
-        && result.assets_seen > 0
-        && !shutdown_token.is_cancelled()
-        && !result.url_expired_abort
+    !result.enumeration_complete && result.assets_seen > 0 && !shutdown_token.is_cancelled()
 }
 
 fn mark_producer_enumeration_incomplete(
@@ -409,7 +405,7 @@ pub(in crate::download) async fn build_download_result(
             tracing::info!(target: "kei::download::pipeline", "  0 files would be downloaded");
             tracing::info!(target: "kei::download::pipeline", destination = %config.directory.display(), "  destination");
         } else if streaming_result.url_expired_abort {
-            tracing::warn!(target: "kei::download::pipeline", "Download batch aborted because signed iCloud URLs expired");
+            tracing::warn!(target: "kei::download::pipeline", "Expired download URL has no retained retry task");
         } else if stats.skipped.uncertain == 0 {
             tracing::info!(target: "kei::download::pipeline", "No new photos to download");
         }
@@ -679,8 +675,7 @@ pub(in crate::download) async fn build_download_result(
         + exif_failures
         + enumeration_errors
         + retry_exhausted
-        + usize::from(enumeration_incomplete)
-        + usize::from(streaming_result.url_expired_abort && failed == 0);
+        + usize::from(enumeration_incomplete);
     if total_failures > 0 {
         for task in &remaining_failed {
             tracing::error!(target: "kei::download::pipeline", asset_id = %task.asset_id, path = %task.download_path.display(), "Download failed");

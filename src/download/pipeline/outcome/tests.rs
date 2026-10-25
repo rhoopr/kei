@@ -60,6 +60,24 @@ async fn producer_incomplete_enumeration_returns_partial_failure_and_blocks_toke
 }
 
 #[tokio::test]
+async fn expired_url_does_not_mask_incomplete_enumeration() {
+    let result = StreamingResult {
+        assets_seen: 1,
+        enumeration_complete: false,
+        url_expired_abort: true,
+        ..StreamingResult::default()
+    };
+    let (outcome, stats) =
+        build_zero_download_outcome(result, DownloadControls::download_hidden()).await;
+    assert!(matches!(
+        outcome,
+        crate::download::DownloadOutcome::PartialFailure { .. }
+    ));
+    assert!(stats.enumeration_incomplete);
+    assert!(stats.sync_token_blocked);
+}
+
+#[tokio::test]
 async fn zero_downloads_with_state_write_failures_returns_partial_failure() {
     use crate::download::DownloadOutcome;
 

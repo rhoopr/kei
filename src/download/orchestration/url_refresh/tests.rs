@@ -1064,10 +1064,12 @@ async fn full_expired_url_cleanup_is_targeted_bounded_and_durable() {
         assert!(
             if recovery.starts_with("auth_") {
                 matches!(outcome, DownloadOutcome::SessionExpired { .. })
+            } else if downloads {
+                matches!(outcome, DownloadOutcome::Success)
             } else {
                 matches!(outcome, DownloadOutcome::PartialFailure { .. })
             },
-            "URL batch cancellation remains a partial run even after cleanup"
+            "completed bounded refresh must succeed; unresolved work must remain visible: {recovery}: {outcome:?}"
         );
         assert_eq!(stats.downloaded, usize::from(downloads));
         assert_eq!(stats.failed, usize::from(!downloads));
