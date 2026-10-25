@@ -1422,6 +1422,16 @@ pub(super) async fn hydrate_missing_selected_relation_assets(
             }
         };
 
+        // A successful provider request can still omit a requested identity.
+        // No durable download owner accounts for these selected relations yet;
+        // replay their source cursor instead of treating an empty result as
+        // completed membership work.
+        if !missing.is_empty() {
+            delta_summary
+                .token_unsafe_reason
+                .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
+        }
+
         for asset in assets {
             delta_summary
                 .persist_asset_mapping_for_asset(&asset, config)

@@ -19,6 +19,9 @@ use wiremock::{Mock, ResponseTemplate};
 #[derive(Clone)]
 struct Session {
     cycle: usize,
+    unavailable_membership: bool,
+    incomplete_inventory: bool,
+    incomplete_hits: Arc<AtomicUsize>,
     records: Arc<Vec<Vec<Value>>>,
     rank_queries: Arc<AtomicUsize>,
 }
@@ -78,6 +81,10 @@ impl PhotosSession for Session {
             return Ok(json!({"batch":batch}));
         }
         if url.contains("/records/query?") {
+            if self.incomplete_inventory && parent(&request) == Some("B") {
+                self.incomplete_hits.fetch_add(1, Ordering::SeqCst);
+                return Ok(json!({"records":"incomplete selected album inventory"}));
+            }
             self.rank_queries.fetch_add(1, Ordering::SeqCst);
             let offset = request["query"]["filterBy"]
                 .as_array()
@@ -94,6 +101,9 @@ impl PhotosSession for Session {
             return Ok(json!({"records":records,"syncToken":"album-query-proof"}));
         }
         if url.contains("/records/lookup?") {
+            if self.unavailable_membership {
+                return Ok(json!({"records":[]}));
+            }
             let requested = request["records"].as_array().unwrap();
             let records: Vec<_> = self
                 .records
@@ -170,6 +180,17 @@ fn selected_album(
 
 #[tokio::test]
 async fn v027_album_relation_only_changes_route_new_copies_and_unfiled_after_reopen() {
+    album_contract(false, false).await;
+}
+#[tokio::test]
+async fn v027_album_membership_confirmation_failure_holds_cursor_then_recovers() {
+    album_contract(true, false).await;
+}
+#[tokio::test]
+async fn v027_incomplete_selected_album_inventory_holds_baseline_then_recovers() {
+    album_contract(false, true).await;
+}
+async fn album_contract(interrupt_membership: bool, interrupt_inventory: bool) {
     let server = crate::start_wiremock_or_skip!();
     for (id, gets) in [("album-a", 2), ("album-b", 1), ("unfiled", 1)] {
         Mock::given(method("GET"))
@@ -200,7 +221,20 @@ async fn v027_album_relation_only_changes_route_new_copies_and_unfiled_after_reo
     let token_key = sync_token_key(ZONE);
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     let mut originals = Vec::new();
-    for cycle in 0..3 {
+    let mut interrupted_downloads = 0;
+    for iteration in 0..if interrupt_membership || interrupt_inventory {
+        4
+    } else {
+        3
+    } {
+        let held =
+            (interrupt_membership && iteration == 1) || (interrupt_inventory && iteration == 0);
+        let cycle =
+            if (interrupt_membership && iteration > 1) || (interrupt_inventory && iteration > 0) {
+                iteration - 1
+            } else {
+                iteration
+            };
         let db = Arc::new(
             SqliteStateDb::open_owned(&database, &baseline_owner())
                 .await
@@ -208,6 +242,9 @@ async fn v027_album_relation_only_changes_route_new_copies_and_unfiled_after_reo
         );
         let session = Session {
             cycle,
+            unavailable_membership: held && interrupt_membership,
+            incomplete_inventory: held && interrupt_inventory,
+            incomplete_hits: Arc::new(AtomicUsize::new(0)),
             records: Arc::clone(&records),
             rank_queries: Arc::new(AtomicUsize::new(0)),
         };
@@ -258,10 +295,45 @@ async fn v027_album_relation_only_changes_route_new_copies_and_unfiled_after_reo
         )
         .await
         .unwrap();
+        if held {
+            if interrupt_inventory {
+                assert!(
+                    session.incomplete_hits.load(Ordering::SeqCst) > 0,
+                    "malformed album inventory must be requested"
+                );
+                interrupted_downloads = result.stats.downloaded;
+                for relative in ["albums/A/album-a.JPG", "unfiled/unfiled.JPG"] {
+                    let path = root.join(relative);
+                    if path.exists() {
+                        originals.push((
+                            path.clone(),
+                            std::fs::read(&path).unwrap(),
+                            std::fs::metadata(&path).unwrap().modified().unwrap(),
+                        ));
+                    }
+                }
+            }
+            assert!(!result.can_advance_database_checkpoint(), "{result:?}");
+            assert_eq!(
+                db.get_metadata(&token_key).await.unwrap().as_deref(),
+                if interrupt_inventory {
+                    None
+                } else {
+                    Some("album-after-1")
+                }
+            );
+            assert!(!root.join("albums/B/album-a.JPG").exists());
+            for (path, bytes, mtime) in &originals {
+                assert_eq!(&std::fs::read(path).unwrap(), bytes);
+                assert_eq!(&std::fs::metadata(path).unwrap().modified().unwrap(), mtime);
+            }
+            continue;
+        }
+        assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
         assert_eq!(
             result.stats.downloaded,
             match cycle {
-                0 => 3,
+                0 => 3 - interrupted_downloads,
                 1 => 1,
                 _ => 0,
             },

@@ -430,3 +430,5 @@ async fn selected_contract(selection: Selection, incomplete_window: bool, transi
     }
     server.verify().await;
 }
+
+mod interruptions;

@@ -943,6 +943,11 @@ identity, or a checkpoint. Interrupted hydration retains the existing checkpoint
 and pending configuration. These waits have no new overall time limit and do
 not establish a universal shutdown deadline.
 
+A successful selected-relation hydration request does not prove every requested
+identity was resolved. Any remaining target retains the source checkpoint using
+the existing incomplete-hydration gate, while resolved assets may finish normally.
+A stored child/master mapping alone does not account for a newly selected copy.
+
 Selected relation targets use bounded child lookups followed by complete-pair
 validation before a full-zone fallback scan in each configured source.
 Omitted, deleted, changed-pair or foreign-scope results remain unresolved;

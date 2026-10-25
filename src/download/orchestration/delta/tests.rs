@@ -21,7 +21,7 @@ use super::super::models::{
     ASSET_DELTA_HYDRATION_INCOMPLETE_REASON, ASSET_MASTER_MAPPING_STATE_WRITE_FAILED_REASON,
     DownloadControls, DownloadOutcome, DownloadReporting, DownloadRunMode, DownloadStore,
     INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON, INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON,
-    SyncMode, SyncResult, UNKNOWN_ALBUM_RELATION_ASSET_REASON, UNPARSABLE_RELATION_DELTA_REASON,
+    SyncMode, SyncResult, UNPARSABLE_RELATION_DELTA_REASON,
 };
 use super::super::test_support::{
     album_with_session_and_container, changes_album, changes_album_with_container,
@@ -1340,12 +1340,12 @@ async fn selected_relation_add_without_photo_blocks_incremental_token() {
     assert!(result.stats.sync_token_blocked);
     assert_eq!(
         result.stats.sync_token_blocked_reason,
-        Some(UNKNOWN_ALBUM_RELATION_ASSET_REASON)
+        Some(super::ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON)
     );
 }
 
 #[tokio::test]
-async fn selected_relation_add_without_photo_uses_persisted_asset_master_mapping() {
+async fn selected_relation_mapping_alone_preserves_membership_but_cannot_complete_copy() {
     let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
     seed_complete_album_snapshot(&db, "container-vacation", "Vacation", &[]).await;
     db.upsert_asset_master_mapping("PrimarySync", "asset-MASTER_KNOWN", "MASTER_KNOWN")
@@ -1379,8 +1379,14 @@ async fn selected_relation_add_without_photo_uses_persisted_asset_master_mapping
     .expect("known selected relation add should not fall back to full here");
 
     assert!(matches!(result.outcome, DownloadOutcome::Success));
-    assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
-    assert!(!result.stats.sync_token_blocked);
+    // A persisted child/master link is useful identity evidence, but does not
+    // prove the newly selected destination exists or has a durable retry owner.
+    assert_eq!(result.sync_token, None);
+    assert!(result.stats.sync_token_blocked);
+    assert_eq!(
+        result.stats.sync_token_blocked_reason,
+        Some(super::ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON)
+    );
     let memberships = db
         .get_live_selected_album_memberships_for_asset(
             "PrimarySync",
@@ -2674,6 +2680,13 @@ async fn issue958_album_groups_share_one_fallback_per_source() {
         assert_eq!(
             calls.iter().filter(|(_, cursor)| cursor.is_none()).count(),
             scans
+        );
+        assert_eq!(
+            summary.token_unsafe_reason,
+            target_page
+                .is_none()
+                .then_some(super::ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON),
+            "unresolved relation targets must retain their source checkpoint"
         );
         assert_eq!(mapping.len(), usize::from(target_page.is_some()));
         assert_eq!(complete.len(), usize::from(target_page.is_some()));
