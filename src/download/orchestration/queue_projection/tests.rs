@@ -2769,6 +2769,9 @@ async fn destination_reopen_fixture_with_signature(
             .map(|name| match name.as_str() {
                 "id" => "?1".into(),
                 "library" => "'MetadataBacklog'".into(),
+                // Independent failed metadata work must not impersonate the
+                // currently selected provider resource without source proof.
+                "checksum" => "'unrelated-backlog-resource'".into(),
                 "local_path" => "?2".into(),
                 "metadata_write_failed_at" => "1".into(),
                 _ => format!("\"{name}\""),
@@ -2999,15 +3002,15 @@ async fn destination_reopen_fixture_with_signature(
         );
         assert_eq!(std::fs::read(&b).unwrap(), media);
         if backlog {
+            assert_eq!(std::fs::read(&backlog_tail).unwrap(), media);
             assert!(
-                std::fs::read_to_string(backlog_tail.with_file_name("backlog-tail.JPG.xmp"))
-                    .unwrap()
-                    .contains("current")
+                !backlog_tail.with_file_name("backlog-tail.JPG.xmp").exists(),
+                "normal sync must not start historical optional rewrites"
             );
             let conn =
                 f.db.acquire_lock("failed prefix survives healthy tail")
                     .unwrap();
-            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM assets WHERE library='MetadataBacklog' AND metadata_write_failed_at IS NOT NULL",[],|r|r.get(0)).unwrap(),501);
+            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM assets WHERE library='MetadataBacklog' AND metadata_write_failed_at=1 AND checksum='unrelated-backlog-resource'",[],|r|r.get(0)).unwrap(),502);
         }
         f.preserved().await;
     }
@@ -3171,19 +3174,39 @@ async fn private_metadata_recovery_fixture_with_signature(
         f.config.metadata.embed_xmp = true;
     }
     if finalization_fault != MetadataStateFault::None {
-        f.db.acquire_lock("interrupt metadata completion after actual embedded write").unwrap().execute_batch("CREATE TRIGGER interrupt_metadata_finish BEFORE UPDATE OF verified_metadata ON provider_active_destinations WHEN NEW.verified_metadata=1 BEGIN SELECT RAISE(ABORT,'synthetic metadata finalization failure'); END;").unwrap();
+        f.db.acquire_lock("interrupt metadata completion after actual embedded write").unwrap().execute_batch("CREATE TRIGGER interrupt_metadata_finish BEFORE UPDATE OF verified_metadata ON provider_active_destinations WHEN NEW.verified_metadata=1 AND OLD.prepared_hash IS NOT NULL BEGIN SELECT RAISE(ABORT,'synthetic metadata finalization failure'); END;").unwrap();
     }
     if interrupted {
         f.db.acquire_lock("interrupt coverage seal after actual publication").unwrap().execute_batch("CREATE TRIGGER interrupt_selection_seal BEFORE UPDATE OF sealed ON provider_active_generations WHEN NEW.sealed=1 BEGIN SELECT RAISE(ABORT,'synthetic selection seal interruption'); END;").unwrap();
     }
-    let first = crate::download::download_photos_with_sync(
-        &reqwest::Client::new(),
-        &passes,
-        Arc::new(f.config.clone()),
-        controls(),
-        CancellationToken::new(),
-    )
-    .await;
+    let first = if finalization_fault != MetadataStateFault::None {
+        // Reconstruct an explicitly requested pre-upgrade metadata operation.
+        // Ordinary v27 sync must never create this historical writer obligation.
+        f.config.refresh_metadata = true;
+        let result = crate::download::orchestration::generation::TEST_GENERATION_FORMAT
+            .scope(
+                1,
+                crate::download::download_photos_with_sync(
+                    &reqwest::Client::new(),
+                    &passes,
+                    Arc::new(f.config.clone()),
+                    controls(),
+                    CancellationToken::new(),
+                ),
+            )
+            .await;
+        f.config.refresh_metadata = false;
+        result
+    } else {
+        crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &passes,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+    };
     if interrupted {
         assert!(
             first
@@ -3215,8 +3238,11 @@ async fn private_metadata_recovery_fixture_with_signature(
         assert_eq!(first.stats.downloaded, usize::from(!native));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         assert!(
-            first.stats.sync_token_blocked_reason.is_some(),
-            "unfinished exact receipts must hold publication: {first:?}"
+            matches!(
+                first.outcome,
+                crate::download::DownloadOutcome::PartialFailure { .. }
+            ) && first.stats.exif_failures > 0,
+            "failed explicit finalization must be reported, with durable exact retries below: {first:?}"
         );
         assert_eq!(f.db.acquire_lock("failed finalization leaves exact debt").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_media=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap(),2);
         assert_ne!(
@@ -3328,6 +3354,18 @@ async fn private_metadata_recovery_fixture_with_signature(
             "embedded metadata must actually change media bytes"
         );
     }
+    let interrupted_outputs = (finalization_fault != MetadataStateFault::None).then(|| {
+        media_paths
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    std::fs::read(path).unwrap(),
+                    std::fs::metadata(path).unwrap().modified().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
     if finalization_fault == MetadataStateFault::AfterWriteAndSourceDrift {
         f.capture(vec![json!({"recordName":"independent-source-drift-after-own-output","recordType":"FutureOpaque","unknown":{"keep":"all"}})],"prepared-output-source-drift").await;
     }
@@ -3376,11 +3414,29 @@ async fn private_metadata_recovery_fixture_with_signature(
         recovered.stats.downloaded, 0,
         "healthy completed physical paths must not redownload"
     );
+    if let Some(outputs) = &interrupted_outputs {
+        for (path, bytes, mtime) in outputs {
+            assert_eq!(
+                &std::fs::read(path).unwrap(),
+                bytes,
+                "reopen must not rewrite an already published prepared output"
+            );
+            assert_eq!(&std::fs::metadata(path).unwrap().modified().unwrap(), mtime);
+        }
+        if let Some((mirror, sidecar, _)) = &native_collision {
+            assert_eq!(std::fs::read(mirror).unwrap(), media);
+            assert_eq!(
+                std::fs::read(sidecar).unwrap(),
+                b"unrelated-sibling-sidecar"
+            );
+        }
+    }
     {
         let conn =
             f.db.acquire_lock("all exact compatible metadata obligations finished")
                 .unwrap();
-        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND (verified_media=0 OR verified_metadata=0)",[],|r|r.get(0)).unwrap(),0);
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND (verified_media=0 OR verified_metadata=0)",[],|r|r.get(0)).unwrap(),0,
+            "ordinary reopen must finish previously prepared operations, not report success while retaining unfinished aliases");
         if interrupted {
             assert_eq!(
                 conn.query_row::<i64, _, _>(
