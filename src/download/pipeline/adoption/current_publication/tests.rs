@@ -572,15 +572,56 @@ async fn prepared_first_publication_reopens_before_rename_without_http_or_metada
                 fs::metadata(&derived.path).unwrap().modified().unwrap(),
                 mtime
             );
-            assert!(
+            // This historical proof has no account/provider binding. Recovery
+            // must retain its only modified-byte lineage until a validated
+            // compact successor exists, rather than inventing that binding.
+            assert_eq!(
                 db.get_prepared_publications(
                     "PrimarySync",
                     asset.state_id(),
                     VersionSizeKey::Original
                 )
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+                vec![proof.clone()]
+            );
+            drop(planner);
+            drop(db);
+            let db = SqliteStateDb::open(&database).await.unwrap();
+            let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
+            assert_eq!(
+                recover_current_pending_publication(
+                    &db,
+                    &config,
+                    &asset,
+                    &mut planner,
+                    VersionSizeKey::Original,
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap(),
+                Some(PendingOnDiskAdoption::Adopted(derived.path.clone()))
+            );
+            assert_eq!(fs::read(&derived.path).unwrap(), MOVIE);
+            assert_eq!(
+                fs::metadata(&derived.path).unwrap().modified().unwrap(),
+                mtime
+            );
+            assert_eq!(
+                db.get_prepared_publications(
+                    "PrimarySync",
+                    asset.state_id(),
+                    VersionSizeKey::Original
+                )
+                .await
+                .unwrap(),
+                vec![proof]
+            );
+            assert!(
+                db.get_owned_temp_files_before(i64::MAX)
+                    .await
+                    .unwrap()
+                    .is_empty()
             );
             let receipts = db.get_baseline_receipts().await.unwrap();
             let receipt = receipts

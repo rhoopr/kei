@@ -2788,3 +2788,37 @@ async fn mark_downloaded_fails_when_asset_row_missing() {
         "expected AssetRowMissing with correct ids, got: {err:?}"
     );
 }
+
+// A baseline's quiet bridge can begin in the same second as the previous
+// observation or a later one. Both status outcomes remain durable retries.
+#[tokio::test]
+async fn v027_retry_status_across_clock_boundary_remains_durable() {
+    for later_second in [false, true] {
+        let dir = test_dir();
+        let path = dir.path().join("retry.db");
+        let db = SqliteStateDb::open(&path).await.unwrap();
+        let record = TestAssetRecord::new("clock-retry").build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_failed("PrimarySync", "clock-retry", "original", "transfer failed")
+            .await
+            .unwrap();
+        let boundary = Utc::now().timestamp();
+        db.backdate_last_seen("clock-retry", boundary - i64::from(later_second));
+        db.prepare_for_retry(Some("PrimarySync"), RetryErrorRetention::Clear)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.promote_pending_to_failed(boundary).await.unwrap(),
+            u64::from(!later_second)
+        );
+        drop(db);
+        let db = SqliteStateDb::open(&path).await.unwrap();
+        let pending = db.get_pending().await.unwrap();
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(pending.len(), usize::from(later_second));
+        assert_eq!(failed.len(), usize::from(!later_second));
+        let row = pending.iter().chain(&failed).next().unwrap();
+        assert_eq!(row.id.as_ref(), "clock-retry");
+        assert_eq!(row.checksum, record.checksum);
+    }
+}

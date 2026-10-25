@@ -985,14 +985,36 @@ async fn baseline_contract(
                     && row.local_path.as_ref() == Some(&added)));
             }
         }
-        assert!(db.get_pending().await.unwrap().is_empty());
+        let pending = db.get_pending().await.unwrap();
+        let failed = db.get_failed().await.unwrap();
         if initial_failure && cycle == 0 {
+            // A quiet bridge resets failed asset rows to pending. The age-gated
+            // legacy cleanup may promote them again within the same second.
+            // Neither status is the independent ledger's retry authority.
+            let unresolved: Vec<_> = pending.iter().chain(&failed).collect();
+            assert_eq!(unresolved.len(), 1);
+            assert_eq!(unresolved[0].id.as_ref(), "asset-current-missing");
+            assert_eq!(unresolved[0].library.as_ref(), ZONE);
+            let retained: bool = db
+                .acquire_lock("assert durable failed transfer retry")
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM provider_active_decisions d
+                     JOIN provider_active_destinations w ON w.generation=d.generation
+                       AND w.pass_key=d.pass_key AND w.child=d.child
+                     WHERE d.child='asset-current-missing' AND d.next_retry_at>0
+                       AND w.admitted=1 AND w.verified_media=0)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert!(
-                !db.get_failed().await.unwrap().is_empty(),
-                "failed transfer must have durable retry state"
+                retained,
+                "failed transfer must retain its admitted destination and retry deadline"
             );
         } else {
-            assert!(db.get_failed().await.unwrap().is_empty());
+            assert!(pending.is_empty());
+            assert!(failed.is_empty());
         }
     }
     assert!(
