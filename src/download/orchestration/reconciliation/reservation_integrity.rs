@@ -17,7 +17,10 @@ use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-async fn collision_fixture(server: &MockServer) -> (RecoveryFixture, std::path::PathBuf) {
+async fn collision_fixture(
+    server: &MockServer,
+    authenticated: bool,
+) -> (RecoveryFixture, std::path::PathBuf) {
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/data/media/pattern.jpg"
@@ -32,6 +35,11 @@ async fn collision_fixture(server: &MockServer) -> (RecoveryFixture, std::path::
     records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
         json!(data_encoding::BASE64.encode(&[0xa7_u8; 32]));
     let root = tempfile::tempdir().unwrap();
+    if authenticated {
+        SqliteStateDb::open_owned(&root.path().join("state.db"), &repair_owner())
+            .await
+            .unwrap();
+    }
     let (mut config, records, unsuffixed) = issue_770_seed_records(&root, records).await;
     let destination = unsuffixed.with_file_name("pending-PENDING.jpg");
     let db = Arc::new(
@@ -108,10 +116,75 @@ async fn collision_fixture(server: &MockServer) -> (RecoveryFixture, std::path::
     )
 }
 
+fn repair_owner() -> crate::state::db::account::AccountOwner {
+    crate::state::db::account::AccountOwner::authenticated(
+        "repair@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"repair-fixture"}})).unwrap(),
+    )
+    .unwrap()
+}
+
+async fn run_authenticated_repair(
+    f: &RecoveryFixture,
+    kinds: &[PassKind],
+) -> crate::download::SyncResult {
+    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, inbox::ShadowCapture};
+    let passes: Vec<_> = kinds
+        .iter()
+        .map(|kind| {
+            let mut album = PhotoAlbum::new(
+                PhotoAlbumConfig {
+                    params: Arc::new(std::collections::HashMap::new()),
+                    service_endpoint:
+                        "https://synthetic.example/database/1/photos/production/private".into(),
+                    name: if *kind == PassKind::SmartFolder {
+                        "Hidden".into()
+                    } else {
+                        "".into()
+                    },
+                    list_type: "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
+                    obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
+                    query_filter: None,
+                    page_size: 2,
+                    zone_id: Arc::new(
+                        json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                    ),
+                    retry_config: crate::retry::RetryConfig::default(),
+                    container_id: None,
+                    cross_zone_sources: Vec::new(),
+                },
+                Box::new(RecoveryLookupSession {
+                    records: Arc::new(f.records.clone()),
+                    enumerate: false,
+                }),
+            );
+            album.set_shadow_capture(
+                ShadowCapture::new(f.db.clone(), repair_owner(), "com"),
+                "private".into(),
+            );
+            AlbumPass {
+                kind: *kind,
+                album,
+                exclude_ids: Default::default(),
+            }
+        })
+        .collect();
+    crate::download::orchestration::dispatch::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes,
+        Arc::new(f.config.clone()),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn v027_reserved_collision_explicit_truncation_repairs_only_saved_owned_destination() {
     let server = MockServer::start().await;
-    let (mut f, foreign) = collision_fixture(&server).await;
+    let (mut f, foreign) = collision_fixture(&server, true).await;
     Mock::given(method("GET"))
         .and(path("/pending.jpg"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(f.bytes.clone()))
@@ -119,7 +192,7 @@ async fn v027_reserved_collision_explicit_truncation_repairs_only_saved_owned_de
         .mount(&server)
         .await;
     let kinds = [PassKind::SmartFolder, PassKind::Unfiled];
-    let initial = f.run(&kinds, CancellationToken::new()).await;
+    let initial = run_authenticated_repair(&f, &kinds).await;
     assert_eq!(
         initial.stats.downloaded,
         1,
@@ -140,7 +213,7 @@ async fn v027_reserved_collision_explicit_truncation_repairs_only_saved_owned_de
     f.config.repair_truncated = true;
     f.reopen().await;
     let (capture, _guard) = crate::test_helpers::TracingCapture::install();
-    let repaired = f.run(&kinds, CancellationToken::new()).await;
+    let repaired = run_authenticated_repair(&f, &kinds).await;
     assert_eq!(
         repaired.stats.downloaded,
         1,
@@ -153,10 +226,7 @@ async fn v027_reserved_collision_explicit_truncation_repairs_only_saved_owned_de
     f.assert_preserved().await;
     f.reopen().await;
     assert_eq!(
-        f.run(&kinds, CancellationToken::new())
-            .await
-            .stats
-            .downloaded,
+        run_authenticated_repair(&f, &kinds).await.stats.downloaded,
         0
     );
     assert_eq!(
@@ -171,9 +241,64 @@ async fn v027_reserved_collision_explicit_truncation_repairs_only_saved_owned_de
 }
 
 #[tokio::test]
+async fn v027_unscoped_prepared_lineage_blocks_repair_without_losing_owned_work() {
+    use crate::state::TempFileOwnershipStore;
+    let server = MockServer::start().await;
+    let (mut f, foreign) = collision_fixture(&server, false).await;
+    Mock::given(method("GET"))
+        .and(path("/pending.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(f.bytes.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let kinds = [PassKind::SmartFolder, PassKind::Unfiled];
+    assert_eq!(
+        f.run(&kinds, CancellationToken::new())
+            .await
+            .stats
+            .downloaded,
+        1
+    );
+    let proof =
+        f.db.get_prepared_publications("PrimarySync", "PENDING", VersionSizeKey::Original)
+            .await
+            .unwrap();
+    assert_eq!(proof.len(), 1);
+    assert!(proof[0].binding.is_none());
+    std::fs::write(&f.destination, &f.bytes[..4]).unwrap();
+    f.db.mark_failed(
+        "PrimarySync",
+        "PENDING",
+        "original",
+        crate::commands::reconcile::FILE_TRUNCATED_REASON,
+    )
+    .await
+    .unwrap();
+    f.config.repair_truncated = true;
+    f.reopen().await;
+    let result = f.run(&kinds, CancellationToken::new()).await;
+    assert_eq!(result.stats.downloaded, 0);
+    assert!(result.stats.failed > 0);
+    assert_eq!(
+        f.db.get_prepared_publications("PrimarySync", "PENDING", VersionSizeKey::Original)
+            .await
+            .unwrap(),
+        proof
+    );
+    assert_eq!(std::fs::read(&f.destination).unwrap(), f.bytes[..4]);
+    assert!(!foreign.exists());
+    assert!(
+        !f.db.get_failed().await.unwrap().is_empty()
+            || !f.db.get_pending().await.unwrap().is_empty()
+    );
+    f.assert_preserved().await;
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn v027_identical_foreign_reserved_leaf_never_satisfies_current_copy_or_gets_overwritten() {
     let server = MockServer::start().await;
-    let (mut f, foreign) = collision_fixture(&server).await;
+    let (mut f, foreign) = collision_fixture(&server, false).await;
     std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
     std::fs::write(&foreign, &f.bytes).unwrap();
     let stamp = std::fs::metadata(&foreign).unwrap().modified().unwrap();

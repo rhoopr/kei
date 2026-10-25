@@ -14,7 +14,6 @@ use crate::download::filter::DownloadTask;
 use crate::download::pipeline::PassResult;
 use crate::state::VersionSizeKey;
 
-
 pub(super) const INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

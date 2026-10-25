@@ -153,10 +153,15 @@ pub(in crate::state::db) fn record_prepared(
 }
 
 /// One bounded batch, usable before a charge while a baseline is still open.
-pub(super) fn compact_batch(conn: &Connection, only: Option<&str>) -> Result<usize, StateError> {
+pub(super) fn compact_batch(
+    conn: &Connection,
+    only: Option<&str>,
+    format: u8,
+) -> Result<usize, StateError> {
     let keys:Vec<(String,String,String)>=conn.prepare("SELECT d.generation,d.pass_key,d.child FROM provider_active_decisions d
         JOIN provider_active_generations g ON g.id=d.generation
         WHERE d.compacted_hash IS NULL AND (?1 IS NULL OR d.generation=?1)
+          AND json_extract(CAST(g.specification AS TEXT),'$.format')=?2
           AND ((json_extract(CAST(g.specification AS TEXT),'$.format')=2 AND g.metadata_enabled=0)
             OR (json_extract(CAST(g.specification AS TEXT),'$.format')=1 AND g.sealed=1))
           AND (d.admission='excluded' OR (d.admission='admitted'
@@ -173,13 +178,15 @@ pub(super) fn compact_batch(conn: &Connection, only: Option<&str>) -> Result<usi
             AND json_extract(t.publication,'$.version')=w.version_size
             WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND t.publication IS NOT NULL)
         ORDER BY g.created_at,d.generation,d.pass_key,d.child LIMIT 64")?
-        .query_map([only],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
+        .query_map(params![only,format],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
     let mut compacted = 0;
     let mut changed_roots = HashSet::new();
     let mut validated_legacy_roots = HashSet::new();
     for (generation, key, child) in keys {
         let root = load_generation(conn, &generation)?;
         if root.spec.format == 1 && validated_legacy_roots.insert(generation.clone()) {
+            #[cfg(test)]
+            count_legacy_validation(&generation);
             let saved: String = conn.query_row(
                 "SELECT seal_hash FROM provider_active_generations WHERE id=?1",
                 [&generation],
@@ -300,9 +307,14 @@ pub(super) fn compact_batch(conn: &Connection, only: Option<&str>) -> Result<usi
 
 /// Called only after a successor root exists, before that root is handed to
 /// the producer. Coverage cursors live in checkpoint metadata, not these rows.
-pub(super) fn retire_completed_roots(conn: &Connection, keep: &str) -> Result<(), StateError> {
+pub(super) fn retire_completed_roots(
+    conn: &Connection,
+    keep: &str,
+    format: u8,
+) -> Result<(), StateError> {
     let ids:Vec<String>=conn.prepare(&format!("SELECT g.id FROM provider_active_generations g
         WHERE g.id<>?1 AND g.scope=(SELECT scope FROM provider_active_generations WHERE id=?1)
+          AND json_extract(CAST(g.specification AS TEXT),'$.format')=?2
           AND ((json_extract(CAST(g.specification AS TEXT),'$.format')=2 AND g.metadata_enabled=0)
             OR (json_extract(CAST(g.specification AS TEXT),'$.format')=1 AND g.sealed=1))
           AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.compacted_hash IS NOT NULL)
@@ -310,7 +322,7 @@ pub(super) fn retire_completed_roots(conn: &Connection, keep: &str) -> Result<()
           AND (json_extract(CAST(g.specification AS TEXT),'$.format')=1
             OR NOT EXISTS(SELECT 1 FROM provider_selection_rank_pages p WHERE p.generation=g.id))
           AND (json_extract(CAST(g.specification AS TEXT),'$.format')=2 OR ({LEGACY_RANK_ACCOUNTED}))
-        ORDER BY g.created_at,g.id LIMIT 64"))?.query_map([keep],|r|r.get(0))?.collect::<Result<_,_>>()?;
+        ORDER BY g.created_at,g.id LIMIT 64"))?.query_map(params![keep,format],|r|r.get(0))?.collect::<Result<_,_>>()?;
     for id in ids {
         let root = load_generation(conn, &id)?;
         let actual = seal_hash(
@@ -425,3 +437,43 @@ const LEGACY_RANK_ACCOUNTED: &str = r"
                     AND json_extract(CAST(d.manifest AS TEXT),'$.decision.master')=r.record_name))
             ),0)
         )";
+
+// Legacy completion reclamation is opportunistic. It must never become a
+// prerequisite for current admission or undo required unfinished-owner freezing.
+pub(super) fn optional_legacy_cleanup(conn: &Connection, keep: &str) -> Result<(), StateError> {
+    conn.execute_batch("SAVEPOINT v27_optional_legacy_cleanup")?;
+    let outcome = (|| {
+        compact_batch(conn, None, 1)?;
+        retire_completed_roots(conn, keep, 1)
+    })();
+    if let Err(error) = outcome {
+        conn.execute_batch(
+            "ROLLBACK TO v27_optional_legacy_cleanup; RELEASE v27_optional_legacy_cleanup",
+        )?;
+        tracing::warn!(%error,"Optional legacy completion cleanup deferred; original owners retained");
+    } else {
+        conn.execute_batch("RELEASE v27_optional_legacy_cleanup")?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+static LEGACY_VALIDATIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+fn count_legacy_validation(generation: &str) {
+    if let Ok(mut counts) = LEGACY_VALIDATIONS.lock() {
+        *counts.entry(generation.to_owned()).or_default() += 1;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn take_legacy_compaction_validation_count(generation: &str) -> usize {
+    LEGACY_VALIDATIONS
+        .lock()
+        .ok()
+        .and_then(|mut counts| counts.remove(generation))
+        .unwrap_or_default()
+}

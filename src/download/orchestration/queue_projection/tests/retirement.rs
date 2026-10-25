@@ -1483,3 +1483,299 @@ async fn v027_retained_mixed_legacy_roots_cannot_starve_newer_completed_retireme
     }
     assert_eq!(std::fs::read(&tasks[0].download_path).unwrap(), RAW);
 }
+
+#[tokio::test]
+async fn v027_invalid_optional_legacy_seal_does_not_block_current_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
+    let old = db
+        .begin_selection_generation(owner(), legacy_spec(), MAX_GENERATION_BYTES)
+        .await
+        .unwrap();
+    let (_, tasks, _) = admission(
+        &db,
+        &old.id,
+        &dir.path().join("media"),
+        0,
+        false,
+        MAX_GENERATION_BYTES,
+    )
+    .await;
+    publish(&db, &tasks[0]).await;
+    db.seal_selection_generation(owner(), old.id.clone(), true, None)
+        .await
+        .unwrap();
+    let original: Vec<u8> = {
+        let conn = db
+            .acquire_lock("corrupt optional legacy completion seal")
+            .unwrap();
+        conn.execute(
+            "UPDATE provider_active_generations SET seal_hash='invalid' WHERE id=?1",
+            [&old.id],
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT manifest FROM provider_active_decisions WHERE generation=?1",
+            [&old.id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    for index in 1..=2 {
+        let current = db
+            .begin_selection_generation(owner(), spec(), BUDGET)
+            .await
+            .unwrap();
+        let (_, fresh, _) = admission(
+            &db,
+            &current.id,
+            &dir.path().join("media"),
+            index,
+            false,
+            BUDGET,
+        )
+        .await;
+        publish(&db, &fresh[0]).await;
+        db.seal_selection_generation(owner(), current.id, true, None)
+            .await
+            .unwrap();
+    }
+    drop(db);
+    let reopened = SqliteStateDb::open_owned(&path, &owner()).await.unwrap();
+    let conn = reopened
+        .acquire_lock("legacy evidence survives cleanup rollback and reopen")
+        .unwrap();
+    let retained: (Vec<u8>, Option<String>) = conn
+        .query_row(
+            "SELECT manifest,compacted_hash FROM provider_active_decisions WHERE generation=?1",
+            [&old.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(retained, (original, None));
+    assert_eq!(std::fs::read(&tasks[0].download_path).unwrap(), RAW);
+}
+
+#[tokio::test]
+async fn v027_current_pressure_never_revalidates_unrelated_legacy_completion() {
+    use crate::state::db::provider_generations::take_legacy_compaction_validation_count;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    let old = db
+        .begin_selection_generation(owner(), legacy_spec(), MAX_GENERATION_BYTES)
+        .await
+        .unwrap();
+    for index in 0..65 {
+        let (_, tasks, _) = admission(
+            &db,
+            &old.id,
+            &dir.path().join("media"),
+            index,
+            false,
+            MAX_GENERATION_BYTES,
+        )
+        .await;
+        publish(&db, &tasks[0]).await;
+    }
+    db.seal_selection_generation(owner(), old.id.clone(), true, None)
+        .await
+        .unwrap();
+    take_legacy_compaction_validation_count(&old.id);
+    let current = db
+        .begin_selection_generation(owner(), spec(), BUDGET)
+        .await
+        .unwrap();
+    assert_eq!(
+        take_legacy_compaction_validation_count(&old.id),
+        1,
+        "one optional batch validates the historical root once"
+    );
+    let (blocked, _, _) = admission(
+        &db,
+        &current.id,
+        &dir.path().join("media"),
+        100,
+        true,
+        BUDGET,
+    )
+    .await;
+    let started = std::time::Instant::now();
+    for index in 101..141 {
+        let (_, tasks, _) = admission(
+            &db,
+            &current.id,
+            &dir.path().join("media"),
+            index,
+            false,
+            BUDGET,
+        )
+        .await;
+        publish(&db, &tasks[0]).await;
+    }
+    assert_eq!(
+        take_legacy_compaction_validation_count(&old.id),
+        0,
+        "current budget pressure must not traverse legacy evidence"
+    );
+    let retained = db
+        .selection_decision(
+            owner(),
+            current.id.clone(),
+            "pass".into(),
+            blocked.decision.child.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retained.decision.confirmation,
+        blocked.decision.confirmation
+    );
+    let conn = db.acquire_lock("measure current compacted bodies").unwrap();
+    let (compacted, bulky): (i64,i64) = conn.query_row(
+        "SELECT sum(compacted_hash IS NOT NULL),sum(CASE WHEN compacted_hash IS NULL THEN length(manifest) ELSE 0 END) FROM provider_active_decisions WHERE generation=?1",
+        [&current.id], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert!(compacted > 0);
+    assert!(bulky < BUDGET as i64);
+    eprintln!(
+        "measured: 40 current publications with blocked companion; compacted={compacted}, remaining_manifest_bytes={bulky}, legacy_pressure_validations=0, elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+}
+
+#[tokio::test]
+async fn v027_sustained_successors_reclaim_bodies_with_blocked_predecessor_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
+    let old = db
+        .begin_selection_generation(owner(), spec(), BUDGET)
+        .await
+        .unwrap();
+    let (blocked, tasks, _) =
+        admission(&db, &old.id, &dir.path().join("media"), 0, true, BUDGET).await;
+    publish(&db, &tasks[0]).await;
+    let mtime = std::fs::metadata(&tasks[0].download_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    db.seal_selection_generation(owner(), old.id.clone(), true, None)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    for cycle in 0..12 {
+        drop(db);
+        db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
+        let next = db
+            .begin_selection_generation(owner(), spec(), BUDGET)
+            .await
+            .unwrap();
+        for item in 1..=10 {
+            let (_, fresh, _) = admission(
+                &db,
+                &next.id,
+                &dir.path().join("media"),
+                1 + cycle * 10 + item,
+                false,
+                BUDGET,
+            )
+            .await;
+            publish(&db, &fresh[0]).await;
+        }
+        db.seal_selection_generation(owner(), next.id, true, None)
+            .await
+            .unwrap();
+        let retained = db
+            .selection_decision(
+                owner(),
+                old.id.clone(),
+                "pass".into(),
+                blocked.decision.child.clone(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retained.decision.confirmation,
+            blocked.decision.confirmation
+        );
+        assert_eq!(std::fs::read(&tasks[0].download_path).unwrap(), RAW);
+        assert_eq!(
+            std::fs::metadata(&tasks[0].download_path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            mtime
+        );
+        assert!(!tasks[1].download_path.exists());
+        let conn = db
+            .acquire_lock("sustained compact ledger with blocked predecessor")
+            .unwrap();
+        let roots: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM provider_active_generations",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            roots <= 2,
+            "only blocked predecessor and current successor remain"
+        );
+        let bulky: i64 = conn.query_row("SELECT sum(length(manifest)) FROM provider_active_decisions WHERE compacted_hash IS NULL", [], |r| r.get(0)).unwrap();
+        assert!(bulky < BUDGET as i64);
+    }
+    eprintln!(
+        "measured: 12 reopened successor cycles, 120 publications, one blocked companion retained, maximum roots=2, remaining bulky evidence below 65536 bytes, elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+}
+
+#[tokio::test]
+async fn v027_pending_reservation_reader_cost_with_unrelated_blocked_work() {
+    use crate::state::db::ReconciliationStateStore;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    let root = db
+        .begin_selection_generation(owner(), spec(), MAX_GENERATION_BYTES)
+        .await
+        .unwrap();
+    let mut admitted = 0;
+    for count in [0, 10, 100] {
+        while admitted < count {
+            admission(
+                &db,
+                &root.id,
+                &dir.path().join("media"),
+                admitted,
+                false,
+                MAX_GENERATION_BYTES,
+            )
+            .await;
+            admitted += 1;
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            let reservations = db.get_reconciliation_reservations().await.unwrap();
+            assert_eq!(reservations.len(), count);
+            assert!(
+                reservations
+                    .iter()
+                    .all(|reservation| reservation.library.as_ref() == "PrimarySync")
+            );
+        }
+        eprintln!(
+            "measured reservation reader: pending={count}, calls=10, elapsed_us={}",
+            started.elapsed().as_micros()
+        );
+    }
+}

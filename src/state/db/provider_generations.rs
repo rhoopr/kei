@@ -22,6 +22,9 @@ use crate::state::{AssetRecord, error::StateError};
 
 mod retirement;
 
+#[cfg(test)]
+pub(crate) use retirement::take_legacy_compaction_validation_count;
+
 pub(super) use retirement::record_prepared as record_prepared_download_receipt;
 
 pub(crate) const MAX_GENERATION_BYTES: u64 = 512 * 1024 * 1024;
@@ -468,7 +471,7 @@ fn charge(conn: &Connection, additional: u64, capacity: u64, format: u8) -> Resu
         if additional <= capacity.saturating_sub(used) {
             return Ok(());
         }
-        if format != 2 || conn.is_autocommit() || retirement::compact_batch(conn, None)? == 0 {
+        if format != 2 || conn.is_autocommit() || retirement::compact_batch(conn, None, 2)? == 0 {
             return Err(StateError::ProviderSelectionFull);
         }
     }
@@ -1018,8 +1021,9 @@ impl SqliteStateDb {
             charge(&tx,charged,capacity,spec.format)?;
             tx.execute("INSERT INTO provider_active_generations(id,account_key,provider_key,scope,config_hash,basis,specification,specification_hash,created_at,charged_bytes,metadata_enabled) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![id,account,provider,spec.scope,spec.config_hash,spec.basis,bytes,digest(&bytes),Utc::now().timestamp_millis(),i64::try_from(charged).map_err(|_invalid|StateError::ProviderSelectionFull)?,spec.metadata_enabled])?;
             if spec.format == 2 {
-                retirement::compact_batch(&tx,None)?;
-                retirement::retire_completed_roots(&tx,&id)?;
+                retirement::compact_batch(&tx,None,2)?;
+                retirement::retire_completed_roots(&tx,&id,2)?;
+                retirement::optional_legacy_cleanup(&tx,&id)?;
             }
             let out=load_generation(&tx,&id)?;tx.commit()?;
             #[cfg(all(test,target_os="linux"))]
@@ -1747,7 +1751,7 @@ impl SqliteStateDb {
                 }
             }
             if root.spec.format == 2 {
-                while retirement::compact_batch(&tx,Some(&root.id))? > 0 {}
+                while retirement::compact_batch(&tx,Some(&root.id),2)? > 0 {}
             }
             let hash=seal_hash(&tx,&root,checkpoint_ready,veto.as_deref())?;
             let header=seal_header(&root,checkpoint_ready,veto.as_deref(),&hash)?;
@@ -2502,7 +2506,7 @@ impl SqliteStateDb {
                 }
             }
             if root.spec.format==2 {
-                while retirement::compact_batch(&tx,Some(&root.id))?>0 {}
+                while retirement::compact_batch(&tx,Some(&root.id),2)?>0 {}
             }
             tx.commit()?;Ok(())
         }).await

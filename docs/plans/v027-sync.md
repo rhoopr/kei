@@ -239,9 +239,10 @@ The three adjacent raw-replay tests pass. This proof required no runtime behavio
 change; a test-only export supplies the real retained-work configuration hash.
 
 Remaining evidence and implementation gaps:
-- Finish and independently validate the preserved optional legacy-compaction
-  isolation changes, including malformed old roots and bounded capacity relief.
-- Measure the per-match pending-destination scan before a targeted scale fix.
+- Independently review the now-tested optional legacy-compaction isolation and
+  cross-parent adoption simplification at the final candidate head.
+- Address the measured per-match pending-destination scan with a narrowly scoped
+  ownership-preserving optimization, then rerun the scale fixture.
 - Finish obsolete state-API removal and required lint/feature/platform checks;
   classify relevant broad failures without restoring removed contracts.
 - Checkpoint a clean final candidate and perform exact-head acceptance and full
@@ -251,3 +252,51 @@ Historical edited files without independent provenance, unsupported signatures
 and arbitrary unindexed moves remain explicit evidence/discovery limits.
 Reporter resolution has not been established. No branch push, PR creation or
 beta publication has occurred.
+
+
+### Bounded compaction and adoption qualification
+
+Current-format budget pressure now reclaims current-format bodies only. Legacy
+completion cleanup uses one optional bounded batch inside a savepoint; failure
+rolls back that cleanup while retaining old evidence. Required unfinished-owner
+freezing remains outside that optional rollback boundary.
+
+Synthetic acceptance covers an open baseline exceeding a 64 KiB evidence budget,
+a blocked companion retained through 12 reopened successor cycles and 120 new
+publications, quiet completion, library separation, changed-template pass
+ownership, valid and invalid legacy seals, and process death across receipt,
+manifest and root retirement. The repeated-cycle fixture keeps at most two
+generation roots and preserves the completed sibling's bytes and timestamp.
+These are ledger/publication fixtures, not a new full provider-loop or live run.
+
+An initial measured run reclaimed 39 bodies during 40 current publications,
+retained 41,227 bytes of bulky manifest evidence, and performed zero historical
+root validations during current budget pressure. The optional successor batch
+validated the 65-item historical root exactly once. The 40-publication loop
+took 1.407 seconds; the 120-publication reopened loop took 4.878 seconds on the
+CachyOS debug build with other tests running. These are observations, not
+production throughput or 40,000-file estimates.
+
+The preserved adoption change removes an unused cross-parent finalization branch
+and its unsupported unequal-hash inference. Destination validation still checks
+confinement and ownership; prepared publication recovery and the atomic matcher
+own content proof. The cross-parent raw-signature/stale-history control and four
+reservation-integrity tests pass, including foreign ownership and failed durable
+reservation writes. Old unscoped prepared lineage remains protected, not cleared
+to make explicit repair succeed.
+
+A separate measurement exposed remaining work: ten existing reservation-reader
+calls took 879 microseconds with zero pending items and 2,791,898 microseconds
+with 100 pending items. The compact reuse transaction calls the same helper,
+which loads and validates every pending manifest. This measures that helper
+through its public reader, not full matching throughput. A 1,000-item case was
+stopped during fixture setup after the smaller case established the issue;
+no 1,000-item result or extrapolated release timing is claimed. The retained
+regression fixture uses 0/10/100 items without a flaky timing assertion.
+
+Next bounded option: select potential conflicting destinations before loading
+their manifests, while preserving canonical/native path collision semantics and
+transactional ownership checks. Do not simply filter on the serialized path key
+or cache away the commit-time guard. This optimization has not been implemented.
+Full final lint, feature/platform gates and exact-head independent review remain
+outstanding. No live validation or publication was repeated in this unit.

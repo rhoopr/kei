@@ -3,18 +3,16 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rustc_hash::FxHashSet;
 
 use crate::download::filter::{
     DerivedPath, DownloadTask, derive_expected_paths, determine_media_type,
 };
 use crate::download::planner::TaskPlanner;
-use crate::download::{DownloadConfig, DownloadContext, DownloadStore, RecordedLocalFile};
+use crate::download::{DownloadConfig, DownloadContext, DownloadStore};
 use crate::icloud::photos::PhotoAsset;
 use crate::state::{AssetRecord, VersionSizeKey};
-
-use super::task::capture_repair_requested;
 
 mod current_publication;
 pub(in crate::download) use current_publication::recover_current_pending_publication;
@@ -62,20 +60,19 @@ fn pending_versions_for_asset<'a>(
 
 /// A saved cross-parent alias protects the whole pending rendition even if
 /// the current enumerating pass happens to render a same-parent alias.
-async fn enumerated_reserved_pending(
+async fn validate_reserved_pending_destination(
     db: &dyn DownloadStore,
     config: &DownloadConfig,
     asset: &PhotoAsset,
     ctx: &DownloadContext,
     planner: &TaskPlanner,
     derived: &DerivedPath,
-    finalize: bool,
-) -> Result<Option<PendingRetryAdoption>> {
+) -> Result<bool> {
     let library = effective_asset_library(asset, config);
     if !pending_versions_for_asset(ctx, library, asset)
         .is_some_and(|versions| versions.contains(derived.version_size.as_str()))
     {
-        return Ok(None);
+        return Ok(false);
     }
     let destinations = planner.cross_parent_retry_destinations(
         library,
@@ -84,33 +81,29 @@ async fn enumerated_reserved_pending(
         &derived.checksum,
         derived.size,
     )?;
-    if destinations.is_empty() {
-        return Ok(None);
+    for saved in &destinations {
+        let destination = crate::fs_util::reserved_path_under_root(&config.directory, saved)?;
+        anyhow::ensure!(
+            crate::download::legacy_preservation::current_path_is_independent(db, &destination)
+                .await?,
+            "Reserved pending file overlaps a protected historical original"
+        );
+        anyhow::ensure!(
+            planner.retry_path_allowed(
+                library,
+                asset.state_id(),
+                derived.version_size,
+                &derived.checksum,
+                derived.size,
+                &destination
+            ),
+            "Reserved cross-parent pending destination has incompatible ownership"
+        );
     }
-    let recorded = ctx.pending_file_matching_checksum(
-        library,
-        asset.state_id(),
-        derived.version_size,
-        &derived.checksum,
-    );
-    let evidence = PendingRetryFileEvidence {
-        version_size: derived.version_size,
-        checksum: &derived.checksum,
-        size: derived.size,
-        cross_parent_recorded_file: recorded,
-    };
-    Ok(Some(
-        adopt_cross_parent_pending_file(
-            db,
-            config,
-            asset,
-            planner,
-            &evidence,
-            &destinations,
-            finalize,
-        )
-        .await?,
-    ))
+    // A reservation owns a destination, not its bytes. Prepared-publication
+    // recovery and the shared matcher decide content reuse and revalidate it
+    // inside their state transaction. Historical unequal hashes prove nothing.
+    Ok(!destinations.is_empty())
 }
 
 /// Preserve finalization proof only for the already-pending rendition and its
@@ -151,9 +144,9 @@ pub(in crate::download) async fn validate_enumerated_reserved_pending(
 ) -> Result<bool> {
     let mut affected = false;
     for derived in derive_expected_paths(asset, config) {
-        affected |= enumerated_reserved_pending(db, config, asset, ctx, planner, &derived, false)
-            .await?
-            .is_some();
+        affected |=
+            validate_reserved_pending_destination(db, config, asset, ctx, planner, &derived)
+                .await?;
     }
     Ok(affected)
 }
@@ -259,132 +252,8 @@ impl From<PendingOnDiskAdoption> for PendingRetryAdoption {
     }
 }
 
-pub(in crate::download) struct PendingRetryFileEvidence<'a> {
-    pub(in crate::download) version_size: VersionSizeKey,
-    pub(in crate::download) checksum: &'a str,
-    /// Stored current-generation proof, checked by confined keys only in the
-    /// cross-parent route; ordinary adoption keeps its existing spelling policy.
-    pub(in crate::download) cross_parent_recorded_file: Option<&'a RecordedLocalFile>,
-    pub(in crate::download) size: u64,
-}
-
-/// Saved provider generations identify ownership, not hashes of local bytes.
-/// Never mint proof from the file that this route is deciding whether to adopt.
-async fn adopt_cross_parent_pending_file(
-    db: &dyn DownloadStore,
-    config: &DownloadConfig,
-    asset: &PhotoAsset,
-    task_planner: &TaskPlanner,
-    evidence: &PendingRetryFileEvidence<'_>,
-    destinations: &[PathBuf],
-    finalize: bool,
-) -> Result<PendingRetryAdoption> {
-    let Some(derived) = derive_expected_paths(asset, config)
-        .into_iter()
-        .find(|derived| {
-            derived.version_size == evidence.version_size
-                && derived.checksum.as_ref() == evidence.checksum
-                && derived.size == evidence.size
-        })
-    else {
-        return Ok(PendingRetryAdoption::NotFound);
-    };
-    let library = effective_asset_library(asset, config);
-    let mut verified = None;
-    for saved_destination in destinations {
-        let destination =
-            crate::fs_util::reserved_path_under_root(&config.directory, saved_destination)?;
-        let destination = &destination;
-        anyhow::ensure!(
-            crate::download::legacy_preservation::current_path_is_independent(db, destination)
-                .await?,
-            "Reserved pending file overlaps a protected historical original"
-        );
-        anyhow::ensure!(
-            task_planner.retry_path_allowed(
-                library,
-                asset.state_id(),
-                evidence.version_size,
-                evidence.checksum,
-                evidence.size,
-                destination,
-            ),
-            "Reserved cross-parent pending destination has incompatible ownership"
-        );
-        let Some(retained) =
-            crate::download::file::retain_pending_file(&config.directory, destination)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Cannot safely inspect reserved cross-parent pending destination {}",
-                        destination.display(),
-                    )
-                })?
-        else {
-            continue;
-        };
-        let Some(recorded) = evidence.cross_parent_recorded_file else {
-            anyhow::bail!(
-                "Reserved cross-parent pending file has no durable matching local-hash proof; retaining file and pending debt"
-            );
-        };
-        anyhow::ensure!(
-            crate::fs_util::confined_path_key(&recorded.path)?
-                == crate::fs_util::confined_path_key(destination)?,
-            "Reserved cross-parent pending file has no durable hash proof at this destination"
-        );
-        let checksum = recorded.local_checksum.as_deref().context(
-            "Reserved cross-parent pending file has no durable matching local-hash proof; retaining file and pending debt",
-        )?;
-        anyhow::ensure!(
-            checksum.len() == 64
-                && data_encoding::HEXLOWER.encode(&retained.fingerprint.sha256) == checksum,
-            "Reserved cross-parent pending file does not match its durable local-hash proof"
-        );
-        let metadata_changed_size = recorded
-            .download_checksum
-            .as_deref()
-            .is_some_and(|download| download != checksum);
-        anyhow::ensure!(
-            retained.fingerprint.size == evidence.size || metadata_changed_size,
-            "Reserved cross-parent pending file does not match its recorded size evidence"
-        );
-        verified = Some((destination.clone(), retained, recorded));
-    }
-    let Some((destination, retained, recorded)) = verified else {
-        return Ok(PendingRetryAdoption::NotFound);
-    };
-    if !finalize {
-        retained.validate().await?;
-        return Ok(PendingRetryAdoption::Adopted);
-    }
-    let record = asset_record_for_derived_path(Arc::from(library), asset, &derived, config);
-    if let Err(error) = db.upsert_seen(&record).await {
-        tracing::warn!(%error, "Failed to refresh reserved cross-parent pending file");
-        return Ok(PendingRetryAdoption::StateWriteFailed);
-    }
-    // Keep both the inode and directory capabilities across the immediate DB
-    // write. A failed write retains pending debt; every later attempt must reopen
-    // and verify independently. This route creates no deferred hash-only write.
-    retained.validate().await?;
-    let finalized = db
-        .mark_downloaded_with_capture_repair(
-            library,
-            asset.state_id(),
-            evidence.version_size.as_str(),
-            &destination,
-            &data_encoding::HEXLOWER.encode(&retained.fingerprint.sha256),
-            recorded.download_checksum.as_deref(),
-            capture_repair_requested(config),
-        )
-        .await;
-    drop(retained);
-    if let Err(error) = finalized {
-        tracing::warn!(%error, "Failed to finalize reserved cross-parent pending file");
-        return Ok(PendingRetryAdoption::StateWriteFailed);
-    }
-    Ok(PendingRetryAdoption::Adopted)
-}
-
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cross_parent_validation_tests;
