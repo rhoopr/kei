@@ -85,14 +85,29 @@ async fn v027_discovery_missing_directory_is_complete_but_failed_directory_is_no
         .await;
     assert!(missing.complete);
     assert!(missing.paths.is_empty());
+    let mut missing_config = config.clone();
+    missing_config.folder_structure = "missing".into();
+    let missing_plan = planner
+        .plan_download_asset(&asset, &missing_config)
+        .await
+        .unwrap();
+    assert!(matches!(
+        planner
+            .match_existing(&asset, &missing_config, missing_plan.tasks.first().unwrap())
+            .await,
+        BaselineMatch::Missing
+    ));
     std::fs::write(root.path().join("blocked"), b"not a directory").unwrap();
     let failed = planner
         .discover_baseline_family(&asset, &root.path().join("blocked/IMG_0001.JPG"))
         .await;
     assert!(!failed.complete);
-    let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
     let mut blocked_config = config.clone();
     blocked_config.folder_structure = "blocked".into();
+    let plan = planner
+        .plan_download_asset(&asset, &blocked_config)
+        .await
+        .unwrap();
     assert!(matches!(
         planner
             .match_existing(&asset, &blocked_config, plan.tasks.first().unwrap())
@@ -163,6 +178,8 @@ async fn v027_discovery_partial_listing_keeps_visible_candidates_and_defers_unkn
         .await;
     assert!(!discovered.complete);
     assert!(discovered.paths.contains(&path));
+    // Keep visible candidates despite a partial listing. Unsupported content
+    // still needs identity evidence; this is not a blanket partial-listing veto.
     let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
     assert!(matches!(
         planner

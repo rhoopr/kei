@@ -116,10 +116,38 @@ async fn v027_compact_only_changed_template_modified_file_is_uncertain() {
     rusqlite::Connection::open(&db_path).unwrap().execute_batch(
         "DELETE FROM asset_metadata_paths; UPDATE assets SET local_path=NULL,local_checksum=NULL;").unwrap();
     let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
-    assert!(matches!(
-        planner.match_existing(&asset, &config, task).await,
-        BaselineMatch::RecordedPresent { .. }
-    ));
+    // This is authenticated receipt binding, not a provider-signature proof:
+    // metadata-edited local bytes deliberately differ from the raw source hash.
+    let untouched_bytes = std::fs::read(&old).unwrap();
+    let untouched_mtime = std::fs::metadata(&old).unwrap().modified().unwrap();
+    let decision = planner.match_existing(&asset, &config, task).await;
+    let BaselineMatch::RecordedPresent { receipt, .. } = &decision else {
+        panic!("scoped completed receipt must match");
+    };
+    assert_eq!(receipt.native_path.to_path(), old);
+    // Positive control uses the same pending status as the reservation refusal.
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch("UPDATE assets SET status='pending';")
+        .unwrap();
+    crate::download::baseline_matching::commit_match(
+        decision,
+        &config,
+        &asset,
+        task,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(db.get_pending().await.unwrap().is_empty());
+    assert_eq!(std::fs::read(&old).unwrap(), untouched_bytes);
+    assert_eq!(
+        std::fs::metadata(&old).unwrap().modified().unwrap(),
+        untouched_mtime
+    );
+    assert!(!task.download_path.exists());
+    rusqlite::Connection::open(&db_path).unwrap().execute_batch(
+        "DELETE FROM asset_metadata_paths; UPDATE assets SET local_path=NULL,local_checksum=NULL;").unwrap();
     // Introduce a valid foreign reservation after the positive match. The
     // transaction must recheck it instead of relying on the planner snapshot.
     let decision = planner.match_existing(&asset, &config, task).await;
@@ -155,11 +183,20 @@ async fn v027_compact_only_changed_template_modified_file_is_uncertain() {
     );
     assert_eq!(db.get_pending().await.unwrap().len(), 1);
     assert_eq!(std::fs::read(&old).unwrap(), b"metadata-output");
+    assert_eq!(
+        std::fs::metadata(&old).unwrap().modified().unwrap(),
+        untouched_mtime
+    );
     assert!(!task.download_path.exists());
     rusqlite::Connection::open(&db_path)
         .unwrap()
-        .execute_batch("DELETE FROM reconciliation_paths;")
+        .execute_batch("DELETE FROM reconciliation_paths; DELETE FROM asset_metadata_paths; UPDATE assets SET status='downloaded',local_path=NULL,local_checksum=NULL;")
         .unwrap();
+    // The restored receipt still matches before changing only the local bytes.
+    assert!(matches!(
+        planner.match_existing(&asset, &config, task).await,
+        BaselineMatch::RecordedPresent { .. }
+    ));
     std::fs::write(&old, b"changed-output!").unwrap();
     let changed_time = std::fs::metadata(&old).unwrap().modified().unwrap();
     assert!(matches!(
