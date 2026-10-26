@@ -2313,6 +2313,17 @@ pub(crate) async fn run_cycle(
             }
         }
 
+        if checkpoint_persistence == "failed" {
+            // A failed current checkpoint transaction is an operational error,
+            // even when every observed media item was already settled.
+            cycle_failed_count = cycle_failed_count.saturating_add(1);
+            sync_result.checkpoint.state_write_failures = sync_result
+                .checkpoint
+                .state_write_failures
+                .saturating_add(1);
+            sync_result.stats.state_write_failures =
+                sync_result.stats.state_write_failures.saturating_add(1);
+        }
         if let Some(fields) = checkpoint_evidence.as_object_mut() {
             fields.insert(
                 "persistence".into(),

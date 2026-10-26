@@ -501,211 +501,173 @@ async fn current_unknown_without_retry_owner_holds_cursor_across_cli_reopen() {
 }
 
 #[derive(Clone)]
-struct ShadowHoldProvider {
-    failure: std::sync::Arc<std::sync::atomic::AtomicBool>,
+struct CurrentRefusalProvider {
+    phase: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     kind: &'static str,
 }
-impl Respond for ShadowHoldProvider {
+impl Respond for CurrentRefusalProvider {
     fn respond(&self, request: &Request) -> ResponseTemplate {
-        let body: Value = serde_json::from_slice(&request.body).unwrap();
-        if request.url.path().ends_with("/changes/zone") {
-            let quiet = body.pointer("/zones/0/syncToken").and_then(Value::as_str)
-                == Some("delta-successor");
-            let mut response = json!({"zones":[{
-                "zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
-                "syncToken":"delta-successor","moreComing":false,
-                "records":if quiet { json!([]) } else { json!([{
-                    "recordName":"future-source","recordType":"FutureRecord",
-                    "futureEnvelope":{"relationship":{"recordName":"unresolved-peer"}}
-                }]) }
-            }]});
-            if self.failure.load(std::sync::atomic::Ordering::SeqCst) && !quiet {
-                if self.kind == "identity" {
-                    *response
-                        .pointer_mut("/zones/0/records/0/recordName")
-                        .expect("known source fixture") = json!("");
-                } else if self.kind == "json" {
-                    return ResponseTemplate::new(200).set_body_string(
-                        response.to_string().replace(
-                            "\"recordName\":\"future-source\"",
-                            "\"recordName\":\"private-other\",\"recordName\":\"future-source\"",
-                        ),
-                    );
-                }
-            }
-            ResponseTemplate::new(200).set_body_json(response)
-        } else if request.url.path().ends_with("/records/query")
-            && body
-                .pointer("/query/recordType")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| kind.starts_with("CPLAsset"))
-        {
-            // A valid rank EOF/new anchor is deliberately available. It cannot
-            // stand in for an incremental observation that was refused.
-            ResponseTemplate::new(200).set_body_json(json!({
-                "records":[],"syncToken":"inventory-after-uncaptured-page"
-            }))
-        } else {
-            OfflinePhotos.respond(request)
+        if !request.url.path().ends_with("/changes/zone") {
+            return EmptySelectedPhotos.respond(request);
         }
+        let phase = self.phase.load(std::sync::atomic::Ordering::SeqCst);
+        let mut body = json!({"zones":[{
+            "zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+            "syncToken":if phase == 0 {"current-baseline"} else {"current-successor"},
+            "moreComing":false,"records":[]
+        }]});
+        if phase == 1 {
+            match self.kind {
+                "scope" => {
+                    *body
+                        .pointer_mut("/zones/0/zoneID/ownerRecordName")
+                        .expect("synthetic owner") = json!("wrong-owner")
+                }
+                "identity" => {
+                    *body
+                        .pointer_mut("/zones/0/records")
+                        .expect("synthetic records") =
+                        json!([{"recordName":"","recordType":"CPLAsset"}])
+                }
+                "json" => {
+                    return ResponseTemplate::new(200).set_body_string(body.to_string().replace(
+                        "\"moreComing\":false",
+                        "\"moreComing\":true,\"moreComing\":false",
+                    ));
+                }
+                "write" => {}
+                _ => panic!("unknown synthetic refusal"),
+            }
+        }
+        ResponseTemplate::new(200).set_body_json(body)
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quietly() {
+async fn current_cli_refusals_preserve_observation_then_recover_without_rank_replay() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     for (kind, expected) in [
-        ("write", "synthetic CLI receipt failure"),
-        ("capacity", "inbox is full"),
-        ("identity", "Missing provider capture source identity"),
+        ("write", "synthetic observation commit failure"),
+        ("scope", "Unexpected changes/zone scope"),
+        ("identity", "no scoped retry owner"),
         ("json", "Invalid or ambiguous provider changes JSON"),
     ] {
-        let failure = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let phase = std::sync::Arc::new(AtomicUsize::new(0));
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(ShadowHoldProvider {
-                failure: failure.clone(),
+            .respond_with(CurrentRefusalProvider {
+                phase: phase.clone(),
                 kind,
             })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
             .mount(&server)
             .await;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         let account = seed(root, ACCOUNTS[0], "A", &server.uri());
-        {
-            let conn = Connection::open(&account.path).unwrap();
-            // Remove fixture-only debt before establishing initial state so it
-            // cannot mask an otherwise eligible rank checkpoint.
-            conn.execute_batch("DELETE FROM assets WHERE id='retry'; DELETE FROM metadata WHERE key LIKE 'pending_sync_token:%';").unwrap();
-            if kind == "write" {
-                conn.execute_batch("CREATE TRIGGER shadow_cli_fault BEFORE INSERT ON provider_shadow_receipts BEGIN SELECT RAISE(ABORT,'synthetic CLI receipt failure'); END;").unwrap();
-            }
-        }
-        let original_charge = if kind == "capacity" {
-            // Start from a real captured page with usable provenance. Inject
-            // logical charge exhaustion without a 512 MiB physical fixture.
-            success(&command(root, &account, &["sync", "--no-progress-bar"]));
-            let conn = Connection::open(&account.path).unwrap();
-            let charge: i64 = conn
-                .query_row(
-                    "SELECT charged_bytes FROM provider_shadow_pages",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            conn.execute(
-                "UPDATE provider_shadow_pages SET charged_bytes=536870912",
-                [],
+        let other = seed(root, ACCOUNTS[1], "B", &server.uri());
+        let other_before = state(&other.path);
+        let media_before = quiet_media_snapshot(account.media.parent().unwrap());
+        success(&command(root, &account, &["sync", "--no-progress-bar"]));
+        let cursor_proof = || {
+            rows(
+                &account.path,
+                "SELECT key,value FROM metadata WHERE key LIKE 'sync_token:%' OR key LIKE 'observed_selection:%' ORDER BY key",
             )
-            .unwrap();
-            Some(charge)
-        } else {
-            None
         };
-        let before = state(&account.path);
-        let initial_pages = i64::from(kind == "capacity");
+        let before = cursor_proof();
+        let rank_count = |requests: &[Request]| {
+            requests
+                .iter()
+                .filter(|request| {
+                    request.url.path().ends_with("/records/query")
+                        && serde_json::from_slice::<Value>(&request.body)
+                            .unwrap()
+                            .pointer("/query/recordType")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| name.starts_with("CPLAsset"))
+                })
+                .count()
+        };
+        let ranks = rank_count(&server.received_requests().await.unwrap());
+        if kind == "write" {
+            Connection::open(&account.path).unwrap().execute_batch("CREATE TRIGGER observation_cli_fault BEFORE INSERT ON metadata WHEN NEW.key='observed_selection:v27:PrimarySync' BEGIN SELECT RAISE(ABORT,'synthetic observation commit failure'); END;").unwrap();
+        }
+        phase.store(1, Ordering::SeqCst);
         for _ in 0..2 {
             let out = command(root, &account, &["sync", "--no-progress-bar"]);
+            assert!(!out.status.success(), "{kind}: {out:?}");
             let diagnostics = String::from_utf8_lossy(&out.stderr);
             assert!(diagnostics.contains(expected), "{kind}: {diagnostics}");
-            assert!(
-                !diagnostics.contains("falling back to full enumeration"),
-                "{kind}: {diagnostics}"
-            );
-            assert!(!diagnostics.contains("private-other"));
             assert_eq!(
-                state(&account.path),
+                cursor_proof(),
                 before,
-                "{kind}: retained owned history/checkpoint"
-            );
-            let conn = Connection::open(&account.path).unwrap();
-            assert_eq!(
-                conn.query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_shadow_pages",
-                    [],
-                    |row| row.get(0)
-                )
-                .unwrap(),
-                initial_pages,
-                "{kind}"
+                "{kind}: token and proof must roll back together"
             );
             assert_eq!(
-                conn.query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_shadow_records",
-                    [],
-                    |row| row.get(0)
-                )
-                .unwrap(),
-                initial_pages,
-                "{kind}"
+                rank_count(&server.received_requests().await.unwrap()),
+                ranks,
+                "{kind}: no rank fallback"
             );
+            assert_eq!(state(&other.path), other_before);
             assert_eq!(
-                std::fs::read(&account.media).unwrap(),
-                b"known media belonging only to account A"
+                quiet_media_snapshot(account.media.parent().unwrap()),
+                media_before
             );
         }
-        {
-            let conn = Connection::open(&account.path).unwrap();
-            if kind == "write" {
-                conn.execute_batch("DROP TRIGGER shadow_cli_fault").unwrap();
-            } else if kind == "capacity" {
-                conn.execute(
-                    "UPDATE provider_shadow_pages SET charged_bytes=?1",
-                    [original_charge.unwrap()],
-                )
+        if kind == "write" {
+            Connection::open(&account.path)
+                .unwrap()
+                .execute_batch("DROP TRIGGER observation_cli_fault")
                 .unwrap();
-            }
         }
-        failure.store(false, std::sync::atomic::Ordering::SeqCst);
-        success(&command(root, &account, &["sync", "--no-progress-bar"]));
-        for _ in 0..2 {
-            // Actual CLI processes reopen independently; the second empty
-            // page replay must not grow observations or repeat publication.
+        // Correct only the malformed envelope/scope. Unknown record types have
+        // their own repeated-refusal test and are never relabeled as known.
+        phase.store(2, Ordering::SeqCst);
+        for _ in 0..3 {
             success(&command(root, &account, &["sync", "--no-progress-bar"]));
             let conn = Connection::open(&account.path).unwrap();
             assert_eq!(
                 conn.query_row::<String, _, _>(
-                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                    "SELECT value FROM metadata WHERE key='sync_token:v27:PrimarySync'",
                     [],
-                    |row| row.get(0)
+                    |r| r.get(0)
                 )
                 .unwrap(),
-                "delta-successor",
-                "{kind}"
+                "current-successor"
+            );
+            let proof: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='observed_selection:v27:PrimarySync'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&proof).unwrap()["cursor_hash"],
+                format!("{:x}", Sha256::digest(b"current-successor"))
             );
             assert_eq!(
                 conn.query_row::<i64, _, _>(
                     "SELECT count(*) FROM provider_shadow_pages",
                     [],
-                    |row| row.get(0)
+                    |r| r.get(0)
                 )
                 .unwrap(),
-                2,
-                "{kind}"
-            );
-            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_shadow_records WHERE record_name='future-source'",[],|row|row.get(0)).unwrap(), 1, "{kind}");
-            assert_eq!(
-                rows(&account.path, "SELECT * FROM asset_metadata_paths"),
-                before[3]
+                0
             );
             assert_eq!(
-                std::fs::read(&account.media).unwrap(),
-                b"known media belonging only to account A"
+                rank_count(&server.received_requests().await.unwrap()),
+                ranks
             );
+            assert_eq!(state(&other.path), other_before);
             assert_eq!(
-                std::fs::read_dir(account.media.parent().unwrap())
-                    .unwrap()
-                    .count(),
-                1
-            );
-        }
-        for request in server.received_requests().await.unwrap() {
-            let body: Value = serde_json::from_slice(&request.body).unwrap();
-            assert!(
-                !(request.url.path().ends_with("/records/query")
-                    && body["query"]["recordType"]
-                        .as_str()
-                        .is_some_and(|kind| kind.starts_with("CPLAsset"))),
-                "{kind}: rank fallback must never run"
+                quiet_media_snapshot(account.media.parent().unwrap()),
+                media_before
             );
         }
     }
@@ -1298,6 +1260,7 @@ fn quiet_media_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>, std::time::System
 
 #[derive(Clone)]
 struct RecentCliPhotos {
+    supported_signature: bool,
     first_delta: std::sync::Arc<std::sync::atomic::AtomicBool>,
     queries: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -1306,11 +1269,16 @@ impl RecentCliPhotos {
     fn pair(&self, number: usize) -> Vec<Value> {
         let master = format!("recent-{number}");
         let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        let checksum = if self.supported_signature {
+            "ARlLhEVSOK91hmylGp3pp97vvptc".to_owned()
+        } else {
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(QUIET_MEDIA))
+        };
         vec![
             json!({"recordName":master,"recordType":"CPLMaster","zoneID":zone,"fields":{
                 "filenameEnc":{"value":format!("recent-{number}.jpg"),"type":"STRING"},
                 "resOriginalRes":{"value":{"downloadURL":format!("https://p01.icloud-content.com/synthetic-never-fetch-recent-{number}"),"size":QUIET_MEDIA.len(),
-                    "fileChecksum":base64::engine::general_purpose::STANDARD.encode(Sha256::digest(QUIET_MEDIA))}},
+                    "fileChecksum":checksum}},
                 "resOriginalWidth":{"value":1},"resOriginalHeight":{"value":1},"resOriginalFileType":{"value":"public.jpeg"},
                 "itemType":{"value":"public.jpeg"},"adjustmentRenderType":{"value":0}},"recordChangeTag":"recent-master"}),
             json!({"recordName":format!("asset-{master}"),"recordType":"CPLAsset","zoneID":zone,"fields":{
@@ -1386,10 +1354,20 @@ impl Respond for RecentCliPhotos {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_other_account() {
+    exercise_recent_cli_reopen(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recent_cli_names_without_content_proof_stay_pending_on_reopen() {
+    exercise_recent_cli_reopen(false).await;
+}
+
+async fn exercise_recent_cli_reopen(supported_signature: bool) {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let server = MockServer::start().await;
     let photos = RecentCliPhotos {
+        supported_signature,
         first_delta: Arc::new(AtomicBool::new(true)),
         queries: Arc::new(AtomicUsize::new(0)),
     };
@@ -1406,8 +1384,9 @@ async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_othe
     let root = directory.path();
     let account = seed(root, ACCOUNTS[0], "A", &server.uri());
     let other = seed(root, ACCOUNTS[1], "B", &server.uri());
-    // The actual binary enforces HTTPS CDN URLs. Exercise its existing local
-    // name-id7 existing-file skip owner, never the synthetic URL.
+    // Name-id7 locates candidates only. RecentCliPhotos supplies the supported
+    // v1 salted provider signature for the complete synthetic QUIET_MEDIA bytes;
+    // ordinary whole-file SHA256 would not prove provider equivalence.
     let text = std::fs::read_to_string(&account.config).unwrap();
     std::fs::write(
         &account.config,
@@ -1434,8 +1413,8 @@ async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_othe
     ).unwrap();
     let other_before = state(&other.path);
     let old_media = quiet_media_snapshot(account.media.parent().unwrap());
-    for cycle in 0..5 {
-        let arguments = match cycle {
+    for cycle in 0..if supported_signature { 5 } else { 2 } {
+        let arguments = match if supported_signature { cycle } else { 0 } {
             0 => vec![
                 "sync",
                 "--recent",
@@ -1465,11 +1444,34 @@ async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_othe
             .timeout(Duration::from_secs(30))
             .output()
             .unwrap();
+        if !supported_signature {
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("Existing file match is uncertain")
+            );
+            let conn = Connection::open(&account.path).unwrap();
+            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM assets WHERE id LIKE 'asset-recent-%' AND status='downloaded'",[],|r|r.get(0)).unwrap(),0);
+            assert!(
+                conn.query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_active_destinations WHERE verified_media=0",
+                    [],
+                    |r| r.get(0)
+                )
+                .unwrap()
+                    > 0
+            );
+            assert_eq!(state(&other.path), other_before);
+            assert_eq!(
+                quiet_media_snapshot(account.media.parent().unwrap()),
+                old_media
+            );
+            continue;
+        }
         success(&output);
         let conn = Connection::open(&account.path).unwrap();
-        // name-id7's existing-file policy skips without inventing downloaded
-        // state. Trace the actual selected byte paths; fresh publication and
-        // finalization are qualified by the dispatcher companion/overflow tests.
+        // Candidate naming locates files; the supported content signature above
+        // verifies reuse. Trace the selected paths as well as settled state.
         let stderr = String::from_utf8_lossy(&output.stderr);
         let names: Vec<_> = (0..3)
             .map(|n| format!("recent-{n}_YXNzZXQ.JPG"))
@@ -1493,8 +1495,8 @@ async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_othe
                 )
                 .unwrap();
             assert_eq!(
-                serde_json::from_str::<Value>(&raw).unwrap()["complete"],
-                false
+                serde_json::from_str::<Value>(&raw).unwrap().get("complete"),
+                Some(&json!(true))
             );
             assert_eq!(
                 conn.query_row::<i64, _, _>(
@@ -1503,7 +1505,8 @@ async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_othe
                     |r| r.get(0)
                 )
                 .unwrap(),
-                3
+                0,
+                "current selection must not require raw catalog projection"
             );
         } else {
             if cycle <= 2 {
@@ -1520,7 +1523,7 @@ async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_othe
             }
             let cursor: String = conn
                 .query_row(
-                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                    "SELECT value FROM metadata WHERE key='sync_token:v27:PrimarySync'",
                     [],
                     |r| r.get(0),
                 )
@@ -1537,6 +1540,28 @@ async fn recent_actual_cli_overflow_reopens_increases_removes_and_preserves_othe
                 );
             }
         }
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT value FROM metadata WHERE key='sync_token:v27:PrimarySync'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            "recent-delta-successor",
+            "bridge cursor, never rank token"
+        );
+        let selected: Vec<String> = conn.prepare(
+            "SELECT id FROM assets WHERE library='PrimarySync' AND id LIKE 'asset-recent-%' AND status='downloaded' ORDER BY id")
+            .unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        let expected: Vec<_> = if cycle == 0 {
+            vec!["asset-recent-1", "asset-recent-2"]
+        } else {
+            vec!["asset-recent-0", "asset-recent-1", "asset-recent-2"]
+        };
+        assert_eq!(
+            selected, expected,
+            "only selected provider identities may be adopted"
+        );
         assert_eq!(conn.query_row::<String,_,_>("SELECT last_error FROM assets WHERE library='OldUnknownScope' AND id='retry' AND status='pending'",[],|r|r.get(0)).unwrap(), "A-retry-error");
         assert_eq!(state(&other.path), other_before);
         for (path, bytes, modified) in &old_media {
@@ -1568,6 +1593,8 @@ struct PrivateSelectionCliPhotos {
 impl PrivateSelectionCliPhotos {
     fn pair(&self, number: usize) -> Vec<Value> {
         let mut pair = RecentCliPhotos {
+            // Preserve this receipt-binding fixture's existing opaque checksum.
+            supported_signature: false,
             first_delta: Default::default(),
             queries: Default::default(),
         }
