@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 37;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 39;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -593,9 +593,11 @@ CREATE TABLE IF NOT EXISTS unresolved_sparse_identities (
     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
     next_retry_at INTEGER,
     last_outcome TEXT,
-    PRIMARY KEY (library, source_record_name)
+    observation_origin TEXT,
+    epoch INTEGER NOT NULL DEFAULT 1 CHECK(epoch IN (0,1)),
+    PRIMARY KEY (epoch, library, source_record_name)
 );
-CREATE INDEX IF NOT EXISTS idx_sparse_identity_retry ON unresolved_sparse_identities(library, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_sparse_identity_retry ON unresolved_sparse_identities(epoch, library, next_retry_at);
 
 CREATE TABLE IF NOT EXISTS metadata_capture_retries (
     library TEXT NOT NULL,
@@ -725,7 +727,7 @@ CREATE INDEX IF NOT EXISTS primary_layout_binding_owner ON primary_layout_bindin
 CREATE INDEX IF NOT EXISTS primary_layout_claim_owner ON primary_layout_claims(library,child);
 CREATE INDEX IF NOT EXISTS primary_layout_pending_library ON primary_layout_operations(source_library,phase);
 ").unwrap();
-    // Match schema 37 before marking this synthetic database current.
+    // Match current receipt columns; sparse epoch/origin above reflect schema 39.
     conn.execute_batch(r"
 ALTER TABLE provider_active_destinations ADD COLUMN frozen_metadata BLOB;
 ALTER TABLE provider_active_destinations ADD COLUMN frozen_metadata_hash BLOB;

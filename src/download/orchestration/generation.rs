@@ -597,6 +597,23 @@ impl SelectionContext {
     }
 }
 
+// Expected reference-transition refusals retain the original task for backoff.
+// Other errors remain fatal to admission and cannot become a deferred success.
+fn classify_selection_reference_deferral(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::state::error::StateError>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                crate::state::error::StateError::ProviderWorkConflict
+                    | crate::state::error::StateError::ProviderSelectionFull
+            )
+        })
+        || error
+            .downcast_ref::<SelectionReferenceUnavailable>()
+            .is_some()
+}
+
 impl SelectionRun {
     pub(in crate::download) fn for_asset(
         self: &Arc<Self>,
@@ -627,20 +644,7 @@ impl SelectionRun {
     ) -> Result<(Arc<Self>, PhotoAsset)> {
         match self.prepare_replay(decision, asset.clone(), config).await {
             Ok(value) => Ok(value),
-            Err(error)
-                if error
-                    .downcast_ref::<crate::state::error::StateError>()
-                    .is_some_and(|error| {
-                        matches!(
-                            error,
-                            crate::state::error::StateError::ProviderWorkConflict
-                                | crate::state::error::StateError::ProviderSelectionFull
-                        )
-                    })
-                    || error
-                        .downcast_ref::<SelectionReferenceUnavailable>()
-                        .is_some() =>
-            {
+            Err(error) if classify_selection_reference_deferral(&error) => {
                 // The existing producer refusal path owns durable backoff and
                 // incomplete reporting for this still-original task.
                 Ok((self.clone(), asset))

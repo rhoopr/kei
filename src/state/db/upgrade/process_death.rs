@@ -150,7 +150,10 @@ async fn v027_upgrade_sigkill_preserves_snapshot_and_reopens_without_losing_wal_
     for _ in 0..2 {
         let db = SqliteStateDb::open_owned(&path, &owner()).await.unwrap();
         let conn = db.acquire_lock("verify upgraded work").unwrap();
-        assert_eq!(schema::get_schema_version(&conn).unwrap(), 37);
+        assert_eq!(
+            schema::get_schema_version(&conn).unwrap(),
+            schema::SCHEMA_VERSION
+        );
         retained(&conn);
         assert_eq!(std::fs::read(&saved[0]).unwrap(), snapshot_bytes);
         assert_eq!(std::fs::read(&media).unwrap(), b"unchanged media");

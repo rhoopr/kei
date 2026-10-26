@@ -27,7 +27,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` in support to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 37;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 39;
     let production_schema = include_str!("../../src/state/schema.rs");
     assert!(
         production_schema.contains(&format!(

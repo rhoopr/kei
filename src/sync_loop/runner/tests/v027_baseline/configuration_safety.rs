@@ -318,7 +318,7 @@ fn seed_stock_history(path: &std::path::Path, history: History, extra: bool) {
             vec!["historical-source"]
         } {
             let evidence = if history == History::Malformed {
-                "unparseable old evidence"
+                "unparsable old evidence"
             } else {
                 r#"[1,"historical-child","SharedSync-absent","historical-owner"]"#
             };

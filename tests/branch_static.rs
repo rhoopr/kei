@@ -2073,6 +2073,7 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_reconciliation_io_error",
         "classify_selection_confirmation_error",
         "classify_selection_incremental_error",
+        "classify_selection_reference_deferral",
         "classify_shadow_page_error",
         "classify_srp_post_error",
         "classify_support_error",

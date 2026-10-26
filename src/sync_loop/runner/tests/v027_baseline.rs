@@ -252,7 +252,7 @@ async fn v027_observation_proof_keeps_failed_media_outstanding_until_quiet_retry
     REQUIRE_OBSERVATION_PROOF
         .scope(
             true,
-            baseline_contract("private", true, false, false, false, false, false),
+            baseline_contract("private", false, false, true, false, false, false),
         )
         .await;
 }
@@ -1070,7 +1070,8 @@ async fn baseline_contract(
             assert!(!observed[0].settlement_unknown);
             assert_eq!(
                 observed[0].pending_media,
-                initial_failure && !current_sidecar_failure && cycle < 2
+                initial_failure && !current_sidecar_failure && cycle == 0,
+                "media failure is outstanding on cycle zero and settled by quiet retry on cycle one"
             );
             assert_eq!(
                 observed[0].pending_metadata,

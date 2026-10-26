@@ -356,7 +356,6 @@ async fn download_photos_with_sync_inner(
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
     // Naming controls new filenames, never convergence of an existing archive.
-    let primary_layout_active = false;
     let config = Arc::new(DownloadConfig {
         primary_layout_active: false,
         primary_layout_preview: false,
@@ -456,10 +455,8 @@ async fn download_photos_with_sync_inner(
             config
         };
 
-    if !primary_layout_active {
-        super::queue_projection::admit_retained_work(passes, &config, controls, &shutdown_token)
-            .await?;
-    }
+    super::queue_projection::admit_retained_work(passes, &config, controls, &shutdown_token)
+        .await?;
 
     let result = match &config.sync_mode {
         SyncMode::Full if config.selection_context.is_some() => {
@@ -649,16 +646,6 @@ async fn download_photos_with_sync_inner(
     )
     .await?;
 
-    // Managed publication can complete the newly captured source in this cycle.
-    // Keep the existing bounded admission owner, but run it after capture so an
-    // otherwise quiet reopen does not need to hydrate yesterday's completed work.
-    if primary_layout_active
-        && matches!(result.outcome, DownloadOutcome::Success)
-        && !shutdown_token.is_cancelled()
-    {
-        super::queue_projection::admit_retained_work(passes, &config, controls, &shutdown_token)
-            .await?;
-    }
     super::generation::hold_retained_debt(passes, &config, controls, &mut result).await?;
 
     // Pending is transient — anything still pending after a complete sync either
