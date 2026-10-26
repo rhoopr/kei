@@ -419,7 +419,13 @@ async fn expansion(
             .unwrap();
     }
     let first_observation = usize::from(historical != History::CurrentBaseline);
-    for cycle in 0..if unavailable { 5 } else { 4 } {
+    let bridge_reopen = matches!(historical, History::MissingBridge | History::BlankBridge);
+    let expansion_cycle = if bridge_reopen { 2 } else { 1 };
+    for cycle in 0..if unavailable {
+        5
+    } else {
+        4 + usize::from(bridge_reopen)
+    } {
         let db = Arc::new(
             SqliteStateDb::open_owned(&database, &baseline_owner())
                 .await
@@ -477,7 +483,8 @@ async fn expansion(
         let mut selected = make_run_cycle_library_state_with_passes(ZONE, &key, vec![pass]);
         selected.library = library;
         let lower = crate::config::CreatedDateFilter::CaptureDate(
-            chrono::NaiveDate::from_ymd_opt(2026, if cycle == 0 { 4 } else { 1 }, 1).unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, if cycle < expansion_cycle { 4 } else { 1 }, 1)
+                .unwrap(),
         );
         let mut config = make_run_cycle_config();
         config.filters.skip_created_before = Some(lower);
@@ -599,7 +606,7 @@ async fn expansion(
             );
             assert_eq!(
                 result.stats.downloaded,
-                usize::from(cycle == 0 || cycle == if unavailable { 2 } else { 1 }),
+                usize::from(cycle == 0 || cycle == if unavailable { 2 } else { expansion_cycle }),
                 "{result:?}"
             );
             assert_eq!(
@@ -607,8 +614,17 @@ async fn expansion(
                 Some(format!("expanded-after-{cycle}"))
             );
         }
-        if cycle == 0 {
+        if cycle < expansion_cycle {
             assert!(!january.exists());
+        }
+        if bridge_reopen && cycle == 1 {
+            assert!(
+                db.get_metadata(&format!("observed_selection:v27:{ZONE}"))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "same-selection reopen must establish observation proof before configuration expansion"
+            );
         }
         if january.exists() {
             assert_eq!(std::fs::read(&january).unwrap(), MEDIA);
@@ -619,14 +635,14 @@ async fn expansion(
                 january_mtime = Some(mtime);
             }
         }
-        if cycle == 1 {
+        if cycle == expansion_cycle {
             assert!(
                 session.inventories.load(Ordering::SeqCst) > 0,
                 "expanded selection needs current inventory"
             );
         }
         if (!observed_historical || resolve_source && cycle >= 3)
-            && cycle >= if unavailable { 3 } else { 2 }
+            && cycle >= if unavailable { 3 } else { expansion_cycle + 1 }
         {
             assert_eq!(
                 session.inventories.load(Ordering::SeqCst),

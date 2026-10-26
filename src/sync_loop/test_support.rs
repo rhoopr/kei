@@ -547,9 +547,6 @@ pub(super) struct FailingMetadataSetDb {
     pub(super) fail_upsert_seen: bool,
     pub(super) fail_source_delete: bool,
     pub(super) fail_mark_downloaded: bool,
-    omit_verified_source: bool,
-    replace_historical_current: bool,
-    receipt_diagnostic: Option<Result<state::db::LegacyChildReceiptRefusal, &'static str>>,
     pub(super) fail_refresh_downloaded_metadata: bool,
     /// Stands in for a concurrent pass: refreshes the row to this snapshot
     /// and marks it for rewrite in the window between the downloader
@@ -576,24 +573,6 @@ impl std::fmt::Debug for FailingMetadataSetDb {
 }
 
 impl FailingMetadataSetDb {
-    pub(super) fn with_historical_current_replacement(mut self) -> Self {
-        self.replace_historical_current = true;
-        self
-    }
-
-    pub(super) fn with_unknown_download_source(mut self) -> Self {
-        self.omit_verified_source = true;
-        self
-    }
-
-    pub(super) fn with_receipt_diagnostic(
-        mut self,
-        result: Result<state::db::LegacyChildReceiptRefusal, &'static str>,
-    ) -> Self {
-        self.receipt_diagnostic = Some(result);
-        self
-    }
-
     async fn prepare_downloaded_write(
         &self,
         library: &str,
@@ -652,9 +631,6 @@ impl FailingMetadataSetDb {
             fail_upsert_seen: false,
             fail_source_delete: false,
             fail_mark_downloaded: false,
-            omit_verified_source: false,
-            replace_historical_current: false,
-            receipt_diagnostic: None,
             fail_refresh_downloaded_metadata: false,
             refresh_on_mark_downloaded: None,
             drains: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -832,31 +808,17 @@ impl state::DownloadStateStore for FailingMetadataSetDb {
     ) -> Result<(), state::error::StateError> {
         self.prepare_downloaded_write(library, id, version_size)
             .await?;
-        if self.omit_verified_source {
-            self.inner
-                .mark_downloaded_with_capture_repair(
-                    library,
-                    id,
-                    version_size,
-                    local_path,
-                    local_checksum,
-                    download_checksum,
-                    mark_capture_repair,
-                )
-                .await
-        } else {
-            self.inner
-                .mark_verified_download(
-                    library,
-                    id,
-                    version_size,
-                    local_path,
-                    local_checksum,
-                    download_checksum,
-                    mark_capture_repair,
-                )
-                .await
-        }
+        self.inner
+            .mark_verified_download(
+                library,
+                id,
+                version_size,
+                local_path,
+                local_checksum,
+                download_checksum,
+                mark_capture_repair,
+            )
+            .await
     }
 
     async fn mark_downloaded(

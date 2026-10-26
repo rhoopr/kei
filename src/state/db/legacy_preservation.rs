@@ -351,23 +351,6 @@ pub(crate) enum LegacyChildReceiptRefusal {
     SourceMissing,
     SourceInvalid,
     StateChanged,
-    Unavailable,
-}
-
-#[cfg(test)]
-impl LegacyChildReceiptRefusal {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::ChildNotReady => "child_not_ready",
-            Self::RenditionMissing => "rendition_missing",
-            Self::PathReceiptMissing => "path_receipt_missing",
-            Self::BindingMismatch => "receipt_binding_mismatch",
-            Self::SourceMissing => "source_receipt_missing",
-            Self::SourceInvalid => "source_receipt_invalid",
-            Self::StateChanged => "receipt_state_changed",
-            Self::Unavailable => "diagnostic_unavailable",
-        }
-    }
 }
 
 pub(super) fn child_receipts_ready(

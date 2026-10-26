@@ -467,3 +467,21 @@ formatting and diff checks passed. No 40,000-item experiment, live account call,
 schema migration or publication occurred. Further broad qualification and
 independent review remain required; this checkpoint addresses the demonstrated
 stable-pending fallback rescan rather than expanding into other startup costs.
+
+### Retired historical certification test contract
+
+Ordinary sync no longer creates historical attribution certificates, relocates
+old files into a new archive layout, or waits for that work before saving current
+progress. The tests that required those operations and their exclusive fixture
+have been removed together. This does not remove interrupted-operation recovery
+or requested metadata completion.
+
+Their applicable safety assertions are covered by current normal-flow fixtures:
+shared historical path claims, mappings, revisions and retries remain unchanged;
+external media and sidecar hardlinks retain their bytes, timestamps and inodes;
+and missing or blank baseline bridge successors cannot save a token or observation
+proof. Same-selection reopen must recover before later configuration expansion.
+Existing selected Hidden/album/companion, publication/checkpoint interruption,
+conservative signature matching, prepared-write and quiet-retry tests retain
+those independent contracts. These synthetic checks do not certify any reporter's
+archive or replace supported-version migration and platform qualification.

@@ -18,9 +18,9 @@ run_scenario_test lib metadata_capture_retry_changed_evidence_is_due_and_old_att
 # Full cycle checkpoint isolation and both streaming/collecting recovery routes.
 run_scenario_test lib unresolved_identity_survives_restart_and_other_zone_success_then_recovers
 run_scenario_test lib sparse_retry_omitted_source_preserves_failed_work_then_recovers_media
-# Schema-28 preservation keeps unattributed history separate from current children.
-run_scenario_test lib run_cycle_ambiguous_children_preserved_independently
-run_scenario_test lib run_cycle_single_survivor_preserved
+# Current sync preserves historical shared claims and metadata debt without backfill.
+run_scenario_test lib v027_normal_selected_sync_preserves_shared_historical_claims_and_debt
+run_scenario_test lib v027_baseline_preserves_queued_existing_metadata_while_new_files_get_sidecars
 
 # Fixed seeded orderings: deferred work, regressing evidence, interruption and a quiet tail.
 run_scenario_test lib capture_recovery_sequence_seed_

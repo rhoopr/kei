@@ -34,8 +34,6 @@ pub(crate) mod provider_inbox;
 pub(crate) mod provider_selection;
 pub(crate) mod provider_work;
 pub(crate) mod trusted_legacy;
-#[cfg(test)]
-pub(crate) use legacy_preservation::LegacyChildReceiptRefusal;
 pub(crate) use legacy_preservation::{LegacyActivationProof, LegacyFileEvidence};
 pub(crate) mod primary_layout;
 mod reconciliation;
