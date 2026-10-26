@@ -514,3 +514,56 @@ pub(super) fn sidecar_path_for(media_path: &std::path::Path) -> std::path::PathB
     name.push(".xmp");
     media_path.with_file_name(name)
 }
+
+/// Current managed downloads have authenticated publication ownership, not
+/// merely a legacy source-byte receipt. The mock cannot contact a live provider.
+pub(super) async fn owned_download_fixture(
+    root: &std::path::Path,
+    library: &str,
+) -> (
+    Arc<crate::state::SqliteStateDb>,
+    crate::download::DownloadConfig,
+) {
+    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, inbox::ShadowCapture};
+    use crate::state::db::account::AccountOwner;
+    use serde_json::json;
+
+    let owner = AccountOwner::authenticated(
+        "writer@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-writer"}})).unwrap(),
+    )
+    .unwrap();
+    let db = Arc::new(
+        crate::state::SqliteStateDb::open_owned(&root.join("state.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: "https://invalid.example".into(),
+            name: "selected".into(),
+            list_type: "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
+            obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
+            query_filter: None,
+            page_size: 1,
+            zone_id: Arc::new(json!({"zoneName":library,"ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(crate::test_helpers::MockPhotosSession::new()),
+    );
+    album.set_shadow_capture(
+        ShadowCapture::new(db.clone(), owner, "com"),
+        "private".into(),
+    );
+    let mut config = crate::download::DownloadConfig::test_default();
+    config.directory = Arc::from(root);
+    config.library = Arc::from(library);
+    config.state_db = Some(db.clone());
+    config.primary_layout_source = Some(Arc::new(album));
+    config.primary_layout_pass = Some("selected-pass".into());
+    (db, config)
+}

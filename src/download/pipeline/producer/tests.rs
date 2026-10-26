@@ -888,55 +888,6 @@ async fn seed_downloaded_jpeg_asset(
     derived
 }
 
-/// Current managed downloads have authenticated publication ownership, not
-/// merely a legacy source-byte receipt. The mock cannot contact a live provider.
-#[cfg(feature = "xmp")]
-async fn owned_metadata_fixture(
-    root: &std::path::Path,
-) -> (Arc<crate::state::SqliteStateDb>, DownloadConfig) {
-    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, inbox::ShadowCapture};
-    use crate::state::db::account::AccountOwner;
-    use serde_json::json;
-
-    let owner = AccountOwner::authenticated(
-        "writer@example.invalid",
-        "com",
-        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-writer"}})).unwrap(),
-    )
-    .unwrap();
-    let db = Arc::new(
-        crate::state::SqliteStateDb::open_owned(&root.join("state.db"), &owner)
-            .await
-            .unwrap(),
-    );
-    let mut album = PhotoAlbum::new(
-        PhotoAlbumConfig {
-            params: Arc::new(std::collections::HashMap::new()),
-            service_endpoint: "https://invalid.example".into(),
-            name: "selected".into(),
-            list_type: "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
-            obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
-            query_filter: None,
-            page_size: 1,
-            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
-            retry_config: crate::retry::RetryConfig::default(),
-            container_id: None,
-            cross_zone_sources: Vec::new(),
-        },
-        Box::new(crate::test_helpers::MockPhotosSession::new()),
-    );
-    album.set_shadow_capture(
-        ShadowCapture::new(db.clone(), owner, "com"),
-        "private".into(),
-    );
-    let mut config = DownloadConfig::test_default();
-    config.directory = Arc::from(root);
-    config.state_db = Some(db.clone());
-    config.primary_layout_source = Some(Arc::new(album));
-    config.primary_layout_pass = Some("selected-pass".into());
-    (db, config)
-}
-
 #[cfg(feature = "xmp")]
 async fn seed_owned_jpeg(
     db: &Arc<crate::state::SqliteStateDb>,
@@ -2072,7 +2023,9 @@ async fn metadata_drift_writes_fresh_value_into_the_sidecar() {
     use std::sync::Arc;
 
     let dir = TempDir::new().unwrap();
-    let (db, mut config) = owned_metadata_fixture(dir.path()).await;
+    let (db, mut config) =
+        crate::download::pipeline::test_support::owned_download_fixture(dir.path(), "PrimarySync")
+            .await;
     config.metadata.xmp_sidecar = true;
     config.state_db = Some(db.clone());
     // Historical writers run only for an explicit metadata refresh.
@@ -2551,7 +2504,9 @@ async fn rewrite_failure_retains_marker_holding_fresh_metadata() {
     use std::sync::Arc;
 
     let dir = TempDir::new().unwrap();
-    let (db, mut config) = owned_metadata_fixture(dir.path()).await;
+    let (db, mut config) =
+        crate::download::pipeline::test_support::owned_download_fixture(dir.path(), "PrimarySync")
+            .await;
     config.metadata.xmp_sidecar = true;
     config.state_db = Some(db.clone());
     // Historical writers run only for an explicit metadata refresh.
@@ -2625,7 +2580,9 @@ async fn rewrite_failure_retains_marker_holding_fresh_metadata() {
     );
     // The fault is connection-local. Reopen the same durable state and retry
     // without another provider observation; the pending writer must settle.
-    let (reopened, mut retry_config) = owned_metadata_fixture(dir.path()).await;
+    let (reopened, mut retry_config) =
+        crate::download::pipeline::test_support::owned_download_fixture(dir.path(), "PrimarySync")
+            .await;
     retry_config.metadata.xmp_sidecar = true;
     retry_config.refresh_metadata = true;
     let retry = stream_and_download_from_stream(

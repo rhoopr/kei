@@ -159,95 +159,119 @@ async fn run_producer_metadata_rewritten_pending_file(
     PathBuf,
     String,
 ) {
-    use crate::download::DownloadConfig;
-    use crate::icloud::photos::PhotoAsset;
-    use crate::state::{SqliteStateDb, VersionSizeKey};
-    use crate::test_helpers::TestAssetRecord;
-    use futures_util::stream;
-    use std::sync::Arc;
+    use crate::download::pipeline::test_support::owned_download_fixture;
+    use crate::state::{
+        TempFileOwnershipStore,
+        db::{PreparedPublication, provider_selection::SelectionPath},
+    };
+    use sha2::{Digest, Sha256};
 
-    fn metadata_rewritten_asset() -> PhotoAsset {
+    let server = wiremock::MockServer::start().await;
+    let asset_for = |checksum: &str| {
         TestPhotoAsset::new("METADATA_REWRITTEN_PENDING")
             .filename("rewritten.jpg")
             .item_type("public.jpeg")
             .orig_file_type("public.jpeg")
             .orig_size(8)
-            .orig_url("https://p01.icloud-content.com/rewritten.jpg")
-            .orig_checksum("ck_metadata_rewritten_pending")
+            .orig_url(&format!("{}/rewritten.jpg", server.uri()))
+            .orig_checksum(checksum)
             .build()
             .with_source_zone(Arc::from("SharedSync-abc"))
-    }
-
-    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+    };
     let dir = TempDir::new().unwrap();
-    let mut config = DownloadConfig::test_default();
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-    let config = Arc::new(config);
-
-    let asset = metadata_rewritten_asset();
-    let target_path = crate::download::filter::expected_paths_for(&asset, config.as_ref())
-        .first()
-        .expect("test asset must derive an expected path")
-        .path
-        .clone();
-    if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
+    let (db, config) = owned_download_fixture(dir.path(), "SharedSync-abc").await;
+    let prior = asset_for(pending_checksum);
+    let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+    let plan = planner.plan_download_asset(&prior, &config).await.unwrap();
+    let task = &plan.tasks[0];
+    db.upsert_seen(&crate::download::planner::pending_record_for_task(
+        &config, &prior, task,
+    ))
+    .await
+    .unwrap();
+    let target_path = task.download_path.clone();
+    fs::create_dir_all(target_path.parent().unwrap()).unwrap();
     fs::write(&target_path, b"shorter").unwrap();
+    let mtime = fs::metadata(&target_path).unwrap().modified().unwrap();
     let local_checksum = crate::download::file::compute_sha256(&target_path)
         .await
-        .expect("hash metadata-rewritten file");
-
-    let record = TestAssetRecord::new(asset.state_id())
-        .library("SharedSync-abc")
-        .checksum(pending_checksum)
-        .filename("rewritten.jpg")
-        .size(8)
-        .build();
-    db.upsert_seen(&record).await.unwrap();
-    db.mark_downloaded(
-        "SharedSync-abc",
-        asset.state_id(),
-        VersionSizeKey::Original.as_str(),
+        .unwrap();
+    let source_checksum = format!("{:x}", Sha256::digest(b"original"));
+    assert_ne!(source_checksum, local_checksum);
+    let temporary = dir.path().join("owned.part");
+    db.claim_temp_file(&temporary).await.unwrap();
+    let proof = PreparedPublication {
+        binding: task.publication_binding.as_deref().cloned(),
+        library: task.library.to_string(),
+        id: task.asset_id.to_string(),
+        version: task.version_size.as_str().into(),
+        provider_checksum: task.checksum.to_string(),
+        provider_size: task.size,
+        temporary: SelectionPath::from_path(&temporary),
+        destination: SelectionPath::from_path(&target_path),
+        local_checksum: local_checksum.clone(),
+        source_checksum: source_checksum.clone(),
+    };
+    assert!(proof.binding.is_some());
+    db.prepare_temp_publication(&temporary, &proof)
+        .await
+        .unwrap();
+    db.mark_verified_download(
+        &proof.library,
+        &proof.id,
+        &proof.version,
         &target_path,
         &local_checksum,
-        Some("download-checksum-before-metadata"),
+        Some(&source_checksum),
+        false,
     )
     .await
     .unwrap();
     db.mark_failed(
-        "SharedSync-abc",
-        asset.state_id(),
-        VersionSizeKey::Original.as_str(),
+        &proof.library,
+        &proof.id,
+        &proof.version,
         "prior false truncation",
     )
     .await
     .unwrap();
     db.prepare_for_retry(
-        Some("SharedSync-abc"),
+        Some(&proof.library),
         crate::state::RetryErrorRetention::Clear,
     )
     .await
     .unwrap();
-
-    let client = reqwest::Client::new();
-    let sync_started_at = chrono::Utc::now().timestamp();
-    let assets = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(
-        metadata_rewritten_asset(),
-    )]);
-    let result = stream_and_download_from_stream(
-        &client,
-        assets,
-        &config,
-        DownloadControls::download_hidden(),
-        1,
-        CancellationToken::new(),
-        StreamRuntime::new(None, None),
-    )
-    .await
-    .expect("sync must process metadata-rewritten pending file");
-
+    drop(config);
+    drop(db);
+    let mut final_attempt = None;
+    for _ in 0..2 {
+        let (db, config) = owned_download_fixture(dir.path(), "SharedSync-abc").await;
+        let sync_started_at = chrono::Utc::now().timestamp();
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset_for(
+                "ck_metadata_rewritten_pending",
+            ))]),
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.downloaded, 0);
+        assert_eq!(result.bytes_downloaded, 0);
+        assert_eq!(result.disk_bytes_written, 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(fs::read(&target_path).unwrap(), b"shorter");
+        assert_eq!(
+            fs::metadata(&target_path).unwrap().modified().unwrap(),
+            mtime
+        );
+        final_attempt = Some((result, sync_started_at, db));
+    }
+    let (result, sync_started_at, db) = final_attempt.unwrap();
     (
         result,
         sync_started_at,
@@ -281,7 +305,7 @@ async fn producer_adopts_smaller_metadata_rewritten_pending_file() {
     );
     assert_eq!(
         downloaded[0].download_checksum.as_deref(),
-        Some("download-checksum-before-metadata")
+        Some(format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b"original")).as_str())
     );
 }
 
@@ -291,12 +315,30 @@ async fn producer_does_not_adopt_metadata_rewritten_file_after_provider_change()
         run_producer_metadata_rewritten_pending_file("old-provider-checksum").await;
 
     assert_eq!(result.downloaded, 0);
-    assert_eq!(result.failed.len(), 1);
+    assert!(result.failed.is_empty());
+    assert_eq!(result.skip_summary.uncertain, 1);
+    assert_eq!(
+        result.state_write_failures, 1,
+        "current generation was not admitted, so coverage must remain held"
+    );
     assert_eq!(fs::read(&target_path).unwrap(), b"shorter");
     assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
-    let failed = db.get_failed().await.unwrap();
-    assert_eq!(failed.len(), 1);
-    assert_eq!(failed[0].checksum.as_ref(), "ck_metadata_rewritten_pending");
+    assert!(db.get_failed().await.unwrap().is_empty());
+    let pending = db.get_pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].checksum.as_ref(),
+        "old-provider-checksum",
+        "refused admission cannot relabel the old receipt"
+    );
+    assert_eq!(
+        pending[0].local_path.as_deref(),
+        Some(target_path.as_path())
+    );
+    assert_eq!(
+        pending[0].download_checksum.as_deref(),
+        Some(format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b"original")).as_str())
+    );
 }
 
 #[tokio::test]
@@ -518,17 +560,19 @@ async fn on_disk_skip_refreshes_catalogue_on_metadata_drift() {
     let record =
         asset_record_for_derived_path(Arc::from("PrimarySync"), &stored, &derived, &config);
     db.upsert_seen(&record).await.unwrap();
-    db.mark_downloaded(
+    db.mark_verified_download(
         "PrimarySync",
         stored.state_id(),
         derived.version_size.as_str(),
         &derived.path,
         &seeded_checksum,
-        None,
+        Some(&seeded_checksum),
+        false,
     )
     .await
     .unwrap();
 
+    let mtime = fs::metadata(&derived.path).unwrap().modified().unwrap();
     let result = stream_and_download_from_stream(
         &reqwest::Client::new(),
         stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(edited)]),
@@ -548,10 +592,22 @@ async fn on_disk_skip_refreshes_catalogue_on_metadata_drift() {
         "the on-disk skip must refresh the stale catalogue to the edited source metadata"
     );
     let queued = db.get_pending_metadata_rewrites(10).await.unwrap();
-    assert!(
-        queued.is_empty(),
-        "the queued rewrite must run from the fresh catalogue and clear its marker"
+    assert_eq!(
+        queued.len(),
+        1,
+        "ordinary sync preserves historical metadata work without running it"
     );
+    assert!(
+        !queued[0].metadata.is_favorite,
+        "retained work must use current provider facts"
+    );
+    assert_eq!(fs::read(&derived.path).unwrap(), vec![0u8; 1000]);
+    assert_eq!(
+        fs::metadata(&derived.path).unwrap().modified().unwrap(),
+        mtime
+    );
+    assert_eq!(result.bytes_downloaded, 0);
+    assert_eq!(result.disk_bytes_written, 0);
     assert_eq!(result.exif_failures, 0);
     assert_eq!(
         fs::read_dir(derived.path.parent().unwrap())
