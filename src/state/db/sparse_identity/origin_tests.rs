@@ -342,3 +342,44 @@ async fn sparse_origin_blank_source_barrier_survives_history_and_later_writes() 
     );
     assert!(db.commit_checkpoint_transition(checkpoint()).await.is_err());
 }
+
+#[tokio::test]
+async fn coverage_reports_current_historical_and_unclassified_observation_origins() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = owned(&dir.path().join("state.db")).await;
+    let evidence = SparseEvidence::new("synthetic retained evidence".into());
+    for source in ["historical", "unclassified"] {
+        db.observe_sparse_identity(
+            "PrimarySync",
+            &SparseSourceId::new(source),
+            &evidence,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    }
+    db.acquire_lock("historical report provenance")
+        .unwrap()
+        .execute(
+            "UPDATE unresolved_sparse_identities SET epoch=0 WHERE source_record_name='historical'",
+            [],
+        )
+        .unwrap();
+    db.observe_current_sparse_identity(
+        "PrimarySync",
+        &SparseSourceId::new("current"),
+        &evidence,
+        &scope("_defaultOwner"),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let work = db.recorded_selection_work().await.unwrap();
+    assert_eq!(work.current_source_observations, 1);
+    assert_eq!(work.historical_source_observations, 1);
+    assert_eq!(work.unclassified_source_observations, 1);
+    assert!(
+        work.profiles.is_empty(),
+        "source observations alone do not prove selected destinations"
+    );
+}

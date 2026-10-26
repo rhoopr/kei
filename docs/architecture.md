@@ -2691,3 +2691,33 @@ rewriting the last backup report or changing cycle counters. Historical metadata
 ambiguity and attribution remain visible but do not imply a broken service.
 Summary-read failure still fails health. Restart does not discard durable work;
 health counters themselves start fresh with the process.
+
+### Recorded selection work and offline status
+
+`status` separates catalog/run notes from validated retained selection work.
+The read-only report uses one SQLite snapshot and the existing generation,
+decision, completion and compact receipt validators. It groups obligations by
+recorded authenticated scope, configuration and profile; it does not assume the
+latest profile is the user's current selection. Identical pass/child/resource/
+destination obligations within one profile count once, with unfinished evidence
+taking precedence. Different selected passes and destinations remain independent.
+A validated compacted predecessor with no remaining destinations contributes no
+new debt after unfinished work has moved to its successor.
+
+The report separates settled destinations, pending media, requested metadata
+pending after media completion, unresolved decisions and recorded exclusions.
+Unsupported profiles and invalid evidence remain unknown. Historical sparse
+observations are identified by the migration epoch, even when their retained
+payload is opaque; current-origin and unclassified observations remain separate.
+These observation counts are not counts of missing selected files.
+
+Compact media receipts are reported separately because they can overlap retained
+work and past selections. Neither those receipts nor retired decisions form a
+complete current selection census. Offline status therefore reports current
+provider coverage as unknown, including when no unfinished work is retained.
+Validated stored proof is not a fresh filesystem integrity check. A successful
+run, saved cursor or healthy process is not a coverage certificate, and `verify`
+checks recorded files rather than independently enumerating selected provider
+content. Historical attribution and optional backfill are not requirements for
+current content completeness; genuine unfinished current publication remains
+visible even if the compatibility catalog already says downloaded.

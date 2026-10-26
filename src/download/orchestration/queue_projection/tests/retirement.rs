@@ -2435,3 +2435,51 @@ async fn changed_master_raw_mapping_preserves_completed_resource() {
         assert_eq!(std::fs::read(&completed.download_path).unwrap(),RAW);
     }).await;
 }
+
+#[tokio::test]
+async fn recorded_work_successor_owns_pending_destinations_without_empty_predecessor_debt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
+    let mut specification = spec();
+    specification.profile["current_download_metadata"] = json!(1);
+    let root = db
+        .begin_selection_generation(owner(), specification, BUDGET)
+        .await
+        .unwrap();
+    let (old, _, rows) = admission(&db, &root.id, &dir.path().join("media"), 0, true, BUDGET).await;
+    let count = old.decision.destinations.len() as u64;
+    assert_eq!(count, 2);
+    db.seal_selection_generation(owner(), root.id.clone(), true, None)
+        .await
+        .unwrap();
+    db.refresh_selection_reference(
+        owner(),
+        root.id.clone(),
+        old.clone(),
+        refreshed_reference(&old),
+        (
+            rows,
+            old.decision
+                .destinations
+                .iter()
+                .map(|d| reference_version(&d.version_size))
+                .collect(),
+        ),
+        BUDGET,
+    )
+    .await
+    .unwrap();
+    {
+        let conn = db.acquire_lock("empty predecessor proof").unwrap();
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_decisions WHERE generation=?1 AND compacted_hash IS NOT NULL", [&root.id], |r|r.get(0)).unwrap(), 1);
+    }
+    drop(db);
+    let db = SqliteStateDb::open_owned(&path, &owner()).await.unwrap();
+    let work = db.recorded_selection_work().await.unwrap();
+    assert_eq!(work.invalid_roots, 0);
+    assert_eq!(work.profiles.len(), 1);
+    assert_eq!(work.profiles[0].pending_media, count);
+    assert_eq!(work.profiles[0].deferred_decisions, 0);
+    assert_eq!(work.profiles[0].verified_destinations, 0);
+}

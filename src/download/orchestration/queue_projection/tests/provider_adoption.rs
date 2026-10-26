@@ -1,5 +1,5 @@
 //! Provider-signature adoption must commit held-file proof with durable work.
-use super::{Fixture, owner, records};
+use super::{CURRENT, Fixture, owner, records};
 use crate::download::baseline_matching::{BaselineMatch, BaselineMatcher};
 use crate::download::planner::{TaskPlanner, pending_record_for_task};
 use crate::state::SqliteStateDb;
@@ -58,7 +58,10 @@ fn snapshot(db: &SqliteStateDb) -> Vec<Vec<Vec<Value>>> {
     .collect()
 }
 
-async fn assert_provider_adoption_interruption(fault: &'static str) {
+async fn assert_provider_adoption_interruption(
+    fault: &'static str,
+    raw_relative_publication: bool,
+) {
     let fixture = Fixture::new().await;
     let checksum = signature(b"good");
     let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
@@ -74,7 +77,7 @@ async fn assert_provider_adoption_interruption(fault: &'static str) {
                 zone: zone.clone(),
                 config_hash: "a".repeat(64),
                 basis: "b".repeat(64),
-                profile: json!({"coverage":"selected_downloads","passes":[{
+                profile: json!({"coverage":"selected_downloads","current_download_metadata":1,"passes":[{
                     "key":key,"scope":{"database":"private","zone":zone,"kind":"unfiled"}
                 }]}),
                 metadata_enabled: false,
@@ -101,6 +104,9 @@ async fn assert_provider_adoption_interruption(fault: &'static str) {
     config.directory = std::path::absolute(relative_media.path().join("media"))
         .unwrap()
         .into();
+    if raw_relative_publication {
+        config.directory = relative_media.path().join("media").into();
+    }
     config.folder_structure = "none".into();
     let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
         .await
@@ -182,6 +188,13 @@ async fn assert_provider_adoption_interruption(fault: &'static str) {
     let diagnostics = fixture.db.pending_match_status(10).await.unwrap();
     assert_eq!(diagnostics.len(), 1);
     assert!(diagnostics[0].schedule.is_some());
+    let work = fixture.db.recorded_selection_work().await.unwrap();
+    assert_eq!(work.invalid_roots, 0);
+    assert_eq!(work.profiles.len(), 1);
+    assert_eq!(work.profiles[0].pending_media, 1);
+    assert_eq!(work.profiles[0].verified_destinations, 0);
+    assert_eq!(work.profiles[0].unsealed_or_held_roots, 1);
+
     assert_eq!(
         diagnostics[0].attempt.explanation.candidates[0].reason,
         "candidate_bytes_not_verified_for_current_resource"
@@ -300,6 +313,18 @@ async fn assert_provider_adoption_interruption(fault: &'static str) {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
+    let work = db.recorded_selection_work().await.unwrap();
+    assert_eq!(work.invalid_roots, 0);
+    if raw_relative_publication {
+        // Known separate settlement defect: reporting must not turn the
+        // catalog's downloaded status into proof of settled selected work.
+        assert_eq!(progress, ("downloaded".into(), 0, 1));
+        assert_eq!(work.profiles[0].pending_media, 1);
+        assert_eq!(work.profiles[0].verified_destinations, 0);
+        return;
+    }
+    assert_eq!(work.profiles[0].pending_media, 0);
+    assert_eq!(work.profiles[0].verified_destinations, 1);
     assert_eq!(progress, ("downloaded".into(), 1, 1));
     drop(db);
     for _ in 0..2 {
@@ -315,16 +340,112 @@ async fn assert_provider_adoption_interruption(fault: &'static str) {
 
 #[tokio::test]
 async fn v027_provider_adoption_callback_failure_retains_durable_retry() {
-    assert_provider_adoption_interruption("callback").await;
+    assert_provider_adoption_interruption("callback", false).await;
 }
 
 #[tokio::test]
 async fn v027_provider_adoption_same_size_mutation_rolls_back_before_commit() {
-    assert_provider_adoption_interruption("same-size").await;
+    assert_provider_adoption_interruption("same-size", false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn v027_provider_adoption_inode_replacement_rolls_back_before_commit() {
-    assert_provider_adoption_interruption("inode").await;
+    assert_provider_adoption_interruption("inode", false).await;
+}
+
+#[tokio::test]
+async fn coverage_keeps_known_raw_relative_settlement_gap_outstanding() {
+    assert_provider_adoption_interruption("callback", true).await;
+}
+
+#[tokio::test]
+async fn coverage_keeps_profiles_unknown_windows_and_invalid_evidence_separate() {
+    let fixture = Fixture::new().await;
+    let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+    let scope = fixture.capture.scope("private", &zone).unwrap();
+    let mut ids = Vec::new();
+    let mut evidence = records("report-master", CURRENT, "synthetic report evidence");
+    for record in &mut evidence {
+        record["zoneID"] = zone.clone();
+    }
+    evidence[1]["fields"]["masterRef"]["value"]["zoneID"] = zone.clone();
+    let confirmation = serde_json::to_vec(&json!({"records": evidence})).unwrap();
+    for (hash, recognized) in [('a', true), ('c', true), ('d', false)] {
+        let mut profile = json!({"coverage":"selected_downloads","passes":[{"key":"unfiled","scope":{"database":"private","zone":zone,"kind":"unfiled"}}]});
+        if recognized {
+            profile["current_download_metadata"] = json!(1);
+        }
+        ids.push(
+            fixture
+                .db
+                .begin_selection_generation(
+                    owner(),
+                    GenerationSpec {
+                        format: 2,
+                        scope: scope.clone(),
+                        zone: zone.clone(),
+                        config_hash: hash.to_string().repeat(64),
+                        basis: "b".repeat(64),
+                        profile,
+                        metadata_enabled: false,
+                        metadata_flags: 0,
+                    },
+                    MAX_GENERATION_BYTES,
+                )
+                .await
+                .unwrap()
+                .id,
+        );
+        fixture
+            .db
+            .project_selection_decision(
+                owner(),
+                ids.last().unwrap().clone(),
+                ActiveDecision {
+                    sources: Vec::new(),
+                    state_id: "asset-report-master".into(),
+                    decision: SelectionDecision {
+                        pass_key: "unfiled".into(),
+                        child: "asset-report-master".into(),
+                        master: Some("report-master".into()),
+                        confirmation: Some(confirmation.clone()),
+                        outcome: SelectionOutcome::Deferred,
+                        reason: "current_lookup_unresolved".into(),
+                        destinations: Vec::new(),
+                    },
+                },
+                Vec::new(),
+                MAX_GENERATION_BYTES,
+            )
+            .await
+            .unwrap();
+    }
+    let work = fixture.db.recorded_selection_work().await.unwrap();
+    assert_eq!(
+        work.profiles.len(),
+        2,
+        "different retained settings cannot become one current total"
+    );
+    assert_eq!(work.unsupported_profiles, 1);
+    assert_eq!(work.invalid_roots, 0);
+    assert!(
+        work.profiles.iter().all(
+            |profile| profile.unsealed_or_held_roots == 1 && profile.verified_destinations == 0
+        )
+    );
+    fixture
+        .db
+        .acquire_lock("corrupt reporting proof")
+        .unwrap()
+        .execute(
+            "UPDATE provider_active_generations SET specification_hash='invalid' WHERE id=?1",
+            [&ids[0]],
+        )
+        .unwrap();
+    let invalid = fixture.db.recorded_selection_work().await.unwrap();
+    assert_eq!(invalid.invalid_roots, 1);
+    assert_eq!(invalid.profiles.len(), 1);
+    assert_eq!(invalid.unsupported_profiles, 1);
+    assert_eq!(invalid.stored_media_receipts, 0);
 }

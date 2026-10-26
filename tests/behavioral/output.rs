@@ -173,7 +173,7 @@ fn status_shows_counts() {
 }
 
 #[test]
-fn status_shows_safe_backup_summary_after_clean_sync() {
+fn status_clean_run_notes_do_not_claim_complete_coverage() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
     let conn = create_state_db(dir.path(), username);
@@ -214,7 +214,7 @@ fn status_shows_safe_backup_summary_after_clean_sync() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(
-            "Backup status: safe - last sync completed and no pending or failed assets are recorded"
+            "Recorded run/database notes: last sync recorded completion and no pending or failed catalog rows remain; this does not prove coverage"
         ),
         "stdout: {stdout}"
     );
@@ -254,21 +254,21 @@ fn status_reports_metadata_capture_retry_without_private_evidence() {
         "{stdout}"
     );
     assert!(stdout.contains("19 failed"), "{stdout}");
-    assert!(stdout.contains("Backup status: unsafe"), "{stdout}");
+    assert!(stdout.contains("Recorded run/database notes:"), "{stdout}");
     assert!(!stdout.contains("private-legacy"));
 }
 
 #[test]
-fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
+fn status_keeps_unresolved_identity_visible_after_another_zone_completes() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
     let conn = create_state_db(dir.path(), username);
     conn.execute("INSERT INTO sync_runs (started_at, completed_at, status) VALUES (1700000000, 1700000010, 'complete')", []).unwrap();
     for (key, value) in [
-        ("unresolved_asset_identity:PrimarySync", "1"),
+        ("unresolved_current_asset_identity:PrimarySync", "1"),
         ("last_checkpoint_status", "current"),
         ("last_recovery_action", "none"),
-        ("sync_token:SharedSync-private", "shared-current"),
+        ("sync_token:v27:SharedSync-private", "shared-current"),
     ] {
         conn.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
@@ -287,12 +287,14 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
         .clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Backup status: unsafe - unresolved asset identity in 1 provider zone"),
+        stdout
+            .contains("Recorded run/database notes: unresolved asset identity in 1 provider zone"),
         "{stdout}"
     );
     assert!(stdout.contains("preserved"), "{stdout}");
     assert!(
-        stdout.contains("Sparse identity recovery: 1 unresolved, 1 deferred until retry"),
+        stdout
+            .contains("Recorded sparse observations: 1 unresolved, 1 with a saved retry deadline"),
         "{stdout}"
     );
     for private in ["private-source", "private-target", "private-owner"] {
@@ -300,7 +302,7 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
     }
     assert!(!stdout.contains("SharedSync-private"), "{stdout}");
     conn.execute(
-        "DELETE FROM metadata WHERE key = 'unresolved_asset_identity:PrimarySync'",
+        "DELETE FROM metadata WHERE key = 'unresolved_current_asset_identity:PrimarySync'",
         [],
     )
     .unwrap();
@@ -313,9 +315,16 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
         .get_output()
         .clone();
     // A missing marker must not hide retained per-source work.
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Backup status: unsafe"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Recorded run/database notes:"));
     conn.execute("DELETE FROM unresolved_sparse_identities", [])
         .unwrap();
+    // Simulate actual resolution of both the observation and its marker.
+    // Reopening an unclassified current row correctly reinstates that marker.
+    conn.execute(
+        "DELETE FROM metadata WHERE key='unresolved_current_asset_identity:PrimarySync'",
+        [],
+    )
+    .unwrap();
     let output = clean_cmd()
         .env("ICLOUD_USERNAME", username)
         .env("KEI_DATA_DIR", dir.path())
@@ -325,12 +334,14 @@ fn status_keeps_unresolved_identity_unsafe_after_another_zone_completes() {
         .get_output()
         .clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Backup status: safe"));
-    assert!(!stdout.contains("Sparse identity recovery:"));
+    assert!(stdout.contains("Recorded run/database notes: last sync recorded completion"));
+    assert!(stdout.contains("Current selected coverage: unknown offline"));
+    assert!(!stdout.contains("Backup status: safe"));
+    assert!(!stdout.contains("Recorded sparse observations:"));
 }
 
 #[test]
-fn status_treats_policy_excluded_assets_as_safe_and_visible() {
+fn status_keeps_policy_excluded_assets_visible_without_coverage_claim() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
     let conn = create_state_db(dir.path(), username);
@@ -366,14 +377,14 @@ fn status_treats_policy_excluded_assets_as_safe_and_visible() {
     assert!(stdout.contains("Policy excluded: 1"), "stdout: {stdout}");
     assert!(
         stdout.contains(
-            "Backup status: safe - last sync completed and no pending or failed assets are recorded"
+            "Recorded run/database notes: last sync recorded completion and no pending or failed catalog rows remain; this does not prove coverage"
         ),
         "stdout: {stdout}"
     );
 }
 
 #[test]
-fn status_shows_unsafe_backup_summary_with_last_run_reasons() {
+fn status_shows_incomplete_run_notes_with_last_run_reasons() {
     let dir = tempfile::tempdir().unwrap();
     let username = "test@example.com";
     let conn = create_state_db(dir.path(), username);
@@ -408,7 +419,7 @@ fn status_shows_unsafe_backup_summary_with_last_run_reasons() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(
-            "Backup status: unsafe - 1 asset failed in the last sync; 2 enumeration errors occurred in the last sync; 1 failed asset remains; 1 pending asset remains"
+            "Recorded run/database notes: 1 asset failed in the last sync; 2 enumeration errors occurred in the last sync; 1 failed asset remains; 1 pending asset remains"
         ),
         "stdout: {stdout}"
     );
@@ -975,17 +986,17 @@ fn status_retained_checkpoint_holds_show_actionable_redacted_guidance_after_othe
         (
             hold(1),
             "await_retained_checkpoint_evidence",
-            "Retained cursor rejected. Recovery makes at most three automatic attempts, at least one hour apart; exhausted holds require authoritative retained-history evidence. Preserve the state database and media. Fresh inventory alone cannot resolve this hold.",
+            "Recorded retained cursor was rejected. Preserve the state database and media. Current baseline and work evidence are reported separately; this recorded event does not establish an active retry or current sync hold.",
         ),
         (
             hold(3),
             "retained_checkpoint_retry_exhausted",
-            "Automatic retained-checkpoint recovery exhausted. Active source/configuration and historical work remain retained. Preserve the state database and media while obtaining authoritative retained-history evidence.",
+            "Recorded retained-checkpoint recovery exhausted its automatic attempts. Historical evidence remains preserved; this recorded event does not establish a current sync hold or missing selected content.",
         ),
         (
             format!("malformed-private-held-evidence:{private_cursor}"),
             "repair_retained_checkpoint_evidence",
-            "Retained recovery evidence is malformed or unsupported. Provider work is paused. Preserve the state database and media and restore validated recovery evidence before resuming.",
+            "Recorded retained-history recovery found malformed or unsupported evidence. Preserve the state database and media. This recorded event does not establish a current sync hold.",
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -1012,12 +1023,12 @@ fn status_retained_checkpoint_holds_show_actionable_redacted_guidance_after_othe
             [],
         ).unwrap();
         for (key, value) in [
-            ("sync_token:PrimarySync", private_cursor),
-            ("retained_checkpoint_hold:PrimarySync", encoded.as_str()),
+            ("sync_token:v27:PrimarySync", private_cursor),
+            ("retained_checkpoint_hold:v27:PrimarySync", encoded.as_str()),
             // A separately successful zone has overwritten the global summary.
             // The durable per-zone hold must still control operator status.
             (
-                "sync_token:SharedSync-private",
+                "sync_token:v27:SharedSync-private",
                 "private-healthy-zone-cursor",
             ),
             ("last_checkpoint_status", "current"),
@@ -1050,7 +1061,7 @@ fn status_retained_checkpoint_holds_show_actionable_redacted_guidance_after_othe
             !stdout.contains("Provider checkpoint: current"),
             "{action}: {stdout}"
         );
-        assert!(stdout.contains("Backup status: unsafe - retained provider history is unavailable; recovery evidence is required"), "{action}: {stdout}");
+        assert!(stdout.contains("Recorded run/database notes: retained provider history is unavailable; this is not a current-selection coverage assessment"), "{action}: {stdout}");
         assert!(
             stdout
                 .lines()
@@ -1120,4 +1131,43 @@ fn status_pending_reports_scoped_match_details_without_private_provider_keys() {
     assert!(stdout.contains("stale or unbound"));
     assert!(stdout.contains("no safe force-trust"));
     assert!(!stdout.contains("do-not-print-provider"));
+}
+
+#[test]
+fn status_reports_unknown_coverage_for_empty_and_historical_only_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "coverage@example.invalid";
+    let conn = create_state_db(dir.path(), username);
+    conn.execute("INSERT INTO sync_runs(started_at,completed_at,status) VALUES(1700000000,1700000010,'complete')",[]).unwrap();
+    for historical in [false, true] {
+        if historical {
+            insert_asset(
+                &conn,
+                "legacy",
+                "pending",
+                "old.JPG",
+                None,
+                Some("historical identity unresolved"),
+                None,
+            );
+            conn.execute("INSERT INTO metadata(key,value) VALUES('sync_token:v27:PrimarySync','opaque-saved-cursor')",[]).unwrap();
+        }
+        let out = clean_cmd()
+            .env("ICLOUD_USERNAME", username)
+            .env("KEI_DATA_DIR", dir.path())
+            .arg("status")
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert!(output.contains("Current selected coverage: unknown offline"));
+        assert!(output.contains("Zero retained work does not mean a complete backup"));
+        assert!(output.contains("Stored completed-media receipts: 0 validated"));
+        assert!(!output.contains("Backup status: safe"));
+        assert!(!output.contains("opaque-saved-cursor"));
+        if historical {
+            assert!(output.contains("1 pending asset remains"));
+        }
+    }
 }

@@ -849,6 +849,29 @@ async fn baseline_contract(
             }
         }
         if current_sidecar_failure {
+            let work = db.recorded_selection_work().await.unwrap();
+            assert_eq!(
+                work.invalid_roots, 0,
+                "valid current roots must remain reportable"
+            );
+            assert_eq!(
+                work.profiles
+                    .iter()
+                    .map(|profile| profile.pending_media)
+                    .sum::<u64>(),
+                0
+            );
+            assert_eq!(
+                work.profiles
+                    .iter()
+                    .map(|profile| profile.pending_metadata)
+                    .sum::<u64>(),
+                u64::from(cycle < 2)
+            );
+            assert!(
+                work.stored_media_receipts > 0,
+                "retired receipt evidence stays visible separately"
+            );
             let conn = db
                 .acquire_lock("current metadata debt and retirement")
                 .unwrap();

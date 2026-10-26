@@ -20,6 +20,7 @@ use super::rows::encode_asset_date;
 use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
 
+pub(crate) mod coverage;
 mod pending_path_cache;
 mod reference_refresh;
 mod retirement;

@@ -391,6 +391,35 @@ fn read_rows(
     Ok(identities)
 }
 
+/// Report provenance categories without turning historical associations into
+/// missing selected files. Unknown origins remain explicitly unclassified.
+pub(super) fn recorded_observation_counts(
+    conn: &Connection,
+) -> Result<(u64, u64, u64), StateError> {
+    let rows: Vec<(i64, String, Option<String>)> = conn
+        .prepare("SELECT epoch,library,observation_origin FROM unresolved_sparse_identities")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let (mut current, mut historical, mut unclassified) = (0, 0, 0);
+    for (epoch, library, origin) in rows {
+        if epoch == 0 {
+            historical += 1;
+        } else if epoch == 1
+            && origin
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<(String, String)>(value).ok())
+                .is_some_and(|(kind, scope)| {
+                    kind == "current-v1" && validate_current_scope(conn, &library, &scope).is_ok()
+                })
+        {
+            current += 1;
+        } else {
+            unclassified += 1;
+        }
+    }
+    Ok((current, historical, unclassified))
+}
+
 fn validate_current_scope(conn: &Connection, library: &str, scope: &str) -> Result<(), StateError> {
     let parsed: serde_json::Value = serde_json::from_str(scope)
         .map_err(|_invalid_scope| invariant("invalid sparse observation scope"))?;

@@ -34,7 +34,7 @@ pub(crate) async fn run_status(
 
     println!("State Database: {}", db_path.display());
     println!();
-    println!("Assets:");
+    println!("Recorded catalog assets (includes historical state; not coverage totals):");
     println!("  Total:      {}", summary.total_assets);
     println!("  Downloaded: {}", summary.downloaded);
     println!("  Pending:    {}", summary.pending);
@@ -71,22 +71,22 @@ pub(crate) async fn run_status(
         println!("Last recovery action: {action}");
         if action == "repair_retained_checkpoint_evidence" {
             println!(
-                "  Retained recovery evidence is malformed or unsupported. Provider work is paused. Preserve the state database and media and restore validated recovery evidence before resuming."
+                "  Recorded retained-history recovery found malformed or unsupported evidence. Preserve the state database and media. This recorded event does not establish a current sync hold."
             );
         } else if action == "retained_checkpoint_retry_exhausted" {
             println!(
-                "  Automatic retained-checkpoint recovery exhausted. Active source/configuration and historical work remain retained. Preserve the state database and media while obtaining authoritative retained-history evidence."
+                "  Recorded retained-checkpoint recovery exhausted its automatic attempts. Historical evidence remains preserved; this recorded event does not establish a current sync hold or missing selected content."
             );
         } else if action == "await_retained_checkpoint_evidence" {
             println!(
-                "  Retained cursor rejected. Recovery makes at most three automatic attempts, at least one hour apart; exhausted holds require authoritative retained-history evidence. Preserve the state database and media. Fresh inventory alone cannot resolve this hold."
+                "  Recorded retained cursor was rejected. Preserve the state database and media. Current baseline and work evidence are reported separately; this recorded event does not establish an active retry or current sync hold."
             );
         }
     }
     if summary.unresolved_sparse_records > 0 {
         println!();
         println!(
-            "Sparse identity recovery: {} unresolved, {} deferred until retry",
+            "Recorded sparse observations: {} unresolved, {} with a saved retry deadline (provenance below; not an active retry promise)",
             summary.unresolved_sparse_records, summary.deferred_sparse_records
         );
     }
@@ -95,7 +95,7 @@ pub(crate) async fn run_status(
         for capture in &summary.metadata_capture {
             if capture.unattributed_legacy_assets > 0 {
                 println!(
-                    "  {}: {} legacy records need attribution; {} awaiting current-work preservation proof",
+                    "  {}: {} preserved records with unresolved historical attribution; {} recorded preservation associations",
                     capture.library,
                     capture.unattributed_legacy_assets,
                     capture.unattributed_legacy_pending
@@ -139,6 +139,12 @@ pub(crate) async fn run_status(
         println!("  Preserved files are local copies, separate from sync network downloads.");
     }
     println!("{}", backup_status_line(&summary));
+    match db.recorded_selection_work().await {
+        Ok(work) => println!("{}", render_selection_work(&work)),
+        Err(_) => println!(
+            "Current selected coverage: unknown. Recorded work could not be read or validated; preserve state. No completeness claim is available."
+        ),
+    }
     println!();
 
     if let Some(started) = &summary.active_sync_started {
@@ -230,11 +236,11 @@ pub(crate) async fn run_status(
 
 pub(crate) fn backup_status_line(summary: &state::types::SyncSummary) -> String {
     if summary.active_sync_started.is_some() {
-        return "Backup status: unsafe - sync is currently in progress".to_string();
+        return "Recorded run/database notes: sync is currently in progress".to_string();
     }
 
     if summary.last_sync_started.is_none() {
-        return "Backup status: unsafe - no sync has completed yet".to_string();
+        return "Recorded run/database notes: no sync has completed yet".to_string();
     }
 
     let mut reasons = Vec::new();
@@ -251,12 +257,12 @@ pub(crate) fn backup_status_line(summary: &state::types::SyncSummary) -> String 
         })
     {
         reasons.push(
-            "retained provider history is unavailable; recovery evidence is required".to_owned(),
+            "retained provider history is unavailable; this is not a current-selection coverage assessment".to_owned(),
         );
     }
     if summary.unresolved_identity_zones > 0 {
         reasons.push(format!(
-            "unresolved asset identity in {}; checkpoint replay is required",
+            "unresolved asset identity in {}; historical and current associations are reported separately below",
             count_phrase(summary.unresolved_identity_zones, "provider zone")
         ));
     }
@@ -318,7 +324,7 @@ pub(crate) fn backup_status_line(summary: &state::types::SyncSummary) -> String 
         .sum();
     if unattributed > 0 {
         reasons.push(format!(
-            "{unattributed} preserved legacy records need attribution"
+            "{unattributed} preserved legacy records have unresolved historical attribution"
         ));
     }
     let metadata_capture_remaining: u64 = summary
@@ -354,10 +360,10 @@ pub(crate) fn backup_status_line(summary: &state::types::SyncSummary) -> String 
     }
 
     if reasons.is_empty() {
-        "Backup status: safe - last sync completed and no pending or failed assets are recorded"
+        "Recorded run/database notes: last sync recorded completion and no pending or failed catalog rows remain; this does not prove coverage"
             .to_string()
     } else {
-        format!("Backup status: unsafe - {}", reasons.join("; "))
+        format!("Recorded run/database notes: {}", reasons.join("; "))
     }
 }
 
@@ -578,5 +584,77 @@ mod match_diagnostic_tests {
         let scheduled = render_match_attempt(&pending);
         assert!(scheduled.contains("next retry not before: 999"));
         assert!(scheduled.contains("eligibility has not been checked"));
+    }
+}
+
+fn render_selection_work(
+    work: &crate::state::db::provider_generations::coverage::RecordedSelectionWork,
+) -> String {
+    let mut lines = vec!["Current selected coverage: unknown offline. Retained records are not a complete current provider inventory.".to_owned(),
+        "Recorded selection work (each profile keeps its own scope/settings; none is assumed to be today's configuration):".into()];
+    if work.profiles.is_empty() {
+        lines.push("  No validated current-format retained profile. Zero retained work does not mean a complete backup.".into());
+    }
+    for (index, profile) in work.profiles.iter().enumerate() {
+        lines.push(format!(
+            "  Profile {}: {} retained observation windows; {} unsealed or held.",
+            index + 1,
+            profile.roots,
+            profile.unsealed_or_held_roots
+        ));
+        lines.push(format!("    Destinations: {} verified/settled; {} awaiting media; {} awaiting requested metadata after media completion.",profile.verified_destinations,profile.pending_media,profile.pending_metadata));
+        lines.push(format!(
+            "    Decisions: {} unresolved selection/identity; {} recorded exclusions.",
+            profile.deferred_decisions, profile.excluded_decisions
+        ));
+    }
+    lines.push("  Verified means validated stored completion proof, not a fresh filesystem check. Counts describe resource/pass/destination obligations, not unique files. Repeated identical obligations within a profile are counted once; unfinished evidence takes precedence. Profiles and decision counts must not be added into a coverage total.".into());
+    lines.push(format!("Stored completed-media receipts: {} validated; {} invalid/unreadable. These may overlap retained work and older selections; they do not establish current membership, requested metadata coverage, or today's file integrity.",work.stored_media_receipts,work.invalid_receipts));
+    lines.push(format!("Unresolved source observations: {} current-origin; {} historical-origin; {} unclassified. These are observations, not inferred missing-file counts.",work.current_source_observations,work.historical_source_observations,work.unclassified_source_observations));
+    lines.push(format!("Other retained evidence: {} historical selection windows; {} older/unsupported profiles; {} invalid/unreadable windows. Historical associations and optional backfill are not current missing-content totals.",work.historical_roots,work.unsupported_profiles,work.invalid_roots));
+    lines.push("Current eligibility is rechecked by normal sync. Recorded exclusions or older profiles may no longer match your settings. A saved cursor or healthy service is not backup completeness. `verify` checks recorded files; it is not a provider-coverage census.".into());
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod selection_work_tests {
+    use super::render_selection_work;
+    use crate::state::db::provider_generations::coverage::{
+        RecordedProfileWork, RecordedSelectionWork,
+    };
+
+    #[test]
+    fn recorded_selection_output_never_infers_current_completeness_from_receipts_or_empty_work() {
+        let mut work = RecordedSelectionWork::default();
+        let empty = render_selection_work(&work);
+        assert!(empty.contains("Current selected coverage: unknown offline"));
+        assert!(empty.contains("Zero retained work does not mean a complete backup"));
+        work.stored_media_receipts = 100;
+        work.historical_source_observations = 22;
+        work.unsupported_profiles = 1;
+        work.invalid_roots = 1;
+        work.profiles = vec![
+            RecordedProfileWork {
+                verified_destinations: 2,
+                pending_media: 1,
+                ..Default::default()
+            },
+            RecordedProfileWork {
+                pending_metadata: 1,
+                excluded_decisions: 3,
+                ..Default::default()
+            },
+        ];
+        let output = render_selection_work(&work);
+        assert!(output.contains("Profile 1:"));
+        assert!(output.contains("Profile 2:"));
+        assert!(output.contains("1 awaiting media"));
+        assert!(output.contains("1 awaiting requested metadata"));
+        assert!(output.contains("22 historical-origin"));
+        assert!(output.contains("1 invalid/unreadable windows"));
+        assert!(
+            output.contains("`verify` checks recorded files; it is not a provider-coverage census")
+        );
+        assert!(!output.contains("Backup status: safe"));
     }
 }

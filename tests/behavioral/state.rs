@@ -1315,13 +1315,13 @@ fn preserved_legacy_status_and_reconcile_keep_attribution_separate_from_failure(
     let output = String::from_utf8(out).unwrap();
     assert!(
         output.contains(
-            "1 legacy records need attribution; 1 awaiting current-work preservation proof"
+            "1 preserved records with unresolved historical attribution; 1 recorded preservation associations"
         ),
         "{output}"
     );
-    assert!(output.contains("Backup status: unsafe"), "{output}");
+    assert!(output.contains("Recorded run/database notes:"), "{output}");
     assert!(
-        output.contains("Backup status: unsafe - 1 preserved legacy records need attribution"),
+        output.contains("Recorded run/database notes: 1 preserved legacy records have unresolved historical attribution"),
         "{output}"
     );
     let out = clean_cmd()

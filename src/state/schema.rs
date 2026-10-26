@@ -3907,6 +3907,19 @@ mod sparse_origin_migration_tests {
         conn.execute("INSERT INTO metadata(key,value) VALUES('unresolved_asset_identity:PrimarySync','opaque old marker')", []).unwrap();
         (dir, conn)
     }
+    fn report_observation_counts(conn: &Connection) -> (u64, u64, u64) {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let db = crate::state::SqliteStateDb::open(std::path::Path::new(conn.path().unwrap()))
+                .await
+                .unwrap();
+            let work = db.recorded_selection_work().await.unwrap();
+            (
+                work.current_source_observations,
+                work.historical_source_observations,
+                work.unclassified_source_observations,
+            )
+        })
+    }
     fn epoch(conn: &Connection) -> i32 {
         conn.query_row("SELECT epoch FROM unresolved_sparse_identities", [], |r| {
             r.get(0)
@@ -3940,6 +3953,14 @@ mod sparse_origin_migration_tests {
             migrate(&conn).unwrap();
             assert_eq!(get_schema_version(&conn).unwrap(), 39);
             assert_eq!(epoch(&conn), 0);
+            assert_eq!(report_observation_counts(&conn), (0, 1, 0));
+            conn.execute("UPDATE unresolved_sparse_identities SET observation_origin='opaque malformed history'", []).unwrap();
+            assert_eq!(report_observation_counts(&conn), (0, 1, 0));
+            conn.execute(
+                "UPDATE unresolved_sparse_identities SET observation_origin=NULL",
+                [],
+            )
+            .unwrap();
             assert_old_marker(&conn);
             assert_eq!(current_marker(&conn), None);
             let evidence:(String,String,i64,Option<String>)=conn.query_row("SELECT original_evidence,observed_evidence,generation,observation_origin FROM unresolved_sparse_identities",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
@@ -4007,6 +4028,14 @@ mod sparse_origin_migration_tests {
             conn.execute("UPDATE unresolved_sparse_identities SET observed_evidence=?1,last_outcome='[invalid',first_seen_at=9223372036854775807",[evidence]).unwrap();
             migrate(&conn).unwrap();
             assert_eq!(epoch(&conn), 0);
+            assert_eq!(report_observation_counts(&conn), (0, 1, 0));
+            conn.execute("UPDATE unresolved_sparse_identities SET observation_origin='opaque malformed history'", []).unwrap();
+            assert_eq!(report_observation_counts(&conn), (0, 1, 0));
+            conn.execute(
+                "UPDATE unresolved_sparse_identities SET observation_origin=NULL",
+                [],
+            )
+            .unwrap();
             assert_old_marker(&conn);
             assert_eq!(current_marker(&conn), None);
             let retained:(String,String,i64)=conn.query_row("SELECT observed_evidence,last_outcome,first_seen_at FROM unresolved_sparse_identities",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
