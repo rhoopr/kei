@@ -471,16 +471,28 @@ async fn seed_downloaded_state_for_expected_path(
         .added_at(asset.added_date())
         .build();
     db.upsert_seen(&record).await.expect("seed state row");
-    db.mark_downloaded(
+    let local_checksum = file::compute_sha256(&expected_path.path)
+        .await
+        .expect("hash seeded file");
+    assert_eq!(
+        tokio::fs::metadata(&expected_path.path)
+            .await
+            .expect("stat seeded file")
+            .len(),
+        expected_path.size,
+        "seeded file must match the expected provider size"
+    );
+    db.mark_verified_download(
         library,
         asset.state_id(),
         expected_path.version_size.as_str(),
         &expected_path.path,
-        "seeded-local-sha256",
-        None,
+        &local_checksum,
+        Some(&local_checksum),
+        false,
     )
     .await
-    .expect("mark seeded file downloaded");
+    .expect("mark seeded file verified downloaded");
     assert!(
         !db.should_download(
             library,
@@ -491,7 +503,7 @@ async fn seed_downloaded_state_for_expected_path(
         )
         .await
         .expect("seeded state should be readable"),
-        "seeded downloaded state must make the expected file a safe skip"
+        "seeded downloaded state must suppress the legacy download hint"
     );
 }
 
