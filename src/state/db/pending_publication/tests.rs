@@ -605,3 +605,56 @@ async fn pending_publication_recovery_accepts_exact_committed_managed_receipt() 
     );
     assert_eq!(fs::read(&proof.local_path).unwrap(), b"movie");
 }
+
+#[tokio::test]
+async fn baseline_uncertainty_requires_rematching_and_invalidates_saved_recovery() {
+    let (dir, db, record) = fixture().await;
+    let before = db
+        .pending_publication("PrimarySync", "L1", VersionSizeKey::LiveOriginal)
+        .await
+        .unwrap()
+        .unwrap();
+    db.set_asset_verification(
+        "PrimarySync",
+        "L1",
+        "live_original",
+        AssetVerificationState::Unknown,
+        "baseline_match_uncertain",
+    )
+    .await
+    .unwrap();
+    assert!(
+        db.pending_publication("PrimarySync", "L1", VersionSizeKey::LiveOriginal)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !db.recover_pending_publication(&before, &record, "L1", "L1", &CancellationToken::new())
+            .await
+            .unwrap()
+    );
+    assert_eq!(status(&db), "pending");
+    drop(db);
+    let db = SqliteStateDb::open(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+    assert!(
+        db.pending_publication("PrimarySync", "L1", VersionSizeKey::LiveOriginal)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(status(&db), "pending");
+    let reason: String = db
+        .acquire_lock("uncertainty survives reopen")
+        .unwrap()
+        .query_row(
+            "SELECT reason FROM asset_verifications WHERE id='L1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "baseline_match_uncertain");
+    assert_eq!(fs::read(dir.path().join("movie.MOV")).unwrap(), b"movie");
+}

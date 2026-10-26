@@ -1431,166 +1431,167 @@ async fn truncated_suffixed_file_without_valid_receipt_remains_pending() {
 /// path family. An existing file recorded under an old directory must not
 /// satisfy a new configured target after path-affecting config drift.
 #[tokio::test]
-async fn old_directory_state_path_is_forwarded_not_on_disk_skipped() {
-    use crate::download::DownloadConfig;
-    use crate::icloud::photos::PhotoAsset;
-    use crate::state::SqliteStateDb;
-    use futures_util::stream;
-    use std::sync::Arc;
-
-    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+#[tracing_test::traced_test]
+async fn old_directory_state_path_remains_uncertain_until_root_restored() {
     let old_dir = TempDir::new().unwrap();
     let new_dir = TempDir::new().unwrap();
-    let mut old_config = DownloadConfig::test_default();
-    old_config.directory = Arc::from(old_dir.path());
-    let old_config = Arc::new(old_config);
-    let mut new_config = DownloadConfig::test_default();
-    new_config.directory = Arc::from(new_dir.path());
-    new_config.state_db = Some(db.clone());
-    let new_config = Arc::new(new_config);
-
-    let asset = suffixed_collision_asset("OLD_DIR_SUFFIXED_B", "ck_old_dir_suffixed_b");
-    let old_bare_path = crate::download::filter::expected_paths_for(&asset, old_config.as_ref())
-        .first()
-        .expect("test asset must derive an old expected path")
-        .path
-        .clone();
-    let old_suffixed_path = identity_suffixed_path_for(&old_bare_path, asset.id());
-    fs::create_dir_all(old_bare_path.parent().unwrap()).unwrap();
-    fs::write(&old_suffixed_path, vec![1u8; 1234]).unwrap();
-
-    let new_bare_path = crate::download::filter::expected_paths_for(&asset, new_config.as_ref())
-        .first()
-        .expect("test asset must derive a new expected path")
-        .path
-        .clone();
-    assert!(
-        !new_bare_path.exists(),
-        "new configured target must be absent"
-    );
-
-    let record = crate::test_helpers::TestAssetRecord::new("OLD_DIR_SUFFIXED_B")
-        .checksum("ck_old_dir_suffixed_b")
+    let state = old_dir.path().join("state.db");
+    let server = wiremock::MockServer::start().await;
+    let asset = TestPhotoAsset::new("OLD_DIR_SUFFIXED_B")
         .filename("IMG_1816.HEIC")
-        .size(1234)
+        .item_type("public.heic")
+        .orig_file_type("public.heic")
+        .orig_size(1234)
+        .orig_checksum("ck_old_dir_suffixed_b")
+        .orig_url(&format!("{}/photo", server.uri()))
         .build();
-    db.upsert_seen(&record).await.unwrap();
-    db.mark_downloaded(
-        "PrimarySync",
-        "OLD_DIR_SUFFIXED_B",
-        "original",
-        &old_suffixed_path,
-        "local_checksum_for_old_suffixed_file",
-        None,
+    let mut config = DownloadConfig::test_default();
+    config.directory = Arc::from(old_dir.path());
+    let old_bare = derive_expected_paths(&asset, &config).remove(0).path;
+    let stored = identity_suffixed_path_for(&old_bare, asset.id());
+    fs::create_dir_all(stored.parent().unwrap()).unwrap();
+    let bytes = vec![1u8; 1234];
+    fs::write(&stored, &bytes).unwrap();
+    let mtime = fs::metadata(&stored).unwrap().modified().unwrap();
+    let db = crate::state::SqliteStateDb::open(&state).await.unwrap();
+    record_verified_test_version(
+        &db,
+        &asset,
+        VersionSizeKey::Original,
+        "ck_old_dir_suffixed_b",
+        &bytes,
+        &stored,
     )
-    .await
-    .unwrap();
-
-    let result = stream_and_download_from_stream(
-        &reqwest::Client::new(),
-        stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
-        &new_config,
-        DownloadControls::download_hidden(),
-        1,
-        CancellationToken::new(),
-        StreamRuntime::new(None, None),
-    )
-    .await
-    .expect("sync must complete");
-
-    assert_eq!(
-        result.skip_summary.on_disk, 0,
-        "old directory state path must not count as a current on-disk skip"
-    );
-    let failed = db.get_failed().await.unwrap();
-    assert_eq!(
-        failed.len(),
-        1,
-        "missing new target must be forwarded for re-download"
-    );
-    assert_eq!(&*failed[0].id, "OLD_DIR_SUFFIXED_B");
+    .await;
+    drop(db);
+    for cycle in 0..3 {
+        let db = Arc::new(crate::state::SqliteStateDb::open(&state).await.unwrap());
+        config.directory = Arc::from(if cycle < 2 {
+            new_dir.path()
+        } else {
+            old_dir.path()
+        });
+        config.state_db = Some(db.clone());
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<_, anyhow::Error>(asset.clone())]),
+            &Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.downloaded, 0);
+        assert_eq!(result.state_write_failures, 0);
+        assert!(result.failed.is_empty());
+        assert_eq!(
+            result.skip_summary.on_disk,
+            usize::from(cycle == 2),
+            "cycle {cycle}: {result:?}; pending={:?}",
+            db.get_pending().await.unwrap()
+        );
+        assert_eq!(result.skip_summary.uncertain, usize::from(cycle < 2));
+        if cycle < 2 {
+            let pending = db.get_pending().await.unwrap();
+            assert_eq!(pending.len(), 1);
+            let diagnostic = crate::state::db::match_diagnostics::MatchDiagnostics::decode(
+                pending[0].last_error.as_deref().unwrap(),
+            )
+            .unwrap();
+            assert!(!diagnostic.attempts.is_empty());
+        } else {
+            assert!(db.get_pending().await.unwrap().is_empty());
+            assert_eq!(
+                db.get_downloaded_page(0, 1).await.unwrap()[0]
+                    .local_path
+                    .as_ref(),
+                Some(&stored)
+            );
+        }
+        assert_eq!(fs::read(&stored).unwrap(), bytes);
+        assert_eq!(fs::metadata(&stored).unwrap().modified().unwrap(), mtime);
+        assert_eq!(fs::read_dir(new_dir.path()).unwrap().count(), 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        config.state_db = None;
+    }
 }
 
-/// Capture-local derivation can move an asset into a different date
-/// folder than a host-local rendering chose. The stored path is then not
-/// a current derived path, so a full sweep forwards the asset for
-/// download into its capture-local folder, and the earlier copy is left
-/// untouched because kei never deletes local media.
+/// Derivation changes do not reorganize an existing verified path. A genuinely
+/// missing selected file still downloads once into the current date folder.
 #[tokio::test]
-async fn capture_local_date_folder_forwards_and_keeps_host_local_copy() {
-    use crate::download::DownloadConfig;
-    use crate::state::SqliteStateDb;
-    use futures_util::stream;
-    use std::sync::Arc;
-
-    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+async fn capture_local_date_reuses_old_path_and_downloads_only_missing_file() {
+    use wiremock::{Mock, ResponseTemplate, matchers::method};
+    let server = wiremock::MockServer::start().await;
+    let bytes = b"\xff\xd8\xff\xe0\0\x10JFIF\0";
+    let checksum = data_encoding::BASE64.encode(&[0xa7; 32]);
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
     let dir = TempDir::new().unwrap();
+    let state = dir.path().join("state.db");
     let mut config = DownloadConfig::test_default();
     config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-    let config = Arc::new(config);
-
-    // 2026-01-31T22:31:59Z captured at +11:00 is 2026-02-01 locally.
     let asset = TestPhotoAsset::new("CAPTURE_OFFSET_MOVE")
         .filename("IMG_9001.JPG")
-        .orig_size(1234)
-        .orig_url("https://p01.icloud-content.com/IMG_9001.JPG")
-        .orig_checksum("ck_capture_offset_move")
+        .orig_size(bytes.len() as u64)
+        .orig_url(&format!("{}/photo", server.uri()))
+        .orig_checksum(&checksum)
         .asset_date(1_769_898_719_000.0)
         .timezone_offset(39_600)
         .build();
-
-    let derived = crate::download::filter::expected_paths_for(&asset, config.as_ref())
-        .first()
-        .expect("test asset must derive an expected path")
-        .path
-        .clone();
-    assert!(derived.parent().is_some_and(|p| p.ends_with("2026/02/01")));
-
-    let host_local_path = dir.path().join("2026/01/31/IMG_9001.JPG");
-    fs::create_dir_all(host_local_path.parent().unwrap()).unwrap();
-    fs::write(&host_local_path, vec![7u8; 1234]).unwrap();
-
-    let record = crate::test_helpers::TestAssetRecord::new("CAPTURE_OFFSET_MOVE")
-        .checksum("ck_capture_offset_move")
-        .filename("IMG_9001.JPG")
-        .size(1234)
-        .build();
-    db.upsert_seen(&record).await.unwrap();
-    db.mark_downloaded(
-        "PrimarySync",
-        "CAPTURE_OFFSET_MOVE",
-        "original",
-        &host_local_path,
-        "local_checksum_for_host_local_file",
-        None,
+    let derived = derive_expected_paths(&asset, &config).remove(0).path;
+    assert!(derived.parent().unwrap().ends_with("2026/02/01"));
+    let prior = dir.path().join("2026/01/31/IMG_9001.JPG");
+    fs::create_dir_all(prior.parent().unwrap()).unwrap();
+    fs::write(&prior, bytes).unwrap();
+    let mtime = fs::metadata(&prior).unwrap().modified().unwrap();
+    let db = crate::state::SqliteStateDb::open(&state).await.unwrap();
+    record_verified_test_version(
+        &db,
+        &asset,
+        VersionSizeKey::Original,
+        &checksum,
+        bytes,
+        &prior,
     )
-    .await
-    .unwrap();
-
-    let result = stream_and_download_from_stream(
-        &reqwest::Client::new(),
-        stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
-        &config,
-        DownloadControls::download_hidden(),
-        1,
-        CancellationToken::new(),
-        StreamRuntime::new(None, None),
-    )
-    .await
-    .expect("sync must complete");
-
-    assert_eq!(
-        result.skip_summary.on_disk, 0,
-        "a host-local stored path must not satisfy the capture-local target"
-    );
-    let failed = db.get_failed().await.unwrap();
-    assert_eq!(failed.len(), 1, "missing capture-local target is forwarded");
-    assert_eq!(&*failed[0].id, "CAPTURE_OFFSET_MOVE");
-    assert!(
-        host_local_path.exists(),
-        "the earlier copy must survive; kei does not delete local media"
-    );
+    .await;
+    drop(db);
+    for cycle in 0..3 {
+        if cycle == 1 {
+            fs::remove_file(&prior).unwrap();
+        }
+        let db = Arc::new(crate::state::SqliteStateDb::open(&state).await.unwrap());
+        config.state_db = Some(db.clone());
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<_, anyhow::Error>(asset.clone())]),
+            &Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.downloaded, usize::from(cycle == 1));
+        assert!(result.failed.is_empty());
+        assert_eq!(result.state_write_failures, 0);
+        if cycle == 0 {
+            assert_eq!(fs::read(&prior).unwrap(), bytes);
+            assert_eq!(fs::metadata(&prior).unwrap().modified().unwrap(), mtime);
+            assert!(!derived.exists());
+            assert!(server.received_requests().await.unwrap().is_empty());
+        } else {
+            assert_eq!(fs::read(&derived).unwrap(), bytes);
+            assert_eq!(fs::read_dir(derived.parent().unwrap()).unwrap().count(), 1);
+        }
+        assert!(db.get_pending().await.unwrap().is_empty());
+        config.state_db = None;
+    }
 }
 
 /// A recorded path and opaque checksum cannot authorize reuse or replacement

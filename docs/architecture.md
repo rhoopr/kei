@@ -1718,7 +1718,10 @@ The state owner rechecks the row, receipt, identity, protected legacy evidence,
 reservations and provider generations in one transaction. Recovery preserves the
 original path, publication timestamp, all receipts, source provenance and metadata
 debt; it does not mint provider progress from local bytes. Unknown identity or a
-saved different destination remains pending. Cancellation before commit or a
+saved different destination remains pending. Baseline matching uncertainty bypasses
+this recovery shortcut and returns to the existing matcher for fresh path and
+receipt validation. Only verified adoption can clear that uncertainty; a saved
+recovery snapshot cannot clear it after it appears. Cancellation before commit or a
 failed state write cannot dispatch a fallback copy from that recovery attempt.
 The destination guard coordinates participating writers in this process; it is
 not an interprocess or network-filesystem lease. Managed selection keeps its

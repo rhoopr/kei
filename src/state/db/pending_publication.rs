@@ -16,6 +16,9 @@ fn read_publication(
     id: &str,
     version: VersionSizeKey,
 ) -> Result<Option<PendingPublicationRecord>, StateError> {
+    // An uncertain baseline match must return to the matcher for fresh receipt
+    // and filesystem validation, not this prior-publication shortcut. The
+    // matcher clears uncertainty only in its own verified adoption transaction.
     conn.query_row(
         "SELECT a.status, a.checksum, a.size_bytes, a.filename, a.created_at, a.added_at, \
                 a.metadata_hash, a.local_path, a.local_checksum, a.download_checksum, \
@@ -27,6 +30,9 @@ fn read_publication(
          WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 \
            AND a.status IN ('pending','downloaded') AND a.is_deleted=0 \
            AND a.downloaded_at IS NOT NULL AND a.size_bytes>=0 \
+           AND NOT EXISTS(SELECT 1 FROM asset_verifications v \
+             WHERE v.library=a.library AND v.id=a.id AND v.version_size=a.version_size \
+               AND v.state='unknown' AND v.reason='baseline_match_uncertain') \
            AND a.checksum<>'' AND p.provider_checksum=a.checksum \
            AND length(a.local_checksum)=64 AND a.download_checksum=a.local_checksum \
            AND p.local_checksum=a.local_checksum \
