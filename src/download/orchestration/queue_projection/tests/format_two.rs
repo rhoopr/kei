@@ -420,3 +420,270 @@ async fn explicit_metadata_refresh_profile_version_is_validated_without_reinterp
     assert_eq!(new.spec.profile["explicit_metadata_refresh"], json!(1));
     assert!(old.spec.profile.get("explicit_metadata_refresh").is_none());
 }
+
+#[tokio::test]
+async fn v027_deferred_observation_requires_fresh_proof_and_atomic_first_destinations() {
+    let f = Fixture::new().await;
+    let (_, scope, zone) = f.pass.album.private_selection_scope().unwrap().unwrap();
+    let key = crate::download::orchestration::generation::pass_key(&f.pass);
+    let root = f.db.begin_selection_generation(owner(), GenerationSpec {
+        format: 2, scope, zone: zone.clone(), config_hash: "a".repeat(64),
+        basis: "b".repeat(64), metadata_enabled: false, metadata_flags: 0,
+        profile: json!({"format":2,"coverage":"selected_downloads","passes":[{"key":key,"scope":f.pass.album.selection_scope()}]}),
+    }, MAX_GENERATION_BYTES).await.unwrap();
+    let body = serde_json::to_vec(&json!({"records":records("m", CURRENT, "observed")})).unwrap();
+    let asset = crate::icloud::photos::current_asset(&body, "asset-m", "m", &zone).unwrap();
+    let observed = ActiveDecision {
+        state_id: "asset-m".into(),
+        sources: Vec::new(),
+        decision: SelectionDecision {
+            pass_key: key.clone(),
+            child: "asset-m".into(),
+            master: Some("m".into()),
+            confirmation: Some(body.clone()),
+            outcome: SelectionOutcome::Deferred,
+            reason: "current_lookup_unresolved".into(),
+            destinations: Vec::new(),
+        },
+    };
+    let queue = f.queue();
+    assert!(
+        f.db.project_selection_decision(owner(), root.id.clone(), observed.clone(), Vec::new(), 0)
+            .await
+            .is_err()
+    );
+    assert_eq!(f.count("provider_active_decisions"), 0);
+    f.db.acquire_lock("inject initial observation rollback").unwrap().execute_batch(
+        "CREATE TRIGGER initial_observation_fault BEFORE INSERT ON provider_active_decisions BEGIN SELECT RAISE(ABORT,'synthetic observation admission'); END;"
+    ).unwrap();
+    assert!(
+        f.db.project_selection_decision(
+            owner(),
+            root.id.clone(),
+            observed.clone(),
+            Vec::new(),
+            MAX_GENERATION_BYTES
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(f.count("provider_active_decisions"), 0);
+    assert_eq!(f.count("provider_active_destinations"), 0);
+    assert_eq!(f.queue(), queue);
+    f.db.acquire_lock("remove initial observation fault")
+        .unwrap()
+        .execute_batch("DROP TRIGGER initial_observation_fault;")
+        .unwrap();
+    assert!(
+        !f.db
+            .project_selection_decision(
+                owner(),
+                root.id.clone(),
+                observed.clone(),
+                Vec::new(),
+                MAX_GENERATION_BYTES
+            )
+            .await
+            .unwrap()
+            .admitted
+    );
+    assert_eq!(f.count("provider_active_destinations"), 0);
+    assert_eq!(f.queue(), queue);
+    f.db.seal_selection_generation(owner(), root.id.clone(), true, None)
+        .await
+        .unwrap();
+    let seal: String =
+        f.db.acquire_lock("saved accounted seal")
+            .unwrap()
+            .query_row(
+                "SELECT seal_hash FROM provider_active_generations WHERE id=?1",
+                [&root.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+    let reopened = SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .selection_decision(owner(), root.id.clone(), key.clone(), "asset-m".into())
+            .await
+            .unwrap(),
+        Some(observed.clone())
+    );
+    let mut planner = TaskPlanner::for_download(f.config.state_db.as_deref())
+        .await
+        .unwrap();
+    let plan = planner
+        .plan_download_asset(&asset, &f.config)
+        .await
+        .unwrap();
+    let mut selected = observed.clone();
+    selected.decision.outcome = SelectionOutcome::Selected;
+    selected.decision.reason.clear();
+    selected.decision.destinations = plan
+        .tasks
+        .iter()
+        .map(|task| SelectionDestination {
+            version_size: task.version_size.as_str().into(),
+            path: SelectionPath::from_path(&std::path::absolute(&task.download_path).unwrap()),
+            checksum: task.checksum.to_string(),
+            size: task.size,
+            metadata_hash: crate::download::filter::metadata_for_selected_version(
+                &asset,
+                &f.config,
+                task.version_size,
+            )
+            .metadata_hash
+            .clone()
+            .unwrap(),
+        })
+        .collect();
+    let pending: Vec<_> = plan
+        .tasks
+        .iter()
+        .map(|task| pending_record_for_task(&f.config, &asset, task))
+        .collect();
+    assert!(
+        reopened
+            .project_selection_decision(
+                owner(),
+                root.id.clone(),
+                selected.clone(),
+                pending.clone(),
+                MAX_GENERATION_BYTES
+            )
+            .await
+            .is_err(),
+        "saved observation is not fresh confirmation"
+    );
+    let mut wrong: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    wrong
+        .pointer_mut("/records/1/fields/masterRef/value/recordName")
+        .map(|value| *value = json!("other-master"))
+        .unwrap();
+    assert!(
+        reopened
+            .project_selection_decision_with_proof(
+                owner(),
+                root.id.clone(),
+                selected.clone(),
+                pending.clone(),
+                Some(serde_json::to_vec(&wrong).unwrap()),
+                MAX_GENERATION_BYTES
+            )
+            .await
+            .is_err()
+    );
+    let mut foreign: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    foreign["records"][0]["zoneID"] = json!({"zoneName":"OtherSync","ownerRecordName":"foreign"});
+    assert!(
+        reopened
+            .project_selection_decision_with_proof(
+                owner(),
+                root.id.clone(),
+                selected.clone(),
+                pending.clone(),
+                Some(serde_json::to_vec(&foreign).unwrap()),
+                MAX_GENERATION_BYTES,
+            )
+            .await
+            .is_err(),
+        "foreign source cannot confirm the retained observation"
+    );
+    let foreign_owner = crate::state::db::account::AccountOwner::authenticated(
+        "other@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"other-provider"}})).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        reopened
+            .project_selection_decision_with_proof(
+                foreign_owner,
+                root.id.clone(),
+                selected.clone(),
+                pending.clone(),
+                Some(body.clone()),
+                MAX_GENERATION_BYTES,
+            )
+            .await
+            .is_err(),
+        "another authenticated account cannot resolve this obligation"
+    );
+    reopened.acquire_lock("inject destination rollback").unwrap().execute_batch(
+        "CREATE TRIGGER observation_destination_fault BEFORE INSERT ON provider_active_destinations BEGIN SELECT RAISE(ABORT,'synthetic first destination'); END;"
+    ).unwrap();
+    assert!(
+        reopened
+            .project_selection_decision_with_proof(
+                owner(),
+                root.id.clone(),
+                selected.clone(),
+                pending.clone(),
+                Some(body.clone()),
+                MAX_GENERATION_BYTES
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        reopened
+            .selection_decision(owner(), root.id.clone(), key.clone(), "asset-m".into())
+            .await
+            .unwrap(),
+        Some(observed)
+    );
+    assert_eq!(f.count("provider_active_destinations"), 0);
+    assert_eq!(f.queue(), queue);
+    assert_eq!(
+        reopened
+            .acquire_lock("rollback preserves accounted seal")
+            .unwrap()
+            .query_row::<String, _, _>(
+                "SELECT seal_hash FROM provider_active_generations WHERE id=?1",
+                [&root.id],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        seal
+    );
+    reopened
+        .acquire_lock("remove destination fault")
+        .unwrap()
+        .execute_batch("DROP TRIGGER observation_destination_fault;")
+        .unwrap();
+    assert!(
+        reopened
+            .project_selection_decision_with_proof(
+                owner(),
+                root.id.clone(),
+                selected.clone(),
+                pending,
+                Some(body),
+                MAX_GENERATION_BYTES
+            )
+            .await
+            .unwrap()
+            .admitted
+    );
+    assert_eq!(
+        reopened
+            .selection_decision(owner(), root.id, key, "asset-m".into())
+            .await
+            .unwrap(),
+        Some(selected)
+    );
+    let current = reopened
+        .current_download_generation(
+            owner(),
+            root.spec.scope.clone(),
+            root.spec.config_hash.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(current.sealed && current.checkpoint_ready);
+    assert!(f.count("provider_active_destinations") > 0);
+    f.preserved().await;
+}

@@ -4051,10 +4051,17 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
     use wiremock::{Mock, MockServer, ResponseTemplate};
     let server = MockServer::start().await;
     let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
+    let later_media = [media.as_slice(), b"distinct-later-content"].concat();
     Mock::given(method("GET"))
         .and(path("/unresolved-control"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
-        .expect(if incompatible { 1 } else { 2 })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/later-control"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(later_media.clone()))
+        .expect(if incompatible { 0 } else { 1 })
         .mount(&server)
         .await;
     let mut f = Fixture::new().await;
@@ -4075,8 +4082,13 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
     f.config.metadata.xmp_sidecar = true;
     let mut observed = records("m", CURRENT, "healthy-title");
     observed.extend(records("c", CURRENT, "later-title"));
-    for pair in observed.chunks_mut(2) {
-        pair[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/unresolved-control",server.uri()),"size":media.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))});
+    for (index, pair) in observed.chunks_mut(2).enumerate() {
+        let (endpoint, bytes) = if index == 0 {
+            ("unresolved-control", media.as_slice())
+        } else {
+            ("later-control", later_media.as_slice())
+        };
+        pair[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/{endpoint}",server.uri()),"size":bytes.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(bytes))});
     }
     observed[2]["fields"]["filenameEnc"] = json!({"value":"later.JPG","type":"STRING"});
     *f.session.records.lock().unwrap() = observed;
@@ -4101,8 +4113,11 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
     .await
     .unwrap();
     assert_eq!(first.stats.downloaded, 1);
-    assert!(first.checkpoint.identity_incomplete);
-    assert!(first.checkpoint.sync_token_blocked);
+    assert_eq!(first.checkpoint.state_write_failures, 0);
+    assert!(
+        first.checkpoint.observation.is_some(),
+        "complete scan accounts for deferred work"
+    );
     let healthy = f.config.directory.join("A/changed.JPG");
     let sidecar = healthy.with_file_name("changed.JPG.xmp");
     assert!(
@@ -4128,8 +4143,13 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
             .unwrap();
     let unresolved: crate::state::db::provider_generations::ActiveDecision =
         serde_json::from_slice(&manifests).unwrap();
-    assert!(unresolved.decision.confirmation.is_none());
-    assert!(!unresolved.sources.is_empty());
+    assert!(unresolved.is_deferred_observation());
+    assert!(unresolved.sources.is_empty());
+    let saved = crate::icloud::photos::current_asset(
+        unresolved.decision.confirmation.as_deref().unwrap(), "asset-c", "c",
+        &json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}),
+    ).unwrap();
+    assert_eq!(saved.filename(), Some("later.JPG"));
     assert_eq!(f.db.acquire_lock("healthy writer proof before coverage").unwrap().query_row::<i64,_,_>(
         "SELECT count(*) FROM provider_active_destinations WHERE child='asset-m' AND verified_metadata=1",[],|r|r.get(0),
     ).unwrap(),1);
@@ -4161,7 +4181,21 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
         .await
         .unwrap();
         assert_eq!(quiet.stats.downloaded, 0);
-        assert!(quiet.checkpoint.sync_token_blocked);
+        // A quiet delta may advance after current work is durably accounted.
+        // Its accounted inventory stays sealed without settling pending media.
+        assert!(
+            f.db.acquire_lock("accounted inventory remains sealed")
+                .unwrap()
+                .query_row::<bool, _, _>(
+                    "SELECT sealed FROM provider_active_generations WHERE id=?1",
+                    [&retry.0],
+                    |r| r.get(0)
+                )
+                .unwrap()
+        );
+        assert_eq!(f.db.acquire_lock("unresolved observation has no destinations").unwrap().query_row::<i64,_,_>(
+            "SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND child='asset-c'", [&retry.0], |r|r.get(0)
+        ).unwrap(),0);
         assert_eq!(
             f.session.calls.load(Ordering::SeqCst),
             calls,
@@ -4189,8 +4223,8 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
         );
         f.preserved().await;
     }
-    // A due failed lookup with a changed raw rank body must back off again,
-    // retaining the first decision's source links and every newer raw page.
+    // A due failed lookup must back off again, retaining the original item
+    // evidence without accumulating whole response pages.
     let before_pages =
         f.db.acquire_lock("retained rank history before retry")
             .unwrap()
@@ -4225,16 +4259,16 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
     assert_eq!(attempts, 2);
     assert!(next >= chrono::Utc::now().timestamp() + 7190);
     assert_eq!(stored, manifests);
-    assert!(
-        f.db.acquire_lock("changed raw rank remains retained")
+    assert_eq!(
+        f.db.acquire_lock("retry does not accumulate raw pages")
             .unwrap()
             .query_row::<i64, _, _>(
                 "SELECT count(*) FROM provider_selection_rank_pages",
                 [],
                 |r| r.get(0)
             )
-            .unwrap()
-            > before_pages
+            .unwrap(),
+        before_pages
     );
     let calls = f.session.calls.load(Ordering::SeqCst);
     let quiet = crate::download::download_photos_with_sync(
@@ -4257,7 +4291,7 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
         Mock::given(method("GET"))
             .and(path("/incompatible-version"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(newer))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
         let mut records = f.session.records.lock().unwrap();
@@ -4278,12 +4312,16 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
     .await
     .unwrap();
     assert_eq!(
-        recovered.stats.downloaded, 1,
+        recovered.stats.downloaded,
+        if incompatible { 0 } else { 1 },
         "due unresolved identity must become reachable actual queue work: {recovered:?}"
     );
     if incompatible {
-        assert!(recovered.checkpoint.sync_token_blocked);
-        assert!(f.config.directory.join("A/new-version.JPG").is_file());
+        assert_eq!(recovered.checkpoint.state_write_failures, 0);
+        assert_eq!(recovered.stats.skipped.uncertain, 1);
+        // The provider delta is empty. A targeted retry with changed facts
+        // cannot silently replace the originally selected observation.
+        assert!(!f.config.directory.join("A/new-version.JPG").exists());
         assert!(!f.config.directory.join("A/later.JPG").exists());
         let old: (String, i64, i64, Vec<u8>) = f.db.acquire_lock("incompatible old identity stays debt").unwrap().query_row(
             "SELECT admission,attempts,next_retry_at,manifest FROM provider_active_decisions WHERE generation=?1 AND child='asset-c'", [&retry.0], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
@@ -4297,13 +4335,12 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
                 f.db.acquire_lock("independent old and current coverage")
                     .unwrap();
             assert!(
-                !conn
-                    .query_row::<bool, _, _>(
-                        "SELECT sealed FROM provider_active_generations WHERE id=?1",
-                        [&retry.0],
-                        |r| r.get(0)
-                    )
-                    .unwrap()
+                conn.query_row::<bool, _, _>(
+                    "SELECT sealed FROM provider_active_generations WHERE id=?1",
+                    [&retry.0],
+                    |r| r.get(0)
+                )
+                .unwrap()
             );
             assert_eq!(
                 conn.query_row::<i64, _, _>(
@@ -4340,7 +4377,14 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
             )
             .await
             .unwrap();
-            assert!(quiet.checkpoint.sync_token_blocked);
+            assert_eq!(quiet.checkpoint.state_write_failures, 0);
+            let retained: (String, i64, i64, Vec<u8>) = f.db.acquire_lock("ineligible retry remains durable").unwrap().query_row(
+                "SELECT admission,attempts,next_retry_at,manifest FROM provider_active_decisions WHERE generation=?1 AND child='asset-c'", [&retry.0], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+            ).unwrap();
+            assert_eq!(
+                retained, old,
+                "quiet cycle cannot forget debt or renew its deadline"
+            );
             assert_eq!(quiet.stats.downloaded, 0);
             let rows = {
                 let conn = f.db.acquire_lock("quiet incompatible diagnostic").unwrap();
@@ -4381,7 +4425,7 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
     }
     assert_eq!(
         std::fs::read(f.config.directory.join("A/later.JPG")).unwrap(),
-        media
+        later_media
     );
     assert!(
         std::fs::read_to_string(f.config.directory.join("A/later.JPG.xmp"))
@@ -4390,35 +4434,30 @@ async fn private_unresolved_recovery_fixture(drift: bool, native: bool, incompat
     );
     assert_eq!(f.db.acquire_lock("atomic unresolved upgrade").unwrap().query_row::<i64,_,_>(
         "SELECT count(*) FROM provider_active_decisions WHERE child='asset-c' AND admission='admitted'",[],|r|r.get(0),
-    ).unwrap(),if drift {2} else {1});
+    ).unwrap(),1);
     assert_eq!(
         std::fs::metadata(&healthy).unwrap().modified().unwrap(),
         media_time
     );
-    if drift {
-        assert!(
-            std::fs::read_to_string(&sidecar)
-                .unwrap()
-                .contains("New Person")
-        );
-        assert_eq!(f.db.acquire_lock("old unresolved identity is resolved without sealing history").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_decisions WHERE child='asset-c' AND admission='deferred'",[],|r|r.get(0)).unwrap(),0);
-        assert!(
-            f.db.acquire_lock("old coverage stays unsealed")
-                .unwrap()
-                .query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_active_generations WHERE sealed=0",
-                    [],
-                    |r| r.get(0)
-                )
-                .unwrap()
-                > 0
-        );
-    } else {
-        assert_eq!(
-            std::fs::metadata(&sidecar).unwrap().modified().unwrap(),
-            sidecar_time
-        );
-    }
+    // Historical grouping changes do not start a second current generation
+    // or authorize rewriting the already completed healthy sidecar.
+    assert_eq!(
+        std::fs::metadata(&sidecar).unwrap().modified().unwrap(),
+        sidecar_time
+    );
+    assert_eq!(f.db.acquire_lock("current unresolved identity is settled").unwrap()
+        .query_row::<i64,_,_>("SELECT count(*) FROM provider_active_decisions WHERE child='asset-c' AND admission='deferred'",[],|r|r.get(0)).unwrap(),0);
+    assert_eq!(
+        f.db.acquire_lock("accounted current root remains sealed")
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM provider_active_generations WHERE sealed=0",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        0
+    );
     let calls = f.session.calls.load(Ordering::SeqCst);
     let rank_calls = f.session.rank_calls.load(Ordering::SeqCst);
     let quiet = crate::download::download_photos_with_sync(
@@ -6871,9 +6910,17 @@ async fn private_non_session_http_refusal_retains_identity_backoff_without_hot_l
         crate::download::DownloadOutcome::SessionExpired { .. }
     ));
     assert_eq!(first.stats.downloaded, 0);
-    assert!(first.checkpoint.sync_token_blocked);
-    assert!(first.sync_token.is_none());
+    assert_eq!(first.checkpoint.state_write_failures, 0);
+    assert!(first.checkpoint.observation.is_some());
     assert_eq!(f.db.acquire_lock("non-session durable declarations").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_decisions WHERE admission='deferred' AND attempts=1 AND next_retry_at>strftime('%s','now')",[],|r|r.get(0)).unwrap(),2);
+    let snapshot = || {
+        let conn = f.db.acquire_lock("retained HTTP refusal evidence").unwrap();
+        conn.prepare("SELECT generation,child,manifest,attempts,next_retry_at FROM provider_active_decisions WHERE admission='deferred' ORDER BY child").unwrap()
+            .query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?)))
+            .unwrap().collect::<Result<Vec<_>,_>>().unwrap()
+    };
+    let debt = snapshot();
+    let queue = f.queue();
     let calls = f.session.calls.load(Ordering::SeqCst);
     let ranks = f.session.rank_calls.load(Ordering::SeqCst);
     for _ in 0..2 {
@@ -6888,7 +6935,29 @@ async fn private_non_session_http_refusal_retains_identity_backoff_without_hot_l
         .await
         .unwrap();
         assert_eq!(quiet.stats.downloaded, 0);
-        assert!(quiet.checkpoint.sync_token_blocked);
+        let actual = {
+            let conn =
+                f.db.acquire_lock("quiet refusal keeps observation and deadline")
+                    .unwrap();
+            conn.prepare("SELECT generation,child,manifest,attempts,next_retry_at FROM provider_active_decisions WHERE admission='deferred' ORDER BY child").unwrap()
+                .query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?)))
+                .unwrap().collect::<Result<Vec<_>,_>>().unwrap()
+        };
+        assert_eq!(actual, debt);
+        assert_eq!(f.queue(), queue);
+        assert_eq!(f.count("provider_active_destinations"), 0);
+        for (root, _, _, _, _) in &debt {
+            assert!(
+                f.db.acquire_lock("quiet preserves accounted inventory")
+                    .unwrap()
+                    .query_row::<bool, _, _>(
+                        "SELECT sealed FROM provider_active_generations WHERE id=?1",
+                        [root],
+                        |r| r.get(0)
+                    )
+                    .unwrap()
+            );
+        }
         assert_eq!(f.session.calls.load(Ordering::SeqCst), calls);
         assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), ranks);
         f.preserved().await;

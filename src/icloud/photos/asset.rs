@@ -279,6 +279,8 @@ pub struct PhotoAsset {
     state_record_name: Option<Arc<str>>,
     source_zone: Option<Arc<str>>,
     selector_membership: Option<Arc<Value>>,
+    // A bounded item pair, retained durably only if current confirmation fails.
+    observed_pair: Option<Arc<Value>>,
     filename: Option<Box<str>>,
     // Metadata behind Arc so downstream consumers (AssetRecord, the
     // pipeline's metadata-hash comparisons) can share the same
@@ -570,6 +572,9 @@ impl PhotoAsset {
             .unwrap_or(record_name.as_ref())
             .into();
         Self {
+            observed_pair: Some(Arc::new(
+                serde_json::json!({"records":[master_record, asset_record]}),
+            )),
             record_name,
             asset_record_name,
             state_record_name: None,
@@ -644,7 +649,14 @@ impl PhotoAsset {
         let asset_metadata = Arc::new(metadata::extract(&master.fields, &asset.fields));
         let rendition_facts =
             metadata::extract_renditions(item_type_val, &master.fields, &asset.fields);
+        let observed_pair = Some(Arc::new(serde_json::json!({"records":[
+            {"recordName":master.record_name,"recordType":master.record_type,
+             "fields":master.fields,"deleted":master.deleted.unwrap_or(false)},
+            {"recordName":asset.record_name,"recordType":asset.record_type,
+             "fields":asset.fields,"deleted":asset.deleted.unwrap_or(false)}
+        ]})));
         Self {
+            observed_pair,
             record_name: Arc::from(master.record_name),
             asset_record_name: Arc::from(asset.record_name.as_str()),
             state_record_name: None,
@@ -724,6 +736,10 @@ impl PhotoAsset {
         .then(|| witness.get("selector_child").and_then(Value::as_str))
         .flatten()
         .filter(|child| !child.is_empty())
+    }
+
+    pub(crate) fn observed_pair(&self) -> Option<&Value> {
+        self.observed_pair.as_deref()
     }
 
     pub(crate) fn selector_membership(&self) -> Option<&Value> {

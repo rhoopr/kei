@@ -25,6 +25,7 @@ struct Session {
     incomplete_hits: Arc<AtomicUsize>,
     records: Arc<Vec<Vec<Value>>>,
     rank_queries: Arc<AtomicUsize>,
+    lookup_calls: Arc<AtomicUsize>,
 }
 fn parent(request: &Value) -> Option<&str> {
     request
@@ -108,6 +109,7 @@ impl PhotosSession for Session {
             return Ok(json!({"records":records,"syncToken":"album-query-proof"}));
         }
         if url.contains("/records/lookup?") {
+            self.lookup_calls.fetch_add(1, Ordering::SeqCst);
             if self.unavailable_membership {
                 return Ok(json!({"records":[]}));
             }
@@ -256,6 +258,7 @@ async fn album_contract(interrupt_membership: bool, interrupt_inventory: bool) {
             incomplete_hits: Arc::new(AtomicUsize::new(0)),
             records: Arc::clone(&records),
             rank_queries: Arc::new(AtomicUsize::new(0)),
+            lookup_calls: Arc::new(AtomicUsize::new(0)),
         };
         let mut library = PhotoLibrary::new(
             "https://synthetic.example/database/1/photos/production/private".into(),
@@ -491,6 +494,7 @@ async fn v027_shared_asset_in_two_selected_albums_keeps_historical_paths_on_quie
             incomplete_hits: Arc::new(AtomicUsize::new(0)),
             records: Arc::clone(&records),
             rank_queries: Arc::new(AtomicUsize::new(0)),
+            lookup_calls: Arc::new(AtomicUsize::new(0)),
         };
         let mut library = PhotoLibrary::new(
             "https://synthetic.example/database/1/photos/production/private".into(),
@@ -652,4 +656,214 @@ async fn seed_shared_historical_pair(
         .await?;
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn v027_initial_album_lookup_refusal_accounts_baseline_and_retries_after_reopen() {
+    initial_album_confirmation_retry(false).await;
+}
+
+#[tokio::test]
+async fn v027_initial_album_refusal_recovers_persisted_legacy_owner_without_duplicate() {
+    initial_album_confirmation_retry(true).await;
+}
+
+async fn initial_album_confirmation_retry(legacy: bool) {
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/album-a"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(u64::from(!legacy))
+        .mount(&server)
+        .await;
+    let records: Arc<Vec<Vec<Value>>> = Arc::new(
+        ["album-a", "album-b", "unfiled"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                pair(
+                    id,
+                    &format!("{id}.JPG"),
+                    &format!("{}/{id}", server.uri()),
+                    30 + u8::try_from(index).unwrap(),
+                )
+            })
+            .collect(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("media");
+    std::fs::create_dir(&root).unwrap();
+    let database = dir.path().join("state.db");
+    let legacy_path = root.join("A/album-a.JPG");
+    let legacy_time = if legacy {
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, MEDIA).unwrap();
+        let db = SqliteStateDb::open_owned(&database, &baseline_owner())
+            .await
+            .unwrap();
+        let asset =
+            crate::icloud::photos::PhotoAsset::new(records[0][0].clone(), records[0][1].clone());
+        let row = crate::test_helpers::TestAssetRecord::new("album-a")
+            .library(ZONE)
+            .filename("album-a.JPG")
+            .checksum(&super::generation(30))
+            .size(MEDIA.len() as u64)
+            .created_at(asset.created())
+            .added_at(asset.added_date())
+            .build();
+        db.upsert_seen(&row).await.unwrap();
+        let hash = download::file::compute_sha256(&legacy_path).await.unwrap();
+        db.mark_verified_download(
+            ZONE,
+            "album-a",
+            "original",
+            &legacy_path,
+            &hash,
+            Some(&hash),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.claim_legacy_master_state_owner(ZONE, "album-a", "asset-album-a")
+                .await
+                .unwrap()
+        );
+        Some(std::fs::metadata(&legacy_path).unwrap().modified().unwrap())
+    } else {
+        None
+    };
+    let token_key = sync_token_key(ZONE);
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let ranks = Arc::new(AtomicUsize::new(0));
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let mut baseline_ranks = 0;
+    let mut failed_lookups = 0;
+    let mut completed = None;
+    for iteration in 0..4 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&database, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        if iteration == 2 {
+            db.make_selection_retry_due(baseline_owner(), "asset-album-a".into())
+                .await
+                .unwrap();
+        }
+        let session = Session {
+            cycle: 0,
+            unavailable_membership: iteration < 2,
+            incomplete_inventory: false,
+            incomplete_hits: Arc::new(AtomicUsize::new(0)),
+            records: records.clone(),
+            rank_queries: ranks.clone(),
+            lookup_calls: lookups.clone(),
+        };
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/private".into(),
+            Arc::default(),
+            Box::new(session.clone()),
+            Arc::new(zone()),
+            "private".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        let capture =
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), baseline_owner(), "com");
+        library.shadow_capture = Some(capture.clone());
+        let passes = vec![selected_album("A", &session, &capture)];
+        let mut selected = make_run_cycle_library_state_with_passes(ZONE, &token_key, passes);
+        selected.library = library;
+        let base = make_run_cycle_download_config_builder(&root, db.clone());
+        let builder = |mode, exclude, groups, zone| {
+            let mut config = (*base(mode, exclude, groups, zone)).clone();
+            config.folder_structure_albums = "{album}".into();
+            #[cfg(feature = "xmp")]
+            {
+                config.metadata.xmp_sidecar = false;
+            }
+            Arc::new(config)
+        };
+        let result = run_cycle(
+            &[&selected],
+            &make_run_cycle_config(),
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.get_metadata(&token_key).await.unwrap().is_some(),
+            "accounted baseline has a cursor: {result:?}"
+        );
+        assert!(
+            db.get_metadata(&format!("observed_selection:v27:{ZONE}"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let outstanding=db.acquire_lock("actual runner deferred observations").unwrap().query_row::<i64,_,_>(
+            "SELECT count(*) FROM provider_active_decisions WHERE child='asset-album-a' AND admission='deferred'",[],|r|r.get(0)).unwrap();
+        if iteration < 2 {
+            assert_eq!(outstanding, 1);
+            assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(root.join("A/album-a.JPG").exists(), legacy);
+            if iteration == 0 {
+                baseline_ranks = ranks.load(Ordering::SeqCst);
+                failed_lookups = lookups.load(Ordering::SeqCst);
+                assert!(baseline_ranks > 0 && failed_lookups > 0);
+            } else {
+                assert_eq!(
+                    lookups.load(Ordering::SeqCst),
+                    failed_lookups,
+                    "backoff survives reopen"
+                );
+            }
+        } else {
+            assert_eq!(outstanding, 0);
+            assert_eq!(
+                result.stats.downloaded,
+                usize::from(iteration == 2 && !legacy)
+            );
+            let path = root.join("A/album-a.JPG");
+            assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            if let Some(before) = completed {
+                assert_eq!(modified, before);
+            } else {
+                completed = Some(modified);
+            }
+        }
+        if let Some(time) = legacy_time {
+            assert_eq!(std::fs::read(&legacy_path).unwrap(), MEDIA);
+            assert_eq!(
+                std::fs::metadata(&legacy_path).unwrap().modified().unwrap(),
+                time
+            );
+            assert_eq!(
+                db.acquire_lock("legacy identity remains singular")
+                    .unwrap()
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM assets WHERE library=?1 AND id='asset-album-a'",
+                        [ZONE],
+                        |r| r.get(0)
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+        if iteration > 0 {
+            assert_eq!(
+                ranks.load(Ordering::SeqCst),
+                baseline_ranks,
+                "pending work must not force another inventory"
+            );
+        }
+    }
 }

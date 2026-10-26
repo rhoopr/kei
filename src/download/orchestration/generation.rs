@@ -694,7 +694,10 @@ impl SelectionRun {
         asset: PhotoAsset,
         config: &DownloadConfig,
     ) -> Result<(Arc<Self>, PhotoAsset)> {
-        if self.root.spec.format != 2 || !self.fresh_confirmation {
+        if self.root.spec.format != 2
+            || !self.fresh_confirmation
+            || decision.is_deferred_observation()
+        {
             return Ok((self.clone(), asset));
         }
         let key = &decision.decision.pass_key;
@@ -996,8 +999,10 @@ impl SelectionRun {
                 observed.asset_record_name().to_owned(),
             )
             .await?
-            && let (Some(body), Some(master)) =
-                (previous.decision.confirmation, previous.decision.master)
+            && let (Some(body), Some(master)) = (
+                previous.decision.confirmation.clone(),
+                previous.decision.master.clone(),
+            )
         {
             let retained = current_asset(
                 &body,
@@ -1009,7 +1014,7 @@ impl SelectionRun {
                 same_selected_facts(&retained, &observed),
                 "Retained current proof differs from observed selection"
             );
-            if self.fresh_confirmation {
+            if self.fresh_confirmation || previous.is_deferred_observation() {
                 let album = self
                     .albums
                     .get(key)
@@ -1095,6 +1100,69 @@ impl SelectionRun {
                 fresh: Some(current.body),
             },
         ))
+    }
+
+    /// Keep the original selected facts for a failed first lookup in the same
+    /// ledger. The deferred outcome never grants a destination or a media write.
+    pub(in crate::download) async fn defer_observed_confirmation(
+        &self,
+        key: &str,
+        observed: &PhotoAsset,
+    ) -> Result<()> {
+        let child = observed.asset_record_name().to_owned();
+        if self.root.spec.format != 2
+            || self
+                .capture
+                .db
+                .selection_decision(
+                    self.capture.owner.clone(),
+                    self.root.id.clone(),
+                    key.to_owned(),
+                    child.clone(),
+                )
+                .await?
+                .is_some()
+        {
+            return self.defer_confirmation(key, child).await;
+        }
+        let mut body = observed
+            .observed_pair()
+            .cloned()
+            .context("Missing selected observation pair")?;
+        if let Some(witness) = observed.selector_membership() {
+            body.as_object_mut()
+                .context("Invalid selected observation")?
+                .insert("selector_membership".into(), witness.clone());
+        }
+        let body = serde_json::to_vec(&body)?;
+        let decoded = current_asset(&body, &child, observed.id(), &self.root.spec.zone)?;
+        anyhow::ensure!(
+            same_selected_facts(&decoded, observed),
+            "Selected observation lost required facts"
+        );
+        self.capture
+            .db
+            .project_selection_decision(
+                self.capture.owner.clone(),
+                self.root.id.clone(),
+                ActiveDecision {
+                    state_id: child.clone(),
+                    sources: Vec::new(),
+                    decision: SelectionDecision {
+                        pass_key: key.to_owned(),
+                        child,
+                        master: Some(observed.id().to_owned()),
+                        confirmation: Some(body),
+                        outcome: SelectionOutcome::Deferred,
+                        reason: "current_lookup_unresolved".into(),
+                        destinations: Vec::new(),
+                    },
+                },
+                Vec::new(),
+                MAX_GENERATION_BYTES,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Account for an unresolved current identity without creating queue work.
@@ -1220,7 +1288,7 @@ impl SelectionRun {
         // its receipt and retained file inside the final adoption transaction.
         if reason.is_empty()
             && previous.as_ref().is_none_or(|value| {
-                value.decision.confirmation.is_none()
+                (value.decision.confirmation.is_none() || value.is_deferred_observation())
                     && value.decision.outcome != SelectionOutcome::Selected
             })
         {
@@ -1247,6 +1315,7 @@ impl SelectionRun {
                 if self.fresh_confirmation
                     && previous.as_ref().is_some_and(|old| {
                         old.decision.confirmation.is_some()
+                            && !old.is_deferred_observation()
                             && !old
                                 .decision
                                 .destinations
@@ -1325,6 +1394,7 @@ impl SelectionRun {
                         .download_path
                         .clone()
                 } else if let Some(previous) = &previous
+                    && !previous.is_deferred_observation()
                     && (previous.decision.confirmation.is_some()
                         || previous.decision.outcome == SelectionOutcome::Selected)
                 {

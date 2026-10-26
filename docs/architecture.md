@@ -371,6 +371,18 @@ retained as independently retryable work. Destination paths are immutable once
 admitted. Pending destinations feed existing generation-aware collision planning
 so a newer rendition cannot take an unfinished older rendition's path.
 
+If an initial selected item's separate confirmation fails, the ledger retains
+its bounded observed child/master pair as `Deferred/current_lookup_unresolved`.
+It records no destinations, mappings, album membership or metadata writes.
+The saved pair preserves retry intent, not fresh confirmation or completion.
+Existing deadlines bound retries across quiet cycles and reopening. Admission
+requires fresh scoped evidence matching those original selected facts, then
+commits the first destinations and queue work atomically. Changed facts retain
+the original obligation; they do not enter completed-reference successor logic.
+A complete scan may seal this accounted work while it remains outstanding.
+Resolving it validates the existing seal and updates that seal in the same
+transaction as the first destination admission; it does not repeat inventory.
+
 Named albums may select content from another authenticated source. Their existing
 source-scoped roots carry a version-2 selecting-owner binding, including the
 account, complete provider scope and selected pass. A current typed owner-side

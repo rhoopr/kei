@@ -396,7 +396,7 @@ where
                             producer_pb.inc(1);
                             continue;
                         };
-                        let observed_child = asset.asset_record_name().to_owned();
+                        let observed_asset = asset.clone();
                         let (current, body) = match run.confirm(key, asset).await {
                             Ok(confirmed) => confirmed,
                             Err(error) => {
@@ -417,8 +417,9 @@ where
                                         return skips;
                                     }
                                     SelectionConfirmationErrorClass::Refused => {
-                                        if let Err(state_error) =
-                                            run.defer_confirmation(key, observed_child).await
+                                        if let Err(state_error) = run
+                                            .defer_observed_confirmation(key, &observed_asset)
+                                            .await
                                         {
                                             retry_durable = false;
                                             state_write_failures_producer
@@ -429,10 +430,12 @@ where
                                     }
                                     SelectionConfirmationErrorClass::RetryDeferred => {}
                                 }
-                                if run.retained_retry && retry_durable {
-                                    // This older observation already has a durable owner.
-                                    // Refusing stale proof must not veto unrelated current
-                                    // enumeration; no producer mutation or completion follows.
+                                if (run.retained_retry || run.root.spec.format == 2)
+                                    && retry_durable
+                                {
+                                    // This observation has a durable retry owner. A completed
+                                    // scan can account for it without claiming media completion.
+                                    // No canonical asset or destination mutation follows.
                                     skips.uncertain += 1;
                                     tracing::warn!(target: "kei::download::pipeline",
                                         "Previously selected work remains pending after confirmation refusal");

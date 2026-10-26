@@ -169,7 +169,7 @@ async fn v027_date_expansion_downloads_new_selection_then_two_quiet_reopens() {
     expansion(false, History::None, false, false, false, false, false).await;
 }
 #[tokio::test]
-async fn v027_date_expansion_unconfirmed_identity_holds_then_recovers() {
+async fn v027_date_expansion_unconfirmed_identity_is_accounted_then_recovers() {
     expansion(true, History::None, false, false, false, false, false).await;
 }
 #[tokio::test]
@@ -441,6 +441,11 @@ async fn expansion(
                 .execute_batch(&sql)
                 .unwrap();
         }
+        if unavailable && cycle == 2 {
+            db.make_selection_retry_due(baseline_owner(), "asset-january".into())
+                .await
+                .unwrap();
+        }
         let prior_cursor = db.get_metadata(&key).await.unwrap();
         let session = Session {
             records: records.clone(),
@@ -591,12 +596,23 @@ async fn expansion(
             assert!(!result.can_advance_database_checkpoint(), "{result:?}");
             assert_eq!(
                 db.get_metadata(&key).await.unwrap(),
-                prior_cursor,
-                "unconfirmed expansion must preserve exact prior cursor"
+                Some("expanded-after-1".into()),
+                "complete expanded observation accounts for pending confirmation"
             );
             assert!(
                 !january.exists(),
                 "unconfirmed identity must not be guessed or downloaded"
+            );
+            let retained: Vec<u8> = db.acquire_lock("expanded current obligation").unwrap().query_row(
+                "SELECT manifest FROM provider_active_decisions WHERE child='asset-january' AND admission='deferred' AND next_retry_at>0",[],|r|r.get(0)).unwrap();
+            let decision: crate::state::db::provider_generations::ActiveDecision =
+                serde_json::from_slice(&retained).unwrap();
+            assert!(decision.is_deferred_observation());
+            assert!(
+                db.get_metadata(&format!("observed_selection:v27:{ZONE}"))
+                    .await
+                    .unwrap()
+                    .is_some()
             );
         } else {
             assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");

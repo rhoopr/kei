@@ -121,7 +121,7 @@ async fn v027_deferred_transfer_survives_checkpoint_failure_and_quiet_reopen() {
 }
 
 #[tokio::test]
-async fn v027_unconfirmed_smart_selection_holds_cursor_then_replays_on_reopen() {
+async fn v027_unconfirmed_smart_selection_is_accounted_then_retries_on_reopen() {
     interrupted(Fault::DeferredSelection).await;
 }
 
@@ -375,7 +375,7 @@ async fn interrupted(fault: Fault) {
                     "{error:#}"
                 ),
             }
-            if fault != Fault::DeferredTransfer {
+            if !matches!(fault, Fault::DeferredTransfer | Fault::DeferredSelection) {
                 assert_eq!(
                     db.get_metadata(&key).await.unwrap().as_deref(),
                     Some("selected-after-1")
@@ -404,12 +404,22 @@ async fn interrupted(fault: Fault) {
                     hit.load(Ordering::SeqCst),
                     "current confirmation must be attempted"
                 );
-                // Format two cannot losslessly admit this unknown identity.
-                // The prior provider cursor, rather than a fabricated manifest,
-                // is its durable replay obligation.
+                // Selected facts are retained independently of fresh confirmation.
+                // The completed scan may advance; the missing file cannot complete.
                 assert_eq!(
                     db.get_metadata(&key).await.unwrap().as_deref(),
-                    Some("selected-after-1")
+                    Some("selected-after-2")
+                );
+                let retained: Vec<u8> = db.acquire_lock("smart selection durable confirmation").unwrap().query_row(
+                    "SELECT manifest FROM provider_active_decisions WHERE child='asset-selected-next' AND admission='deferred' AND next_retry_at>0",[],|r|r.get(0)).unwrap();
+                let decision: crate::state::db::provider_generations::ActiveDecision =
+                    serde_json::from_slice(&retained).unwrap();
+                assert!(decision.is_deferred_observation());
+                assert!(
+                    db.get_metadata(&format!("observed_selection:v27:{ZONE}"))
+                        .await
+                        .unwrap()
+                        .is_some()
                 );
                 assert!(!root.join("new-selected/next.JPG").exists());
             }

@@ -19,7 +19,7 @@ fn resource_facts(
     })
 }
 
-fn reseal(conn: &Connection, root: &ActiveGeneration) -> Result<(), StateError> {
+pub(super) fn reseal(conn: &Connection, root: &ActiveGeneration) -> Result<(), StateError> {
     if root.sealed {
         let hash = seal_hash(
             conn,

@@ -74,6 +74,19 @@ pub(crate) struct ActiveDecision {
     pub(crate) state_id: String,
 }
 
+impl ActiveDecision {
+    /// Paired observation retained for lookup retry, never publication authority.
+    pub(crate) fn is_deferred_observation(&self) -> bool {
+        self.decision.outcome == SelectionOutcome::Deferred
+            && self.decision.reason == "current_lookup_unresolved"
+            && self.decision.confirmation.is_some()
+            && self.decision.master.is_some()
+            && self.decision.destinations.is_empty()
+            && self.sources.is_empty()
+            && self.state_id == self.decision.child
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct GenerationProjection {
     pub(crate) admitted: bool,
@@ -1725,6 +1738,7 @@ impl SqliteStateDb {
             let d=&manifest.decision;let bytes=encode(&manifest)?;let hash=digest(&bytes);
             let existing:Option<(Vec<u8>,String)>=tx.query_row("SELECT manifest,admission FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             let mut resolving=false;
+            let mut reseal_observation=false;
             if let Some((previous,admission))=&existing {
                 let old=load_decision(&tx,&root,&d.pass_key,&d.child)?;
                 let compacted:bool=tx.query_row("SELECT compacted_hash IS NOT NULL FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
@@ -1734,10 +1748,26 @@ impl SqliteStateDb {
                     if normalized!=old {return Err(StateError::ProviderWorkConflict)}
                     tx.commit()?;return Ok(GenerationProjection{admitted:admission=="admitted",reason:String::new()})
                 }
-                resolving=admission=="deferred" && old.decision.outcome==SelectionOutcome::Deferred && old.decision.confirmation.is_none() && manifest.decision.confirmation.is_some() && !root.sealed && old.sources.iter().all(|source|manifest.sources.contains(source));
+                let observation = root.spec.format == 2 && old.is_deferred_observation();
+                resolving=admission=="deferred" && old.decision.outcome==SelectionOutcome::Deferred && (old.decision.confirmation.is_none() || observation) && manifest.decision.confirmation.is_some() && (!root.sealed || observation) && old.sources.iter().all(|source|manifest.sources.contains(source)) && !manifest.is_deferred_observation();
+                if resolving && observation {
+                    if root.sealed {
+                        let saved:String=tx.query_row("SELECT seal_hash FROM provider_active_generations WHERE id=?1",[&root.id],|r|r.get(0))?;
+                        if seal_hash(&tx,&root,root.checkpoint_ready,root.checkpoint_veto.as_deref())? != saved {return invalid()}
+                        reseal_observation=true;
+                    }
+                    // validate_decision already fences the first legacy state owner in this transaction.
+                    let fresh = fresh_confirmation.as_deref().filter(|body|body.len()<=MAX_CHUNK_BYTES).ok_or(StateError::ProviderWorkConflict)?;
+                    selector_binding::validate_membership(&root.spec,pass(&root,&d.pass_key)?,&d.child,fresh)?;
+                    let current=crate::icloud::photos::current_asset(fresh,&d.child,d.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,&root.spec.zone).map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
+                    let proposed=crate::icloud::photos::current_asset(d.confirmation.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,&d.child,d.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,&root.spec.zone).map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
+                    if !crate::icloud::photos::same_selected_facts(&current,&proposed) {return Err(StateError::ProviderWorkConflict)}
+                }
                 if previous!=&bytes && !resolving {return Err(StateError::ProviderWorkConflict)}
                 if resolving {
-                    let observed=observed_asset(&tx,&root,&old)?;
+                    let observed=if observation {
+                        Some(crate::icloud::photos::current_asset(old.decision.confirmation.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,&old.decision.child,old.decision.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,&root.spec.zone).map_err(|_invalid|StateError::ProviderSelectionInvalid)?)
+                    } else {observed_asset(&tx,&root,&old)?};
                     let current=crate::icloud::photos::current_asset(manifest.decision.confirmation.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,&d.child,d.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,&root.spec.zone).map_err(|_invalid|StateError::ProviderSelectionInvalid)?;
                     if observed.as_ref().is_none_or(|observed|!crate::icloud::photos::same_selected_facts(observed,&current)) {
                         defer_attempt(&tx,&root,&d.pass_key,&d.child)?;tx.commit()?;
@@ -1753,7 +1783,9 @@ impl SqliteStateDb {
                 }
                 if admission!="deferred" {tx.commit()?;return Ok(GenerationProjection {admitted:admission=="admitted",reason:String::new()})}
             } else if root.sealed {return invalid()} else if changed_basis {return Err(StateError::ProviderWorkConflict)}
+            if !manifest.is_deferred_observation() {
             freeze_metadata_identity(&tx,root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id)?;
+            }
             let mut reason=d.reason.clone();
             if d.outcome==SelectionOutcome::Selected {
                 let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM unattributed_legacy WHERE library=?1 AND asset_id IN (?2,?3))",params![root.spec.zone.get("zoneName").and_then(Value::as_str),manifest.state_id,d.master],|r|r.get(0))?;
@@ -1815,6 +1847,7 @@ impl SqliteStateDb {
             // Consumption is the final write, and never means verified publication.
             tx.execute("UPDATE provider_active_decisions SET admission=?4,reason=?5,attempts=?6,next_retry_at=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child,admission,reason,if admission=="deferred" {attempts.saturating_add(1).min(32)} else {0},if admission=="deferred" {Utc::now().timestamp()+delay} else {0}])?;
             refresh_admission_hash(&tx,&root,&d.pass_key,&d.child)?;
+            if reseal_observation {reference_refresh::reseal(&tx,&root)?;}
             tx.commit()?;
             #[cfg(all(test, target_os = "linux"))]
             crate::test_helpers::process_death_point("selection-work-committed");
