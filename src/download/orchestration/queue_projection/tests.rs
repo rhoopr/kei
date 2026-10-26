@@ -1135,6 +1135,8 @@ async fn queue_projection_schema30_migration_and_conflict_preserve_unknown_histo
 async fn queue_projection_cancelled_attempt_leaves_source_and_no_admission() {
     let f = Fixture::new().await;
     f.capture(records("m", OLD, "source"), "old").await;
+    f.defer_retained().await;
+    let calls = f.session.calls.load(Ordering::SeqCst);
     let cancel = CancellationToken::new();
     cancel.cancel();
     admit_retained_work(
@@ -1146,10 +1148,14 @@ async fn queue_projection_cancelled_attempt_leaves_source_and_no_admission() {
     .await
     .unwrap();
     assert_eq!(f.count("assets"), 0);
-    assert_eq!(f.count("provider_work_scan"), 0);
-    assert_eq!(f.session.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.count("provider_work_scan"), 1);
+    assert_eq!(f.count("provider_work_receipts"), 1);
+    assert_eq!(f.count("provider_work_retries"), 1);
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), calls);
     f.cycle().await.unwrap();
     assert_eq!(f.count("assets"), 1);
+    assert_eq!(f.count("provider_work_obligations"), 1);
+    assert_eq!(f.count("provider_work_retries"), 0);
     f.preserved().await;
 }
 
@@ -1214,6 +1220,7 @@ async fn queue_projection_dispatch_fault_holds_cursor_and_does_not_rank_fallback
     f.config.sync_mode = crate::download::SyncMode::Incremental {
         zone_sync_token: "old-cursor".into(),
     };
+    f.defer_retained().await;
     f.db.acquire_lock("dispatch fault before receipt").unwrap().execute_batch("CREATE TRIGGER work_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'synthetic dispatch work fault'); END;").unwrap();
     for _ in 0..2 {
         let result = crate::download::download_photos_with_sync(
@@ -1231,7 +1238,21 @@ async fn queue_projection_dispatch_fault_holds_cursor_and_does_not_rank_fallback
                 .contains("synthetic dispatch work fault")
         );
         assert_eq!(f.count("assets"), 0);
-        assert_eq!(f.count("provider_work_receipts"), 0);
+        assert_eq!(f.count("provider_work_receipts"), 1);
+        assert_eq!(f.count("provider_work_obligations"), 0);
+        assert_eq!(f.count("asset_master_mappings"), 0);
+        assert_eq!(f.count("provider_work_scan"), 1);
+        assert_eq!(
+            f.db.acquire_lock("unchanged due retry")
+                .unwrap()
+                .query_row::<(i64, i64, i64), _, _>(
+                    "SELECT attempts,last_attempt_at,next_retry_at FROM provider_work_retries",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                )
+                .unwrap(),
+            (1, 0, 1)
+        );
         f.preserved().await;
     }
     f.db.acquire_lock("restore fixture")
@@ -1239,6 +1260,9 @@ async fn queue_projection_dispatch_fault_holds_cursor_and_does_not_rank_fallback
         .execute_batch("DROP TRIGGER work_fault")
         .unwrap();
     f.cycle().await.unwrap();
+    assert_eq!(f.count("assets"), 1);
+    assert_eq!(f.count("provider_work_obligations"), 1);
+    assert_eq!(f.count("provider_work_retries"), 0);
     let baseline = f.queue();
     f.cycle().await.unwrap();
     assert_eq!(f.queue(), baseline);
@@ -1276,6 +1300,7 @@ async fn queue_projection_process_death_child() {
     assert!(std::env::var_os("KEI_TEST_WORK_COMMIT_PAUSE").is_some());
     let f = Fixture::new().await;
     f.capture(records("m", OLD, "source"), "old").await;
+    f.defer_retained().await;
     f.cycle().await.unwrap();
 }
 
@@ -1316,8 +1341,6 @@ async fn queue_projection_process_death_before_receipt_rolls_back_and_recovers_t
         "assets",
         "asset_master_mappings",
         "provider_work_obligations",
-        "provider_work_receipts",
-        "provider_work_scan",
     ] {
         assert_eq!(
             conn.query_row::<i64, _, _>(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
@@ -1326,6 +1349,28 @@ async fn queue_projection_process_death_before_receipt_rolls_back_and_recovers_t
             "{table}"
         );
     }
+    // The seed committed before the admission pause. Admission must not
+    // expose its replacement receipt, erase its retry, or change its scan.
+    assert_eq!(
+        conn.query_row::<String, _, _>("SELECT state FROM provider_work_receipts", [], |r| r
+            .get(0))
+            .unwrap(),
+        "deferred"
+    );
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM provider_work_scan", [], |r| r.get(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row::<(i64, i64, i64), _, _>(
+            "SELECT attempts,last_attempt_at,next_retry_at FROM provider_work_retries",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        )
+        .unwrap(),
+        (1, 0, 1)
+    );
     drop(conn);
     child.kill().unwrap();
     assert!(!child.wait().unwrap().success());
@@ -1350,6 +1395,7 @@ async fn queue_projection_process_death_before_receipt_rolls_back_and_recovers_t
         f.cycle().await.unwrap();
         assert_eq!(f.count("assets"), 1);
         assert_eq!(f.count("provider_work_obligations"), 1);
+        assert_eq!(f.count("provider_work_retries"), 0);
         if reopen == 1 {
             assert_eq!(f.session.calls.load(Ordering::SeqCst), calls);
         }

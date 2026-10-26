@@ -386,7 +386,11 @@ impl SqliteStateDb {
                 tx.execute("INSERT INTO provider_work_retries(page_id,ordinal,config_hash,attempts,last_attempt_at,next_retry_at) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(page_id,ordinal,config_hash) DO UPDATE SET attempts=excluded.attempts,last_attempt_at=excluded.last_attempt_at,next_retry_at=excluded.next_retry_at",params![current.id.0,plan.source.ordinal,plan.config_hash,attempts.saturating_add(1).min(32),now,now+delay])?;
             }
             #[cfg(test)]
-            pause_before_receipt(&database)?;
+            if admitted {
+                // The process-death fixture seeds committed deferred work first;
+                // stop only at the admission transaction it intends to kill.
+                pause_before_receipt(&database)?;
+            }
             // Last write: queue/mapping/debt/scan and receipt commit together.
             tx.execute("INSERT INTO provider_work_receipts(page_id,ordinal,config_hash,confirmation_hash,confirmation,state,reason,scope,source_hash,master_record_name,charged_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(page_id,ordinal,config_hash,confirmation_hash) DO UPDATE SET state=excluded.state,reason=excluded.reason,charged_bytes=excluded.charged_bytes",params![current.id.0,plan.source.ordinal,plan.config_hash,retained_hash,retained_confirmation,if admitted {"admitted"} else {"deferred"},if admitted {""} else if reason.is_empty() {"no_selected_tasks"} else {reason},plan.scope,current.observation_hash,plan.master,i64::try_from(charge).map_err(|_invalid|StateError::ProviderWorkFull)?])?;
             tx.commit()?;
