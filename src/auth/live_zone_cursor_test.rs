@@ -1,4 +1,5 @@
-//! Opt-in, session-only cursor validation. Never logs provider bodies or tokens.
+//! Opt-in saved-session Photos cursor probe. Diagnostic errors/logs omit bodies/tokens.
+//! Opening the saved session may perform ordinary local cookie-file maintenance.
 
 use serde_json::Value;
 
@@ -74,6 +75,48 @@ pub(crate) async fn existing_session_and_owner_for_validation() -> Result<
     Ok((session, root, owner))
 }
 
+// This only identifies candidates for the bounded diagnostic; it is not
+// production library discovery and cannot establish snapshot consistency.
+fn photos_cursor_candidate(zone: &Value) -> Result<Option<(&Value, &str)>, &'static str> {
+    if zone.get("deleted").and_then(Value::as_bool) == Some(true) {
+        return Ok(None);
+    }
+    if zone
+        .get("serverErrorCode")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err("provider returned a zone-list error");
+    }
+    let zone_id = zone.get("zoneID").ok_or("provider zone identity missing")?;
+    if !zone_id
+        .get("zoneName")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name == "PrimarySync" || name.starts_with("SharedSync-"))
+    {
+        return Ok(None);
+    }
+    Ok(zone
+        .get("syncToken")
+        .and_then(Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .map(|token| (zone_id, token)))
+}
+
+fn cursor_response_matches_scope(response: &Value, zone_id: &Value) -> bool {
+    let Some(returned) = response.get("zones").and_then(Value::as_array) else {
+        return false;
+    };
+    returned.len() == 1
+        && returned[0].get("zoneID") == Some(zone_id)
+        && returned[0]
+            .get("serverErrorCode")
+            .is_none_or(Value::is_null)
+        && returned[0]
+            .get("syncToken")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
 #[tokio::test]
 #[ignore = "requires explicit authorization and an existing authenticated test session"]
 async fn existing_session_zone_cursor_is_accepted_without_reauthentication()
@@ -129,22 +172,11 @@ async fn existing_session_zone_cursor_is_accepted_without_reauthentication()
         let mut token_bearing = 0;
         let mut accepted = 0;
         let mut rejected = 0;
+        // Listing anomalies fail this diagnostic conservatively, even if a
+        // malformed entry cannot be identified as a Photos zone. They are not
+        // interpreted as a production sync failure or proof of missing content.
         for zone in zones {
-            if zone.get("deleted").and_then(Value::as_bool) == Some(true) {
-                continue;
-            }
-            if zone
-                .get("serverErrorCode")
-                .is_some_and(|value| !value.is_null())
-            {
-                return Err("provider returned a zone-list error");
-            }
-            let zone_id = zone.get("zoneID").ok_or("provider zone identity missing")?;
-            let Some(token) = zone
-                .get("syncToken")
-                .and_then(Value::as_str)
-                .filter(|token| !token.trim().is_empty())
-            else {
+            let Some((zone_id, token)) = photos_cursor_candidate(zone)? else {
                 continue;
             };
             token_bearing += 1;
@@ -161,20 +193,7 @@ async fn existing_session_zone_cursor_is_accepted_without_reauthentication()
             .map_err(|_error| "read-only changes cursor request failed")?;
             let response: Value =
                 serde_json::from_slice(&raw).map_err(|_error| "changes response invalid")?;
-            let returned = response
-                .get("zones")
-                .and_then(Value::as_array)
-                .ok_or("changes zones missing")?;
-            if returned.len() == 1
-                && returned[0].get("zoneID") == Some(zone_id)
-                && returned[0]
-                    .get("serverErrorCode")
-                    .is_none_or(Value::is_null)
-                && returned[0]
-                    .get("syncToken")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.trim().is_empty())
-            {
+            if cursor_response_matches_scope(&response, zone_id) {
                 accepted += 1;
             } else {
                 rejected += 1;
@@ -186,12 +205,64 @@ async fn existing_session_zone_cursor_is_accepted_without_reauthentication()
             zones.len()
         );
         if rejected > 0 {
-            return Err("zone metadata cursor was not accepted in its exact scope");
+            return Err(
+                "Cursor acceptance was not established for every token-bearing Photos zone",
+            );
         }
     }
     if accepted_total == 0 {
-        return Err("no zone metadata cursor was available for validation");
+        return Err("no Photos zone metadata cursor was available for validation");
     }
-    eprintln!("cursor_acceptance_only=true snapshot_consistency_proven=false provider_writes=0");
+    eprintln!(
+        "photos_cursor_acceptance_only=true snapshot_consistency_proven=false provider_write_endpoints_called=0"
+    );
     Ok(())
+}
+
+#[test]
+fn synthetic_cursor_probe_selects_only_token_bearing_photos_zones() {
+    use serde_json::json;
+    for name in ["PrimarySync", "SharedSync-synthetic"] {
+        let zone = json!({"zoneID":{"zoneName":name,"ownerRecordName":"synthetic-owner"},"syncToken":"synthetic-cursor"});
+        let (id, token) = photos_cursor_candidate(&zone).unwrap().unwrap();
+        assert_eq!(id, &zone["zoneID"]);
+        assert_eq!(token, "synthetic-cursor");
+    }
+    for zone in [
+        json!({"zoneID":{"zoneName":"UnrelatedZone"},"syncToken":"synthetic-cursor"}),
+        json!({"zoneID":{"zoneName":"PrimarySync"},"syncToken":"  "}),
+        json!({"zoneID":{"zoneName":"PrimarySync"}}),
+        json!({"zoneID":{"zoneName":"PrimarySync"},"syncToken":"synthetic-cursor","deleted":true}),
+    ] {
+        assert!(photos_cursor_candidate(&zone).unwrap().is_none());
+    }
+    assert!(photos_cursor_candidate(&json!({"syncToken":"synthetic-cursor"})).is_err());
+    assert!(photos_cursor_candidate(&json!({"serverErrorCode":"synthetic-error"})).is_err());
+}
+
+#[test]
+fn synthetic_cursor_probe_requires_exact_returned_scope() {
+    use serde_json::json;
+    let id = json!({"zoneName":"PrimarySync","ownerRecordName":"synthetic-owner"});
+    let good = json!({"zoneID":id,"syncToken":"synthetic-next"});
+    assert!(cursor_response_matches_scope(
+        &json!({"zones":[good.clone()]}),
+        &id
+    ));
+    // Acceptance is only acceptance: a continuing response is not an EOF proof.
+    assert!(cursor_response_matches_scope(
+        &json!({"zones":[good.clone()],"moreComing":true}),
+        &id
+    ));
+    for response in [
+        json!({}),
+        json!({"zones":[]}),
+        json!({"zones":[good.clone(),good.clone()]}),
+        json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"other-owner"},"syncToken":"synthetic-next"}]}),
+        json!({"zones":[{"zoneID":{"zoneName":"UnrelatedZone","ownerRecordName":"synthetic-owner"},"syncToken":"synthetic-next"}]}),
+        json!({"zones":[{"zoneID":id,"syncToken":" "}]}),
+        json!({"zones":[{"zoneID":id,"syncToken":"synthetic-next","serverErrorCode":"synthetic-error"}]}),
+    ] {
+        assert!(!cursor_response_matches_scope(&response, &id));
+    }
 }
