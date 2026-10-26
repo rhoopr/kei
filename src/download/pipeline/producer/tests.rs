@@ -1028,13 +1028,18 @@ async fn seed_downloaded_drift_asset(
     fs::write(&derived.path, vec![0u8; 1000]).unwrap();
     let record = asset_record_for_derived_path(Arc::from("PrimarySync"), stored, &derived, config);
     db.upsert_seen(&record).await.unwrap();
-    db.mark_downloaded(
+    let hash = crate::download::file::compute_sha256(&derived.path)
+        .await
+        .unwrap();
+    crate::state::DownloadStateStore::mark_verified_download(
+        db.as_ref(),
         "PrimarySync",
         stored.state_id(),
         derived.version_size.as_str(),
         &derived.path,
-        "local-checksum",
-        None,
+        &hash,
+        Some(&hash),
+        false,
     )
     .await
     .unwrap();
@@ -1062,6 +1067,9 @@ async fn metadata_drift_without_writers_refreshes_catalogue_and_queues_nothing()
 
     let (stored, edited) = drifted_asset_pair("NOWRITERS", "nowriters.jpg");
     let derived = seed_downloaded_drift_asset(&db, &config, &stored).await;
+    let original_bytes = fs::read(&derived.path).unwrap();
+    let original_mtime = fs::metadata(&derived.path).unwrap().modified().unwrap();
+    let original_receipt = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
     let before = fs::metadata(&derived.path).unwrap().len();
 
     let result = stream_and_download_from_stream(
@@ -1095,6 +1103,23 @@ async fn metadata_drift_without_writers_refreshes_catalogue_and_queues_nothing()
         before,
         "local files must be untouched"
     );
+    let final_receipt = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
+    assert_eq!(fs::read(&derived.path).unwrap(), original_bytes);
+    assert_eq!(
+        fs::metadata(&derived.path).unwrap().modified().unwrap(),
+        original_mtime
+    );
+    assert_eq!(final_receipt.local_path, original_receipt.local_path);
+    assert_eq!(
+        final_receipt.local_checksum,
+        original_receipt.local_checksum
+    );
+    assert_eq!(
+        final_receipt.download_checksum,
+        original_receipt.download_checksum
+    );
+    assert_eq!(final_receipt.checksum, original_receipt.checksum);
+    assert_eq!(final_receipt.downloaded_at, original_receipt.downloaded_at);
 }
 
 #[tokio::test]
@@ -2194,7 +2219,10 @@ async fn metadata_drift_refresh_failure_preserves_state_and_reports_not_durable(
     let config = Arc::new(config);
 
     let (stored, edited) = drifted_asset_pair("DBFAIL", "dbfail.jpg");
-    seed_downloaded_drift_asset(&db, &config, &stored).await;
+    let derived = seed_downloaded_drift_asset(&db, &config, &stored).await;
+    let original_bytes = fs::read(&derived.path).unwrap();
+    let original_mtime = fs::metadata(&derived.path).unwrap().modified().unwrap();
+    let original_receipt = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
 
     db.fail_provider_metadata_refresh_for_test();
 
@@ -2226,6 +2254,23 @@ async fn metadata_drift_refresh_failure_preserves_state_and_reports_not_durable(
             .is_empty(),
         "a failed refresh must not queue a rewrite, which would publish the stale row"
     );
+    let final_receipt = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
+    assert_eq!(fs::read(&derived.path).unwrap(), original_bytes);
+    assert_eq!(
+        fs::metadata(&derived.path).unwrap().modified().unwrap(),
+        original_mtime
+    );
+    assert_eq!(final_receipt.local_path, original_receipt.local_path);
+    assert_eq!(
+        final_receipt.local_checksum,
+        original_receipt.local_checksum
+    );
+    assert_eq!(
+        final_receipt.download_checksum,
+        original_receipt.download_checksum
+    );
+    assert_eq!(final_receipt.checksum, original_receipt.checksum);
+    assert_eq!(final_receipt.downloaded_at, original_receipt.downloaded_at);
 }
 
 /// The skip helper must compare the same unknown-measurement projection as
@@ -2406,6 +2451,9 @@ async fn retry_marker_refreshes_row_whose_hash_matches_but_columns_are_stale() {
 
     let (visible, _) = drifted_asset_pair("UNHIDE", "unhide.jpg");
     let derived = seed_downloaded_drift_asset(&db, &config, &visible).await;
+    let original_bytes = fs::read(&derived.path).unwrap();
+    let original_mtime = fs::metadata(&derived.path).unwrap().modified().unwrap();
+    let original_receipt = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
 
     // Hidden at source: the column flips, the stored hash does not.
     db.mark_hidden_at_source("PrimarySync", visible.state_id())
@@ -2445,6 +2493,28 @@ async fn retry_marker_refreshes_row_whose_hash_matches_but_columns_are_stale() {
             .metadata
             .is_hidden,
         "the retry marker must drive a refresh that clears the stale hidden flag"
+    );
+    let final_receipt = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
+    assert_eq!(fs::read(&derived.path).unwrap(), original_bytes);
+    assert_eq!(
+        fs::metadata(&derived.path).unwrap().modified().unwrap(),
+        original_mtime
+    );
+    assert_eq!(final_receipt.local_path, original_receipt.local_path);
+    assert_eq!(
+        final_receipt.local_checksum,
+        original_receipt.local_checksum
+    );
+    assert_eq!(
+        final_receipt.download_checksum,
+        original_receipt.download_checksum
+    );
+    assert_eq!(final_receipt.checksum, original_receipt.checksum);
+    assert_eq!(final_receipt.downloaded_at, original_receipt.downloaded_at);
+    assert_eq!(
+        db.get_pending_metadata_rewrites(10).await.unwrap().len(),
+        1,
+        "existing marker must remain, without a new writer obligation"
     );
 }
 
