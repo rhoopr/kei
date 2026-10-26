@@ -359,7 +359,7 @@ impl Fixture {
 async fn queue_projection_current_confirmation_then_two_reopens_have_no_repeat_admission() {
     let mut f = Fixture::new().await;
     f.capture(records("m", OLD, "old"), "old").await;
-    f.cycle().await.unwrap();
+    assert_eq!(f.project_retained().await.unwrap(), WorkAdmission::Admitted);
     assert_eq!(f.count("assets"), 1);
     assert_eq!(f.count("provider_work_obligations"), 1);
     assert_eq!(f.count("provider_work_receipts"), 1);
@@ -1496,7 +1496,7 @@ async fn queue_projection_raw_alignment_preserves_current_provider_metadata_bind
         current[0]["fields"]["resOriginalAltHeight"] = json!({"value":300});
     }
     f.config.raw_policy = crate::types::RawPolicy::PreferJpeg;
-    f.cycle().await.unwrap();
+    assert_eq!(f.project_retained().await.unwrap(), WorkAdmission::Admitted);
     assert_eq!(
         f.db.acquire_lock("logical original uses confirmed JPEG facts")
             .unwrap()
@@ -1578,7 +1578,7 @@ async fn queue_projection_same_generation_collision_replans_without_stranding_wo
         .await
         .unwrap();
     let original_path = initial.tasks.first().unwrap().download_path.clone();
-    f.cycle().await.unwrap();
+    assert_eq!(f.project_retained().await.unwrap(), WorkAdmission::Admitted);
     std::fs::create_dir_all(original_path.parent().unwrap()).unwrap();
     std::fs::write(&original_path, b"independent-conflicting-file").unwrap();
     for _ in 0..2 {
