@@ -2553,9 +2553,11 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                     )
                     .await
                     .unwrap();
+                    // Historical capture is no longer requested by ordinary sync.
+                    // Its lookup failure must not masquerade as a current auth failure.
+                    let current_auth_failure = cycle == 0 && stage != Stage::Capture;
                     assert_eq!(
-                        result.session_expired,
-                        cycle == 0,
+                        result.session_expired, current_auth_failure,
                         "{stage:?} HTTP {status} recent={recent:?} cycle={cycle}"
                     );
                     assert_eq!(
@@ -2564,7 +2566,7 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                             .await
                             .unwrap()
                             .as_deref(),
-                        Some(if cycle == 0 {
+                        Some(if current_auth_failure {
                             "zone-before"
                         } else {
                             "zone-after"
@@ -2598,19 +2600,19 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                             assert_eq!(
                                 status,
                                 if matches!(stage, Stage::AssetPair | Stage::AssetIdentity) {
-                                    "Backup status: unsafe - unresolved asset identity in 1 provider zone; checkpoint replay is required; last sync was interrupted; 1 enumeration error occurred in the last sync"
+                                    "Recorded run/database notes: unresolved asset identity in 1 provider zone; historical and current associations are reported separately below; last sync was interrupted; 1 enumeration error occurred in the last sync"
                                 } else {
-                                    "Backup status: unsafe - last sync was interrupted; 1 enumeration error occurred in the last sync"
+                                    "Recorded run/database notes: last sync was interrupted; 1 enumeration error occurred in the last sync"
                                 }
                             );
                         } else {
                             assert_eq!(
                                 status,
-                                "Backup status: safe - last sync completed and no pending or failed assets are recorded"
+                                "Recorded run/database notes: last sync recorded completion and no pending or failed catalog rows remain; this does not prove coverage"
                             );
                         }
                     }
-                    if cycle == 0 {
+                    if current_auth_failure {
                         assert!(!result.db_sync_token_advance_safe);
                         assert_eq!(
                             inner
@@ -2636,22 +2638,36 @@ async fn run_cycle_provider_session_failures_preserve_and_recover_checkpoints() 
                         }
                     } else {
                         assert_eq!(result.failed_count, 0);
-                        if capture_pending {
-                            assert_eq!(
-                                result.stats.metadata_capture_refreshed,
-                                usize::from(cycle == 1)
-                            );
-                            assert_eq!(result.stats.metadata_capture_remaining, 0);
-                            assert!(
-                                inner.get_downloaded_page(0, 1).await.unwrap()[0]
-                                    .metadata
-                                    .is_favorite
-                            );
-                        }
+                    }
+                    if capture_pending {
+                        assert_eq!(result.stats.metadata_capture_refreshed, 0);
+                    }
+                    if stage == Stage::LegacyCapture && cycle > 0 {
+                        assert!(
+                            inner.get_downloaded_page(0, 1).await.unwrap()[0]
+                                .metadata
+                                .is_favorite,
+                            "current provider metadata must still refresh"
+                        );
+                    }
+                    // A quiet delta has no new metadata evidence. Bounded inventory
+                    // and LegacyCapture's live records may legitimately refresh the
+                    // database revision without initiating historical file writes.
+                    if stage == Stage::Capture && recent.is_none() {
+                        assert!(
+                            inner
+                                .has_metadata_capture_work(
+                                    &["PrimarySync"],
+                                    state::METADATA_CAPTURE_REVISION
+                                )
+                                .await
+                                .unwrap(),
+                            "historical capture debt: {stage:?} HTTP {status} recent={recent:?} cycle={cycle}"
+                        );
                     }
                 }
                 if stage == Stage::Capture {
-                    assert_eq!(lookups.load(Ordering::SeqCst), 2);
+                    assert_eq!(lookups.load(Ordering::SeqCst), 0);
                 }
             }
         }
