@@ -2764,3 +2764,21 @@ provider boundary, not a live census, fresh file verification or aggregate proof
 for every currently selected library. Read-only adoption preserves metadata and
 does not claim a rewrite. Requested current metadata remains an obligation until
 its existing completion transaction settles it.
+
+
+### Explicit repair when the provider resource changed
+
+A confirmed pending child's explicit truncated-file repair can preserve its
+older damaged file and fetch a different current resource to a reserved sibling.
+This does not certify or rewrite the old bytes. Same-resource repair keeps its
+existing replacement fingerprint guard; a changed resource never receives that
+replacement permission. Both require the existing scoped identity resolution.
+
+The retry planner uses reserved-download planning from the first explicit repair
+attempt. It commits the sibling choice before recording the new provider
+resource, then uses existing no-overwrite publication and receipt settlement.
+After failure or interruption, an absent exact reservation with matching current
+owner/content can resume without rediscovering the old file's identity. Occupied
+unverified destinations stay uncertain. Normal sync without explicit repair
+retains its conservative existing-file matching behavior. Old file paths,
+receipts and timestamps are preserved; this adds no queue, schema or repair mode.

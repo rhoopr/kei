@@ -614,6 +614,45 @@ async fn approved_truncated_reconcile_retry_replaces_the_recorded_path() {
 
 #[tokio::test]
 async fn truncated_repair_provider_version_change_uses_sibling() {
+    changed_resource_repair("normal").await;
+}
+
+#[tokio::test]
+async fn changed_resource_repair_collision_failure_reopens_without_duplicate() {
+    changed_resource_repair("collision").await;
+}
+
+#[tokio::test]
+async fn changed_resource_repair_refuses_wrong_child() {
+    changed_resource_repair("wrong-child").await;
+}
+
+#[tokio::test]
+async fn changed_resource_repair_admission_failure_reopens_same_reservation() {
+    changed_resource_repair("admission").await;
+}
+
+#[tokio::test]
+async fn changed_resource_repair_refuses_wrong_source() {
+    changed_resource_repair("wrong-source").await;
+}
+
+#[tokio::test]
+async fn changed_resource_repair_requires_explicit_option() {
+    changed_resource_repair("disabled").await;
+}
+
+#[tokio::test]
+async fn changed_resource_repair_refuses_post_match_file_change() {
+    changed_resource_repair("mutation").await;
+}
+
+async fn changed_resource_repair(scenario: &str) {
+    let fail_first = scenario == "collision";
+    let wrong_child = scenario == "wrong-child";
+    let wrong_source = scenario == "wrong-source";
+    let interrupt = scenario == "admission";
+    let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -623,19 +662,30 @@ async fn truncated_repair_provider_version_change_uses_sibling() {
     let current_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
     let current_checksum =
         base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&current_body));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let response_calls = calls.clone();
+    let response_body = current_body.clone();
     Mock::given(method("GET"))
         .and(path("/photo.jpg"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(current_body.clone())
-                .insert_header("content-type", "image/jpeg"),
-        )
-        .expect(1)
+        .respond_with(move |_: &wiremock::Request| {
+            let call = response_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if fail_first && call == 0 {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200).set_body_bytes(response_body.clone())
+            }
+        })
         .mount(&server)
         .await;
-
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let dir = TempDir::new().expect("temp dir");
+    let dir = TempDir::new().unwrap();
+    let database = dir.path().join("state.db");
+    let owner = crate::state::db::account::AccountOwner::authenticated(
+        "repair@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"repair-fixture"}})).unwrap(),
+    )
+    .unwrap();
+    let db = Arc::new(SqliteStateDb::open_owned(&database, &owner).await.unwrap());
     let recorded_path = dir.path().join("2019/11/2019-11-28/photo.jpg");
     tokio::fs::create_dir_all(recorded_path.parent().expect("recorded parent"))
         .await
@@ -678,6 +728,19 @@ async fn truncated_repair_provider_version_change_uses_sibling() {
         .await
         .expect("truncate recorded download");
 
+    let original_time = std::fs::metadata(&recorded_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    let collision = recorded_path.with_file_name(crate::download::paths::add_dedup_suffix(
+        "photo.jpg",
+        current_body.len() as u64,
+    ));
+    if fail_first {
+        std::fs::write(&collision, b"unrelated collision").unwrap();
+    }
+    let collision_time =
+        fail_first.then(|| std::fs::metadata(&collision).unwrap().modified().unwrap());
     let (counts, drift) = crate::commands::reconcile::scan_local_drift(
         db.as_ref(),
         |_: &crate::commands::reconcile::LocalDriftAsset| {},
@@ -713,6 +776,15 @@ async fn truncated_repair_provider_version_change_uses_sibling() {
         current_body.len() as u64,
     );
     records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(current_checksum);
+    if wrong_child {
+        records[1]["recordName"] = json!("different-child");
+    }
+    if wrong_source {
+        for record in &mut records {
+            record["zoneID"] =
+                json!({"zoneName":"SharedSync-foreign","ownerRecordName":"_defaultOwner"});
+        }
+    }
     let passes = vec![AlbumPass {
         kind: PassKind::Album,
         album: album_with_session(
@@ -727,22 +799,139 @@ async fn truncated_repair_provider_version_change_uses_sibling() {
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
     config.state_db = Some(db.clone());
-    config.repair_truncated = true;
+    config.repair_truncated = scenario != "disabled";
+    config.retry.max_retries = 0;
     config.sync_mode = SyncMode::Incremental {
         zone_sync_token: "zone-token-prev".to_string(),
     };
 
-    let result = download_photos_with_sync(
-        &Client::new(),
+    let mut reserved = None;
+    if interrupt {
+        db.acquire_lock("inject changed repair observation failure").unwrap().execute_batch(
+            "CREATE TRIGGER interrupt_repair_observation BEFORE UPDATE OF checksum ON assets WHEN OLD.checksum <> NEW.checksum BEGIN SELECT RAISE(ABORT,'injected repair observation failure'); END;"
+        ).unwrap();
+        let first = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(first.as_ref().map_or(true, |result| !matches!(
+            result.outcome,
+            DownloadOutcome::Success
+        )));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let conn = db
+            .acquire_lock("durable choice before failed observation")
+            .unwrap();
+        reserved = Some(
+            conn.query_row::<String, _, _>(
+                "SELECT destination_path FROM reconciliation_paths WHERE provider_checksum=?1",
+                [&current_checksum],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT checksum FROM assets WHERE id='CHANGED_TRUNCATED_PATH'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            "old-provider-checksum"
+        );
+        conn.execute_batch("DROP TRIGGER interrupt_repair_observation")
+            .unwrap();
+    }
+    if fail_first {
+        let failed = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!matches!(failed.outcome, DownloadOutcome::Success));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&recorded_path).unwrap(), b"bad");
+        reserved = Some(
+            db.acquire_lock("saved sibling after failed transfer")
+                .unwrap()
+                .query_row::<String, _, _>(
+                    "SELECT destination_path FROM reconciliation_paths WHERE provider_checksum=?1",
+                    [&current_checksum],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+        );
+        config.state_db = None;
+    }
+    config.state_db = None;
+    drop(db);
+    let db = Arc::new(SqliteStateDb::open_owned(&database, &owner).await.unwrap());
+    config.state_db = Some(db.clone());
+    let client = Client::new();
+    let attempt = download_photos_with_sync(
+        &client,
         &passes,
-        Arc::new(config),
+        Arc::new(config.clone()),
         DownloadControls::download_hidden(),
         CancellationToken::new(),
-    )
-    .await
+    );
+    let result = if scenario == "mutation" {
+        let old = recorded_path.clone();
+        crate::download::retry::AFTER_REPAIR_MATCH
+            .scope(
+                Arc::new(move || {
+                    std::fs::write(&old, b"changed after match").unwrap();
+                }),
+                attempt,
+            )
+            .await
+    } else {
+        attempt.await
+    }
     .expect("retry changed provider version through production pipeline");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    if wrong_child || wrong_source || matches!(scenario, "disabled" | "mutation") {
+        assert!(!matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            std::fs::read(&recorded_path).unwrap(),
+            if scenario == "mutation" {
+                b"changed after match".as_slice()
+            } else {
+                b"bad".as_slice()
+            }
+        );
+        if scenario != "mutation" {
+            assert_eq!(
+                std::fs::metadata(&recorded_path)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                original_time
+            );
+        }
+        assert!(
+            db.get_summary().await.unwrap().pending + db.get_summary().await.unwrap().failed > 0
+        );
+        return;
+    }
+    assert!(
+        matches!(result.outcome, DownloadOutcome::Success),
+        "{result:?}; warnings={:?}",
+        trace
+            .events()
+            .iter()
+            .filter(|event| event.level <= tracing::Level::WARN)
+            .collect::<Vec<_>>()
+    );
     assert_eq!(result.stats.downloaded, 1);
     assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), b"bad");
     let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
@@ -752,12 +941,77 @@ async fn truncated_repair_provider_version_change_uses_sibling() {
         .as_ref()
         .expect("current provider version has a local path");
     assert_ne!(current_path, &recorded_path);
+    if let Some(reserved) = reserved {
+        assert_eq!(current_path, &std::path::PathBuf::from(reserved));
+    }
+    assert_eq!(
+        db.acquire_lock("old receipt remains historical")
+            .unwrap()
+            .query_row::<String, _, _>(
+                "SELECT provider_checksum FROM asset_metadata_paths WHERE local_path=?1",
+                [recorded_path.to_str().unwrap()],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        "old-provider-checksum"
+    );
     assert_eq!(tokio::fs::read(current_path).await.unwrap(), current_body);
     assert_eq!(current_path.parent(), recorded_path.parent());
     let summary = db.get_summary().await.expect("summary");
     assert_eq!(summary.downloaded, 1);
     assert_eq!(summary.pending, 0);
     assert_eq!(summary.failed, 0);
+    let current_path = current_path.clone();
+    let current_time = std::fs::metadata(&current_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    config.state_db = None;
+    drop(db);
+    let db = Arc::new(SqliteStateDb::open_owned(&database, &owner).await.unwrap());
+    config.state_db = Some(db.clone());
+    for _ in 0..2 {
+        let quiet = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config.clone()),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(quiet.outcome, DownloadOutcome::Success),
+            "{quiet:?}"
+        );
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_eq!(std::fs::read(&recorded_path).unwrap(), b"bad");
+        assert_eq!(
+            std::fs::metadata(&recorded_path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            original_time
+        );
+        assert_eq!(
+            std::fs::metadata(&current_path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            current_time
+        );
+        if fail_first {
+            assert_eq!(std::fs::read(&collision).unwrap(), b"unrelated collision");
+            assert_eq!(
+                Some(std::fs::metadata(&collision).unwrap().modified().unwrap()),
+                collision_time
+            );
+        }
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        if fail_first { 2 } else { 1 }
+    );
 }
 
 #[tokio::test]

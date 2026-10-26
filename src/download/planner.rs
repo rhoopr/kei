@@ -167,6 +167,14 @@ impl TaskPlanner {
         Ok(planner)
     }
 
+    /// Explicit repair must persist its first sibling choice, not only replay
+    /// reservations left by an earlier run. Reuse normal reserved-download planning.
+    pub(super) fn reserve_explicit_retry_destinations(&mut self) {
+        if matches!(self.path_mode, PathPlanningMode::Download) {
+            self.path_mode = PathPlanningMode::ReservedDownload;
+        }
+    }
+
     /// Pending recovery needs positive ownership even in ordinary download mode.
     #[must_use]
     pub(super) fn pending_publication_path_owned(

@@ -326,14 +326,15 @@ impl PendingRetryPlanning<'_> {
                         }
                         decision @ (crate::download::baseline_matching::BaselineMatch::Missing
                             | crate::download::baseline_matching::BaselineMatch::Uncertain(_)) => {
-                            // Only an explicitly marked, same-generation truncated target can
-                            // proceed past uncertainty. The later claim still authorizes the
-                            // exact destination and carries the fresh replacement fingerprint.
+                            // Explicit repair may replace the same resource or preserve a
+                            // damaged older resource and reserve a sibling for the confirmed
+                            // current child. The resolved identity above is required in both
+                            // cases; the fingerprint never certifies old bytes as current.
                             let authorized_repair = if let Some(local_path)=evidence.local_path_under(&pass_config.directory) {
-                                if evidence.matches_provider_version(task)
-                                    && (!self.task_planner.has_durable_destination(task) || task.download_path==local_path)
-                                    && self.task_planner.retry_path_allowed(&task.library,&task.asset_id,
-                                        task.version_size,&task.checksum,task.size,local_path) {
+                                if (!self.task_planner.has_durable_destination(task) || task.download_path==local_path)
+                                    && (!evidence.matches_provider_version(task)
+                                        || self.task_planner.retry_path_allowed(&task.library,&task.asset_id,
+                                            task.version_size,&task.checksum,task.size,local_path)) {
                                     evidence.truncated_repair_fingerprint(pass_config.repair_truncated).await?
                                 } else { None }
                             } else { None };
@@ -353,7 +354,16 @@ impl PendingRetryPlanning<'_> {
                             } else {
                                 false
                             };
-                            if authorized_repair.is_none() && (matches!(
+                            // A previously admitted sibling is already current work. Resume
+                            // its exact reservation after failure, without interpreting the
+                            // old candidate or requiring its consumed repair marker again.
+                            let reserved_copy = pass_config.repair_truncated
+                                && self.task_planner.has_durable_destination(task)
+                                && evidence.local_path_under(&pass_config.directory)
+                                    .is_some_and(|old|old != task.download_path)
+                                && matches!(super::file::inspect_pending_candidate(
+                                    &pass_config.directory,&task.download_path).await,Ok(false));
+                            if authorized_repair.is_none() && !reserved_copy && (matches!(
                                 decision,
                                 crate::download::baseline_matching::BaselineMatch::Uncertain(_)
                             ) || recorded_candidate)
@@ -452,14 +462,16 @@ impl PendingRetryPlanning<'_> {
                     && let Some(local_path) = evidence.local_path_under(&pass_config.directory)
                     && (!self.task_planner.has_durable_destination(&task)
                         || task.download_path == local_path)
-                    && self.task_planner.retry_path_allowed(
-                        &task.library,
-                        &task.asset_id,
-                        task.version_size,
-                        &task.checksum,
-                        task.size,
-                        local_path,
-                    )
+                    && ((!evidence.matches_provider_version(&task)
+                        && authorized_repairs.contains_key(&target))
+                        || self.task_planner.retry_path_allowed(
+                            &task.library,
+                            &task.asset_id,
+                            task.version_size,
+                            &task.checksum,
+                            task.size,
+                            local_path,
+                        ))
                 {
                     if evidence.matches_provider_version(&task)
                         && let Some(fingerprint) = evidence
@@ -490,10 +502,14 @@ impl PendingRetryPlanning<'_> {
                         task.download_path = local_path.to_path_buf();
                         task.replacement_fingerprint = Some(Arc::new(fingerprint));
                     } else {
-                        if authorized_repairs.contains_key(&target) {
+                        if evidence.matches_provider_version(&task)
+                            && authorized_repairs.contains_key(&target)
+                        {
                             retained_targets.insert(target);
                             continue;
                         }
+                        // Changed resources never receive a replacement fingerprint:
+                        // the occupied recorded path must survive alongside the new copy.
                         let Some(retry_path) = self
                             .task_planner
                             .resolve_recorded_retry_path(local_path, &task)
@@ -508,6 +524,15 @@ impl PendingRetryPlanning<'_> {
                             retained_targets.insert(target);
                             continue;
                         };
+                        if authorized_repairs.contains_key(&target)
+                            && !evidence.matches_provider_version(&task)
+                            && retry_path == local_path
+                        {
+                            // A disappearing old file does not turn separate-copy
+                            // repair into permission to reuse its recorded path.
+                            retained_targets.insert(target);
+                            continue;
+                        }
                         task.download_path = retry_path;
                     }
                 }
@@ -522,6 +547,18 @@ impl PendingRetryPlanning<'_> {
                 self.task_planner
                     .persist_download_reservations(self.db, &retry_tasks)
                     .await?;
+                for task in &retry_tasks {
+                    if pass_config.repair_truncated
+                        && self
+                            .pending_evidence
+                            .get(&PendingRetryTarget::from_task(task))
+                            .is_some_and(|old| !old.matches_provider_version(task))
+                    {
+                        // Reserve first: interruption before the observation write can
+                        // only resume the same sibling, never replace the old resource.
+                        planner::upsert_seen_for_task(self.db, pass_config, asset, task).await?;
+                    }
+                }
             }
             for task in &mut retry_tasks {
                 if !self
@@ -901,6 +938,9 @@ pub(super) async fn build_pending_retry_download_tasks(
     let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested);
     let mut retry_sources: FxHashMap<RetryTaskKey, UrlRetrySource> = FxHashMap::default();
     let mut task_planner = planner::TaskPlanner::for_download(Some(db.as_ref())).await?;
+    if config.repair_truncated {
+        task_planner.reserve_explicit_retry_destinations();
+    }
     let pending_state_ids: Vec<&str> = pending
         .iter()
         .filter(|record| record.library.as_ref() == config.library.as_ref())
