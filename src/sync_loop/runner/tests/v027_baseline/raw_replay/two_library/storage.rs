@@ -1,5 +1,5 @@
 //! Full distinct stock history is not a current admission budget.
-use super::super::super::{MEDIA, ZONE, baseline_owner, pair, zone};
+use super::super::super::{MEDIA, baseline_owner, pair, zone};
 use super::{HEALTHY, HealthySession, healthy_zone, selected};
 use crate::download;
 use crate::icloud::photos::{PhotosSession, inbox::ShadowCapture};
@@ -94,13 +94,15 @@ fn old_snapshot(db: &SqliteStateDb) -> Vec<Vec<rusqlite::types::Value>> {
     out
 }
 
-async fn stock(database: &Path, root: &Path) -> u64 {
+async fn stock(database: &Path, root: &Path, padding: usize) -> u64 {
     let db = Arc::new(SqliteStateDb::create_stock_v36_for_test(
         database,
         &baseline_owner(),
     ));
     let capture = ShadowCapture::new(db.clone(), baseline_owner(), "com");
-    let scope = capture.scope("private", &zone()).unwrap();
+    // The library that must make current progress owns the full historical
+    // inbox and unresolved old work; another library's success is not proof.
+    let scope = capture.scope("private", &healthy_zone()).unwrap();
     for index in 0..32 {
         let mut records = pair(
             &format!("old-{index}"),
@@ -108,8 +110,10 @@ async fn stock(database: &Path, root: &Path) -> u64 {
             "https://invalid.example/old",
             index + 30,
         );
-        records[0]["fields"]["syntheticRetainedPadding"] = json!({"value":"p".repeat(8192)});
-        let raw=serde_json::to_vec(&json!({"zones":[{"zoneID":zone(),"records":records,"syncToken":format!("old-after-{index}"),"moreComing":false}]})).unwrap();
+        records[1]["fields"]["masterRef"]["value"]["zoneID"] = healthy_zone();
+        records[0]["fields"]["syntheticRetainedPadding"] = json!({"value":"p".repeat(padding)});
+        let raw=serde_json::to_vec(&json!({"zones":[{"zoneID":healthy_zone(),"records":records,"syncToken":format!("old-after-{index}"),"moreComing":false}]})).unwrap();
+        assert!(raw.len() <= crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES);
         capture
             .capture(
                 crate::icloud::photos::catalog_observed_page(
@@ -122,19 +126,19 @@ async fn stock(database: &Path, root: &Path) -> u64 {
             .await
             .unwrap();
     }
-    let blocked = selected(db.clone(), zone(), Box::new(Unavailable)).await;
+    let blocked = selected(db.clone(), healthy_zone(), Box::new(Unavailable)).await;
     let base = make_run_cycle_download_config_builder(root, db.clone());
     let mut config = (*base(
         download::SyncMode::Full,
         Arc::default(),
         Arc::default(),
-        Arc::from(ZONE),
+        Arc::from(HEALTHY),
     ))
     .clone();
     configure(&mut config);
     let hash = download::retained_work_config_hash_for_test(
         &config.with_pass(&blocked.plan.passes[0]),
-        &zone(),
+        &healthy_zone(),
     );
     let source = db
         .catalog_source(baseline_owner(), CapturedPageId(1), 16 * 1024 * 1024)
@@ -149,7 +153,7 @@ async fn stock(database: &Path, root: &Path) -> u64 {
                     ordinal: 1
                 },
                 scope,
-                zone: zone(),
+                zone: healthy_zone(),
                 config_hash: hash,
                 confirmation: None,
                 master: None,
@@ -219,6 +223,17 @@ async fn v027_full_distinct_stock_inbox_preserves_work_and_reclaims_current_cycl
     storage_contract(Fault::None).await;
 }
 #[tokio::test]
+#[ignore = "near-512 MiB historical inbox scale qualification; run explicitly on disposable storage"]
+async fn v027_large_stock_inbox_preserves_current_progress() {
+    storage_contract_with_stock(
+        Fault::None,
+        crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES - 8192,
+        Some(512 * 1024 * 1024),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn v027_full_distinct_stock_admission_rollback_reopens_without_lost_work() {
     storage_contract(Fault::Admission).await;
 }
@@ -247,11 +262,15 @@ fn owner_snapshot(db: &SqliteStateDb) -> Vec<Vec<rusqlite::types::Value>> {
     }
     rows
 }
+async fn storage_contract(fault: Fault) {
+    storage_contract_with_stock(fault, 8192, None).await;
+}
+
 #[allow(
     clippy::print_stdout,
     reason = "synthetic storage measurements are test evidence"
 )]
-async fn storage_contract(fault: Fault) {
+async fn storage_contract_with_stock(fault: Fault, padding: usize, capacity: Option<u64>) {
     let fairness = ASSESS_FAIRNESS
         .try_with(|enabled| *enabled)
         .unwrap_or(false);
@@ -302,7 +321,15 @@ async fn storage_contract(fault: Fault) {
     std::fs::write(&original, MEDIA).unwrap();
     let mtime = std::fs::metadata(&original).unwrap().modified().unwrap();
     let database = dir.path().join("state.db");
-    let budget = stock(&database, &root).await;
+    let setup_started = std::time::Instant::now();
+    let budget = stock(&database, &root, padding).await;
+    if let Some(capacity) = capacity {
+        assert!(budget > 511 * 1024 * 1024 && budget < capacity);
+    }
+    println!(
+        "STOCK_SETUP charged_bytes={budget} elapsed_ms={}",
+        setup_started.elapsed().as_millis()
+    );
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     let mut before = None;
     let mut measurements = Vec::new();
@@ -333,14 +360,23 @@ async fn storage_contract(fault: Fault) {
         if cycle == 0 {
             before = Some(old_snapshot(&db));
             let capture = ShadowCapture::new(db.clone(), baseline_owner(), "com");
-            let scope = capture.scope("private", &zone()).unwrap();
-            let raw=serde_json::to_vec(&json!({"zones":[{"zoneID":zone(),"records":pair("new-capacity-probe","probe.JPG","https://invalid.example/probe",99),"syncToken":"probe-after","moreComing":false}]})).unwrap();
+            let scope = capture.scope("private", &healthy_zone()).unwrap();
+            let mut probe = pair(
+                "new-capacity-probe",
+                "probe.JPG",
+                "https://invalid.example/probe",
+                99,
+            );
+            probe[1]["fields"]["masterRef"]["value"]["zoneID"] = healthy_zone();
+            probe[0]["fields"]["syntheticRetainedPadding"] = json!({"value":"p".repeat(padding)});
+            let raw=serde_json::to_vec(&json!({"zones":[{"zoneID":healthy_zone(),"records":probe,"syncToken":"probe-after","moreComing":false}]})).unwrap();
+            assert!(raw.len() <= crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES);
             assert!(
                 db.capture_shadow_page(
                     baseline_owner(),
                     crate::icloud::photos::catalog_observed_page(raw, &scope, "probe-before")
                         .unwrap(),
-                    budget
+                    capacity.unwrap_or(budget)
                 )
                 .await
                 .is_err_and(|error| matches!(
