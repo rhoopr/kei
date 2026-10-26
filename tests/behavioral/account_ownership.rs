@@ -407,6 +407,39 @@ impl Respond for UnknownChanges {
                 "records":[{"recordName":"future-source","recordType":"FutureRecord",
                     "futureEnvelope":{"relationship":{"recordName":"unresolved-peer"}}}]
             }]}))
+        } else if request.url.path().ends_with("/records/query")
+            && serde_json::from_slice::<Value>(&request.body)
+                .unwrap()
+                .pointer("/query/recordType")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with("CPLAsset"))
+        {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "records":[],"syncToken":"observed-empty-rank"
+            }))
+        } else {
+            OfflinePhotos.respond(request)
+        }
+    }
+}
+
+struct EmptySelectedPhotos;
+impl Respond for EmptySelectedPhotos {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if request.url.path().ends_with("/records/query")
+            && serde_json::from_slice::<Value>(&request.body)
+                .unwrap()
+                .pointer("/query/recordType")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with("CPLAsset"))
+        {
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"records":[],"syncToken":"selected-empty-rank"}))
+        } else if request.url.path().ends_with("/changes/zone") {
+            ResponseTemplate::new(200).set_body_json(json!({"zones":[{
+                "zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+                "records":[],"syncToken":"A-cursor","moreComing":false
+            }]}))
         } else {
             OfflinePhotos.respond(request)
         }
@@ -414,7 +447,7 @@ impl Respond for UnknownChanges {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shadow_actual_sync_captures_unknown_source_after_library_resolution() {
+async fn current_unknown_without_retry_owner_holds_cursor_across_cli_reopen() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(UnknownChanges)
@@ -423,41 +456,47 @@ async fn shadow_actual_sync_captures_unknown_source_after_library_resolution() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let account = seed(root, ACCOUNTS[0], "A", &server.uri());
-    success(&command(root, &account, &["sync", "--no-progress-bar"]));
+    let other = seed(root, ACCOUNTS[1], "B", &server.uri());
+    let other_before = state(&other.path);
+    let media_before = quiet_media_snapshot(account.media.parent().unwrap());
+    let cursors_before = rows(
+        &account.path,
+        "SELECT key,value FROM metadata WHERE key LIKE 'sync_token:%' ORDER BY key",
+    );
+    for _ in 0..2 {
+        let out = command(root, &account, &["sync", "--no-progress-bar"]);
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("no scoped retry owner"),
+            "{out:?}"
+        );
+        assert_eq!(
+            rows(
+                &account.path,
+                "SELECT key,value FROM metadata WHERE key LIKE 'sync_token:%' ORDER BY key"
+            ),
+            cursors_before
+        );
+        assert_eq!(
+            rows(&account.path, "SELECT count(*) FROM provider_shadow_pages"),
+            vec![vec![rusqlite::types::Value::Integer(0)]]
+        );
+        assert_eq!(state(&other.path), other_before);
+        assert_eq!(
+            quiet_media_snapshot(account.media.parent().unwrap()),
+            media_before
+        );
+    }
     assert!(
         server
             .received_requests()
             .await
             .unwrap()
             .iter()
-            .any(|request| request.url.path().ends_with("/changes/zone")),
-        "production sync must observe an incremental page"
-    );
-    let conn =
-        Connection::open_with_flags(&account.path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .unwrap();
-    // The startup path, not a manually attached test album, must capture the
-    // unknown record before the existing stream drops its lossy projection.
-    let records: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM provider_shadow_records WHERE record_name='future-source'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        records, 1,
-        "resolved library clones must carry capture composition"
-    );
-    let body: Vec<u8> = conn
-        .query_row("SELECT body FROM provider_shadow_pages", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert!(String::from_utf8_lossy(&body).contains("unresolved-peer"));
-    assert_eq!(
-        std::fs::read(&account.media).unwrap(),
-        b"known media belonging only to account A"
+            .filter(|request| request.url.path().ends_with("/changes/zone"))
+            .count()
+            >= 2,
+        "each reopened CLI must encounter the unaccountable current observation"
     );
 }
 
@@ -673,10 +712,10 @@ async fn shadow_actual_cli_refusals_hold_without_rank_fallback_then_recover_quie
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn catalog_projection_actual_cli_replays_schema29_backlog_after_fault_and_stays_quiet() {
+async fn stock_history_survives_current_admission_rollback_and_quiet_cli_reopen() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(OfflinePhotos)
+        .respond_with(EmptySelectedPhotos)
         .mount(&server)
         .await;
     let directory = tempfile::tempdir().unwrap();
@@ -756,7 +795,7 @@ async fn catalog_projection_actual_cli_replays_schema29_backlog_after_fault_and_
             0,
             "status migration must not invent indexing proof"
         );
-        conn.execute_batch("CREATE TRIGGER catalog_cli_fault BEFORE INSERT ON provider_catalog_pages BEGIN SELECT RAISE(ABORT,'synthetic CLI catalog receipt failure'); END;").unwrap();
+        conn.execute_batch("CREATE TRIGGER catalog_cli_fault BEFORE INSERT ON provider_active_generations BEGIN SELECT RAISE(ABORT,'synthetic CLI current admission failure'); END;").unwrap();
     }
     let before = state(&account.path);
     let debt_before = rows(
@@ -768,7 +807,7 @@ async fn catalog_projection_actual_cli_replays_schema29_backlog_after_fault_and_
         let diagnostics = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success());
         assert!(
-            diagnostics.contains("synthetic CLI catalog receipt failure"),
+            diagnostics.contains("synthetic CLI current admission failure"),
             "{diagnostics}"
         );
         assert!(!diagnostics.contains("falling back to full enumeration"));
@@ -790,6 +829,10 @@ async fn catalog_projection_actual_cli_replays_schema29_backlog_after_fault_and_
             "provider_catalog_references",
             "provider_catalog_debt",
             "provider_catalog_pages",
+            "provider_active_generations",
+            "provider_active_decisions",
+            "provider_active_destinations",
+            "provider_active_sources",
         ] {
             assert_eq!(
                 conn.query_row::<i64, _, _>(&format!("SELECT count(*) FROM {table}"), [], |row| {
@@ -814,37 +857,28 @@ async fn catalog_projection_actual_cli_replays_schema29_backlog_after_fault_and_
             .unwrap()
             .iter()
             .all(|request| !request.url.path().ends_with("/changes/zone")),
-        "startup replay refusal must happen before live delta dispatch"
+        "failed baseline admission must precede bridge cursor dispatch"
     );
     Connection::open(&account.path)
         .unwrap()
         .execute_batch("DROP TRIGGER catalog_cli_fault")
         .unwrap();
-    let recover_with_retained_debt = || {
-        let out = command(root, &account, &["sync", "--no-progress-bar"]);
-        let diagnostics = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !out.status.success(),
-            "retained sparse debt must keep the overall cycle incomplete"
-        );
-        assert!(diagnostics.contains("1 sync failures"), "{diagnostics}");
-        assert!(
-            !diagnostics.contains("synthetic CLI catalog receipt failure"),
-            "{diagnostics}"
-        );
-        assert!(
-            !diagnostics.contains("falling back to full enumeration"),
-            "{diagnostics}"
-        );
+    let baseline_queries = |requests: &[Request]| {
+        requests
+            .iter()
+            .filter(|request| {
+                request.url.path().ends_with("/records/query")
+                    && serde_json::from_slice::<Value>(&request.body)
+                        .unwrap()
+                        .pointer("/query/recordType")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind.starts_with("CPLAsset"))
+            })
+            .count()
     };
-    recover_with_retained_debt();
-    let frozen = rows(
-        &account.path,
-        "SELECT * FROM provider_catalog_pages ORDER BY page_id",
-    );
-    for _ in 0..2 {
-        recover_with_retained_debt();
-        assert_eq!(state(&account.path), before);
+    let mut completed_queries = None;
+    for _ in 0..3 {
+        success(&command(root, &account, &["sync", "--no-progress-bar"]));
         assert_eq!(
             rows(
                 &account.path,
@@ -853,45 +887,34 @@ async fn catalog_projection_actual_cli_replays_schema29_backlog_after_fault_and_
             debt_before
         );
         let conn = Connection::open(&account.path).unwrap();
-        for (table, count) in [
-            ("provider_catalog_records", 4),
-            ("provider_catalog_references", 2),
-            ("provider_catalog_debt", 4),
-            ("provider_catalog_pages", 2),
+        assert_eq!(
+            conn.query_row::<Vec<u8>, _, _>("SELECT body FROM provider_shadow_pages", [], |r| r
+                .get(0))
+                .unwrap(),
+            raw
+        );
+        for table in [
+            "provider_catalog_records",
+            "provider_catalog_references",
+            "provider_catalog_debt",
+            "provider_catalog_pages",
         ] {
             assert_eq!(
-                conn.query_row::<i64, _, _>(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap(),
-                count
+                conn.query_row::<i64, _, _>(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                    .get(0))
+                    .unwrap(),
+                0,
+                "current progress must not require historical projection"
             );
         }
         assert_eq!(
-            rows(
-                &account.path,
-                "SELECT * FROM provider_catalog_pages ORDER BY page_id"
-            ),
-            frozen
-        );
-        assert_eq!(
-            conn.query_row::<Vec<u8>, _, _>(
-                "SELECT body FROM provider_shadow_pages ORDER BY id LIMIT 1",
-                [],
-                |row| row.get(0)
-            )
-            .unwrap(),
-            raw
-        );
-        assert_eq!(
             conn.query_row::<String, _, _>(
-                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                "SELECT value FROM metadata WHERE key='sync_token:v27:PrimarySync'",
                 [],
-                |row| row.get(0)
+                |r| r.get(0)
             )
             .unwrap(),
-            "A-cursor",
-            "retained observation successor never owns current checkpoint"
+            "A-cursor"
         );
         assert_eq!(
             std::fs::read(&account.media).unwrap(),
@@ -903,6 +926,14 @@ async fn catalog_projection_actual_cli_replays_schema29_backlog_after_fault_and_
                 .count(),
             1
         );
+        let queries = baseline_queries(&server.received_requests().await.unwrap());
+        if let Some(previous) = completed_queries {
+            assert_eq!(
+                queries, previous,
+                "quiet reopened CLI must not repeat inventory"
+            );
+        }
+        completed_queries = Some(queries);
     }
 }
 
@@ -942,7 +973,7 @@ impl Respond for QuietCatalogPhotos {
         let path = request.url.path();
         let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
         let value = if path.ends_with("/zones/list") {
-            json!({"zones":if path.contains("/private/"){vec![json!({"zoneID":zone})]}else{vec![]}})
+            json!({"zones":if path.contains("/private/"){vec![json!({"zoneID":zone,"syncToken":"scoped-baseline-cursor"})]}else{vec![]}})
         } else if body.pointer("/query/recordType").and_then(Value::as_str)
             == Some("CheckIndexingState")
         {
@@ -1571,7 +1602,7 @@ impl Respond for PrivateSelectionCliPhotos {
         let path = request.url.path();
         let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
         let value = if path.ends_with("/zones/list") {
-            json!({"zones":if path.contains("/private/"){vec![json!({"zoneID":zone})]}else{vec![]}})
+            json!({"zones":if path.contains("/private/"){vec![json!({"zoneID":zone,"syncToken":"scoped-baseline-cursor"})]}else{vec![]}})
         } else if body.pointer("/query/recordType").and_then(Value::as_str)
             == Some("CheckIndexingState")
         {
@@ -1754,6 +1785,11 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
         ),
         vec![vec![rusqlite::types::Value::Text("A-cursor".into())]]
     );
+    let interrupted_roots = rows(
+        &account.path,
+        "SELECT id FROM provider_active_generations WHERE sealed=0 ORDER BY id",
+    );
+    assert!(!interrupted_roots.is_empty());
     Connection::open(&account.path)
         .unwrap()
         .execute_batch("DROP TRIGGER private_cli_destination_fault;")
@@ -1802,6 +1838,23 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
     );
     let started = std::time::Instant::now();
     let mut recovered = None;
+    let mut recovered_ledger = None;
+    let ledger_snapshot = || {
+        (
+            rows(
+                &account.path,
+                "SELECT id,sealed,checkpoint_ready FROM provider_active_generations ORDER BY id",
+            ),
+            rows(
+                &account.path,
+                "SELECT generation,pass_key,child,compacted_hash FROM provider_active_decisions ORDER BY generation,pass_key,child",
+            ),
+            rows(
+                &account.path,
+                "SELECT generation,pass_key,child,compat_path,verified_media,verified_metadata FROM provider_active_destinations ORDER BY generation,pass_key,child,compat_path",
+            ),
+        )
+    };
     let mut completed_cycles = 0;
     while completed_cycles < 3 && started.elapsed() < Duration::from_secs(210) {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1823,12 +1876,19 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
             photos.lookups.load(Ordering::SeqCst),
         );
         if completed_cycles == 1 {
+            let mut expected_paths: Vec<_> = seeded
+                .iter()
+                .map(|(path, _)| vec![rusqlite::types::Value::Text(path.to_str().unwrap().into())])
+                .collect();
+            expected_paths.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+            let mut completed_paths = rows(
+                &account.path,
+                "SELECT DISTINCT compat_path FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=1",
+            );
+            completed_paths.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
             assert_eq!(
-                count(
-                    "SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=1"
-                ),
-                5,
-                "recovery must finish all media and metadata before quiet sampling"
+                completed_paths, expected_paths,
+                "recovery must settle every exact selected destination; retained generations are not extra destinations"
             );
             assert_eq!(
                 count(
@@ -1836,12 +1896,37 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
                 ),
                 0
             );
+            // Additional evidence only: retain the unsealed-root assertion
+            // below until its lifecycle disposition receives review.
+            let conn = Connection::open(&account.path).unwrap();
+            let cursor: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='sync_token:v27:PrimarySync'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let proof: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='observed_selection:v27:PrimarySync'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let proof: Value = serde_json::from_str(&proof).unwrap();
             assert_eq!(
-                count("SELECT count(*) FROM provider_active_generations WHERE sealed=0"),
-                0
+                proof["cursor_hash"],
+                format!("{:x}", Sha256::digest(cursor.as_bytes()))
             );
+            assert_eq!(proof["library"], "PrimarySync");
             recovered = Some(counters);
+            recovered_ledger = Some(ledger_snapshot());
         } else {
+            assert_eq!(
+                Some(ledger_snapshot()),
+                recovered_ledger,
+                "quiet cycles must not create roots, decisions or destinations"
+            );
             assert_eq!(
                 recovered,
                 Some(counters),
@@ -1851,6 +1936,29 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
     }
     child.0.kill().unwrap();
     child.0.wait().unwrap();
+    assert_eq!(
+        rows(
+            &account.path,
+            "SELECT id FROM provider_active_generations WHERE sealed=0 ORDER BY id"
+        ),
+        interrupted_roots,
+        "identify the retained interrupted predecessor, not a new quiet-cycle root"
+    );
+    let status = command(root, &account, &["status"]);
+    success(&status);
+    let status_text = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_text.contains("complete as of this recorded observation"),
+        "{status_text}"
+    );
+    assert!(
+        !status_text.contains("fully observed; settlement unknown"),
+        "{status_text}"
+    );
+    assert!(
+        !status_text.contains("fully observed; requested work outstanding"),
+        "{status_text}"
+    );
     let diagnostics = std::fs::read_to_string(&log).unwrap();
     assert_eq!(completed_cycles, 3, "{diagnostics}");
     assert!(photos.checks.load(Ordering::SeqCst) >= 3, "{diagnostics}");
@@ -1877,6 +1985,51 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
         "two unchanged watch cycles must not repeat completed selection/hydration; rank phases={:?}",
         photos.rank_cycles.lock().unwrap().clone()
     );
+
+    // A new selection policy with identical selected content legitimately
+    // starts a generation and reclaims completed predecessor evidence.
+    let next_config = config.replace(
+        "unfiled=true\n",
+        "unfiled=true\nfilename_exclude=[\"never-selected-v27\"]\n",
+    );
+    assert_ne!(next_config, config);
+    std::fs::write(&account.config, next_config).unwrap();
+    success(&command(root, &account, &["sync", "--no-progress-bar"]));
+    for root in &interrupted_roots {
+        let rusqlite::types::Value::Text(id) = &root[0] else {
+            panic!("root id must be text")
+        };
+        let conn = Connection::open(&account.path).unwrap();
+        for (table, key) in [
+            ("provider_active_generations", "id"),
+            ("provider_active_decisions", "generation"),
+            ("provider_active_destinations", "generation"),
+            ("provider_active_sources", "generation"),
+            ("provider_selection_rank_pages", "generation"),
+        ] {
+            assert_eq!(
+                conn.query_row::<i64, _, _>(
+                    &format!("SELECT count(*) FROM {table} WHERE {key}=?1"),
+                    [id],
+                    |r| r.get(0)
+                )
+                .unwrap(),
+                0,
+                "completed predecessor must retire at the next real admission: {table}"
+            );
+        }
+    }
+    // Retain the original zero-unsealed assertion at the retirement boundary.
+    assert_eq!(
+        count("SELECT count(*) FROM provider_active_generations WHERE sealed=0"),
+        0,
+        "unsealed roots: {:?}",
+        rows(
+            &account.path,
+            "SELECT json_extract(CAST(specification AS TEXT),'$.format'),config_hash,scope,basis,checkpoint_ready,checkpoint_veto,(SELECT group_concat(pass_key || ':' || child || ':' || outcome || ':' || coalesce(reason,'none')) FROM provider_active_decisions d WHERE d.generation=g.id),(SELECT count(*) FROM provider_selection_rank_pages p WHERE p.generation=g.id) FROM provider_active_generations g WHERE sealed=0"
+        )
+    );
+
     assert_eq!(
         count(
             "SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=1"

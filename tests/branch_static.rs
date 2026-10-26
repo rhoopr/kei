@@ -655,7 +655,7 @@ fn focused_scenario_catalog_lists_every_runner_slice() {
 fn config_reconciliation_scenario_pins_transition_seed_tests() {
     let scenario = repo_file("scripts/test-scenarios/config-reconciliation.sh");
     let required = [
-        "path_reconciliation_copies_catalog_file_without_provider_inventory",
+        "orchestration::primary_layout::tests::normal_boundary_tests",
         "local_reconciliation_copy_preserves_source_and_refuses_conflict",
         "download_config_hash_drift_stages_reconciliation_without_clearing_token",
         "download_config_revert_clears_pending_reconciliation",
