@@ -16,17 +16,10 @@ use crate::icloud::photos::PhotoAsset;
 use crate::state::{DownloadStateStore, VersionSizeKey};
 use crate::test_helpers::TestPhotoAsset;
 
-/// Producer-side regression for resolving pending rows when the expected
-/// file already exists on disk.
-///
-/// A pending row carried over from a prior interrupted sync, whose
-/// new sync sees the expected file at the natural path, must be adopted as
-/// downloaded when the file already exists with the same name and size.
-/// Otherwise standard sync resets failed assets to pending, full
-/// enumeration routes the path collision through a deterministic alternate
-/// path, and the same row is promoted back to failed every run.
+/// A pending file with only matching name and size remains visible uncertainty.
+/// It is neither verified completion nor permission to download a duplicate.
 #[tokio::test]
-async fn producer_adopts_pending_on_disk_skip_as_downloaded() {
+async fn producer_keeps_pending_size_match_without_content_proof() {
     use crate::download::DownloadConfig;
     use crate::icloud::photos::PhotoAsset;
     use crate::state::SqliteStateDb;
@@ -34,19 +27,23 @@ async fn producer_adopts_pending_on_disk_skip_as_downloaded() {
     use futures_util::stream;
     use std::sync::Arc;
 
-    fn carryover_asset() -> PhotoAsset {
+    fn carryover_asset(url: &str) -> PhotoAsset {
         TestPhotoAsset::new("STUCK")
             .filename("stuck.jpg")
             .item_type("public.jpeg")
             .orig_file_type("public.jpeg")
             .orig_size(1234)
-            .orig_url("https://p01.icloud-content.com/stuck.jpg")
+            .orig_url(url)
             .orig_checksum("ck_stuck")
             .build()
             .with_source_zone(Arc::from("SharedSync-abc"))
     }
 
-    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+    let dir = TempDir::new().unwrap();
+    let database = dir.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open(&database).await.unwrap());
+    let server = wiremock::MockServer::start().await;
+    let url = format!("{}/stuck.jpg", server.uri());
 
     let prior_seen_at = chrono::Utc::now().timestamp() - 86400;
     let record = TestAssetRecord::new("STUCK")
@@ -58,7 +55,6 @@ async fn producer_adopts_pending_on_disk_skip_as_downloaded() {
     db.upsert_seen(&record).await.unwrap();
     db.backdate_last_seen("STUCK", prior_seen_at);
 
-    let dir = TempDir::new().unwrap();
     let mut config = DownloadConfig::test_default();
     config.directory = Arc::from(dir.path());
     config.state_db = Some(db.clone());
@@ -68,10 +64,8 @@ async fn producer_adopts_pending_on_disk_skip_as_downloaded() {
     config.metadata.set_exif_datetime = true;
     let config = Arc::new(config);
 
-    // Pre-create the on-disk file at the expected natural path. The path
-    // layer now emits an identity collision task for this same-size file,
-    // so the producer must still adopt the pending row before forwarding.
-    let asset = carryover_asset();
+    // The natural path has no receipt or supported provider-byte proof.
+    let asset = carryover_asset(&url);
     let target_path = crate::download::filter::expected_paths_for(&asset, config.as_ref())
         .first()
         .expect("test asset must derive an expected path")
@@ -82,10 +76,11 @@ async fn producer_adopts_pending_on_disk_skip_as_downloaded() {
     }
     fs::write(&target_path, vec![0u8; 1234]).unwrap();
 
+    let mtime = fs::metadata(&target_path).unwrap().modified().unwrap();
     let client = reqwest::Client::new();
     let sync_started_at = chrono::Utc::now().timestamp();
-    let stream1 = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(carryover_asset())]);
-    stream_and_download_from_stream(
+    let stream1 = stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(carryover_asset(&url))]);
+    let result = stream_and_download_from_stream(
         &client,
         stream1,
         &config,
@@ -100,12 +95,12 @@ async fn producer_adopts_pending_on_disk_skip_as_downloaded() {
     let promoted = db.promote_pending_to_failed(sync_started_at).await.unwrap();
     assert_eq!(
         promoted, 0,
-        "on-disk pending row should be resolved before failed promotion"
+        "uncertainty remains pending rather than becoming a transfer failure"
     );
 
     let summary = db.get_summary().await.unwrap();
-    assert_eq!(summary.downloaded, 1);
-    assert_eq!(summary.pending, 0);
+    assert_eq!(summary.downloaded, 0);
+    assert_eq!(summary.pending, 1);
     assert_eq!(summary.failed, 0);
     let capture_repairs = db
         .get_pending_metadata_rewrites_page_for_queue(
@@ -116,8 +111,42 @@ async fn producer_adopts_pending_on_disk_skip_as_downloaded() {
         )
         .await
         .unwrap();
-    assert_eq!(capture_repairs.len(), 1);
-    assert_eq!(capture_repairs[0].asset.id.as_ref(), "STUCK");
+    assert!(
+        capture_repairs.is_empty(),
+        "unverified adoption cannot authorize metadata writes"
+    );
+    assert_eq!(result.downloaded, 0);
+    assert_eq!(result.bytes_downloaded, 0);
+    assert_eq!(result.disk_bytes_written, 0);
+    assert_eq!(result.skip_summary.uncertain, 1);
+    assert_eq!(result.skip_summary.on_disk, 0);
+    assert!(result.failed.is_empty());
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(fs::read(&target_path).unwrap(), vec![0u8; 1234]);
+    assert_eq!(
+        fs::metadata(&target_path).unwrap().modified().unwrap(),
+        mtime
+    );
+    drop(config);
+    drop(db);
+    let reopened = SqliteStateDb::open(&database).await.unwrap();
+    let pending = reopened.get_pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id.as_ref(), "STUCK");
+    let diagnostic = crate::state::db::match_diagnostics::MatchDiagnostics::decode(
+        pending[0]
+            .last_error
+            .as_deref()
+            .expect("uncertainty is visible"),
+    )
+    .expect("structured matching refusal survives reopen");
+    assert!(!diagnostic.attempts.is_empty());
+    assert!(
+        diagnostic
+            .attempts
+            .iter()
+            .any(|attempt| !attempt.explanation.candidates.is_empty())
+    );
 }
 
 async fn run_producer_metadata_rewritten_pending_file(
@@ -280,10 +309,11 @@ async fn pending_same_size_collision_does_not_adopt_other_assets_bare_file() {
     use std::sync::Arc;
 
     let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+    let server = wiremock::MockServer::start().await;
     let asset = TestPhotoAsset::new("SAME_SIZE_B")
         .filename("IMG_0001.JPG")
         .orig_size(5000)
-        .orig_url("https://p01.icloud-content.com/b.jpg")
+        .orig_url(&format!("{}/b.jpg", server.uri()))
         .orig_checksum("ck_same_size_b")
         .build();
 
@@ -302,6 +332,7 @@ async fn pending_same_size_collision_does_not_adopt_other_assets_bare_file() {
     fs::create_dir_all(bare_path.parent().unwrap()).unwrap();
     fs::write(&bare_path, vec![1u8; 5000]).unwrap();
 
+    let mtime = fs::metadata(&bare_path).unwrap().modified().unwrap();
     let pending = TestAssetRecord::new(asset.id())
         .checksum("ck_same_size_b")
         .filename(
@@ -332,7 +363,22 @@ async fn pending_same_size_collision_does_not_adopt_other_assets_bare_file() {
     );
     let summary = db.get_summary().await.unwrap();
     assert_eq!(summary.downloaded, 0);
-    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.failed, 0);
+    assert_eq!(summary.pending, 1);
+    assert_eq!(result.skip_summary.uncertain, 1);
+    assert_eq!(result.downloaded, 0);
+    assert_eq!(result.bytes_downloaded, 0);
+    assert_eq!(result.disk_bytes_written, 0);
+    assert!(result.failed.is_empty());
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(fs::read(&bare_path).unwrap(), vec![1u8; 5000]);
+    assert_eq!(fs::metadata(&bare_path).unwrap().modified().unwrap(), mtime);
+    assert!(!identity_path.exists());
+    let pending = db.get_pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].last_error.as_deref().is_some_and(|error| {
+        crate::state::db::match_diagnostics::MatchDiagnostics::decode(error).is_some()
+    }));
 }
 
 /// v5 metadata backfill regression: a previously downloaded row with a
