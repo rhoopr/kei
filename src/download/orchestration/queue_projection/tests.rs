@@ -258,6 +258,13 @@ impl Fixture {
         )
         .await
     }
+    // Explicit old-version work projection. Merely retaining a response is no
+    // longer permission for normal sync to manufacture historical work.
+    async fn project_retained(&self) -> Result<WorkAdmission, crate::state::error::StateError> {
+        self.db
+            .project_provider_work(owner(), self.plan().await, 512 * 1024 * 1024)
+            .await
+    }
     async fn plan(&self) -> WorkPlan {
         let (_, scope, zone) = self.pass.album.catalog_work_scope().unwrap().unwrap();
         let config = self.config.with_pass(&self.pass);
@@ -789,7 +796,7 @@ async fn queue_projection_receipt_fault_rolls_back_real_queue_mapping_and_scan_w
     let f = Fixture::new().await;
     f.capture(records("m", OLD, "source"), "old").await;
     f.db.acquire_lock("fault after publication writes").unwrap().execute_batch("CREATE TRIGGER work_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'synthetic work receipt fault'); END;").unwrap();
-    let error = f.cycle().await.unwrap_err();
+    let error = f.project_retained().await.unwrap_err();
     for table in [
         "assets",
         "asset_master_mappings",
@@ -808,9 +815,9 @@ async fn queue_projection_receipt_fault_rolls_back_real_queue_mapping_and_scan_w
         .unwrap()
         .execute_batch("DROP TRIGGER work_fault")
         .unwrap();
-    f.cycle().await.unwrap();
+    assert_eq!(f.project_retained().await.unwrap(), WorkAdmission::Admitted);
     let baseline = f.queue();
-    f.cycle().await.unwrap();
+    assert_eq!(f.project_retained().await.unwrap(), WorkAdmission::Admitted);
     assert_eq!(f.queue(), baseline);
     f.preserved().await;
 }
@@ -1508,7 +1515,12 @@ async fn queue_projection_raw_alignment_preserves_current_provider_metadata_bind
 async fn queue_projection_completed_receipt_refuses_corrupted_obligation() {
     let f = Fixture::new().await;
     f.capture(records("m", OLD, "source"), "old").await;
-    f.cycle().await.unwrap();
+    assert_eq!(f.project_retained().await.unwrap(), WorkAdmission::Admitted);
+    assert_eq!(
+        f.count("provider_work_obligations"),
+        1,
+        "fault must reach real retained ownership"
+    );
     let baseline = f.queue();
     f.db.acquire_lock("receipt evidence corruption")
         .unwrap()
