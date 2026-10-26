@@ -2575,10 +2575,11 @@ async fn full_sync_recent_album_passes_use_scope_frontier() {
     let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
     config.concurrent_downloads = 1;
+    config.folder_structure_albums = "selected".into();
     config.recent = Some(300);
-    for pass in &passes {
-        seed_existing_file_for_asset(&mut config, pass, &asset).await;
-    }
+    // Enumeration only needs one verified historical copy. Multi-destination
+    // reuse is exercised through the authenticated normal runner.
+    seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
 
     let result = download_photos_full_with_token(
         &Client::new(),
@@ -2590,7 +2591,10 @@ async fn full_sync_recent_album_passes_use_scope_frontier() {
     .await
     .expect("scope-frontier recent sync should complete");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert!(
+        matches!(result.outcome, DownloadOutcome::Success),
+        "{result:?}"
+    );
     assert_eq!(
         result.stats.assets_seen,
         10,
@@ -2635,13 +2639,12 @@ async fn full_sync_recent_per_filter_scope_limits_each_pass_independently() {
     let dir = TempDir::new().expect("temp dir");
     config.directory = Arc::from(dir.path());
     config.concurrent_downloads = 1;
+    config.folder_structure_albums = "selected".into();
     config.recent = Some(6);
     config.recent_scope = crate::cli::RecentScope::PerFilter;
 
-    for pass in &passes {
-        for asset in &expected_assets {
-            seed_existing_file_for_asset(&mut config, pass, asset).await;
-        }
+    for asset in &expected_assets {
+        seed_existing_file_for_asset(&mut config, &passes[0], asset).await;
     }
 
     let result = download_photos_full_with_token(
@@ -2654,7 +2657,10 @@ async fn full_sync_recent_per_filter_scope_limits_each_pass_independently() {
     .await
     .expect("per-filter recent sync should complete");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert!(
+        matches!(result.outcome, DownloadOutcome::Success),
+        "{result:?}"
+    );
     assert_eq!(
         result.stats.assets_seen, 18,
         "per-filter recent scope should take the recent limit from each album pass"
@@ -3085,7 +3091,7 @@ async fn full_sync_recent_deferred_unfiled_filters_album_members_after_multi_pag
         &mut config,
         &passes[1],
         "PrimarySync",
-        &unfiled_ids,
+        &unfiled_only_ids,
         "unfiled-mixed",
     )
     .await;
@@ -3100,7 +3106,10 @@ async fn full_sync_recent_deferred_unfiled_filters_album_members_after_multi_pag
     .await
     .expect("recent album plus unfiled sync should complete");
 
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert!(
+        matches!(result.outcome, DownloadOutcome::Success),
+        "{result:?}"
+    );
     assert_eq!(
         result.stats.assets_seen, 60,
         "40 album assets plus 20 non-album unfiled assets should be counted"

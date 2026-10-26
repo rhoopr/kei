@@ -19,7 +19,9 @@ use crate::commands::{AlbumPass, PassKind};
 use crate::download::filter::derive_expected_paths;
 use crate::download::{DownloadConfig, DownloadControls, download_photos_with_sync};
 use crate::icloud::photos::PhotoAsset;
-use crate::state::{AssetRecord, RetryErrorRetention, SqliteStateDb, VersionSizeKey};
+use crate::state::{
+    AssetRecord, DownloadStateStore, RetryErrorRetention, SqliteStateDb, VersionSizeKey,
+};
 use crate::test_helpers::MockPhotosFlow;
 
 const ID: &str = "SYNTHETIC_L1";
@@ -86,13 +88,16 @@ async fn publish(
     ));
     db.upsert_seen(&record).await.unwrap();
     let local = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
-    db.mark_downloaded(
+    // This fixture represents a completed raw transfer with known local provenance.
+    // The provider signature remains separate from the local SHA-256 receipt.
+    db.mark_verified_download(
         "PrimarySync",
         ID,
         version.as_str(),
         file,
         &local,
         Some(&local),
+        false,
     )
     .await
     .unwrap();

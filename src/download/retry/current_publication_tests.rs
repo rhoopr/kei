@@ -10,7 +10,9 @@ use super::{PendingRetryEvidence, PendingRetryPlanning, PendingRetryTarget};
 use crate::download::filter::derive_expected_paths;
 use crate::download::planner::TaskPlanner;
 use crate::download::{DownloadConfig, DownloadRunMode};
-use crate::state::{AssetRecord, RetryErrorRetention, SqliteStateDb, VersionSizeKey};
+use crate::state::{
+    AssetRecord, DownloadStateStore, RetryErrorRetention, SqliteStateDb, VersionSizeKey,
+};
 use crate::test_helpers::TestPhotoAsset;
 
 #[tokio::test]
@@ -69,9 +71,17 @@ async fn issue845_l1_targeted_pending_recovery_keeps_current_legacy_movie_across
             fs::write(&file, movie).unwrap();
             let db = SqliteStateDb::open(&db_path).await.unwrap();
             db.upsert_seen(&record).await.unwrap();
-            db.mark_downloaded(library, "L1", "live_original", &file, &local, Some(&local))
-                .await
-                .unwrap();
+            db.mark_verified_download(
+                library,
+                "L1",
+                "live_original",
+                &file,
+                &local,
+                Some(&local),
+                false,
+            )
+            .await
+            .unwrap();
             let timestamp: i64 = db
                 .acquire_lock("initial targeted publication")
                 .unwrap()
@@ -135,11 +145,11 @@ async fn issue845_l1_targeted_pending_recovery_keeps_current_legacy_movie_across
                     assert!(targets.is_empty());
                     assert!(sources.is_empty());
                 } else {
-                    // Queued targets leave this planner set; the row stays
-                    // pending until an actual download/recovery completes.
+                    // Preview recognizes the same verified existing file without
+                    // scheduling a duplicate transfer or settling durable state.
                     assert!(targets.is_empty());
-                    assert_eq!(tasks.len(), 1);
-                    assert_eq!(sources.len(), 1);
+                    assert!(tasks.is_empty());
+                    assert!(sources.is_empty());
                 }
                 let state:(String,String,i64,String,String)=db.acquire_lock("targeted durable outcome").unwrap().query_row(
                     "SELECT status,local_path,downloaded_at,local_checksum,download_checksum FROM assets WHERE id='L1'",[],

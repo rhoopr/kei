@@ -3,6 +3,7 @@ use super::{MEDIA, ZONE, baseline_owner, pair, zone};
 use crate::commands::{AlbumPass, PassKind};
 use crate::download;
 use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotoLibrary, PhotosSession};
+use crate::state::DownloadStateStore;
 use crate::state::SqliteStateDb;
 use crate::sync_cycle::{run_cycle, sync_token_key};
 use crate::sync_loop::test_support::{
@@ -34,6 +35,12 @@ fn parent(request: &Value) -> Option<&str> {
         .find(|f| f["fieldName"] == "parentId")
         .and_then(|f| f.pointer("/fieldValue/value"))
         .and_then(Value::as_str)
+        .or_else(|| {
+            request
+                .pointer("/query/filterBy/fieldValue/value/0")
+                .and_then(Value::as_str)
+                .and_then(|kind| kind.rsplit_once(':').map(|(_, name)| name))
+        })
         .or_else(|| {
             request
                 .pointer("/query/recordType")
@@ -105,6 +112,7 @@ impl PhotosSession for Session {
                 return Ok(json!({"records":[]}));
             }
             let requested = request["records"].as_array().unwrap();
+            let mut returned = std::collections::HashSet::new();
             let records: Vec<_> = self
                 .records
                 .iter()
@@ -114,6 +122,7 @@ impl PhotosSession for Session {
                         .iter()
                         .any(|query| query["recordName"] == record["recordName"])
                 })
+                .filter(|record| returned.insert(record["recordName"].as_str().unwrap()))
                 .cloned()
                 .collect();
             return Ok(json!({"records":records}));
@@ -405,4 +414,242 @@ async fn album_contract(interrupt_membership: bool, interrupt_inventory: bool) {
         }
     }
     server.verify().await;
+}
+
+#[tokio::test]
+async fn v027_shared_asset_in_two_selected_albums_keeps_historical_paths_on_quiet_reopen() {
+    let (trace, _guard) = crate::test_helpers::TracingCapture::install();
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/shared"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let shared = pair(
+        "shared",
+        "shared.JPG",
+        &format!("{}/shared", server.uri()),
+        70,
+    );
+    let records = Arc::new(vec![
+        shared.clone(),
+        shared,
+        pair(
+            "unselected",
+            "unselected.JPG",
+            &format!("{}/unselected", server.uri()),
+            71,
+        ),
+    ]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("media");
+    let a_path = root.join("albums/A/shared.JPG");
+    let b_path = root.join("albums/B/shared.JPG");
+    std::fs::create_dir_all(a_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(b_path.parent().unwrap()).unwrap();
+    std::fs::write(&a_path, MEDIA).unwrap();
+    std::fs::write(&b_path, MEDIA).unwrap();
+
+    let snapshots = [&a_path, &b_path].map(|path| {
+        (
+            path.to_path_buf(),
+            std::fs::read(path).unwrap(),
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+        )
+    });
+
+    let database = dir.path().join("state.db");
+    let token_key = sync_token_key(ZONE);
+    let checksum = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(MEDIA)
+            .iter()
+            .map(|byte| format!("{:02x}", *byte))
+            .collect::<String>()
+    };
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+    for iteration in 0..3 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&database, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        if iteration == 0 {
+            seed_shared_historical_pair(db.as_ref(), &records[0], &a_path, &b_path, &checksum)
+                .await
+                .unwrap();
+        }
+
+        let session = Session {
+            cycle: 0,
+            unavailable_membership: false,
+            incomplete_inventory: false,
+            incomplete_hits: Arc::new(AtomicUsize::new(0)),
+            records: Arc::clone(&records),
+            rank_queries: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/private".into(),
+            Arc::default(),
+            Box::new(session.clone()),
+            Arc::new(zone()),
+            "private".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        let capture =
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), baseline_owner(), "com");
+        library.shadow_capture = Some(capture.clone());
+        let passes = vec![
+            selected_album("A", &session, &capture),
+            selected_album("B", &session, &capture),
+        ];
+        let mut selected = make_run_cycle_library_state_with_passes(ZONE, &token_key, passes);
+        selected.library = library;
+
+        let base = make_run_cycle_download_config_builder(&root, db.clone());
+        let builder = |mode, exclude, groups, zone| {
+            let mut config = (*base(mode, exclude, groups, zone)).clone();
+            config.folder_structure_albums = "albums/{album}".into();
+            #[cfg(feature = "xmp")]
+            {
+                config.metadata.xmp_sidecar = false;
+            }
+            Arc::new(config)
+        };
+
+        let result = run_cycle(
+            &[&selected],
+            &make_run_cycle_config(),
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        if result.failed_count != 0 {
+            eprintln!("TRACE {:?}", trace.events());
+        }
+        assert_eq!(result.failed_count, 0, "iteration {iteration}: {result:?}");
+        assert_eq!(
+            result.stats.downloaded, 0,
+            "iteration {iteration}: {result:?}"
+        );
+        assert!(
+            result.can_advance_database_checkpoint(),
+            "iteration {iteration}: {result:?}"
+        );
+        assert_eq!(
+            db.get_metadata(&token_key).await.unwrap().as_deref(),
+            Some("album-after-1"),
+            "iteration {iteration}: {result:?}"
+        );
+        if iteration > 0 {
+            assert_eq!(
+                session.rank_queries.load(Ordering::SeqCst),
+                0,
+                "quiet reopen must not replay rank inventory: {result:?}"
+            );
+        }
+
+        for (path, old_bytes, old_mtime) in &snapshots {
+            assert!(
+                path.exists(),
+                "historical path vanished: {}",
+                path.display()
+            );
+            assert_eq!(
+                &std::fs::read(path).unwrap(),
+                old_bytes,
+                "historical bytes changed: {}",
+                path.display()
+            );
+            assert_eq!(
+                &std::fs::metadata(path).unwrap().modified().unwrap(),
+                old_mtime,
+                "historical mtime changed: {}",
+                path.display()
+            );
+        }
+        assert!(!root.join("albums/A/unselected.JPG").exists());
+        assert!(!root.join("albums/B/unselected.JPG").exists());
+
+        // Each selected destination must have its own settled receipt, not
+        // merely an empty work queue or an untouched unaccounted old copy.
+        {
+            let conn = db
+                .acquire_lock("historical selected destination receipts")
+                .unwrap();
+            for path in [&a_path, &b_path] {
+                let key = crate::state::db::provider_selection::SelectionPath::from_path(path)
+                    .key()
+                    .unwrap();
+                let receipts: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM download_receipts WHERE child='asset-shared' AND native_path=?1",
+                [key], |row| row.get(0)).unwrap();
+                assert!(
+                    receipts > 0,
+                    "selected historical path lacks completion: {}",
+                    path.display()
+                );
+            }
+        }
+        let observed = db.observed_selection_status().await.unwrap();
+        assert_eq!(observed.len(), 1, "{result:?}");
+        assert!(
+            !observed[0].settlement_unknown,
+            "iteration {iteration}: {result:?}"
+        );
+        assert!(
+            !observed[0].pending_media,
+            "iteration {iteration}: {result:?}"
+        );
+        assert!(
+            !observed[0].pending_metadata,
+            "iteration {iteration}: {result:?}"
+        );
+    }
+
+    server.verify().await;
+}
+
+async fn seed_shared_historical_pair(
+    db: &SqliteStateDb,
+    records: &[Value],
+    a_path: &std::path::Path,
+    b_path: &std::path::Path,
+    checksum: &str,
+) -> anyhow::Result<()> {
+    let asset = crate::icloud::photos::PhotoAsset::new(records[0].clone(), records[1].clone());
+    let record = crate::test_helpers::TestAssetRecord::new(asset.state_id())
+        .library(ZONE)
+        .filename("shared.JPG")
+        .checksum(&super::generation(70))
+        .size(MEDIA.len() as u64)
+        .created_at(asset.created())
+        .added_at(asset.added_date())
+        .build();
+    db.upsert_seen(&record).await?;
+    for path in [a_path, b_path] {
+        db.mark_verified_download(
+            ZONE,
+            asset.state_id(),
+            "original",
+            path,
+            checksum,
+            Some(checksum),
+            false,
+        )
+        .await?;
+    }
+    Ok(())
 }
