@@ -44,15 +44,16 @@ fn unknown_page() -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn legacy_unknown_delta_loses_source_before_successor_control() {
+async fn current_unknown_delta_retains_cursor_without_raw_capture() {
     let album = make_album_with_session(100, Box::new(BodySession(unknown_page())));
     let (stream, token) = album.changes_stream("saved");
     let events: Vec<_> = stream.collect().await;
+    assert_eq!(events.len(), 1);
     assert!(
-        events.is_empty(),
-        "unknown records have no legacy projection"
+        events.iter().all(Result::is_err),
+        "unknown current work must not disappear"
     );
-    assert_eq!(token.await.unwrap(), "successor");
+    assert_eq!(token.await.unwrap(), "saved");
 }
 
 pub(super) fn owner() -> AccountOwner {
@@ -76,6 +77,20 @@ pub(super) fn album(body: Vec<u8>, capture: ShadowCapture) -> crate::icloud::pho
     let mut album = make_album_with_session(100, Box::new(BodySession(body)));
     album.set_shadow_capture(capture, Arc::from("private"));
     album
+}
+
+// Build historical evidence directly. Ordinary streams no longer save raw
+// pages; compatibility storage must retain its own atomicity and scope guards.
+async fn retain_raw(capture: &ShadowCapture, body: Vec<u8>, database: &str) -> anyhow::Result<()> {
+    let value: Value = serde_json::from_slice(&body)?;
+    let zone = value.pointer("/zones/0/zoneID").unwrap();
+    let scope = capture.scope(database, zone)?;
+    let page = super::catalog_observed_page(body, &scope, "saved")?;
+    capture
+        .db
+        .capture_shadow_page(capture.owner.clone(), page, capture.capacity)
+        .await?;
+    Ok(())
 }
 
 fn counts(db: &SqliteStateDb) -> (i64, i64, i64) {
@@ -149,11 +164,15 @@ async fn shadow_source_payload_roundtrip_reopens_losslessly_and_replays_legacy_p
         Box::new(BodySession(body.clone())),
     ))
     .await;
-    assert!(baseline.1.is_empty());
+    assert_eq!(baseline.1.len(), 1);
     assert!(
-        !baseline.0.is_empty(),
-        "paired known records and tombstones are the positive control"
+        baseline.0.is_empty(),
+        "unknown current page is held before emission"
     );
+    assert_eq!(baseline.2, "saved");
+    retain_raw(&capture(&db), body.clone(), "private")
+        .await
+        .unwrap();
     let bound = album(body.clone(), capture(&db));
     assert_eq!(collect(&bound.clone()).await, baseline);
     assert_eq!(counts(&db), (1, 5, 1));
@@ -252,17 +271,15 @@ async fn shadow_transaction_failure_and_capacity_hold_then_recover_after_reopen(
     let db = open(&path).await;
     db.acquire_lock("capture fault").unwrap().execute_batch(
         "CREATE TRIGGER shadow_receipt_fault BEFORE INSERT ON provider_shadow_receipts BEGIN SELECT RAISE(ABORT,'synthetic receipt failure'); END").unwrap();
-    let bound = album(unknown_page(), capture(&db));
-    let (events, errors, token) = collect(&bound).await;
-    assert!(events.is_empty());
-    assert_eq!(errors.len(), 1);
-    assert_eq!(token, "saved");
+    let error = retain_raw(&capture(&db), unknown_page(), "private")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("synthetic receipt failure"));
     assert_eq!(
         counts(&db),
         (0, 0, 0),
         "failure after page and record writes must roll back the whole page"
     );
-    drop(bound);
     drop(db);
     let db = open(&path).await;
     assert_eq!(counts(&db), (0, 0, 0));
@@ -272,34 +289,23 @@ async fn shadow_transaction_failure_and_capacity_hold_then_recover_after_reopen(
         .unwrap();
     let mut full = capture(&db);
     full.capacity = 0;
-    let refused = album(unknown_page(), full.clone());
-    let (events, errors, token) = collect(&refused).await;
-    assert!(events.is_empty());
-    assert_eq!(errors.len(), 1);
-    assert!(errors[0].contains("inbox is full"));
-    assert_eq!(token, "saved");
+    let error = retain_raw(&full, unknown_page(), "private")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("inbox is full"));
     assert_eq!(counts(&db), (0, 0, 0));
-    drop(refused);
-    let recovered = album(unknown_page(), capture(&db));
-    assert_eq!(
-        collect(&recovered).await,
-        (Vec::new(), Vec::new(), "successor".into())
-    );
+    retain_raw(&capture(&db), unknown_page(), "private")
+        .await
+        .unwrap();
     assert_eq!(counts(&db), (1, 1, 1));
-    drop(recovered);
     // Existing exact observations do not need another byte allocation, even
     // when capacity is exhausted. A changed revision must hold, not overwrite.
-    assert!(
-        collect(&album(unknown_page(), full.clone()))
-            .await
-            .1
-            .is_empty()
-    );
+    retain_raw(&full, unknown_page(), "private").await.unwrap();
     let changed = String::from_utf8(unknown_page())
         .unwrap()
         .replace("v1", "v2")
         .into_bytes();
-    assert_eq!(collect(&album(changed, full)).await.2, "saved");
+    assert!(retain_raw(&full, changed, "private").await.is_err());
     assert_eq!(counts(&db), (1, 1, 1));
 }
 
@@ -344,23 +350,21 @@ async fn shadow_rejects_unusable_or_ambiguous_identity_before_any_page_write() {
 async fn shadow_scopes_and_revisions_remain_distinct_and_owner_is_rechecked() {
     let directory = tempfile::tempdir().unwrap();
     let db = open(&directory.path().join("owned.db")).await;
-    assert!(
-        collect(&album(unknown_page(), capture(&db)))
-            .await
-            .1
-            .is_empty()
-    );
-    let mut shared = album(unknown_page(), capture(&db));
-    shared.set_shadow_capture(capture(&db), Arc::from("shared"));
-    assert!(collect(&shared).await.1.is_empty());
+    retain_raw(&capture(&db), unknown_page(), "private")
+        .await
+        .unwrap();
+    retain_raw(&capture(&db), unknown_page(), "shared")
+        .await
+        .unwrap();
     let mut changed: Value = serde_json::from_slice(&unknown_page()).unwrap();
     changed["zones"][0]["zoneID"]["futureMetadata"] = json!({"version":"next"});
-    assert!(
-        collect(&album(serde_json::to_vec(&changed).unwrap(), capture(&db)))
-            .await
-            .1
-            .is_empty()
-    );
+    retain_raw(
+        &capture(&db),
+        serde_json::to_vec(&changed).unwrap(),
+        "private",
+    )
+    .await
+    .unwrap();
     assert_eq!(counts(&db), (3, 3, 2));
     {
         let conn = db
@@ -395,15 +399,12 @@ async fn shadow_scopes_and_revisions_remain_distinct_and_owner_is_rechecked() {
         )
         .unwrap();
     }
-    let (events, errors, token) = collect(&album(unknown_page(), capture(&db))).await;
-    assert!(events.is_empty());
-    assert_eq!(token, "saved");
-    assert_eq!(errors.len(), 1);
-    assert!(errors[0].contains("account ownership does not match"));
-    assert!(
-        !errors[0].contains("synthetic@example.invalid")
-            && !errors[0].contains("different-provider")
-    );
+    let error = retain_raw(&capture(&db), unknown_page(), "private")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("account ownership does not match"));
+    assert!(!error.contains("synthetic@example.invalid") && !error.contains("different-provider"));
     assert_eq!(
         counts(&db),
         (3, 3, 2),
@@ -496,13 +497,16 @@ async fn shadow_cancelled_receiver_before_capture_preserves_page_and_legacy_curs
             .as_deref(),
         Some("saved")
     );
-    assert!(
-        collect(&album(unknown_page(), capture(&db)))
-            .await
-            .1
-            .is_empty()
+    let mut quiet: Value = serde_json::from_slice(&unknown_page()).unwrap();
+    quiet["zones"][0]["records"] = json!([]);
+    let result = collect(&album(serde_json::to_vec(&quiet).unwrap(), capture(&db))).await;
+    assert!(result.1.is_empty());
+    assert_eq!(result.2, "successor");
+    assert_eq!(
+        counts(&db),
+        (0, 0, 0),
+        "quiet resume does not create an inbox"
     );
-    assert_eq!(counts(&db), (1, 1, 1));
     assert_eq!(
         db.get_metadata("sync_token:PrimarySync")
             .await

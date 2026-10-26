@@ -43,6 +43,37 @@ async fn retain(
         .unwrap()
 }
 
+// Explicit compatibility projection fixture. Normal sync must not discover
+// or project bare historical pages merely because they exist.
+async fn project_retained_fixture(
+    capture: &crate::icloud::photos::inbox::ShadowCapture,
+) -> anyhow::Result<()> {
+    let ids = {
+        let conn = capture
+            .db
+            .acquire_lock("selected retained fixture sources")?;
+        conn.prepare("SELECT id FROM provider_shadow_pages ORDER BY id")?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for id in ids {
+        let source = capture
+            .db
+            .catalog_source(
+                capture.owner.clone(),
+                crate::state::db::provider_inbox::CapturedPageId(id),
+                16 * 1024 * 1024,
+            )
+            .await?;
+        let plan = crate::icloud::photos::projection::plan(capture, source)?;
+        capture
+            .db
+            .project_catalog_page(capture.owner.clone(), plan, capture.catalog_capacity)
+            .await?;
+    }
+    Ok(())
+}
+
 fn counts(db: &SqliteStateDb) -> Vec<i64> {
     let conn = db.acquire_lock("catalog fixture counts").unwrap();
     [
@@ -123,10 +154,7 @@ async fn catalog_projection_replays_schema29_sources_losslessly_through_two_quie
     let mut frozen = None;
     for _ in 0..2 {
         let db = open(&path).await;
-        capture(&db)
-            .replay_catalog(&CancellationToken::new())
-            .await
-            .unwrap();
+        project_retained_fixture(&capture(&db)).await.unwrap();
         assert_eq!(counts(&db), [7, 4, 7, 1]);
         let current = snapshot(&db);
         if let Some(expected) = &frozen {
@@ -209,11 +237,13 @@ async fn catalog_projection_transaction_failure_retains_source_then_recovers_liv
     seed(&db);
     db.acquire_lock("receipt fault after real indexing").unwrap().execute_batch("CREATE TRIGGER catalog_fault BEFORE INSERT ON provider_catalog_pages BEGIN SELECT RAISE(ABORT,'synthetic catalog receipt fault'); END;").unwrap();
     let raw = body("PrimarySync", "v1");
-    let bound = album(raw.clone(), capture(&db));
-    let result = collect(&bound).await;
-    assert!(result.0.is_empty());
-    assert_eq!(result.2, "saved");
-    assert!(result.1[0].contains("synthetic catalog receipt fault"));
+    retain(&db, raw.clone(), "private").await;
+    let error = project_retained_fixture(&capture(&db)).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("synthetic catalog receipt fault")
+    );
     assert_eq!(counts(&db), [0, 0, 0, 0]);
     assert_eq!(
         db.acquire_lock("retained failed source")
@@ -224,25 +254,16 @@ async fn catalog_projection_transaction_failure_retains_source_then_recovers_liv
         1
     );
     unchanged(&db, &media).await;
-    drop(bound);
     drop(db);
     let db = open(&path).await;
-    assert!(
-        capture(&db)
-            .replay_catalog(&CancellationToken::new())
-            .await
-            .is_err()
-    );
+    assert!(project_retained_fixture(&capture(&db)).await.is_err());
     assert_eq!(counts(&db), [0, 0, 0, 0]);
     unchanged(&db, &media).await;
     db.acquire_lock("fault-only removal")
         .unwrap()
         .execute_batch("DROP TRIGGER catalog_fault")
         .unwrap();
-    capture(&db)
-        .replay_catalog(&CancellationToken::new())
-        .await
-        .unwrap();
+    project_retained_fixture(&capture(&db)).await.unwrap();
     assert_eq!(counts(&db), [7, 4, 7, 1]);
     let frozen = snapshot(&db);
     let baseline = collect(&make_album_with_session(
@@ -256,10 +277,7 @@ async fn catalog_projection_transaction_failure_retains_source_then_recovers_liv
     drop(db);
     for _ in 0..2 {
         let db = open(&path).await;
-        capture(&db)
-            .replay_catalog(&CancellationToken::new())
-            .await
-            .unwrap();
+        project_retained_fixture(&capture(&db)).await.unwrap();
         assert_eq!(snapshot(&db), frozen);
         unchanged(&db, &media).await;
     }
@@ -272,10 +290,7 @@ async fn catalog_projection_scopes_revisions_and_old_replay_never_overwrite_fact
     retain(&db, body("PrimarySync", "v1"), "private").await;
     retain(&db, body("PrimarySync", "v2"), "private").await;
     retain(&db, body("PrimarySync", "v1"), "shared").await;
-    capture(&db)
-        .replay_catalog(&CancellationToken::new())
-        .await
-        .unwrap();
+    project_retained_fixture(&capture(&db)).await.unwrap();
     assert_eq!(counts(&db), [21, 12, 21, 3]);
     let frozen = snapshot(&db);
     let old = super::catalog_observed_page(
@@ -302,17 +317,14 @@ async fn catalog_projection_capacity_replays_existing_and_recovers_pending_page(
     let mut full = capture(&db);
     full.catalog_capacity = 0;
     assert!(
-        full.replay_catalog(&CancellationToken::new())
+        project_retained_fixture(&full)
             .await
             .unwrap_err()
             .to_string()
             .contains("projection is full")
     );
     assert_eq!(counts(&db), [0, 0, 0, 0]);
-    capture(&db)
-        .replay_catalog(&CancellationToken::new())
-        .await
-        .unwrap();
+    project_retained_fixture(&capture(&db)).await.unwrap();
     let frozen = snapshot(&db);
     let source = db
         .catalog_source(owner(), id, 16 * 1024 * 1024)
@@ -322,16 +334,9 @@ async fn catalog_projection_capacity_replays_existing_and_recovers_pending_page(
     db.project_catalog_page(owner(), plan, 0).await.unwrap();
     assert_eq!(snapshot(&db), frozen);
     retain(&db, body("PrimarySync", "v2"), "private").await;
-    assert!(
-        full.replay_catalog(&CancellationToken::new())
-            .await
-            .is_err()
-    );
+    assert!(project_retained_fixture(&full).await.is_err());
     assert_eq!(snapshot(&db), frozen);
-    capture(&db)
-        .replay_catalog(&CancellationToken::new())
-        .await
-        .unwrap();
+    project_retained_fixture(&capture(&db)).await.unwrap();
     assert_eq!(counts(&db), [14, 8, 14, 2]);
 }
 
@@ -372,10 +377,7 @@ async fn catalog_projection_revalidates_owner_source_metadata_and_ordinals() {
             .execute_batch(sql)
             .unwrap();
         assert!(
-            capture(&db)
-                .replay_catalog(&CancellationToken::new())
-                .await
-                .is_err(),
+            project_retained_fixture(&capture(&db)).await.is_err(),
             "{fault}"
         );
         assert_eq!(counts(&db), [0, 0, 0, 0], "{fault}");
@@ -406,21 +408,137 @@ async fn catalog_projection_revalidates_source_after_planning_before_transaction
 
 #[tokio::test]
 async fn catalog_projection_cancelled_replay_leaves_pending_source_for_restart() {
+    use crate::commands::{AlbumPass, PassKind};
+    use crate::download;
+    use crate::state::db::provider_work::{MAX_WORK_BYTES, WorkAdmission, WorkPlan, WorkSource};
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("owned.db");
+    let media = directory.path().join("kept.jpg");
+    std::fs::write(&media, b"existing-media").unwrap();
     let db = open(&path).await;
-    retain(&db, body("PrimarySync", "v1"), "private").await;
-    let cancel = CancellationToken::new();
-    cancel.cancel();
-    capture(&db).replay_catalog(&cancel).await.unwrap();
-    assert_eq!(counts(&db), [0, 0, 0, 0]);
-    drop(db);
-    let db = open(&path).await;
-    capture(&db)
-        .replay_catalog(&CancellationToken::new())
+    seed(&db);
+    let raw = body("PrimarySync", "v1");
+    let id = retain(&db, raw.clone(), "private").await;
+    let retained_capture = capture(&db);
+    project_retained_fixture(&retained_capture).await.unwrap();
+    let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+    let scope = retained_capture.scope("private", &zone).unwrap();
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: album(raw, retained_capture.clone()),
+        exclude_ids: Arc::default(),
+    };
+    let config = download::DownloadConfig {
+        directory: directory.path().into(),
+        library: Arc::from("PrimarySync"),
+        state_db: Some(db.clone()),
+        ..download::DownloadConfig::test_default()
+    };
+    let hash = download::retained_work_config_hash_for_test(&config.with_pass(&pass), &zone);
+    let source = db
+        .catalog_source(owner(), id, 16 * 1024 * 1024)
         .await
         .unwrap();
-    assert_eq!(counts(&db), [7, 4, 7, 1]);
+    assert_eq!(
+        db.project_provider_work(
+            owner(),
+            WorkPlan {
+                source: WorkSource {
+                    page: source,
+                    ordinal: 1
+                },
+                scope: scope.clone(),
+                zone,
+                config_hash: hash.clone(),
+                confirmation: None,
+                master: None,
+                records: vec![],
+                reason: "current_lookup_unresolved"
+            },
+            MAX_WORK_BYTES
+        )
+        .await
+        .unwrap(),
+        WorkAdmission::Deferred
+    );
+    db.acquire_lock("make retained fixture retry due")
+        .unwrap()
+        .execute_batch("UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1")
+        .unwrap();
+    assert_eq!(
+        db.due_work_pages(owner(), scope.clone(), hash.clone(), 64)
+            .await
+            .unwrap(),
+        vec![id]
+    );
+    let retry_snapshot = |db: &SqliteStateDb| {
+        db.acquire_lock("retained retry evidence").unwrap().query_row(
+            "SELECT p.scope,r.config_hash,r.attempts,r.last_attempt_at,r.next_retry_at FROM provider_work_retries r JOIN provider_shadow_pages p ON p.id=r.page_id WHERE r.page_id=?1",[id.0],
+            |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?))
+        ).unwrap()
+    };
+    let retry = retry_snapshot(&db);
+    let facts = snapshot(&db);
+    let original_hash: String = {
+        let conn = db
+            .acquire_lock("inject source corruption after admission")
+            .unwrap();
+        let original = conn
+            .query_row(
+                "SELECT body_hash FROM provider_shadow_pages WHERE id=?1",
+                [id.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE provider_shadow_pages SET body_hash='injected-corruption' WHERE id=?1",
+            [id.0],
+        )
+        .unwrap();
+        original
+    };
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    retained_capture
+        .replay_due_catalog(scope.clone(), hash.clone(), 64, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(retry_snapshot(&db), retry);
+    assert_eq!(snapshot(&db), facts);
+    unchanged(&db, &media).await;
+    drop(config);
+    drop(pass);
+    drop(retained_capture);
+    drop(db);
+    let db = open(&path).await;
+    assert!(
+        capture(&db)
+            .replay_due_catalog(scope.clone(), hash.clone(), 64, &CancellationToken::new())
+            .await
+            .is_err(),
+        "uncancelled replay must reach source validation"
+    );
+    assert_eq!(retry_snapshot(&db), retry);
+    assert_eq!(snapshot(&db), facts);
+    unchanged(&db, &media).await;
+    db.acquire_lock("restore only injected corruption")
+        .unwrap()
+        .execute(
+            "UPDATE provider_shadow_pages SET body_hash=?1 WHERE id=?2",
+            rusqlite::params![original_hash, id.0],
+        )
+        .unwrap();
+    capture(&db)
+        .replay_due_catalog(scope, hash, 64, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        retry_snapshot(&db),
+        retry,
+        "projection cannot retire the unfinished task"
+    );
+    assert_eq!(snapshot(&db), facts);
+    unchanged(&db, &media).await;
 }
 
 #[tokio::test]
@@ -504,10 +622,7 @@ async fn catalog_projection_migration_conflict_preserves_schema29_source_and_unk
         .unwrap();
     for _ in 0..2 {
         let db = open(&path).await;
-        capture(&db)
-            .replay_catalog(&CancellationToken::new())
-            .await
-            .unwrap();
+        project_retained_fixture(&capture(&db)).await.unwrap();
         assert_eq!(counts(&db), [7, 4, 7, 1]);
         unchanged(&db, &media).await;
     }
@@ -530,10 +645,9 @@ async fn catalog_projection_page_budget_refuses_expanding_reference_paths_withou
         raw.len() < 16 * 1024 * 1024,
         "raw page fits; normalized pointer paths cause the refusal"
     );
-    let result = collect(&album(raw, capture(&db))).await;
-    assert!(result.0.is_empty());
-    assert_eq!(result.2, "saved");
-    assert!(result.1[0].contains("projection is full"), "{:?}", result.1);
+    retain(&db, raw, "private").await;
+    let error = project_retained_fixture(&capture(&db)).await.unwrap_err();
+    assert!(error.to_string().contains("projection is full"), "{error}");
     assert_eq!(counts(&db), [0, 0, 0, 0]);
     assert_eq!(
         db.acquire_lock("retained oversized projection source")
@@ -723,13 +837,16 @@ async fn transport_stream_url_rotations_keep_latest_events_and_unchanged_state()
     assert_eq!(result.2, "successor");
     assert!(result.0.iter().any(|url| url == first_master));
     let baseline = transport_alias_counts(&db);
-    assert_eq!(baseline.0, 1);
-    assert_eq!(baseline.1, baseline.0, "one canonical index per class");
+    assert_eq!(
+        baseline,
+        (0, 0, 0, 0, 0, 0),
+        "normal stream stores no raw response inbox"
+    );
+
     let checkpoint = db.get_metadata("sync_token:PrimarySync").await.unwrap();
 
-    // Repeated old-range captures rotate only the URL tokens. Each downstream
-    // event still carries the incoming latest URLs, while the retained class,
-    // catalogue facts, debt, charged bytes and checkpoint do not move.
+    // Repeated old-range pages deliver current URLs without saving responses
+    // or changing durable checkpoint state.
     for index in 1..4 {
         let master_url = format!("https://p{index:02}.icloud-content.com/original?token={index}");
         let compute_url = format!("https://p{index:02}.icloud-content.com/compute?token={index}");
@@ -755,11 +872,7 @@ async fn transport_stream_url_rotations_keep_latest_events_and_unchanged_state()
         );
     }
 
-    // A fixed-cursor EOF page requests and returns the same successor with
-    // `moreComing: false`. The cursor is part of the canonical key, so this is
-    // an independent class from the old-range page even though the record
-    // bytes differ only in their eligible URLs. Both URL variants rotate
-    // together, and repeated equivalent EOF captures stay in this class.
+    // Quiet fixed-cursor pages also deliver current URLs without raw retention.
     let eof_master = "https://p11.icloud-content.com/original?token=11";
     let eof_compute = "https://p11.icloud-content.com/compute?token=11";
     let result = stream_urls(
@@ -778,24 +891,8 @@ async fn transport_stream_url_rotations_keep_latest_events_and_unchanged_state()
     );
     let eof_baseline = transport_alias_counts(&db);
     assert_eq!(
-        eof_baseline.0,
-        baseline.0 + 1,
-        "fixed-cursor EOF is an independent canonical class"
-    );
-    assert_eq!(eof_baseline.1, baseline.1 + 1);
-    assert_eq!(eof_baseline.2, baseline.2);
-    assert_eq!(
-        eof_baseline.3,
-        baseline.3 * 2,
-        "one debt set per class page"
-    );
-    assert!(
-        eof_baseline.4 > baseline.4,
-        "the new class is charged in the inbox budget"
-    );
-    assert!(
-        eof_baseline.5 > baseline.5,
-        "the new class is charged in the catalogue budget"
+        eof_baseline, baseline,
+        "even distinct cursor pages do not create a response inbox"
     );
     assert_eq!(
         db.get_metadata("sync_token:PrimarySync").await.unwrap(),
@@ -874,7 +971,7 @@ async fn transport_stream_url_rotations_keep_latest_events_and_unchanged_state()
     );
     unchanged(&db, &media).await;
 
-    // A genuine new record version is admitted separately, not aliased.
+    // A genuinely changed record is still emitted without saving a raw page.
     let result = collect(&album(
         transport_stream_page(
             "https://p05.icloud-content.com/original?token=5",
@@ -889,9 +986,10 @@ async fn transport_stream_url_rotations_keep_latest_events_and_unchanged_state()
     .await;
     assert!(result.1.is_empty(), "{:?}", result.1);
     let after = transport_alias_counts(&db);
-    assert_eq!(after.0, eof_baseline.0 + 1);
-    assert_eq!(after.1, eof_baseline.1 + 1);
-    assert_eq!(after.2, eof_baseline.2);
+    assert_eq!(
+        after, eof_baseline,
+        "changed records are delivered without raw retention"
+    );
 }
 
 fn transport_counts(db: &SqliteStateDb) -> (i64, i64, i64) {
