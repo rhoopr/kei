@@ -234,6 +234,10 @@ where
                     continue;
                 }
             };
+        if db.validate_metadata_writer(&pending_rewrite).await.is_err() {
+            deferred += 1;
+            continue;
+        }
         if db.guard_primary_writer(&path).await.is_err() {
             deferred += 1;
             continue;
@@ -343,7 +347,9 @@ where
         // Only an embedded write touches media bytes, so the drain needs the
         // pre-write hash to tell its own rewrite apart from damage that
         // arrived some other way.
-        let pre_rewrite_fingerprint = if metadata_flags.any_embed() {
+        let pre_rewrite_fingerprint = if metadata_flags.any_embed()
+            || pending_rewrite.selection_receipt.is_some()
+        {
             match crate::download::file::fingerprint_regular_file(&path).await {
                 Ok(fingerprint) => Some(fingerprint),
                 Err(e) => {
@@ -399,6 +405,9 @@ where
                  marker alone. Run `kei verify --checksums` or `kei reconcile`"
             );
             skipped_drifted += 1;
+            if pending_rewrite.selection_receipt.is_some() {
+                continue;
+            }
         }
 
         let mut outcome = MetadataWriteOutcome::default();

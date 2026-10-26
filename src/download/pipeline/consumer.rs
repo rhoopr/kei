@@ -168,7 +168,7 @@ pub(super) async fn consume_stream_download_tasks(
                         &task,
                         local_checksum,
                         download_checksum,
-                        exif_ok,
+                        (exif_ok, metadata_flags.bits()),
                         mark_capture_repair_after_download,
                         retained.clone(),
                     )

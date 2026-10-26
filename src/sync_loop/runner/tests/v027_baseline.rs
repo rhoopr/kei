@@ -234,6 +234,18 @@ async fn v027_baseline_mixed_receipt_concurrent_delta_then_two_quiet_reopened_cy
     }
 }
 
+tokio::task_local! {static CURRENT_SIDECAR_FAILURE: bool;}
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn v027_current_requested_sidecar_retries_quietly_without_historical_backfill() {
+    CURRENT_SIDECAR_FAILURE
+        .scope(
+            true,
+            baseline_contract("private", true, false, false, false, false, false),
+        )
+        .await;
+}
+
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn v027_baseline_preserves_queued_existing_metadata_while_new_files_get_sidecars() {
@@ -514,9 +526,34 @@ async fn baseline_contract(
     let requests = Arc::new(Mutex::new(Vec::new()));
     let config = make_run_cycle_config();
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
-    for cycle in 0..if retained_operation { 1 } else { 3 } {
+    let trace = CURRENT_SIDECAR_FAILURE
+        .try_with(|value| *value)
+        .unwrap_or(false)
+        .then(crate::test_helpers::TracingCapture::install);
+    let current_sidecar_failure = CURRENT_SIDECAR_FAILURE
+        .try_with(|value| *value)
+        .unwrap_or(false);
+    let mut successful_sidecars = std::collections::BTreeMap::new();
+    let mut metadata_retry_state = None;
+    let mut captured_metadata = None;
+    for cycle in 0..if retained_operation {
+        1
+    } else if current_sidecar_failure {
+        4
+    } else {
+        3
+    } {
+        if current_sidecar_failure {
+            let blocked = root.join("missing.JPG.xmp");
+            if cycle == 0 {
+                std::fs::create_dir(&blocked).unwrap();
+            }
+            if cycle == 2 {
+                std::fs::remove_dir(&blocked).unwrap();
+            }
+        }
         current_cycle.store(cycle, Ordering::SeqCst);
-        if initial_failure && cycle == 1 {
+        if (initial_failure && cycle == 1) || (current_sidecar_failure && cycle == 2) {
             // Simulate the retry deadline becoming due without sleeping or
             // altering admission, receipts, source evidence or destinations.
             SqliteStateDb::open_owned(&db_path, &baseline_owner())
@@ -531,6 +568,23 @@ async fn baseline_contract(
                 .await
                 .unwrap(),
         );
+        if current_sidecar_failure && cycle == 2 {
+            use crate::state::db::MetadataRewriteStore;
+            let generation:String=db.acquire_lock("capture due metadata round").unwrap().query_row("SELECT generation FROM provider_active_destinations WHERE child='asset-current-missing' AND verified_metadata=0",[],|r|r.get(0)).unwrap();
+            let rows = db
+                .pending_selection_metadata(baseline_owner(), generation.clone(), 10)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            db.validate_metadata_writer(&rows[0]).await.unwrap();
+            let mut stale = rows[0].clone();
+            stale.asset.created_at += chrono::Duration::seconds(1);
+            assert!(
+                db.validate_metadata_writer(&stale).await.is_err(),
+                "stale captured writer cannot write even a sidecar"
+            );
+            captured_metadata = Some((generation, rows));
+        }
         let cycle_records = if initial_failure && cycle > 0 {
             let mut current = pair(
                 "current-existing",
@@ -756,17 +810,78 @@ async fn baseline_contract(
                 )),
                 "historical rewrite marker must remain pending"
             );
-            assert_eq!(
-                result.stats.exif_failures, 0,
-                "normal sync must not attempt and fail historical metadata work: {result:?}"
-            );
+            if current_sidecar_failure && cycle == 0 {
+                assert!(
+                    result.stats.exif_failures > 0,
+                    "current requested write failure stays visible"
+                );
+            } else {
+                assert_eq!(
+                    result.stats.exif_failures,
+                    0,
+                    "historical metadata work must remain untouched: {result:?}, trace={:?}",
+                    trace.as_ref().map(|value| value.0.events())
+                );
+            }
             for name in ["missing.JPG.xmp", "concurrent.JPG.xmp"] {
+                if current_sidecar_failure && cycle < 2 && name == "missing.JPG.xmp" {
+                    continue;
+                }
                 let output = std::fs::read_to_string(root.join(name)).unwrap();
+                if current_sidecar_failure {
+                    let observed = (
+                        output.clone(),
+                        std::fs::metadata(root.join(name))
+                            .unwrap()
+                            .modified()
+                            .unwrap(),
+                    );
+                    if let Some(prior) = successful_sidecars.get(name) {
+                        assert_eq!(prior, &observed, "successful sidecar must not be rewritten");
+                    } else {
+                        successful_sidecars.insert(name, observed);
+                    }
+                }
                 assert!(
                     output.contains("xmpmeta") && output.contains("rdf:RDF"),
                     "new download must publish an XMP packet: {name}"
                 );
             }
+        }
+        if current_sidecar_failure {
+            let conn = db
+                .acquire_lock("current metadata debt and retirement")
+                .unwrap();
+            let debt:i64=conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-current-missing' AND verified_media=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap();
+            if cycle < 2 {
+                assert_eq!(debt, 1, "failed metadata remains durable during backoff");
+                let retry:(i64,i64)=conn.query_row("SELECT attempts,next_retry_at FROM provider_active_decisions WHERE child='asset-current-missing' AND attempts>0",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                assert!(retry.1 > chrono::Utc::now().timestamp());
+                if let Some(prior) = metadata_retry_state {
+                    assert_eq!(retry, prior, "quiet backoff must not attempt again");
+                }
+                metadata_retry_state = Some(retry);
+            } else {
+                assert_eq!(debt, 0);
+                let retained:i64=conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE verified_metadata=1 AND (frozen_metadata IS NOT NULL OR prepared_hash IS NOT NULL)",[],|r|r.get(0)).unwrap();
+                assert_eq!(retained, 0, "finished snapshots must retire safely");
+            }
+        }
+        if current_sidecar_failure && cycle == 2 {
+            let (generation, rows) = captured_metadata.take().unwrap();
+            let before:(i64,i64)=db.acquire_lock("completed decision deadline").unwrap().query_row("SELECT attempts,next_retry_at FROM provider_active_decisions WHERE generation=?1 AND child='asset-current-missing'",[&generation],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert!(
+                db.defer_selection_metadata_round(baseline_owner(), generation.clone(), rows)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "completed captured owner must be skipped"
+            );
+            let after:(i64,i64)=db.acquire_lock("unchanged completed decision deadline").unwrap().query_row("SELECT attempts,next_retry_at FROM provider_active_decisions WHERE generation=?1 AND child='asset-current-missing'",[&generation],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(
+                before, after,
+                "completed work must not acquire a new attempt or deadline"
+            );
         }
         if primary_template_change {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -870,7 +985,7 @@ async fn baseline_contract(
             session.changes.load(Ordering::SeqCst),
             if cycle == 0 { 2 } else { 1 }
         );
-        if initial_failure && cycle == 0 {
+        if (initial_failure || current_sidecar_failure) && cycle == 0 {
             assert!(
                 result.failed_count > 0,
                 "failed transfer must remain visible: {result:?}"

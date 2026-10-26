@@ -26,6 +26,7 @@ pub(super) struct PendingStateWrite {
     pub(super) local_checksum: String,
     pub(super) download_checksum: Option<String>,
     pub(super) mark_capture_repair: bool,
+    pub(super) completed_metadata_flags: u8,
     pub(super) retained: Option<Arc<super::file::RetainedPendingFile>>,
     pub(super) requires_retained: bool,
 }
@@ -79,7 +80,7 @@ where
         task,
         local_checksum,
         download_checksum,
-        exif_ok,
+        (exif_ok, 0),
         mark_capture_repair,
         None,
     )
@@ -92,13 +93,14 @@ pub(super) async fn finalize_downloaded_with_proof<D>(
     task: &DownloadTask,
     local_checksum: String,
     download_checksum: Option<String>,
-    exif_ok: bool,
+    metadata_result: (bool, u8),
     mark_capture_repair: bool,
     retained: Option<Arc<super::file::RetainedPendingFile>>,
 ) -> DownloadedFinalization
 where
     D: DownloadFinalizationStore + ?Sized,
 {
+    let (exif_ok, completed_metadata_flags) = metadata_result;
     #[cfg(all(test, target_os = "linux"))]
     crate::test_helpers::process_death_point("published");
     let write = PendingStateWrite {
@@ -109,6 +111,7 @@ where
         local_checksum,
         download_checksum,
         mark_capture_repair,
+        completed_metadata_flags: if exif_ok { completed_metadata_flags } else { 0 },
         retained,
         requires_retained: task.pending_cross_parent_root.is_some(),
     };
@@ -119,14 +122,14 @@ where
         };
     }
     match db
-        .mark_verified_download(
+        .mark_verified_download_with_metadata(
             library,
             &task.asset_id,
             task.version_size.as_str(),
             &task.download_path,
             &write.local_checksum,
             write.download_checksum.as_deref(),
-            mark_capture_repair,
+            (mark_capture_repair, write.completed_metadata_flags),
         )
         .await
     {
@@ -255,14 +258,14 @@ where
             return false;
         }
         match db
-            .mark_verified_download(
+            .mark_verified_download_with_metadata(
                 &write.library,
                 &write.asset_id,
                 write.version_size.as_str(),
                 &write.download_path,
                 &write.local_checksum,
                 write.download_checksum.as_deref(),
-                write.mark_capture_repair,
+                (write.mark_capture_repair, write.completed_metadata_flags),
             )
             .await
         {
@@ -472,7 +475,7 @@ mod tests {
             &pending_task,
             checksum.clone(),
             Some(checksum),
-            true,
+            (true, 0),
             false,
             Some(proof),
         )
@@ -583,7 +586,7 @@ mod tests {
                 &pending_task,
                 checksum.clone(),
                 Some(checksum),
-                true,
+                (true, 0),
                 false,
                 if missing { None } else { Some(proof) },
             )

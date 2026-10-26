@@ -5142,6 +5142,7 @@ async fn private_current_destination_and_retained_tail_progress_past_501_failed_
 async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_healthy_current_writers()
  {
     use sha2::{Digest, Sha256};
+    let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     let server = MockServer::start().await;
@@ -5164,7 +5165,12 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
     f.config.metadata.embed_xmp = true;
     f.config.metadata.xmp_sidecar = true;
     f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/prepared",server.uri()),"size":media.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))});
-    f.db.acquire_lock("interrupt after authorized actual prepared output").unwrap().execute_batch("CREATE TRIGGER option_drift_finalization_fault BEFORE UPDATE OF verified_metadata ON provider_active_destinations WHEN NEW.verified_metadata=1 BEGIN SELECT RAISE(ABORT,'synthetic option drift metadata finalization'); END;").unwrap();
+    // Create genuine current metadata debt before exercising prepared-write
+    // finalization. Initial successful publication now settles metadata atomically.
+    let path = f.config.directory.join("copies/changed.JPG");
+    let sidecar = path.with_file_name("changed.JPG.xmp");
+    std::fs::create_dir_all(&sidecar).unwrap();
+    f.db.acquire_lock("interrupt partial media receipt advancement").unwrap().execute_batch("CREATE TRIGGER partial_receipt_fault BEFORE UPDATE OF local_checksum ON download_receipts WHEN NEW.local_checksum<>OLD.local_checksum BEGIN SELECT RAISE(ABORT,'synthetic partial media receipt advancement'); END;").unwrap();
     let first = crate::download::download_photos_with_sync(
         &reqwest::Client::new(),
         &[destination_pass(&f, "A"), destination_pass(&f, "B")],
@@ -5175,17 +5181,102 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
     .await
     .unwrap();
     assert_eq!(first.stats.downloaded, 1, "{first:?}");
-    assert!(first.sync_token.is_none());
+    assert!(
+        first.sync_token.is_some(),
+        "durable current work permits accounted progress"
+    );
+    assert!(first.stats.exif_failures > 0);
+    assert!(
+        trace.events().iter().any(|event| event
+            .fields
+            .values()
+            .any(|value| value.contains("synthetic partial media receipt advancement"))),
+        "receipt update fault must actually execute"
+    );
+    let actual = data_encoding::HEXLOWER.encode(&Sha256::digest(std::fs::read(&path).unwrap()));
+    let (input,prepared,receipt):(String,String,String)=f.db.acquire_lock("partial receipt rollback oracle").unwrap().query_row("SELECT w.local_checksum,w.prepared_checksum,r.local_checksum FROM provider_active_destinations w JOIN download_receipts r ON r.child=w.child AND r.native_path=w.path AND r.version_size=w.version_size WHERE w.child='asset-m' AND w.prepared_hash IS NOT NULL LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(
+        input, receipt,
+        "failed receipt advancement rolls back destination checksum"
+    );
+    assert_eq!(
+        prepared, actual,
+        "published output remains owned by its prepared proof"
+    );
+    assert_ne!(
+        input, actual,
+        "fixture must exercise changed prepared media"
+    );
+    f.db.acquire_lock("remove partial receipt fault")
+        .unwrap()
+        .execute_batch("DROP TRIGGER partial_receipt_fault")
+        .unwrap();
+    f.db.make_selection_retry_due(owner(), "asset-m".into())
+        .await
+        .unwrap();
+    f = reopen_destination_fixture(f).await;
+    let partial = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &[destination_pass(&f, "A"), destination_pass(&f, "B")],
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(partial.stats.downloaded, 0);
+    assert!(
+        partial.stats.exif_failures > 0,
+        "sidecar remains obstructed"
+    );
+    let (local,receipt,incomplete,frozen):(String,String,bool,bool)=f.db.acquire_lock("partial metadata media receipt conservation").unwrap().query_row("SELECT w.local_checksum,r.local_checksum,w.verified_metadata=0,w.frozen_metadata IS NOT NULL FROM provider_active_destinations w JOIN download_receipts r ON r.child=w.child AND r.native_path=w.path AND r.version_size=w.version_size WHERE w.child='asset-m' AND w.verified_media=1 AND w.verified_metadata=0 LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    assert_eq!(local, actual);
+    assert_eq!(receipt, actual);
+    assert!(
+        incomplete && frozen,
+        "advancing verified media must retain requested metadata debt"
+    );
+    std::fs::remove_dir(&sidecar).unwrap();
+    f.db.make_selection_retry_due(owner(), "asset-m".into())
+        .await
+        .unwrap();
+    f.db.acquire_lock("interrupt actual queued metadata finalization").unwrap().execute_batch("CREATE TRIGGER option_drift_finalization_fault BEFORE UPDATE OF verified_metadata ON provider_active_destinations WHEN OLD.verified_media=1 AND NEW.verified_metadata=1 BEGIN SELECT RAISE(ABORT,'synthetic option drift metadata finalization'); END;").unwrap();
+    let interrupted = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &[destination_pass(&f, "A"), destination_pass(&f, "B")],
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(interrupted.stats.downloaded, 0);
+    assert!(
+        interrupted.stats.exif_failures > 0,
+        "fault must hit the queued finalization boundary: {interrupted:?}"
+    );
+    assert!(
+        trace.events().iter().any(|event| event
+            .fields
+            .values()
+            .any(|value| value.contains("synthetic option drift metadata finalization"))),
+        "prepared finalization fault must actually execute"
+    );
+    assert!(
+        interrupted.sync_token.is_some(),
+        "failed requested metadata is durable, not lost provider progress"
+    );
     let old =
         f.db.acquire_lock("prepared original writer proof")
             .unwrap()
-            .query_row::<String, _, _>("SELECT id FROM provider_active_generations", [], |r| {
+            .query_row::<String, _, _>("SELECT generation FROM provider_active_destinations WHERE child='asset-m' AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND prepared_hash IS NOT NULL LIMIT 1", [], |r| {
                 r.get(0)
             })
             .unwrap();
     assert!(f.db.acquire_lock("actual prepared output precedes receipt failure").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE prepared_checksum IS NOT NULL AND verified_metadata=0",[],|r|r.get(0)).unwrap()>0);
-    let path = f.config.directory.join("copies/changed.JPG");
-    let sidecar = path.with_file_name("changed.JPG.xmp");
+
+    let original_pending:i64=f.db.acquire_lock("unfinished current writer aliases").unwrap().query_row("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND verified_metadata=0",[&old],|r|r.get(0)).unwrap();
+    assert!(original_pending > 0);
     let original = (
         std::fs::read(&path).unwrap(),
         std::fs::metadata(&path).unwrap().modified().unwrap(),
@@ -5207,6 +5298,8 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
     f.session.records.lock().unwrap().extend(new);
     f.capture(vec![json!({"recordName":"future-option-drift","recordType":"FutureOpaque","payload":[0,255,9]})],"option-drift-source").await;
     f = reopen_destination_fixture(f).await;
+    // A configuration expansion is a real current inventory, not an old inbox reseed.
+    f.config.sync_mode = crate::download::SyncMode::Full;
     let current = crate::download::download_photos_with_sync(
         &reqwest::Client::new(),
         &[destination_pass(&f, "A"), destination_pass(&f, "B")],
@@ -5218,10 +5311,10 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
     .unwrap();
     assert_eq!(current.stats.downloaded, 1, "{current:?}");
     assert!(
-        current.sync_token.is_none(),
-        "disabled historical writer remains unfinished debt"
+        current.sync_token.is_some(),
+        "disabled requested metadata remains owned without holding current provider progress"
     );
-    assert_eq!(f.db.acquire_lock("disabled frozen embed cannot be acknowledged by sidecar only").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND verified_metadata=0",[&old],|r|r.get(0)).unwrap(),2);
+    assert_eq!(f.db.acquire_lock("disabled frozen embed cannot be acknowledged by sidecar only").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND verified_metadata=0",[&old],|r|r.get(0)).unwrap(),original_pending);
     assert_eq!(
         std::fs::read(&path).unwrap(),
         original.0,
@@ -5251,6 +5344,12 @@ async fn private_prepared_metadata_option_drift_retains_old_flags_and_allows_hea
     );
     assert_eq!(f.db.acquire_lock("independent current sidecar work finishes").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE child='asset-c' AND verified_metadata=1",[],|r|r.get(0)).unwrap(),2);
     f.config.metadata.embed_xmp = true;
+    f.config.sync_mode = crate::download::SyncMode::Incremental {
+        zone_sync_token: "quiet-zone-cursor".into(),
+    };
+    f.db.make_selection_retry_due(owner(), "asset-m".into())
+        .await
+        .unwrap();
     f = reopen_destination_fixture(f).await;
     let restored = crate::download::download_photos_with_sync(
         &reqwest::Client::new(),
@@ -5376,7 +5475,7 @@ async fn current_writers_reseed_fixture(writers: usize, cycles: usize) {
             let conn =
                 f.db.acquire_lock("physical writer versus pass obligation oracle")
                     .unwrap();
-            assert_eq!(conn.query_row::<(i64,i64),_,_>("SELECT count(DISTINCT path),count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap(),(i64::try_from(writers).unwrap(),i64::try_from(2*writers*(cycle.min(2)+1)).unwrap()));
+            assert_eq!(conn.query_row::<(i64,i64),_,_>("SELECT count(DISTINCT path),count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap(),(i64::try_from(writers).unwrap(),i64::try_from(2*writers).unwrap()));
             assert_eq!(
                 conn.query_row::<i64, _, _>(
                     "SELECT count(*) FROM provider_active_destinations WHERE verified_metadata=0",

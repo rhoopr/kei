@@ -468,6 +468,15 @@ impl PhotosSession for AddMemberSession {
     }
 }
 
+tokio::task_local! { static CURRENT_SOURCE_METADATA: bool; }
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn cross_zone_current_metadata_and_missing_copy_retry_independently() {
+    CURRENT_SOURCE_METADATA
+        .scope(true, run_cross_zone_case(false, false, None))
+        .await;
+}
+
 async fn run_cross_zone_case(
     incremental_addition: bool,
     folder_change: bool,
@@ -475,6 +484,10 @@ async fn run_cross_zone_case(
 ) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let server = crate::start_wiremock_or_skip!();
+    let source_metadata = CURRENT_SOURCE_METADATA
+        .try_with(|value| *value)
+        .unwrap_or(false);
+    let mut completed_sidecars = std::collections::BTreeMap::new();
     let failure_cycle = usize::from(incremental_addition);
     let shared_gets = Arc::new(AtomicUsize::new(0));
     let count = shared_gets.clone();
@@ -525,6 +538,15 @@ async fn run_cross_zone_case(
     let mut first_stamp = None;
     let mut baseline_gets = 0;
     for cycle in 0..(failure_cycle + 3) {
+        if source_metadata {
+            let blocked = root.join("Second/shared.JPG.xmp");
+            if cycle == 0 {
+                std::fs::create_dir_all(&blocked).unwrap();
+            }
+            if cycle == 1 {
+                std::fs::remove_dir(&blocked).unwrap();
+            }
+        }
         current_cycle.store(cycle, Ordering::SeqCst);
         let db = Arc::new(
             SqliteStateDb::open_owned(&database, &baseline_owner())
@@ -616,7 +638,7 @@ async fn run_cross_zone_case(
             .into();
             #[cfg(feature = "xmp")]
             {
-                config.metadata.xmp_sidecar = false;
+                config.metadata.xmp_sidecar = source_metadata;
             }
             Arc::new(config)
         };
@@ -674,6 +696,29 @@ async fn run_cross_zone_case(
                 pending, 1,
                 "baseline must leave exactly the failed destination pending"
             );
+        }
+        if source_metadata {
+            let unresolved:i64=conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE library=?1 AND child='asset-shared' AND verified_media=1 AND verified_metadata=0",[SOURCE],|r|r.get(0)).unwrap();
+            if cycle == 0 {
+                assert_eq!(unresolved, 1);
+                assert!(result.failed_count > 0);
+            } else {
+                assert_eq!(
+                    unresolved, 0,
+                    "source-root metadata must finish on quiet reopen"
+                );
+                for album in ["First", "Second"] {
+                    let path = root.join(album).join("shared.JPG.xmp");
+                    let bytes = std::fs::read(&path).unwrap();
+                    let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+                    let observed = (bytes, stamp);
+                    if let Some(prior) = completed_sidecars.get(album) {
+                        assert_eq!(prior, &observed);
+                    } else {
+                        completed_sidecars.insert(album, observed);
+                    }
+                }
+            }
         }
         if cycle >= failure_cycle {
             db.make_selection_retry_due(baseline_owner(), "asset-shared".into())

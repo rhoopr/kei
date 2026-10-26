@@ -575,7 +575,7 @@ async fn unscoped_publication_proof_survives_finalization_and_other_transfer_int
             &published,
             local_checksum,
             source_checksum,
-            exif_ok,
+            (exif_ok, 0),
             false,
             retained,
         )

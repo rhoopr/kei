@@ -295,6 +295,7 @@ pub(super) struct DownloadChecksums<'a> {
     pub(super) local: &'a str,
     pub(super) downloaded: Option<&'a str>,
     pub(super) source: Option<&'a str>,
+    pub(super) completed_metadata_flags: u8,
 }
 
 /// Copy the catalogue path's exact publication evidence in the same transaction.

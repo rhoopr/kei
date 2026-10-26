@@ -162,7 +162,7 @@ pub(super) fn compact_batch(
         JOIN provider_active_generations g ON g.id=d.generation
         WHERE d.compacted_hash IS NULL AND (?1 IS NULL OR d.generation=?1)
           AND json_extract(CAST(g.specification AS TEXT),'$.format')=?2
-          AND ((json_extract(CAST(g.specification AS TEXT),'$.format')=2 AND g.metadata_enabled=0)
+          AND ((json_extract(CAST(g.specification AS TEXT),'$.format')=2)
             OR (json_extract(CAST(g.specification AS TEXT),'$.format')=1 AND g.sealed=1))
           AND (d.admission='excluded' OR (d.admission='admitted'
             AND NOT EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child
@@ -315,7 +315,7 @@ pub(super) fn retire_completed_roots(
     let ids:Vec<String>=conn.prepare(&format!("SELECT g.id FROM provider_active_generations g
         WHERE g.id<>?1 AND g.scope=(SELECT scope FROM provider_active_generations WHERE id=?1)
           AND json_extract(CAST(g.specification AS TEXT),'$.format')=?2
-          AND ((json_extract(CAST(g.specification AS TEXT),'$.format')=2 AND g.metadata_enabled=0)
+          AND ((json_extract(CAST(g.specification AS TEXT),'$.format')=2)
             OR (json_extract(CAST(g.specification AS TEXT),'$.format')=1 AND g.sealed=1))
           AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.compacted_hash IS NOT NULL)
                OR NOT EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id))

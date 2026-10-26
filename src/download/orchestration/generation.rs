@@ -394,6 +394,12 @@ async fn context_for_source(
                 json!(digest(&serde_json::to_vec(&retry_policy)?)),
             );
     }
+    if format == 2 {
+        profile
+            .as_object_mut()
+            .context("Invalid selection profile")?
+            .insert("current_download_metadata".into(), json!(1));
+    }
     let mut fingerprint = policy(hash_download_config(config));
     fingerprint
         .as_object_mut()
@@ -535,13 +541,9 @@ impl SelectionContext {
                     .await?
             },
             profile: self.profile.clone(),
-            metadata_enabled: self.format == 1
-                && crate::download::pipeline::MetadataFlags::from(config).has_any_write(),
-            metadata_flags: if self.format == 1 {
-                crate::download::pipeline::MetadataFlags::from(config).bits()
-            } else {
-                0
-            },
+            metadata_enabled: crate::download::pipeline::MetadataFlags::from(config)
+                .has_any_write(),
+            metadata_flags: crate::download::pipeline::MetadataFlags::from(config).bits(),
         };
         let root = if self.format == 1
             && let Some(current) = self.current().await?
@@ -1555,7 +1557,7 @@ pub(super) async fn inventory(
         selection_run: Some(run.clone()),
         ..config.as_ref().clone()
     });
-    let retained = Box::pin(recover_retained(
+    let mut retained = Box::pin(recover_retained(
         client,
         passes,
         config,
@@ -1564,6 +1566,33 @@ pub(super) async fn inventory(
         &run.root,
     ))
     .await?;
+    for source in &context.source_contexts {
+        if cancel.is_cancelled() || retained.provider_auth_errors > 0 {
+            break;
+        }
+        let zone = source
+            .zone
+            .get("zoneName")
+            .and_then(Value::as_str)
+            .context("Missing source zone")?;
+        let source_run = run.source_runs.get(zone).context("Missing source root")?;
+        let mut single = source.clone();
+        single.source_contexts.clear();
+        let effective = Arc::new(DownloadConfig {
+            selection_context: Some(Arc::new(single)),
+            ..config.as_ref().clone()
+        });
+        let result = Box::pin(recover_retained(
+            client,
+            passes,
+            &effective,
+            controls,
+            cancel.clone(),
+            &source_run.root,
+        ))
+        .await?;
+        super::models::merge_streaming_result(&mut retained, result);
+    }
     if retained.provider_auth_errors > 0 {
         return crate::download::pipeline::build_download_result(
             client,
@@ -1660,6 +1689,16 @@ pub(super) async fn inventory(
             .db
             .freeze_interrupted_selection(source.capture.owner.clone(), source.scope.clone())
             .await?;
+        let failures = metadata_tail(config, &cancel, source, &source_run.root.id, None).await?;
+        result.stats.exif_failures += failures;
+        if failures > 0 {
+            result.outcome = merge_download_outcomes(
+                &result.outcome,
+                &DownloadOutcome::PartialFailure {
+                    failed_count: failures,
+                },
+            );
+        }
         source
             .capture
             .db
@@ -1671,7 +1710,7 @@ pub(super) async fn inventory(
         .db
         .freeze_interrupted_selection(context.capture.owner.clone(), context.scope.clone())
         .await?;
-    let metadata_failures = metadata_tail(config, &cancel, context, &run.root.id).await?;
+    let metadata_failures = metadata_tail(config, &cancel, context, &run.root.id, None).await?;
     result.stats.exif_failures += metadata_failures;
     if metadata_failures > 0 {
         result.outcome = merge_download_outcomes(
@@ -1734,8 +1773,9 @@ async fn metadata_tail(
     cancel: &CancellationToken,
     context: &SelectionContext,
     generation: &str,
+    captured: Option<Vec<crate::state::db::PendingMetadataRewrite>>,
 ) -> Result<usize> {
-    if !config.refresh_metadata {
+    if !config.refresh_metadata && context.format != 2 {
         return Ok(0);
     }
     let Some(db) = &config.state_db else {
@@ -1754,15 +1794,32 @@ async fn metadata_tail(
     // destinations. Older failed work cannot occupy this lane, and repeated
     // inventory never resets the independent retained/legacy continuation.
     let (current_reserve, budget) = metadata_writer_limits();
-    let current = context
-        .capture
-        .db
-        .pending_selection_metadata(
-            context.capture.owner.clone(),
-            generation.to_owned(),
-            current_reserve,
-        )
-        .await?;
+    let current = if let Some(captured) = captured {
+        captured
+    } else {
+        context
+            .capture
+            .db
+            .pending_selection_metadata(
+                context.capture.owner.clone(),
+                generation.to_owned(),
+                current_reserve,
+            )
+            .await?
+    };
+    let current = if context.format == 2 && !current.is_empty() && !cancel.is_cancelled() {
+        context
+            .capture
+            .db
+            .defer_selection_metadata_round(
+                context.capture.owner.clone(),
+                generation.to_owned(),
+                current,
+            )
+            .await?
+    } else {
+        current
+    };
     let priority = crate::download::metadata_rewrite::run_pending_rows(
         db.as_ref(),
         flags,
@@ -1772,6 +1829,9 @@ async fn metadata_tail(
         current,
     )
     .await;
+    if context.format == 2 && !config.refresh_metadata {
+        return Ok(priority.failed);
+    }
     let remaining = budget.saturating_sub(priority.fetched);
     let original = offset;
     let mut result = crate::download::metadata_rewrite::run_pending_budget(
@@ -1851,6 +1911,15 @@ async fn recover_retained(
             && root.spec.metadata_flags == current.spec.metadata_flags,
         "Retained selection configuration disagrees"
     );
+    let metadata = context
+        .capture
+        .db
+        .pending_selection_metadata(
+            context.capture.owner.clone(),
+            root.id.clone(),
+            metadata_writer_limits().0,
+        )
+        .await?;
     let decisions = context
         .capture
         .db
@@ -1951,6 +2020,8 @@ async fn recover_retained(
             run.remember_retry_sources(&result.failed, passes, config)
                 .await?;
             if run.root.id != root.id {
+                combined.exif_failures +=
+                    metadata_tail(config, &cancel, context, &run.root.id, None).await?;
                 context
                     .capture
                     .db
@@ -1960,6 +2031,8 @@ async fn recover_retained(
             super::models::merge_streaming_result(&mut combined, result);
         }
     }
+    combined.exif_failures +=
+        metadata_tail(config, &cancel, context, &root.id, Some(metadata)).await?;
     context
         .capture
         .db
@@ -1981,6 +2054,15 @@ async fn replay(
         .as_ref()
         .context("Missing replay context")?;
     let run = context.replay_run(root.clone(), passes, root.spec.format == 2, false);
+    let metadata = context
+        .capture
+        .db
+        .pending_selection_metadata(
+            context.capture.owner.clone(),
+            root.id.clone(),
+            metadata_writer_limits().0,
+        )
+        .await?;
     let started = Instant::now();
     let mut combined = Box::pin(recover_retained(
         client,
@@ -2078,7 +2160,8 @@ async fn replay(
             }
         }
     }
-    combined.exif_failures += metadata_tail(config, &cancel, context, &run.root.id).await?;
+    combined.exif_failures +=
+        metadata_tail(config, &cancel, context, &run.root.id, Some(metadata)).await?;
     let mut result = crate::download::pipeline::build_download_result(
         client, passes, config, controls, combined, started, cancel,
     )
@@ -2213,6 +2296,7 @@ async fn deliver_delta_single(
             .await?;
         super::models::merge_streaming_result(&mut combined, result);
     }
+    combined.exif_failures += metadata_tail(config, &cancel, context, &run.root.id, None).await?;
     let mut result = crate::download::pipeline::build_download_result(
         client,
         passes,
@@ -2237,6 +2321,11 @@ async fn deliver_delta_single(
             accounted,
             (!accounted).then(|| DEFERRED_REASON.to_owned()),
         )
+        .await?;
+    context
+        .capture
+        .db
+        .complete_selection_metadata(context.capture.owner.clone(), run.root.id.clone())
         .await?;
     if !accounted {
         result.block_incremental_token(DEFERRED_REASON);

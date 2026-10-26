@@ -1547,7 +1547,7 @@ impl SqliteStateDb {
             let profile = compatible_profile.as_ref().map(serde_json::to_string)
                 .transpose().map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
             account::validate_authenticated(conn,&owner)?;
-            let id:Option<String>=conn.query_row("SELECT g.id FROM provider_active_generations g WHERE g.scope=?1 AND (g.config_hash=?2 OR (?5 IS NOT NULL AND json_extract(CAST(g.specification AS TEXT),'$.format')=2 AND (json_extract(CAST(g.specification AS TEXT),'$.profile')=json(?5) OR (length(json_extract(?5,'$.admitted_retry_policy'))=64 AND json_extract(?5,'$.admitted_retry_policy') NOT GLOB '*[^0-9a-f]*' AND json_extract(CAST(g.specification AS TEXT),'$.profile.admitted_retry_policy')=json_extract(?5,'$.admitted_retry_policy'))))) AND g.id<>?3 AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.admission='deferred' AND d.next_retry_at<=?4) OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id AND w.admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=?4) AND w.verified_media=0)) ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT 1",params![scope,config_hash,current,Utc::now().timestamp(),profile],|r|r.get(0)).optional()?;
+            let id:Option<String>=conn.query_row("SELECT g.id FROM provider_active_generations g WHERE g.scope=?1 AND (g.config_hash=?2 OR (?5 IS NOT NULL AND json_extract(CAST(g.specification AS TEXT),'$.format')=2 AND (json_extract(CAST(g.specification AS TEXT),'$.profile')=json(?5) OR (length(json_extract(?5,'$.admitted_retry_policy'))=64 AND json_extract(?5,'$.admitted_retry_policy') NOT GLOB '*[^0-9a-f]*' AND json_extract(CAST(g.specification AS TEXT),'$.profile.admitted_retry_policy')=json_extract(?5,'$.admitted_retry_policy'))))) AND g.id<>?3 AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.admission='deferred' AND d.next_retry_at<=?4) OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id AND w.admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=?4) AND (w.verified_media=0 OR (g.metadata_enabled=1 AND w.verified_metadata=0)))) ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT 1",params![scope,config_hash,current,Utc::now().timestamp(),profile],|r|r.get(0)).optional()?;
             let root = id.map(|id|load_generation(conn,&id)).transpose()?;
             if let Some(root) = &root
                 && root.spec.config_hash != config_hash
@@ -1610,6 +1610,36 @@ impl SqliteStateDb {
         .await
     }
 
+    /// Charge one shared retry round, without charging media twice or reviving
+    /// an owner completed by another compatible destination during the round.
+    pub(crate) async fn defer_selection_metadata_round(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        pending: Vec<super::PendingMetadataRewrite>,
+    ) -> Result<Vec<super::PendingMetadataRewrite>, StateError> {
+        self.with_conn_mut("scheduling current metadata retry round", move |conn| {
+            let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            account::validate_authenticated(&tx,&owner)?;
+            let root=load_generation(&tx,&generation)?;
+            let mut keys=std::collections::BTreeSet::new();
+            let mut retained=Vec::new();
+            for row in pending {
+                let receipt=row.selection_receipt.as_ref().ok_or(StateError::ProviderSelectionInvalid)?;
+                if receipt.generation!=generation {return invalid()}
+                let path=super::provider_selection::SelectionPath::from_path(row.asset.local_path.as_deref().ok_or(StateError::ProviderSelectionInvalid)?).key()?;
+                let unfinished:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_decisions d ON d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child WHERE w.generation=?1 AND w.pass_key=?2 AND w.child=?3 AND w.version_size=?4 AND w.path=?5 AND w.admitted=1 AND w.verified_media=1 AND w.verified_metadata=0 AND d.compacted_hash IS NULL)",params![generation,receipt.pass_key,receipt.child,row.asset.version_size.as_str(),path],|r|r.get(0))?;
+                if unfinished {keys.insert((receipt.pass_key.clone(),receipt.child.clone()));retained.push(row);}
+            }
+            for (key,child) in keys {
+                load_decision(&tx,&root,&key,&child)?;
+                let due:bool=tx.query_row("SELECT next_retry_at<=?4 FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,key,child,Utc::now().timestamp()],|r|r.get(0))?;
+                if due { defer_attempt(&tx,&root,&key,&child)?; }
+            }
+            tx.commit()?;Ok(retained)
+        }).await
+    }
+
     #[cfg(test)]
     pub(crate) async fn make_selection_retry_due(
         &self,
@@ -1618,7 +1648,7 @@ impl SqliteStateDb {
     ) -> Result<(), StateError> {
         self.with_conn_mut("advancing synthetic selection retry clock",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
-            let keys:Vec<(String,String)>=tx.prepare("SELECT generation,pass_key FROM provider_active_decisions WHERE child=?1 AND next_retry_at>0 AND compacted_hash IS NULL AND (admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=provider_active_decisions.generation AND w.pass_key=provider_active_decisions.pass_key AND w.child=provider_active_decisions.child AND w.verified_media=0))")?.query_map([&child],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
+            let keys:Vec<(String,String)>=tx.prepare("SELECT generation,pass_key FROM provider_active_decisions WHERE child=?1 AND next_retry_at>0 AND compacted_hash IS NULL AND (admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=provider_active_decisions.generation AND w.pass_key=provider_active_decisions.pass_key AND w.child=provider_active_decisions.child AND (w.verified_media=0 OR w.verified_metadata=0)))")?.query_map([&child],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
             for (generation,key) in keys {
                 let root=load_generation(&tx,&generation)?;load_decision(&tx,&root,&key,&child)?;
                 tx.execute("UPDATE provider_active_decisions SET next_retry_at=1 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,key,child])?;
@@ -1638,7 +1668,7 @@ impl SqliteStateDb {
             let mut statement=conn.prepare("SELECT pass_key,child FROM provider_active_decisions WHERE generation=?1")?;
             let mut rows=statement.query([&generation])?;
             while let Some(row)=rows.next()? {let key:String=row.get(0)?;let child:String=row.get(1)?;load_decision_with_sources(conn,&root,&key,&child,false)?;}
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission<>'excluded' AND next_retry_at>?2) AND NOT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) AND NOT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND verified_media=0)",params![generation,Utc::now().timestamp()],|r|r.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission<>'excluded' AND next_retry_at>?2) AND NOT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) AND NOT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND (verified_media=0 OR (verified_metadata=0 AND EXISTS(SELECT 1 FROM provider_active_generations g WHERE g.id=provider_active_destinations.generation AND g.metadata_enabled=1))))",params![generation,Utc::now().timestamp()],|r|r.get(0))?)
         }).await
     }
 
@@ -1841,7 +1871,7 @@ impl SqliteStateDb {
     ) -> Result<bool, StateError> {
         self.with_conn("inspecting destination wake-up",move|conn|{
             account::validate_authenticated(conn,&owner)?;load_generation(conn,&generation)?;
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND verified_media=0)",params![generation,Utc::now().timestamp()],|r|r.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND (verified_media=0 OR (verified_metadata=0 AND EXISTS(SELECT 1 FROM provider_active_generations g WHERE g.id=provider_active_destinations.generation AND g.metadata_enabled=1))))",params![generation,Utc::now().timestamp()],|r|r.get(0))?)
         }).await
     }
 }
@@ -1918,7 +1948,7 @@ fn frozen_metadata(
     let snapshot: FrozenMetadata =
         serde_json::from_slice(&bytes).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
     let group = group.ok_or(StateError::ProviderSelectionInvalid)?;
-    if root.spec.format != 1
+    if !matches!(root.spec.format, 1 | 2)
         || !root.spec.metadata_enabled
         || snapshot.version != 1
         || snapshot.asset.local_path.is_some()
@@ -1987,7 +2017,7 @@ pub(super) fn freeze_metadata_identity(
          JOIN provider_active_generations g ON g.id=w.generation
          WHERE w.library=?1 AND (w.asset_id=?2 OR w.child=?2) AND w.admitted=1
          AND w.verified_media=1 AND w.verified_metadata=0 AND g.metadata_enabled=1
-         AND json_extract(CAST(g.specification AS TEXT),'$.format')=1
+         AND json_extract(CAST(g.specification AS TEXT),'$.format') IN (1,2)
          ORDER BY w.generation,w.pass_key,w.child",
         )?
         .query_map(params![library, asset], |row| {
@@ -2497,14 +2527,15 @@ pub(super) fn record_layout_destination(
 }
 
 enum VerifiedDestinationSource<'a> {
-    PathPublication(&'a str),
+    PathPublication(&'a str, u8),
     ReadOnlyReceipt(&'a str),
     // Only the reuse owner constructs this after validating the retained
     // native generation/decision and exact source, path and local fingerprint.
     RetainedNative(&'a str),
 }
 
-pub(super) fn record_verified_destination(
+/// A successful initial writer may settle only a newly published destination.
+pub(super) fn record_verified_destination_with_metadata(
     conn: &Connection,
     library: &str,
     asset: &str,
@@ -2512,6 +2543,7 @@ pub(super) fn record_verified_destination(
     path: &Path,
     local: &str,
     source: &str,
+    completed_flags: u8,
 ) -> Result<(), StateError> {
     record_destination_source(
         conn,
@@ -2520,7 +2552,7 @@ pub(super) fn record_verified_destination(
         version,
         path,
         local,
-        VerifiedDestinationSource::PathPublication(source),
+        VerifiedDestinationSource::PathPublication(source, completed_flags),
     )
 }
 
@@ -2554,10 +2586,13 @@ fn record_destination_source(
     local: &str,
     source: VerifiedDestinationSource<'_>,
 ) -> Result<(), StateError> {
-    let (source, require_path_receipt, preserve_prepared) = match source {
-        VerifiedDestinationSource::PathPublication(source) => (source, true, false),
-        VerifiedDestinationSource::RetainedNative(source) => (source, false, false),
-        VerifiedDestinationSource::ReadOnlyReceipt(source) => (source, true, true),
+    let (source, require_path_receipt, preserve_prepared, readonly, completed_flags) = match source
+    {
+        VerifiedDestinationSource::PathPublication(source, flags) => {
+            (source, true, false, false, flags)
+        }
+        VerifiedDestinationSource::RetainedNative(source) => (source, false, true, true, 0),
+        VerifiedDestinationSource::ReadOnlyReceipt(source) => (source, true, true, true, 0),
     };
     validate_identity_decisions(conn, library, asset)?;
     let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND admitted=1)",params![library,asset,version],|r|r.get(0))?;
@@ -2596,9 +2631,17 @@ fn record_destination_source(
                 d.version_size == version && d.path.key().ok().as_deref() == Some(path.as_str())
             })
             .ok_or(StateError::ProviderSelectionInvalid)?;
+        if root.spec.format == 2 && root.spec.metadata_enabled {
+            let group = grouping_hash(conn, library, asset)?;
+            freeze_asset_intents(conn, &root, library, asset, &group)?;
+            if readonly || root.spec.metadata_flags & completed_flags == root.spec.metadata_flags {
+                conn.execute("UPDATE provider_active_destinations SET verified_metadata=1 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND verified_media=0 AND prepared_hash IS NULL AND frozen_metadata IS NULL", params![generation,key,child,version,path])?;
+            }
+        }
         conn.execute("UPDATE provider_active_destinations SET prepared_checksum=CASE WHEN ?8 THEN prepared_checksum ELSE NULL END,prepared_size=CASE WHEN ?8 THEN prepared_size ELSE NULL END,prepared_hash=CASE WHEN ?8 THEN prepared_hash ELSE NULL END,verified_media=1,local_checksum=?6,source_checksum=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,key,child,version,path,local,source,preserve_prepared])?;
         refresh_progress_hash(conn, &root, &manifest, destination)?;
     }
+    freeze_metadata_identity(conn, library, asset)?;
     Ok(())
 }
 
@@ -2656,7 +2699,7 @@ impl SqliteStateDb {
             let Some(text)=native.to_str() else {tx.commit()?;return Ok(false)};
             let receipt:Option<String>=tx.query_row("SELECT p.source_checksum FROM asset_metadata_paths p JOIN assets a USING(library,id,version_size) WHERE p.library=?1 AND p.id=?2 AND p.local_path=?3 AND p.local_checksum=?4 AND p.source_checksum IS NOT NULL AND a.metadata_hash IS ?5 AND p.version_size=?6 AND p.provider_checksum=?7 AND a.checksum=p.provider_checksum AND p.source_checksum=p.local_checksum AND a.size_bytes=?8 AND NOT EXISTS(SELECT 1 FROM primary_layout_bindings b WHERE b.library=p.library AND b.child=p.id)",params![root.spec.zone.get("zoneName").and_then(Value::as_str),manifest.state_id,text,local,manifest.decision.destinations.iter().find(|d|d.path==path).map(|d|&d.metadata_hash),manifest.decision.destinations.iter().find(|d|d.path==path).map(|d|&d.version_size),selected.checksum,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|r.get(0)).optional()?;
             if let Some(source)=receipt {
-                record_verified_destination(&tx,root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,
+                record_readonly_destination(&tx,root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,
                     &manifest.decision.destinations.iter().find(|d|d.path==path).ok_or(StateError::ProviderSelectionInvalid)?.version_size,&native,&local,&source)?;
                 tx.commit()?;Ok(true)
             } else {tx.commit()?;Ok(false)}
@@ -2682,6 +2725,12 @@ impl SqliteStateDb {
                 }
             }
             if root.spec.format==2 {
+                let done:Vec<(String,String)>=tx.prepare("SELECT DISTINCT pass_key,child FROM provider_active_destinations WHERE generation=?1 AND verified_media=1 AND verified_metadata=1 AND frozen_metadata IS NOT NULL AND prepared_hash IS NULL")?.query_map([&generation],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
+                for (key,child) in done {
+                    let manifest=load_decision(&tx,&root,&key,&child)?;
+                    tx.execute("UPDATE provider_active_destinations SET frozen_metadata=NULL,frozen_metadata_hash=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND verified_media=1 AND verified_metadata=1 AND prepared_hash IS NULL",params![generation,key,child])?;
+                    for destination in &manifest.decision.destinations {refresh_progress_hash(&tx,&root,&manifest,destination)?;}
+                }
                 while retirement::compact_batch(&tx,Some(&root.id),2)?>0 {}
             }
             tx.commit()?;Ok(())
@@ -2838,11 +2887,11 @@ pub(super) fn finish_metadata_receipt(
             })
             .ok_or(StateError::ProviderSelectionInvalid)?;
         refresh_progress_hash(conn, &root, &manifest, destination)?;
-        if complete
-            && receipt
-                .prepared
-                .as_ref()
-                .is_some_and(|(output, _)| Some(output.as_str()) == local)
+        // Media evidence advances even if a sidecar remains unfinished.
+        if receipt
+            .prepared
+            .as_ref()
+            .is_some_and(|(output, _)| Some(output.as_str()) == local)
         {
             let completed = retirement::receipt(conn, &root, &manifest, destination)?;
             super::download_receipts::save_prepared_rewrite(
@@ -2920,11 +2969,10 @@ pub(super) fn finish_metadata_receipt(
                 })
                 .ok_or(StateError::ProviderSelectionInvalid)?;
             refresh_progress_hash(conn, &alias_root, &alias, destination)?;
-            if complete
-                && receipt
-                    .prepared
-                    .as_ref()
-                    .is_some_and(|(output, _)| Some(output.as_str()) == local)
+            if receipt
+                .prepared
+                .as_ref()
+                .is_some_and(|(output, _)| Some(output.as_str()) == local)
             {
                 let completed = retirement::receipt(conn, &alias_root, &alias, destination)?;
                 super::download_receipts::save_prepared_rewrite(

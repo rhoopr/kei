@@ -210,7 +210,7 @@ pub(in crate::download) async fn run_download_pass(
                         &task,
                         local_checksum.clone(),
                         download_checksum.clone(),
-                        *exif_ok,
+                        (*exif_ok, metadata_flags.bits()),
                         mark_capture_repair_after_download,
                         retained.clone(),
                     )

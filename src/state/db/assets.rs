@@ -171,6 +171,7 @@ impl SqliteStateDb {
                 local: local_checksum,
                 downloaded: download_checksum,
                 source: None,
+                completed_metadata_flags: 0,
             },
             mark_capture_repair,
         )
@@ -194,6 +195,7 @@ impl SqliteStateDb {
         let local_checksum = checksums.local.to_owned();
         let download_checksum = checksums.downloaded.map(str::to_owned);
         let source_checksum = checksums.source.map(str::to_owned);
+        let completed_metadata_flags = checksums.completed_metadata_flags;
 
         self.with_conn_mut("mark_downloaded", move |conn| {
             let tx = conn
@@ -246,7 +248,7 @@ impl SqliteStateDb {
             }
 
             if let Some(source) = &source_checksum {
-                super::provider_generations::record_verified_destination(
+                super::provider_generations::record_verified_destination_with_metadata(
                     &tx,
                     &library,
                     &id,
@@ -254,6 +256,7 @@ impl SqliteStateDb {
                     &local_path,
                     &local_checksum,
                     source,
+                    completed_metadata_flags,
                 )?;
             }
 
@@ -1227,6 +1230,34 @@ impl DownloadStateStore for SqliteStateDb {
                 local: local_checksum,
                 downloaded: download_checksum,
                 source: download_checksum,
+                completed_metadata_flags: 0,
+            },
+            mark_capture_repair,
+        )
+        .await
+    }
+
+    async fn mark_verified_download_with_metadata(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &Path,
+        local_checksum: &str,
+        download_checksum: Option<&str>,
+        metadata: (bool, u8),
+    ) -> Result<(), StateError> {
+        let (mark_capture_repair, completed_metadata_flags) = metadata;
+        self.mark_downloaded_with_checksums(
+            library,
+            id,
+            version_size,
+            local_path,
+            DownloadChecksums {
+                local: local_checksum,
+                downloaded: download_checksum,
+                source: download_checksum,
+                completed_metadata_flags,
             },
             mark_capture_repair,
         )

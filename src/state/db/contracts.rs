@@ -124,7 +124,7 @@ impl CaptureRepairReceipt {
 
 /// Exact native destination selected by the generation owner. The metadata
 /// writer receives this receipt without translating its path through SQLite TEXT.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SelectionMetadataReceipt {
     pub(crate) generation: String,
     pub(crate) pass_key: String,
@@ -575,6 +575,28 @@ pub trait DownloadStateStore: Send + Sync {
             local_checksum,
             download_checksum,
             mark_capture_repair,
+        )
+        .await
+    }
+    /// Verified pipeline metadata result; unsupported stores retain unknown completion.
+    async fn mark_verified_download_with_metadata(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &Path,
+        local_checksum: &str,
+        download_checksum: Option<&str>,
+        metadata: (bool, u8),
+    ) -> Result<(), StateError> {
+        self.mark_verified_download(
+            library,
+            id,
+            version_size,
+            local_path,
+            local_checksum,
+            download_checksum,
+            metadata.0,
         )
         .await
     }
@@ -1047,6 +1069,17 @@ pub enum SourceMetadataRecovery {
 /// Metadata rewrite markers and hashes.
 #[async_trait]
 pub trait MetadataRewriteStore: Send + Sync {
+    /// Called under the destination lock before any selected metadata write.
+    async fn validate_metadata_writer(
+        &self,
+        pending: &PendingMetadataRewrite,
+    ) -> Result<(), StateError> {
+        if pending.selection_receipt.is_some() {
+            return Err(StateError::ProviderWorkConflict);
+        }
+        Ok(())
+    }
+
     /// Original media and exact sidecars protected before or after preparation.
     async fn protected_legacy_paths(&self) -> Result<Vec<PathBuf>, StateError> {
         Ok(Vec::new())

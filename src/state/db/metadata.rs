@@ -271,7 +271,7 @@ fn query_selection_and_legacy_metadata(
 ) -> Result<Vec<PendingMetadataRewrite>, StateError> {
     let source = metadata_rewrite_source_sql();
     let generation_filter = if generation.is_some() {
-        " AND w.generation=?"
+        " AND w.generation=? AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=unixepoch())"
     } else {
         ""
     };
@@ -1437,6 +1437,53 @@ impl SqliteStateDb {
 
 #[async_trait]
 impl MetadataRewriteStore for SqliteStateDb {
+    async fn validate_metadata_writer(
+        &self,
+        pending: &PendingMetadataRewrite,
+    ) -> Result<(), StateError> {
+        let pending = pending.clone();
+        self.with_conn("validating selected metadata writer", move |conn| {
+            let Some(receipt) = &pending.selection_receipt else {
+                return Ok(());
+            };
+            let path = super::provider_selection::SelectionPath::from_path(
+                pending
+                    .asset
+                    .local_path
+                    .as_deref()
+                    .ok_or(StateError::ProviderSelectionInvalid)?,
+            )
+            .key()?;
+            let current = super::provider_generations::metadata_receipt(
+                conn,
+                &receipt.generation,
+                &receipt.pass_key,
+                &receipt.child,
+                pending.asset.version_size.as_str(),
+                &path,
+            )?;
+            if current.selection_receipt != pending.selection_receipt
+                || current.source_checksum != pending.source_checksum
+                || current.asset.local_path != pending.asset.local_path
+            {
+                return Err(StateError::ProviderWorkConflict);
+            }
+            let mut actual = current.asset;
+            let mut expected = pending.asset;
+            actual.local_path = None;
+            expected.local_path = None;
+            if serde_json::to_value(actual)
+                .map_err(|_invalid| StateError::ProviderSelectionInvalid)?
+                != serde_json::to_value(expected)
+                    .map_err(|_invalid| StateError::ProviderSelectionInvalid)?
+            {
+                return Err(StateError::ProviderWorkConflict);
+            }
+            Ok(())
+        })
+        .await
+    }
+
     async fn protected_legacy_paths(&self) -> Result<Vec<std::path::PathBuf>, StateError> {
         self.with_conn(
             "protected_legacy_paths",
