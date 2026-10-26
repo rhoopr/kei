@@ -755,6 +755,8 @@ async fn filtered_embed_rewrite_keeps_stored_checksums_current() {
     config.metadata.set_exif_rating = true;
     config.filename_exclude =
         Arc::from(vec![glob::Pattern::new("*.jpg").expect("filename pattern")]);
+    // Historical writers run only for an explicit metadata refresh.
+    config.refresh_metadata = true;
     let config = Arc::new(config);
 
     let media_path = dir.path().join("filtered-embed.jpg");
@@ -775,20 +777,22 @@ async fn filtered_embed_rewrite_keeps_stored_checksums_current() {
     let record = crate::test_helpers::TestAssetRecord::new("FILTERED_EMBED")
         .checksum("ck_filtered_embed")
         .filename("filtered-embed.jpg")
-        .size(1234)
+        .size(fs::metadata(&media_path).unwrap().len())
         .metadata(AssetMetadata {
             metadata_hash: Some("stale-hash".to_string()),
             ..AssetMetadata::default()
         })
         .build();
     db.upsert_seen(&record).await.unwrap();
-    db.mark_downloaded(
+    crate::state::DownloadStateStore::mark_verified_download(
+        db.as_ref(),
         "PrimarySync",
         "FILTERED_EMBED",
         "original",
         &media_path,
         &seeded_checksum,
-        None,
+        Some(&seeded_checksum),
+        false,
     )
     .await
     .unwrap();
@@ -797,7 +801,7 @@ async fn filtered_embed_rewrite_keeps_stored_checksums_current() {
         .filename("filtered-embed.jpg")
         .item_type("public.jpeg")
         .orig_file_type("public.jpeg")
-        .orig_size(1234)
+        .orig_size(fs::metadata(&media_path).unwrap().len())
         .orig_url("https://p01.icloud-content.com/filtered-embed.jpg")
         .orig_checksum("ck_filtered_embed")
         .favorite(true)
@@ -864,17 +868,124 @@ async fn seed_downloaded_jpeg_asset(
     fs::write(&derived.path, MINIMAL_JPEG).unwrap();
     let record = asset_record_for_derived_path(Arc::from("PrimarySync"), stored, &derived, config);
     db.upsert_seen(&record).await.unwrap();
-    db.mark_downloaded(
+    // The provider key is opaque; these hashes bind the actual raw fixture
+    // bytes to its completed-download receipt, not to a provider hash algorithm.
+    let hash = crate::download::file::compute_sha256(&derived.path)
+        .await
+        .unwrap();
+    crate::state::DownloadStateStore::mark_verified_download(
+        db.as_ref(),
         "PrimarySync",
         stored.state_id(),
         derived.version_size.as_str(),
         &derived.path,
-        "local-checksum",
-        None,
+        &hash,
+        Some(&hash),
+        false,
     )
     .await
     .unwrap();
     derived
+}
+
+/// Current managed downloads have authenticated publication ownership, not
+/// merely a legacy source-byte receipt. The mock cannot contact a live provider.
+#[cfg(feature = "xmp")]
+async fn owned_metadata_fixture(
+    root: &std::path::Path,
+) -> (Arc<crate::state::SqliteStateDb>, DownloadConfig) {
+    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, inbox::ShadowCapture};
+    use crate::state::db::account::AccountOwner;
+    use serde_json::json;
+
+    let owner = AccountOwner::authenticated(
+        "writer@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-writer"}})).unwrap(),
+    )
+    .unwrap();
+    let db = Arc::new(
+        crate::state::SqliteStateDb::open_owned(&root.join("state.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: "https://invalid.example".into(),
+            name: "selected".into(),
+            list_type: "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
+            obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
+            query_filter: None,
+            page_size: 1,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(crate::test_helpers::MockPhotosSession::new()),
+    );
+    album.set_shadow_capture(
+        ShadowCapture::new(db.clone(), owner, "com"),
+        "private".into(),
+    );
+    let mut config = DownloadConfig::test_default();
+    config.directory = Arc::from(root);
+    config.state_db = Some(db.clone());
+    config.primary_layout_source = Some(Arc::new(album));
+    config.primary_layout_pass = Some("selected-pass".into());
+    (db, config)
+}
+
+#[cfg(feature = "xmp")]
+async fn seed_owned_jpeg(
+    db: &Arc<crate::state::SqliteStateDb>,
+    config: &DownloadConfig,
+    asset: &PhotoAsset,
+) -> std::path::PathBuf {
+    use crate::state::db::{PreparedPublication, provider_selection::SelectionPath};
+    use crate::state::{DownloadStateStore, TempFileOwnershipStore};
+    let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+    let plan = planner.plan_download_asset(asset, config).await.unwrap();
+    let task = plan.tasks.first().unwrap();
+    db.upsert_seen(&planner::pending_record_for_task(config, asset, task))
+        .await
+        .unwrap();
+    fs::create_dir_all(task.download_path.parent().unwrap()).unwrap();
+    fs::write(&task.download_path, MINIMAL_JPEG).unwrap();
+    let hash = crate::download::file::compute_sha256(&task.download_path)
+        .await
+        .unwrap();
+    let temporary = config.directory.join("owned.part");
+    db.claim_temp_file(&temporary).await.unwrap();
+    let proof = PreparedPublication {
+        binding: task.publication_binding.as_deref().cloned(),
+        library: task.library.to_string(),
+        id: task.asset_id.to_string(),
+        version: task.version_size.as_str().into(),
+        provider_checksum: task.checksum.to_string(),
+        provider_size: task.size,
+        temporary: SelectionPath::from_path(&temporary),
+        destination: SelectionPath::from_path(&task.download_path),
+        local_checksum: hash.clone(),
+        source_checksum: hash.clone(),
+    };
+    assert!(proof.binding.is_some());
+    db.prepare_temp_publication(&temporary, &proof)
+        .await
+        .unwrap();
+    db.mark_verified_download(
+        &proof.library,
+        &proof.id,
+        &proof.version,
+        &task.download_path,
+        &hash,
+        Some(&hash),
+        false,
+    )
+    .await
+    .unwrap();
+    task.download_path.clone()
 }
 
 /// A stored/edited `PhotoAsset` pair sharing identical bytes but differing
@@ -1913,24 +2024,23 @@ async fn restored_and_edited_asset_does_not_report_unsafe_state() {
 /// favouriting proves the fresh value reached the file.
 #[cfg(feature = "xmp")]
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn metadata_drift_writes_fresh_value_into_the_sidecar() {
-    use crate::download::DownloadConfig;
     use crate::icloud::photos::PhotoAsset;
-    use crate::state::SqliteStateDb;
     use futures_util::stream;
     use std::sync::Arc;
 
-    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
     let dir = TempDir::new().unwrap();
-    let mut config = DownloadConfig::test_default();
-    config.directory = Arc::from(dir.path());
+    let (db, mut config) = owned_metadata_fixture(dir.path()).await;
     config.metadata.xmp_sidecar = true;
     config.state_db = Some(db.clone());
+    // Historical writers run only for an explicit metadata refresh.
+    config.refresh_metadata = true;
     let config = Arc::new(config);
 
     let stored = jpeg_asset("SIDECAR", "sidecar.jpg", false);
     let edited = jpeg_asset("SIDECAR", "sidecar.jpg", true);
-    let derived = seed_downloaded_jpeg_asset(&db, &config, &stored).await;
+    let path = seed_owned_jpeg(&db, &config, &stored).await;
 
     let result = stream_and_download_from_stream(
         &reqwest::Client::new(),
@@ -1945,9 +2055,10 @@ async fn metadata_drift_writes_fresh_value_into_the_sidecar() {
     .unwrap();
 
     assert_eq!(result.downloaded, 0, "a metadata edit must not fetch media");
+    assert_eq!(fs::read(&path).unwrap(), MINIMAL_JPEG);
     assert_eq!(result.exif_failures, 0);
 
-    let sidecar = fs::read_to_string(sidecar_path_for(&derived.path))
+    let sidecar = fs::read_to_string(sidecar_path_for(&path))
         .expect("sidecar written next to the media file");
     assert!(
         sidecar.contains("<xmp:Rating>5</xmp:Rating>"),
@@ -2342,23 +2453,23 @@ async fn retry_marker_refreshes_row_whose_hash_matches_but_columns_are_stale() {
 /// so the retry cannot replay stale values.
 #[cfg(feature = "xmp")]
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn rewrite_failure_retains_marker_holding_fresh_metadata() {
-    use crate::download::DownloadConfig;
     use crate::icloud::photos::PhotoAsset;
-    use crate::state::SqliteStateDb;
     use futures_util::stream;
     use std::sync::Arc;
 
-    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
     let dir = TempDir::new().unwrap();
-    let mut config = DownloadConfig::test_default();
-    config.directory = Arc::from(dir.path());
+    let (db, mut config) = owned_metadata_fixture(dir.path()).await;
     config.metadata.xmp_sidecar = true;
     config.state_db = Some(db.clone());
+    // Historical writers run only for an explicit metadata refresh.
+    config.refresh_metadata = true;
     let config = Arc::new(config);
 
-    let (stored, edited) = drifted_asset_pair("REWRITEFAIL", "rewritefail.jpg");
-    seed_downloaded_drift_asset(&db, &config, &stored).await;
+    let stored = jpeg_asset("REWRITEFAIL", "rewritefail.jpg", true);
+    let edited = jpeg_asset("REWRITEFAIL", "rewritefail.jpg", false);
+    let path = seed_owned_jpeg(&db, &config, &stored).await;
     db.fail_metadata_marker_clear_for_test();
 
     let result = stream_and_download_from_stream(
@@ -2391,7 +2502,16 @@ async fn rewrite_failure_retains_marker_holding_fresh_metadata() {
     // A metadata-only edit downloads nothing, so the zero-download branch
     // is the one that has to report the failure.
     assert_eq!(result.downloaded, 0);
+    assert_eq!(fs::read(&path).unwrap(), MINIMAL_JPEG);
     assert!(result.exif_failures > 0);
+    assert!(
+        sidecar_path_for(&path).exists(),
+        "writer must publish before finalization fails"
+    );
+    assert!(
+        logs_contain("simulated metadata marker clear failure"),
+        "must reach the injected finalization boundary"
+    );
     let (outcome, stats) = build_download_outcome(
         &reqwest::Client::new(),
         &[],
@@ -2412,6 +2532,32 @@ async fn rewrite_failure_retains_marker_holding_fresh_metadata() {
         stats.state_write_failures, 0,
         "the checkpoint may still advance once the marker is durable"
     );
+    // The fault is connection-local. Reopen the same durable state and retry
+    // without another provider observation; the pending writer must settle.
+    let (reopened, mut retry_config) = owned_metadata_fixture(dir.path()).await;
+    retry_config.metadata.xmp_sidecar = true;
+    retry_config.refresh_metadata = true;
+    let retry = stream_and_download_from_stream(
+        &reqwest::Client::new(),
+        stream::empty::<anyhow::Result<PhotoAsset>>(),
+        &Arc::new(retry_config),
+        DownloadControls::download_hidden(),
+        1,
+        CancellationToken::new(),
+        StreamRuntime::new(None, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry.downloaded, 0);
+    assert_eq!(retry.exif_failures, 0);
+    assert!(
+        reopened
+            .get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fs::read(&path).unwrap(), MINIMAL_JPEG);
 }
 
 /// #741: the normal pending-rewrite owner must treat an unparsable
@@ -2436,6 +2582,8 @@ async fn contract_xmp_sidecar_rewrite_requires_stable_input() {
     config.directory = Arc::from(download_dir.as_path());
     config.metadata.xmp_sidecar = true;
     config.state_db = Some(db.clone());
+    // Historical writers run only for an explicit metadata refresh.
+    config.refresh_metadata = true;
     let config = Arc::new(config);
 
     let stored = jpeg_asset("UNPARSABLE_SIDECAR", "unparsable.jpg", true);
@@ -2464,6 +2612,7 @@ async fn contract_xmp_sidecar_rewrite_requires_stable_input() {
     .unwrap();
 
     assert_eq!(result.downloaded, 0);
+    assert_eq!(fs::read(&derived.path).unwrap(), MINIMAL_JPEG);
     assert_eq!(result.exif_failures, 1);
     assert_eq!(fs::read(&sidecar_path).unwrap(), original);
     assert_eq!(
@@ -2514,6 +2663,8 @@ async fn retained_sidecar_temp_does_not_block_pending_rewrite_retry() {
     config.directory = Arc::from(download_dir.as_path());
     config.metadata.xmp_sidecar = true;
     config.state_db = Some(db.clone());
+    // Historical writers run only for an explicit metadata refresh.
+    config.refresh_metadata = true;
     let config = Arc::new(config);
 
     let stored = jpeg_asset("RETAINED_SIDECAR_TEMP", "retained.jpg", true);
@@ -2547,6 +2698,7 @@ async fn retained_sidecar_temp_does_not_block_pending_rewrite_retry() {
     .unwrap();
 
     assert_eq!(result.downloaded, 0);
+    assert_eq!(fs::read(&derived.path).unwrap(), MINIMAL_JPEG);
     assert_eq!(result.exif_failures, 0);
     assert!(
         db.get_pending_metadata_rewrites(10)
