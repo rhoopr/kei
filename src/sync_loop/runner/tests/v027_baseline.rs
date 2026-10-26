@@ -77,6 +77,25 @@ fn historical_rows(path: &std::path::Path) -> Vec<Vec<rusqlite::types::Value>> {
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap(),
     );
+    if PRESERVE_SHARED_CLAIMS.try_get().unwrap_or(false) {
+        for query in [
+            "SELECT * FROM asset_master_mappings WHERE library='PrimarySync' ORDER BY asset_record_name",
+            "SELECT * FROM asset_metadata_capture_revisions WHERE library='PrimarySync' ORDER BY asset_id",
+        ] {
+            let mut stmt = conn.prepare(query).unwrap();
+            let count = stmt.column_count();
+            rows.extend(
+                stmt.query_map([], |r| {
+                    (0..count)
+                        .map(|i| r.get(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap(),
+            );
+        }
+    }
     rows
 }
 
@@ -237,6 +256,7 @@ async fn v027_baseline_mixed_receipt_concurrent_delta_then_two_quiet_reopened_cy
 tokio::task_local! {static CURRENT_SIDECAR_FAILURE: bool;}
 tokio::task_local! {static REQUIRE_OBSERVATION_PROOF: bool;}
 tokio::task_local! {static PRESERVE_EXTERNAL_LINKS: bool;}
+tokio::task_local! {static PRESERVE_SHARED_CLAIMS: bool;}
 
 #[tokio::test]
 async fn v027_observation_proof_tracks_baseline_restart_and_quiet_deltas() {
@@ -296,6 +316,19 @@ async fn v027_baseline_preserves_queued_existing_metadata_while_new_files_get_si
 async fn v027_normal_sync_preserves_external_historical_media_and_sidecar_hardlinks() {
     for database in ["private", "shared"] {
         PRESERVE_EXTERNAL_LINKS
+            .scope(
+                true,
+                baseline_contract(database, true, false, false, false, false, false),
+            )
+            .await;
+    }
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn v027_normal_selected_sync_preserves_shared_historical_claims_and_debt() {
+    for database in ["private", "shared"] {
+        PRESERVE_SHARED_CLAIMS
             .scope(
                 true,
                 baseline_contract(database, true, false, false, false, false, false),
@@ -536,6 +569,12 @@ async fn baseline_contract(
             db.upsert_asset_master_mapping("PrimarySync", child, "old-primary-master")
                 .await
                 .unwrap();
+            if PRESERVE_SHARED_CLAIMS.try_get().unwrap_or(false) {
+                db.acquire_lock("seed ambiguous historical shared-path claim").unwrap().execute(
+                    "INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum) VALUES('PrimarySync',?1,'original',?2,?3,'historical-local')",
+                    rusqlite::params![child,old_path.to_str().unwrap(),generation(1)],
+                ).unwrap();
+            }
         }
         let candidate = db
             .get_metadata_capture_candidates("PrimarySync", 1, 1)
@@ -553,6 +592,10 @@ async fn baseline_contract(
         db.set_metadata(&format!("pending_sync_token:old-config:{ZONE}"), OLD_TOKEN)
             .await
             .unwrap();
+    }
+    if PRESERVE_SHARED_CLAIMS.try_get().unwrap_or(false) {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM asset_metadata_paths WHERE local_checksum='historical-local' AND local_path=?1",[old_path.to_str().unwrap()],|r|r.get(0)).unwrap(), 2);
     }
     let original_rows = historical_rows(&db_path);
     let original_current_receipts = if same_zone_current_receipt {
