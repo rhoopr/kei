@@ -23,6 +23,7 @@ struct Session {
     cycle: usize,
     first_observation: usize,
     interrupted_inventory: Option<std::path::PathBuf>,
+    bridge_fault: Option<bool>,
     unresolved: bool,
     observed_historical: bool,
     omit_after_first: bool,
@@ -139,8 +140,22 @@ impl PhotosSession for Session {
             } else {
                 Vec::new()
             };
-            return Ok(json!({"zones":[{"zoneID":zone(),"records":records,
-                "syncToken":format!("expanded-after-{}",self.cycle),"moreComing":false}]}));
+            let mut response = json!({"zones":[{"zoneID":zone(),"records":records,
+                "syncToken":format!("expanded-after-{}",self.cycle),"moreComing":false}]});
+            if let Some(blank) = self.bridge_fault {
+                assert_eq!(request["zones"][0]["syncToken"], "expansion-boundary");
+                assert!(self.inventories.load(Ordering::SeqCst) > 0);
+                self.omissions.fetch_add(1, Ordering::SeqCst);
+                if blank {
+                    response["zones"][0]["syncToken"] = json!("");
+                } else {
+                    response["zones"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("syncToken");
+                }
+            }
+            return Ok(response);
         }
         anyhow::bail!("unexpected expansion fixture endpoint: {url}");
     }
@@ -196,6 +211,8 @@ enum History {
     InterruptedMigration,
     InterruptedBaseline,
     InterruptedInventory,
+    MissingBridge,
+    BlankBridge,
     CurrentBaseline,
 }
 
@@ -273,6 +290,13 @@ async fn v027_stock_partial_initial_inventory_preserves_admission_then_reopens()
         false,
     )
     .await;
+}
+
+#[tokio::test]
+async fn v027_stock_missing_or_blank_bridge_successor_preserves_work_then_reopens() {
+    for history in [History::MissingBridge, History::BlankBridge] {
+        expansion(false, history, false, false, false, false, false).await;
+    }
 }
 
 fn snapshot_history(path: &std::path::Path) -> Vec<Vec<rusqlite::types::Value>> {
@@ -418,6 +442,9 @@ async fn expansion(
             first_observation,
             interrupted_inventory: (historical == History::InterruptedInventory && cycle == 0)
                 .then(|| root.join("april.JPG")),
+            bridge_fault: (cycle == 0
+                && matches!(historical, History::MissingBridge | History::BlankBridge))
+            .then_some(historical == History::BlankBridge),
             unresolved: unavailable && cycle == 1,
             observed_historical,
             omit_after_first,
@@ -475,7 +502,10 @@ async fn expansion(
         .await;
         if matches!(
             historical,
-            History::InterruptedBaseline | History::InterruptedInventory
+            History::InterruptedBaseline
+                | History::InterruptedInventory
+                | History::MissingBridge
+                | History::BlankBridge
         ) && cycle == 0
         {
             if historical == History::InterruptedInventory {
@@ -484,9 +514,26 @@ async fn expansion(
                     "later malformed page must actually execute after publication"
                 );
             }
+            if matches!(historical, History::MissingBridge | History::BlankBridge) {
+                assert!(
+                    session.omissions.load(Ordering::SeqCst) > 0,
+                    "bridge fault must execute after inventory"
+                );
+            }
+            assert_eq!(
+                db.get_metadata(&format!("observed_selection:v27:{ZONE}"))
+                    .await
+                    .unwrap(),
+                None,
+                "query EOF cannot certify an unfinished bridge"
+            );
             match &result {
                 Ok(outcome) => assert!(!outcome.can_advance_database_checkpoint()),
-                Err(error) => assert!(format!("{error:#}").contains("initial checkpoint failure")),
+                Err(error) => assert!(
+                    matches!(historical, History::MissingBridge | History::BlankBridge)
+                        || format!("{error:#}").contains("initial checkpoint failure"),
+                    "{error:#}"
+                ),
             }
             assert_eq!(db.get_metadata(&key).await.unwrap(), None);
             assert_eq!(std::fs::read(root.join("april.JPG")).unwrap(), MEDIA);
@@ -697,6 +744,7 @@ async fn v027_destination_root_replaced_during_transfer_preserves_work_and_reope
             cycle,
             first_observation: 1,
             interrupted_inventory: None,
+            bridge_fault: None,
             unresolved: false,
             observed_historical: false,
             omit_after_first: false,

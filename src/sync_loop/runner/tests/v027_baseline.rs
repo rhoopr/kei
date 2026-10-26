@@ -236,6 +236,7 @@ async fn v027_baseline_mixed_receipt_concurrent_delta_then_two_quiet_reopened_cy
 
 tokio::task_local! {static CURRENT_SIDECAR_FAILURE: bool;}
 tokio::task_local! {static REQUIRE_OBSERVATION_PROOF: bool;}
+tokio::task_local! {static PRESERVE_EXTERNAL_LINKS: bool;}
 
 #[tokio::test]
 async fn v027_observation_proof_tracks_baseline_restart_and_quiet_deltas() {
@@ -287,6 +288,19 @@ async fn v027_current_requested_sidecar_retries_quietly_without_historical_backf
 async fn v027_baseline_preserves_queued_existing_metadata_while_new_files_get_sidecars() {
     for database in ["private", "shared"] {
         baseline_contract(database, true, false, false, false, false, false).await;
+    }
+}
+
+#[cfg(all(unix, feature = "xmp"))]
+#[tokio::test]
+async fn v027_normal_sync_preserves_external_historical_media_and_sidecar_hardlinks() {
+    for database in ["private", "shared"] {
+        PRESERVE_EXTERNAL_LINKS
+            .scope(
+                true,
+                baseline_contract(database, true, false, false, false, false, false),
+            )
+            .await;
     }
 }
 
@@ -424,6 +438,17 @@ async fn baseline_contract(
     let old_sidecar_mtime = if metadata_enabled {
         std::fs::write(&old_sidecar, sidecar_bytes).unwrap();
         Some(std::fs::metadata(&old_sidecar).unwrap().modified().unwrap())
+    } else {
+        None
+    };
+    let external_links = if PRESERVE_EXTERNAL_LINKS.try_get().unwrap_or(false) {
+        let outside = dir.path().join("external-archive");
+        std::fs::create_dir(&outside).unwrap();
+        let media_alias = outside.join("preserved.JPG");
+        let sidecar_alias = outside.join("preserved.xmp");
+        std::fs::hard_link(&old_path, &media_alias).unwrap();
+        std::fs::hard_link(&old_sidecar, &sidecar_alias).unwrap();
+        Some((media_alias, sidecar_alias))
     } else {
         None
     };
@@ -822,6 +847,33 @@ async fn baseline_contract(
             }
         }
         recorded_only::assert_unadmitted(db.as_ref());
+        if let Some((media_alias, sidecar_alias)) = &external_links {
+            assert_eq!(std::fs::read(media_alias).unwrap(), MEDIA);
+            assert_eq!(std::fs::read(sidecar_alias).unwrap(), sidecar_bytes);
+            assert_eq!(
+                std::fs::metadata(media_alias).unwrap().modified().unwrap(),
+                old_mtime
+            );
+            assert_eq!(
+                std::fs::metadata(sidecar_alias)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                old_sidecar_mtime.unwrap()
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(
+                    std::fs::metadata(media_alias).unwrap().ino(),
+                    std::fs::metadata(&old_path).unwrap().ino()
+                );
+                assert_eq!(
+                    std::fs::metadata(sidecar_alias).unwrap().ino(),
+                    std::fs::metadata(&old_sidecar).unwrap().ino()
+                );
+            }
+        }
         assert_eq!(std::fs::read(&old_path).unwrap(), MEDIA);
         assert_eq!(
             std::fs::metadata(&old_path).unwrap().modified().unwrap(),
