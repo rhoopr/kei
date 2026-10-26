@@ -574,7 +574,7 @@ async fn baseline_contract(
     let mut captured_metadata = None;
     for cycle in 0..if retained_operation {
         1
-    } else if current_sidecar_failure {
+    } else if current_sidecar_failure || recorded_only::enabled() {
         4
     } else {
         3
@@ -746,7 +746,7 @@ async fn baseline_contract(
             if primary_template_change {
                 configured.edited_naming = crate::types::EditedNaming::Primary;
             }
-            if recorded_only::enabled() && cycle == 2 {
+            if recorded_only::enabled() && cycle >= 2 {
                 configured.folder_structure = "changed-template".into();
             }
             #[cfg(feature = "xmp")]
@@ -1030,11 +1030,19 @@ async fn baseline_contract(
                 "only genuinely missing inventory+concurrent content downloads"
             );
         } else {
-            assert_eq!(
-                session.inventory_queries.load(Ordering::SeqCst),
-                0,
-                "quiet reopened cycles must remain incremental"
-            );
+            if recorded_only::enabled() && cycle == 2 {
+                assert_eq!(
+                    session.inventory_starts.load(Ordering::SeqCst),
+                    1,
+                    "new selected path policy requires one complete comparison"
+                );
+            } else {
+                assert_eq!(
+                    session.inventory_queries.load(Ordering::SeqCst),
+                    0,
+                    "quiet reopened cycles must remain incremental"
+                );
+            }
             assert_eq!(
                 result.stats.downloaded,
                 usize::from((initial_failure || add_after_baseline) && cycle == 1)
@@ -1057,7 +1065,7 @@ async fn baseline_contract(
             db.get_metadata(&token_key).await.unwrap().as_deref(),
             Some(format!("v27-after-cycle-{}", cycle + 1).as_str())
         );
-        if REQUIRE_OBSERVATION_PROOF.try_with(|v| *v).unwrap_or(false) {
+        if REQUIRE_OBSERVATION_PROOF.try_with(|v| *v).unwrap_or(false) || recorded_only::enabled() {
             let encoded = db
                 .get_metadata(&format!("observed_selection:v27:{ZONE}"))
                 .await

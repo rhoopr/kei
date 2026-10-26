@@ -3057,11 +3057,14 @@ impl SqliteStateDb {
 }
 
 impl SqliteStateDb {
-    /// Completed pass ownership preserves its original physical destination
-    /// when a later configuration changes the path template.
-    pub(crate) async fn selection_path_fulfills_pass(
+    /// Preserve fulfilled pass paths and existing Unfiled media. Another pass
+    /// admitted in this generation remains an independent destination, even
+    /// after its manifest is compacted. This is path eligibility, not content
+    /// proof; the caller still verifies the receipt and retained local file.
+    pub(crate) async fn selection_path_reusable_for_pass(
         &self,
         owner: account::AccountOwner,
+        generation: String,
         scope: String,
         key: String,
         child: String,
@@ -3069,13 +3072,21 @@ impl SqliteStateDb {
     ) -> Result<bool, StateError> {
         self.with_conn("checking fulfilled native pass ownership",move|conn|{
             account::validate_authenticated(conn,&owner)?;
+            let root = load_generation(conn, &generation)?;
+            if root.spec.scope != scope { return invalid(); }
+            let unfiled = pass(&root, &key)?.get("kind").and_then(Value::as_str) == Some("Unfiled");
             let ids:Vec<String>=conn.prepare("SELECT id FROM download_receipts WHERE scope=?1 AND child=?2 AND native_path=?3")?
                 .query_map(params![scope,child,path.key()?],|row|row.get(0))?.collect::<Result<_,_>>()?;
             for id in ids {
                 let receipt=super::download_receipts::load(conn,&id)?.ok_or(StateError::ProviderSelectionInvalid)?;
                 if receipt.fulfills_pass(&key) { return Ok(true); }
             }
-            Ok(false)
+            if !unfiled { return Ok(false); }
+            let other: Vec<String> = conn.prepare(
+                "SELECT DISTINCT pass_key FROM provider_active_destinations WHERE generation=?1 AND pass_key<>?2 AND child=?3 AND path=?4 AND admitted=1"
+            )?.query_map(params![generation,key,child,path.key()?], |row| row.get(0))?.collect::<Result<_,_>>()?;
+            for other_key in &other { load_decision(conn, &root, other_key, &child)?; }
+            Ok(other.is_empty())
         }).await
     }
 

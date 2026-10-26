@@ -217,6 +217,76 @@ async fn publish(db: &SqliteStateDb, task: &crate::download::filter::DownloadTas
 }
 
 #[tokio::test]
+async fn v027_compacted_current_pass_cannot_settle_independent_unfiled_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    let mut specification = spec();
+    specification.profile["passes"].as_array_mut().unwrap().push(json!({
+        "key":"unfiled", "kind":"Unfiled", "scope":{"database":"private","zone":specification.zone.clone(),"kind":"unfiled"}
+    }));
+    let root = db
+        .begin_selection_generation(owner(), specification.clone(), BUDGET)
+        .await
+        .unwrap();
+    let (_, tasks, _) = admission(&db, &root.id, &dir.path().join("media"), 1, false, BUDGET).await;
+    publish(&db, &tasks[0]).await;
+    db.seal_selection_generation(owner(), root.id.clone(), true, None)
+        .await
+        .unwrap();
+    {
+        let conn = db.acquire_lock("prove current owner compacted").unwrap();
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_decisions WHERE generation=?1 AND compacted_hash IS NOT NULL", [&root.id], |r|r.get(0)).unwrap(), 1);
+    }
+    let path = SelectionPath::from_path(&tasks[0].download_path);
+    assert!(
+        !db.selection_path_reusable_for_pass(
+            owner(),
+            root.id.clone(),
+            specification.scope.clone(),
+            "unfiled".into(),
+            "asset-compact-1".into(),
+            path.clone()
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        db.selection_path_reusable_for_pass(
+            owner(),
+            root.id,
+            specification.scope.clone(),
+            "pass".into(),
+            "asset-compact-1".into(),
+            path.clone()
+        )
+        .await
+        .unwrap()
+    );
+    // A later observation may reuse the earlier verified file at its stable path.
+    let next = db
+        .begin_selection_generation(owner(), specification.clone(), BUDGET)
+        .await
+        .unwrap();
+    assert!(
+        db.selection_path_reusable_for_pass(
+            owner(),
+            next.id,
+            specification.scope,
+            "unfiled".into(),
+            "asset-compact-1".into(),
+            path
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(std::fs::read(&tasks[0].download_path).unwrap(), RAW);
+}
+
+#[tokio::test]
 async fn v027_active_baseline_compacts_above_budget_and_preserves_pending_companion() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(

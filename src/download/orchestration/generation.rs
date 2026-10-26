@@ -1275,8 +1275,9 @@ impl SelectionRun {
                     let fulfilled = self
                         .capture
                         .db
-                        .selection_path_fulfills_pass(
+                        .selection_path_reusable_for_pass(
                             self.capture.owner.clone(),
+                            self.root.id.clone(),
                             self.root.spec.scope.clone(),
                             key.to_owned(),
                             asset.asset_record_name().to_owned(),
