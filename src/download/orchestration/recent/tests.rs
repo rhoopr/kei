@@ -865,11 +865,23 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
 #[tokio::test]
 async fn private_filter_expansion_reopens_retained_coverage_and_converges_without_source_changes() {
     let server = crate::start_wiremock_or_skip!();
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
-        .mount(&server)
-        .await;
-    let inventory = inventory(&server.uri());
+    // Distinct items must have distinct synthetic content here. Equal provider
+    // signatures legitimately allow immutable reuse and would test matching,
+    // not whether newly selected content is discovered.
+    let mut inventory = (*inventory(&server.uri())).clone();
+    for pair in &mut inventory {
+        let id = pair[0]["recordName"].as_str().unwrap().to_owned();
+        let body = [MEDIA, id.as_bytes()].concat();
+        pair[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(body.len());
+        pair[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body)));
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path(format!("/{id}.jpg")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+    }
+    let inventory = Arc::new(inventory);
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("filter-history.db");
     let mut config = test_config();
@@ -923,6 +935,11 @@ async fn private_filter_expansion_reopens_retained_coverage_and_converges_withou
                     .unwrap()
                     .unwrap(),
             };
+        }
+        if cycle == 1 {
+            // The cycle owner, not the download producer, detects enumeration
+            // configuration changes and requests a fresh selected inventory.
+            config.sync_mode = SyncMode::Full;
         }
         let queries = Arc::new(Mutex::new(Vec::new()));
         let session = SelectionSession {
@@ -982,7 +999,7 @@ async fn private_filter_expansion_reopens_retained_coverage_and_converges_withou
             .expect("complete unbounded selection retains the existing source bridge");
         assert_eq!(
             successor,
-            if cycle == 0 {
+            if cycle <= 1 {
                 "rank-query-token"
             } else {
                 "delta-successor"

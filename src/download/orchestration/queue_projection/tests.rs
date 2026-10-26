@@ -3214,7 +3214,7 @@ async fn private_metadata_recovery_fixture_with_signature(
                 .to_string()
                 .contains("synthetic selection seal interruption")
         );
-        assert_eq!(f.db.acquire_lock("interrupted independent media").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap(),2);
+        assert_eq!(f.db.acquire_lock("interrupted independent media").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=1",[],|r|r.get(0)).unwrap(),2, "initial publication settles requested metadata before the later seal fault");
         assert_eq!(
             f.db.acquire_lock("old coverage remains unsealed")
                 .unwrap()
@@ -3509,18 +3509,29 @@ async fn private_metadata_recovery_fixture_with_signature(
             "embedded metadata must actually change media bytes"
         );
     }
-    let interrupted_outputs = (finalization_fault != MetadataStateFault::None).then(|| {
-        media_paths
-            .iter()
-            .map(|path| {
-                (
-                    path.clone(),
-                    std::fs::read(path).unwrap(),
-                    std::fs::metadata(path).unwrap().modified().unwrap(),
-                )
-            })
-            .collect::<Vec<_>>()
-    });
+    let interrupted_outputs =
+        (interrupted || finalization_fault != MetadataStateFault::None).then(|| {
+            media_paths
+                .iter()
+                .flat_map(|path| {
+                    let mut paths = vec![path.clone()];
+                    if interrupted && !shared {
+                        paths.push(path.with_file_name(format!(
+                            "{}.xmp",
+                            path.file_name().unwrap().to_str().unwrap()
+                        )));
+                    }
+                    paths
+                })
+                .map(|path| {
+                    (
+                        path.clone(),
+                        std::fs::read(&path).unwrap(),
+                        std::fs::metadata(&path).unwrap().modified().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
     if finalization_fault == MetadataStateFault::AfterWriteAndSourceDrift {
         f.capture(vec![json!({"recordName":"independent-source-drift-after-own-output","recordType":"FutureOpaque","unknown":{"keep":"all"}})],"prepared-output-source-drift").await;
     }
