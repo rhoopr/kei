@@ -1943,14 +1943,13 @@ async fn numbered_live_photo_paths_remain_stable_across_restart() {
 }
 
 #[tokio::test]
-async fn album_publication_receipts_prevent_repeat_downloads_after_restart() {
+async fn unscoped_album_receipt_cannot_replace_current_catalog_path() {
     use base64::Engine as _;
-    use sha2::{Digest, Sha256};
     use wiremock::matchers::method;
     use wiremock::{Mock, ResponseTemplate};
     let server = crate::start_wiremock_or_skip!();
     let bytes = b"\xff\xd8\xff\xe0\0\x10JFIF\0";
-    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
+    let checksum = base64::engine::general_purpose::STANDARD.encode([0xa7; 32]);
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.as_slice()))
         .expect(0)
@@ -2001,7 +2000,9 @@ async fn album_publication_receipts_prevent_repeat_downloads_after_restart() {
         .await
         .unwrap();
         assert_eq!(result.downloaded, 0);
-        assert_eq!(result.skip_summary.on_disk, 1);
+        assert_eq!(result.skip_summary.on_disk, usize::from(album == "B"));
+        assert_eq!(result.skip_summary.uncertain, usize::from(album == "C"));
+        assert_eq!(result.state_write_failures, usize::from(album == "C"));
         assert!(result.failed.is_empty());
         let rows = db.get_downloaded_file_records().await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -2019,9 +2020,8 @@ async fn album_publication_receipts_prevent_repeat_downloads_after_restart() {
 }
 
 #[tokio::test]
-async fn additional_album_receipts_reject_missing_changed_and_foreign_files() {
+async fn unadmitted_album_candidates_remain_uncertain_without_duplicate_transfers() {
     use base64::Engine as _;
-    use sha2::{Digest, Sha256};
     use wiremock::matchers::method;
     use wiremock::{Mock, ResponseTemplate};
     #[derive(Debug)]
@@ -2047,16 +2047,19 @@ async fn additional_album_receipts_reject_missing_changed_and_foreign_files() {
         } else {
             original.as_slice()
         };
-        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
-        let old_checksum =
-            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(original));
+        let old_checksum = base64::engine::general_purpose::STANDARD.encode([0xa7; 32]);
+        let checksum = if matches!(mutation, Mutation::ProviderChange) {
+            base64::engine::general_purpose::STANDARD.encode([0xb7; 32])
+        } else {
+            old_checksum.clone()
+        };
         Mock::given(method("GET"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_bytes(bytes)
                     .insert_header("content-type", "image/jpeg"),
             )
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
         let asset = TestPhotoAsset::new("GUARDED_ALBUM")
@@ -2106,12 +2109,14 @@ async fn additional_album_receipts_reject_missing_changed_and_foreign_files() {
             Mutation::ProviderChange => {}
         }
         let preserved = fs::read(&a).ok();
+        let a_mtime = fs::metadata(&a).ok().map(|m| m.modified().unwrap());
+        let b_mtime = fs::metadata(&b).unwrap().modified().unwrap();
         let mut config = DownloadConfig::test_default();
         config.directory = Arc::from(dir.path());
         config.folder_structure = "A".to_string();
         config.album_name = Some(Arc::from("A"));
         config.state_db = Some(db.clone());
-        for cycle in 0..2 {
+        for _ in 0..2 {
             let result = stream_and_download_from_stream(
                 &reqwest::Client::new(),
                 stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
@@ -2123,16 +2128,32 @@ async fn additional_album_receipts_reject_missing_changed_and_foreign_files() {
             )
             .await
             .unwrap();
-            assert_eq!(result.downloaded, usize::from(cycle == 0), "{mutation:?}");
+            assert_eq!(result.downloaded, 0, "{mutation:?}");
+            assert_eq!(result.skip_summary.on_disk, 0, "{mutation:?}");
+            assert_eq!(result.skip_summary.uncertain, 1, "{mutation:?}");
             assert!(result.failed.is_empty(), "{mutation:?}");
+            assert!(
+                result.state_write_failures > 0
+                    || db
+                        .get_pending()
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|row| row.id.as_ref() == asset.id()),
+                "{mutation:?}: uncertain current work must be retained or admission explicitly refused"
+            );
             assert_eq!(fs::read(&b).unwrap(), bytes);
             if let Some(ref original_a) = preserved {
                 assert_eq!(&fs::read(&a).unwrap(), original_a, "{mutation:?}");
             }
         }
-        let rows = db.get_downloaded_file_records().await.unwrap();
-        let row = rows.iter().find(|row| row.id == asset.id()).unwrap();
-        assert_eq!(fs::read(row.local_path.as_ref().unwrap()).unwrap(), bytes);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(fs::read(&b).unwrap(), bytes);
+        assert_eq!(fs::metadata(&b).unwrap().modified().unwrap(), b_mtime);
+        assert_eq!(
+            fs::metadata(&a).ok().map(|m| m.modified().unwrap()),
+            a_mtime
+        );
     }
 }
 
