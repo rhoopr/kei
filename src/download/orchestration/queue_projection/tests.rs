@@ -267,6 +267,11 @@ impl Fixture {
     }
     async fn defer_retained(&self) {
         let mut plan = self.plan().await;
+        let retry_key = (
+            plan.source.page.id.0,
+            plan.source.ordinal,
+            plan.config_hash.clone(),
+        );
         plan.confirmation = None;
         plan.master = None;
         plan.records.clear();
@@ -284,23 +289,26 @@ impl Fixture {
             .unwrap();
         assert_eq!(
             conn.query_row::<(i64, i64), _, _>(
-                "SELECT attempts,next_retry_at-last_attempt_at FROM provider_work_retries",
-                [],
+                "SELECT attempts,next_retry_at-last_attempt_at FROM provider_work_retries WHERE page_id=?1 AND ordinal=?2 AND config_hash=?3",
+                rusqlite::params![retry_key.0,retry_key.1,retry_key.2],
                 |r| Ok((r.get(0)?, r.get(1)?))
             )
             .unwrap(),
             (1, 3600)
         );
-        conn.execute_batch("UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1")
-            .unwrap();
+        assert_eq!(conn.execute("UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1 WHERE page_id=?1 AND ordinal=?2 AND config_hash=?3",
+            rusqlite::params![retry_key.0,retry_key.1,retry_key.2]).unwrap(), 1);
     }
     async fn plan(&self) -> WorkPlan {
+        self.plan_for(None, true).await
+    }
+    async fn plan_for(&self, child: Option<&str>, confirm: bool) -> WorkPlan {
         let (_, scope, zone) = self.pass.album.catalog_work_scope().unwrap().unwrap();
         let config = self.config.with_pass(&self.pass);
         let config_hash = config_hash(&config, &zone);
         // Independent replay fixture is selected directly from source PK, even
         // after the production scheduler correctly skips an admitted receipt.
-        let (id,ordinal):(i64,i64)=self.db.acquire_lock("fixture source PK").unwrap().query_row("SELECT page_id,ordinal FROM provider_catalog_records WHERE kind='asset' ORDER BY page_id,ordinal LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        let (id,ordinal):(i64,i64)=self.db.acquire_lock("fixture source PK").unwrap().query_row("SELECT page_id,ordinal FROM provider_catalog_records WHERE kind='asset' AND (?1 IS NULL OR record_name=?1) ORDER BY page_id,ordinal LIMIT 1",[child],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
         let page = self
             .db
             .catalog_source(
@@ -310,6 +318,18 @@ impl Fixture {
             )
             .await
             .unwrap();
+        if !confirm {
+            return WorkPlan {
+                source: crate::state::db::provider_work::WorkSource { page, ordinal },
+                scope,
+                zone,
+                config_hash,
+                confirmation: None,
+                master: None,
+                records: Vec::new(),
+                reason: "current_lookup_unresolved",
+            };
+        }
         let current = self
             .pass
             .album
@@ -337,6 +357,29 @@ impl Fixture {
                 .collect(),
             reason: "",
         }
+    }
+    async fn seed_retained_retry(
+        &self,
+        child: &str,
+        due: bool,
+    ) -> Result<(), crate::state::error::StateError> {
+        let plan = self.plan_for(Some(child), false).await;
+        let key = (
+            plan.source.page.id.0,
+            plan.source.ordinal,
+            plan.config_hash.clone(),
+        );
+        let result = self
+            .db
+            .project_provider_work(owner(), plan, 512 * 1024 * 1024)
+            .await?;
+        assert_eq!(result, WorkAdmission::Deferred);
+        if due {
+            assert_eq!(self.db.acquire_lock("make exact retained source due").unwrap().execute(
+                "UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1 WHERE page_id=?1 AND ordinal=?2 AND config_hash=?3",
+                rusqlite::params![key.0,key.1,key.2]).unwrap(), 1);
+        }
+        Ok(())
     }
     fn count(&self, table: &str) -> i64 {
         self.db
@@ -1167,14 +1210,34 @@ async fn queue_projection_current_filters_retain_source_then_replan_changed_conf
     f.cycle().await.unwrap();
     assert_eq!(f.count("assets"), 0);
     assert_eq!(
+        f.count("provider_work_receipts"),
+        0,
+        "bare history is not admission authority"
+    );
+    // Seed an explicit pre-upgrade obligation; production must recheck current selection.
+    f.defer_retained().await;
+    f.cycle().await.unwrap();
+    assert_eq!(f.count("assets"), 0);
+    assert_eq!(
         f.db.acquire_lock("filter evidence")
             .unwrap()
-            .query_row::<String, _, _>("SELECT reason FROM provider_work_receipts", [], |r| r
-                .get(0))
+            .query_row::<String, _, _>(
+                "SELECT reason FROM provider_work_receipts WHERE confirmation IS NOT NULL",
+                [],
+                |r| r.get(0)
+            )
             .unwrap(),
         "currently_filtered"
     );
     f.config.filename_exclude = Arc::from([]);
+    f.cycle().await.unwrap();
+    assert_eq!(
+        f.count("assets"),
+        0,
+        "configuration changes do not turn raw history into work"
+    );
+    // A different profile requires its own explicit obligation. The old one remains.
+    f.defer_retained().await;
     f.cycle().await.unwrap();
     assert_eq!(f.count("assets"), 1);
     assert_eq!(f.count("provider_shadow_pages"), 1);
@@ -1203,10 +1266,22 @@ async fn queue_projection_hidden_current_asset_retains_source_without_queue_work
     f.cycle().await.unwrap();
     assert_eq!(f.count("assets"), 0);
     assert_eq!(
+        f.count("provider_work_receipts"),
+        0,
+        "bare history is not admission authority"
+    );
+    // Seed an explicit pre-upgrade obligation; production must recheck current selection.
+    f.defer_retained().await;
+    f.cycle().await.unwrap();
+    assert_eq!(f.count("assets"), 0);
+    assert_eq!(
         f.db.acquire_lock("current hidden evidence")
             .unwrap()
-            .query_row::<String, _, _>("SELECT reason FROM provider_work_receipts", [], |r| r
-                .get(0))
+            .query_row::<String, _, _>(
+                "SELECT reason FROM provider_work_receipts WHERE confirmation IS NOT NULL",
+                [],
+                |r| r.get(0)
+            )
             .unwrap(),
         "current_library_ineligible"
     );
@@ -1284,12 +1359,24 @@ async fn queue_projection_bounded_scan_does_not_starve_later_sources() {
     *f.session.records.lock().unwrap() = current;
     f.capture(original, "many").await;
     f.cycle().await.unwrap();
+    assert_eq!(f.count("assets"), 0);
+    for index in 0..66 {
+        f.seed_retained_retry(&format!("asset-m-{index}"), true)
+            .await
+            .unwrap();
+    }
+    f.cycle().await.unwrap();
     assert_eq!(f.count("assets"), 63);
     f.cycle().await.unwrap();
     assert_eq!(f.count("assets"), 65);
     f.cycle().await.unwrap();
     assert_eq!(f.count("assets"), 65);
-    assert_eq!(f.db.acquire_lock("early source still unresolved").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_work_receipts WHERE state='deferred' AND reason='current_lookup_unresolved'",[],|r|r.get(0)).unwrap(),1);
+    assert_eq!(f.db.acquire_lock("early source still unresolved").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_work_receipts r WHERE r.state='deferred' AND r.reason='current_lookup_unresolved' AND NOT EXISTS (SELECT 1 FROM provider_work_receipts done WHERE done.page_id=r.page_id AND done.ordinal=r.ordinal AND done.config_hash=r.config_hash AND done.state='admitted')",[],|r|r.get(0)).unwrap(),1);
+    assert_eq!(
+        f.count("provider_work_retries"),
+        1,
+        "only the unresolved early source remains due later"
+    );
     f.preserved().await;
 }
 
@@ -1736,6 +1823,9 @@ async fn queue_projection_actual_discovery_qualifies_primary_and_private_shared(
     }
     f.capture(source, "discovered").await;
     f.cycle().await.unwrap();
+    assert_eq!(f.count("assets"), 0);
+    assert_eq!(f.count("provider_work_receipts"), 0);
+    assert_eq!(f.project_retained().await.unwrap(), WorkAdmission::Admitted);
     assert_eq!(f.count("assets"), 1);
     assert_eq!(f.count("provider_work_receipts"), 1);
     assert_eq!(f.count("provider_work_obligations"), 1);
@@ -1798,11 +1888,14 @@ async fn queue_projection_default_primary_uses_discovered_owner_and_retained_sou
         f.pass.album.catalog_work_scope().unwrap().is_some(),
         "default primary must use explicit authenticated private discovery evidence"
     );
+    f.cycle().await.unwrap();
+    assert_eq!(f.count("assets"), 0);
+    assert_eq!(f.count("provider_work_receipts"), 0);
     // Fault after real queue writes must roll back even on the newly reachable
     // default primary route, preserving the existing checkpoint and debt.
     f.db.acquire_lock("primary receipt fault").unwrap().execute_batch("CREATE TRIGGER primary_receipt_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'primary receipt fault'); END;").unwrap();
     assert!(
-        f.cycle()
+        f.project_retained()
             .await
             .unwrap_err()
             .to_string()
@@ -1825,7 +1918,7 @@ async fn queue_projection_default_primary_uses_discovered_owner_and_retained_sou
         .unwrap()
         .execute_batch("DROP TRIGGER primary_receipt_fault;")
         .unwrap();
-    f.cycle().await.unwrap();
+    assert_eq!(f.project_retained().await.unwrap(), WorkAdmission::Admitted);
     assert_eq!(f.count("assets"), 1);
     assert_eq!(f.count("provider_work_receipts"), 1);
     assert_eq!(f.count("provider_work_obligations"), 1);
@@ -1945,7 +2038,7 @@ async fn queue_projection_due_early_retry_is_revisited_behind_scan_and_new_tail(
     let f = Fixture::new().await;
     f.capture(records("early", OLD, "source"), "early").await;
     *f.session.corrupt.lock().unwrap() = Some("missing");
-    f.cycle().await.unwrap();
+    f.seed_retained_retry("asset-early", false).await.unwrap();
     *f.session.corrupt.lock().unwrap() = None;
     let mut current = Vec::new();
     let mut original = Vec::new();
@@ -1955,6 +2048,11 @@ async fn queue_projection_due_early_retry_is_revisited_behind_scan_and_new_tail(
     }
     *f.session.records.lock().unwrap() = current;
     f.capture(original, "late").await;
+    for index in 0..70 {
+        f.seed_retained_retry(&format!("asset-late-{index}"), true)
+            .await
+            .unwrap();
+    }
     f.cycle().await.unwrap();
     assert_eq!(f.count("assets"), 64);
     f.db.acquire_lock("due behind historical scan")
@@ -1993,10 +2091,11 @@ async fn queue_projection_wake_requires_current_scope_config_and_unfinished_gene
     let mut f = Fixture::new().await;
     f.capture(records("m", OLD, "source"), "old").await;
     assert!(
-        has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+        !has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
             .await
             .unwrap()
     );
+    assert_eq!(f.project_retained().await.unwrap(), WorkAdmission::Admitted);
     f.cycle().await.unwrap();
     assert!(
         has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
@@ -2065,10 +2164,10 @@ async fn queue_projection_wake_requires_current_scope_config_and_unfinished_gene
     );
     f.config.filename_exclude = Arc::from([glob::Pattern::new("changed.jpg").unwrap()]);
     assert!(
-        has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+        !has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
             .await
             .unwrap(),
-        "new config has its own unconsumed source"
+        "new configuration alone must not turn history into admitted work"
     );
 }
 
@@ -2079,7 +2178,7 @@ async fn queue_projection_deferred_retry_and_scan_roll_back_with_receipt_fault()
     *f.session.corrupt.lock().unwrap() = Some("missing");
     f.db.acquire_lock("deferred receipt fault").unwrap().execute_batch("CREATE TRIGGER retry_receipt_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'synthetic deferred receipt fault'); END;").unwrap();
     assert!(
-        f.cycle()
+        f.seed_retained_retry("asset-m", true)
             .await
             .unwrap_err()
             .to_string()
@@ -2098,7 +2197,7 @@ async fn queue_projection_deferred_retry_and_scan_roll_back_with_receipt_fault()
         .unwrap()
         .execute_batch("DROP TRIGGER retry_receipt_fault")
         .unwrap();
-    f.cycle().await.unwrap();
+    f.seed_retained_retry("asset-m", true).await.unwrap();
     f.db.acquire_lock("retry due and failed receipt").unwrap().execute_batch("UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1; CREATE TRIGGER retry_receipt_fault BEFORE INSERT ON provider_work_receipts BEGIN SELECT RAISE(ABORT,'synthetic deferred receipt fault'); END;").unwrap();
     assert!(f.cycle().await.is_err());
     let retry: (u32, i64, i64) =
@@ -2191,6 +2290,13 @@ async fn queue_projection_admitted_before_dispatch_reopens_materializes_and_stay
     }
     f.capture(records("m", OLD, "source"), "old").await;
     f.cycle().await.unwrap();
+    assert_eq!(
+        f.count("provider_work_receipts"),
+        0,
+        "bare history is not admission authority"
+    );
+    assert_eq!(f.count("assets"), 0);
+    assert_eq!(f.project_retained().await.unwrap(), WorkAdmission::Admitted);
     assert_eq!(f.count("provider_work_receipts"), 1);
     assert_eq!(
         f.db.acquire_lock("pre-dispatch interruption oracle")
