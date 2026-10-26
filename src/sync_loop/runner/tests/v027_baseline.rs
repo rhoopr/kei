@@ -1213,6 +1213,10 @@ async fn baseline_contract(
             "renamed receipt must not acquire a duplicate"
         );
         if initial_failure && cycle == 0 {
+            assert_eq!(
+                result.stats.state_write_failures, 0,
+                "the injected media failure must not be confused with a state-write failure"
+            );
             assert!(!missing_root.join("missing.JPG").exists());
         } else {
             assert_eq!(

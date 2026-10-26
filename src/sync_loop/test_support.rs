@@ -547,7 +547,6 @@ pub(super) struct FailingMetadataSetDb {
     pub(super) replace_download_dir_on_upsert: Option<std::path::PathBuf>,
     pub(super) fail_upsert_seen: bool,
     pub(super) fail_source_delete: bool,
-    pub(super) fail_mark_downloaded: bool,
     pub(super) fail_refresh_downloaded_metadata: bool,
     /// Stands in for a concurrent pass: refreshes the row to this snapshot
     /// and marks it for rewrite in the window between the downloader
@@ -580,9 +579,6 @@ impl FailingMetadataSetDb {
         id: &str,
         version_size: &str,
     ) -> Result<(), state::error::StateError> {
-        if self.fail_mark_downloaded {
-            return Err(state::error::StateError::LockPoisoned(self.message.into()));
-        }
         if let Some(newer) = &self.refresh_on_mark_downloaded {
             let record = self
                 .inner
@@ -632,7 +628,6 @@ impl FailingMetadataSetDb {
             replace_download_dir_on_upsert: None,
             fail_upsert_seen: false,
             fail_source_delete: false,
-            fail_mark_downloaded: false,
             fail_refresh_downloaded_metadata: false,
             refresh_on_mark_downloaded: None,
             drains: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -684,11 +679,6 @@ impl FailingMetadataSetDb {
 
     pub(super) fn with_download_dir_replaced_on_upsert(mut self, path: std::path::PathBuf) -> Self {
         self.replace_download_dir_on_upsert = Some(path);
-        self
-    }
-
-    pub(super) fn with_mark_downloaded_failure(mut self) -> Self {
-        self.fail_mark_downloaded = true;
         self
     }
 

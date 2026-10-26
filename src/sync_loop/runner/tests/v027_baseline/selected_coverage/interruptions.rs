@@ -26,6 +26,7 @@ enum Fault {
     EarlyCancel,
     LateCancel,
     DeferredTransfer,
+    DeferredTransferCheckpoint,
     DeferredSelection,
     StalePlan,
     DownloadedStatus,
@@ -115,6 +116,11 @@ async fn v027_changed_smart_selection_deferred_transfer_retries_when_provider_qu
 }
 
 #[tokio::test]
+async fn v027_deferred_transfer_survives_checkpoint_failure_and_quiet_reopen() {
+    interrupted(Fault::DeferredTransferCheckpoint).await;
+}
+
+#[tokio::test]
 async fn v027_unconfirmed_smart_selection_holds_cursor_then_replays_on_reopen() {
     interrupted(Fault::DeferredSelection).await;
 }
@@ -187,7 +193,7 @@ async fn interrupted(fault: Fault) {
         );
         let cancel = CancellationToken::new();
         let hit = Arc::new(AtomicBool::new(false));
-        if cycle == 1 && fault == Fault::Checkpoint {
+        if cycle == 1 && matches!(fault, Fault::Checkpoint | Fault::DeferredTransferCheckpoint) {
             let sql = format!("CREATE TRIGGER reject_current_checkpoint BEFORE INSERT ON metadata
                 WHEN NEW.key='{}' BEGIN SELECT RAISE(ABORT,'synthetic v27 checkpoint failure'); END;",key);
             db.acquire_lock("install checkpoint fault")
@@ -201,25 +207,54 @@ async fn interrupted(fault: Fault) {
             ).unwrap();
         }
         if cycle == 2 {
+            if fault == Fault::DeferredTransferCheckpoint {
+                assert_eq!(
+                    db.get_metadata(&key).await.unwrap().as_deref(),
+                    Some("selected-after-1")
+                );
+                let pending: i64 = db.acquire_lock("reopened failed checkpoint retains transfer").unwrap().query_row(
+                    "SELECT count(*) FROM provider_active_destinations WHERE library=?1 AND asset_id='asset-selected-next' AND admitted=1 AND verified_media=0",
+                    [ZONE], |r| r.get(0)).unwrap();
+                assert!(
+                    pending > 0,
+                    "reopen must preserve independently admitted unfinished work"
+                );
+                assert!(!root.join("new-selected/next.JPG").exists());
+            }
             db.acquire_lock("remove checkpoint fault")
                 .unwrap()
                 .execute_batch("DROP TRIGGER IF EXISTS reject_current_checkpoint; DROP TRIGGER IF EXISTS reject_downloaded_status;")
                 .unwrap();
-            if matches!(fault, Fault::DeferredTransfer | Fault::DeferredSelection) {
+            if matches!(
+                fault,
+                Fault::DeferredTransfer
+                    | Fault::DeferredTransferCheckpoint
+                    | Fault::DeferredSelection
+            ) {
                 db.make_selection_retry_due(baseline_owner(), "asset-selected-next".into())
                     .await
                     .unwrap();
             }
         }
         fail_transfer.store(
-            cycle == 1 && fault == Fault::DeferredTransfer,
+            cycle == 1
+                && matches!(
+                    fault,
+                    Fault::DeferredTransfer | Fault::DeferredTransferCheckpoint
+                ),
             Ordering::SeqCst,
         );
         let inner = Session {
             // Deferred work must recover without another provider observation.
             cycle: if cycle == 0 {
                 0
-            } else if cycle == 1 || (cycle == 2 && fault != Fault::DeferredTransfer) {
+            } else if cycle == 1
+                || (cycle == 2
+                    && !matches!(
+                        fault,
+                        Fault::DeferredTransfer | Fault::DeferredTransferCheckpoint
+                    ))
+            {
                 1
             } else {
                 2
@@ -310,11 +345,17 @@ async fn interrupted(fault: Fault) {
                     "downloaded-status trigger must execute"
                 );
             }
-            if fault == Fault::Checkpoint {
+            if matches!(fault, Fault::Checkpoint | Fault::DeferredTransferCheckpoint) {
                 assert!(
                     format!("{:?} {result:?}", trace.events())
                         .contains("synthetic v27 checkpoint failure"),
                     "checkpoint trigger must execute"
+                );
+            }
+            if fault == Fault::DeferredTransferCheckpoint {
+                assert!(
+                    failed_next.load(Ordering::SeqCst) > 0,
+                    "transfer fault must also execute"
                 );
             }
             if fault == Fault::DeferredTransfer {
@@ -329,7 +370,7 @@ async fn interrupted(fault: Fault) {
                     "{fault:?}: {result:?}"
                 ),
                 Err(error) => assert!(
-                    fault == Fault::Checkpoint
+                    matches!(fault, Fault::Checkpoint | Fault::DeferredTransferCheckpoint)
                         && format!("{error:#}").contains("synthetic v27 checkpoint failure"),
                     "{error:#}"
                 ),
@@ -372,7 +413,10 @@ async fn interrupted(fault: Fault) {
                 );
                 assert!(!root.join("new-selected/next.JPG").exists());
             }
-            if fault == Fault::DeferredTransfer {
+            if matches!(
+                fault,
+                Fault::DeferredTransfer | Fault::DeferredTransferCheckpoint
+            ) {
                 let count:i64=db.acquire_lock("prove pending destination").unwrap().query_row(
                     "SELECT count(*) FROM provider_active_destinations WHERE library=?1 AND asset_id='asset-selected-next' AND admitted=1 AND verified_media=0",
                     [ZONE],|r|r.get(0)).unwrap();
@@ -391,12 +435,21 @@ async fn interrupted(fault: Fault) {
                 result.can_advance_database_checkpoint(),
                 "{fault:?} cycle {cycle}: {result:?}"
             );
-            if cycle == 2 && fault == Fault::DeferredTransfer {
-                assert_eq!(
-                    inner.queries.load(Ordering::SeqCst),
-                    0,
-                    "independent retry must not enumerate inventory"
-                );
+            if cycle == 2
+                && matches!(
+                    fault,
+                    Fault::DeferredTransfer | Fault::DeferredTransferCheckpoint
+                )
+            {
+                // A rejected selection checkpoint may require its observation again;
+                // a committed observation with only transfer debt must not rescan.
+                if fault == Fault::DeferredTransfer {
+                    assert_eq!(
+                        inner.queries.load(Ordering::SeqCst),
+                        0,
+                        "independent retry must not enumerate inventory"
+                    );
+                }
                 let pending:i64=db.acquire_lock("prove resolved decision").unwrap().query_row(
                     "SELECT count(*) FROM provider_active_destinations WHERE library='PrimarySync' AND asset_id='asset-selected-next' AND admitted=1 AND verified_media=0",
                     [],|r|r.get(0)).unwrap();
@@ -435,7 +488,10 @@ async fn interrupted(fault: Fault) {
         1,
         "new selected content transfers successfully exactly once"
     );
-    if fault == Fault::DeferredTransfer {
+    if matches!(
+        fault,
+        Fault::DeferredTransfer | Fault::DeferredTransferCheckpoint
+    ) {
         assert!(failed_next.load(Ordering::SeqCst) > 0);
     }
     server.verify().await;
