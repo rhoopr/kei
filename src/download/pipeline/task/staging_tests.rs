@@ -92,6 +92,28 @@ fn task(path: std::path::PathBuf, id: &str, size: u64) -> DownloadTask {
     }
 }
 
+// The task runner receives already-admitted work from the planner. Seed that
+// prerequisite explicitly so staging tests reach publication ownership checks.
+async fn admit_task(db: &crate::state::SqliteStateDb, task: &DownloadTask) {
+    db.upsert_seen(&crate::state::AssetRecord::new_pending(
+        task.library.clone(),
+        task.asset_id.to_string(),
+        task.version_size,
+        task.checksum.to_string(),
+        task.download_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        task.created_local.with_timezone(&chrono::Utc),
+        None,
+        task.size,
+        task.media_type,
+    ))
+    .await
+    .unwrap();
+}
+
 async fn wait_for_part(path: &std::path::Path, length: u64) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while tokio::fs::metadata(path).await.unwrap().len() != length {
@@ -206,6 +228,7 @@ async fn resumed_owner_survives_same_identity_and_cross_version_waiter_cancellat
             db.claim_temp_file(&part).await.unwrap();
         }
         let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+        admit_task(&db, &a).await;
         let written = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let first = PausedClient {
@@ -264,7 +287,10 @@ async fn resumed_owner_survives_same_identity_and_cross_version_waiter_cancellat
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].path, part);
         release.notify_one();
-        assert!(owner.await.unwrap().is_ok());
+        owner
+            .await
+            .unwrap()
+            .expect("streaming owner must publish safely");
         assert_eq!(std::fs::read(&a.download_path).unwrap(), body);
         assert!(!part.exists());
         assert!(
@@ -275,11 +301,17 @@ async fn resumed_owner_survives_same_identity_and_cross_version_waiter_cancellat
                 .is_empty()
         );
         // The lease's stable inode survives restart, but its ownership does not.
-        assert!(
-            run(&client, &a, &CancellationToken::new(), Some(&reopened))
-                .await
-                .is_ok()
-        );
+        // Check the lease directly: an already-published file is not authority
+        // for another task-level transfer to overwrite that destination.
+        let token = CancellationToken::new();
+        let lease = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::download::file::lock_download_destination(&a.download_path, &token),
+        )
+        .await
+        .expect("completed owner must release its lease")
+        .unwrap();
+        drop(lease);
         assert_eq!(std::fs::read(a.download_path).unwrap(), body);
     }
 }
@@ -294,6 +326,8 @@ async fn failed_claim_and_failed_peer_retirement_preserve_streaming_owner_eviden
         .unwrap();
     let db_path = dir.path().join("state.db");
     let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+    admit_task(&db, &a).await;
+    admit_task(&db, &b).await;
     let written = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let first = PausedClient {
@@ -349,7 +383,10 @@ async fn failed_claim_and_failed_peer_retirement_preserve_streaming_owner_eviden
     assert_eq!(claims[0].path, part);
     assert_eq!(std::fs::read(&part).unwrap(), body[..32]);
     release.notify_one();
-    assert!(owner.await.unwrap().is_ok());
+    owner
+        .await
+        .unwrap()
+        .expect("streaming owner must publish safely");
     assert_eq!(std::fs::read(a.download_path).unwrap(), body);
     assert!(!b.download_path.exists());
     assert!(
@@ -403,7 +440,10 @@ async fn changed_generation_waits_then_preserves_no_overwrite_publication() {
     );
     assert!(!new_part.exists());
     release.notify_one();
-    assert!(owner.await.unwrap().is_ok());
+    owner
+        .await
+        .unwrap()
+        .expect("streaming owner must publish safely");
     assert!(
         waiter.await.is_err(),
         "different bytes cannot overwrite an earlier generation"
@@ -606,6 +646,8 @@ async fn cancelled_twin_retains_only_its_prefix_and_resumes_after_reopen() {
         .unwrap();
     let db_path = dir.path().join("state.db");
     let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+    admit_task(&db, &a).await;
+    admit_task(&db, &b).await;
     let written = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let token = CancellationToken::new();
@@ -622,11 +664,9 @@ async fn cancelled_twin_retains_only_its_prefix_and_resumes_after_reopen() {
     });
     written.notified().await;
     let client = StaticClient { body: body.clone() };
-    assert!(
-        run(&client, &b, &CancellationToken::new(), Some(db.as_ref()))
-            .await
-            .is_ok()
-    );
+    run(&client, &b, &CancellationToken::new(), Some(db.as_ref()))
+        .await
+        .expect("independent staging owner must publish safely");
     token.cancel();
     assert!(
         owner
@@ -683,13 +723,12 @@ async fn legacy_checksum_staging_is_neither_adopted_nor_retired_by_new_task() {
     let db = crate::state::SqliteStateDb::open(&dir.path().join("state.db"))
         .await
         .unwrap();
+    admit_task(&db, &a).await;
     db.claim_temp_file(&legacy).await.unwrap();
     let client = StaticClient { body: body.clone() };
-    assert!(
-        run(&client, &a, &CancellationToken::new(), Some(&db))
-            .await
-            .is_ok()
-    );
+    run(&client, &a, &CancellationToken::new(), Some(&db))
+        .await
+        .expect("independent staging owner must publish safely");
     assert_eq!(std::fs::read(a.download_path).unwrap(), body);
     assert_eq!(
         std::fs::read(&legacy).unwrap(),
