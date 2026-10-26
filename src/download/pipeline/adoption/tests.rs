@@ -1230,10 +1230,10 @@ async fn ampm_variant_suffixed_downloaded_file_is_on_disk_skipped() {
     assert!(failed.is_empty(), "suffixed file should remain downloaded");
 }
 
-/// Same #594 path, but the recorded suffixed file is too small. The
-/// state-backed skip must not hide local truncation.
+/// A truncated suffixed candidate with an invalid receipt must remain visible
+/// without blessing its bytes or downloading a speculative duplicate.
 #[tokio::test]
-async fn truncated_suffixed_downloaded_file_is_forwarded_not_on_disk_skipped() {
+async fn truncated_suffixed_file_without_valid_receipt_remains_pending() {
     use crate::download::DownloadConfig;
     use crate::icloud::photos::PhotoAsset;
     use crate::state::SqliteStateDb;
@@ -1291,13 +1291,30 @@ async fn truncated_suffixed_downloaded_file_is_forwarded_not_on_disk_skipped() {
         result.skip_summary.on_disk, 0,
         "truncated suffixed file must not be counted as an on-disk skip"
     );
-    let failed = db.get_failed().await.unwrap();
-    assert_eq!(
-        failed.len(),
-        1,
-        "truncated suffixed file must be forwarded for re-download"
+    assert_eq!(result.downloaded, 0);
+    assert_eq!(result.skip_summary.uncertain, 1);
+    assert!(
+        db.get_failed().await.unwrap().is_empty(),
+        "no transfer was attempted"
     );
-    assert_eq!(&*failed[0].id, "TRUNCATED_SUFFIXED_B");
+    let pending = db.get_pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(&*pending[0].id, "TRUNCATED_SUFFIXED_B");
+    let diagnostic = crate::state::db::match_diagnostics::MatchDiagnostics::decode(
+        pending[0]
+            .last_error
+            .as_deref()
+            .expect("pending match explanation"),
+    )
+    .expect("pending work must carry structured existing-file uncertainty");
+    assert!(
+        diagnostic
+            .attempts
+            .iter()
+            .any(|attempt| !attempt.explanation.candidates.is_empty())
+    );
+    assert_eq!(fs::read(&suffixed_path).unwrap(), Vec::<u8>::new());
+    assert_eq!(fs::read(&bare_path).unwrap(), vec![0u8; 1234]);
 }
 
 /// A state-backed identity-suffixed skip is valid only for the current
@@ -1466,15 +1483,10 @@ async fn capture_local_date_folder_forwards_and_keeps_host_local_copy() {
     );
 }
 
-/// Data-sacred regression for state-backed on-disk skips.
-///
-/// A downloaded DB row with a matching remote checksum is not enough to
-/// trust a too-small local file. If the stored current path exists but is
-/// shorter than the API-reported size, the producer must route the asset
-/// back through the download phase instead of letting the truncated file
-/// mask the real media.
+/// A recorded path and opaque checksum cannot authorize reuse or replacement
+/// of a truncated candidate. Keep durable uncertainty and preserve the file.
 #[tokio::test]
-async fn truncated_downloaded_file_is_forwarded_not_on_disk_skipped() {
+async fn truncated_file_without_valid_receipt_remains_pending() {
     use crate::download::DownloadConfig;
     use crate::icloud::photos::PhotoAsset;
     use crate::state::SqliteStateDb;
@@ -1487,9 +1499,8 @@ async fn truncated_downloaded_file_is_forwarded_not_on_disk_skipped() {
             .item_type("public.jpeg")
             .orig_file_type("public.jpeg")
             .orig_size(1234)
-            // Allowlisted CDN host so the asset reaches the download
-            // phase; the non-base64 checksum fails locally without
-            // doing network I/O.
+            // A syntactically allowed host does not authorize transfer when
+            // the existing candidate lacks a valid receipt/provider proof.
             .orig_url("https://p01.icloud-content.com/IMG_TRUNCATED.JPG")
             .orig_checksum("ck_truncated_downloaded")
             .build()
@@ -1545,19 +1556,34 @@ async fn truncated_downloaded_file_is_forwarded_not_on_disk_skipped() {
 
     assert_eq!(
         result.downloaded, 0,
-        "dead test URL should not produce a successful download"
+        "uncertain existing content must not trigger a duplicate transfer"
     );
     assert_eq!(
         result.skip_summary.on_disk, 0,
         "truncated downloaded file must not be counted as an on-disk skip"
     );
-    let failed = db.get_failed().await.unwrap();
-    assert_eq!(
-        failed.len(),
-        1,
-        "truncated file must be forwarded for re-download (which fails against the dead URL)"
+    assert_eq!(result.skip_summary.uncertain, 1);
+    assert!(
+        db.get_failed().await.unwrap().is_empty(),
+        "no transfer was attempted"
     );
-    assert_eq!(&*failed[0].id, "TRUNCATED_DOWNLOADED");
+    let pending = db.get_pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(&*pending[0].id, "TRUNCATED_DOWNLOADED");
+    let diagnostic = crate::state::db::match_diagnostics::MatchDiagnostics::decode(
+        pending[0]
+            .last_error
+            .as_deref()
+            .expect("pending match explanation"),
+    )
+    .expect("pending work must carry structured existing-file uncertainty");
+    assert!(
+        diagnostic
+            .attempts
+            .iter()
+            .any(|attempt| !attempt.explanation.candidates.is_empty())
+    );
+    assert_eq!(fs::read(&target_path).unwrap(), Vec::<u8>::new());
 }
 
 /// When SIGTERM fires mid-sync, the .part files must not be promoted
