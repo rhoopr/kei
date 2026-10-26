@@ -10,6 +10,7 @@ use std::sync::Arc;
 #[cfg(feature = "xmp")]
 pub(super) async fn write_sidecar_metadata(
     path: &Path,
+    namespace: Option<crate::fs_util::ConfinedPath>,
     payload: Arc<MetadataPayload>,
     created_local: DateTime<FixedOffset>,
     source_checksum: Option<&str>,
@@ -51,8 +52,9 @@ pub(super) async fn write_sidecar_metadata(
     if write.is_empty() {
         return source_error.is_none();
     }
-    match Box::pin(crate::download::metadata::write_sidecar(
+    match Box::pin(crate::download::metadata::write_sidecar_in_namespace(
         path,
+        namespace,
         &write,
         temp_suffix,
     ))

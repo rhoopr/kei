@@ -256,3 +256,50 @@ fn windows_long_path_replacement_retains_backup_and_guarded_restore() {
     assert_eq!(std::fs::read(&part).unwrap(), b"verified replacement");
     assert!(!backup.exists());
 }
+
+#[cfg(all(unix, feature = "xmp"))]
+#[test]
+fn sidecar_cleanup_preserves_replaced_or_edited_displaced_entry() {
+    for replace in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("photo.xmp");
+        let part = dir.path().join("output.part");
+        std::fs::write(&target, b"original packet").unwrap();
+        std::fs::write(&part, b"requested packet").unwrap();
+        let expected = super::fingerprint_regular_file_blocking(&target).unwrap();
+        let output = super::fingerprint_regular_file_blocking(&part).unwrap();
+        let target = crate::fs_util::ConfinedPath::open(
+            dir.path(),
+            &target,
+            crate::fs_util::ConfinedParents::Existing,
+        )
+        .unwrap();
+        let part = crate::fs_util::ConfinedPath::open(
+            dir.path(),
+            &part,
+            crate::fs_util::ConfinedParents::Existing,
+        )
+        .unwrap();
+        let identity = crate::fs_util::file_identity(&part.open_regular().unwrap()).unwrap();
+        let path = part.path().to_owned();
+        super::SIDECAR_CLEANUP_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if replace {
+                    std::fs::rename(&path, path.with_extension("retained")).unwrap();
+                }
+                std::fs::write(&path, b"unapproved external edit").unwrap();
+            }))
+        });
+        let result =
+            super::publish_sidecar_confined(&part, &target, Some(expected), output, identity);
+        assert!(
+            result.is_err(),
+            "changed displaced entry must remain pending; replace={replace}"
+        );
+        assert_eq!(
+            std::fs::read(part.path()).unwrap(),
+            b"unapproved external edit"
+        );
+        assert_eq!(std::fs::read(target.path()).unwrap(), b"requested packet");
+    }
+}

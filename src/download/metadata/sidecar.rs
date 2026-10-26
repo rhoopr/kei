@@ -1,6 +1,6 @@
 //! Sidecar ownership, preparation, and conditional publication.
 
-use super::prepared::{TmpGuard, fingerprint_bytes};
+use super::prepared::fingerprint_bytes;
 use super::values::MetadataWrite;
 use super::xmp_fields::{
     KEI_MANAGED_FIELDS, KEI_XMP_NS, apply_to_owned_sidecar, ensure_initialized,
@@ -51,8 +51,18 @@ impl ReconciledSidecarSnapshot {
 /// rather than overwriting the whole packet. Existing bytes must remain
 /// readable, parseable, and unchanged through publication. Otherwise the
 /// write fails without replacing them.
+#[cfg(test)]
 pub(crate) async fn write_sidecar(
     media_path: &Path,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+) -> Result<()> {
+    write_sidecar_in_namespace(media_path, None, write, temp_suffix).await
+}
+
+pub(crate) async fn write_sidecar_in_namespace(
+    media_path: &Path,
+    namespace: Option<crate::fs_util::ConfinedPath>,
     write: &MetadataWrite,
     temp_suffix: &str,
 ) -> Result<()> {
@@ -60,7 +70,7 @@ pub(crate) async fn write_sidecar(
     let write = write.clone();
     let temp_suffix = temp_suffix.to_owned();
     let prepared = tokio::task::spawn_blocking(move || {
-        prepare_sidecar_write(&media_path, &write, &temp_suffix)
+        prepare_sidecar_write(&media_path, namespace, &write, &temp_suffix)
     })
     .await
     .context("XMP sidecar preparation task panicked")??;
@@ -78,42 +88,17 @@ pub(crate) async fn write_sidecar(
     };
 
     // CONTRACT: XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT
-    let publication = crate::download::file::publish_file_if_unchanged(
-        &prepared.tmp_path,
-        &prepared.sidecar_path,
-        prepared.expected,
-    )
-    .await;
-    if let Err(error) = publication {
-        #[cfg(target_os = "linux")]
-        if crate::download::file::classify_conditional_publish_error(&error).filesystem_unsupported
-            && crate::download::file::classify_conditional_publish_error(&error)
-                .retained_paths
-                .is_empty()
-        {
-            // Remove only the writer's unchanged output after an unsupported
-            // filesystem operation. Explicit recovery claims always retain it.
-            let temp = prepared.tmp_path.clone();
-            let output = prepared.output;
-            let identity = prepared.identity;
-            tokio::task::spawn_blocking(move || {
-                if let Err(error) = crate::download::file::cleanup_prepared_sidecar(&temp, output, identity) {
-                    tracing::warn!(path = %temp.display(), error = %format!("{error:#}"), "Could not safely remove prepared sidecar; retaining file");
-                }
-            })
-            .await
-            .context("Sidecar cleanup task panicked")?;
-        }
-        return Err(error).with_context(|| {
-            format!(
-                "Could not install XMP sidecar {} -> {}",
-                prepared.tmp_path.display(),
-                prepared.sidecar_path.display()
-            )
-        });
-    }
-    tracing::debug!(target: "kei::download::metadata", path = %prepared.sidecar_path.display(), "Wrote XMP sidecar");
-    Ok(())
+    tokio::task::spawn_blocking(move || {
+        crate::download::file::publish_sidecar_confined(
+            &prepared.temp,
+            &prepared.target,
+            prepared.expected,
+            prepared.output,
+            prepared.identity,
+        )
+    })
+    .await
+    .context("Sidecar publication task panicked")?
 }
 
 enum PreparedSidecar {
@@ -122,17 +107,16 @@ enum PreparedSidecar {
 }
 
 struct SidecarPublication {
-    tmp_path: PathBuf,
-    sidecar_path: PathBuf,
+    temp: crate::fs_util::ConfinedPath,
+    target: crate::fs_util::ConfinedPath,
     expected: Option<crate::download::file::ExistingFileFingerprint>,
-    #[cfg(target_os = "linux")]
     output: crate::download::file::ExistingFileFingerprint,
-    #[cfg(target_os = "linux")]
     identity: crate::fs_util::FileIdentity,
 }
 
 fn prepare_sidecar_write(
     media_path: &Path,
+    namespace: Option<crate::fs_util::ConfinedPath>,
     write: &MetadataWrite,
     temp_suffix: &str,
 ) -> Result<Option<PreparedSidecar>> {
@@ -150,12 +134,31 @@ fn prepare_sidecar_write(
     let mut sidecar_name = name.to_os_string();
     sidecar_name.push(".xmp");
     let sidecar_path = media_path.with_file_name(&sidecar_name);
+    let target = match namespace {
+        Some(namespace) => namespace.sibling(&sidecar_path)?,
+        None => crate::fs_util::ConfinedPath::open(
+            sidecar_path.parent().context("Sidecar has no parent")?,
+            &sidecar_path,
+            crate::fs_util::ConfinedParents::Existing,
+        )?,
+    };
+    // Recovery refuses unsafe ancestors; retain the checked namespace afterward.
     #[cfg(target_os = "linux")]
-    crate::download::file::recover_file_replacement(&sidecar_path)?;
+    crate::download::file::recover_file_replacement_confined(&target)?;
+    let existing = target
+        .open_optional_regular()?
+        .map(|mut file| {
+            let identity = crate::fs_util::file_identity(&file)?;
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes)?;
+            target.validate_identity(identity)?;
+            Ok::<_, std::io::Error>(bytes)
+        })
+        .transpose()?;
     // Seed the packet with any existing sidecar content so user-authored
     // ratings / keywords / develop settings from another tool survive.
-    let (mut meta, expected, existing_bytes) = match std::fs::read(&sidecar_path) {
-        Ok(existing_bytes) => {
+    let (mut meta, expected, existing_bytes) = match existing {
+        Some(existing_bytes) => {
             let existing = std::str::from_utf8(&existing_bytes).with_context(|| {
                 format!(
                     "Existing XMP sidecar is not valid UTF-8: {}",
@@ -171,17 +174,7 @@ fn prepare_sidecar_write(
             let fingerprint = fingerprint_bytes(&existing_bytes)?;
             (parsed, Some(fingerprint), Some(existing_bytes))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (XmpMeta::new().context("creating XmpMeta")?, None, None)
-        }
-        Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "Could not read existing XMP sidecar {}",
-                    sidecar_path.display()
-                )
-            });
-        }
+        None => (XmpMeta::new().context("creating XmpMeta")?, None, None),
     };
     if write.is_empty() && !meta.contains_property(KEI_XMP_NS, KEI_MANAGED_FIELDS) {
         return Ok(None);
@@ -189,14 +182,7 @@ fn prepare_sidecar_write(
     apply_to_owned_sidecar(&mut meta, write)?;
     let bytes = meta.to_string().into_bytes();
     if existing_bytes.as_deref() == Some(bytes.as_slice()) {
-        let parent = sidecar_path
-            .parent()
-            .context("Sidecar has no parent directory")?;
-        let path = crate::fs_util::ConfinedPath::open(
-            parent,
-            &sidecar_path,
-            crate::fs_util::ConfinedParents::Existing,
-        )?;
+        let path = target;
         let snapshot =
             ReconciledSidecarSnapshot::read(path)?.context("Unchanged sidecar disappeared")?;
         anyhow::ensure!(
@@ -207,8 +193,8 @@ fn prepare_sidecar_write(
         return Ok(Some(PreparedSidecar::Unchanged(snapshot)));
     }
 
-    let (mut temp, tmp_path) = create_unique_sidecar_temp(&sidecar_path, temp_suffix)?;
-    let guard = TmpGuard::new(&tmp_path);
+    let (mut temp, temporary) = create_unique_sidecar_temp(&target, temp_suffix)?;
+    let tmp_path = temporary.path();
     std::io::Write::write_all(&mut temp, &bytes).with_context(|| {
         format!(
             "Could not write temporary XMP sidecar {}",
@@ -221,14 +207,11 @@ fn prepare_sidecar_write(
             tmp_path.display()
         )
     })?;
-    guard.disarm();
     Ok(Some(PreparedSidecar::Publish(SidecarPublication {
-        tmp_path,
-        sidecar_path,
+        temp: temporary,
+        target,
         expected,
-        #[cfg(target_os = "linux")]
         output: fingerprint_bytes(&bytes)?,
-        #[cfg(target_os = "linux")]
         identity: crate::fs_util::file_identity(&temp)?,
     })))
 }
@@ -242,21 +225,18 @@ fn sidecar_temp_path(sidecar_path: &Path, temp_suffix: &str, sequence: u64) -> P
 }
 
 fn create_unique_sidecar_temp(
-    sidecar_path: &Path,
+    target: &crate::fs_util::ConfinedPath,
     temp_suffix: &str,
-) -> Result<(std::fs::File, PathBuf)> {
+) -> Result<(std::fs::File, crate::fs_util::ConfinedPath)> {
     loop {
         let candidate = sidecar_temp_path(
-            sidecar_path,
+            target.path(),
             temp_suffix,
             SIDECAR_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         );
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(file) => return Ok((file, candidate)),
+        let confined = target.sibling(&candidate)?;
+        match confined.create_new_regular() {
+            Ok(file) => return Ok((file, confined)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -423,6 +403,57 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn current_sidecar_writer_refuses_linked_destination_and_parent() {
+        for linked_parent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let parent = dir.path().join("owned");
+            fs::create_dir(&parent).unwrap();
+            let media = parent.join("photo.jpg");
+            fs::write(&media, b"original media").unwrap();
+            let external_media = outside.path().join("photo.jpg");
+            fs::write(&external_media, b"external media").unwrap();
+            let external_sidecar = outside.path().join("photo.jpg.xmp");
+            let old = MetadataWrite {
+                title: Some("External".into()),
+                ..MetadataWrite::default()
+            };
+            write_sidecar(&external_media, &old, ".test").await.unwrap();
+            let bytes = fs::read(&external_sidecar).unwrap();
+            let stamp = fs::metadata(&external_sidecar).unwrap().modified().unwrap();
+            if linked_parent {
+                fs::rename(&parent, dir.path().join("retained")).unwrap();
+                std::os::unix::fs::symlink(outside.path(), &parent).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&external_sidecar, parent.join("photo.jpg.xmp"))
+                    .unwrap();
+            }
+            let changed = MetadataWrite {
+                title: Some("Changed".into()),
+                ..MetadataWrite::default()
+            };
+            assert!(
+                write_sidecar(&media, &changed, ".test").await.is_err(),
+                "linked_parent={linked_parent}"
+            );
+            assert_eq!(fs::read(&external_sidecar).unwrap(), bytes);
+            assert_eq!(
+                fs::metadata(&external_sidecar).unwrap().modified().unwrap(),
+                stamp
+            );
+            assert_eq!(fs::read(&external_media).unwrap(), b"external media");
+            assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 2);
+            let original = if linked_parent {
+                dir.path().join("retained/photo.jpg")
+            } else {
+                media
+            };
+            assert_eq!(fs::read(original).unwrap(), b"original media");
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn identical_sidecar_refuses_links_replacement_parent_and_in_place_mutation() {
         for fault in ["leaf-link", "replace-file", "replace-parent", "in-place"] {
@@ -443,12 +474,12 @@ mod tests {
                 fs::write(&other, &bytes).unwrap();
                 fs::remove_file(&sidecar).unwrap();
                 std::os::unix::fs::symlink(&other, &sidecar).unwrap();
-                assert!(prepare_sidecar_write(&media, &write, ".meta-tmp").is_err());
+                assert!(prepare_sidecar_write(&media, None, &write, ".meta-tmp").is_err());
                 assert_eq!(fs::read(&other).unwrap(), bytes);
                 continue;
             }
             let super::PreparedSidecar::Unchanged(snapshot) =
-                prepare_sidecar_write(&media, &write, ".meta-tmp")
+                prepare_sidecar_write(&media, None, &write, ".meta-tmp")
                     .unwrap()
                     .unwrap()
             else {
@@ -531,6 +562,7 @@ mod tests {
 
         let super::PreparedSidecar::Publish(prepared) = prepare_sidecar_write(
             &media_path,
+            None,
             &MetadataWrite {
                 rating: Some(4),
                 ..MetadataWrite::default()
@@ -541,16 +573,17 @@ mod tests {
         .expect("sidecar update should be prepared") else {
             panic!("changed sidecar requires publication")
         };
-        let temp_path = prepared.tmp_path.clone();
+        let temp_path = prepared.temp.path().to_path_buf();
 
         let external = b"external replacement after initial read";
         std::fs::write(&sidecar_path, external).unwrap();
-        let error = crate::download::file::publish_file_if_unchanged(
-            &prepared.tmp_path,
-            &prepared.sidecar_path,
+        let error = crate::download::file::publish_sidecar_confined(
+            &prepared.temp,
+            &prepared.target,
             prepared.expected,
+            prepared.output,
+            prepared.identity,
         )
-        .await
         .unwrap_err();
 
         assert!(error.to_string().contains("bytes changed"), "{error:#}");
@@ -574,6 +607,7 @@ mod tests {
 
         let super::PreparedSidecar::Publish(prepared) = prepare_sidecar_write(
             &media_path,
+            None,
             &MetadataWrite {
                 rating: Some(4),
                 ..MetadataWrite::default()
@@ -584,16 +618,17 @@ mod tests {
         .expect("new sidecar should be prepared") else {
             panic!("changed sidecar requires publication")
         };
-        let temp_path = prepared.tmp_path.clone();
+        let temp_path = prepared.temp.path().to_path_buf();
 
         let external = b"sidecar created by another application";
         std::fs::write(&sidecar_path, external).unwrap();
-        let error = crate::download::file::publish_file_if_unchanged(
-            &prepared.tmp_path,
-            &prepared.sidecar_path,
+        let error = crate::download::file::publish_sidecar_confined(
+            &prepared.temp,
+            &prepared.target,
             prepared.expected,
+            prepared.output,
+            prepared.identity,
         )
-        .await
         .unwrap_err();
 
         assert!(error.to_string().contains("appeared"), "{error:#}");
@@ -613,6 +648,7 @@ mod tests {
 
         let super::PreparedSidecar::Publish(prepared) = prepare_sidecar_write(
             &media_path,
+            None,
             &MetadataWrite {
                 rating: Some(4),
                 ..MetadataWrite::default()
@@ -623,7 +659,7 @@ mod tests {
         .expect("initial sidecar should be prepared") else {
             panic!("changed sidecar requires publication")
         };
-        let retained_path = prepared.tmp_path.clone();
+        let retained_path = prepared.temp.path().to_path_buf();
         let retained_bytes = std::fs::read(&retained_path).unwrap();
 
         ensure_initialized();
@@ -636,12 +672,13 @@ mod tests {
             )
             .unwrap();
         std::fs::write(&sidecar_path, external.to_string().into_bytes()).unwrap();
-        crate::download::file::publish_file_if_unchanged(
-            &prepared.tmp_path,
-            &prepared.sidecar_path,
+        crate::download::file::publish_sidecar_confined(
+            &prepared.temp,
+            &prepared.target,
             prepared.expected,
+            prepared.output,
+            prepared.identity,
         )
-        .await
         .unwrap_err();
 
         write_sidecar(

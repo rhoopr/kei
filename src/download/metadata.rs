@@ -62,8 +62,10 @@ pub(super) use prepared::PreparedMetadataFile;
 )]
 pub(super) use probe::HeifNativeCaptureTime;
 pub(crate) use probe::{ExifProbe, probe_exif};
-#[cfg(feature = "xmp")]
+#[cfg(all(test, feature = "xmp"))]
 pub(crate) use sidecar::write_sidecar;
+#[cfg(feature = "xmp")]
+pub(crate) use sidecar::write_sidecar_in_namespace;
 #[cfg(feature = "__fuzz_internals")]
 pub(crate) use source_gps::fuzz_tiff_source_gps;
 #[cfg(feature = "xmp")]

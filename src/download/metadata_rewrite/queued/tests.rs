@@ -2137,6 +2137,7 @@ async fn run_pending_matches_normal_grouped_xmp_payload() {
     let normal_path = dir.path().join("normal.jpg");
     std::fs::write(&normal_path, minimal_jpeg_bytes()).unwrap();
     let normal_outcome = write_download_metadata(MetadataWriteRequest {
+        sidecar_namespace: None,
         final_path: &normal_path,
         embed_path: Some(&normal_path),
         expected_embed_fingerprint: None,

@@ -10,8 +10,6 @@ use super::platform::fsync_parent_dir_best_effort_blocking;
 use super::platform::rename_exchange_blocking;
 #[cfg(target_os = "linux")]
 use super::platform::renameat2_exchange_blocking;
-#[cfg(feature = "xmp")]
-use super::platform::{PublishResult, publish_part_no_replace};
 #[cfg(windows)]
 use super::platform::{move_file_no_replace_blocking, replace_file_with_backup_blocking};
 
@@ -76,38 +74,6 @@ pub(in crate::download) enum FinalPublication {
     NoReplace,
     /// Replace only the exact truncated bytes authorized by retry planning.
     ReplaceTruncated(ExistingFileFingerprint),
-}
-
-/// Publish a prepared file only while the destination still matches the
-/// caller's initial observation. `None` means the destination did not exist;
-/// `Some` authorizes replacement of exactly those bytes and no others.
-#[cfg(feature = "xmp")]
-pub(in crate::download) async fn publish_file_if_unchanged(
-    part_path: &Path,
-    final_path: &Path,
-    expected: Option<ExistingFileFingerprint>,
-) -> anyhow::Result<()> {
-    if let Some(expected) = expected {
-        return replace_file_if_unchanged(part_path, final_path, expected).await;
-    }
-
-    match publish_part_no_replace(part_path, final_path).await {
-        Ok(PublishResult::Published) => {
-            crate::fs_util::fsync_parent_dir_async_best_effort(final_path).await;
-            Ok(())
-        }
-        Ok(PublishResult::DestinationExists) => anyhow::bail!(
-            "Refusing to publish {} because it appeared after write planning",
-            final_path.display()
-        ),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "Could not publish prepared file {} -> {}",
-                part_path.display(),
-                final_path.display()
-            )
-        }),
-    }
 }
 
 pub(super) async fn replace_file_if_unchanged(
@@ -573,3 +539,125 @@ fn restore_exchanged_repair_files_blocking(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix, feature = "xmp"))]
+thread_local! {
+    static SIDECAR_CLEANUP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Sidecar publication retains the same no-follow parents used for preparation.
+#[cfg(feature = "xmp")]
+pub(in crate::download) fn publish_sidecar_confined(
+    part: &crate::fs_util::ConfinedPath,
+    target: &crate::fs_util::ConfinedPath,
+    expected: Option<ExistingFileFingerprint>,
+    replacement: ExistingFileFingerprint,
+    identity: crate::fs_util::FileIdentity,
+) -> anyhow::Result<()> {
+    fn fingerprint(
+        path: &crate::fs_util::ConfinedPath,
+    ) -> anyhow::Result<Option<(ExistingFileFingerprint, crate::fs_util::FileIdentity)>> {
+        let Some(mut file) = path.open_optional_regular()? else {
+            return Ok(None);
+        };
+        let identity = crate::fs_util::file_identity(&file)?;
+        let result =
+            super::fingerprint::fingerprint_open_file_snapshot_blocking(&mut file, path.path())?
+                .fingerprint;
+        path.validate_identity(identity)?;
+        Ok(Some((result, identity)))
+    }
+    part.validate_identity(identity)?;
+    anyhow::ensure!(
+        fingerprint(part)? == Some((replacement, identity)),
+        "Prepared sidecar changed; retaining output"
+    );
+    let current = fingerprint(target)?;
+    if current.map(|(bytes, _)| bytes) != expected {
+        anyhow::bail!(if expected.is_none() {
+            "Sidecar appeared after preparation; retaining output"
+        } else {
+            "Sidecar bytes changed after preparation; retaining output"
+        });
+    }
+    if let Some(expected) = expected {
+        let original_identity = current.context("Existing sidecar disappeared")?.1;
+        #[cfg(unix)]
+        {
+            #[cfg(all(test, target_os = "linux"))]
+            let forced = crate::test_helpers::process_death_force_journal();
+            #[cfg(not(all(test, target_os = "linux")))]
+            let forced = false;
+            let exchange = if forced {
+                Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+            } else {
+                super::platform::exchange_layout_confined(part, target)
+            };
+            #[cfg(target_os = "linux")]
+            if exchange
+                .as_ref()
+                .err()
+                .is_some_and(super::platform::is_renameat2_unsupported)
+            {
+                super::replacement_recovery::publish_confined(part, target, expected, replacement)?;
+                target.sync_parent()?;
+                return Ok(());
+            }
+            exchange?;
+            let displaced = fingerprint(part);
+            let installed = fingerprint(target);
+            if displaced.as_ref().ok().copied().flatten() != Some((expected, original_identity))
+                || installed.as_ref().ok().copied().flatten() != Some((replacement, identity))
+            {
+                if target.validate_identity(identity).is_ok()
+                    && installed.as_ref().ok().copied().flatten() == Some((replacement, identity))
+                {
+                    super::platform::exchange_layout_confined(part, target)?;
+                }
+                return Err(anyhow::anyhow!(
+                    "Sidecar changed during publication; retaining displaced bytes"
+                ))
+                .context(ConditionalPublishMustRetainPaths {
+                    paths: vec![part.path().to_owned()],
+                });
+            }
+            #[cfg(all(test, unix, feature = "xmp"))]
+            SIDECAR_CLEANUP_HOOK.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
+            anyhow::ensure!(
+                fingerprint(part)? == Some((expected, original_identity)),
+                "Displaced sidecar changed before cleanup; retaining bytes"
+            );
+            part.remove_regular(original_identity)?;
+        }
+        #[cfg(windows)]
+        {
+            let _part_pin = part.pin_identity(identity)?;
+            let _target_pin = target.pin_identity(original_identity)?;
+            publish_file_if_unchanged_blocking(part.path(), target.path(), expected, replacement)?;
+        }
+    } else {
+        match super::platform::publish_reconciliation_part_blocking(part, target)? {
+            super::platform::PublishResult::Published => {}
+            super::platform::PublishResult::DestinationExists => {
+                anyhow::bail!("Sidecar appeared after preparation; retaining output")
+            }
+        }
+    }
+    target.validate_identity(identity)?;
+    anyhow::ensure!(
+        fingerprint(target)? == Some((replacement, identity)),
+        "Published sidecar changed before completion"
+    );
+    if let Some(file) = part.open_optional_regular()?
+        && crate::fs_util::file_identity(&file)? == identity
+        && fingerprint(part)? == Some((replacement, identity))
+    {
+        part.remove_regular(identity)?;
+    }
+    target.sync_parent()?;
+    Ok(())
+}

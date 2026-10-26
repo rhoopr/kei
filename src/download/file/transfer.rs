@@ -625,6 +625,14 @@ pub(in crate::download) struct DownloadedFile {
 }
 
 impl DownloadedFile {
+    /// Sidecar writes inherit the namespace retained through media publication.
+    pub(in crate::download) fn metadata_namespace(&self) -> anyhow::Result<ConfinedPath> {
+        self.retained
+            .path
+            .validate_identity(file_identity(&self.retained.file)?)?;
+        Ok(self.retained.path.sibling(self.retained.path.path())?)
+    }
+
     /// Reopen only bytes already verified and owned by the durable publication
     /// ledger. Never feed a metadata-modified completed part back into HTTP resume.
     pub(in crate::download) async fn reopen_prepared(

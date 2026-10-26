@@ -235,6 +235,70 @@ impl ConfinedPath {
         })
     }
 
+    /// Descend into a retained directory entry without reopening its ancestors.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn child(&self, name: &std::ffi::OsStr) -> std::io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        self.validate_namespace()?;
+        if Path::new(name).components().count() != 1
+            || !matches!(
+                Path::new(name).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Expected one child name",
+            ));
+        }
+        let parent_dir = openat_owned(
+            self.parent_dir.as_raw_fd(),
+            &self.name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?;
+        let parent_identity = file_identity(&std::fs::File::from(parent_dir.try_clone()?))?;
+        let mut parent_components = self.parent_components.clone();
+        parent_components.push(
+            self.path
+                .file_name()
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "Directory has no name")
+                })?
+                .to_owned(),
+        );
+        Ok(Self {
+            root: self.root.clone(),
+            path: self.path.join(name),
+            parent_components,
+            parent_dir,
+            name: confined_cstring(name)?,
+            parent_identity,
+        })
+    }
+
+    /// Remove only the checked entry in the held parent, never a replacement parent.
+    #[cfg(feature = "xmp")]
+    pub(crate) fn remove_regular(&self, expected: FileIdentity) -> std::io::Result<()> {
+        let file = self.validate_identity(expected)?;
+        #[cfg(unix)]
+        {
+            drop(file);
+            ConfinedRegularFile {
+                modified_secs: 0,
+                parent: self.parent_dir.try_clone()?,
+                name: self.name.clone(),
+            }
+            .remove()
+        }
+        #[cfg(windows)]
+        {
+            // Retained directory handles disallow replacement of ancestors.
+            drop(file);
+            std::fs::remove_file(&self.path)
+        }
+    }
+
     pub(crate) fn open_regular(&self) -> std::io::Result<std::fs::File> {
         self.validate_namespace()?;
         self.open_regular_with_access(ConfinedAccess::Read)
@@ -443,7 +507,7 @@ impl ConfinedPath {
         }
     }
 
-    fn validate_namespace(&self) -> std::io::Result<()> {
+    pub(crate) fn validate_namespace(&self) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;

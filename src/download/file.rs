@@ -42,8 +42,6 @@ pub(super) use publication::rename_part_to_final;
 pub(super) use replacement::ConditionalPublishTargetChanged;
 pub(super) use replacement::FinalPublication;
 pub(super) use replacement::classify_conditional_publish_error;
-#[cfg(feature = "xmp")]
-pub(super) use replacement::publish_file_if_unchanged;
 pub(super) use replacement::publish_file_if_unchanged_blocking;
 pub(super) use staging::{CleanupLeases, lock_download_destination};
 pub(super) use transfer::DownloadClient;
@@ -86,12 +84,10 @@ pub(super) async fn recover_conditional_replacements(
 }
 
 #[cfg(all(target_os = "linux", feature = "xmp"))]
-pub(super) fn cleanup_prepared_sidecar(
-    path: &std::path::Path,
-    expected: ExistingFileFingerprint,
-    identity: crate::fs_util::FileIdentity,
+pub(super) fn recover_file_replacement_confined(
+    path: &crate::fs_util::ConfinedPath,
 ) -> anyhow::Result<()> {
-    replacement_recovery::cleanup_prepared(path, expected, identity)
+    replacement_recovery::recover_target_confined(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -101,22 +97,39 @@ pub(super) fn recover_file_replacement(path: &std::path::Path) -> anyhow::Result
 
 /// Recover the media and sidecar journals before inspecting either input.
 pub(super) async fn recover_metadata_replacements(path: &std::path::Path) -> anyhow::Result<()> {
+    recover_metadata_replacements_in_namespace(path, None).await
+}
+
+pub(super) async fn recover_metadata_replacements_in_namespace(
+    path: &std::path::Path,
+    namespace: Option<crate::fs_util::ConfinedPath>,
+) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            replacement_recovery::recover_target(&path)?;
+            if let Some(namespace) = &namespace {
+                replacement_recovery::recover_target_confined(namespace)?;
+            } else {
+                replacement_recovery::recover_target(&path)?;
+            }
             let mut name = path
                 .file_name()
                 .context("Metadata path has no filename")?
                 .to_os_string();
             name.push(".xmp");
-            replacement_recovery::recover_target(&path.with_file_name(name))
+            if let Some(namespace) = namespace {
+                replacement_recovery::recover_target_confined(
+                    &namespace.sibling(&path.with_file_name(name))?,
+                )
+            } else {
+                replacement_recovery::recover_target(&path.with_file_name(name))
+            }
         })
         .await??;
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = path;
+    let _ = (path, namespace);
     Ok(())
 }
 
@@ -151,3 +164,6 @@ pub(super) fn has_replacement_journal_blocking(
         Ok(false)
     }
 }
+
+#[cfg(feature = "xmp")]
+pub(super) use replacement::publish_sidecar_confined;

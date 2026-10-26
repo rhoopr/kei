@@ -148,8 +148,15 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_native_boundaries(
             });
             let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
             assert!(
-                write_sidecar_metadata(&path, payload, now_local(), Some(&checksum), ".gps-test")
-                    .await
+                write_sidecar_metadata(
+                    &path,
+                    None,
+                    payload,
+                    now_local(),
+                    Some(&checksum),
+                    ".gps-test"
+                )
+                .await
             );
             let xmp: XmpMeta =
                 std::fs::read_to_string(path.with_extension(format!("{extension}.xmp")))
@@ -184,6 +191,7 @@ async fn sidecar_write_carries_source_gps_and_corrected_coordinates() {
     };
     let cloudkit_created = authority_cloudkit_time();
     let request = || MetadataWriteRequest {
+        sidecar_namespace: None,
         final_path: &media_path,
         embed_path: None,
         expected_embed_fingerprint: None,
@@ -278,6 +286,7 @@ async fn sidecar_write_reads_source_gps_from_dng_content() {
         };
 
         let outcome = write_download_metadata(MetadataWriteRequest {
+            sidecar_namespace: None,
             final_path: &media_path,
             embed_path: None,
             expected_embed_fingerprint: None,
@@ -342,6 +351,7 @@ async fn production_sidecar_io_error_is_typed_support_evidence() {
     let path = dir.path().join("absent").join("PRIVATE_MEDIA.jpg");
     let ok = write_sidecar_metadata(
         &path,
+        None,
         Arc::new(MetadataPayload::default()),
         now_local(),
         None,

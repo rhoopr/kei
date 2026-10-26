@@ -17,6 +17,7 @@ async fn contract_metadata_writes_require_opt_in_leaves_files_untouched() {
     std::fs::write(&photo_path, b"original-media").expect("seed media");
 
     write_download_metadata(MetadataWriteRequest {
+        sidecar_namespace: None,
         final_path: &photo_path,
         embed_path: Some(&photo_path),
         expected_embed_fingerprint: None,
@@ -55,6 +56,7 @@ async fn approved_heif_fingerprint_bypasses_changed_format_routing_gate() {
     std::fs::write(&photo_path, changed).unwrap();
 
     let outcome = write_download_metadata(MetadataWriteRequest {
+        sidecar_namespace: None,
         final_path: &photo_path,
         embed_path: Some(&photo_path),
         expected_embed_fingerprint: Some(approved),
@@ -115,7 +117,15 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
         });
         let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
         assert!(
-            write_sidecar_metadata(&path, payload, now_local(), Some(&checksum), ".gps-test").await
+            write_sidecar_metadata(
+                &path,
+                None,
+                payload,
+                now_local(),
+                Some(&checksum),
+                ".gps-test"
+            )
+            .await
         );
         let xmp: XmpMeta = std::fs::read_to_string(path.with_extension("jpg.xmp"))
             .unwrap()
@@ -145,6 +155,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
         assert!(
             write_sidecar_metadata(
                 &path,
+                None,
                 Arc::new(MetadataPayload {
                     latitude: Some(1.5),
                     longitude: Some(2.5),
@@ -266,6 +277,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
         assert!(
             write_sidecar_metadata(
                 &path,
+                None,
                 Arc::new(MetadataPayload {
                     latitude: Some(latitude),
                     longitude: Some(longitude),
@@ -310,6 +322,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_after_embed() {
     // sidecar from the published media in a separate call.
     for (embed_path, sidecar_path) in [(Some(path.as_path()), None), (None, Some(path.as_path()))] {
         let outcome = write_download_metadata(MetadataWriteRequest {
+            sidecar_namespace: None,
             final_path: &path,
             embed_path,
             expected_embed_fingerprint: None,

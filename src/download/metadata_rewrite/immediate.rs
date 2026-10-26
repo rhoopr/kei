@@ -35,6 +35,7 @@ impl MetadataWriteOutcome {
 /// only to the embedded path.
 pub(in crate::download) struct MetadataWriteRequest<'a> {
     pub(in crate::download) final_path: &'a Path,
+    pub(in crate::download) sidecar_namespace: Option<crate::fs_util::ConfinedPath>,
     pub(in crate::download) embed_path: Option<&'a Path>,
     pub(in crate::download) expected_embed_fingerprint:
         Option<crate::download::file::ExistingFileFingerprint>,
@@ -62,6 +63,8 @@ pub(in crate::download) async fn write_download_metadata(
     request: MetadataWriteRequest<'_>,
 ) -> MetadataWriteOutcome {
     // CONTRACT: METADATA_WRITES_REQUIRE_OPT_IN
+    #[cfg(not(feature = "xmp"))]
+    let _ = &request.sidecar_namespace; // Shared requests retain no sidecar writer in native builds.
     let mut outcome = MetadataWriteOutcome::default();
     let mut embed_applied = false;
 
@@ -102,6 +105,7 @@ pub(in crate::download) async fn write_download_metadata(
     {
         outcome.sidecar_failed = !write_sidecar_metadata(
             sidecar_path,
+            request.sidecar_namespace,
             Arc::clone(&request.payload),
             request.created_local,
             request.source_checksum,

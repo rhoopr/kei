@@ -1784,6 +1784,7 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
             .unwrap();
         let outcome =
             metadata_rewrite::write_download_metadata(metadata_rewrite::MetadataWriteRequest {
+                sidecar_namespace: None,
                 final_path: &rendition.path,
                 embed_path: None,
                 expected_embed_fingerprint: None,

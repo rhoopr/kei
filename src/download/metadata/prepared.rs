@@ -100,7 +100,7 @@ pub(super) struct TmpGuard {
 }
 
 impl TmpGuard {
-    #[cfg(any(test, feature = "xmp"))]
+    #[cfg(test)]
     pub(super) fn new(path: &Path) -> Self {
         Self {
             path: path.to_path_buf(),

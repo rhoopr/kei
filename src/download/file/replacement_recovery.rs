@@ -95,7 +95,7 @@ pub(super) fn directory_path(target: &Path) -> Result<PathBuf> {
     Ok(target.with_file_name(format!("{JOURNAL_PREFIX}{digest}")))
 }
 
-#[cfg(feature = "xmp")]
+#[cfg(all(test, feature = "xmp"))]
 pub(super) fn cleanup_prepared(
     path: &Path,
     expected: ExistingFileFingerprint,
@@ -231,8 +231,8 @@ impl Journal {
         directory: ConfinedPath,
         lock: std::fs::File,
         evidence: Manifest,
+        manifest: ConfinedPath,
     ) -> Result<Self> {
-        let manifest = confined(&directory.path().join("manifest.json"))?;
         Ok(Self {
             original: manifest.sibling(&directory.path().join("original"))?,
             replacement: manifest.sibling(&directory.path().join("replacement"))?,
@@ -269,7 +269,7 @@ impl Journal {
                 )
             });
         }
-        let manifest = confined(&directory.path().join("manifest.json"))?;
+        let manifest = directory.child(std::ffi::OsStr::new("manifest.json"))?;
         let mut lock = manifest.create_new_regular()?;
         anyhow::ensure!(lock.try_lock_exclusive()?, "Replacement journal is busy");
         let evidence = Manifest {
@@ -287,7 +287,7 @@ impl Journal {
         lock.sync_all()?;
         manifest.sync_parent()?;
         directory.sync_parent()?;
-        let journal = Self::paths(target, directory, lock, evidence)?;
+        let journal = Self::paths(target, directory, lock, evidence, manifest)?;
         super::platform::hard_link_confined(part, &journal.replacement)?;
         journal.replacement.open_regular()?.sync_all()?;
         journal.replacement.sync_parent()?;
@@ -299,8 +299,11 @@ impl Journal {
     }
 
     fn open(directory: &Path) -> Result<Option<Self>> {
-        let directory = confined(directory)?;
-        let manifest = confined(&directory.path().join("manifest.json"))?;
+        Self::open_confined(confined(directory)?)
+    }
+
+    fn open_confined(directory: ConfinedPath) -> Result<Option<Self>> {
+        let manifest = directory.child(std::ffi::OsStr::new("manifest.json"))?;
         let Some(read) = manifest.open_optional_regular()? else {
             // mkdir may have succeeded immediately before interruption. Only
             // an empty directory can be removed; unknown contents stay intact.
@@ -375,7 +378,14 @@ impl Journal {
             directory_path(&target_path)? == directory.path(),
             "Replacement journal target does not match its directory"
         );
-        Self::paths(directory.sibling(&target_path)?, directory, lock, evidence).map(Some)
+        Self::paths(
+            directory.sibling(&target_path)?,
+            directory,
+            lock,
+            evidence,
+            manifest,
+        )
+        .map(Some)
     }
 
     fn sync(&self) -> Result<()> {
@@ -660,6 +670,22 @@ pub(super) fn recover_target(target: &Path) -> Result<()> {
         return Ok(());
     }
     if let Some(mut journal) = Journal::open(&directory)? {
+        journal.recover()?;
+    }
+    Ok(())
+}
+
+/// Recover using the caller's retained parent, never a newly resolved ancestor.
+pub(super) fn recover_target_confined(target: &ConfinedPath) -> Result<()> {
+    target.validate_namespace()?;
+    let directory = target.sibling(&directory_path(target.path())?)?;
+    // Probe through the held directory. A missing journal is normal.
+    match directory.child(std::ffi::OsStr::new("manifest.json")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    if let Some(mut journal) = Journal::open_confined(directory)? {
         journal.recover()?;
     }
     Ok(())

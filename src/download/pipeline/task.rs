@@ -195,6 +195,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
         if let Some(part) = &part_path {
             let outcome = metadata_rewrite::write_download_metadata(
                 metadata_rewrite::MetadataWriteRequest {
+                sidecar_namespace: None,
                     final_path: &task.download_path,
                     embed_path: Some(part),
                     expected_embed_fingerprint: downloaded_fingerprint,
@@ -257,6 +258,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
 
         let outcome =
             metadata_rewrite::write_download_metadata(metadata_rewrite::MetadataWriteRequest {
+                sidecar_namespace: Some(downloaded.metadata_namespace()?),
                 final_path: &task.download_path,
                 embed_path: None,
                 expected_embed_fingerprint: None,

@@ -20,6 +20,7 @@ async fn enabled_heif_embed_failure_preserves_invalid_media() {
     drop(file);
 
     let outcome = write_download_metadata(MetadataWriteRequest {
+        sidecar_namespace: None,
         final_path: &photo_path,
         embed_path: Some(&photo_path),
         expected_embed_fingerprint: None,
@@ -69,6 +70,7 @@ async fn heif_embed_reports_change_after_approved_retry_fingerprint() {
     std::fs::write(&photo_path, &changed).unwrap();
 
     let outcome = write_download_metadata(MetadataWriteRequest {
+        sidecar_namespace: None,
         final_path: &photo_path,
         embed_path: Some(&photo_path),
         expected_embed_fingerprint: Some(approved),

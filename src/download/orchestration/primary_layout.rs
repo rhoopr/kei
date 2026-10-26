@@ -952,6 +952,7 @@ async fn prepare(
                 };
                 let written = crate::download::metadata_rewrite::write_download_metadata(
                     crate::download::metadata_rewrite::MetadataWriteRequest {
+                        sidecar_namespace: None,
                         final_path: &stage,
                         embed_path: Some(&stage),
                         expected_embed_fingerprint: Some(fingerprint),

@@ -126,6 +126,7 @@ where
         temp_suffix,
         shutdown_token,
         pending,
+        None,
     )
     .await
 }
@@ -139,6 +140,7 @@ pub(in crate::download) async fn run_pending_rows<D>(
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
     pending: Vec<crate::state::db::PendingMetadataRewrite>,
+    archive_root: Option<&std::path::Path>,
 ) -> super::RewritePass
 where
     D: MembershipStore + MetadataRewriteStore + ?Sized,
@@ -226,6 +228,24 @@ where
             continue;
         };
         let path = PathBuf::from(local_path);
+        let namespace = match archive_root {
+            Some(root) => match crate::fs_util::ConfinedPath::open(
+                root,
+                &path,
+                crate::fs_util::ConfinedParents::Existing,
+            ) {
+                Ok(namespace) => Some(namespace),
+                Err(error) => {
+                    tracing::warn!(target: "kei::download::metadata_rewrite", %error,
+                        "Metadata destination namespace changed; retaining retry");
+                    errored += 1;
+                    continue;
+                }
+            },
+            None => None,
+        };
+        #[cfg(not(feature = "xmp"))]
+        let _ = &namespace; // Native-only retries still validate the destination namespace.
         let _layout_guard =
             match crate::download::file::lock_download_destination(&path, shutdown_token).await {
                 Ok(guard) => guard,
@@ -243,7 +263,15 @@ where
             continue;
         }
 
-        if let Err(error) = crate::download::file::recover_metadata_replacements(&path).await {
+        if let Err(error) = async {
+            let retained = namespace
+                .as_ref()
+                .map(|namespace| namespace.sibling(namespace.path()))
+                .transpose()?;
+            crate::download::file::recover_metadata_replacements_in_namespace(&path, retained).await
+        }
+        .await
+        {
             tracing::warn!(path = %path.display(), error = %format!("{error:#}"),
                 "Could not recover metadata replacement; leaving marker for retry");
             errored += 1;
@@ -540,6 +568,7 @@ where
         if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
             outcome.sidecar_failed = !write_sidecar_metadata(
                 &path,
+                namespace,
                 Arc::clone(&payload),
                 created_local,
                 pending_rewrite.source_checksum.as_deref(),

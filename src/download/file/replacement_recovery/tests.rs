@@ -1,6 +1,6 @@
 use super::{
     Fingerprint, Journal, Manifest, Stage, confined, directory_path, publish, publish_journal,
-    recover_target, recover_tree_blocking,
+    recover_target, recover_target_confined, recover_tree_blocking,
 };
 use crate::download::file::fingerprint::fingerprint_regular_file_blocking;
 use std::fs;
@@ -1217,4 +1217,49 @@ async fn terminal_sidecar_worker() {
         );
         drop(db);
     }
+}
+
+#[test]
+fn retained_sidecar_recovery_refuses_replaced_real_parent() {
+    let root = TempDir::new().unwrap();
+    let selected = root.path().join("selected");
+    fs::create_dir(&selected).unwrap();
+    let target = selected.join("photo.jpg");
+    fs::write(&target, b"selected original").unwrap();
+    let retained = crate::fs_util::ConfinedPath::open(
+        root.path(),
+        &target,
+        crate::fs_util::ConfinedParents::Existing,
+    )
+    .unwrap();
+    fs::rename(&selected, root.path().join("retained")).unwrap();
+    fs::create_dir(&selected).unwrap();
+    let (foreign_target, foreign_part, journal) = prepare(&selected);
+    assert!(
+        publish_journal(&journal, |stage| {
+            anyhow::ensure!(
+                stage != Stage::Displaced,
+                "synthetic interrupted foreign journal"
+            );
+            Ok(())
+        })
+        .is_err()
+    );
+    drop(journal);
+    assert!(!foreign_target.exists());
+    let result = recover_target_confined(&retained);
+    assert!(
+        result.is_err(),
+        "recovery must reject the substituted parent"
+    );
+    assert!(
+        !foreign_target.exists(),
+        "foreign original must remain inside its journal"
+    );
+    assert!(directory_path(&foreign_target).unwrap().exists());
+    assert_eq!(fs::read(&foreign_part).unwrap(), b"replacement");
+    assert_eq!(
+        fs::read(root.path().join("retained/photo.jpg")).unwrap(),
+        b"selected original"
+    );
 }

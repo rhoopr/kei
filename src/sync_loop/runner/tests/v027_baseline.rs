@@ -1486,3 +1486,6 @@ mod indexing_layout;
 mod configuration_safety;
 
 mod current_sparse_coverage;
+
+#[cfg(all(unix, feature = "xmp"))]
+mod sidecar_namespace;

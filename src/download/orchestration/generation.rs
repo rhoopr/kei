@@ -1870,6 +1870,7 @@ async fn metadata_tail(
         config.temp_suffix.clone(),
         cancel,
         current,
+        Some(&config.directory),
     )
     .await;
     if context.format == 2 && !config.refresh_metadata {
