@@ -1192,6 +1192,22 @@ async fn raw_policy_rendition_metadata_tracks_bytes_across_refresh_and_config_dr
                     };
                     fs::create_dir_all(task.download_path.parent().unwrap()).unwrap();
                     fs::write(&task.download_path, body).unwrap();
+                    // Completed raw transfer evidence, not name/size adoption.
+                    let hash = crate::download::file::compute_sha256(&task.download_path)
+                        .await
+                        .unwrap();
+                    crate::state::DownloadStateStore::mark_verified_download(
+                        db.as_ref(),
+                        &task.library,
+                        &task.asset_id,
+                        task.version_size.as_str(),
+                        &task.download_path,
+                        &hash,
+                        Some(&hash),
+                        false,
+                    )
+                    .await
+                    .unwrap();
                 }
             }
             let mut initial = Vec::<AssetRecord>::new();
@@ -2273,8 +2289,9 @@ async fn metadata_drift_refresh_failure_preserves_state_and_reports_not_durable(
     assert_eq!(final_receipt.downloaded_at, original_receipt.downloaded_at);
 }
 
-/// The skip helper must compare the same unknown-measurement projection as
-/// drift detection. Defer draining so an unnecessary marker stays observable.
+/// Unknown historical measurements remain unchanged, but filename agreement
+/// cannot verify a different current generation. Refusal must remain visible
+/// without queuing a writer or changing the old receipt.
 #[tokio::test]
 async fn unknown_measurements_idle_cycle_does_not_queue_metadata_rewrites() {
     use serde_json::json;
@@ -2347,11 +2364,15 @@ async fn unknown_measurements_idle_cycle_does_not_queue_metadata_rewrites() {
             .await
             .unwrap();
             assert_eq!(
-                result.state_write_failures, 0,
+                result.state_write_failures, 1,
                 "checksum {checksum:?}: {result:?}"
             );
             assert_eq!(result.downloaded, 0);
-            assert_eq!(result.skip_summary.on_disk, 1);
+            assert_eq!(result.skip_summary.on_disk, 0);
+            assert_eq!(result.skip_summary.uncertain, 1);
+            // A changed/absent historical generation cannot be settled by a
+            // filename. The refused current admission must hold the cursor;
+            // it must not rewrite or relabel the historical downloaded row.
             assert!(result.failed.is_empty());
             assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
             let row = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
