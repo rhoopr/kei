@@ -13,7 +13,7 @@ use crate::download::pipeline::outcome::StreamingResult;
 use crate::download::pipeline::streaming::{StreamRuntime, stream_and_download_from_stream};
 use crate::download::{DownloadConfig, DownloadControls};
 use crate::icloud::photos::PhotoAsset;
-use crate::state::VersionSizeKey;
+use crate::state::{DownloadStateStore, VersionSizeKey};
 use crate::test_helpers::TestPhotoAsset;
 
 /// Producer-side regression for resolving pending rows when the expected
@@ -846,13 +846,17 @@ async fn suffixed_downloaded_file_is_on_disk_skipped() {
         .size(1234)
         .build();
     db.upsert_seen(&record).await.unwrap();
-    db.mark_downloaded(
+    let local = crate::download::file::compute_sha256(&suffixed_path)
+        .await
+        .unwrap();
+    db.mark_verified_download(
         "PrimarySync",
         "SUFFIXED_B",
         "original",
         &suffixed_path,
-        "local_checksum_for_suffixed_file",
-        None,
+        &local,
+        Some(&local),
+        false,
     )
     .await
     .unwrap();
@@ -907,21 +911,21 @@ async fn live_photo_motion_with_size_suffixed_primary_stem_is_on_disk_skipped() 
     fs::write(&stored_primary, vec![1u8; 2000]).unwrap();
     fs::write(&stored_motion, vec![2u8; 3000]).unwrap();
 
-    record_downloaded_test_version(
+    record_verified_test_version(
         db.as_ref(),
         &asset,
         VersionSizeKey::Original,
         "heic_ck",
-        2000,
+        &[1u8; 2000],
         &stored_primary,
     )
     .await;
-    record_downloaded_test_version(
+    record_verified_test_version(
         db.as_ref(),
         &asset,
         VersionSizeKey::LiveOriginal,
         "mov_ck",
-        3000,
+        &[2u8; 3000],
         &stored_motion,
     )
     .await;
@@ -983,21 +987,21 @@ async fn live_photo_motion_with_identity_suffixed_primary_stem_is_on_disk_skippe
     fs::write(&stored_primary, vec![1u8; 2000]).unwrap();
     fs::write(&stored_motion, vec![2u8; 3000]).unwrap();
 
-    record_downloaded_test_version(
+    record_verified_test_version(
         db.as_ref(),
         &asset,
         VersionSizeKey::Original,
         "heic_ck",
-        2000,
+        &[1u8; 2000],
         &stored_primary,
     )
     .await;
-    record_downloaded_test_version(
+    record_verified_test_version(
         db.as_ref(),
         &asset,
         VersionSizeKey::LiveOriginal,
         "mov_ck",
-        3000,
+        &[2u8; 3000],
         &stored_motion,
     )
     .await;
@@ -1047,21 +1051,21 @@ async fn live_photo_motion_with_sanitized_identity_suffix_is_on_disk_skipped() {
     fs::write(&stored_primary, vec![1u8; 2000]).unwrap();
     fs::write(&stored_motion, vec![2u8; 3000]).unwrap();
 
-    record_downloaded_test_version(
+    record_verified_test_version(
         db.as_ref(),
         &asset,
         VersionSizeKey::Original,
         "heic_ck",
-        2000,
+        &[1u8; 2000],
         &stored_primary,
     )
     .await;
-    record_downloaded_test_version(
+    record_verified_test_version(
         db.as_ref(),
         &asset,
         VersionSizeKey::LiveOriginal,
         "mov_ck",
-        3000,
+        &[2u8; 3000],
         &stored_motion,
     )
     .await;
@@ -1121,21 +1125,21 @@ async fn live_photo_motion_original_policy_with_primary_collision_is_on_disk_ski
     fs::write(&stored_primary, vec![1u8; 2000]).unwrap();
     fs::write(&stored_motion, vec![2u8; 3000]).unwrap();
 
-    record_downloaded_test_version(
+    record_verified_test_version(
         db.as_ref(),
         &asset,
         VersionSizeKey::Original,
         "heic_ck",
-        2000,
+        &[1u8; 2000],
         &stored_primary,
     )
     .await;
-    record_downloaded_test_version(
+    record_verified_test_version(
         db.as_ref(),
         &asset,
         VersionSizeKey::LiveOriginal,
         "mov_ck",
-        3000,
+        &[2u8; 3000],
         &stored_motion,
     )
     .await;
@@ -1197,13 +1201,17 @@ async fn ampm_variant_suffixed_downloaded_file_is_on_disk_skipped() {
         .size(1234)
         .build();
     db.upsert_seen(&record).await.unwrap();
-    db.mark_downloaded(
+    let local = crate::download::file::compute_sha256(&suffixed_path)
+        .await
+        .unwrap();
+    db.mark_verified_download(
         "PrimarySync",
         "AMPM_SUFFIXED_B",
         "original",
         &suffixed_path,
-        "local_checksum_for_ampm_suffixed_file",
-        None,
+        &local,
+        Some(&local),
+        false,
     )
     .await
     .unwrap();
@@ -1611,15 +1619,24 @@ async fn record_verified_test_version(
     path: &Path,
 ) {
     use sha2::{Digest, Sha256};
-    record_downloaded_test_version(db, asset, version, checksum, bytes.len() as u64, path).await;
+    assert_eq!(fs::read(path).unwrap(), bytes, "known raw fixture bytes");
+    let filename = path.file_name().and_then(|name| name.to_str()).unwrap();
+    let record = crate::test_helpers::TestAssetRecord::new(asset.id())
+        .checksum(checksum)
+        .filename(filename)
+        .size(bytes.len() as u64)
+        .version_size(version)
+        .build();
+    db.upsert_seen(&record).await.unwrap();
     let local = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
-    db.mark_downloaded(
+    db.mark_verified_download(
         "PrimarySync",
         asset.id(),
         version.as_str(),
         path,
         &local,
         Some(&local),
+        false,
     )
     .await
     .unwrap();
