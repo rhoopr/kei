@@ -340,15 +340,6 @@ async fn selected_contract(selection: Selection, incomplete_window: bool, transi
                 "{selection:?} cycle {cycle}: {result:?}"
             );
         }
-        assert_eq!(
-            result.stats.downloaded,
-            if cycle == 1 && transition == Transition::MixedPathChange {
-                2
-            } else {
-                usize::from(cycle < 2)
-            },
-            "{selection:?} cycle {cycle}: {result:?}"
-        );
         if incomplete_window {
             assert!(
                 db.get_metadata(&token_key).await.unwrap().is_none(),
@@ -367,7 +358,7 @@ async fn selected_contract(selection: Selection, incomplete_window: bool, transi
                 .await
                 .unwrap()
                 .is_some(),
-            "selected smart observation must carry proof"
+            "selected smart observation must carry proof: {selection:?} cycle {cycle}, result={result:?}"
         );
         let directory = if matches!(selection, Selection::Recent) {
             root.clone()
@@ -421,6 +412,15 @@ async fn selected_contract(selection: Selection, incomplete_window: bool, transi
                 original_mtime
             );
         }
+        assert_eq!(
+            result.stats.downloaded,
+            if cycle == 1 && transition == Transition::MixedPathChange {
+                2
+            } else {
+                usize::from(cycle < 2)
+            },
+            "{selection:?} cycle {cycle}: {result:?}"
+        );
         if cycle == 1 {
             assert!(
                 session.queries.load(Ordering::SeqCst) > 0,

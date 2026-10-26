@@ -210,6 +210,32 @@ async fn observation_commit_staged_proof_activates_only_with_configuration() {
             .unwrap()
             .is_some()
     );
+    let mut expected_plan = spec();
+    expected_plan.profile["current_download_metadata"] = serde_json::json!(1);
+    assert!(
+        db.current_observation_matches(owner(), staged.into(), vec![expected_plan.clone()])
+            .await
+            .unwrap()
+    );
+    let staged_proof_key = "observed_selection_staged:v27:next-enum:PrimarySync";
+    let descriptor = db.get_metadata(staged_proof_key).await.unwrap().unwrap();
+    db.set_metadata("pending_download_config_hash", "different-path")
+        .await
+        .unwrap();
+    db.set_metadata(staged_proof_key, &descriptor)
+        .await
+        .unwrap();
+    assert!(
+        !db.current_observation_matches(owner(), staged.into(), vec![expected_plan.clone()])
+            .await
+            .unwrap()
+    );
+    db.set_metadata("pending_download_config_hash", "next-path")
+        .await
+        .unwrap();
+    db.set_metadata(staged_proof_key, &descriptor)
+        .await
+        .unwrap();
     let mut promote = transition(&db, "after").await;
     promote.metadata_updates.extend([
         ("enum_config_hash".into(), "next-enum".into()),
@@ -297,4 +323,64 @@ async fn observation_commit_certificate_cannot_move_to_another_library() {
         "copied proof must not certify another library"
     );
     assert_eq!(observed[0].selector_label, "Primary library");
+}
+
+#[tokio::test]
+async fn observation_resume_requires_exact_plans_and_current_policy_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, proof) = fixture(dir.path()).await;
+    db.commit_observation_transition(transition(&db, "after").await, Some(proof), false)
+        .await
+        .unwrap();
+    drop(db);
+    let db = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+        .await
+        .unwrap();
+    let mut selected = spec();
+    selected.profile["current_download_metadata"] = serde_json::json!(1);
+    assert!(
+        db.current_observation_matches(owner(), TOKEN.into(), vec![selected.clone()])
+            .await
+            .unwrap()
+    );
+    let mut changed = selected.clone();
+    changed.profile["passes"] = serde_json::json!([]);
+    assert!(
+        !db.current_observation_matches(owner(), TOKEN.into(), vec![changed])
+            .await
+            .unwrap()
+    );
+    let mut source = selected.clone();
+    source.scope.push_str("-different-source");
+    assert!(
+        !db.current_observation_matches(owner(), TOKEN.into(), vec![selected.clone(), source])
+            .await
+            .unwrap()
+    );
+    assert!(
+        !db.current_observation_matches(
+            owner(),
+            TOKEN.into(),
+            vec![selected.clone(), selected.clone()]
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !db.current_observation_matches(owner(), TOKEN.into(), vec![])
+            .await
+            .unwrap()
+    );
+    let descriptor = db.get_metadata(PROOF).await.unwrap().unwrap();
+    db.set_metadata("pending_download_config_hash", "changed-policy")
+        .await
+        .unwrap();
+    // A stale descriptor cannot authorize resume even if retained/corrupt old
+    // state restores its bytes after policy invalidation.
+    db.set_metadata(PROOF, &descriptor).await.unwrap();
+    assert!(
+        !db.current_observation_matches(owner(), TOKEN.into(), vec![selected])
+            .await
+            .unwrap()
+    );
 }

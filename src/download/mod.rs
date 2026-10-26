@@ -36,7 +36,9 @@ pub(crate) use orchestration::config::{
 pub(crate) use orchestration::context::{ClaimedLegacyMasterStates, DownloadContext};
 use orchestration::context::{RecordedLocalFile, preload_download_context};
 pub use orchestration::dispatch::download_photos_with_sync;
-pub(crate) use orchestration::generation::has_due as has_due_selection_work;
+pub(crate) use orchestration::generation::{
+    has_current_observation, has_due as has_due_selection_work,
+};
 pub(crate) use orchestration::maintenance::drain_pending_metadata_rewrites;
 use orchestration::models::PENDING_RETRY_UNMATCHED_REASON;
 pub(super) use orchestration::models::PRODUCER_ENUMERATION_INCOMPLETE_REASON;

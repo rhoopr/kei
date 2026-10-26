@@ -81,6 +81,40 @@ impl AdmissionReceipt {
     }
 }
 impl SqliteStateDb {
+    /// Read-only selection check used to resume a completed zone while another
+    /// zone still prevents global configuration promotion. The checkpoint
+    /// transaction independently rechecks the same plans, policy and cursor.
+    pub(crate) async fn current_observation_matches(
+        &self,
+        owner: account::AccountOwner,
+        token_key: String,
+        specs: Vec<GenerationSpec>,
+    ) -> Result<bool, StateError> {
+        self.with_conn("checking current observation selection", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            account::validate_authenticated(&tx, &owner)?;
+            if specs.is_empty() || specs.iter().any(|spec| spec.format != 2) {
+                return Ok(false);
+            }
+            let mut plans = specs.iter().map(Plan::of).collect::<Vec<_>>();
+            plans.sort_by(|a, b| a.scope.cmp(&b.scope));
+            if plans
+                .windows(2)
+                .any(|pair| matches!(pair, [left, right] if left.scope == right.scope))
+            {
+                return Ok(false);
+            }
+            let Some(key) = descriptor_key(&token_key) else {
+                return Ok(false);
+            };
+            let Some(token) = metadata(&tx, &token_key)? else {
+                return Ok(false);
+            };
+            Ok(valid(&tx, &key, &token)?.is_some_and(|saved| saved.plans == plans))
+        })
+        .await
+    }
+
     /// Only the current delta producer uses this after routing an empty batch.
     /// It proves no new admission was required, never a complete inventory.
     pub(crate) async fn empty_observation_admission(

@@ -237,6 +237,28 @@ pub(crate) async fn context(
     Ok(Some(context))
 }
 
+/// Compare the exact current selector/source plans with an existing checkpoint.
+/// Constructing contexts here neither admits work nor grants coverage.
+pub(crate) async fn has_current_observation(
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+    controls: DownloadControls,
+    token_key: &str,
+) -> Result<bool> {
+    let Some(context) = context(passes, config, controls).await? else {
+        return Ok(false);
+    };
+    let specs = std::iter::once(&context)
+        .chain(context.source_contexts.iter())
+        .map(|source| source.spec(config, source.config_hash.clone()))
+        .collect();
+    Ok(context
+        .capture
+        .db
+        .current_observation_matches(context.capture.owner.clone(), token_key.to_owned(), specs)
+        .await?)
+}
+
 async fn context_for_format(
     passes: &[AlbumPass],
     config: &DownloadConfig,
@@ -445,6 +467,20 @@ pub(crate) struct SelectionRun {
 }
 
 impl SelectionContext {
+    fn spec(&self, config: &DownloadConfig, basis: String) -> GenerationSpec {
+        GenerationSpec {
+            format: self.format,
+            scope: self.scope.clone(),
+            zone: self.zone.clone(),
+            config_hash: self.config_hash.clone(),
+            basis,
+            profile: self.profile.clone(),
+            metadata_enabled: crate::download::pipeline::MetadataFlags::from(config)
+                .has_any_write(),
+            metadata_flags: crate::download::pipeline::MetadataFlags::from(config).bits(),
+        }
+    }
+
     pub(super) fn current_sparse_scope(&self) -> Option<&str> {
         (self.format == 2).then_some(self.scope.as_str())
     }
@@ -536,24 +572,15 @@ impl SelectionContext {
         passes: &[AlbumPass],
         config: &DownloadConfig,
     ) -> Result<Arc<SelectionRun>> {
-        let spec = GenerationSpec {
-            format: self.format,
-            scope: self.scope.clone(),
-            zone: self.zone.clone(),
-            config_hash: self.config_hash.clone(),
-            basis: if self.format == 2 {
-                self.config_hash.clone()
-            } else {
-                self.capture
-                    .db
-                    .selection_basis(self.capture.owner.clone(), self.scope.clone())
-                    .await?
-            },
-            profile: self.profile.clone(),
-            metadata_enabled: crate::download::pipeline::MetadataFlags::from(config)
-                .has_any_write(),
-            metadata_flags: crate::download::pipeline::MetadataFlags::from(config).bits(),
+        let basis = if self.format == 2 {
+            self.config_hash.clone()
+        } else {
+            self.capture
+                .db
+                .selection_basis(self.capture.owner.clone(), self.scope.clone())
+                .await?
         };
+        let spec = self.spec(config, basis);
         let root = if self.format == 1
             && let Some(current) = self.current().await?
             && !current.sealed
@@ -1256,20 +1283,7 @@ impl SelectionRun {
                             candidate.clone(),
                         )
                         .await?;
-                    let unfiled = self
-                        .root
-                        .spec
-                        .profile
-                        .get("passes")
-                        .and_then(Value::as_array)
-                        .is_some_and(|passes| {
-                            passes.iter().any(|pass| {
-                                pass.get("key").and_then(Value::as_str) == Some(key)
-                                    && pass.get("kind").and_then(Value::as_str) == Some("Unfiled")
-                            })
-                        });
                     if (fulfilled
-                        || unfiled
                         || filter::stored_path_matches_download_family(
                             asset.state_id(),
                             derived,
@@ -2308,17 +2322,7 @@ async fn deliver_delta_single(
         && let Some(root) = context.current().await?
     {
         let mut result = replay(client, passes, config, controls, cancel, root).await?;
-        let spec = GenerationSpec {
-            format: 2,
-            scope: context.scope.clone(),
-            zone: context.zone.clone(),
-            config_hash: context.config_hash.clone(),
-            basis: "0".repeat(64),
-            profile: context.profile.clone(),
-            metadata_enabled: crate::download::pipeline::MetadataFlags::from(config.as_ref())
-                .has_any_write(),
-            metadata_flags: crate::download::pipeline::MetadataFlags::from(config.as_ref()).bits(),
-        };
+        let spec = context.spec(config, "0".repeat(64));
         let receipt = context
             .capture
             .db

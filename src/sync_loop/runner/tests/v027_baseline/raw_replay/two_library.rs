@@ -173,11 +173,19 @@ fn snapshot(db: &SqliteStateDb, id: i64) -> RetainedSource {
 #[tokio::test]
 async fn v027_blocked_and_healthy_libraries_share_cycle_and_reopen_in_either_order() {
     for blocked_first in [true, false] {
-        prove_isolation(blocked_first).await;
+        prove_isolation(blocked_first, false).await;
     }
 }
 
-async fn prove_isolation(blocked_first: bool) {
+#[tokio::test]
+async fn v027_changed_path_policy_rebuilds_healthy_proof_once_with_pending_promotion_and_blocked_peer()
+ {
+    for blocked_first in [true, false] {
+        prove_isolation(blocked_first, true).await;
+    }
+}
+
+async fn prove_isolation(blocked_first: bool, path_change: bool) {
     let server = crate::start_wiremock_or_skip!();
     Mock::given(method("GET"))
         .and(path("/healthy"))
@@ -215,6 +223,11 @@ async fn prove_isolation(blocked_first: bool) {
                 .await
                 .unwrap(),
         );
+        if path_change && cycle == 1 {
+            db.acquire_lock("hold policy promotion across reopen").unwrap().execute_batch(
+                "CREATE TRIGGER hold_path_promotion BEFORE UPDATE ON metadata WHEN NEW.key='config_hash' AND NEW.value != OLD.value BEGIN SELECT RAISE(ABORT,'injected policy promotion failure'); END;"
+            ).unwrap();
+        }
         let blocked = selected(db.clone(), zone(), Box::new(BlockedSession)).await;
         let session = HealthySession {
             cycle,
@@ -228,7 +241,12 @@ async fn prove_isolation(blocked_first: bool) {
         let base = make_run_cycle_download_config_builder(&root, db.clone());
         let builder = |mode, excludes, groups, name| {
             let mut config = (*base(mode, excludes, groups, name)).clone();
-            config.folder_structure = "none".into();
+            config.folder_structure = if path_change && cycle > 0 {
+                "changed"
+            } else {
+                "none"
+            }
+            .into();
             #[cfg(feature = "xmp")]
             {
                 config.metadata.xmp_sidecar = false;
@@ -322,9 +340,29 @@ async fn prove_isolation(blocked_first: bool) {
             Some(format!("healthy-cycle-{}", cycle + 1))
         );
         assert_eq!(snapshot(&db, source_id), *retained.as_ref().unwrap());
+        assert!(
+            db.get_metadata(&format!("observed_selection:v27:{HEALTHY}"))
+                .await
+                .unwrap()
+                .is_some(),
+            "healthy selected observation remains proven"
+        );
+        if path_change && cycle > 0 {
+            assert!(
+                db.get_metadata(crate::sync_cycle::PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "failed global policy promotion remains pending across reopen"
+            );
+        }
         assert_eq!(session.changes.load(Ordering::SeqCst), 1);
         if cycle > 0 {
-            assert_eq!(session.inventory.load(Ordering::SeqCst), 0);
+            if path_change && cycle == 1 {
+                assert!(session.inventory.load(Ordering::SeqCst) > 0);
+            } else {
+                assert_eq!(session.inventory.load(Ordering::SeqCst), 0);
+            }
             assert_eq!(session.boundaries.load(Ordering::SeqCst), 0);
         }
         let bytes = std::fs::read(root.join("healthy.JPG")).unwrap();

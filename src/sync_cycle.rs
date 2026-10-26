@@ -766,7 +766,10 @@ pub(crate) enum DownloadConfigHashOutcome {
 
 impl DownloadConfigHashOutcome {
     const fn must_force_full_sync(self) -> bool {
-        matches!(self, Self::ReadFailed | Self::TokenPurgeFailed)
+        matches!(
+            self,
+            Self::Changed | Self::ReadFailed | Self::TokenPurgeFailed
+        )
     }
 
     const fn token_purge_failed(self) -> bool {
@@ -1024,8 +1027,8 @@ pub(crate) async fn run_cycle(
     // unsafe, but it does make an incremental cycle insufficient: with no
     // changed assets, `/changes/zone` would never re-plan already-known media
     // into the new directory/template. Detect that before choosing
-    // incremental mode. Path-only drift keeps source tracking incremental;
-    // the pending marker drives separate catalog/targeted rehydration work.
+    // incremental mode. Each selected library establishes its new-policy
+    // observation once; completed libraries can then continue incrementally.
     if !config.runtime.dry_run
         && let (Some(db), Some(first_library)) = (state_db, library_states.first())
     {
@@ -1277,21 +1280,41 @@ pub(crate) async fn run_cycle(
         // Determine source-enumeration mode per library. Failed transfers are
         // rehydrated from durable pending state by the download engine and do
         // not require replaying the provider inventory.
+        let policy_probe = build_download_config(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from(lib_state.zone_name.as_str()),
+        );
         let pending_zone_token =
             if matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed) {
-                if let Some(db) = state_db {
-                    db.get_metadata(&pending_zone_token_key(
-                        &enum_config_hash,
-                        &lib_state.zone_name,
-                    ))
+                let key = pending_zone_token_key(&enum_config_hash, &lib_state.zone_name);
+                if let Some(db) = state_db
+                    && download::has_current_observation(
+                        &lib_state.plan.passes,
+                        &policy_probe,
+                        download_controls,
+                        &key,
+                    )
                     .await?
-                    .filter(|token| !token.trim().is_empty())
+                {
+                    db.get_metadata(&key)
+                        .await?
+                        .filter(|token| !token.trim().is_empty())
                 } else {
                     None
                 }
             } else {
                 None
             };
+        let download_policy_observed = pending_download_config_hash.is_some()
+            && download::has_current_observation(
+                &lib_state.plan.passes,
+                &policy_probe,
+                download_controls,
+                &lib_state.sync_token_key,
+            )
+            .await?;
         let sync_mode_decision = if indexing_reconciliation || indexing_materialization_pending {
             SyncModeDecision {
                 mode: download::SyncMode::Full,
@@ -1321,7 +1344,7 @@ pub(crate) async fn run_cycle(
                 mode: download::SyncMode::Full,
                 full_enumeration_reason: Some(reason),
             }
-        } else if force_full_for_download_config_hash {
+        } else if force_full_for_download_config_hash && !download_policy_observed {
             let reason = download::FullEnumerationReason::DownloadConfigHashDrift;
             tracing::debug!(
                 zone = %lib_state.zone_name,
@@ -1586,6 +1609,7 @@ pub(crate) async fn run_cycle(
         };
         if (baseline_cursor_at_start.is_some()
             || matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed)
+            || pending_download_config_hash.is_some()
             || unresolved_identity
             || ((indexing_replay_pending || indexing_materialization_pending)
                 && !is_retry_failed
