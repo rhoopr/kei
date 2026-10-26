@@ -5992,7 +5992,13 @@ async fn private_replay_raw_cross_pass_aliases_refresh_only_original_failed_reso
     .await
     .unwrap();
     assert_eq!(first.stats.downloaded, 0, "{first:?}");
-    assert!(first.sync_token.is_none());
+    // The completed observation may advance once failed transfers are durable.
+    // Backup completion remains partial; the exact unfinished owners are checked below.
+    assert!(first.sync_token.is_some());
+    assert!(matches!(
+        first.outcome,
+        crate::download::DownloadOutcome::PartialFailure { .. }
+    ));
     let roots = f.count("provider_active_generations");
     assert_eq!(roots, 1);
     assert_eq!(
@@ -6271,14 +6277,23 @@ async fn private_historical_first_session_failure_preserves_original_intent_and_
     .unwrap();
     assert_eq!(first.stats.downloaded, 0);
     assert_eq!(first.stats.failed, 1);
-    assert!(first.sync_token.is_none());
+    // The completed observation may advance once failed transfers are durable.
+    // Backup completion remains partial; the exact unfinished owners are checked below.
+    assert!(first.sync_token.is_some());
+    assert!(matches!(
+        first.outcome,
+        crate::download::DownloadOutcome::PartialFailure { .. }
+    ));
+    f.db.make_selection_retry_due(owner(), "asset-m".into())
+        .await
+        .unwrap();
     let old =
         f.db.acquire_lock("retain selected historical intent")
             .unwrap()
-            .query_row::<(String, Vec<u8>), _, _>(
-                "SELECT generation,manifest FROM provider_active_decisions",
+            .query_row::<(String, Vec<u8>, i64, i64), _, _>(
+                "SELECT generation,manifest,attempts,next_retry_at FROM provider_active_decisions",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
     f.capture(vec![json!({"recordName":"future-historical-session","recordType":"FutureOpaque","payload":[0,255,9]})],"historical-session-drift").await;
@@ -6315,7 +6330,7 @@ async fn private_historical_first_session_failure_preserves_original_intent_and_
         let conn =
             f.db.acquire_lock("auth cannot rewrite historical proof as backoff")
                 .unwrap();
-        assert_eq!(conn.query_row::<(Vec<u8>,i64,i64),_,_>("SELECT manifest,attempts,next_retry_at FROM provider_active_decisions WHERE generation=?1",[&old.0],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap(),(old.1.clone(),0,0));
+        assert_eq!(conn.query_row::<(Vec<u8>,i64,i64),_,_>("SELECT manifest,attempts,next_retry_at FROM provider_active_decisions WHERE generation=?1",[&old.0],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap(),(old.1.clone(),old.2,old.3));
     }
     f.preserved().await;
     *f.session.corrupt.lock().unwrap() = None;
@@ -6335,7 +6350,38 @@ async fn private_historical_first_session_failure_preserves_original_intent_and_
         std::fs::read(f.config.directory.join("A/changed.JPG")).unwrap(),
         media
     );
-    assert_eq!(f.db.acquire_lock("one physical publication completes compatible roots").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=1",[],|r|r.get(0)).unwrap(),2);
+    let original: crate::state::db::provider_generations::ActiveDecision =
+        serde_json::from_slice(&old.1).unwrap();
+    assert_eq!(original.decision.destinations.len(), 1);
+    let destination = original
+        .decision
+        .destinations
+        .first()
+        .expect("one originally admitted destination");
+    let local = data_encoding::HEXLOWER.encode(&Sha256::digest(media));
+    {
+        let conn = f
+            .db
+            .acquire_lock("original admitted destination settles without a second history root")
+            .unwrap();
+        assert_eq!(conn.query_row::<i64,_,_>(
+            "SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND path=?4 AND checksum=?5 AND size_bytes=?6 AND local_checksum=?7 AND verified_media=1 AND verified_metadata=1",
+            rusqlite::params![old.0, original.decision.pass_key, original.decision.child, destination.path.key().unwrap(), destination.checksum, i64::try_from(destination.size).unwrap(), local], |r|r.get(0)).unwrap(), 1);
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE verified_media=0 OR verified_metadata=0",[],|r|r.get(0)).unwrap(), 0);
+    }
+    let (_, scope, _) = f.pass.album.owned_private_scope().unwrap().unwrap();
+    assert!(
+        f.db.selection_path_matches_local(
+            owner(),
+            scope,
+            original.decision.pass_key,
+            original.decision.child,
+            destination.path.clone(),
+            (local, media.len() as u64)
+        )
+        .await
+        .unwrap()
+    );
     let calls = f.session.calls.load(Ordering::SeqCst);
     let ranks = f.session.rank_calls.load(Ordering::SeqCst);
     let requests = server.received_requests().await.unwrap().len();
