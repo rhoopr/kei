@@ -539,6 +539,7 @@ impl MetadataSetFailure {
 pub(super) struct FailingMetadataSetDb {
     pub(super) inner: Arc<dyn download::DownloadStore>,
     pub(super) failure: MetadataSetFailure,
+    pub(super) metadata_failure_hits: std::sync::atomic::AtomicUsize,
     pub(super) get_failure: Option<MetadataSetFailure>,
     pub(super) delete_prefix_failure: Option<&'static str>,
     pub(super) message: &'static str,
@@ -623,6 +624,7 @@ impl FailingMetadataSetDb {
         Self {
             inner,
             failure,
+            metadata_failure_hits: std::sync::atomic::AtomicUsize::new(0),
             get_failure: None,
             delete_prefix_failure: None,
             message,
@@ -1181,6 +1183,7 @@ impl state::SyncTokenStore for FailingMetadataSetDb {
 
     async fn set_metadata(&self, key: &str, value: &str) -> Result<(), state::error::StateError> {
         if self.failure.matches(key) {
+            self.metadata_failure_hits.fetch_add(1, Ordering::SeqCst);
             Err(state::error::StateError::LockPoisoned(self.message.into()))
         } else {
             self.inner.set_metadata(key, value).await
@@ -1211,6 +1214,7 @@ impl state::SyncTokenStore for FailingMetadataSetDb {
                 .iter()
                 .any(|key| self.delete_prefix_failure == Some(key.as_str()))
         {
+            self.metadata_failure_hits.fetch_add(1, Ordering::SeqCst);
             Err(state::error::StateError::LockPoisoned(self.message.into()))
         } else {
             self.inner.commit_checkpoint_transition(transition).await

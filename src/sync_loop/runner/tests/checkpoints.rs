@@ -689,19 +689,20 @@ async fn run_cycle_zone_token_write_failure_blocks_database_precheck_token() {
     let config = make_run_cycle_config();
     let inner = make_state_db();
     inner
-        .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+        .set_metadata("sync_token:v27:PrimarySync", "zone-tok-prev")
         .await
         .expect("seed zone token");
-    let db: Arc<dyn download::DownloadStore> = Arc::new(FailingMetadataSetDb::new(
+    let fault = Arc::new(FailingMetadataSetDb::new(
         Arc::clone(&inner),
         MetadataSetFailure::Prefix(SYNC_TOKEN_PREFIX),
         "simulated sync-token write failure",
     ));
+    let db: Arc<dyn download::DownloadStore> = fault.clone();
     let download_dir = tempfile::tempdir().expect("download tempdir");
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
     let lib_state =
-        make_run_cycle_library_state("PrimarySync", "sync_token:PrimarySync", "zone-tok-new");
+        make_run_cycle_library_state("PrimarySync", "sync_token:v27:PrimarySync", "zone-tok-new");
     let states = vec![&lib_state];
     let build_download_config =
         make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
@@ -719,6 +720,13 @@ async fn run_cycle_zone_token_write_failure_blocks_database_precheck_token() {
     .await
     .expect("run cycle");
 
+    assert!(
+        fault
+            .metadata_failure_hits
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0,
+        "the current scoped checkpoint write must reach the injected fault"
+    );
     assert_eq!(result.failed_count, 0);
     assert!(
         !result.db_sync_token_advance_safe,
@@ -726,7 +734,7 @@ async fn run_cycle_zone_token_write_failure_blocks_database_precheck_token() {
     );
     assert_eq!(
         inner
-            .get_metadata("sync_token:PrimarySync")
+            .get_metadata("sync_token:v27:PrimarySync")
             .await
             .expect("read zone token")
             .as_deref(),
@@ -1276,7 +1284,7 @@ async fn run_cycle_multi_zone_status_preserves_an_earlier_checkpoint_hold() {
             .await
             .expect("read recovery action")
             .as_deref(),
-        Some("retry_passes")
+        Some("replay_from_prior_token")
     );
 }
 
