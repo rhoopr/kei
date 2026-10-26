@@ -265,6 +265,35 @@ impl Fixture {
             .project_provider_work(owner(), self.plan().await, 512 * 1024 * 1024)
             .await
     }
+    async fn defer_retained(&self) {
+        let mut plan = self.plan().await;
+        plan.confirmation = None;
+        plan.master = None;
+        plan.records.clear();
+        plan.reason = "current_lookup_unresolved";
+        assert_eq!(
+            self.db
+                .project_provider_work(owner(), plan, 512 * 1024 * 1024)
+                .await
+                .unwrap(),
+            WorkAdmission::Deferred
+        );
+        let conn = self
+            .db
+            .acquire_lock("initial retained retry schedule")
+            .unwrap();
+        assert_eq!(
+            conn.query_row::<(i64, i64), _, _>(
+                "SELECT attempts,next_retry_at-last_attempt_at FROM provider_work_retries",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?))
+            )
+            .unwrap(),
+            (1, 3600)
+        );
+        conn.execute_batch("UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1")
+            .unwrap();
+    }
     async fn plan(&self) -> WorkPlan {
         let (_, scope, zone) = self.pass.album.catalog_work_scope().unwrap().unwrap();
         let config = self.config.with_pass(&self.pass);
@@ -951,6 +980,7 @@ async fn queue_projection_lookup_failures_retain_fixed_debt_and_recover_current_
     ] {
         let f = Fixture::new().await;
         f.capture(records("m", OLD, "source"), "old").await;
+        f.defer_retained().await;
         *f.session.corrupt.lock().unwrap() = Some(fault);
         f.cycle().await.unwrap();
         assert_eq!(f.count("assets"), 0);
@@ -1807,8 +1837,9 @@ async fn queue_projection_default_primary_uses_discovered_owner_and_retained_sou
 async fn queue_projection_retry_deadline_survives_reopen_is_bounded_and_is_not_completion() {
     let f = Fixture::new().await;
     f.capture(records("m", OLD, "source"), "old").await;
+    f.defer_retained().await;
     *f.session.corrupt.lock().unwrap() = Some("missing");
-    for attempt in 1..=7 {
+    for attempt in 2..=8 {
         assert!(
             has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
                 .await
