@@ -927,12 +927,12 @@ where
                                         }
                                     }
                                 }
-                                crate::download::baseline_matching::BaselineMatch::Uncertain => {
+                                crate::download::baseline_matching::BaselineMatch::Uncertain(explanation) => {
                                     uncertain_rendition = true;
                                     disposition = disposition.max(AssetDisposition::Uncertain);
                                     let retained = if let Some(db) = &producer_state_db {
-                                        db.defer_baseline_match(&planner::pending_record_for_task(
-                                            config, &asset, &task,
+                                        db.defer_baseline_match(&crate::download::baseline_matching::pending_record(
+                                            config, &asset, &task, explanation,
                                         ))
                                         .await
                                         .is_ok()

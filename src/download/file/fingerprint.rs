@@ -150,6 +150,28 @@ pub(in crate::download) async fn retain_pending_file(
     .await?
 }
 
+/// Existence/namespace inspection only. Never content proof or adoption authority.
+pub(in crate::download) async fn inspect_pending_candidate(
+    root: &Path,
+    path: &Path,
+) -> anyhow::Result<bool> {
+    let root = root.to_path_buf();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let confined = match ConfinedPath::open(&root, &path, ConfinedParents::Existing) {
+            Ok(confined) => confined,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(file) = confined.open_optional_regular()? else {
+            return Ok(false);
+        };
+        confined.validate_identity(crate::fs_util::file_identity(&file)?)?;
+        Ok(true)
+    })
+    .await?
+}
+
 /// Import's durable-ownership exception uses the same confined, same-handle
 /// fingerprint as sync. A matching hash through a symlink is not ownership proof.
 pub(crate) async fn imported_path_matches_receipt(

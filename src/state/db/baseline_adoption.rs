@@ -15,13 +15,19 @@ impl SqliteStateDb {
         self.with_conn_mut("defer_baseline_match", move |conn| {
             let tx = conn.transaction()?;
             let now = chrono::Utc::now().timestamp();
-            let target: Option<(String, i64, bool)> = tx.query_row(
-                "SELECT checksum,size_bytes,is_deleted FROM assets
+            let target: Option<(String, i64, bool)> = tx
+                .query_row(
+                    "SELECT checksum,size_bytes,is_deleted FROM assets
                  WHERE library=?1 AND id=?2 AND version_size=?3",
-                params![record.library.as_ref(),record.id.as_ref(),record.version_size.as_str()],
-                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-            ).optional()?;
-            if let Some((checksum,size,deleted)) = &target
+                    params![
+                        record.library.as_ref(),
+                        record.id.as_ref(),
+                        record.version_size.as_str()
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if let Some((checksum, size, deleted)) = &target
                 && (checksum != record.checksum.as_ref()
                     || u64::try_from(*size).ok() != Some(record.size_bytes)
                     || *deleted)
@@ -34,21 +40,53 @@ impl SqliteStateDb {
             if target.is_none() {
                 super::asset_writes::upsert_asset_row(&tx, &record, now)?;
             }
+            let prior: Option<String> = tx.query_row(
+                "SELECT last_error FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
+                params![
+                    record.library.as_ref(),
+                    record.id.as_ref(),
+                    record.version_size.as_str()
+                ],
+                |row| row.get(0),
+            )?;
+            let diagnostic = record
+                .last_error
+                .as_deref()
+                .and_then(|new| {
+                    super::match_diagnostics::MatchDiagnostics::merge(prior.as_deref(), new)
+                })
+                .or(prior.filter(|old| {
+                    super::match_diagnostics::MatchDiagnostics::decode(old).is_some()
+                }))
+                .unwrap_or_else(|| {
+                    "Existing file match remains uncertain; no detailed attempt recorded".into()
+                });
             tx.execute(
-                "UPDATE assets SET status='pending',last_error='Existing file match remains uncertain'
+                "UPDATE assets SET status='pending',last_error=?4
                  WHERE library=?1 AND id=?2 AND version_size=?3",
-                params![record.library.as_ref(),record.id.as_ref(),record.version_size.as_str()],
+                params![
+                    record.library.as_ref(),
+                    record.id.as_ref(),
+                    record.version_size.as_str(),
+                    diagnostic
+                ],
             )?;
             tx.execute(
                 "INSERT INTO asset_verifications(library,id,version_size,state,reason,checked_at)
                  VALUES(?1,?2,?3,'unknown','baseline_match_uncertain',?4)
                  ON CONFLICT(library,id,version_size) DO UPDATE SET
                  state=excluded.state,reason=excluded.reason,checked_at=excluded.checked_at",
-                params![record.library.as_ref(),record.id.as_ref(),record.version_size.as_str(),now],
+                params![
+                    record.library.as_ref(),
+                    record.id.as_ref(),
+                    record.version_size.as_str(),
+                    now
+                ],
             )?;
             tx.commit()?;
             Ok(())
-        }).await
+        })
+        .await
     }
 
     pub(crate) async fn adopt_baseline_receipt(

@@ -1192,16 +1192,19 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 .await;
             match decision {
                 crate::download::baseline_matching::BaselineMatch::Missing => plan.tasks.push(task),
-                crate::download::baseline_matching::BaselineMatch::Uncertain => {
+                crate::download::baseline_matching::BaselineMatch::Uncertain(explanation) => {
                     uncertain_matches = uncertain_matches.saturating_add(1);
                     if controls.run_mode.downloads_files() {
                         if let Some(db) = &effective_config.state_db {
                             if db
-                                .defer_baseline_match(&planner::pending_record_for_task(
-                                    effective_config,
-                                    asset,
-                                    &task,
-                                ))
+                                .defer_baseline_match(
+                                    &crate::download::baseline_matching::pending_record(
+                                        effective_config,
+                                        asset,
+                                        &task,
+                                        explanation,
+                                    ),
+                                )
                                 .await
                                 .is_err()
                             {

@@ -95,6 +95,12 @@ async fn assert_provider_adoption_interruption(fault: &'static str) {
     let confirmation = serde_json::to_vec(&json!({"records":values})).unwrap();
     let asset = crate::icloud::photos::current_asset(&confirmation, &child, master, &zone).unwrap();
     let mut config = fixture.config.clone();
+    // Keep publication's existing absolute-path contract. Separately exercise
+    // diagnostic capture of the same destination expressed relative to cwd.
+    let relative_media = tempfile::tempdir_in(".").unwrap();
+    config.directory = std::path::absolute(relative_media.path().join("media"))
+        .unwrap()
+        .into();
     config.folder_structure = "none".into();
     let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
         .await
@@ -107,7 +113,7 @@ async fn assert_provider_adoption_interruption(fault: &'static str) {
     assert_eq!(tasks.len(), 1);
     let task = tasks.remove(0);
     assert_eq!(task.size, 4);
-    let record = pending_record_for_task(&config, &asset, &task);
+    let mut record = pending_record_for_task(&config, &asset, &task);
     let manifest = ActiveDecision {
         decision: SelectionDecision {
             pass_key: key.into(),
@@ -138,7 +144,49 @@ async fn assert_provider_adoption_interruption(fault: &'static str) {
         )
         .await
         .unwrap();
+    use crate::state::db::match_diagnostics::MatchDiagnostics;
+    std::fs::create_dir_all(task.download_path.parent().unwrap()).unwrap();
+    std::fs::write(&task.download_path, b"evil").unwrap();
+    let BaselineMatch::Uncertain(explanation) = BaselineMatcher::default()
+        .match_task(&config.directory, &task, &task.download_path)
+        .await
+    else {
+        panic!("wrong same-size bytes must remain uncertain");
+    };
+    let mut diagnostic_task = task.clone();
+    diagnostic_task.download_path = relative_media
+        .path()
+        .join("media")
+        .join(task.download_path.file_name().unwrap());
+    let captured = crate::download::baseline_matching::pending_record(
+        &config,
+        &asset,
+        &diagnostic_task,
+        explanation,
+    );
+    let mut report = MatchDiagnostics::decode(captured.last_error.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        report.attempts[0].destination.to_path(),
+        std::path::absolute(&task.download_path).unwrap()
+    );
+    report.attempts[0].generation = Some(root.id.clone());
+    report.attempts[0].pass = Some(key.into());
+    report.attempts[0].observed_at = 123;
+    record.last_error = report.encode();
     fixture.db.defer_baseline_match(&record).await.unwrap();
+    fixture
+        .db
+        .defer_selection_confirmation(owner(), root.id.clone(), key.into(), child.clone())
+        .await
+        .unwrap();
+    let diagnostics = fixture.db.pending_match_status(10).await.unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert!(diagnostics[0].schedule.is_some());
+    assert_eq!(
+        diagnostics[0].attempt.explanation.candidates[0].reason,
+        "candidate_bytes_not_verified_for_current_resource"
+    );
+
     std::fs::create_dir_all(task.download_path.parent().unwrap()).unwrap();
     std::fs::write(&task.download_path, b"good").unwrap();
     let BaselineMatch::ProviderPresent { receipt, file } = BaselineMatcher::default()
@@ -196,6 +244,10 @@ async fn assert_provider_adoption_interruption(fault: &'static str) {
 
     let db = SqliteStateDb::open_owned(&state, &owner()).await.unwrap();
     assert!(snapshot(&db) == before);
+    let reopened_report = db.pending_match_status(10).await.unwrap();
+    assert_eq!(reopened_report[0].schedule, diagnostics[0].schedule);
+    assert_eq!(reopened_report[0].attempt.observed_at, 123);
+
     let progress: (String, i64, i64, i64) = db.acquire_lock("read retained adoption retry").unwrap()
         .query_row(
             "SELECT a.status,w.admitted,w.verified_media,
@@ -232,6 +284,7 @@ async fn assert_provider_adoption_interruption(fault: &'static str) {
     )
     .await
     .unwrap();
+    assert!(db.pending_match_status(10).await.unwrap().is_empty());
     let completed = snapshot(&db);
     let progress: (String, i64, i64) = db
         .acquire_lock("read committed provider adoption")

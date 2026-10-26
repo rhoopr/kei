@@ -32,8 +32,11 @@ pub(super) use fingerprint::ExistingFileFingerprint;
 pub(crate) use fingerprint::compute_sha256;
 pub(super) use fingerprint::fingerprint_open_file_snapshot_blocking;
 pub(crate) use fingerprint::imported_path_matches_receipt;
-pub(super) use fingerprint::{RetainedPendingFile, retain_pending_file};
+pub(super) use fingerprint::{RetainedPendingFile, inspect_pending_candidate, retain_pending_file};
 pub(super) use fingerprint::{fingerprint_downloaded_path, fingerprint_regular_file};
+pub(super) fn supported_provider_signature(checksum: &str) -> bool {
+    provider_signature::supported(checksum).is_some()
+}
 #[cfg(test)]
 pub(super) use publication::rename_part_to_final;
 pub(super) use replacement::ConditionalPublishTargetChanged;

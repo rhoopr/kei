@@ -410,10 +410,23 @@ pub(super) fn update_status_to_downloaded(
         super::primary_layout::guard_slot(conn, library, id, version_size, checksum, local_path)?;
         super::primary_layout::guard_downloaded_checksum(conn, local_path, local_checksum)?;
     }
+    let old_error: Option<String> = conn
+        .query_row(
+            "SELECT last_error FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
+            rusqlite::params![library, id, version_size],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let remaining_diagnostics = super::match_diagnostics::MatchDiagnostics::after_publication(
+        old_error.as_deref(),
+        local_path,
+        checksum,
+    );
     let mut stmt = conn
         .prepare_cached(
             "UPDATE assets SET status = 'downloaded', downloaded_at = ?1, local_path = ?2, \
-             local_checksum = ?3, download_checksum = COALESCE(?4, download_checksum), last_error = NULL, \
+             local_checksum = ?3, download_checksum = COALESCE(?4, download_checksum), last_error = ?9, \
              capture_repair_metadata_hash = CASE \
                  WHEN ?5 = 1 THEN metadata_hash \
                  WHEN local_checksum IS ?3 AND local_path IS ?2 THEN capture_repair_metadata_hash ELSE NULL END, \
@@ -435,7 +448,8 @@ pub(super) fn update_status_to_downloaded(
             i64::from(mark_capture_repair),
             library,
             id,
-            version_size
+            version_size,
+            remaining_diagnostics
         ])
         .map_err(|e| StateError::query("mark_downloaded", e))?;
     crate::support::observe_scoped(

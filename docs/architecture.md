@@ -419,6 +419,22 @@ rechecks its complete bytes and namespace inside the adoption transaction.
 The provider path is enabled after independent source review and passing
 transaction rollback, retained-inode and reopened-cycle tests.
 
+`status --pending` displays bounded matching explanations saved in the existing
+asset diagnostic field. Entries retain their exact native candidate and destination
+paths, observation time and refusal reason, keyed by generation/pass/child/path.
+They are diagnostic only, never identity proof, ownership or retry authority.
+Concurrent deferrals merge within the existing transaction. Publication removes
+only matching path/resource explanations; other destination explanations survive.
+The status reader joins exact unfinished destinations for their recorded retry
+attempts/deadline and labels unmatched entries stale or unbound. It does not claim
+current configuration eligibility: retained work can be ineligible after selection
+changes. These details are not complete provider coverage or a new retry queue.
+Local paths are escaped and only printed in the local status command, not emitted
+as provider support events. Unknown provider proof without a valid receipt has no
+force-trust resolution; unchanged retries cannot establish missing identity.
+Unreceipted candidates with unsupported signatures receive a confined existence
+check instead of a futile full-file hash, without changing missing/uncertain policy.
+
 Names, suffixes, size and old Primary/Shared labels locate candidates but cannot
 complete work. Read-only adoption preserves bytes, metadata, paths and modification
 times. Distinct provider identities retain separate obligations even when bytes

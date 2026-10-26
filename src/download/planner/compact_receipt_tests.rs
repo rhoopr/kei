@@ -164,7 +164,7 @@ async fn v027_compact_only_changed_template_modified_file_is_uncertain() {
     let changed_time = std::fs::metadata(&old).unwrap().modified().unwrap();
     assert!(matches!(
         planner.match_existing(&asset, &config, task).await,
-        BaselineMatch::Uncertain
+        BaselineMatch::Uncertain(_)
     ));
     assert_eq!(std::fs::read(&old).unwrap(), b"changed-output!");
     assert_eq!(

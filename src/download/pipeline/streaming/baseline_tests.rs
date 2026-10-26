@@ -302,6 +302,24 @@ async fn baseline_stream_wrong_same_size_bytes_stay_pending_without_transfer() {
             verification,
             ("unknown".into(), "baseline_match_uncertain".into())
         );
+        let diagnostics = db.pending_match_status(10).await.unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            diagnostics[0]
+                .attempt
+                .explanation
+                .candidates
+                .iter()
+                .any(|entry| entry
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| path.to_path() == media))
+        );
+        assert!(diagnostics[0].attempt.observed_at > 0);
+        assert!(
+            diagnostics[0].schedule.is_none(),
+            "unbound test flow must not claim an active ledger retry"
+        );
         let quiet = run(&root, db.clone(), Vec::new(), DownloadRunMode::Download).await;
         assert_eq!(quiet.downloaded, 0);
         assert_eq!(current_rows(&db_path)[0].1, "pending");

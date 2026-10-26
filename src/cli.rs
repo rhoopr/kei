@@ -352,7 +352,8 @@ pub struct StatusArgs {
 
     /// Show pending assets (known to the DB, not yet finalized this sync).
     /// Includes assets the current sync scope excludes via filters or album
-    /// selection.
+    /// selection. Shows saved existing-file candidate paths and refusal details
+    /// when available; these do not prove current retry eligibility.
     #[arg(long)]
     pub pending: bool,
 

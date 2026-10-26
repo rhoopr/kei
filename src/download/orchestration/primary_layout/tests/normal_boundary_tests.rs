@@ -47,7 +47,7 @@ async fn v027_absent_managed_claim_is_uncertain_for_same_and_other_identity_afte
                     planner
                         .match_existing(&asset, &config, &plan.tasks[0])
                         .await,
-                    BaselineMatch::Uncertain
+                    BaselineMatch::Uncertain(_)
                 ),
                 "an absent managed slot remains owned, including for its own current identity"
             );

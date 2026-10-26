@@ -205,6 +205,19 @@ pub(crate) async fn run_status(
         print_truncation_tail(summary_count_to_usize(summary.pending), printed);
     }
 
+    if args.pending {
+        let matches = db.pending_match_status(LISTING_CAP).await?;
+        if !matches.is_empty() {
+            println!("\nExisting-file matching attempts (local paths; review before sharing):");
+            for pending in matches {
+                println!("{}", render_match_attempt(&pending));
+            }
+            println!(
+                "Details are bounded last-attempt evidence, not a complete pending-work inventory. Retry schedules require current selection, authentication and file revalidation; configuration-ineligible work is retained without a promise of active retry."
+            );
+        }
+    }
+
     if args.downloaded && summary.downloaded > 0 {
         println!();
         println!("Downloaded assets:");
@@ -436,13 +449,19 @@ fn summary_count_to_usize(count: u64) -> usize {
 
 fn print_failed(asset: &AssetRecord) {
     let last_seen = asset.last_seen_at.format("%Y-%m-%d %H:%M:%S");
+    let diagnostic = asset
+        .last_error
+        .as_deref()
+        .and_then(crate::state::db::match_diagnostics::MatchDiagnostics::decode);
+    let error = diagnostic.as_ref().map(|report| report.last_transfer_error.as_deref().unwrap_or("Existing-file identity is unproven; use status --pending for local candidate details"))
+        .unwrap_or_else(|| match asset.last_error.as_deref() {
+            Some(error) if error.starts_with("existing_match_v1:") => "Unreadable matching diagnostic; preserve state and use normal sync to obtain fresh evidence",
+            Some(error) => error,
+            None => "unknown error",
+        });
     println!(
         "  {} ({}) - {} (attempts: {}, last seen: {})",
-        asset.filename,
-        asset.id,
-        asset.last_error.as_deref().unwrap_or("unknown error"),
-        asset.download_attempts,
-        last_seen
+        asset.filename, asset.id, error, asset.download_attempts, last_seen
     );
 }
 
@@ -452,6 +471,16 @@ fn print_pending(asset: &AssetRecord) {
         "  {} ({}) - attempts: {}, last seen: {}",
         asset.filename, asset.id, asset.download_attempts, last_seen
     );
+    if let Some(reason) = asset
+        .last_error
+        .as_deref()
+        .filter(|reason| !reason.starts_with("existing_match_v1:"))
+    {
+        println!("    Last recorded error: {reason:?}");
+        println!(
+            "    Retained work; retry eligibility depends on the current selection and provider access."
+        );
+    }
 }
 
 fn print_downloaded(asset: &AssetRecord) {
@@ -464,4 +493,90 @@ fn print_downloaded(asset: &AssetRecord) {
         |p| p.display().to_string(),
     );
     println!("  {} ({}) -> {}", asset.filename, asset.id, local);
+}
+
+fn render_match_attempt(
+    pending: &crate::state::db::match_diagnostics::PendingMatchStatus,
+) -> String {
+    let attempt = &pending.attempt;
+    let mut lines = vec![format!(
+        "  Destination: {:?}; last match attempt: {} (Unix UTC)",
+        attempt.destination.to_path(),
+        attempt.observed_at
+    )];
+    if pending.policy_excluded {
+        lines.push("    Asset currently marked policy-excluded. Work is retained; review the selected libraries/albums/filters if this content is wanted. A saved deadline is not an active retry promise.".into());
+    }
+    match pending.schedule {
+        Some((attempts, deadline)) => lines.push(format!("    Recorded retry attempts: {attempts}; next retry not before: {deadline} (Unix UTC). Current configuration eligibility has not been checked by status.")),
+        None => lines.push("    No matching current unfinished destination/schedule: stale or unbound attempt. This is not a claim that automatic retry is active.".into()),
+    }
+    for refusal in &attempt.explanation.candidates {
+        let path = refusal
+            .path
+            .as_ref()
+            .map(|path| format!("{:?}", path.to_path()))
+            .unwrap_or_else(|| "candidate discovery/scope".into());
+        lines.push(format!("    {path}: {:?}", refusal.reason));
+        let action = match refusal.reason.as_str() {
+            "candidate_unreadable_unsafe_or_changed" | "candidate_discovery_incomplete" => {
+                "Check archive mount/access and file stability. Restore access to the same paths, then run normal sync; symlinks or unsafe paths are not accepted."
+            }
+            "provider_signature_missing" | "scoped_receipt_or_reservation_validation_failed" => {
+                "Current provider/receipt or destination evidence is unavailable or inconsistent. Normal sync can retry after access or evidence changes; do not edit state or bypass ownership checks."
+            }
+            _ => {
+                "Content identity is unproven. Names and sizes are insufficient. Preserve these files and their state/receipts; supported provider proof or a valid bound receipt is required. There is no safe force-trust or uncertain-download action. Unchanged retries cannot manufacture missing proof."
+            }
+        };
+        lines.push(format!("      {action}"));
+    }
+    if attempt.explanation.omitted > 0 || pending.omitted > 0 {
+        lines.push(format!(
+            "    Additional diagnostics omitted: {} candidates, {} destination attempts.",
+            attempt.explanation.omitted, pending.omitted
+        ));
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod match_diagnostic_tests {
+    use super::render_match_attempt;
+    use crate::state::db::match_diagnostics::{MatchAttempt, MatchExplanation, PendingMatchStatus};
+    use crate::state::db::provider_selection::SelectionPath;
+
+    #[test]
+    fn status_match_explanation_escapes_paths_and_never_promises_eligibility() {
+        let path = std::path::Path::new("/archive/line\n\u{1b}[31m.JPG");
+        let mut explanation = MatchExplanation::default();
+        explanation.add(
+            Some(path),
+            "unsupported_provider_proof_without_valid_receipt",
+        );
+        let mut pending = PendingMatchStatus {
+            policy_excluded: false,
+            attempt: MatchAttempt {
+                generation: None,
+                pass: None,
+                child: "private-child".into(),
+                destination: SelectionPath::from_path(path),
+                checksum: "private-signature".into(),
+                observed_at: 123,
+                explanation,
+            },
+            schedule: None,
+            omitted: 0,
+        };
+        let stale = render_match_attempt(&pending);
+        assert!(!stale.contains('\u{1b}'));
+        assert!(!stale.contains("private-child"));
+        assert!(!stale.contains("private-signature"));
+        assert!(stale.contains("stale or unbound"));
+        assert!(stale.contains("no safe force-trust"));
+        pending.schedule = Some((3, 999));
+        let scheduled = render_match_attempt(&pending);
+        assert!(scheduled.contains("next retry not before: 999"));
+        assert!(scheduled.contains("eligibility has not been checked"));
+    }
 }

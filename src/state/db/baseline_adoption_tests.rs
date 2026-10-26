@@ -378,3 +378,108 @@ async fn baseline_deferral_retains_unknown_work_and_refuses_stale_target() {
         .unwrap();
     assert_eq!(count, 0);
 }
+
+#[tokio::test]
+async fn baseline_diagnostics_merge_destinations_reopen_and_settle_only_published_path() {
+    use super::match_diagnostics::{MatchAttempt, MatchDiagnostics, MatchExplanation};
+    use super::provider_selection::SelectionPath;
+    let fixture = Fixture::new().await;
+    let before = fixture.source_snapshot();
+    let other = fixture._directory.path().join("second-album.JPG");
+    fixture
+        .db
+        .upsert_seen(&fixture.selected("pending"))
+        .await
+        .unwrap();
+    fixture
+        .db
+        .mark_failed(
+            "SharedSync",
+            "pending",
+            "original",
+            "earlier sibling transfer failure",
+        )
+        .await
+        .unwrap();
+
+    for (path, reason) in [
+        (&fixture.media, "provider_content_signature_mismatch"),
+        (&other, "candidate_unreadable_unsafe_or_changed"),
+    ] {
+        let mut record = fixture.selected("pending");
+        let mut explanation = MatchExplanation::default();
+        explanation.add(Some(path), reason);
+        record.last_error = MatchDiagnostics {
+            last_transfer_error: None,
+            attempts: vec![MatchAttempt {
+                generation: None,
+                pass: Some("album".into()),
+                child: "child".into(),
+                destination: SelectionPath::from_path(path),
+                checksum: "generation".into(),
+                observed_at: 123,
+                explanation,
+            }],
+            omitted: 0,
+        }
+        .encode();
+        fixture.db.defer_baseline_match(&record).await.unwrap();
+    }
+    let saved: String = fixture
+        .db
+        .acquire_lock("reverse-order diagnostic")
+        .unwrap()
+        .query_row(
+            "SELECT last_error FROM assets WHERE library='SharedSync' AND id='pending'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        MatchDiagnostics::decode(&saved)
+            .unwrap()
+            .last_transfer_error
+            .as_deref(),
+        Some("earlier sibling transfer failure")
+    );
+    fixture
+        .db
+        .mark_failed(
+            "SharedSync",
+            "pending",
+            "original",
+            "synthetic sibling transfer failure",
+        )
+        .await
+        .unwrap();
+    fixture
+        .db
+        .prepare_for_retry(Some("SharedSync"), super::RetryErrorRetention::Clear)
+        .await
+        .unwrap();
+    let reopened = SqliteStateDb::open(&fixture.db_path).await.unwrap();
+    let report = reopened.pending_match_status(10).await.unwrap();
+    assert_eq!(report.len(), 2);
+    assert!(
+        report
+            .iter()
+            .all(|entry| entry.schedule.is_none() && entry.attempt.observed_at == 123)
+    );
+    reopened
+        .adopt_baseline_receipt(
+            &fixture.selected("pending"),
+            &fixture.receipt,
+            Box::new(|| Ok(())),
+        )
+        .await
+        .unwrap();
+    let remaining = reopened.pending_match_status(10).await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].attempt.destination.to_path(), other);
+    assert_eq!(
+        remaining[0].attempt.explanation.candidates[0].reason,
+        "candidate_unreadable_unsafe_or_changed"
+    );
+    assert_eq!(fixture.source_snapshot(), before);
+    assert_eq!(std::fs::read(&fixture.media).unwrap(), b"good");
+}

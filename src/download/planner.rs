@@ -609,7 +609,12 @@ impl TaskPlanner {
         {
             let capture = match album.publication_scope(&task.library) {
                 Ok(Some((capture, scope, _))) if scope == binding.scope => capture,
-                _ => return super::baseline_matching::BaselineMatch::Uncertain,
+                _ => {
+                    return super::baseline_matching::uncertain(
+                        "scoped_receipt_or_reservation_validation_failed",
+                        Some(&task.download_path),
+                    );
+                }
             };
             let db = &capture.db;
             match db
@@ -626,7 +631,10 @@ impl TaskPlanner {
                         if self.has_durable_destination(task)
                             && task.download_path != receipt.native_path.to_path()
                         {
-                            return super::baseline_matching::BaselineMatch::Uncertain;
+                            return super::baseline_matching::uncertain(
+                                "receipt_destination_differs_from_reserved_destination",
+                                Some(&receipt.native_path.to_path()),
+                            );
                         }
                         match super::file::retain_pending_file(
                             &config.directory,
@@ -649,13 +657,27 @@ impl TaskPlanner {
                             // A saved scoped native destination remains a candidate after
                             // compatibility rows retire or the configured template changes.
                             // Changed bytes and unreadable paths must not become new downloads.
-                            Ok(Some(_)) | Err(_) => {
-                                return super::baseline_matching::BaselineMatch::Uncertain;
+                            Ok(Some(_)) => {
+                                return super::baseline_matching::uncertain(
+                                    "recorded_local_hash_or_size_changed",
+                                    Some(&receipt.native_path.to_path()),
+                                );
+                            }
+                            Err(_) => {
+                                return super::baseline_matching::uncertain(
+                                    "candidate_unreadable_unsafe_or_changed",
+                                    Some(&receipt.native_path.to_path()),
+                                );
                             }
                         }
                     }
                 }
-                Err(_) => return super::baseline_matching::BaselineMatch::Uncertain,
+                Err(_) => {
+                    return super::baseline_matching::uncertain(
+                        "scoped_receipt_or_reservation_validation_failed",
+                        Some(&task.download_path),
+                    );
+                }
             }
         }
         let derived = super::filter::derive_expected_paths(asset, config);
@@ -687,7 +709,12 @@ impl TaskPlanner {
                     .await
                 {
                     Ok(admitted) => admitted,
-                    Err(_) => return super::baseline_matching::BaselineMatch::Uncertain,
+                    Err(_) => {
+                        return super::baseline_matching::uncertain(
+                            "scoped_receipt_or_reservation_validation_failed",
+                            Some(&task.download_path),
+                        );
+                    }
                 }
             } else {
                 Default::default()
@@ -711,7 +738,10 @@ impl TaskPlanner {
         {
             // An absent leaf can still belong to an interrupted publication.
             // Preserve its claim rather than transferring into the owned slot.
-            return super::baseline_matching::BaselineMatch::Uncertain;
+            return super::baseline_matching::uncertain(
+                "scoped_receipt_or_reservation_validation_failed",
+                Some(&task.download_path),
+            );
         }
         matched
     }

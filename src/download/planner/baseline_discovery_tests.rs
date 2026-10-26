@@ -69,7 +69,7 @@ async fn v027_discovery_wrong_size_edited_or_same_size_wrong_bytes_stay_uncertai
             planner
                 .match_existing(&asset, &config, plan.tasks.first().unwrap())
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
@@ -97,7 +97,7 @@ async fn v027_discovery_missing_directory_is_complete_but_failed_directory_is_no
         planner
             .match_existing(&asset, &blocked_config, plan.tasks.first().unwrap())
             .await,
-        BaselineMatch::Uncertain
+        BaselineMatch::Uncertain(_)
     ));
 }
 
@@ -115,7 +115,7 @@ async fn v027_discovery_symlink_family_does_not_adopt_or_disappear_as_missing() 
         planner
             .match_existing(&asset, &config, plan.tasks.first().unwrap())
             .await,
-        BaselineMatch::Uncertain
+        BaselineMatch::Uncertain(_)
     ));
     assert_eq!(std::fs::read(target).unwrap(), b"good");
 }
@@ -168,6 +168,6 @@ async fn v027_discovery_partial_listing_keeps_visible_candidates_and_defers_unkn
         planner
             .match_existing(&asset, &config, plan.tasks.first().unwrap())
             .await,
-        BaselineMatch::Uncertain
+        BaselineMatch::Uncertain(_)
     ));
 }

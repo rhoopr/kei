@@ -325,7 +325,7 @@ impl PendingRetryPlanning<'_> {
                             else { pipeline::PendingRetryAdoption::StateWriteFailed }
                         }
                         decision @ (crate::download::baseline_matching::BaselineMatch::Missing
-                            | crate::download::baseline_matching::BaselineMatch::Uncertain) => {
+                            | crate::download::baseline_matching::BaselineMatch::Uncertain(_)) => {
                             // Only an explicitly marked, same-generation truncated target can
                             // proceed past uncertainty. The later claim still authorizes the
                             // exact destination and carries the fresh replacement fingerprint.
@@ -346,24 +346,32 @@ impl PendingRetryPlanning<'_> {
                                 evidence.local_path_under(&pass_config.directory)
                             {
                                 !matches!(
-                                    super::file::retain_pending_file(&pass_config.directory, path)
+                                    super::file::inspect_pending_candidate(&pass_config.directory, path)
                                         .await,
-                                    Ok(None)
+                                    Ok(false)
                                 )
                             } else {
                                 false
                             };
                             if authorized_repair.is_none() && (matches!(
                                 decision,
-                                crate::download::baseline_matching::BaselineMatch::Uncertain
+                                crate::download::baseline_matching::BaselineMatch::Uncertain(_)
                             ) || recorded_candidate)
                             {
                                 if self.run_mode.downloads_files() {
+                                    let mut explanation = match decision {
+                                        crate::download::baseline_matching::BaselineMatch::Uncertain(explanation) => explanation,
+                                        _ => Default::default(),
+                                    };
+                                    if recorded_candidate {
+                                        explanation.add(evidence.local_path_under(&pass_config.directory), "saved_pending_path_not_verified");
+                                    }
                                     self.db
-                                        .defer_baseline_match(&planner::pending_record_for_task(
+                                        .defer_baseline_match(&crate::download::baseline_matching::pending_record(
                                             pass_config,
                                             asset,
                                             task,
+                                            explanation,
                                         ))
                                         .await?;
                                 }

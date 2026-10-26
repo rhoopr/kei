@@ -1078,3 +1078,46 @@ fn status_retained_checkpoint_holds_show_actionable_redacted_guidance_after_othe
         assert_eq!(std::fs::read(&kept).unwrap(), bytes);
     }
 }
+
+#[test]
+fn status_pending_reports_scoped_match_details_without_private_provider_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "match-status@example.invalid";
+    let conn = create_state_db(dir.path(), username);
+    let diagnostic = serde_json::json!({
+        "attempts":[{
+            "generation":null,"pass":null,"child":"do-not-print-provider-child",
+            "destination":{"encoding":"utf8","path":"/archive/selected.JPG"},
+            "checksum":"do-not-print-provider-signature","observed_at":123,
+            "explanation":{"candidates":[{
+                "path":{"encoding":"utf8","path":"/archive/old\nname.JPG"},
+                "reason":"unsupported_provider_proof_without_valid_receipt"
+            }],"omitted":0}
+        }],"omitted":0
+    });
+    insert_asset(
+        &conn,
+        "a1",
+        "pending",
+        "selected.JPG",
+        None,
+        Some(&format!("existing_match_v1:{diagnostic}")),
+        None,
+    );
+    drop(conn);
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status", "--pending"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("/archive/selected.JPG"));
+    assert!(stdout.contains("old\\nname.JPG"));
+    assert!(stdout.contains("unsupported_provider_proof_without_valid_receipt"));
+    assert!(stdout.contains("stale or unbound"));
+    assert!(stdout.contains("no safe force-trust"));
+    assert!(!stdout.contains("do-not-print-provider"));
+}

@@ -10,6 +10,8 @@ use crate::state::VersionSizeKey;
 use crate::state::db::BaselineReceipt;
 use crate::state::db::provider_generations::SelectedCopyScope;
 
+use crate::state::db::match_diagnostics::{MatchAttempt, MatchDiagnostics, MatchExplanation};
+
 use super::file::{RetainedPendingFile, retain_pending_file};
 use super::filter::DownloadTask;
 
@@ -32,7 +34,7 @@ pub(in crate::download) enum BaselineMatch {
         file: Arc<RetainedPendingFile>,
     },
     Missing,
-    Uncertain,
+    Uncertain(MatchExplanation),
 }
 
 /// Commit only positive matches through their original durable proof owner.
@@ -203,7 +205,7 @@ impl BaselineMatcher {
         discovered: &BaselineCandidates,
     ) -> BaselineMatch {
         if task.checksum.trim().is_empty() {
-            return BaselineMatch::Uncertain;
+            return uncertain("provider_signature_missing", None);
         }
         let key = (task.version_size, task.checksum.to_string(), task.size);
         let candidates = self.receipts.get(&key).map_or(&[][..], Vec::as_slice);
@@ -251,6 +253,13 @@ impl BaselineMatcher {
                 source_digest = Some(source);
             }
         }
+        let mut explanation = MatchExplanation::default();
+        if conflicting_sources {
+            explanation.add(None, "conflicting_receipt_source_hashes");
+        }
+        if !discovered.complete {
+            explanation.add(None, "candidate_discovery_incomplete");
+        }
         let mut uncertain = conflicting_sources || !discovered.complete;
         let is_identity = |receipt: &&BaselineReceipt| {
             receipt.library == task.library.as_ref() && receipt.id == task.asset_id.as_ref()
@@ -268,17 +277,52 @@ impl BaselineMatcher {
                 let requested_parent = parent_key(requested_path);
                 if requested_parent.is_none() {
                     uncertain = true;
+                    explanation.add(
+                        Some(&receipt.local_path),
+                        "path_or_receipt_validation_failed",
+                    );
                     continue;
                 }
                 parent_key(&receipt.local_path) != requested_parent
             } else {
                 false
             };
+            if !super::file::supported_provider_signature(&task.checksum)
+                && (conflicting_sources
+                    || receipt
+                        .source_checksum
+                        .as_deref()
+                        .filter(|source| valid_sha256(source))
+                        .is_none_or(|source| receipt.local_checksum.as_deref() != Some(source)))
+            {
+                match super::file::inspect_pending_candidate(root, &receipt.local_path).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        explanation.add(
+                            Some(&receipt.local_path),
+                            "no_valid_receipt_or_supported_provider_proof",
+                        );
+                        uncertain = true;
+                    }
+                    Err(_) => {
+                        explanation.add(
+                            Some(&receipt.local_path),
+                            "candidate_unreadable_unsafe_or_changed",
+                        );
+                        uncertain = true;
+                    }
+                }
+                continue;
+            }
             let file = match retain_pending_file(root, &receipt.local_path).await {
                 Ok(Some(file)) => file,
                 Ok(None) => continue,
                 Err(_) => {
                     uncertain = true;
+                    explanation.add(
+                        Some(&receipt.local_path),
+                        "path_or_receipt_validation_failed",
+                    );
                     continue;
                 }
             };
@@ -306,12 +350,28 @@ impl BaselineMatcher {
             let provider_verified = match provider_comparison {
                 Ok(Some(true)) => !verified,
                 Ok(None) => false,
-                Ok(Some(false)) | Err(_) => {
+                Ok(Some(false)) => {
                     uncertain = true;
+                    explanation.add(
+                        Some(&receipt.local_path),
+                        "provider_content_signature_mismatch",
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    uncertain = true;
+                    explanation.add(
+                        Some(&receipt.local_path),
+                        "candidate_unreadable_unsafe_or_changed",
+                    );
                     continue;
                 }
             };
             if !verified && !provider_verified {
+                explanation.add(
+                    Some(&receipt.local_path),
+                    "no_valid_receipt_or_supported_provider_proof",
+                );
                 uncertain = true;
                 continue;
             }
@@ -320,6 +380,12 @@ impl BaselineMatcher {
                 // also cannot make an absent B ambiguous. Without that exact
                 // admission, preserve possible historical-layout ambiguity.
                 uncertain |= !separate_destination_admitted;
+                if !separate_destination_admitted {
+                    explanation.add(
+                        Some(&receipt.local_path),
+                        "different_selected_destination_requires_confirmation",
+                    );
+                }
                 continue;
             }
             return if provider_verified {
@@ -336,16 +402,41 @@ impl BaselineMatcher {
         }
         // An occupied path is only a candidate. Supported provider signatures
         // can prove its complete bytes even when historical receipts are absent.
+        let mut visited = std::collections::HashSet::new();
         for path in [requested_path, task.download_path.as_path()]
             .into_iter()
             .chain(discovered.paths.iter().map(std::path::PathBuf::as_path))
         {
+            if !visited.insert(path.to_path_buf()) {
+                continue;
+            }
             if other_selected_copies.iter().any(|(native, compatible)| {
                 native == path
                     || compatible
                         .as_ref()
                         .is_some_and(|old| old.local_path == path)
             }) {
+                continue;
+            }
+            // No known content proof can result from hashing this unreceipted
+            // candidate. Still inspect confinement/existence so absence and
+            // unsafe occupied paths retain their original distinct decisions.
+            if !super::file::supported_provider_signature(&task.checksum) || path.to_str().is_none()
+            {
+                match super::file::inspect_pending_candidate(root, path).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        explanation.add(
+                            Some(path),
+                            "unsupported_provider_proof_without_valid_receipt",
+                        );
+                        uncertain = true;
+                    }
+                    Err(_) => {
+                        explanation.add(Some(path), "candidate_unreadable_unsafe_or_changed");
+                        uncertain = true;
+                    }
+                }
                 continue;
             }
             match retain_pending_file(root, path).await {
@@ -364,17 +455,57 @@ impl BaselineMatcher {
                             file,
                         };
                     }
+                    explanation.add(
+                        Some(path),
+                        "candidate_bytes_not_verified_for_current_resource",
+                    );
                     uncertain = true;
                 }
-                Err(_) => uncertain = true,
+                Err(_) => {
+                    explanation.add(Some(path), "candidate_unreadable_unsafe_or_changed");
+                    uncertain = true;
+                }
             }
         }
         if uncertain {
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(explanation)
         } else {
             BaselineMatch::Missing
         }
     }
+}
+
+pub(in crate::download) fn uncertain(reason: &str, path: Option<&Path>) -> BaselineMatch {
+    let mut explanation = MatchExplanation::default();
+    explanation.add(path, reason);
+    BaselineMatch::Uncertain(explanation)
+}
+
+pub(in crate::download) fn pending_record(
+    config: &super::DownloadConfig,
+    asset: &crate::icloud::photos::PhotoAsset,
+    task: &DownloadTask,
+    explanation: MatchExplanation,
+) -> crate::state::AssetRecord {
+    let mut record = super::planner::pending_record_for_task(config, asset, task);
+    let report = MatchDiagnostics {
+        last_transfer_error: None,
+        attempts: vec![MatchAttempt {
+            generation: config.selection_run.as_ref().map(|run| run.root.id.clone()),
+            pass: config.primary_layout_pass.as_ref().map(ToString::to_string),
+            child: task.asset_record_name.to_string(),
+            destination: crate::state::db::provider_selection::SelectionPath::from_path(
+                &std::path::absolute(&task.download_path)
+                    .unwrap_or_else(|_| task.download_path.clone()),
+            ),
+            checksum: task.checksum.to_string(),
+            observed_at: chrono::Utc::now().timestamp(),
+            explanation,
+        }],
+        omitted: 0,
+    };
+    record.last_error = report.encode();
+    record
 }
 
 fn provider_receipt(task: &DownloadTask, path: &Path, local: &str) -> BaselineReceipt {
@@ -488,7 +619,7 @@ mod tests {
             BaselineMatcher::new(vec![receipt(&task, &path)])
                 .match_task(tmp.path(), &task, &task.download_path)
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         std::fs::write(&path, b"good").unwrap();
         let mut imported = receipt(&task, &path);
@@ -497,7 +628,7 @@ mod tests {
             BaselineMatcher::new(vec![imported])
                 .match_task(tmp.path(), &task, &task.download_path)
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         assert!(matches!(
             BaselineMatcher::default()
@@ -510,7 +641,7 @@ mod tests {
             BaselineMatcher::default()
                 .match_task(tmp.path(), &task, &task.download_path)
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
     }
 
@@ -528,7 +659,7 @@ mod tests {
             BaselineMatcher::new(vec![first, second])
                 .match_task(tmp.path(), &task, &task.download_path)
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
     }
 
@@ -579,7 +710,7 @@ mod tests {
             BaselineMatcher::new(vec![receipt(&task, &path)])
                 .match_task(tmp.path(), &task, &task.download_path)
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         let matcher = BaselineMatcher::new(vec![receipt(&task, &source)]);
         let BaselineMatch::Present { file, .. } = matcher
@@ -648,7 +779,7 @@ mod tests {
             BaselineMatcher::new(vec![imported.clone()])
                 .match_task(tmp.path(), &selected, &selected.download_path)
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         let matcher = BaselineMatcher::new(receipts);
         let BaselineMatch::Present { receipt, file } = matcher
@@ -730,7 +861,7 @@ mod tests {
                     BaselineMatcher::new(receipts)
                         .match_task(tmp.path(), &selected, &requested)
                         .await,
-                    BaselineMatch::Uncertain
+                    BaselineMatch::Uncertain(_)
                 ));
                 assert_eq!(std::fs::read(&old_path).unwrap(), bytes);
                 assert_eq!(
@@ -762,14 +893,14 @@ mod tests {
             BaselineMatcher::default()
                 .match_task(tmp.path(), &task, &requested)
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         task.checksum = " ".into();
         assert!(matches!(
             BaselineMatcher::default()
                 .match_task(tmp.path(), &task, &task.download_path)
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
     }
 
@@ -849,7 +980,7 @@ mod tests {
             BaselineMatcher::new(receipts)
                 .match_task(tmp.path(), &selected, &selected.download_path)
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         assert_eq!(std::fs::read(&path).unwrap(), rewritten);
         assert_eq!(
@@ -906,7 +1037,7 @@ mod tests {
             BaselineMatcher::new(receipts)
                 .match_task(tmp.path(), &selected, &selected.download_path)
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
     }
 
@@ -963,7 +1094,7 @@ mod selected_destination_tests {
                     &BaselineCandidates::default()
                 )
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         assert!(matches!(
             matcher
@@ -997,7 +1128,7 @@ mod selected_destination_tests {
                     &BaselineCandidates::default()
                 )
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         assert_eq!(std::fs::read(&source).unwrap(), b"good");
         assert_eq!(std::fs::read(&target.download_path).unwrap(), b"evil");
@@ -1038,7 +1169,7 @@ mod selected_copy_scope_tests {
                     &BaselineCandidates::default()
                 )
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         // Even a unique other-copy binding with different receipts cannot hide
         // a same-spelled candidate whose provenance is not that binding.
@@ -1058,7 +1189,7 @@ mod selected_copy_scope_tests {
                     &BaselineCandidates::default()
                 )
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         let mut unrelated = candidate;
         unrelated.local_checksum = Some("0".repeat(64));
@@ -1077,7 +1208,7 @@ mod selected_copy_scope_tests {
                     &BaselineCandidates::default()
                 )
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         assert!(!target.download_path.exists());
         assert_eq!(std::fs::read(native).unwrap(), b"good");
@@ -1185,7 +1316,7 @@ mod historical_writer_tests {
                     BaselineMatcher::new(receipts)
                         .match_task(dir.path(), &selected, &selected.download_path)
                         .await,
-                    BaselineMatch::Uncertain
+                    BaselineMatch::Uncertain(_)
                 ),
                 "historical source/local mismatch alone cannot establish a metadata-only edit"
             );
@@ -1297,7 +1428,7 @@ mod provider_v1_matching_tests {
             BaselineMatcher::new(vec![receipt])
                 .match_task(dir.path(), &task, &task.download_path)
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"evil");
         assert!(!task.download_path.exists());
@@ -1333,7 +1464,7 @@ mod provider_v1_matching_tests {
             BaselineMatcher::new(vec![first, contradictory])
                 .match_task(dir.path(), &task, &task.download_path)
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"good");
         assert_eq!(
@@ -1364,7 +1495,7 @@ mod provider_v1_matching_tests {
             BaselineMatcher::default()
                 .match_task(dir.path(), &task, &task.download_path)
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
         let mut unsupported = data_encoding::BASE64
             .decode(signature(&wrong).as_bytes())
@@ -1375,7 +1506,7 @@ mod provider_v1_matching_tests {
             BaselineMatcher::default()
                 .match_task(dir.path(), &task, &task.download_path)
                 .await,
-            BaselineMatch::Uncertain
+            BaselineMatch::Uncertain(_)
         ));
     }
 }

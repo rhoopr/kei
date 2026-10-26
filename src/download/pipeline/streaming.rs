@@ -228,7 +228,7 @@ where
                             crate::download::baseline_matching::BaselineMatch::Present { .. }
                             | crate::download::baseline_matching::BaselineMatch::ProviderPresent { .. }
                             | crate::download::baseline_matching::BaselineMatch::RecordedPresent { .. } => continue,
-                            crate::download::baseline_matching::BaselineMatch::Uncertain => {
+                            crate::download::baseline_matching::BaselineMatch::Uncertain(_) => {
                                 tracing::warn!(
                                     "Existing file match is uncertain; no duplicate download planned"
                                 );
@@ -308,7 +308,7 @@ where
                             crate::download::baseline_matching::BaselineMatch::Present { .. }
                             | crate::download::baseline_matching::BaselineMatch::ProviderPresent { .. }
                             | crate::download::baseline_matching::BaselineMatch::RecordedPresent { .. } => {}
-                            crate::download::baseline_matching::BaselineMatch::Uncertain => {
+                            crate::download::baseline_matching::BaselineMatch::Uncertain(_) => {
                                 tracing::warn!(
                                     "Existing file match is uncertain; no duplicate download planned"
                                 );

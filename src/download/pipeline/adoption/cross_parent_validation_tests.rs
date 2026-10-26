@@ -120,7 +120,7 @@ async fn v027_cross_parent_validation_defers_content_proof_to_atomic_matcher() {
         );
         let decision = planner.match_existing(&asset, &config, task).await;
         if stale_history {
-            assert!(matches!(decision, BaselineMatch::Uncertain));
+            assert!(matches!(decision, BaselineMatch::Uncertain(_)));
             let pending: i64 = db
                 .acquire_lock("uncertain remains pending")
                 .unwrap()

@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-#[cfg(test)]
 use rusqlite::OptionalExtension;
 
 use super::asset_writes::{
@@ -293,8 +292,11 @@ impl SqliteStateDb {
         let version_size = version_size.to_owned();
         let error = error.to_owned();
 
-        self.with_conn("mark_failed", move |conn| {
-            let rows = conn
+        self.with_conn_mut("mark_failed", move |conn| {
+            let tx = conn.transaction()?;
+            let old: Option<String> = tx.query_row("SELECT last_error FROM assets WHERE library=?1 AND id=?2 AND version_size=?3", rusqlite::params![library,id,version_size], |row| row.get(0)).optional()?.flatten();
+            let error = super::match_diagnostics::MatchDiagnostics::with_transfer_error(old.as_deref(), &error);
+            let rows = tx
                 .execute(
                     "UPDATE assets SET status = 'failed', download_attempts = download_attempts + 1, \
                      last_error = ?1 WHERE library = ?2 AND id = ?3 AND version_size = ?4",
@@ -322,6 +324,7 @@ impl SqliteStateDb {
                 });
             }
 
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -390,24 +393,24 @@ impl SqliteStateDb {
         self.with_conn("prepare_for_retry", move |conn| {
             let failed = match (library.as_deref(), error_retention) {
                 (Some(library), RetryErrorRetention::Clear) => conn.execute(
-                    "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = NULL \
+                    "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = CASE WHEN last_error LIKE 'existing_match_v1:%' THEN last_error ELSE NULL END \
                      WHERE status = 'failed' AND is_deleted = 0 AND library = ?1",
                     rusqlite::params![library],
                 ),
                 (None, RetryErrorRetention::Clear) => conn.execute(
-                    "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = NULL \
+                    "UPDATE assets SET status = 'pending', download_attempts = 0, last_error = CASE WHEN last_error LIKE 'existing_match_v1:%' THEN last_error ELSE NULL END \
                      WHERE status = 'failed' AND is_deleted = 0",
                     [],
                 ),
                 (Some(library), RetryErrorRetention::Preserve(reason)) => conn.execute(
                     "UPDATE assets SET status = 'pending', download_attempts = 0, \
-                     last_error = CASE WHEN last_error = ?2 THEN last_error ELSE NULL END \
+                     last_error = CASE WHEN last_error LIKE 'existing_match_v1:%' OR last_error = ?2 THEN last_error ELSE NULL END \
                      WHERE status = 'failed' AND is_deleted = 0 AND library = ?1",
                     rusqlite::params![library, reason],
                 ),
                 (None, RetryErrorRetention::Preserve(reason)) => conn.execute(
                     "UPDATE assets SET status = 'pending', download_attempts = 0, \
-                     last_error = CASE WHEN last_error = ?1 THEN last_error ELSE NULL END \
+                     last_error = CASE WHEN last_error LIKE 'existing_match_v1:%' OR last_error = ?1 THEN last_error ELSE NULL END \
                      WHERE status = 'failed' AND is_deleted = 0",
                     rusqlite::params![reason],
                 ),
@@ -417,24 +420,24 @@ impl SqliteStateDb {
 
             let pending = match (library.as_deref(), error_retention) {
                 (Some(library), RetryErrorRetention::Clear) => conn.execute(
-                    "UPDATE assets SET download_attempts = 0, last_error = NULL \
+                    "UPDATE assets SET download_attempts = 0, last_error = CASE WHEN last_error LIKE 'existing_match_v1:%' THEN last_error ELSE NULL END \
                      WHERE status = 'pending' AND is_deleted = 0 AND download_attempts > 0 AND library = ?1",
                     rusqlite::params![library],
                 ),
                 (None, RetryErrorRetention::Clear) => conn.execute(
-                    "UPDATE assets SET download_attempts = 0, last_error = NULL \
+                    "UPDATE assets SET download_attempts = 0, last_error = CASE WHEN last_error LIKE 'existing_match_v1:%' THEN last_error ELSE NULL END \
                      WHERE status = 'pending' AND is_deleted = 0 AND download_attempts > 0",
                     [],
                 ),
                 (Some(library), RetryErrorRetention::Preserve(reason)) => conn.execute(
                     "UPDATE assets SET download_attempts = 0, \
-                     last_error = CASE WHEN last_error = ?2 THEN last_error ELSE NULL END \
+                     last_error = CASE WHEN last_error LIKE 'existing_match_v1:%' OR last_error = ?2 THEN last_error ELSE NULL END \
                      WHERE status = 'pending' AND is_deleted = 0 AND download_attempts > 0 AND library = ?1",
                     rusqlite::params![library, reason],
                 ),
                 (None, RetryErrorRetention::Preserve(reason)) => conn.execute(
                     "UPDATE assets SET download_attempts = 0, \
-                     last_error = CASE WHEN last_error = ?1 THEN last_error ELSE NULL END \
+                     last_error = CASE WHEN last_error LIKE 'existing_match_v1:%' OR last_error = ?1 THEN last_error ELSE NULL END \
                      WHERE status = 'pending' AND is_deleted = 0 AND download_attempts > 0",
                     rusqlite::params![reason],
                 ),
@@ -913,7 +916,7 @@ impl SqliteStateDb {
                 .map_err(|e| StateError::query("mark_policy_excluded::begin", e))?;
             let affected = tx
                 .execute(
-                    "UPDATE assets SET status = 'policy_excluded', last_error = NULL \
+                    "UPDATE assets SET status = 'policy_excluded', last_error = CASE WHEN last_error LIKE 'existing_match_v1:%' THEN last_error ELSE NULL END \
                      WHERE library = ?1 AND id = ?2 AND version_size = ?3 \
                        AND status = 'pending' AND is_deleted = 0",
                     rusqlite::params![library, id, version_size],

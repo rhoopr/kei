@@ -23,6 +23,7 @@ pub(crate) mod download_receipts;
 mod identity;
 mod import;
 mod legacy_preservation;
+pub(crate) mod match_diagnostics;
 mod membership;
 mod metadata;
 mod metadata_capture_retry;
