@@ -2713,8 +2713,8 @@ These observation counts are not counts of missing selected files.
 
 Compact media receipts are reported separately because they can overlap retained
 work and past selections. Neither those receipts nor retired decisions form a
-complete current selection census. Offline status therefore reports current
-provider coverage as unknown, including when no unfinished work is retained.
+complete current selection census. Without a matching observation certificate, offline status reports provider
+coverage as unknown, including when no unfinished work is retained.
 Validated stored proof is not a fresh filesystem integrity check. A successful
 run, saved cursor or healthy process is not a coverage certificate, and `verify`
 checks recorded files rather than independently enumerating selected provider
@@ -2733,3 +2733,34 @@ including its existing text representation for non-UTF-8 paths; the lossless
 native destination key independently prevents sibling settlement. Retained native
 reuse keeps its separate validated proof route. Source/local hashes,
 provider resource, selected facts and receipt/settlement atomicity remain required.
+
+
+### Checkpoint-bound selected observation
+
+The producer explicitly combines validated selection admission receipts with a
+completed inventory and its change bridge, or with a matching prior checkpoint
+for incremental changes. Empty delta admission cannot establish inventory
+coverage. Required source and smart-selection subplans compose explicitly;
+generic statistics accumulation does not carry completeness evidence. A rank
+restart discards its superseded candidate proof.
+
+`provider_generations::observation` owns this typed handoff and a compact
+`observed_selection:v27:` descriptor in existing metadata storage. Configuration
+changes stage the descriptor under `observed_selection_staged:v27:` until the
+existing atomic configuration promotion. Sealing validates decisions before
+issuing admission proof, so body compaction does not erase its meaning. The
+checkpoint transaction binds authenticated owner, exact recorded plan, effective
+enumeration/download policy and opaque cursor digest. Generic token writes or
+deletes invalidate the corresponding proof; effective policy changes invalidate
+incompatible proofs. Unsupported/older writes remain unknown. No response pages,
+second item ledger or new scheduling mechanism are introduced.
+
+Status reports each certified library plan independently as observed with
+outstanding work, observed with unknown settlement, or complete as of the
+recorded observation. Other selected libraries may lack proof. Outstanding media,
+requested metadata and unresolved decisions come from existing validated current
+work; historical attribution is separate. This is recorded settlement through a
+provider boundary, not a live census, fresh file verification or aggregate proof
+for every currently selected library. Read-only adoption preserves metadata and
+does not claim a rewrite. Requested current metadata remains an obligation until
+its existing completion transaction settles it.

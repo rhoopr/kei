@@ -235,6 +235,42 @@ async fn v027_baseline_mixed_receipt_concurrent_delta_then_two_quiet_reopened_cy
 }
 
 tokio::task_local! {static CURRENT_SIDECAR_FAILURE: bool;}
+tokio::task_local! {static REQUIRE_OBSERVATION_PROOF: bool;}
+
+#[tokio::test]
+async fn v027_observation_proof_tracks_baseline_restart_and_quiet_deltas() {
+    REQUIRE_OBSERVATION_PROOF
+        .scope(
+            true,
+            baseline_contract("private", false, false, false, false, false, true),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn v027_observation_proof_keeps_failed_media_outstanding_until_quiet_retry() {
+    REQUIRE_OBSERVATION_PROOF
+        .scope(
+            true,
+            baseline_contract("private", true, false, false, false, false, false),
+        )
+        .await;
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn v027_observation_proof_keeps_requested_metadata_outstanding() {
+    REQUIRE_OBSERVATION_PROOF
+        .scope(
+            true,
+            CURRENT_SIDECAR_FAILURE.scope(
+                true,
+                baseline_contract("private", true, false, false, false, false, false),
+            ),
+        )
+        .await;
+}
+
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn v027_current_requested_sidecar_retries_quietly_without_historical_backfill() {
@@ -1021,6 +1057,31 @@ async fn baseline_contract(
             db.get_metadata(&token_key).await.unwrap().as_deref(),
             Some(format!("v27-after-cycle-{}", cycle + 1).as_str())
         );
+        if REQUIRE_OBSERVATION_PROOF.try_with(|v| *v).unwrap_or(false) {
+            let encoded = db
+                .get_metadata(&format!("observed_selection:v27:{ZONE}"))
+                .await
+                .unwrap()
+                .expect("a completed selected observation must commit its proof with its token");
+            let proof: Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(proof["version"], 1);
+            let observed = db.observed_selection_status().await.unwrap();
+            assert_eq!(observed.len(), 1);
+            assert!(!observed[0].settlement_unknown);
+            assert_eq!(
+                observed[0].pending_media,
+                initial_failure && !current_sidecar_failure && cycle < 2
+            );
+            assert_eq!(
+                observed[0].pending_metadata,
+                current_sidecar_failure && cycle < 2
+            );
+
+            assert!(
+                !encoded.contains("v27-after-cycle"),
+                "proof must bind the opaque cursor without rendering it"
+            );
+        }
         assert_eq!(
             db.get_metadata(&format!("sync_token:{ZONE}"))
                 .await

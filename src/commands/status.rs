@@ -139,6 +139,36 @@ pub(crate) async fn run_status(
         println!("  Preserved files are local copies, separate from sync network downloads.");
     }
     println!("{}", backup_status_line(&summary));
+    match db.observed_selection_status().await {
+        Ok(observations) if !observations.is_empty() => {
+            for observation in &observations {
+                let disposition = if observation.settlement_unknown {
+                    "fully observed; settlement unknown"
+                } else if observation.pending_media
+                    || observation.pending_metadata
+                    || observation.unresolved
+                {
+                    "fully observed; requested work outstanding"
+                } else {
+                    "complete as of this recorded observation"
+                };
+                println!(
+                    "Recorded {} selection {}: {disposition} (observation completed at {} Unix UTC).",
+                    observation.selector_label, observation.plan_id, observation.observed_at
+                );
+                println!(
+                    "  Outstanding recorded obligations: media={}; requested metadata={}; unresolved selection decisions={}.",
+                    observation.pending_media, observation.pending_metadata, observation.unresolved
+                );
+            }
+            println!(
+                "  Other selected libraries or plans may lack proof. This covers the recorded selection through its saved provider boundary, not unseen later changes or a fresh check of today's file integrity. Read-only adoption preserves existing metadata; it does not claim metadata was rewritten."
+            );
+        }
+        _ => println!(
+            "As-of selected coverage: unknown; no matching validated observation/checkpoint proof."
+        ),
+    }
     match db.recorded_selection_work().await {
         Ok(work) => println!("{}", render_selection_work(&work)),
         Err(_) => println!(

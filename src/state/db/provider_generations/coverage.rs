@@ -218,6 +218,35 @@ impl SqliteStateDb {
     }
 }
 
+/// Same validators as retained-work status; no historical repair prerequisites.
+pub(super) fn observation_pending(
+    conn: &Connection,
+    root: &ActiveGeneration,
+) -> Result<Option<(u64, u64, u64)>, StateError> {
+    if root
+        .spec
+        .profile
+        .get("current_download_metadata")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return Ok(None);
+    }
+    let work = match read_root(conn, root) {
+        Ok(work) => work.finish(),
+        Err(_) => return Ok(None),
+    };
+    let prepared:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND (prepared_hash IS NOT NULL OR frozen_metadata IS NOT NULL))",[&root.id],|r|r.get(0))?;
+    if prepared && work.pending_media == 0 && work.pending_metadata == 0 {
+        return Ok(None);
+    }
+    Ok(Some((
+        work.pending_media,
+        work.pending_metadata,
+        work.deferred_decisions,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DestinationState, ProfileAccumulator};

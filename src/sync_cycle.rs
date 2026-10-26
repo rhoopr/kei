@@ -1711,6 +1711,13 @@ pub(crate) async fn run_cycle(
                                 }
                                 // Only the upcoming bridge may complete this new
                                 // rank inventory; older replay evidence is not its proof.
+                                if bridge_result.full_enumeration_ran {
+                                    sync_result.checkpoint.observation = bridge_result
+                                        .checkpoint
+                                        .observation
+                                        .clone()
+                                        .and_then(|p| p.restarted_inventory());
+                                }
                                 sync_result.checkpoint.completed_delta_replay = false;
                                 sync_result.checkpoint.inventory_rank_changed = false;
                                 continue;
@@ -1761,6 +1768,14 @@ pub(crate) async fn run_cycle(
                         {
                             if let SourceCheckpointDecision::Advance { token, .. } = bridge_decision
                             {
+                                sync_result.checkpoint.observation = sync_result
+                                    .checkpoint
+                                    .observation
+                                    .take()
+                                    .zip(bridge_result.checkpoint.observation.clone())
+                                    .and_then(|(inventory, delta)| {
+                                        inventory.bridge(delta, &prior_token)
+                                    });
                                 sync_result.sync_token = Some(token);
                                 checkpoint_basis = CheckpointBasis::InventoryWithDeltaBridge;
                             } else {
@@ -2097,20 +2112,28 @@ pub(crate) async fn run_cycle(
                         let candidate_key =
                             pending_zone_token_key(&enum_config_hash, &lib_state.zone_name);
                         if let Err(e) = db
-                            .commit_checkpoint_transition(state::CheckpointTransition {
-                                expected_metadata: zone_metadata_fence.clone(),
-                                legacy_preservation_proofs: legacy_proofs,
-                                legacy_config_hash: preservation_config_hash.clone(),
-                                sparse_identity_proofs: sync_result
-                                    .checkpoint
-                                    .sparse_identity_proofs
-                                    .clone(),
-                                metadata_updates: vec![(candidate_key, token)],
-                                metadata_deletes: vec![
-                                    retained_checkpoint_hold_key(&lib_state.zone_name),
-                                    baseline_key.clone(),
-                                ],
-                            })
+                            .commit_observation_transition(
+                                state::CheckpointTransition {
+                                    expected_metadata: zone_metadata_fence
+                                        .iter()
+                                        .cloned()
+                                        .chain(path_metadata_at_start.iter().cloned())
+                                        .collect(),
+                                    legacy_preservation_proofs: legacy_proofs,
+                                    legacy_config_hash: preservation_config_hash.clone(),
+                                    sparse_identity_proofs: sync_result
+                                        .checkpoint
+                                        .sparse_identity_proofs
+                                        .clone(),
+                                    metadata_updates: vec![(candidate_key, token)],
+                                    metadata_deletes: vec![
+                                        retained_checkpoint_hold_key(&lib_state.zone_name),
+                                        baseline_key.clone(),
+                                    ],
+                                },
+                                sync_result.checkpoint.observation.clone(),
+                                false,
+                            )
                             .await
                         {
                             checkpoint_hold_action =
@@ -2146,30 +2169,38 @@ pub(crate) async fn run_cycle(
                                 .push((LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()));
                         }
                         if let Err(e) = db
-                            .commit_checkpoint_transition(state::CheckpointTransition {
-                                expected_metadata: zone_metadata_fence.clone(),
-                                legacy_preservation_proofs: legacy_proofs,
-                                legacy_config_hash: preservation_config_hash.clone(),
-                                sparse_identity_proofs: sync_result
-                                    .checkpoint
-                                    .sparse_identity_proofs
-                                    .clone(),
-                                metadata_updates,
-                                metadata_deletes: [(!is_current_zone_checkpoint(
-                                    &lib_state.sync_token_key,
-                                ))
-                                .then(|| state::unresolved_identity_key(&lib_state.zone_name))]
-                                .into_iter()
-                                .flatten()
-                                .chain(vec![
-                                    baseline_key.clone(),
-                                    retained_checkpoint_hold_key(&lib_state.zone_name),
-                                    indexing_key.clone(),
-                                    replay_key.clone(),
-                                    materialization_key.clone(),
-                                ])
-                                .collect(),
-                            })
+                            .commit_observation_transition(
+                                state::CheckpointTransition {
+                                    expected_metadata: zone_metadata_fence
+                                        .iter()
+                                        .cloned()
+                                        .chain(path_metadata_at_start.iter().cloned())
+                                        .collect(),
+                                    legacy_preservation_proofs: legacy_proofs,
+                                    legacy_config_hash: preservation_config_hash.clone(),
+                                    sparse_identity_proofs: sync_result
+                                        .checkpoint
+                                        .sparse_identity_proofs
+                                        .clone(),
+                                    metadata_updates,
+                                    metadata_deletes: [(!is_current_zone_checkpoint(
+                                        &lib_state.sync_token_key,
+                                    ))
+                                    .then(|| state::unresolved_identity_key(&lib_state.zone_name))]
+                                    .into_iter()
+                                    .flatten()
+                                    .chain(vec![
+                                        baseline_key.clone(),
+                                        retained_checkpoint_hold_key(&lib_state.zone_name),
+                                        indexing_key.clone(),
+                                        replay_key.clone(),
+                                        materialization_key.clone(),
+                                    ])
+                                    .collect(),
+                                },
+                                sync_result.checkpoint.observation.clone(),
+                                false,
+                            )
                             .await
                         {
                             checkpoint_hold_action =
@@ -2393,18 +2424,23 @@ pub(crate) async fn run_cycle(
             metadata_updates.push((LAST_CHECKPOINT_STATUS_KEY.to_owned(), "current".to_owned()));
             metadata_updates.push((LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()));
             if let Err(e) = db
-                .commit_checkpoint_transition(state::CheckpointTransition {
-                    expected_metadata: enum_metadata_at_start
-                        .iter()
-                        .cloned()
-                        .chain(active_cursor_fences)
-                        .collect(),
-                    legacy_preservation_proofs: Vec::new(),
-                    legacy_config_hash: preservation_config_hash.clone(),
-                    sparse_identity_proofs,
-                    metadata_updates,
-                    metadata_deletes,
-                })
+                .commit_observation_transition(
+                    state::CheckpointTransition {
+                        expected_metadata: enum_metadata_at_start
+                            .iter()
+                            .cloned()
+                            .chain(active_cursor_fences)
+                            .chain(path_metadata_at_start.iter().cloned())
+                            .collect(),
+                        legacy_preservation_proofs: Vec::new(),
+                        legacy_config_hash: preservation_config_hash.clone(),
+                        sparse_identity_proofs,
+                        metadata_updates,
+                        metadata_deletes,
+                    },
+                    None,
+                    true,
+                )
                 .await
             {
                 db_sync_token_advance_safe = false;

@@ -7258,3 +7258,5 @@ async fn v027_prepared_operation_upgrade_normal_runner_and_quiet_reopen() {
         )
         .await;
 }
+
+mod observation_commits;

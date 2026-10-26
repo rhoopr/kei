@@ -21,6 +21,7 @@ use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
 
 pub(crate) mod coverage;
+pub(crate) mod observation;
 mod pending_path_cache;
 mod reference_refresh;
 mod retirement;
@@ -1817,6 +1818,7 @@ impl SqliteStateDb {
         }).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn seal_selection_generation(
         &self,
         owner: account::AccountOwner,
@@ -1824,6 +1826,18 @@ impl SqliteStateDb {
         checkpoint_ready: bool,
         veto: Option<String>,
     ) -> Result<(), StateError> {
+        self.seal_observed_selection(owner, generation, checkpoint_ready, veto)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn seal_observed_selection(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        checkpoint_ready: bool,
+        veto: Option<String>,
+    ) -> Result<Option<observation::AdmissionReceipt>, StateError> {
         self.with_conn_mut("sealing observed selection coverage",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
             let root=load_generation(&tx,&generation)?;
@@ -1843,10 +1857,12 @@ impl SqliteStateDb {
             let hash=seal_hash(&tx,&root,checkpoint_ready,veto.as_deref())?;
             let header=seal_header(&root,checkpoint_ready,veto.as_deref(),&hash)?;
             tx.execute("UPDATE provider_active_generations SET sealed=1,checkpoint_ready=?2,checkpoint_veto=?3,seal_hash=?4,seal_header_hash=?5 WHERE id=?1",params![generation,checkpoint_ready,veto,hash,header])?;
+            let sealed=load_generation(&tx,&generation)?;
+            let proof=observation::AdmissionReceipt::sealed(&tx,&sealed,header)?;
             tx.commit()?;
             #[cfg(all(test,target_os="linux"))]
             crate::test_helpers::process_death_point("completion-handoff-committed");
-            Ok(())
+            Ok(proof)
         }).await
     }
 

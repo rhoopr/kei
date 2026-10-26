@@ -362,6 +362,13 @@ async fn selected_contract(selection: Selection, incomplete_window: bool, transi
             Some(format!("selected-after-{}", cycle + 1)),
             "{selection:?} cycle {cycle}: {result:?}"
         );
+        assert!(
+            db.get_metadata(&format!("observed_selection:v27:{ZONE}"))
+                .await
+                .unwrap()
+                .is_some(),
+            "selected smart observation must carry proof"
+        );
         let directory = if matches!(selection, Selection::Recent) {
             root.clone()
         } else {

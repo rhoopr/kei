@@ -19,9 +19,9 @@ use tokio_util::sync::CancellationToken;
 tokio::task_local! { static REFERENCE_RAW: bool; }
 
 const RAW: &[u8] = b"raw fixture bytes";
-const BUDGET: u64 = 64 * 1024;
+pub(super) const BUDGET: u64 = 64 * 1024;
 
-fn spec() -> GenerationSpec {
+pub(super) fn spec() -> GenerationSpec {
     let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
     GenerationSpec {
         format:2,
@@ -31,7 +31,7 @@ fn spec() -> GenerationSpec {
         metadata_enabled:false,metadata_flags:0,
     }
 }
-async fn admission(
+pub(super) async fn admission(
     db: &Arc<SqliteStateDb>,
     root: &str,
     media: &std::path::Path,

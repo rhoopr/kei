@@ -205,6 +205,9 @@ pub(crate) struct InventoryMeasurement {
 #[derive(Debug, Default)]
 #[must_use]
 pub(crate) struct CheckpointEvidence {
+    /// Scan-issued proof; generic statistics/retry composition never promotes it.
+    pub(crate) observation:
+        Option<crate::state::db::provider_generations::observation::ObservationProof>,
     /// Every fresh ordered path-selection query (including the global frontier)
     /// reached proven EOF with usable unanimous tokens, but the selected work
     /// excluded a tail. This certifies local work only, never a source cursor.

@@ -656,6 +656,15 @@ async fn run_cross_zone_case(
         .unwrap_or_else(|error| {
             panic!("cycle {cycle}: {error}");
         });
+        if refusal.is_none() && !folder_change {
+            assert!(
+                db.get_metadata(&format!("observed_selection:v27:{OWNER}"))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "cross-source selection must carry proof at cycle {cycle}"
+            );
+        }
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged original");
         assert_eq!(
             std::fs::metadata(&sentinel).unwrap().modified().unwrap(),

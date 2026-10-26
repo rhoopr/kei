@@ -306,6 +306,25 @@ async fn v027_sigkill_publication_reopens_then_two_quiet_cycles() {
             requests_before,
             usize::from(!point.starts_with("selection-"))
         );
+        if matches!(
+            point,
+            "checkpoint-before-commit" | "checkpoint-after-commit"
+        ) {
+            let reopened = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap();
+            let token = reopened.get_metadata(&sync_token_key(ZONE)).await.unwrap();
+            let proof = reopened
+                .get_metadata(&format!("observed_selection:v27:{ZONE}"))
+                .await
+                .unwrap();
+            assert_eq!(
+                token.is_some(),
+                proof.is_some(),
+                "token/proof split at {point}"
+            );
+            assert_eq!(proof.is_some(), point == "checkpoint-after-commit");
+        }
         // checkpoint-persisted is the end-of-cycle hook, not an in-transaction pause.
         death_cycle(root.path(), &server.uri(), false).await;
         let completed = SqliteStateDb::open_owned(&db_path, &baseline_owner())

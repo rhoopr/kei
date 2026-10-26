@@ -887,6 +887,16 @@ pub trait SyncTokenStore: Send + Sync {
             detail: "atomic checkpoint transitions are not implemented by this state store".into(),
         })
     }
+    async fn commit_observation_transition(
+        &self,
+        transition: CheckpointTransition,
+        _proof: Option<super::provider_generations::observation::ObservationProof>,
+        _promote: bool,
+    ) -> Result<(), StateError> {
+        // Unsupported stores retain their existing checkpoint behavior but
+        // cannot issue observation coverage evidence.
+        self.commit_checkpoint_transition(transition).await
+    }
     async fn get_scoped_db_sync_token(
         &self,
         _provider: &str,

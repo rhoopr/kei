@@ -1,5 +1,6 @@
 //! Private selection generation composition using existing selection and queues.
 
+use crate::state::db::provider_generations::observation::ObservationProof;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1650,17 +1651,24 @@ pub(super) async fn inventory(
     // complete current query or seal the older root.
     result.outcome = merge_download_outcomes(&result.outcome, &retained.outcome);
     result.accumulate(&retained);
+    let mut admission_receipts = Vec::new();
+    let mut all_admissions_proven = covered;
     if covered {
-        context
+        let receipt = context
             .capture
             .db
-            .seal_selection_generation(
+            .seal_observed_selection(
                 context.capture.owner.clone(),
                 run.root.id.clone(),
                 query_checkpoint_ready,
                 query_veto.clone(),
             )
             .await?;
+        if let Some(receipt) = receipt {
+            admission_receipts.push(receipt);
+        } else {
+            all_admissions_proven = false;
+        }
     }
     for source in &context.source_contexts {
         let zone = source
@@ -1673,16 +1681,21 @@ pub(super) async fn inventory(
             .get(zone)
             .context("Missing started source root")?;
         if covered {
-            source
+            let receipt = source
                 .capture
                 .db
-                .seal_selection_generation(
+                .seal_observed_selection(
                     source.capture.owner.clone(),
                     source_run.root.id.clone(),
                     query_checkpoint_ready && !run.held.load(Ordering::Relaxed),
                     query_veto.clone(),
                 )
                 .await?;
+            if let Some(receipt) = receipt {
+                admission_receipts.push(receipt);
+            } else {
+                all_admissions_proven = false;
+            }
         }
         source
             .capture
@@ -1737,6 +1750,9 @@ pub(super) async fn inventory(
             .await?
     {
         result.block_incremental_token(DEFERRED_REASON)
+    }
+    if all_admissions_proven && !run.held.load(Ordering::Relaxed) {
+        result.checkpoint.observation = ObservationProof::inventory(admission_receipts);
     }
     result.checkpoint.project(&mut result.stats);
     Ok(result)
@@ -2208,6 +2224,15 @@ async fn deliver_delta(
         .selection_context
         .as_ref()
         .context("Missing download ledger context")?;
+    let routed = assets.iter().all(|(asset, index)| {
+        *index < passes.len()
+            && std::iter::once(owner.as_ref())
+                .chain(owner.source_contexts.iter())
+                .any(|context| {
+                    context.zone.get("zoneName").and_then(Value::as_str)
+                        == Some(asset.source_zone().unwrap_or(config.library.as_ref()))
+                })
+    });
     let mut combined: Option<SyncResult> = None;
     for context in std::iter::once(owner.as_ref()).chain(owner.source_contexts.iter()) {
         let mut single = context.clone();
@@ -2226,7 +2251,7 @@ async fn deliver_delta(
             .filter(|(asset, _)| asset.source_zone().unwrap_or(config.library.as_ref()) == zone)
             .cloned()
             .collect();
-        let result = deliver_delta_single(
+        let mut result = deliver_delta_single(
             client,
             passes,
             &Arc::new(effective),
@@ -2237,12 +2262,22 @@ async fn deliver_delta(
         .await?;
         if let Some(previous) = &mut combined {
             previous.outcome = merge_download_outcomes(&previous.outcome, &result.outcome);
+            previous.checkpoint.observation = previous
+                .checkpoint
+                .observation
+                .take()
+                .zip(result.checkpoint.observation.take())
+                .and_then(|(a, b)| a.combine_sources(b));
             previous.accumulate(&result);
         } else {
             combined = Some(result);
         }
     }
-    combined.context("Missing selected ledger result")
+    let mut result = combined.context("Missing selected ledger result")?;
+    if !routed {
+        result.checkpoint.observation = None;
+    }
+    Ok(result)
 }
 
 async fn deliver_delta_single(
@@ -2260,7 +2295,25 @@ async fn deliver_delta_single(
     if assets.is_empty()
         && let Some(root) = context.current().await?
     {
-        return replay(client, passes, config, controls, cancel, root).await;
+        let mut result = replay(client, passes, config, controls, cancel, root).await?;
+        let spec = GenerationSpec {
+            format: 2,
+            scope: context.scope.clone(),
+            zone: context.zone.clone(),
+            config_hash: context.config_hash.clone(),
+            basis: "0".repeat(64),
+            profile: context.profile.clone(),
+            metadata_enabled: crate::download::pipeline::MetadataFlags::from(config.as_ref())
+                .has_any_write(),
+            metadata_flags: crate::download::pipeline::MetadataFlags::from(config.as_ref()).bits(),
+        };
+        let receipt = context
+            .capture
+            .db
+            .empty_observation_admission(context.capture.owner.clone(), spec)
+            .await?;
+        result.checkpoint.observation = Some(ObservationProof::delivery(receipt));
+        return Ok(result);
     }
     let run = context.start(passes, config).await?;
     let started = Instant::now();
@@ -2312,10 +2365,10 @@ async fn deliver_delta_single(
         && result.checkpoint.enumeration_errors == 0
         && !result.checkpoint.enumeration_incomplete
         && !cancel.is_cancelled();
-    context
+    let admission = context
         .capture
         .db
-        .seal_selection_generation(
+        .seal_observed_selection(
             context.capture.owner.clone(),
             run.root.id.clone(),
             accounted,
@@ -2329,6 +2382,9 @@ async fn deliver_delta_single(
         .await?;
     if !accounted {
         result.block_incremental_token(DEFERRED_REASON);
+    }
+    if accounted {
+        result.checkpoint.observation = admission.map(ObservationProof::delivery);
     }
     Ok(result)
 }
@@ -2416,7 +2472,7 @@ pub(super) async fn after_delta(
                 .await?
                 .map(Arc::new);
             let smart_config = Arc::new(smart_config);
-            let refreshed = inventory(
+            let mut refreshed = inventory(
                 client,
                 &smart_passes,
                 &smart_config,
@@ -2425,6 +2481,12 @@ pub(super) async fn after_delta(
             )
             .await?;
             selected.outcome = merge_download_outcomes(&selected.outcome, &refreshed.outcome);
+            selected.checkpoint.observation = selected
+                .checkpoint
+                .observation
+                .take()
+                .zip(refreshed.checkpoint.observation.take())
+                .and_then(|(a, b)| a.with_smart(b));
             selected.accumulate(&refreshed);
         }
     }
@@ -2476,6 +2538,12 @@ pub(super) async fn after_delta(
             .map_err(super::recent::RecentSelectionError)?;
         }
     }
+    selected.checkpoint.observation = selected
+        .checkpoint
+        .observation
+        .take()
+        .zip(selected.sync_token.as_deref())
+        .and_then(|(proof, next)| proof.delta(prior_cursor, next));
     Ok(selected)
 }
 

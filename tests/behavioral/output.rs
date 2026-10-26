@@ -1171,3 +1171,119 @@ fn status_reports_unknown_coverage_for_empty_and_historical_only_state() {
         }
     }
 }
+
+#[test]
+fn status_scopes_saved_observation_and_refuses_stale_cursor() {
+    use serde::Serialize;
+    use sha2::{Digest, Sha256};
+    #[derive(Serialize)]
+    struct Plan {
+        scope: String,
+        config: String,
+        profile: serde_json::Value,
+        metadata: bool,
+        flags: u8,
+    }
+    #[derive(Serialize)]
+    struct Descriptor {
+        version: u8,
+        account: String,
+        provider: String,
+        library: String,
+        plans: Vec<Plan>,
+        cursor_hash: String,
+        observed_at: i64,
+        policy: [Option<String>; 2],
+        admission_hash: String,
+        proof_hash: String,
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let username = "observation@example.invalid";
+    let conn = create_state_db(dir.path(), username);
+    let (account, provider) = conn
+        .query_row(
+            "SELECT account_key,provider_key FROM account_owner WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    let mut descriptor = Descriptor {
+        version: 1,
+        account,
+        provider,
+        library: "PrimarySync".into(),
+        plans: vec![Plan {
+            scope: serde_json::json!({"format":1,"realm":"com","container":"com.apple.photos.cloud","environment":"production","database":"private","zone":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}}).to_string(),
+            config: "synthetic-selected-plan".into(),
+            profile: serde_json::json!({"current_download_metadata":1,"coverage":"selected_downloads","passes":[{"key":"pass","scope":{"database":"private","zone":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"kind":"unfiled"}}]}),
+            metadata: false,
+            flags: 0,
+        }],
+        cursor_hash: format!("{:x}", Sha256::digest(b"opaque-current-cursor")),
+        observed_at: 1700000000,
+        policy: [None, None],
+        admission_hash: "a".repeat(64),
+        proof_hash: String::new(),
+    };
+    // Serialization fixture for a completed empty synthetic observation. Actual
+    // producer issuance and checkpoint atomicity are exercised by runner tests.
+    descriptor.proof_hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&descriptor).unwrap())
+    );
+    conn.execute(
+        "INSERT INTO metadata(key,value) VALUES('observed_selection:v27:PrimarySync',?1)",
+        [serde_json::to_string(&descriptor).unwrap()],
+    )
+    .unwrap();
+    for (token, certified) in [("opaque-current-cursor", true), ("changed-cursor", false)] {
+        conn.execute("INSERT INTO metadata(key,value) VALUES('sync_token:v27:PrimarySync',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[token]).unwrap();
+        let out = clean_cmd()
+            .env("ICLOUD_USERNAME", username)
+            .env("KEI_DATA_DIR", dir.path())
+            .arg("status")
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let output = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            output.contains("complete as of this recorded observation"),
+            certified
+        );
+        if certified {
+            assert!(output.contains("Recorded Primary library selection"));
+            assert!(output.contains("Other selected libraries or plans may lack proof"));
+            assert!(output.contains("not unseen later changes"));
+        } else {
+            assert!(output.contains("no matching validated observation/checkpoint proof"));
+        }
+        assert!(!output.contains(token));
+    }
+    descriptor.plans[0].scope =
+        serde_json::json!({"zone":{"zoneName":"SharedSync-other"}}).to_string();
+    descriptor.proof_hash.clear();
+    descriptor.proof_hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&descriptor).unwrap())
+    );
+    conn.execute(
+        "UPDATE metadata SET value=?1 WHERE key='observed_selection:v27:PrimarySync'",
+        [serde_json::to_string(&descriptor).unwrap()],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE metadata SET value='opaque-current-cursor' WHERE key='sync_token:v27:PrimarySync'",
+        [],
+    )
+    .unwrap();
+    clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "no matching validated observation/checkpoint proof",
+        ));
+}

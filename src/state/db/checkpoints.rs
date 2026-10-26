@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use rusqlite::OptionalExtension;
 
+use super::provider_generations::observation::{self, ObservationProof};
 use super::sparse_identity;
 use super::{CheckpointTransition, ScopedDbSyncToken, SqliteStateDb, SyncTokenStore};
 use crate::state::error::StateError;
@@ -73,7 +74,10 @@ impl SqliteStateDb {
     pub(crate) async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError> {
         let key = key.to_owned();
         let value = value.to_owned();
-        self.with_conn("set_metadata", move |conn| {
+        self.with_conn_mut("set_metadata", move |conn| {
+            let tx=conn.transaction()?;
+            let conn=&tx;
+            let old_policy=observation::policy(conn)?;
             if !crate::sync_cycle::is_current_zone_checkpoint(&key)
                 && let Some(library) = super::legacy_preservation::checkpoint_library(&key) {
                 let protected: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM unattributed_legacy WHERE library=?1)", [library], |row| row.get(0))?;
@@ -85,7 +89,8 @@ impl SqliteStateDb {
                 rusqlite::params![key, value, key.starts_with(crate::state::UNRESOLVED_IDENTITY_PREFIX) && value == "1", crate::state::UNACCOUNTED_CURRENT_IDENTITY],
             )
             .map_err(|e| StateError::query("set_metadata", e))?;
-
+            observation::invalidate(conn,&[key],old_policy)?;
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -93,7 +98,14 @@ impl SqliteStateDb {
 
     pub(crate) async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
         let prefix = prefix.to_owned();
-        self.with_conn("delete_metadata_by_prefix", move |conn| {
+        self.with_conn_mut("delete_metadata_by_prefix", move |conn| {
+            let tx = conn.transaction()?;
+            let conn = &tx;
+            let old_policy = observation::policy(conn)?;
+            let keys: Vec<String> = conn
+                .prepare("SELECT key FROM metadata WHERE key LIKE ?1")?
+                .query_map([format!("{prefix}%")], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
             let mut stmt = conn
                 .prepare_cached("DELETE FROM metadata WHERE key LIKE ?1")
                 .map_err(|e| StateError::query("delete_metadata_by_prefix::prepare", e))?;
@@ -101,6 +113,9 @@ impl SqliteStateDb {
                 .execute([format!("{prefix}%")])
                 .map_err(|e| StateError::query("delete_metadata_by_prefix", e))?;
 
+            drop(stmt);
+            observation::invalidate(conn, &keys, old_policy)?;
+            tx.commit()?;
             Ok(deleted as u64)
         })
         .await
@@ -110,10 +125,34 @@ impl SqliteStateDb {
         &self,
         transition: CheckpointTransition,
     ) -> Result<(), StateError> {
+        self.commit_observation_transition(transition, None, false)
+            .await
+    }
+
+    pub(crate) async fn commit_observation_transition(
+        &self,
+        transition: CheckpointTransition,
+        proof: Option<ObservationProof>,
+        promote: bool,
+    ) -> Result<(), StateError> {
         self.with_conn_mut("commit_checkpoint_transition", move |conn| {
             let tx = conn
                 .transaction()
                 .map_err(|e| StateError::query("commit_checkpoint_transition::begin", e))?;
+            let old_policy = observation::policy(&tx)?;
+            let prepared_observation = observation::prepare(
+                &tx,
+                &transition.metadata_updates,
+                &transition.expected_metadata,
+                proof.as_ref(),
+                promote,
+            )?;
+            let changed_keys = transition
+                .metadata_updates
+                .iter()
+                .map(|(k, _)| k.clone())
+                .chain(transition.metadata_deletes.iter().cloned())
+                .collect::<Vec<_>>();
             for (key, expected) in &transition.expected_metadata {
                 let actual: Option<String> = tx
                     .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
@@ -190,6 +229,8 @@ impl SqliteStateDb {
                 tx.execute("DELETE FROM metadata WHERE key = ?1", [key])
                     .map_err(|e| StateError::query("commit_checkpoint_transition::delete", e))?;
             }
+            observation::invalidate(&tx, &changed_keys, old_policy)?;
+            observation::apply(&tx, prepared_observation)?;
             #[cfg(all(test, target_os = "linux"))]
             if writes_current_token {
                 crate::test_helpers::process_death_point("checkpoint-before-commit");
@@ -303,6 +344,14 @@ impl SyncTokenStore for SqliteStateDb {
         SqliteStateDb::commit_checkpoint_transition(self, transition).await
     }
 
+    async fn commit_observation_transition(
+        &self,
+        transition: CheckpointTransition,
+        proof: Option<ObservationProof>,
+        promote: bool,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::commit_observation_transition(self, transition, proof, promote).await
+    }
     async fn get_scoped_db_sync_token(
         &self,
         provider: &str,
