@@ -1561,7 +1561,8 @@ impl DownloadContextStateStore for SqliteStateDb {
         self.with_conn("get_baseline_receipts", |conn| {
             let mut statement = conn.prepare_cached(
                 // Managed layout history can carry old download_checksum values
-                // as source evidence. Keep those candidates, but do not promote
+                // as source evidence. Deletion does not invalidate retained byte receipts.
+                // Keep those candidates, but do not promote
                 // that provenance into baseline content proof. A legacy asset
                 // path without a receipt is still an uncertain candidate; its
                 // download checksum must never manufacture source evidence.
@@ -1572,13 +1573,13 @@ impl DownloadContextStateStore for SqliteStateDb {
                           THEN NULL ELSE p.source_checksum END, (p.local_path IS a.local_path)
                  FROM asset_metadata_paths p JOIN assets a
                    ON a.library=p.library AND a.id=p.id AND a.version_size=p.version_size
-                 WHERE a.is_deleted=0 AND a.checksum=p.provider_checksum
+                 WHERE a.checksum=p.provider_checksum
                    AND a.size_bytes>=0 AND a.downloaded_at IS NOT NULL
                  UNION ALL
                  SELECT a.library,a.id,a.version_size,a.checksum,a.size_bytes,
                         a.local_path,a.local_checksum,NULL,1
                  FROM assets a
-                 WHERE a.is_deleted=0 AND a.size_bytes>=0
+                 WHERE a.size_bytes>=0
                    AND a.downloaded_at IS NOT NULL AND a.local_path IS NOT NULL
                    AND NOT EXISTS(SELECT 1 FROM asset_metadata_paths p
                        WHERE p.library=a.library AND p.id=a.id

@@ -793,6 +793,55 @@ mod tests {
         drop(db);
         let db = SqliteStateDb::open(&db_path).await.unwrap();
         assert_eq!(db.get_baseline_receipts().await.unwrap().len(), 2);
+        for id in ["downloaded-old", "imported-old"] {
+            db.mark_soft_deleted("PrimarySync", id, None).await.unwrap();
+        }
+        drop(db);
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let deleted = db.get_baseline_receipts().await.unwrap();
+        assert_eq!(deleted.len(), 2);
+        let receipt = deleted
+            .iter()
+            .find(|r| r.id == "downloaded-old")
+            .unwrap()
+            .clone();
+        assert!(matches!(
+            BaselineMatcher::new(vec![receipt.clone()])
+                .match_task(tmp.path(), &selected, &selected.download_path)
+                .await,
+            BaselineMatch::Present { .. }
+        ));
+        for change in 0..3 {
+            let mut other = selected.clone();
+            match change {
+                0 => other.checksum = "other-generation".into(),
+                1 => other.size += 1,
+                _ => other.version_size = crate::state::VersionSizeKey::LiveOriginal,
+            }
+            assert!(matches!(
+                BaselineMatcher::new(vec![receipt.clone()])
+                    .match_task(tmp.path(), &other, &other.download_path)
+                    .await,
+                BaselineMatch::Missing
+            ));
+        }
+        for source in [None, Some("invalid".into()), Some("0".repeat(64))] {
+            let mut unproven = receipt.clone();
+            unproven.source_checksum = source;
+            assert!(matches!(
+                BaselineMatcher::new(vec![unproven])
+                    .match_task(tmp.path(), &selected, &selected.download_path)
+                    .await,
+                BaselineMatch::Uncertain(_)
+            ));
+        }
+        std::fs::write(&receipt.local_path, b"evil").unwrap();
+        assert!(matches!(
+            BaselineMatcher::new(vec![receipt.clone()])
+                .match_task(tmp.path(), &selected, &selected.download_path)
+                .await,
+            BaselineMatch::Uncertain(_)
+        ));
     }
 
     #[tokio::test]

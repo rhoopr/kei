@@ -148,13 +148,15 @@ impl SqliteStateDb {
             let Some(path_text) = receipt.local_path.to_str() else {
                 return Err(refuse());
             };
+            // Source deletion is not a byte mutation. Current target deletion
+            // remains independently fenced below until authenticated admission.
             let unchanged: bool = !historical || tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM asset_metadata_paths p JOIN assets a
                  ON a.library=p.library AND a.id=p.id AND a.version_size=p.version_size
                  WHERE p.library=?1 AND p.id=?2 AND p.version_size=?3
                    AND p.local_path=?4 AND p.provider_checksum=?5
                    AND a.checksum=p.provider_checksum AND a.size_bytes=?6
-                   AND a.is_deleted=0 AND a.downloaded_at IS NOT NULL
+                   AND a.downloaded_at IS NOT NULL
                    AND NOT EXISTS(SELECT 1 FROM primary_layout_bindings b
                        WHERE b.library=p.library AND b.child=p.id)
                    AND p.local_checksum=?7 AND p.source_checksum=?8)",

@@ -172,7 +172,7 @@ async fn baseline_adoption_callback_failure_rolls_back_every_new_row() {
 }
 
 #[tokio::test]
-async fn baseline_adoption_rejects_stale_source_receipt_and_source_deletion() {
+async fn baseline_adoption_rejects_stale_receipt_even_when_source_is_deleted() {
     for deleted in [false, true] {
         let fixture = Fixture::new().await;
         let conn = Connection::open(&fixture.db_path).unwrap();
@@ -182,7 +182,8 @@ async fn baseline_adoption_rejects_stale_source_receipt_and_source_deletion() {
                 [],
             )
             .unwrap();
-        } else {
+        }
+        {
             conn.execute("UPDATE asset_metadata_paths SET local_checksum=?1 WHERE library='PrimarySync' AND id='old-master'", ["0".repeat(64)]).unwrap();
         }
         let before = fixture.source_snapshot();
@@ -482,4 +483,61 @@ async fn baseline_diagnostics_merge_destinations_reopen_and_settle_only_publishe
     );
     assert_eq!(fixture.source_snapshot(), before);
     assert_eq!(std::fs::read(&fixture.media).unwrap(), b"good");
+}
+
+#[tokio::test]
+async fn deleted_source_receipt_preserves_history_but_never_revives_deleted_target() {
+    let fixture = Fixture::new().await;
+    fixture
+        .db
+        .mark_soft_deleted("PrimarySync", "old-master", None)
+        .await
+        .unwrap();
+    let before = fixture.source_snapshot();
+    let receipts = fixture.db.get_baseline_receipts().await.unwrap();
+    assert_eq!(
+        receipts.len(),
+        1,
+        "source deletion does not invalidate recorded byte provenance"
+    );
+    fixture
+        .db
+        .adopt_baseline_receipt(
+            &fixture.selected("current"),
+            &receipts[0],
+            Box::new(|| Ok(())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fixture.source_snapshot(), before);
+    assert_eq!(fixture.selected_count("current"), 1);
+    fixture
+        .db
+        .mark_soft_deleted("SharedSync", "current", None)
+        .await
+        .unwrap();
+    let target = || {
+        fixture.db.acquire_lock("deleted target snapshot").unwrap().query_row::<(bool,String,String,Option<String>,Option<String>,Option<i64>),_,_>(
+        "SELECT is_deleted,status,checksum,local_checksum,local_path,downloaded_at FROM assets WHERE library='SharedSync' AND id='current'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap()
+    };
+    let deleted_target = target();
+    assert!(deleted_target.0);
+    assert!(
+        fixture
+            .db
+            .adopt_baseline_receipt(
+                &fixture.selected("current"),
+                &receipts[0],
+                Box::new(|| Ok(()))
+            )
+            .await
+            .is_err(),
+        "source proof cannot replace current restoration authority"
+    );
+    assert_eq!(fixture.source_snapshot(), before);
+    assert_eq!(
+        target(),
+        deleted_target,
+        "refusal must be atomic for the target too"
+    );
 }

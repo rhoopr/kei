@@ -1399,13 +1399,15 @@ async fn forced_metadata_refresh_resolves_completed_sibling_with_stale_preload()
             let checksum = crate::download::file::compute_sha256(&task.download_path)
                 .await
                 .unwrap();
-            db.mark_downloaded(
+            crate::state::DownloadStateStore::mark_verified_download(
+                db.as_ref(),
                 "PrimarySync",
                 asset.state_id(),
                 "original",
                 &task.download_path,
                 &checksum,
-                None,
+                Some(&checksum),
+                false,
             )
             .await
             .unwrap();
@@ -1413,6 +1415,28 @@ async fn forced_metadata_refresh_resolves_completed_sibling_with_stale_preload()
     }
     let stale = preload_download_context(&config).await;
     assert_eq!(db.get_pending().await.unwrap().len(), 1);
+    // The sibling finishes after preloading. A file without a completed receipt
+    // would remain uncertain; this case specifically tests stale preload state.
+    let sibling = plan
+        .tasks
+        .iter()
+        .find(|task| task.version_size == VersionSizeKey::Alternative)
+        .unwrap();
+    let sibling_hash = crate::download::file::compute_sha256(&sibling.download_path)
+        .await
+        .unwrap();
+    crate::state::DownloadStateStore::mark_verified_download(
+        db.as_ref(),
+        "PrimarySync",
+        asset.state_id(),
+        "alternative",
+        &sibling.download_path,
+        &sibling_hash,
+        Some(&sibling_hash),
+        false,
+    )
+    .await
+    .unwrap();
     // Reject even an intermediate refresh that uses provider keys instead of
     // the current downloaded checksums. Final-state assertions alone miss it.
     db.acquire_lock("guard swapped metadata")
@@ -1671,6 +1695,7 @@ async fn metadata_drift_refreshes_when_media_task_is_filtered() {
 /// on-disk check, so the default naming policy files a copy beside the
 /// original.
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn restored_soft_deleted_asset_is_skipped_without_downloading() {
     use crate::download::DownloadConfig;
     use crate::icloud::photos::PhotoAsset;
@@ -1686,10 +1711,77 @@ async fn restored_soft_deleted_asset_is_skipped_without_downloading() {
     let config = Arc::new(config);
 
     let (stored, _) = drifted_asset_pair("RESTORED", "restored.jpg");
+    let stored = stored
+        .clone()
+        .with_state_record_name(stored.asset_record_name_arc());
     let derived = seed_downloaded_drift_asset(&db, &config, &stored).await;
+    // Bind the opaque provider generation to the actual unchanged local bytes.
+    let local_hash = crate::download::file::compute_sha256(&derived.path)
+        .await
+        .unwrap();
+    crate::state::DownloadStateStore::mark_verified_download(
+        db.as_ref(),
+        "PrimarySync",
+        stored.state_id(),
+        derived.version_size.as_str(),
+        &derived.path,
+        &local_hash,
+        Some(&local_hash),
+        false,
+    )
+    .await
+    .unwrap();
+    let before = fs::read(&derived.path).unwrap();
+    let modified = fs::metadata(&derived.path).unwrap().modified().unwrap();
     db.mark_soft_deleted("PrimarySync", stored.state_id(), None)
         .await
         .unwrap();
+
+    let refused = stream_and_download_from_stream(
+        &reqwest::Client::new(),
+        stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(stored.clone())]),
+        &config,
+        DownloadControls::download_hidden(),
+        1,
+        CancellationToken::new(),
+        StreamRuntime::new(None, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused.downloaded, 0);
+    assert!(
+        refused.state_write_failures > 0,
+        "matching bytes alone cannot revive a deleted target"
+    );
+    assert!(
+        db.acquire_lock("unconfirmed target stays deleted")
+            .unwrap()
+            .query_row::<bool, _, _>(
+                "SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id=?1",
+                [stored.state_id()],
+                |r| r.get(0)
+            )
+            .unwrap()
+    );
+    assert_eq!(fs::read(&derived.path).unwrap(), before);
+
+    // This downstream producer fixture starts after current authenticated
+    // admission restores the selected row. The real runner restoration/reopen
+    // contract is exercised by v027_restored_selected_receipt_survives_reopen_without_duplicate_or_rewrite.
+    let current =
+        asset_record_for_derived_path(Arc::from("PrimarySync"), &stored, &derived, &config);
+    db.upsert_seen(&current).await.unwrap();
+    let restored: (bool, String) = db
+        .acquire_lock("trusted admission restored target")
+        .unwrap()
+        .query_row(
+            "SELECT is_deleted,status FROM assets WHERE library='PrimarySync' AND id=?1",
+            [stored.state_id()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(!restored.0);
+    assert_eq!(restored.1, "downloaded");
 
     let result = stream_and_download_from_stream(
         &reqwest::Client::new(),
@@ -1716,12 +1808,18 @@ async fn restored_soft_deleted_asset_is_skipped_without_downloading() {
         1,
         "no duplicate may be written beside the original"
     );
+    assert_eq!(fs::read(&derived.path).unwrap(), before);
+    assert_eq!(
+        fs::metadata(&derived.path).unwrap().modified().unwrap(),
+        modified
+    );
 }
 
 /// #707: a restored photo that was also edited must not report unsafe
 /// provider state. Its rows cannot be refreshed while the deletion stands,
 /// and reporting that every cycle would hold the checkpoint forever.
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn restored_and_edited_asset_does_not_report_unsafe_state() {
     use crate::download::DownloadConfig;
     use crate::icloud::photos::PhotoAsset;
@@ -1738,10 +1836,52 @@ async fn restored_and_edited_asset_does_not_report_unsafe_state() {
     let config = Arc::new(config);
 
     let (stored, edited) = drifted_asset_pair("RESTORED_EDIT", "restored_edit.jpg");
-    seed_downloaded_drift_asset(&db, &config, &stored).await;
+    let stored = stored
+        .clone()
+        .with_state_record_name(stored.asset_record_name_arc());
+    let edited = edited
+        .clone()
+        .with_state_record_name(edited.asset_record_name_arc());
+    let derived = seed_downloaded_drift_asset(&db, &config, &stored).await;
+    // Bind the opaque provider generation to the actual unchanged local bytes.
+    let local_hash = crate::download::file::compute_sha256(&derived.path)
+        .await
+        .unwrap();
+    crate::state::DownloadStateStore::mark_verified_download(
+        db.as_ref(),
+        "PrimarySync",
+        stored.state_id(),
+        derived.version_size.as_str(),
+        &derived.path,
+        &local_hash,
+        Some(&local_hash),
+        false,
+    )
+    .await
+    .unwrap();
+    let before = fs::read(&derived.path).unwrap();
+    let modified = fs::metadata(&derived.path).unwrap().modified().unwrap();
     db.mark_soft_deleted("PrimarySync", stored.state_id(), None)
         .await
         .unwrap();
+
+    // This downstream producer fixture starts after current authenticated
+    // admission restores the selected row. The real runner restoration/reopen
+    // contract is exercised by v027_restored_selected_receipt_survives_reopen_without_duplicate_or_rewrite.
+    let current =
+        asset_record_for_derived_path(Arc::from("PrimarySync"), &edited, &derived, &config);
+    db.upsert_seen(&current).await.unwrap();
+    let restored: (bool, String) = db
+        .acquire_lock("trusted admission restored target")
+        .unwrap()
+        .query_row(
+            "SELECT is_deleted,status FROM assets WHERE library='PrimarySync' AND id=?1",
+            [stored.state_id()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(!restored.0);
+    assert_eq!(restored.1, "downloaded");
 
     let result = stream_and_download_from_stream(
         &reqwest::Client::new(),
@@ -1760,6 +1900,11 @@ async fn restored_and_edited_asset_does_not_report_unsafe_state() {
         "a deleted row that cannot be refreshed is not a durability failure"
     );
     assert_eq!(result.downloaded, 0);
+    assert_eq!(fs::read(&derived.path).unwrap(), before);
+    assert_eq!(
+        fs::metadata(&derived.path).unwrap().modified().unwrap(),
+        modified
+    );
 }
 
 /// #707 acceptance criterion 1, sidecar half: the rewrite must run from

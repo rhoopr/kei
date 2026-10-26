@@ -416,7 +416,9 @@ require preservation before their mutable-row guards can be retired. Aggregate
 cross-zone routing and complete selection coverage remain under validation.
 
 Existing-file matching keeps current provider identity separate from content
-equivalence. Unchanged historical raw-file receipts require source SHA-256,
+equivalence. A historical source deletion does not invalidate a content receipt; current
+target restoration still requires authenticated admission before adoption.
+Unchanged historical raw-file receipts require source SHA-256,
 recorded local SHA-256 and freshly read bytes to agree. Old source/local
 mismatches cannot certify metadata edits because older generic adoption could
 preserve a source hash while replacing the local hash with unrelated bytes.

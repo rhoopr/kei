@@ -257,6 +257,17 @@ tokio::task_local! {static CURRENT_SIDECAR_FAILURE: bool;}
 tokio::task_local! {static REQUIRE_OBSERVATION_PROOF: bool;}
 tokio::task_local! {static PRESERVE_EXTERNAL_LINKS: bool;}
 tokio::task_local! {static PRESERVE_SHARED_CLAIMS: bool;}
+tokio::task_local! {static RESTORE_DELETED_RECEIPTS: bool;}
+
+#[tokio::test]
+async fn v027_restored_selected_receipt_survives_reopen_without_duplicate_or_rewrite() {
+    RESTORE_DELETED_RECEIPTS
+        .scope(
+            true,
+            baseline_contract("private", false, false, false, true, false, false),
+        )
+        .await;
+}
 
 #[tokio::test]
 async fn v027_observation_proof_tracks_baseline_restart_and_quiet_deltas() {
@@ -592,6 +603,16 @@ async fn baseline_contract(
         db.set_metadata(&format!("pending_sync_token:old-config:{ZONE}"), OLD_TOKEN)
             .await
             .unwrap();
+        if RESTORE_DELETED_RECEIPTS.try_get().unwrap_or(false) {
+            db.mark_soft_deleted("PrimarySync", "old-primary-master", None)
+                .await
+                .unwrap();
+            db.mark_soft_deleted(ZONE, "asset-current-existing", None)
+                .await
+                .unwrap();
+            assert_eq!(db.acquire_lock("prove deleted restoration seed").unwrap().query_row::<i64,_,_>(
+                "SELECT count(*) FROM assets WHERE is_deleted=1 AND id IN ('old-primary-master','asset-current-existing')",[],|r|r.get(0)).unwrap(),2);
+        }
     }
     if PRESERVE_SHARED_CLAIMS.try_get().unwrap_or(false) {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1065,6 +1086,23 @@ async fn baseline_contract(
                 current_content_receipts(&db_path) == *expected,
                 "same-zone configuration drift must keep current path and content receipts unchanged"
             );
+        }
+        if RESTORE_DELETED_RECEIPTS.try_get().unwrap_or(false) {
+            let current: (bool, String, String, String) = db.acquire_lock("current restoration result").unwrap().query_row(
+                "SELECT is_deleted,status,local_path,local_checksum FROM assets WHERE library=?1 AND id='asset-current-existing' AND version_size='original'",[ZONE],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            assert!(!current.0);
+            assert_eq!(current.1, "downloaded");
+            assert_eq!(std::path::Path::new(&current.2), old_path);
+            assert_eq!(
+                current.3,
+                download::file::compute_sha256(&old_path).await.unwrap()
+            );
+            assert!(
+                !root.join("existing.JPG").exists(),
+                "restoration cannot create a second path"
+            );
+            assert!(db.acquire_lock("historical source stays deleted").unwrap().query_row::<bool,_,_>(
+                "SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id='old-primary-master'",[],|r|r.get(0)).unwrap());
         }
         let old_rows = db.get_downloaded_page(0, 100).await.unwrap();
         assert_eq!(
