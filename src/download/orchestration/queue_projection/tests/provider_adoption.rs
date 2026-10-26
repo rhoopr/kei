@@ -315,14 +315,6 @@ async fn assert_provider_adoption_interruption(
         .unwrap();
     let work = db.recorded_selection_work().await.unwrap();
     assert_eq!(work.invalid_roots, 0);
-    if raw_relative_publication {
-        // Known separate settlement defect: reporting must not turn the
-        // catalog's downloaded status into proof of settled selected work.
-        assert_eq!(progress, ("downloaded".into(), 0, 1));
-        assert_eq!(work.profiles[0].pending_media, 1);
-        assert_eq!(work.profiles[0].verified_destinations, 0);
-        return;
-    }
     assert_eq!(work.profiles[0].pending_media, 0);
     assert_eq!(work.profiles[0].verified_destinations, 1);
     assert_eq!(progress, ("downloaded".into(), 1, 1));
@@ -355,7 +347,7 @@ async fn v027_provider_adoption_inode_replacement_rolls_back_before_commit() {
 }
 
 #[tokio::test]
-async fn coverage_keeps_known_raw_relative_settlement_gap_outstanding() {
+async fn v027_relative_provider_adoption_settles_exact_destination_after_reopen() {
     assert_provider_adoption_interruption("callback", true).await;
 }
 
@@ -448,4 +440,13 @@ async fn coverage_keeps_profiles_unknown_windows_and_invalid_evidence_separate()
     assert_eq!(invalid.profiles.len(), 1);
     assert_eq!(invalid.unsupported_profiles, 1);
     assert_eq!(invalid.stored_media_receipts, 0);
+}
+
+#[tokio::test]
+async fn v027_relative_provider_adoption_mutation_rolls_back_before_settlement() {
+    assert_provider_adoption_interruption("same-size", true).await;
+}
+#[tokio::test]
+async fn v027_relative_provider_adoption_inode_replacement_rolls_back_before_settlement() {
+    assert_provider_adoption_interruption("inode", true).await;
 }

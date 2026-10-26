@@ -2587,6 +2587,14 @@ fn record_destination_source(
     local: &str,
     source: VerifiedDestinationSource<'_>,
 ) -> Result<(), StateError> {
+    // Publication has just written this compatibility receipt in the same
+    // transaction from its verified native path. Its TEXT representation is
+    // only a row locator: the lossless destination key below remains mandatory.
+    // Read-only receipt adoption must never infer native identity from lossy text.
+    let receipt_path = match &source {
+        VerifiedDestinationSource::PathPublication(..) => Some(path.to_string_lossy()),
+        _ => path.to_str().map(std::borrow::Cow::Borrowed),
+    };
     let (source, require_path_receipt, preserve_prepared, readonly, completed_flags) = match source
     {
         VerifiedDestinationSource::PathPublication(source, flags) => {
@@ -2620,7 +2628,7 @@ fn record_destination_source(
     // Validated native reuse has its own lossless receipt, including prepared
     // rewrite outputs that must not update a lossy TEXT sibling's checksum.
     // Bind MMCS as a provider generation, never as a local content digest.
-    let rows:Vec<(String,String,String)>=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND admitted=1 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND a.checksum=provider_active_destinations.checksum AND a.size_bytes=provider_active_destinations.size_bytes AND a.metadata_hash=provider_active_destinations.metadata_hash AND a.created_at IS provider_active_destinations.created_at AND a.added_at IS provider_active_destinations.added_at AND a.status='downloaded' AND a.is_deleted=0 AND (?7=0 OR EXISTS(SELECT 1 FROM asset_metadata_paths p WHERE p.library=a.library AND p.id=a.id AND p.version_size=a.version_size AND p.provider_checksum=a.checksum AND p.local_path=provider_active_destinations.compat_path AND p.local_checksum=?5 AND p.source_checksum=?6)))")?.query_map(params![library,asset,version,path,local,source,require_path_receipt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
+    let rows:Vec<(String,String,String)>=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND admitted=1 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND a.checksum=provider_active_destinations.checksum AND a.size_bytes=provider_active_destinations.size_bytes AND a.metadata_hash=provider_active_destinations.metadata_hash AND a.created_at IS provider_active_destinations.created_at AND a.added_at IS provider_active_destinations.added_at AND a.status='downloaded' AND a.is_deleted=0 AND (?7=0 OR EXISTS(SELECT 1 FROM asset_metadata_paths p WHERE p.library=a.library AND p.id=a.id AND p.version_size=a.version_size AND p.provider_checksum=a.checksum AND p.local_path=?8 AND p.local_checksum=?5 AND p.source_checksum=?6)))")?.query_map(params![library,asset,version,path,local,source,require_path_receipt,receipt_path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
     for (generation, key, child) in rows {
         let root = load_generation(conn, &generation)?;
         let manifest = load_decision(conn, &root, &key, &child)?;

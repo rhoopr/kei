@@ -2721,3 +2721,15 @@ checks recorded files rather than independently enumerating selected provider
 content. Historical attribution and optional backfill are not requirements for
 current content completeness; genuine unfinished current publication remains
 visible even if the compatibility catalog already says downloaded.
+
+Publication settlement binds the per-path receipt using the exact path spelling
+supplied to the existing publication/adoption transaction, while independently
+matching the ledger's absolute native destination key. This lets a relative
+archive root settle its own destination without rewriting recorded paths or
+borrowing another destination's receipt. Equivalent spelling alone is not proof:
+read-only receipt adoption needs the caller's exact UTF-8 path. Newly verified
+publication uses the compatibility receipt just written in that transaction,
+including its existing text representation for non-UTF-8 paths; the lossless
+native destination key independently prevents sibling settlement. Retained native
+reuse keeps its separate validated proof route. Source/local hashes,
+provider resource, selected facts and receipt/settlement atomicity remain required.

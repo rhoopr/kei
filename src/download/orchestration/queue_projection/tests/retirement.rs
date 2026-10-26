@@ -2483,3 +2483,264 @@ async fn recorded_work_successor_owns_pending_destinations_without_empty_predece
     assert_eq!(work.profiles[0].deferred_decisions, 0);
     assert_eq!(work.profiles[0].verified_destinations, 0);
 }
+
+#[tokio::test]
+async fn relative_publication_binds_exact_receipt_and_keeps_sibling_pending_through_rollback() {
+    let dir = tempfile::tempdir_in(".").unwrap();
+    let state = std::path::absolute(dir.path().join("state.db")).unwrap();
+    let db = Arc::new(SqliteStateDb::open_owned(&state, &owner()).await.unwrap());
+    let first = db
+        .begin_selection_generation(owner(), spec(), BUDGET)
+        .await
+        .unwrap();
+    let (_, mut first_tasks, _) =
+        admission(&db, &first.id, &dir.path().join("first"), 0, false, BUDGET).await;
+    let second = db
+        .begin_selection_generation(owner(), spec(), BUDGET)
+        .await
+        .unwrap();
+    let (_, second_tasks, _) = admission(
+        &db,
+        &second.id,
+        &std::path::absolute(dir.path().join("second")).unwrap(),
+        0,
+        false,
+        BUDGET,
+    )
+    .await;
+    // Admission normalizes task destinations; exercise the public state
+    // boundary with the equivalent natural relative spelling of that same path.
+    let first_native = first_tasks[0].download_path.clone();
+    first_tasks[0].download_path = first_native
+        .strip_prefix(std::env::current_dir().unwrap())
+        .unwrap()
+        .to_path_buf();
+    assert_eq!(
+        std::path::absolute(&first_tasks[0].download_path).unwrap(),
+        first_native
+    );
+    let a = &first_tasks[0];
+    let b = &second_tasks[0];
+    assert!(a.download_path.is_relative());
+    assert!(b.download_path.is_absolute());
+    for task in [a, b] {
+        std::fs::create_dir_all(task.download_path.parent().unwrap()).unwrap();
+        std::fs::write(&task.download_path, RAW).unwrap();
+    }
+    let timestamps: Vec<_> = [a, b]
+        .iter()
+        .map(|t| {
+            std::fs::metadata(&t.download_path)
+                .unwrap()
+                .modified()
+                .unwrap()
+        })
+        .collect();
+    let sha = data_encoding::HEXLOWER.encode(&Sha256::digest(RAW));
+    let mark = |db: Arc<SqliteStateDb>, task: crate::download::filter::DownloadTask| {
+        let sha = sha.clone();
+        async move {
+            db.mark_verified_download(
+                "PrimarySync",
+                &task.asset_id,
+                task.version_size.as_str(),
+                &task.download_path,
+                &sha,
+                Some(&sha),
+                false,
+            )
+            .await
+        }
+    };
+    // An equivalent absolute receipt spelling alone cannot authorize the
+    // relative caller. Model inconsistent evidence without changing any bytes.
+    {
+        let conn = db.acquire_lock("receipt spelling refusal").unwrap();
+        conn.execute(
+            "CREATE TEMP TABLE alternate_receipt_path(path TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO alternate_receipt_path VALUES(?1)",
+            [std::path::absolute(&a.download_path)
+                .unwrap()
+                .to_str()
+                .unwrap()],
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TEMP TRIGGER alter_receipt_spelling AFTER UPDATE OF source_checksum ON main.asset_metadata_paths WHEN NEW.source_checksum IS NOT NULL BEGIN UPDATE asset_metadata_paths SET local_path=(SELECT path FROM alternate_receipt_path) WHERE library=NEW.library AND id=NEW.id AND version_size=NEW.version_size AND local_path=NEW.local_path; END;").unwrap();
+    }
+    mark(db.clone(), a.clone()).await.unwrap();
+    {
+        let conn = db.acquire_lock("check refused alternate spelling").unwrap();
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT sum(verified_media) FROM provider_active_destinations",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute_batch(
+            "DROP TRIGGER alter_receipt_spelling; DROP TABLE alternate_receipt_path;",
+        )
+        .unwrap();
+    }
+    mark(db.clone(), a.clone()).await.unwrap();
+    {
+        let conn = db.acquire_lock("exact first destination only").unwrap();
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT verified_media FROM provider_active_destinations WHERE generation=?1",
+                [&first.id],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT verified_media FROM provider_active_destinations WHERE generation=?1",
+                [&second.id],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute_batch("CREATE TRIGGER fail_settlement BEFORE UPDATE OF verified_media ON provider_active_destinations WHEN OLD.verified_media=0 AND NEW.verified_media=1 BEGIN SELECT RAISE(ABORT,'synthetic settlement interruption'); END;").unwrap();
+    }
+    assert!(mark(db.clone(), b.clone()).await.is_err());
+    {
+        let conn = db.acquire_lock("receipt transaction rollback").unwrap();
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM asset_metadata_paths WHERE local_path=?1",
+                [b.download_path.to_str().unwrap()],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT sum(verified_media) FROM provider_active_destinations",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+    drop(db);
+    let db = Arc::new(SqliteStateDb::open_owned(&state, &owner()).await.unwrap());
+    db.acquire_lock("resume settlement")
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_settlement")
+        .unwrap();
+    mark(db.clone(), b.clone()).await.unwrap();
+    assert_eq!(
+        db.acquire_lock("both independent destinations settled")
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT sum(verified_media) FROM provider_active_destinations",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        2
+    );
+    drop(db);
+    let reopened = SqliteStateDb::open_owned(&state, &owner()).await.unwrap();
+    assert_eq!(
+        reopened
+            .acquire_lock("settlement survives reopen")
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT sum(verified_media) FROM provider_active_destinations",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        2
+    );
+    for (i, task) in [a, b].iter().enumerate() {
+        assert_eq!(std::fs::read(&task.download_path).unwrap(), RAW);
+        assert_eq!(
+            std::fs::metadata(&task.download_path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            timestamps[i]
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_publication_with_equal_lossy_text_settles_only_exact_destination() {
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    let mut roots = Vec::new();
+    let mut tasks = Vec::new();
+    for byte in [0xfe, 0xff] {
+        let root = db
+            .begin_selection_generation(owner(), spec(), BUDGET)
+            .await
+            .unwrap();
+        let media = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(vec![b'p', byte]));
+        let (_, selected, _) = admission(&db, &root.id, &media, 0, false, BUDGET).await;
+        roots.push(root.id);
+        tasks.push(selected[0].clone());
+    }
+    assert_ne!(tasks[0].download_path, tasks[1].download_path);
+    assert_eq!(
+        tasks[0].download_path.to_string_lossy(),
+        tasks[1].download_path.to_string_lossy()
+    );
+    publish(&db, &tasks[0]).await;
+    {
+        let conn = db.acquire_lock("native sibling still pending").unwrap();
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT verified_media FROM provider_active_destinations WHERE generation=?1",
+                [&roots[0]],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT verified_media FROM provider_active_destinations WHERE generation=?1",
+                [&roots[1]],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+    publish(&db, &tasks[1]).await;
+    assert_eq!(
+        db.acquire_lock("both native paths separately settled")
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT sum(verified_media) FROM provider_active_destinations",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        2
+    );
+    for task in tasks {
+        assert_eq!(std::fs::read(task.download_path).unwrap(), RAW);
+    }
+}
