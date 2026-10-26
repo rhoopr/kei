@@ -401,6 +401,14 @@ async fn context_for_source(
             .context("Invalid selection profile")?
             .insert("current_download_metadata".into(), json!(1));
     }
+    if format == 2 && config.refresh_metadata {
+        // Admission records the explicit request. Its unfinished writers remain
+        // authorized on later normal retries under the same source/flags policy.
+        profile
+            .as_object_mut()
+            .context("Invalid selection profile")?
+            .insert("explicit_metadata_refresh".into(), json!(1));
+    }
     let mut fingerprint = policy(hash_download_config(config));
     fingerprint
         .as_object_mut()

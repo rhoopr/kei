@@ -437,7 +437,12 @@ check instead of a futile full-file hash, without changing missing/uncertain pol
 
 Names, suffixes, size and old Primary/Shared labels locate candidates but cannot
 complete work. Read-only adoption preserves bytes, metadata, paths and modification
-times. Distinct provider identities retain separate obligations even when bytes
+times. An explicit metadata-refresh request is recorded as a versioned intent in
+its new format-2 profile. Verified reuse settles media but leaves that request's
+metadata outstanding for the existing guarded writer, including native paths.
+Later normal retries retain this already-admitted authorization under the same
+source/resource/metadata policy; they cannot grant it to older read-only roots.
+Completed destinations are not reopened merely by retry-policy compatibility. Distinct provider identities retain separate obligations even when bytes
 coincide. Distinct database/owner scopes sharing a legacy zone-name key fail closed
 rather than merge identities. Completely unindexed arbitrary renames/moves remain
 outside the current candidate discovery coverage.

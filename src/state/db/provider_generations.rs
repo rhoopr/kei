@@ -166,6 +166,10 @@ fn validate_spec(spec: &GenerationSpec) -> Result<(), StateError> {
     let scope: Value = serde_json::from_str(&spec.scope)
         .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
     if !matches!(spec.format, 1 | 2)
+        || spec
+            .profile
+            .get("explicit_metadata_refresh")
+            .is_some_and(|version| spec.format != 2 || version.as_u64() != Some(1))
         || spec.metadata_enabled != (spec.metadata_flags != 0)
         || spec.metadata_flags & !0b0011_1111 != 0
         || (spec.format == 1
@@ -2659,7 +2663,11 @@ fn record_destination_source(
         if root.spec.format == 2 && root.spec.metadata_enabled {
             let group = grouping_hash(conn, library, asset)?;
             freeze_asset_intents(conn, &root, library, asset, &group)?;
-            if readonly || root.spec.metadata_flags & completed_flags == root.spec.metadata_flags {
+            let readonly_exempt =
+                readonly && root.spec.profile.get("explicit_metadata_refresh").is_none();
+            if readonly_exempt
+                || root.spec.metadata_flags & completed_flags == root.spec.metadata_flags
+            {
                 conn.execute("UPDATE provider_active_destinations SET verified_metadata=1 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND verified_media=0 AND prepared_hash IS NULL AND frozen_metadata IS NULL", params![generation,key,child,version,path])?;
             }
         }

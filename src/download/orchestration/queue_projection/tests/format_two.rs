@@ -379,3 +379,44 @@ async fn v027_same_named_provider_identity_in_distinct_scope_must_not_merge() {
         assert_eq!(reopened.get_pending().await.unwrap().len(), 1);
     }
 }
+
+#[tokio::test]
+async fn explicit_metadata_refresh_profile_version_is_validated_without_reinterpreting_old_roots() {
+    let f = Fixture::new().await;
+    let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+    let base = GenerationSpec {
+        format: 2,
+        scope: f.capture.scope("private", &zone).unwrap(),
+        zone: zone.clone(),
+        config_hash: "a".repeat(64),
+        basis: "b".repeat(64),
+        profile: json!({"coverage":"selected_downloads","passes":[{"key":"selected","scope":{
+            "database":"private","zone":zone,"kind":"unfiled"}}]}),
+        metadata_enabled: false,
+        metadata_flags: 0,
+    };
+    let old =
+        f.db.begin_selection_generation(owner(), base.clone(), MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+    assert!(old.spec.profile.get("explicit_metadata_refresh").is_none());
+    for unsupported in [json!(null), json!(0), json!(2), json!("1")] {
+        let mut spec = base.clone();
+        spec.config_hash = "c".repeat(64);
+        spec.profile["explicit_metadata_refresh"] = unsupported;
+        assert!(matches!(
+            f.db.begin_selection_generation(owner(), spec, MAX_GENERATION_BYTES)
+                .await,
+            Err(crate::state::error::StateError::ProviderSelectionInvalid)
+        ));
+    }
+    let mut explicit = base;
+    explicit.config_hash = "d".repeat(64);
+    explicit.profile["explicit_metadata_refresh"] = json!(1);
+    let new =
+        f.db.begin_selection_generation(owner(), explicit, MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+    assert_eq!(new.spec.profile["explicit_metadata_refresh"], json!(1));
+    assert!(old.spec.profile.get("explicit_metadata_refresh").is_none());
+}

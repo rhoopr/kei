@@ -3084,6 +3084,9 @@ async fn private_metadata_recovery_fixture(
 }
 
 #[cfg(feature = "xmp")]
+tokio::task_local! { static EXPLICIT_REFRESH_FAILURE: bool; }
+
+#[cfg(feature = "xmp")]
 async fn private_metadata_recovery_fixture_with_signature(
     shared: bool,
     interrupted: bool,
@@ -3611,6 +3614,53 @@ async fn private_metadata_recovery_fixture_with_signature(
         assert_eq!(next.stats.downloaded, 0);
         assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), ranks);
     }
+    let mut refreshed_sibling = None;
+    let passes = if EXPLICIT_REFRESH_FAILURE.try_with(|v| *v).unwrap_or(false) {
+        assert!(refresh && native && !shared);
+        let blocked = media_paths[0].with_file_name(format!("{}.xmp", filename));
+        let saved = blocked.with_extension("saved-xmp");
+        std::fs::rename(&blocked, &saved).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        let failed = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &passes,
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed.stats.downloaded, 0);
+        assert!(failed.stats.exif_failures > 0, "{failed:?}");
+        assert!(!matches!(
+            failed.outcome,
+            crate::download::DownloadOutcome::Success
+        ));
+        assert!(f.db.acquire_lock("failed explicit native refresh remains durable").unwrap()
+            .query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap()>0);
+        let sibling = media_paths[1].with_file_name(format!("{}.xmp", filename));
+        let bytes = std::fs::read(&sibling).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("new-explicit-title"));
+        refreshed_sibling = Some((
+            sibling.clone(),
+            bytes,
+            std::fs::metadata(&sibling).unwrap().modified().unwrap(),
+        ));
+        for path in &media_paths {
+            assert_eq!(std::fs::read(path).unwrap(), media);
+        }
+        std::fs::remove_dir(&blocked).unwrap();
+        std::fs::rename(saved, blocked).unwrap();
+        drop(passes);
+        f = reopen_destination_fixture(f).await;
+        f.config.refresh_metadata = false;
+        f.db.make_selection_retry_due(owner(), "asset-m".into())
+            .await
+            .unwrap();
+        vec![destination_pass(&f, "A"), destination_pass(&f, "B")]
+    } else {
+        passes
+    };
     let recovered = crate::download::download_photos_with_sync(
         &reqwest::Client::new(),
         &passes,
@@ -3713,6 +3763,27 @@ async fn private_metadata_recovery_fixture_with_signature(
             );
         }
     }
+    if let Some((path, bytes, mtime)) = &refreshed_sibling {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+            *mtime,
+            "quiet recovery cannot repeat the successful sibling writer"
+        );
+    }
+    let refreshed_sidecars = if refresh {
+        media_paths
+            .iter()
+            .map(|path| {
+                let sidecar = path.with_file_name(format!("{}.xmp", filename));
+                let bytes = std::fs::read(&sidecar).unwrap();
+                let mtime = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
+                (sidecar, bytes, mtime)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let times: Vec<_> = media_paths
         .iter()
         .map(|p| std::fs::metadata(p).unwrap().modified().unwrap())
@@ -3739,6 +3810,14 @@ async fn private_metadata_recovery_fixture_with_signature(
         assert_eq!(
             std::fs::metadata(media_path).unwrap().modified().unwrap(),
             time
+        );
+    }
+    for (path, bytes, mtime) in refreshed_sidecars {
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            mtime,
+            "quiet normal sync must not repeat completed explicit refresh"
         );
     }
     if let Some((mirror, sidecar, legacy)) = native_collision {
@@ -5073,6 +5152,17 @@ async fn private_completed_native_publications_receive_explicit_current_metadata
         MetadataStateFault::None,
     ))
     .await;
+}
+
+#[cfg(all(target_os = "linux", feature = "xmp"))]
+#[tokio::test]
+async fn explicit_native_refresh_failure_reopens_under_normal_sync_without_rewriting_sibling() {
+    EXPLICIT_REFRESH_FAILURE
+        .scope(
+            true,
+            private_metadata_recovery_fixture(false, false, true, true, MetadataStateFault::None),
+        )
+        .await;
 }
 
 #[tokio::test]
