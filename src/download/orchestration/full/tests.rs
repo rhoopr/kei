@@ -1172,6 +1172,37 @@ async fn full_sync_deferred_unfiled_opens_stream_after_album_passes_finish() {
 
 #[tokio::test]
 async fn full_sync_deferred_unfiled_logs_heartbeat_and_completion() {
+    const CHILD: &str = "KEI_TEST_DEFERRED_HEARTBEAT_CAPTURE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Temporary per-test dispatchers share tracing's process-wide callsites.
+        // Parallel enumeration can suppress capture of start/complete while the
+        // same real-flow assertion passes alone. Isolate subscriber lifetime;
+        // retain every event and field assertion in the child process.
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .kill_on_drop(true)
+                .args([
+                    "--exact",
+                    "download::orchestration::full::tests::full_sync_deferred_unfiled_logs_heartbeat_and_completion",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output(),
+        )
+        .await
+        .expect("isolated heartbeat capture timed out")
+        .expect("start isolated heartbeat capture");
+        assert!(
+            output.status.success(),
+            "isolated heartbeat capture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
     let (capture, _guard) = TracingCapture::install();
     let album_session =
         DynamicRecentPhotosSession::from_ids(vec!["album-heartbeat-0000".to_string()])
