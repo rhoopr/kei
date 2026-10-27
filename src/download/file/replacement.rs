@@ -92,7 +92,10 @@ pub(in crate::download) async fn publish_file_if_unchanged(
     }
 
     match publish_part_no_replace(part_path, final_path).await {
-        Ok(PublishResult::Published) => {
+        // See publication.rs: publish_part_no_replace() never actually
+        // produces PublishedWithRetainedTemp, but Published is the correct
+        // reading either way.
+        Ok(PublishResult::Published | PublishResult::PublishedWithRetainedTemp) => {
             crate::fs_util::fsync_parent_dir_async_best_effort(final_path).await;
             Ok(())
         }

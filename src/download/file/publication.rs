@@ -39,7 +39,11 @@ pub(in crate::download) async fn publish_part_to_final(
     }
 
     match publish_part_no_replace(part_path, final_path).await {
-        Ok(PublishResult::Published) => {
+        // publish_part_no_replace() never produces PublishedWithRetainedTemp
+        // (it does not use the reconciliation hard-link fallback), but the
+        // conservative reading if that ever changed is the same as Published:
+        // the destination's bytes are already correct either way.
+        Ok(PublishResult::Published | PublishResult::PublishedWithRetainedTemp) => {
             // ext4 default `data=ordered` does not guarantee directory
             // entry durability after `rename` returns Ok: a power loss
             // between rename and the kernel committing the dir block

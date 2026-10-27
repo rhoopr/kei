@@ -378,6 +378,7 @@ fn unsupported_rename_flags_exercise_the_production_publication_routes() {
         + if cfg!(target_endian = "big") { 4 } else { 0 };
     let routes = [
         "download::file::replacement::tests::approved_truncated_publish_replaces_only_expected_bytes",
+        "download::file::reconciliation::tests::reconciliation_publication_leaves_a_single_link_without_retained_part",
         #[cfg(feature = "xmp")]
         "download::metadata::sidecar::tests::write_sidecar_creates_xmp_file_next_to_media",
         #[cfg(feature = "xmp")]

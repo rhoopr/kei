@@ -179,8 +179,13 @@ pub(in crate::download) async fn publish(
                     ExistingFileFingerprint{size:new.size,sha256:new.sha256})?;
             }
         } else {
-            match super::platform::publish_reconciliation_part_blocking(&part,&destination)? {
+            match super::platform::publish_reconciliation_part_blocking(&part,&destination,new.identity)? {
                 super::platform::PublishResult::Published=>{},
+                // finish_owned_prepared_link() below re-verifies identity,
+                // fingerprint and link count against `new` before retrying
+                // cleanup, so an outstanding temporary link here is resolved
+                // there rather than failing this publication.
+                super::platform::PublishResult::PublishedWithRetainedTemp=>{},
                 super::platform::PublishResult::DestinationExists=>anyhow::bail!("Foreign file appeared in a primary layout destination"),
             }
         }

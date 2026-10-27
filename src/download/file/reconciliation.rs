@@ -213,10 +213,11 @@ fn copy_local_file_no_replace_blocking(
         file_identity(&part_path.validate_identity(part_identity)?)? == part_identity,
         "Reconciliation temporary entry changed before publication"
     );
-    let publication = publish_reconciliation_part_blocking(&part_path, &destination)?;
+    let publication =
+        publish_reconciliation_part_blocking(&part_path, &destination, part_identity)?;
     after_publication();
     let expected_identity = match publication {
-        PublishResult::Published => Some(part_identity),
+        PublishResult::Published | PublishResult::PublishedWithRetainedTemp => Some(part_identity),
         PublishResult::DestinationExists => None,
     };
     if part_path.entry_exists()? {
@@ -332,6 +333,42 @@ mod tests {
             .unwrap();
         assert!(conflict.is_none());
         assert_eq!(std::fs::read(&destination).unwrap(), b"user bytes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconciliation_publication_leaves_a_single_link_without_retained_part() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.jpg");
+        let destination = dir.path().join("destination.jpg");
+        std::fs::write(&source, b"reconciled bytes").unwrap();
+
+        let copied = copy_local_file_no_replace(dir.path(), &source, &destination, ".part")
+            .await
+            .unwrap();
+        assert!(copied.is_some(), "destination must be published");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"reconciled bytes");
+        // The published entry must keep exactly one link: on filesystems without
+        // renameat2(RENAME_NOREPLACE) the hard-link fallback must unlink the
+        // reconciliation part. A retained second link trips the primary layout
+        // hardlink guard (`file::primary_layout::snapshot`) and deadlocks.
+        assert_eq!(
+            std::fs::metadata(&destination).unwrap().nlink(),
+            1,
+            "published destination must have exactly one link"
+        );
+        let retained: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".kei-reconcile-"))
+            .collect();
+        assert!(
+            retained.is_empty(),
+            "no reconciliation temporary may be retained after publication: {retained:?}"
+        );
     }
 
     #[cfg(unix)]
