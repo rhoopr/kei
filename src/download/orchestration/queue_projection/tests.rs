@@ -2220,6 +2220,8 @@ async fn queue_projection_schema31_retry_migration_preserves_receipts_and_confli
     for conflict in [false, true] {
         let f = Fixture::new().await;
         f.capture(records("m", OLD, "source"), "old").await;
+        // Seed actual retained old work; bare history is not admission authority.
+        f.defer_retained().await;
         *f.session.corrupt.lock().unwrap() = Some("missing");
         f.cycle().await.unwrap();
         f.db.acquire_lock("schema31 retained receipt")
@@ -2520,6 +2522,10 @@ async fn selection_shadow_schema32_migration_preserves_live_wal_work_and_unknown
         .capture(records("m", OLD, "historical"), "source")
         .await;
     fixture.cycle().await.unwrap();
+    assert_eq!(
+        fixture.project_retained().await.unwrap(),
+        WorkAdmission::Admitted
+    );
     let queue = fixture.queue();
     let work: Vec<u8> = fixture
         .db
@@ -4482,6 +4488,10 @@ async fn private_selection_schema33_migration_preserves_live_wal_work_and_unknow
         .capture(records("m", OLD, "historical"), "source")
         .await;
     fixture.cycle().await.unwrap();
+    assert_eq!(
+        fixture.project_retained().await.unwrap(),
+        WorkAdmission::Admitted
+    );
     let queue = fixture.queue();
     let work: Vec<u8> = fixture
         .db
