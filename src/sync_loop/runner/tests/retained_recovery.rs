@@ -18,8 +18,8 @@ use crate::sync_loop::test_support::{
 use crate::{download, state};
 
 const ZONE: &str = "PrimarySync";
-const CURSOR_KEY: &str = "sync_token:PrimarySync";
-const HOLD_KEY: &str = "retained_checkpoint_hold:PrimarySync";
+const CURSOR_KEY: &str = "sync_token:v27:PrimarySync";
+const HOLD_KEY: &str = "retained_checkpoint_hold:v27:PrimarySync";
 const PRIOR: &str = "private-retained-cursor";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,7 +88,7 @@ impl PhotosSession for RetainedSession {
             if self.fault == Fault::ConcurrentCursor && !self.injected.swap(true, Ordering::SeqCst)
             {
                 rusqlite::Connection::open(&self.database)?.execute(
-                    "UPDATE metadata SET value='independently-advanced-cursor' WHERE key='sync_token:PrimarySync'", [],
+                    "UPDATE metadata SET value='independently-advanced-cursor' WHERE key='sync_token:v27:PrimarySync'", [],
                 )?;
             }
             if self.fault == Fault::ConcurrentConfig && !self.injected.swap(true, Ordering::SeqCst)
@@ -813,7 +813,7 @@ async fn retained_checkpoint_expiry_controls_never_promote_or_clear_debt() {
         let db = Arc::new(state::SqliteStateDb::open(&fixture.database).await.unwrap());
         if fault == Fault::HoldWrite {
             db.acquire_lock("retained hold write fault").unwrap().execute_batch(
-                "CREATE TRIGGER retained_hold_fault BEFORE INSERT ON metadata WHEN NEW.key='retained_checkpoint_hold:PrimarySync' BEGIN SELECT RAISE(ABORT,'injected hold write failure'); END;"
+                "CREATE TRIGGER retained_hold_fault BEFORE INSERT ON metadata WHEN NEW.key='retained_checkpoint_hold:v27:PrimarySync' BEGIN SELECT RAISE(ABORT,'injected hold write failure'); END;"
             ).unwrap();
         }
         let cancel = CancellationToken::new();
@@ -918,7 +918,7 @@ async fn retained_checkpoint_held_zone_does_not_block_clean_zone_or_clear_aggreg
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     {
         let db = state::SqliteStateDb::open(&fixture.database).await.unwrap();
-        db.set_metadata("sync_token:SharedSync-CLEAN", "clean-zone-before")
+        db.set_metadata("sync_token:v27:SharedSync-CLEAN", "clean-zone-before")
             .await
             .unwrap();
     }
@@ -934,7 +934,7 @@ async fn retained_checkpoint_held_zone_does_not_block_clean_zone_or_clear_aggreg
         let clean_changes = Arc::new(AtomicUsize::new(0));
         let clean = make_run_cycle_library_state_with_album(
             "SharedSync-CLEAN",
-            "sync_token:SharedSync-CLEAN",
+            "sync_token:v27:SharedSync-CLEAN",
             make_full_album_with_boxed_session(
                 "SharedSync-CLEAN",
                 Box::new(UnaffectedSession {
@@ -971,7 +971,7 @@ async fn retained_checkpoint_held_zone_does_not_block_clean_zone_or_clear_aggreg
             Some(PRIOR)
         );
         assert_eq!(
-            db.get_metadata("sync_token:SharedSync-CLEAN")
+            db.get_metadata("sync_token:v27:SharedSync-CLEAN")
                 .await
                 .unwrap()
                 .as_deref(),
@@ -1022,7 +1022,7 @@ async fn retained_checkpoint_due_retry_write_failure_prevents_every_provider_req
             hold["next_attempt_at"] = json!(0);
             db.set_metadata(HOLD_KEY, &hold.to_string()).await.unwrap();
             db.acquire_lock("due retry reservation failure").unwrap().execute_batch(
-                "CREATE TRIGGER retained_retry_fault BEFORE UPDATE ON metadata WHEN NEW.key='retained_checkpoint_hold:PrimarySync' BEGIN SELECT RAISE(ABORT,'injected retry reservation failure'); END;"
+                "CREATE TRIGGER retained_retry_fault BEFORE UPDATE ON metadata WHEN NEW.key='retained_checkpoint_hold:v27:PrimarySync' BEGIN SELECT RAISE(ABORT,'injected retry reservation failure'); END;"
             ).unwrap();
         }
         let cancel = CancellationToken::new();
