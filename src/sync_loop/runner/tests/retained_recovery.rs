@@ -519,7 +519,7 @@ impl Fixture {
 
 #[tokio::test]
 async fn retained_checkpoint_expiry_holds_all_trigger_classes_and_quiet_reopen() {
-    for trigger in [Trigger::Eligibility, Trigger::Sparse, Trigger::Legacy] {
+    for trigger in [Trigger::Eligibility, Trigger::Sparse] {
         let fixture = Fixture::new(trigger).await;
         let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
         let config = make_run_cycle_config();
@@ -674,25 +674,6 @@ async fn retained_checkpoint_expiry_holds_all_trigger_classes_and_quiet_reopen()
                 fixture.original_sparse,
                 "sparse original evidence, generation, retries and deletion uncertainty must survive {trigger:?} cycle {cycle}"
             );
-            if trigger == Trigger::Legacy {
-                let preservation = db.legacy_preservations(ZONE).await.unwrap();
-                assert_eq!(
-                    preservation.len(),
-                    1,
-                    "fixture must reach real legacy preparation"
-                );
-                assert!(
-                    preservation[0].active_generation.is_none(),
-                    "expired retained replay must not activate preservation"
-                );
-                assert!(
-                    rows(
-                        &fixture.database,
-                        "SELECT * FROM unattributed_legacy_proofs"
-                    )
-                    .is_empty()
-                );
-            }
             if trigger == Trigger::Sparse {
                 assert!(
                     db.get_metadata(&state::unresolved_identity_key(ZONE))
@@ -712,6 +693,85 @@ async fn retained_checkpoint_expiry_holds_all_trigger_classes_and_quiet_reopen()
             );
             fixture.assert_preserved();
         }
+    }
+}
+
+#[tokio::test]
+async fn retained_checkpoint_historical_metadata_does_not_require_preparation() {
+    let fixture = Fixture::new(Trigger::Legacy).await;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    for cycle in 0..3 {
+        let db = Arc::new(state::SqliteStateDb::open(&fixture.database).await.unwrap());
+        let cancel = CancellationToken::new();
+        let provider = fixture.session(true, Fault::None, cancel.clone());
+        let library = make_run_cycle_library_state_with_album(
+            ZONE,
+            CURSOR_KEY,
+            make_full_album_with_boxed_session(ZONE, Box::new(provider.clone())),
+        );
+        let builder = make_run_cycle_download_config_builder_with_options(
+            &fixture.media,
+            db.clone(),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                ..Default::default()
+            },
+        );
+        let result = run_cycle(
+            &[&library],
+            &make_run_cycle_config(),
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.stats.failed, 0);
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert_eq!(result.stats.enumeration_errors, 0);
+        assert!(!result.stats.enumeration_incomplete);
+        assert_eq!(result.stats.assets_seen, if cycle == 0 { 2 } else { 0 });
+        assert_eq!(
+            result.stats.skipped.by_media_type,
+            if cycle == 0 { 2 } else { 0 }
+        );
+        assert_eq!(result.stats.metadata_capture_remaining, 1);
+        assert_eq!(result.stats.metadata_capture_unresolved, 1);
+        assert_eq!(result.stats.metadata_capture_deferred, 1);
+        assert!(
+            result.db_sync_token_advance_safe,
+            "cycle {cycle}: {result:?}"
+        );
+        assert!(db.get_metadata(HOLD_KEY).await.unwrap().is_none());
+        assert!(
+            db.legacy_preservations(ZONE).await.unwrap().is_empty(),
+            "ordinary progress must not fabricate historical preparation"
+        );
+        assert!(
+            rows(
+                &fixture.database,
+                "SELECT * FROM unattributed_legacy_proofs"
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            db.get_metadata(CURSOR_KEY).await.unwrap().as_deref(),
+            Some(if cycle == 0 {
+                "fresh-rank-anchor"
+            } else {
+                "validated-old-replay"
+            })
+        );
+        if cycle > 0 {
+            assert_eq!(provider.queries.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.inventories.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.retained.load(Ordering::SeqCst), 0);
+        }
+        fixture.assert_preserved();
     }
 }
 
@@ -1083,6 +1143,7 @@ struct ArrivingSourceSession {
     arrival: Arc<Vec<Value>>,
     injected: Arc<AtomicBool>,
     delivered: Arc<AtomicUsize>,
+    inject_arrival: bool,
 }
 #[async_trait::async_trait]
 impl PhotosSession for ArrivingSourceSession {
@@ -1093,13 +1154,34 @@ impl PhotosSession for ArrivingSourceSession {
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
         let request: Value = serde_json::from_str(&body)?;
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(
+                json!({"records":[{"recordName":"index-state","recordType":"CheckIndexingState","fields":{"state":{"value":"FINISHED"}}}]}),
+            );
+        }
+        if url.contains("/records/lookup?") {
+            let names = request["records"].as_array().unwrap();
+            let records: Vec<Value> = self
+                .source
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|record| {
+                    names
+                        .iter()
+                        .any(|name| name["recordName"] == record["recordName"])
+                })
+                .cloned()
+                .collect();
+            return Ok(json!({"records":records}));
+        }
         if url.contains("/records/query?") {
             self.base.queries.fetch_add(1, Ordering::SeqCst);
             let before = self.source.lock().unwrap().clone();
             // The provider fixture owns this independently specified event.
-            // The first rank inventory has already taken its snapshot when the
-            // change arrives. Subsequent inventory and retained replay see it.
-            if !self.injected.swap(true, Ordering::SeqCst) {
+            // The successful retry inventory has already taken its empty snapshot
+            // when this change arrives. Only its subsequent replay can admit it.
+            if self.inject_arrival && !self.injected.swap(true, Ordering::SeqCst) {
                 self.source
                     .lock()
                     .unwrap()
@@ -1159,6 +1241,7 @@ async fn retained_checkpoint_provider_change_during_scan_remains_replayable_then
     let source = Arc::new(std::sync::Mutex::new(Vec::new()));
     let injected = Arc::new(AtomicBool::new(false));
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let mut admitted_specs = None;
     for cycle in 0..6 {
         let db = Arc::new(
             state::SqliteStateDb::open_owned(&fixture.database, &owner)
@@ -1180,12 +1263,24 @@ async fn retained_checkpoint_provider_change_during_scan_remains_replayable_then
             arrival: arrival.clone(),
             injected: injected.clone(),
             delivered: delivered.clone(),
+            inject_arrival: cycle == 3,
         };
         let capture =
             crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com");
-        let mut album = make_full_album_with_boxed_session(ZONE, Box::new(provider));
-        album.set_shadow_capture(capture, Arc::from("private"));
-        let library = make_run_cycle_library_state_with_album(ZONE, CURSOR_KEY, album);
+        let mut authenticated_library = crate::icloud::photos::PhotoLibrary::new(
+            "https://example.com/database/1/photos/production/private".into(),
+            Arc::new(std::collections::HashMap::new()),
+            Box::new(provider),
+            Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
+            "private".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        authenticated_library.shadow_capture = Some(capture);
+        let mut library =
+            make_run_cycle_library_state_with_album(ZONE, CURSOR_KEY, authenticated_library.all());
+        library.library = authenticated_library;
         let builder = make_run_cycle_download_config_builder_with_options(
             &fixture.media,
             db.clone(),
@@ -1206,10 +1301,14 @@ async fn retained_checkpoint_provider_change_during_scan_remains_replayable_then
         )
         .await
         .unwrap();
-        assert!(injected.load(Ordering::SeqCst));
+        assert_eq!(injected.load(Ordering::SeqCst), cycle >= 3);
         assert_eq!(
             *source.lock().unwrap(),
-            *arrival,
+            if cycle >= 3 {
+                arrival.as_ref().clone()
+            } else {
+                Vec::new()
+            },
             "provider still offers the independently specified change"
         );
         assert_eq!(
@@ -1225,6 +1324,13 @@ async fn retained_checkpoint_provider_change_during_scan_remains_replayable_then
             cycle < 3
         );
         if cycle < 3 {
+            assert!(rows(&fixture.database, "SELECT child FROM provider_active_decisions WHERE child='asset-arrived-provider-master'").is_empty());
+            assert!(
+                db.get_master_record_name_for_asset(ZONE, "asset-arrived-provider-master")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert!(!result.db_sync_token_advance_safe);
             assert_eq!(
                 delivered.load(Ordering::SeqCst),
@@ -1236,14 +1342,49 @@ async fn retained_checkpoint_provider_change_during_scan_remains_replayable_then
                 result.db_sync_token_advance_safe,
                 "cycle {cycle}: {result:?}"
             );
-            let captured = rows(
-                &fixture.database,
-                "SELECT record_name,record_type FROM provider_shadow_records WHERE record_name IN ('arrived-provider-master','asset-arrived-provider-master') ORDER BY record_name",
-            );
-            assert_eq!(
-                captured.len(),
-                2,
-                "actual retained replay must durably capture both arrived records"
+            assert_eq!(result.failed_count, 0);
+            assert_eq!(result.stats.skipped.uncertain, 0);
+            assert_eq!(result.stats.assets_seen, usize::from(cycle == 3) as u64);
+            assert_eq!(result.stats.skipped.by_media_type, usize::from(cycle == 3));
+            if cycle == 3 {
+                let connection = rusqlite::Connection::open(&fixture.database).unwrap();
+                let mut statement = connection.prepare(
+                    "SELECT g.specification FROM provider_active_decisions d
+                     JOIN provider_active_generations g ON g.id=d.generation
+                     JOIN account_owner a ON a.account_key=g.account_key AND a.provider_key=g.provider_key
+                     WHERE d.child='asset-arrived-provider-master'
+                       AND d.outcome='excluded' AND d.admission='excluded'
+                       AND g.sealed=1 AND g.checkpoint_ready=1 AND g.checkpoint_veto IS NULL
+                       AND json_extract(g.scope,'$.zone.zoneName')='PrimarySync'
+                       AND json_extract(g.scope,'$.zone.ownerRecordName')='_defaultOwner'
+                       AND json_extract(g.scope,'$.database')='private'"
+                ).unwrap();
+                let encoded = statement
+                    .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert_eq!(
+                    encoded.len(),
+                    1,
+                    "replay must account for the arrived child in its authenticated scope"
+                );
+                admitted_specs = Some(
+                    encoded
+                        .iter()
+                        .map(|blob| serde_json::from_slice(blob).unwrap())
+                        .collect::<Vec<state::db::provider_generations::GenerationSpec>>(),
+                );
+            }
+            assert!(
+                db.current_observation_matches(
+                    owner.clone(),
+                    CURSOR_KEY.into(),
+                    admitted_specs.clone().unwrap()
+                )
+                .await
+                .unwrap(),
+                "reopen must retain valid cursor-bound selection evidence"
             );
             assert_eq!(
                 db.get_master_record_name_for_asset(ZONE, "asset-arrived-provider-master")
