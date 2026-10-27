@@ -319,6 +319,8 @@ fn migration_guide_uses_toml_for_durable_sync_settings() {
         "| `--threads-num` | `--threads`",
         "| `--report-json`",
         "| `--http-bind`, `--http-port`",
+        "cp ~/.config/icloudpd-rs/config.toml ~/.config/kei/config.toml",
+        "cp ~/.icloudpd-rs/* ~/.config/kei/cookies/",
     ];
     for needle in stale {
         assert!(
@@ -334,9 +336,8 @@ fn migration_guide_uses_toml_for_durable_sync_settings() {
         "[watch].interval",
         "[notifications].script",
         "[download.retry].per_transfer",
-        "don't auto-copy files from the old `icloudpd-rs` paths",
-        "cp ~/.config/icloudpd-rs/config.toml ~/.config/kei/config.toml",
-        "cp ~/.icloudpd-rs/* ~/.config/kei/cookies/",
+        "follow [account-state adoption](account-state-migration.md)",
+        "Do not copy or rename old authentication files into kei's current session directory",
     ] {
         assert!(
             guide.contains(expected),
