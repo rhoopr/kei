@@ -2389,6 +2389,92 @@ async fn queue_projection_admitted_before_dispatch_reopens_materializes_and_stay
     }
 }
 
+// Explicit compatibility fixture only: normal sync does not create shadow manifests.
+async fn seed_selection_shadow(fixture: &Fixture) {
+    use crate::state::db::provider_selection::{
+        SelectionDecision, SelectionDestination, SelectionManifest, SelectionSource,
+    };
+    assert_eq!(
+        fixture.count("provider_selection_generations"),
+        0,
+        "ordinary cycle must not create legacy shadow generations"
+    );
+    assert_eq!(
+        fixture.project_retained().await.unwrap(),
+        WorkAdmission::Admitted
+    );
+    let plan = fixture.plan().await;
+    assert_eq!(plan.scope, plan.source.page.page.scope);
+    let child = plan.source.page.page.identities[usize::try_from(plan.source.ordinal).unwrap()]
+        .name
+        .clone();
+    let asset = crate::icloud::photos::current_asset(
+        plan.confirmation.as_ref().unwrap(),
+        &child,
+        plan.master.as_ref().unwrap(),
+        &plan.zone,
+    )
+    .unwrap();
+    let effective = fixture.config.with_pass(&fixture.pass);
+    let destinations: Vec<SelectionDestination> =
+        crate::download::filter::derive_expected_paths(&asset, &effective)
+            .into_iter()
+            .map(|expected| SelectionDestination {
+                version_size: expected.version_size.as_str().into(),
+                path: SelectionPath::from_path(&std::path::absolute(expected.path).unwrap()),
+                checksum: expected.checksum.into(),
+                size: expected.size,
+                metadata_hash: crate::download::filter::metadata_for_selected_version(
+                    &asset,
+                    &effective,
+                    expected.version_size,
+                )
+                .metadata_hash
+                .clone()
+                .unwrap(),
+            })
+            .collect();
+    assert_eq!(destinations.len(), 1);
+    assert_eq!(child, "asset-m");
+    assert_eq!(destinations[0].checksum, CURRENT);
+    assert_eq!(fixture.count("assets"), 1);
+    assert_eq!(fixture.count("provider_work_receipts"), 1);
+    assert_eq!(fixture.count("provider_work_obligations"), 1);
+    let manifest = SelectionManifest {
+        scope: plan.scope,
+        zone: plan.zone,
+        config_hash: plan.config_hash,
+        profile: json!({"format":1,"coverage":"confirmed_sources_only"}),
+        sources: vec![SelectionSource {
+            page_id: plan.source.page.id.0,
+            ordinal: plan.source.ordinal,
+            body_hash: plan.source.page.observation_hash,
+        }],
+        decisions: vec![SelectionDecision {
+            pass_key: crate::download::orchestration::generation::pass_key(&fixture.pass),
+            child,
+            master: plan.master,
+            confirmation: plan.confirmation,
+            outcome: SelectionOutcome::Selected,
+            reason: String::new(),
+            destinations,
+        }],
+    };
+    let queue = fixture.queue();
+    assert!(
+        !queue.is_empty(),
+        "refusal must protect actual retained work"
+    );
+    fixture
+        .db
+        .capture_selection_shadow(owner(), manifest, MAX_SELECTION_BYTES)
+        .await
+        .unwrap();
+    assert_eq!(fixture.queue(), queue);
+    assert_eq!(fixture.count("provider_selection_generations"), 1);
+    assert_eq!(fixture.count("provider_selection_destinations"), 1);
+}
+
 async fn selection_manifest(
     fixture: &Fixture,
 ) -> (
@@ -2415,13 +2501,41 @@ async fn selection_manifest(
 
 #[tokio::test]
 async fn selection_shadow_replay_rejects_corrupt_rows_sources_confirmations_and_foreign_owner() {
+    fn work_snapshot(fixture: &Fixture) -> Vec<Vec<rusqlite::types::Value>> {
+        let conn = fixture
+            .db
+            .acquire_lock("retained work fingerprint")
+            .unwrap();
+        let mut rows = Vec::new();
+        for sql in [
+            "SELECT * FROM provider_work_receipts ORDER BY page_id,ordinal,config_hash",
+            "SELECT * FROM provider_work_obligations ORDER BY page_id,ordinal,config_hash,library,asset_id,version_size",
+        ] {
+            let mut statement = conn.prepare(sql).unwrap();
+            let width = statement.column_count();
+            rows.extend(
+                statement
+                    .query_map([], |row| {
+                        (0..width)
+                            .map(|i| row.get(i))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+            );
+        }
+        rows
+    }
     let fixture = Fixture::new().await;
     fixture
         .capture(records("m", OLD, "historical"), "source")
         .await;
     fixture.cycle().await.unwrap();
+    seed_selection_shadow(&fixture).await;
     let (id, manifest) = selection_manifest(&fixture).await;
     let original_queue = fixture.queue();
+    let original_work = work_snapshot(&fixture);
     let wrong = AccountOwner::authenticated(
         "other@example.invalid",
         "com",
@@ -2444,6 +2558,7 @@ async fn selection_shadow_replay_rejects_corrupt_rows_sources_confirmations_and_
             .capture(records("m", OLD, "historical"), "corruption-source")
             .await;
         probe.cycle().await.unwrap();
+        seed_selection_shadow(&probe).await;
         let (probe_id, healthy) = selection_manifest(&probe).await;
         assert_eq!(
             probe
@@ -2454,14 +2569,17 @@ async fn selection_shadow_replay_rejects_corrupt_rows_sources_confirmations_and_
             healthy
         );
         let queue = probe.queue();
+        let work = work_snapshot(&probe);
         probe
             .db
             .acquire_lock("committed shadow corruption probe")
             .unwrap()
             .execute_batch(mutation)
             .unwrap();
-        let error = probe
-            .db
+        let reopened = SqliteStateDb::open_owned(&probe.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        let error = reopened
             .replay_selection_shadow(owner(), probe_id)
             .await
             .expect_err("corrupted evidence cannot replay");
@@ -2483,6 +2601,7 @@ async fn selection_shadow_replay_rejects_corrupt_rows_sources_confirmations_and_
             );
         }
         assert_eq!(probe.queue(), queue);
+        assert_eq!(work_snapshot(&probe), work);
         probe.preserved().await;
     }
     assert_eq!(
@@ -2512,6 +2631,7 @@ async fn selection_shadow_replay_rejects_corrupt_rows_sources_confirmations_and_
         Err(crate::state::error::StateError::ProviderSelectionInvalid)
     ));
     assert_eq!(fixture.queue(), original_queue);
+    assert_eq!(work_snapshot(&fixture), original_work);
     fixture.preserved().await;
 }
 
@@ -2627,6 +2747,7 @@ async fn selection_shadow_non_utf8_download_root_preserves_native_path() {
         .capture(records("m", OLD, "historical"), "native-source")
         .await;
     fixture.cycle().await.unwrap();
+    seed_selection_shadow(&fixture).await;
     let (generation, manifest) = selection_manifest(&fixture).await;
     let path = manifest.decisions[0].destinations[0].path.to_path();
     assert!(path.starts_with(&root));
@@ -2653,6 +2774,7 @@ async fn selection_shadow_native_path_storage_reopens_without_filesystem_creatio
         .capture(records("m", OLD, "historical"), "native-storage-source")
         .await;
     fixture.cycle().await.unwrap();
+    seed_selection_shadow(&fixture).await;
     let (_, mut manifest) = selection_manifest(&fixture).await;
     let component = {
         #[cfg(unix)]
