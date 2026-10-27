@@ -246,24 +246,72 @@ async fn incremental_soft_delete_write_error_blocks_sync_token() {
         .unwrap();
     {
         let conn = db.acquire_lock("test").unwrap();
-        conn.execute("DROP TABLE assets", []).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_source_flag BEFORE UPDATE OF is_deleted ON assets
+             WHEN OLD.id = 'SOFT_DELETE_ERR'
+             BEGIN SELECT RAISE(ABORT, 'injected source flag write failure'); END;",
+        )
+        .unwrap();
     }
     let result = run_incremental_change_records(
-        db,
+        db.clone(),
         flagged_incremental_records("SOFT_DELETE_ERR", ("isDeleted", 1)),
     )
     .await;
 
-    assert!(matches!(
-        result.outcome,
-        DownloadOutcome::PartialFailure { failed_count: 1 }
-    ));
+    assert!(
+        matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ),
+        "{result:?}"
+    );
     assert_eq!(result.sync_token, None);
     assert_eq!(result.stats.state_write_failures, 1);
     assert!(result.stats.sync_token_blocked);
     assert_eq!(
         result.stats.sync_token_blocked_reason,
         Some(INCREMENTAL_DELETE_STATE_WRITE_FAILED_REASON)
+    );
+
+    {
+        let conn = db.acquire_lock("test").unwrap();
+        let flag: i64 = conn
+            .query_row(
+                "SELECT is_deleted FROM assets WHERE id = 'SOFT_DELETE_ERR'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            flag, 0,
+            "failed source transition must leave the row unchanged"
+        );
+        conn.execute_batch("DROP TRIGGER refuse_source_flag;")
+            .unwrap();
+    }
+    let recovered = run_incremental_change_records(
+        db.clone(),
+        flagged_incremental_records("SOFT_DELETE_ERR", ("isDeleted", 1)),
+    )
+    .await;
+    assert!(
+        matches!(recovered.outcome, DownloadOutcome::Success),
+        "{recovered:?}"
+    );
+    assert_eq!(recovered.sync_token.as_deref(), Some("zone-token-after"));
+    assert_eq!(recovered.stats.state_write_failures, 0);
+    let conn = db.acquire_lock("test").unwrap();
+    let flag: i64 = conn
+        .query_row(
+            "SELECT is_deleted FROM assets WHERE id = 'SOFT_DELETE_ERR'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        flag, 1,
+        "replay must persist the previously refused transition"
     );
 }
 
@@ -275,24 +323,72 @@ async fn incremental_hidden_write_error_blocks_sync_token() {
         .unwrap();
     {
         let conn = db.acquire_lock("test").unwrap();
-        conn.execute("DROP TABLE assets", []).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_source_flag BEFORE UPDATE OF is_hidden ON assets
+             WHEN OLD.id = 'HIDDEN_ERR'
+             BEGIN SELECT RAISE(ABORT, 'injected source flag write failure'); END;",
+        )
+        .unwrap();
     }
     let result = run_incremental_change_records(
-        db,
+        db.clone(),
         flagged_incremental_records("HIDDEN_ERR", ("isHidden", 1)),
     )
     .await;
 
-    assert!(matches!(
-        result.outcome,
-        DownloadOutcome::PartialFailure { failed_count: 1 }
-    ));
+    assert!(
+        matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ),
+        "{result:?}"
+    );
     assert_eq!(result.sync_token, None);
     assert_eq!(result.stats.state_write_failures, 1);
     assert!(result.stats.sync_token_blocked);
     assert_eq!(
         result.stats.sync_token_blocked_reason,
         Some(INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON)
+    );
+
+    {
+        let conn = db.acquire_lock("test").unwrap();
+        let flag: i64 = conn
+            .query_row(
+                "SELECT is_hidden FROM assets WHERE id = 'HIDDEN_ERR'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            flag, 0,
+            "failed source transition must leave the row unchanged"
+        );
+        conn.execute_batch("DROP TRIGGER refuse_source_flag;")
+            .unwrap();
+    }
+    let recovered = run_incremental_change_records(
+        db.clone(),
+        flagged_incremental_records("HIDDEN_ERR", ("isHidden", 1)),
+    )
+    .await;
+    assert!(
+        matches!(recovered.outcome, DownloadOutcome::Success),
+        "{recovered:?}"
+    );
+    assert_eq!(recovered.sync_token.as_deref(), Some("zone-token-after"));
+    assert_eq!(recovered.stats.state_write_failures, 0);
+    let conn = db.acquire_lock("test").unwrap();
+    let flag: i64 = conn
+        .query_row(
+            "SELECT is_hidden FROM assets WHERE id = 'HIDDEN_ERR'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        flag, 1,
+        "replay must persist the previously refused transition"
     );
 }
 
