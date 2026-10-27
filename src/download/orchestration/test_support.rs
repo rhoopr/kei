@@ -14,7 +14,7 @@ use crate::download::filter;
 use crate::download::filter::DownloadTask;
 use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotoAsset, PhotosSession};
 use crate::retry::RetryConfig;
-use crate::state::{SqliteStateDb, VersionSizeKey};
+use crate::state::{DownloadStateStore, SqliteStateDb, VersionSizeKey};
 use crate::test_helpers::{TestAssetRecord, mock_photo_records_for_zone_with_filename};
 
 use super::config::DownloadConfig;
@@ -272,18 +272,18 @@ pub(super) async fn seed_downloaded_metadata_asset(
     pass: &AlbumPass,
     asset: &PhotoAsset,
 ) -> PathBuf {
+    use sha2::{Digest, Sha256};
+
     let pass_config = config.with_pass(pass);
     let expected_paths = filter::expected_paths_for(asset, &pass_config);
     for expected in &expected_paths {
         tokio::fs::create_dir_all(expected.path.parent().expect("path has parent"))
             .await
             .expect("create expected parent");
-        tokio::fs::write(
-            &expected.path,
-            vec![0u8; usize::try_from(expected.size).expect("test asset size fits usize")],
-        )
-        .await
-        .expect("seed existing media");
+        let source = vec![0u8; usize::try_from(expected.size).expect("test asset size fits usize")];
+        tokio::fs::write(&expected.path, &source)
+            .await
+            .expect("seed existing media");
         let filename = expected
             .path
             .file_name()
@@ -307,13 +307,17 @@ pub(super) async fn seed_downloaded_metadata_asset(
             )
             .build();
         db.upsert_seen(&record).await.expect("seed state row");
-        db.mark_downloaded(
+        // This fixture creates known raw source bytes. Bind their actual hash
+        // to the provider generation; do not fabricate edited-file ownership.
+        let checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(&source));
+        db.mark_verified_download(
             asset.source_zone().unwrap_or(&pass_config.library),
             asset.state_id(),
             expected.version_size.as_str(),
             &expected.path,
-            "seeded-local-sha256",
-            None,
+            &checksum,
+            Some(&checksum),
+            false,
         )
         .await
         .expect("mark seeded media downloaded");
