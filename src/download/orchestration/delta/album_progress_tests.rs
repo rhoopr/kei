@@ -14,6 +14,7 @@ const PREFIX_PAGES: usize = PREFIX_RECORDS.div_ceil(200);
 
 #[derive(Clone)]
 struct SparseFixture {
+    capture: Option<crate::icloud::photos::inbox::ShadowCapture>,
     started: Instant,
     trace: Arc<Mutex<Vec<Value>>>,
     attempts: Arc<Mutex<HashMap<(String, usize), usize>>>,
@@ -28,6 +29,7 @@ struct SparseFixture {
 impl SparseFixture {
     fn new(page_seconds: u64, late_owner: bool) -> Self {
         Self {
+            capture: None,
             started: Instant::now(),
             trace: Arc::default(),
             attempts: Arc::default(),
@@ -40,12 +42,27 @@ impl SparseFixture {
             gate: None,
         }
     }
+    fn authenticated(mut self) -> Self {
+        let owner = crate::state::db::account::AccountOwner::authenticated(
+            "progress-fixture@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"progress-synthetic-account"}}))
+                .unwrap(),
+        )
+        .unwrap();
+        self.capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+            Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap()),
+            owner,
+            "com",
+        ));
+        self
+    }
     fn event(&self, mut event: Value) {
         event["at_ms"] = json!(self.started.elapsed().as_millis() as u64);
         self.trace.lock().unwrap().push(event);
     }
     fn album(&self, zone: &str) -> PhotoAlbum {
-        PhotoAlbum::new(
+        let mut album = PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::default(),
                 service_endpoint: Arc::from("https://example.invalid"),
@@ -54,7 +71,11 @@ impl SparseFixture {
                 obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
                 query_filter: None,
                 page_size: 100,
-                zone_id: Arc::new(json!({"zoneName":zone})),
+                zone_id: Arc::new(if self.capture.is_some() {
+                    json!({"zoneName":zone,"ownerRecordName":"_defaultOwner"})
+                } else {
+                    json!({"zoneName":zone})
+                }),
                 retry_config: RetryConfig {
                     max_retries: 1,
                     base_delay_secs: 0,
@@ -64,7 +85,11 @@ impl SparseFixture {
                 cross_zone_sources: Vec::new(),
             },
             Box::new(self.clone()),
-        )
+        );
+        if let Some(capture) = &self.capture {
+            album.set_shadow_capture(capture.clone(), Arc::from("private"));
+        }
+        album
     }
     fn pairs(zone: &Value) -> Vec<Value> {
         let mut records = incremental_photo_records("LATE_A");
@@ -117,6 +142,13 @@ impl PhotosSession for SparseFixture {
                         let mut record = crate::test_helpers::sparse_shared_asset_record();
                         record["recordName"] = json!(name);
                         record["zoneID"] = zone.clone();
+                        if self.capture.is_some() {
+                            record["fields"]["linkedShareRecordName"]["value"] = json!(name);
+                            record["fields"]["linkedShareZoneName"]["value"] =
+                                json!("SharedSync-fixture");
+                            record["fields"]["linkedShareZoneOwner"]["value"]["recordName"] =
+                                json!("_defaultOwner");
+                        }
                         record
                     })
                     .collect()
@@ -366,7 +398,7 @@ async fn issue958_progress_identifies_lookup_waits_without_source_names() {
     for phase in ["asset_lookup", "paired_lookup"] {
         let (capture, _guard) = crate::test_helpers::TracingCapture::install();
         let requested = Arc::new(tokio::sync::Notify::new());
-        let mut session = SparseFixture::new(1, false);
+        let mut session = SparseFixture::new(1, false).authenticated();
         session.gate = Some(requested.clone());
         session.gate_phase = phase;
         let album = session
