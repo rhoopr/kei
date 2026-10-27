@@ -13,19 +13,76 @@ use crate::sync_loop::test_support::{
 };
 use crate::{config, download, state};
 
+// These fixtures model a completed inventory followed by a quiet, scoped
+// history bridge. Query responses are not valid changes/zone responses.
+struct QuietEnumerationBridge {
+    inner: Box<dyn crate::icloud::photos::PhotosSession>,
+    zone: String,
+    token: String,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for QuietEnumerationBridge {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        if url.contains("/changes/zone?") {
+            let request: serde_json::Value = serde_json::from_str(&body)?;
+            assert_eq!(request["zones"].as_array().unwrap().len(), 1);
+            assert_eq!(request["zones"][0]["zoneID"]["zoneName"], self.zone);
+            assert_eq!(
+                request["zones"][0]["syncToken"],
+                "fixture-zone-history-boundary"
+            );
+            return Ok(
+                serde_json::json!({"zones":[{"zoneID":{"zoneName":self.zone},"records":[],"syncToken":self.token,"moreComing":false}]}),
+            );
+        }
+        self.inner.post(url, body, headers).await
+    }
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(Self {
+            inner: self.inner.clone_box(),
+            zone: self.zone.clone(),
+            token: self.token.clone(),
+        })
+    }
+}
+
+fn quiet_bridge(
+    zone: &str,
+    token: &str,
+    inner: Box<dyn crate::icloud::photos::PhotosSession>,
+) -> Box<dyn crate::icloud::photos::PhotosSession> {
+    Box::new(QuietEnumerationBridge {
+        inner,
+        zone: zone.to_owned(),
+        token: token.to_owned(),
+    })
+}
+
 fn make_one_photo_full_album_for_zone(
     zone: &str,
     zone_sync_token: &str,
 ) -> crate::icloud::photos::PhotoAlbum {
-    make_full_album_with_session(
+    make_full_album_with_boxed_session(
         zone,
-        crate::test_helpers::MockPhotosSession::new()
-            .ok(album_count_response(1))
-            .ok(full_album_page(
-                zone,
-                &format!("master-{zone}"),
-                zone_sync_token,
-            )),
+        quiet_bridge(
+            zone,
+            "fixture-zone-history-successor",
+            Box::new(
+                crate::test_helpers::MockPhotosSession::new()
+                    .ok(album_count_response(1))
+                    .ok(full_album_page(
+                        zone,
+                        &format!("master-{zone}"),
+                        zone_sync_token,
+                    )),
+            ),
+        ),
     )
 }
 
@@ -231,7 +288,7 @@ async fn run_cycle_full_zero_assets_warns_once() {
     assert_eq!(result.stats.assets_seen, 0);
     assert_eq!(
         result.stats.full_enumeration_reason,
-        Some(download::FullEnumerationReason::NoStoredToken)
+        Some(download::FullEnumerationReason::OtherStaticReason)
     );
     assert!(
         logs_contain(ZERO_ASSET_WARNING_PREFIX),
@@ -256,7 +313,7 @@ async fn run_cycle_retry_failed_zero_assets_does_not_warn() {
     assert_eq!(result.stats.assets_seen, 0);
     assert_eq!(
         result.stats.full_enumeration_reason,
-        Some(download::FullEnumerationReason::NoStoredToken)
+        Some(download::FullEnumerationReason::OtherStaticReason)
     );
     assert!(
         !logs_contain(ZERO_ASSET_WARNING_PREFIX),
