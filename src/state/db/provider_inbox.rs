@@ -1851,6 +1851,15 @@ mod tests {
         );
         capture.capacity = 512 * 1024 * 1024;
         let oversized = oversized_unprojected_observed();
+        let before_id = db
+            .acquire_lock("raw page freshness boundary")
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(MAX(id),0) FROM provider_shadow_pages",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
         let error = capture.capture(oversized.clone()).await.unwrap_err();
         assert!(
             error
@@ -1858,11 +1867,46 @@ mod tests {
                 .is_some(),
             "normal capture preserves the observation-refusal wrapper"
         );
+        assert!(
+            db.next_catalog_source(owner.clone(), 16 * 1024 * 1024)
+                .await
+                .unwrap()
+                .is_none(),
+            "bare historical pages must not become retry authority"
+        );
+        let retained_id = {
+            let conn = db.acquire_lock("exact retained raw page").unwrap();
+            let mut statement = conn
+                .prepare(
+                    "SELECT p.id FROM provider_shadow_pages p JOIN account_owner a
+                 ON a.account_key=p.account_key AND a.provider_key=p.provider_key
+                 WHERE p.scope=?1 AND p.request_cursor=?2 AND p.body=?3 AND p.id>?4",
+                )
+                .unwrap();
+            let ids = statement
+                .query_map(
+                    rusqlite::params![
+                        oversized.scope,
+                        oversized.request_cursor,
+                        oversized.body,
+                        before_id
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                ids.len(),
+                1,
+                "this capture must retain exactly one new owner-scoped raw page"
+            );
+            ids[0]
+        };
         let retained = db
-            .next_catalog_source(owner.clone(), 16 * 1024 * 1024)
+            .catalog_source(owner.clone(), CapturedPageId(retained_id), 16 * 1024 * 1024)
             .await
-            .unwrap()
-            .expect("the oversized raw page remains captured");
+            .unwrap();
         assert_eq!(retained.page.body, oversized.body);
         let projection_error = crate::icloud::photos::plan_retained(&retained)
             .err()
