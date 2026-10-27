@@ -340,6 +340,48 @@ impl Fixture {
                 .await
                 .unwrap();
         }
+        // Model an already-prepared historical state explicitly. Ordinary
+        // baseline sync no longer owns historical preservation or backfill.
+        let snapshots = db.legacy_preparation_snapshots(ZONE, 10).await.unwrap();
+        assert_eq!(snapshots.len(), 2);
+        for snapshot in snapshots {
+            let mut evidence = Vec::new();
+            for path in &snapshot.paths {
+                evidence.push(state::LegacyFileEvidence {
+                    root: media.clone(),
+                    path: path.clone(),
+                    sha256: Some(download::file::compute_sha256(path).await.unwrap()),
+                    size: Some(std::fs::metadata(path).unwrap().len()),
+                });
+                let mut sidecar = path.as_os_str().to_owned();
+                sidecar.push(".xmp");
+                let sidecar = std::path::PathBuf::from(sidecar);
+                assert!(!sidecar.exists());
+                evidence.push(state::LegacyFileEvidence {
+                    root: media.clone(),
+                    path: sidecar,
+                    sha256: None,
+                    size: None,
+                });
+            }
+            assert!(
+                db.prepare_legacy_preservation(&snapshot, &evidence)
+                    .await
+                    .unwrap()
+            );
+        }
+        for (child, _) in &targets {
+            db.set_metadata_capture_revision_for_test(
+                ZONE,
+                child,
+                state::METADATA_CAPTURE_REVISION,
+            );
+        }
+        assert_eq!(
+            db.trusted_legacy_candidates(ZONE).await.unwrap().len(),
+            6,
+            "fixture must establish historical eligibility without a normal sync"
+        );
         {
             let conn = db.acquire_lock("synthetic pre-receipt chronology").unwrap();
             conn.execute(
