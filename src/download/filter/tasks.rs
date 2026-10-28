@@ -32,6 +32,7 @@ use super::{
 /// - 1-byte enum last
 #[derive(Debug, Clone)]
 pub(in crate::download) struct DownloadTask {
+    pub(in crate::download) require_created_entry: bool,
     // Heap types first
     pub(in crate::download) url: Box<str>,
     pub(in crate::download) download_path: PathBuf,
@@ -81,6 +82,7 @@ impl DownloadTask {
     pub(in crate::download) fn publication(&self) -> FinalPublication {
         match &self.replacement_fingerprint {
             Some(expected) => FinalPublication::ReplaceTruncated(**expected),
+            None if self.require_created_entry => FinalPublication::CreateOnly,
             None => FinalPublication::NoReplace,
         }
     }
@@ -160,6 +162,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
         return Ok(super::derive_expected_paths(asset, config)
             .into_iter()
             .map(|d| DownloadTask {
+                require_created_entry: !config.allows_existing_mutation(),
                 url: d.url,
                 download_path: d.path,
                 replacement_fingerprint: None,
@@ -236,6 +239,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
             claimed_paths.insert(planning_mode.key(&p)?, size);
             seen_urls.push(url.clone());
             tasks.push(DownloadTask {
+                require_created_entry: !config.allows_existing_mutation(),
                 url,
                 download_path: p,
                 replacement_fingerprint: None,
@@ -306,6 +310,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
             claimed_paths.insert(planning_mode.key(&p)?, size);
             seen_urls.push(url.clone());
             tasks.push(DownloadTask {
+                require_created_entry: !config.allows_existing_mutation(),
                 url,
                 download_path: p,
                 replacement_fingerprint: None,
@@ -371,6 +376,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
             claimed_paths.insert(planning_mode.key(&p)?, size);
             seen_urls.push(url.clone());
             tasks.push(DownloadTask {
+                require_created_entry: !config.allows_existing_mutation(),
                 url,
                 download_path: p,
                 replacement_fingerprint: None,

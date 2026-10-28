@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use super::PhotoAlbum;
 use crate::icloud::photos::asset::{PhotoAsset, RequiredAssetFields};
+use crate::icloud::photos::hydration_progress::{self, Phase};
 use crate::icloud::photos::{changes_json, cloudkit, inbox::ShadowCapture, queries, session};
 
 pub(crate) struct CurrentCatalogAsset {
@@ -145,6 +146,12 @@ impl PhotoAlbum {
     }
 
     async fn current_lookup_body(&self, names: &[&str]) -> Result<Vec<u8>> {
+        // Updates are inert outside an active anonymous hydration observation.
+        hydration_progress::phase(if names.len() == 1 {
+            Phase::AssetLookup
+        } else {
+            Phase::PairedLookup
+        });
         let url = format!(
             "{}/records/lookup?{}",
             self.service_endpoint,
@@ -195,6 +202,7 @@ impl PhotoAlbum {
     ) -> Result<PhotoAsset> {
         let scopes = self.selector_sources()?;
         anyhow::ensure!(!scopes.is_empty(), "Missing authenticated selecting owner");
+        hydration_progress::source(1);
         let body = self.current_lookup_body(&[selector_child]).await?;
         let records = lookup_members(&body, &[selector_child], &self.zone_id)?;
         let record = records.first().context("Missing selecting child")?;
@@ -213,11 +221,15 @@ impl PhotoAlbum {
             );
             return Ok(self.confirm_catalog_asset(selector_child).await?.asset);
         };
-        let mut targets = self.cross_zone_sources.iter().filter_map(|source| {
-            link.target_in_scope(&source.zone_id)
-                .map(|child| (source, child))
-        });
-        let (source, target) = targets
+        let mut targets =
+            self.cross_zone_sources
+                .iter()
+                .enumerate()
+                .filter_map(|(index, source)| {
+                    link.target_in_scope(&source.zone_id)
+                        .map(|child| (index + 2, source, child))
+                });
+        let (source_index, source, target) = targets
             .next()
             .context("Selecting link has no authenticated attached source")?;
         anyhow::ensure!(
@@ -242,6 +254,7 @@ impl PhotoAlbum {
             .all(|key| prior.get(key) == witness.get(key))),
             "Selecting source binding changed"
         );
+        hydration_progress::source(source_index);
         let asset = source.confirm_catalog_asset(target.as_str()).await?.asset;
         Ok(asset.with_selector_membership(witness))
     }

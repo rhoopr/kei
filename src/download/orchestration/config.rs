@@ -518,11 +518,18 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
 /// Decoupled from CLI parsing so the engine can be tested independently.
 #[derive(Clone)]
 pub(crate) struct DownloadConfig {
+    /// Checked per operation; absent evidence never grants existing-file mutation.
+    pub(crate) ownership_check: Option<crate::download::planner::OwnershipCheck>,
     pub(crate) sparse_targets: Arc<[crate::download::sparse_target::SelectedSparseTarget]>,
     /// Drain ordered queries to certify bounded local path work on config drift.
     /// Download eligibility and provider checkpoint bounds remain unchanged.
     pub(crate) complete_path_selection: bool,
     pub(crate) selection_context: Option<Arc<super::generation::SelectionContext>>,
+    /// Transient proof from this operation's completed full inventory.
+    /// Never serialized, hashed, or persisted; an absent proof keeps the
+    /// ordinary inventory path.
+    pub(crate) prior_inventory_proof:
+        Option<Box<crate::state::db::provider_generations::observation::ObservationProof>>,
     pub(crate) selection_run: Option<Arc<super::generation::SelectionRun>>,
     pub(crate) selection_pass: Option<String>,
     /// Behind `Arc` so per-pass clones (`with_album_name`, `with_pass`,
@@ -609,6 +616,26 @@ pub(crate) struct DownloadConfig {
 }
 
 impl DownloadConfig {
+    pub(crate) fn allows_existing_mutation(&self) -> bool {
+        self.ownership_check
+            .is_some_and(crate::download::planner::OwnershipCheck::allows_existing_mutation)
+    }
+
+    pub(crate) async fn check_ownership(&self) -> anyhow::Result<Self> {
+        let mut checked = self.clone();
+        // Recheck at operation boundaries, including watch-cycle reopen. A
+        // prior restriction remains in force for this operation's descendants.
+        let current = match self.state_db.as_deref() {
+            Some(db) => Some(crate::download::planner::OwnershipCheck::inspect(db).await?),
+            None => None,
+        };
+        checked.ownership_check = match self.ownership_check {
+            Some(previous) if !previous.allows_existing_mutation() => Some(previous),
+            _ => current,
+        };
+        Ok(checked)
+    }
+
     /// Human-readable label for the active pass: the album's own name for
     /// album/smart-folder passes, "unfiled" for the unfiled pass (which uses
     /// `library.all()` whose `.name` is the empty string).
@@ -804,9 +831,11 @@ impl DownloadConfig {
             filename_exclude: Arc::from(Vec::<glob::Pattern>::new()),
             temp_suffix: Arc::from(".kei-tmp"),
             state_db: None,
+            ownership_check: None,
             sparse_targets: Arc::from([]),
             complete_path_selection: false,
             selection_context: None,
+            prior_inventory_proof: None,
             selection_run: None,
             selection_pass: None,
             retry_only: false,

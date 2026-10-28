@@ -161,7 +161,9 @@ pub(super) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, 
 pub(crate) fn path_key(path: &std::path::Path) -> Result<String, StateError> {
     let path =
         crate::fs_util::absolute_lexical(path).map_err(|_error| invalid("invalid layout path"))?;
-    // Match the existing case and AM/PM collision equivalence without lossy native paths.
+    // Layout keys use case and AM/PM collision equivalence without lossy native
+    // paths. Read-only protection still uses the exact UTF-8 local_path spelling;
+    // native byte paths use the encoded SelectionPath key directly.
     let path = if let Some(text) = path.to_str() {
         std::path::PathBuf::from(crate::download::paths::normalize_ampm(text).to_lowercase())
     } else {
@@ -236,6 +238,288 @@ pub(super) fn guard_writer(conn: &Connection, path: &std::path::Path) -> Result<
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadonlyMarker {
+    Marked,
+    Unchanged,
+    Missing,
+    Conflict,
+    Unsupported,
+}
+
+/// Persist the existing read-only preservation marker atomically with one
+/// verified reuse settlement. Only an exact compatibility row may carry it.
+pub(super) fn persist_readonly_marker(
+    conn: &Connection,
+    library: &str,
+    asset: &str,
+    version: &str,
+    native_path: &std::path::Path,
+    provider_checksum: &str,
+    local_checksum: &str,
+    source_checksum: &str,
+) -> Result<ReadonlyMarker, StateError> {
+    let Ok(normalized) = crate::fs_util::absolute_lexical(native_path) else {
+        return Ok(ReadonlyMarker::Unsupported);
+    };
+    let marker = path_key(&normalized)?;
+    // A native path and a real UTF-8 sibling can share the same lossy TEXT
+    // spelling. If that sibling exists, the locator is ambiguous and no row
+    // may be marked or settled from the native path alone.
+    if normalized.to_str().is_none() {
+        let lossy = std::path::PathBuf::from(normalized.to_string_lossy().as_ref());
+        if lossy != normalized {
+            match std::fs::symlink_metadata(&lossy) {
+                Ok(_) => return Ok(ReadonlyMarker::Missing),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Ok(ReadonlyMarker::Missing),
+            }
+        }
+    }
+    // UTF-8 paths use the exact TEXT spelling. Native byte paths cannot be
+    // represented losslessly in local_path, so require one unique compatibility
+    // row for the same library/id/version/provider/local evidence.
+    let existing: Option<(String, Option<String>, Option<String>)> = match normalized.to_str() {
+        Some(local_path) => conn
+            .query_row(
+                "SELECT local_path,source_checksum,preserved_path_key FROM asset_metadata_paths
+                 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4
+                   AND provider_checksum=?5 AND local_checksum=?6",
+                params![
+                    library,
+                    asset,
+                    version,
+                    local_path,
+                    provider_checksum,
+                    local_checksum
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?,
+        None => {
+            let rows: Vec<(String, Option<String>, Option<String>)> = conn
+                .prepare(
+                    "SELECT local_path,source_checksum,preserved_path_key FROM asset_metadata_paths
+                     WHERE library=?1 AND id=?2 AND version_size=?3
+                       AND provider_checksum=?4 AND local_checksum=?5 AND local_path=?6",
+                )?
+                .query_map(
+                    params![
+                        library,
+                        asset,
+                        version,
+                        provider_checksum,
+                        local_checksum,
+                        normalized.to_string_lossy()
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?
+                .collect::<Result<_, _>>()?;
+            if rows.len() == 1 {
+                rows.into_iter().next()
+            } else {
+                None
+            }
+        }
+    };
+    let Some((local_path, stored_source, stored_marker)) = existing else {
+        return Ok(ReadonlyMarker::Missing);
+    };
+    match stored_source.as_deref() {
+        Some(source) if source != source_checksum => return Ok(ReadonlyMarker::Conflict),
+        Some(_) => {}
+        None => {
+            let changed = conn.execute(
+                "UPDATE asset_metadata_paths SET source_checksum=?7
+                 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4
+                   AND provider_checksum=?5 AND local_checksum=?6 AND source_checksum IS NULL",
+                params![
+                    library,
+                    asset,
+                    version,
+                    local_path,
+                    provider_checksum,
+                    local_checksum,
+                    source_checksum
+                ],
+            )?;
+            if changed != 1 {
+                return Ok(ReadonlyMarker::Conflict);
+            }
+        }
+    }
+    match stored_marker {
+        None => {
+            let changed = conn.execute(
+                "UPDATE asset_metadata_paths SET preserved_path_key=?7
+                 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4
+                   AND provider_checksum=?5 AND local_checksum=?6 AND source_checksum=?8",
+                params![
+                    library,
+                    asset,
+                    version,
+                    local_path,
+                    provider_checksum,
+                    local_checksum,
+                    marker,
+                    source_checksum
+                ],
+            )?;
+            if changed != 1 {
+                return Ok(ReadonlyMarker::Missing);
+            }
+            Ok(ReadonlyMarker::Marked)
+        }
+        Some(current) if current == marker => Ok(ReadonlyMarker::Unchanged),
+        Some(_) => Ok(ReadonlyMarker::Conflict),
+    }
+}
+
+fn readonly_local_paths(path: &std::path::Path) -> (Option<String>, Option<String>) {
+    let Ok(path) = crate::fs_util::absolute_lexical(path) else {
+        return (None, None);
+    };
+    let Some(requested) = path.to_str().map(str::to_owned) else {
+        return (None, None);
+    };
+    let is_sidecar = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xmp"));
+    if is_sidecar {
+        (
+            path.with_extension("").to_str().map(str::to_owned),
+            Some(requested),
+        )
+    } else {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(".xmp");
+        (
+            Some(requested),
+            std::path::Path::new(&sidecar).to_str().map(str::to_owned),
+        )
+    }
+}
+
+fn protected_readonly_pair(path: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let is_sidecar = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xmp"));
+    if is_sidecar {
+        (path.with_extension(""), path.to_path_buf())
+    } else {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(".xmp");
+        (path.to_path_buf(), std::path::PathBuf::from(sidecar))
+    }
+}
+
+/// A persisted marker protects the exact recorded media path and its exact
+/// sidecar spelling. Native byte paths use their encoded marker key because the
+/// TEXT local_path is only a lossy locator. A marker that no longer matches its
+/// recorded UTF-8 path keeps that recorded path protected and unresolved.
+pub(super) fn path_is_readonly(
+    conn: &Connection,
+    path: &std::path::Path,
+) -> Result<bool, StateError> {
+    let normalized = crate::fs_util::absolute_lexical(path)
+        .map_err(|_error| invalid("invalid read-only path"))?;
+    if normalized.to_str().is_some() {
+        let (media, sidecar) = readonly_local_paths(&normalized);
+        if media.is_none() && sidecar.is_none() {
+            return Ok(false);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT local_path,preserved_path_key FROM asset_metadata_paths
+             WHERE local_path IN (?1,?2) AND preserved_path_key IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map(params![media, sidecar], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (recorded, marker) in rows {
+            if let Ok(selection) = serde_json::from_str::<SelectionPath>(&marker)
+                && !matches!(selection, SelectionPath::Utf8(_))
+            {
+                // A native marker's lossy local_path text is not an exact path.
+                continue;
+            }
+            if path_key(std::path::Path::new(&recorded))? != marker {
+                tracing::warn!(
+                    "Read-only preservation marker does not match its recorded path; keeping that path protected"
+                );
+            }
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    // Native byte paths are represented losslessly by their encoded
+    // SelectionPath key. local_path is only a lossy TEXT locator.
+    let (media, sidecar) = readonly_native_keys(&normalized)?;
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM asset_metadata_paths
+         WHERE preserved_path_key IN (?1,?2))",
+        params![media, sidecar],
+        |row| row.get(0),
+    )?)
+}
+
+fn readonly_native_keys(path: &std::path::Path) -> Result<(String, String), StateError> {
+    let is_sidecar = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xmp"));
+    let (media, sidecar) = if is_sidecar {
+        (path.with_extension(""), path.to_path_buf())
+    } else {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(".xmp");
+        (path.to_path_buf(), std::path::PathBuf::from(sidecar))
+    };
+    Ok((path_key(&media)?, path_key(&sidecar)?))
+}
+
+pub(super) fn protected_readonly_paths(
+    conn: &Connection,
+) -> Result<Vec<std::path::PathBuf>, StateError> {
+    let mut stmt = conn.prepare(
+        "SELECT local_path,preserved_path_key FROM asset_metadata_paths
+         WHERE preserved_path_key IS NOT NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut paths = Vec::new();
+    for (recorded, marker) in rows {
+        // A native marker is already the lossless path representation. Do not
+        // add the lossy recorded TEXT spelling as an independent path.
+        if let Ok(selection) = serde_json::from_str::<SelectionPath>(&marker)
+            && !matches!(selection, SelectionPath::Utf8(_))
+        {
+            let (media, sidecar) = protected_readonly_pair(&selection.to_path());
+            paths.push(media);
+            paths.push(sidecar);
+            continue;
+        }
+        let native = std::path::PathBuf::from(&recorded);
+        if path_key(&native)? != marker {
+            tracing::warn!(
+                "Read-only preservation marker does not match its recorded path; retaining that recorded path"
+            );
+        }
+        let (media, sidecar) = protected_readonly_pair(&native);
+        paths.push(media);
+        paths.push(sidecar);
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 // A journal may publish old prepared bytes, but must never roll newer provider
@@ -546,9 +830,11 @@ impl SqliteStateDb {
 #[cfg(test)]
 mod tests {
     use super::{
-        LayoutBinding, LayoutFile, LayoutFingerprint, LayoutMember, LayoutOperation, decode,
-        encode, path_key,
+        LayoutBinding, LayoutFile, LayoutFingerprint, LayoutMember, LayoutOperation,
+        ReadonlyMarker, decode, encode, path_is_readonly, path_key, persist_readonly_marker,
+        protected_readonly_paths,
     };
+    use crate::state::MetadataRewriteStore;
     use crate::state::db::provider_selection::SelectionPath;
     use crate::state::{
         AssetMetadata, AssetRecord, AssetStatus, MediaType, SqliteStateDb, VersionSizeKey,
@@ -898,6 +1184,376 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn readonly_marker_is_exact_and_conflicts_are_refused() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let conn = db.acquire_lock("readonly marker test").unwrap();
+        let native = std::path::Path::new("/photos/photo.jpg");
+        let marker = path_key(native).unwrap();
+        conn.execute(
+            "INSERT INTO asset_metadata_paths
+             (library,id,version_size,local_path,provider_checksum,local_checksum,source_checksum)
+             VALUES ('PrimarySync','child','original',?1,'provider','local',NULL)",
+            [native.to_str().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            persist_readonly_marker(
+                &conn,
+                "PrimarySync",
+                "child",
+                "original",
+                native,
+                "provider",
+                "local",
+                "source",
+            )
+            .unwrap(),
+            ReadonlyMarker::Marked
+        );
+        assert_eq!(
+            persist_readonly_marker(
+                &conn,
+                "PrimarySync",
+                "child",
+                "original",
+                native,
+                "provider",
+                "local",
+                "source",
+            )
+            .unwrap(),
+            ReadonlyMarker::Unchanged
+        );
+        assert!(path_is_readonly(&conn, native).unwrap());
+        assert!(path_is_readonly(&conn, std::path::Path::new("/photos/photo.jpg.xmp")).unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT source_checksum FROM asset_metadata_paths WHERE id='child'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "source"
+        );
+        conn.execute(
+            "UPDATE asset_metadata_paths SET preserved_path_key='conflict' WHERE id='child'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            persist_readonly_marker(
+                &conn,
+                "PrimarySync",
+                "child",
+                "original",
+                native,
+                "provider",
+                "local",
+                "source",
+            )
+            .unwrap(),
+            ReadonlyMarker::Conflict
+        );
+        conn.execute(
+            "UPDATE asset_metadata_paths SET local_path='/photos/other.jpg', preserved_path_key=?1 WHERE id='child'",
+            [&marker],
+        )
+        .unwrap();
+        assert!(path_is_readonly(&conn, std::path::Path::new("/photos/other.jpg")).unwrap());
+        assert_eq!(
+            persist_readonly_marker(
+                &conn,
+                "PrimarySync",
+                "child",
+                "original",
+                native,
+                "provider",
+                "local",
+                "source",
+            )
+            .unwrap(),
+            ReadonlyMarker::Missing
+        );
+        assert_eq!(marker, path_key(native).unwrap());
+    }
+
+    #[test]
+    fn readonly_marker_does_not_equate_case_distinct_paths() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let conn = db.acquire_lock("case-distinct marker test").unwrap();
+        let lower = std::path::Path::new("/photos/photo.jpg");
+        let upper = std::path::Path::new("/photos/photo.JPG");
+        conn.execute(
+            "INSERT INTO asset_metadata_paths
+             (library,id,version_size,local_path,provider_checksum,local_checksum,source_checksum,preserved_path_key)
+             VALUES ('PrimarySync','child','original',?1,'provider','local','source',?2)",
+            rusqlite::params![lower.to_str().unwrap(), path_key(lower).unwrap()],
+        )
+        .unwrap();
+        assert!(path_is_readonly(&conn, lower).unwrap());
+        assert!(!path_is_readonly(&conn, upper).unwrap());
+        assert_eq!(
+            persist_readonly_marker(
+                &conn,
+                "PrimarySync",
+                "child",
+                "original",
+                upper,
+                "provider",
+                "local",
+                "source",
+            )
+            .unwrap(),
+            ReadonlyMarker::Missing
+        );
+    }
+
+    #[test]
+    fn protected_readonly_paths_does_not_double_suffix_sidecars() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let conn = db.acquire_lock("sidecar protection test").unwrap();
+        let sidecar = std::path::Path::new("/photos/photo.jpg.xmp");
+        conn.execute(
+            "INSERT INTO asset_metadata_paths
+             (library,id,version_size,local_path,provider_checksum,local_checksum,source_checksum,preserved_path_key)
+             VALUES ('PrimarySync','child','original',?1,'provider','local','source',?2)",
+            rusqlite::params![sidecar.to_str().unwrap(), path_key(sidecar).unwrap()],
+        )
+        .unwrap();
+        let protected = protected_readonly_paths(&conn).unwrap();
+        assert!(
+            protected
+                .iter()
+                .any(|path| path == std::path::Path::new("/photos/photo.jpg"))
+        );
+        assert!(protected.iter().any(|path| path == sidecar));
+        assert!(
+            !protected
+                .iter()
+                .any(|path| path == std::path::Path::new("/photos/photo.jpg.xmp.xmp"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_marker_encodes_non_utf8_native_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let conn = db.acquire_lock("non-utf8 marker test").unwrap();
+        let native = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'/', b'p', 0xff, b'.', b'j', b'p', b'g',
+        ]));
+        conn.execute(
+            "INSERT INTO asset_metadata_paths
+             (library,id,version_size,local_path,provider_checksum,local_checksum,source_checksum)
+             VALUES ('PrimarySync','child','original',?1,'provider','local',NULL)",
+            [native.to_string_lossy()],
+        )
+        .unwrap();
+        assert_eq!(
+            persist_readonly_marker(
+                &conn,
+                "PrimarySync",
+                "child",
+                "original",
+                &native,
+                "provider",
+                "local",
+                "source",
+            )
+            .unwrap(),
+            ReadonlyMarker::Marked
+        );
+        assert!(path_is_readonly(&conn, &native).unwrap());
+        let lossy = std::path::PathBuf::from(native.to_string_lossy().as_ref());
+        assert!(!path_is_readonly(&conn, &lossy).unwrap());
+        assert!(
+            protected_readonly_paths(&conn)
+                .unwrap()
+                .iter()
+                .any(|path| path == &native)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_marker_does_not_attach_to_a_same_evidence_sibling() {
+        use std::os::unix::ffi::OsStringExt;
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let conn = db.acquire_lock("non-utf8 sibling test").unwrap();
+        let native = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'/', b'p', 0xff, b'.', b'j', b'p', b'g',
+        ]));
+        conn.execute(
+            "INSERT INTO asset_metadata_paths
+             (library,id,version_size,local_path,provider_checksum,local_checksum,source_checksum)
+             VALUES ('PrimarySync','child','original','/photos/sibling.jpg','provider','local',NULL)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            persist_readonly_marker(
+                &conn,
+                "PrimarySync",
+                "child",
+                "original",
+                &native,
+                "provider",
+                "local",
+                "source",
+            )
+            .unwrap(),
+            ReadonlyMarker::Missing
+        );
+        let marker: Option<String> = conn
+            .query_row(
+                "SELECT preserved_path_key FROM asset_metadata_paths WHERE local_path='/photos/sibling.jpg'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker.is_none());
+    }
+    #[cfg(all(unix, target_os = "linux"))]
+    #[tokio::test]
+    async fn native_and_utf8_siblings_with_identical_lossy_text_do_not_share_markers() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let native = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"native-\xff.jpg".to_vec()));
+        let lossy = std::path::PathBuf::from(native.to_string_lossy().as_ref());
+        assert_ne!(native, lossy);
+        std::fs::write(&native, b"same bytes").unwrap();
+        std::fs::write(&lossy, b"same bytes").unwrap();
+        let checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(b"same bytes"));
+        let native_text = native.to_string_lossy().into_owned();
+
+        let database = dir.path().join("state.db");
+        let db = SqliteStateDb::open_owned(
+            &database,
+            &crate::state::db::account::AccountOwner::authenticated(
+                "collision@example.invalid",
+                "com",
+                &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"native-collision"}}))
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        {
+            let conn = db.acquire_lock("seed colliding utf8 row").unwrap();
+            conn.execute(
+                "INSERT INTO asset_metadata_paths
+                 (library,id,version_size,local_path,provider_checksum,local_checksum,source_checksum)
+                 VALUES ('PrimarySync','utf8','original',?1,'provider',?2,?2)",
+                rusqlite::params![native_text, checksum],
+            )
+            .unwrap();
+            assert_eq!(
+                persist_readonly_marker(
+                    &conn,
+                    "PrimarySync",
+                    "utf8",
+                    "original",
+                    &native,
+                    "provider",
+                    &checksum,
+                    &checksum,
+                )
+                .unwrap(),
+                ReadonlyMarker::Missing,
+                "a colliding UTF-8 sibling makes the native locator ambiguous"
+            );
+            let marker: Option<String> = conn
+                .query_row(
+                    "SELECT preserved_path_key FROM asset_metadata_paths WHERE id='utf8'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(marker.is_none());
+        }
+        assert!(db.guard_primary_writer(&native).await.is_ok());
+        assert!(db.guard_primary_writer(&lossy).await.is_ok());
+        assert!(
+            !path_is_readonly(&db.acquire_lock("native unprotected").unwrap(), &native).unwrap()
+        );
+        assert!(!path_is_readonly(&db.acquire_lock("lossy unprotected").unwrap(), &lossy).unwrap());
+
+        // A marker attached to the UTF-8 sibling must not protect the native path.
+        let utf8_marker = path_key(&lossy).unwrap();
+        db.acquire_lock("mark utf8 sibling")
+            .unwrap()
+            .execute(
+                "UPDATE asset_metadata_paths SET preserved_path_key=?1 WHERE id='utf8'",
+                [&utf8_marker],
+            )
+            .unwrap();
+        assert!(db.guard_primary_writer(&native).await.is_ok());
+        assert!(db.guard_primary_writer(&lossy).await.is_err());
+
+        // A native marker key must not protect the lossy UTF-8 sibling.
+        {
+            let conn = db.acquire_lock("seed native row").unwrap();
+            conn.execute(
+                "INSERT INTO asset_metadata_paths
+                 (library,id,version_size,local_path,provider_checksum,local_checksum,source_checksum,preserved_path_key)
+                 VALUES ('PrimarySync','native','original',?1,'provider',?2,?2,?3)",
+                rusqlite::params![native_text, checksum, path_key(&native).unwrap()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE asset_metadata_paths SET preserved_path_key=NULL WHERE id='utf8'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(db.guard_primary_writer(&native).await.is_err());
+        assert!(db.guard_primary_writer(&lossy).await.is_ok());
+        assert!(
+            !path_is_readonly(
+                &db.acquire_lock("lossy not native-protected").unwrap(),
+                &lossy
+            )
+            .unwrap()
+        );
+
+        drop(db);
+        let reopened = SqliteStateDb::open_owned(
+            &database,
+            &crate::state::db::account::AccountOwner::authenticated(
+                "collision@example.invalid",
+                "com",
+                &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"native-collision"}}))
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(reopened.guard_primary_writer(&native).await.is_err());
+        assert!(reopened.guard_primary_writer(&lossy).await.is_ok());
+        assert_eq!(
+            persist_readonly_marker(
+                &reopened.acquire_lock("reopened collision refusal").unwrap(),
+                "PrimarySync",
+                "utf8",
+                "original",
+                &native,
+                "provider",
+                &checksum,
+                &checksum,
+            )
+            .unwrap(),
+            ReadonlyMarker::Missing
         );
     }
 }

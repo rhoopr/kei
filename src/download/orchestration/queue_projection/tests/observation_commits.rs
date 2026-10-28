@@ -60,6 +60,72 @@ async fn fixture(dir: &std::path::Path) -> (Arc<SqliteStateDb>, ObservationProof
 }
 
 #[tokio::test]
+async fn prior_inventory_proof_requires_matching_owner_plans_policy_and_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    let mut selected = spec();
+    selected.profile["current_download_metadata"] = serde_json::json!(1);
+    let root = db
+        .begin_selection_generation(owner(), selected.clone(), BUDGET)
+        .await
+        .unwrap();
+    admission(&db, &root.id, &dir.path().join("media"), 0, false, BUDGET).await;
+    let receipt = db
+        .seal_observed_selection(owner(), root.id, true, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let proof = ObservationProof::inventory(vec![receipt.clone()]).unwrap();
+    assert!(
+        db.inventory_proof_matches(owner(), proof.clone(), vec![selected.clone()])
+            .await
+            .unwrap()
+    );
+    let mut changed_config = selected.clone();
+    changed_config.config_hash = "different-config".into();
+    assert!(
+        !db.inventory_proof_matches(owner(), proof.clone(), vec![changed_config])
+            .await
+            .unwrap()
+    );
+    let mut changed_profile = selected.clone();
+    changed_profile.profile["recent"] = serde_json::json!(5);
+    assert!(
+        !db.inventory_proof_matches(owner(), proof.clone(), vec![changed_profile])
+            .await
+            .unwrap()
+    );
+    db.set_metadata("config_hash", "changed-policy")
+        .await
+        .unwrap();
+    assert!(
+        !db.inventory_proof_matches(owner(), proof.clone(), vec![selected.clone()])
+            .await
+            .unwrap()
+    );
+    let other = crate::state::db::account::AccountOwner::authenticated(
+        "other@example.invalid",
+        "com",
+        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"other"}})).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !db.inventory_proof_matches(other, proof.clone(), vec![selected])
+            .await
+            .unwrap()
+    );
+    let delta = ObservationProof::delivery(receipt)
+        .delta("before", "after")
+        .unwrap();
+    assert!(proof.clone().bridge(delta.clone(), "before").is_some());
+    assert!(proof.bridge(delta, "other-boundary").is_none());
+}
+
+#[tokio::test]
 async fn observation_commit_pending_reopen_and_generic_token_invalidation() {
     let dir = tempfile::tempdir().unwrap();
     let (db, proof) = fixture(dir.path()).await;

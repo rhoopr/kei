@@ -524,6 +524,9 @@ async fn production_download_recovers_before_work_but_dry_run_does_not_mutate() 
     drop(journal);
     let mut config = DownloadConfig::test_default();
     config.directory = Arc::from(dir.path());
+    config.state_db = Some(Arc::new(
+        crate::state::SqliteStateDb::open_in_memory().unwrap(),
+    ));
     let config = Arc::new(config);
     download_photos_with_sync(
         &reqwest::Client::new(),
@@ -861,12 +864,13 @@ fn protected_legacy_journal_is_untouched_even_through_root_alias() {
     let before = snapshot();
     let alias = dir.path().join("alias");
     std::os::unix::fs::symlink(&root, &alias).unwrap();
-    assert!(
+    assert_eq!(
         super::recover_tree_blocking_with_protection(
             &alias,
             &[alias.join("missing/old/photo.jpg"), target.clone()],
         )
-        .is_err()
+        .unwrap(),
+        1
     );
     assert_eq!(fs::read(&target).unwrap(), b"original");
     assert_eq!(fs::read(&part).unwrap(), b"replacement");
@@ -875,7 +879,10 @@ fn protected_legacy_journal_is_untouched_even_through_root_alias() {
     drop(_journal);
     fs::remove_dir_all(&journal_path).unwrap();
     fs::create_dir(&journal_path).unwrap();
-    assert!(super::recover_tree_blocking_with_protection(&root, &[target]).is_err());
+    assert_eq!(
+        super::recover_tree_blocking_with_protection(&root, &[target]).unwrap(),
+        1
+    );
     assert!(journal_path.is_dir());
 }
 
@@ -918,9 +925,10 @@ fn symlinked_protected_parent_still_blocks_recovery() {
     let alias = dir.path().join("protected-parent");
     std::os::unix::fs::symlink(&root, &alias).unwrap();
     let protected = alias.join(target.file_name().unwrap());
-    assert!(
+    assert_eq!(
         super::recover_tree_blocking_with_protection(&root, std::slice::from_ref(&protected))
-            .is_err()
+            .unwrap(),
+        1
     );
     assert_eq!(fs::read(&target).unwrap(), b"original");
     assert_eq!(fs::read(&part).unwrap(), b"replacement");
@@ -1262,4 +1270,184 @@ fn retained_sidecar_recovery_refuses_replaced_real_parent() {
         fs::read(root.path().join("retained/photo.jpg")).unwrap(),
         b"selected original"
     );
+}
+
+#[test]
+fn protected_and_healthy_journals_progress_independently_and_recover_after_protection_lifts() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("root");
+    let protected_root = root.join("protected");
+    let healthy_root = root.join("healthy");
+    fs::create_dir_all(&protected_root).unwrap();
+    fs::create_dir_all(&healthy_root).unwrap();
+    let (protected, protected_part, protected_journal) = prepare(&protected_root);
+    let (healthy, healthy_part, healthy_journal) = prepare(&healthy_root);
+    for journal in [&protected_journal, &healthy_journal] {
+        assert!(
+            publish_journal(journal, |stage| {
+                anyhow::ensure!(stage != Stage::Displaced, "interrupted");
+                Ok(())
+            })
+            .is_err()
+        );
+    }
+    drop(protected_journal);
+    drop(healthy_journal);
+    let journal_path = directory_path(&protected).unwrap();
+    let snapshot = || {
+        let mut entries = fs::read_dir(&journal_path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_owned(),
+                    fs::read(&path).unwrap(),
+                    fs::metadata(&path).unwrap().modified().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    };
+    let before = snapshot();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&root, &alias).unwrap();
+    let protected_alias = alias.join("protected").join(protected.file_name().unwrap());
+    for recovery_root in [&root, &alias, &root] {
+        assert_eq!(
+            super::recover_tree_blocking_with_protection(
+                recovery_root,
+                std::slice::from_ref(&protected_alias)
+            )
+            .unwrap(),
+            1
+        );
+        assert!(!protected.exists());
+        assert_eq!(snapshot(), before);
+        assert_eq!(fs::read(&healthy).unwrap(), b"original");
+        assert_eq!(fs::read(&healthy_part).unwrap(), b"replacement");
+        assert!(!directory_path(&healthy).unwrap().exists());
+    }
+    assert_eq!(
+        super::recover_tree_blocking_with_protection(&root, &[]).unwrap(),
+        0
+    );
+    assert_eq!(fs::read(&protected).unwrap(), b"original");
+    assert_eq!(fs::read(&protected_part).unwrap(), b"replacement");
+    assert!(!journal_path.exists());
+}
+
+#[tokio::test]
+async fn readonly_marker_protects_replacement_journal_across_reopen() {
+    use crate::state::{MetadataRewriteStore, SqliteStateDb};
+
+    let dir = TempDir::new().unwrap();
+    let (target, part, journal) = prepare(dir.path());
+    drop(journal);
+    let database = dir.path().join("state.db");
+    let owner = crate::state::db::account::AccountOwner::authenticated(
+        "journal@example.invalid",
+        "com",
+        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"synthetic-journal"}}))
+            .unwrap(),
+    )
+    .unwrap();
+    let db = SqliteStateDb::open_owned(&database, &owner).await.unwrap();
+    let marker = crate::state::db::primary_layout::path_key(&target).unwrap();
+    db.acquire_lock("seed readonly journal marker")
+        .unwrap()
+        .execute(
+            "INSERT INTO asset_metadata_paths
+             (library,id,version_size,local_path,provider_checksum,local_checksum,source_checksum,preserved_path_key)
+             VALUES ('PrimarySync','protected','original',?1,'provider','local','source',?2)",
+            rusqlite::params![target.to_str().unwrap(), marker],
+        )
+        .unwrap();
+    let protected = db.protected_legacy_paths().await.unwrap();
+    assert!(protected.iter().any(|path| path == &target));
+    assert!(db.guard_primary_writer(&target).await.is_err());
+    assert_eq!(
+        db.source_metadata_recovery(&target).await.unwrap(),
+        crate::state::db::SourceMetadataRecovery::ReadOnly
+    );
+    drop(db);
+    let reopened = SqliteStateDb::open_owned(&database, &owner).await.unwrap();
+    let protected = reopened.protected_legacy_paths().await.unwrap();
+    assert_eq!(
+        super::super::recover_conditional_replacements(dir.path(), &protected)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"original");
+    assert_eq!(fs::read(&part).unwrap(), b"replacement");
+    assert!(directory_path(&target).unwrap().exists());
+    reopened
+        .acquire_lock("remove readonly journal marker")
+        .unwrap()
+        .execute("DELETE FROM asset_metadata_paths WHERE id='protected'", [])
+        .unwrap();
+    assert_eq!(
+        super::super::recover_conditional_replacements(dir.path(), &[])
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"original");
+    assert_eq!(fs::read(&part).unwrap(), b"replacement");
+    assert!(!directory_path(&target).unwrap().exists());
+}
+
+#[tokio::test]
+async fn stale_readonly_marker_holds_only_its_journal_and_healthy_journal_recovers() {
+    use crate::state::{MetadataRewriteStore, SqliteStateDb};
+
+    let dir = TempDir::new().unwrap();
+    let protected_root = dir.path().join("protected");
+    let healthy_root = dir.path().join("healthy");
+    fs::create_dir(&protected_root).unwrap();
+    fs::create_dir(&healthy_root).unwrap();
+    let (protected_target, protected_part, protected_journal) = prepare(&protected_root);
+    let (healthy_target, healthy_part, healthy_journal) = prepare(&healthy_root);
+    drop(protected_journal);
+    drop(healthy_journal);
+    let owner = crate::state::db::account::AccountOwner::authenticated(
+        "stale-marker@example.invalid",
+        "com",
+        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"synthetic-stale"}})).unwrap(),
+    )
+    .unwrap();
+    let db = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner)
+        .await
+        .unwrap();
+    let wrong_marker = crate::state::db::primary_layout::path_key(&healthy_target).unwrap();
+    db.acquire_lock("seed stale readonly marker")
+        .unwrap()
+        .execute(
+            "INSERT INTO asset_metadata_paths
+             (library,id,version_size,local_path,provider_checksum,local_checksum,source_checksum,preserved_path_key)
+             VALUES ('PrimarySync','stale','original',?1,'provider','local','source',?2)",
+            rusqlite::params![protected_target.to_str().unwrap(), wrong_marker],
+        )
+        .unwrap();
+    let protected = db.protected_legacy_paths().await.unwrap();
+    assert!(protected.iter().any(|path| path == &protected_target));
+    assert_eq!(
+        db.source_metadata_recovery(&protected_target)
+            .await
+            .unwrap(),
+        crate::state::db::SourceMetadataRecovery::ReadOnly
+    );
+    assert_eq!(
+        super::super::recover_conditional_replacements(dir.path(), &protected)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(fs::read(&protected_target).unwrap(), b"original");
+    assert_eq!(fs::read(&protected_part).unwrap(), b"replacement");
+    assert!(directory_path(&protected_target).unwrap().exists());
+    assert_eq!(fs::read(&healthy_target).unwrap(), b"original");
+    assert_eq!(fs::read(&healthy_part).unwrap(), b"replacement");
+    assert!(!directory_path(&healthy_target).unwrap().exists());
 }

@@ -74,6 +74,12 @@ async fn fixture() -> (
     db.prepare_for_retry(Some("PrimarySync"), RetryErrorRetention::Clear)
         .await
         .unwrap();
+    // This lower-level fixture bypasses dispatch, so establish its real database check.
+    config.ownership_check = Some(
+        crate::download::planner::OwnershipCheck::inspect(&db)
+            .await
+            .unwrap(),
+    );
     (dir, db, config, asset, file)
 }
 
@@ -487,7 +493,12 @@ async fn prepared_first_publication_reopens_before_rename_without_http_or_metada
         provider_selection::SelectionPath,
     };
 
-    for changed_part in [false, true] {
+    for (changed_part, incomplete, published) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, true, true),
+    ] {
         let dir = TempDir::new().unwrap();
         let database = dir.path().join("state.db");
         let mut config = DownloadConfig::test_default();
@@ -534,6 +545,25 @@ async fn prepared_first_publication_reopens_before_rename_without_http_or_metada
             fs::write(&temporary, b"foreign altered temporary bytes").unwrap();
         }
         let db = SqliteStateDb::open(&database).await.unwrap();
+        config.ownership_check = Some(
+            crate::download::planner::OwnershipCheck::inspect(&db)
+                .await
+                .unwrap(),
+        );
+        if incomplete {
+            let legacy = crate::test_helpers::TestAssetRecord::new("legacy-malformed").build();
+            db.upsert_seen(&legacy).await.unwrap();
+            db.acquire_lock("synthetic historical claim")
+                .unwrap()
+                .execute(
+                    "UPDATE assets SET local_path='old/../history.JPG' WHERE id='legacy-malformed'",
+                    [],
+                )
+                .unwrap();
+        }
+        if published {
+            fs::rename(&temporary, &derived.path).unwrap();
+        }
         let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
         let recovered = recover_current_pending_publication(
             &db,
@@ -544,6 +574,54 @@ async fn prepared_first_publication_reopens_before_rename_without_http_or_metada
             &CancellationToken::new(),
         )
         .await;
+        if incomplete {
+            assert!(recovered.unwrap().is_none());
+            assert_eq!(derived.path.exists(), published);
+            assert_eq!(
+                fs::read(if published { &derived.path } else { &temporary }).unwrap(),
+                MOVIE
+            );
+            assert_eq!(
+                db.get_prepared_publications(
+                    "PrimarySync",
+                    asset.state_id(),
+                    VersionSizeKey::Original
+                )
+                .await
+                .unwrap(),
+                vec![proof.clone()]
+            );
+            drop(planner);
+            drop(db);
+            let reopened = SqliteStateDb::open(&database).await.unwrap();
+            let mut planner = TaskPlanner::for_download(Some(&reopened)).await.unwrap();
+            assert!(
+                recover_current_pending_publication(
+                    &reopened,
+                    &config,
+                    &asset,
+                    &mut planner,
+                    VersionSizeKey::Original,
+                    &CancellationToken::new()
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+            assert_eq!(
+                reopened
+                    .get_prepared_publications(
+                        "PrimarySync",
+                        asset.state_id(),
+                        VersionSizeKey::Original
+                    )
+                    .await
+                    .unwrap(),
+                vec![proof]
+            );
+            assert!(reopened.get_baseline_receipts().await.unwrap().is_empty());
+            continue;
+        }
         if changed_part {
             assert!(recovered.is_err());
             assert!(!derived.path.exists());

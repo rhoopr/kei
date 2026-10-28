@@ -509,6 +509,15 @@ async fn issue958_unscoped_provider_request_has_no_album_progress() {
     )
     .await;
     assert!(result.is_ok());
+    let raw = crate::icloud::photos::session::retry_post_changes_body(
+        &session,
+        "https://example.invalid/records/lookup?",
+        &body,
+        &[],
+        &RetryConfig::default(),
+    )
+    .await;
+    assert!(raw.is_ok());
     assert!(!capture.contains_event(|e| e.message() == Some("Album hydration progress")));
 }
 

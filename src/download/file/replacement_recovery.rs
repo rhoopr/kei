@@ -698,27 +698,45 @@ pub(super) fn recover_target_confined(target: &ConfinedPath) -> Result<()> {
 pub(super) async fn recover_tree(
     root: &Path,
     protected_paths: &[std::path::PathBuf],
-) -> Result<()> {
+) -> Result<usize> {
     let root = root.to_path_buf();
     let protected_paths = protected_paths.to_vec();
     tokio::task::spawn_blocking(move || {
         recover_tree_blocking_with_protection(&root, &protected_paths)
     })
-    .await??;
-    Ok(())
+    .await?
 }
 
 #[cfg(test)]
 fn recover_tree_blocking(root: &Path) -> Result<()> {
-    recover_tree_blocking_with_protection(root, &[])
+    recover_tree_blocking_with_protection(root, &[]).map(|_| ())
+}
+
+#[cfg(test)]
+pub(super) fn seed_test_journal(
+    target: &Path,
+    part: &Path,
+    original: &[u8],
+    replacement: &[u8],
+) -> Result<()> {
+    std::fs::write(target, original)?;
+    std::fs::write(part, replacement)?;
+    let journal = Journal::create(
+        &confined(part)?,
+        confined(target)?,
+        super::fingerprint::fingerprint_regular_file_blocking(target)?,
+        super::fingerprint::fingerprint_regular_file_blocking(part)?,
+    )?;
+    drop(journal);
+    Ok(())
 }
 
 fn recover_tree_blocking_with_protection(
     root: &Path,
     protected_paths: &[std::path::PathBuf],
-) -> Result<()> {
+) -> Result<usize> {
     if !root.try_exists()? {
-        return Ok(());
+        return Ok(0);
     }
     anyhow::ensure!(
         !root
@@ -764,18 +782,19 @@ fn recover_tree_blocking_with_protection(
             ),
         );
     }
+    let mut retained = 0;
     let mut directories = vec![std::fs::canonicalize(root)?];
     while let Some(directory) = directories.pop() {
         let capability = confined(&directory.join(".kei-recovery-probe"))?;
         for entry in std::fs::read_dir(format!("/proc/self/fd/{}", capability.parent_fd()))? {
             let entry = entry?;
             if journal_name(&entry.file_name()) {
-                // Opening an incomplete journal can clean it up; reject before
-                // open, including originals belonging to unselected libraries.
-                anyhow::ensure!(
-                    !protected_journals.contains(&directory.join(entry.file_name())),
-                    "Replacement recovery intersects protected legacy evidence; all bytes retained"
-                );
+                // Opening an incomplete journal can clean it up. Retain protected
+                // journals unopened, including claims from unselected libraries.
+                if protected_journals.contains(&directory.join(entry.file_name())) {
+                    retained += 1;
+                    continue;
+                }
                 if let Some(mut journal) = Journal::open(&directory.join(entry.file_name()))
                     .with_context(|| {
                         format!(
@@ -791,7 +810,7 @@ fn recover_tree_blocking_with_protection(
             }
         }
     }
-    Ok(())
+    Ok(retained)
 }
 
 #[cfg(test)]

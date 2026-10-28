@@ -27,6 +27,11 @@ pub(in crate::download) async fn recover_current_pending_publication(
         !shutdown.is_cancelled(),
         "Current publication recovery cancelled"
     );
+    if !planner.allows_existing_mutation(config) {
+        // A retained hash is not evidence that this operation created the
+        // destination. Let independent read-only matching run; keep journals.
+        return Ok(None);
+    }
     if is_asset_filtered(asset, config).is_none() {
         let library = effective_asset_library(asset, config);
         let derived_paths = derive_expected_paths(asset, config);

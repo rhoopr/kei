@@ -1485,33 +1485,28 @@ impl MetadataRewriteStore for SqliteStateDb {
     }
 
     async fn protected_legacy_paths(&self) -> Result<Vec<std::path::PathBuf>, StateError> {
-        self.with_conn(
-            "protected_legacy_paths",
-            super::legacy_preservation::protected_paths,
-        )
-        .await
+        let mut paths = self
+            .with_conn(
+                "protected_legacy_paths",
+                super::legacy_preservation::protected_paths,
+            )
+            .await?;
+        paths.extend(
+            self.with_conn(
+                "protected_readonly_paths",
+                super::primary_layout::protected_readonly_paths,
+            )
+            .await?,
+        );
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
     }
 
     async fn guard_primary_writer(&self, path: &Path) -> Result<(), StateError> {
         let path = path.to_owned();
         self.with_conn("guard_primary_writer", move |conn| {
-            let requested = super::primary_layout::path_key(&path)?;
-            let sidecar_media = if path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("xmp"))
-            {
-                Some(super::primary_layout::path_key(&path.with_extension(""))?)
-            } else {
-                None
-            };
-            let preserved: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM asset_metadata_paths
-                 WHERE preserved_path_key=?1 OR preserved_path_key=?2)",
-                rusqlite::params![requested, sidecar_media],
-                |row| row.get(0),
-            )?;
-            if preserved {
+            if super::primary_layout::path_is_readonly(conn, &path)? {
                 return Err(StateError::Invariant {
                     operation: "guard_primary_writer",
                     detail: "receipt-adopted existing media is read-only".into(),
@@ -1529,9 +1524,12 @@ impl MetadataRewriteStore for SqliteStateDb {
     ) -> Result<super::SourceMetadataRecovery, StateError> {
         let path = path.to_owned();
         self.with_conn("source_metadata_recovery", move |conn| {
+            let readonly = super::primary_layout::path_is_readonly(conn, &path)?;
             let managed = super::primary_layout::path_is_managed(conn, &path)?;
             let protected = super::legacy_preservation::path_is_protected(conn, &path)?;
-            Ok(if protected {
+            Ok(if readonly {
+                super::SourceMetadataRecovery::ReadOnly
+            } else if protected {
                 super::SourceMetadataRecovery::ProtectedLegacy
             } else if managed {
                 super::SourceMetadataRecovery::ManagedPrimary

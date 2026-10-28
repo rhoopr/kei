@@ -1073,6 +1073,7 @@ pub trait MembershipStore: Send + Sync {
 pub enum SourceMetadataRecovery {
     Ordinary,
     ProtectedLegacy,
+    ReadOnly,
     ManagedPrimary,
 }
 

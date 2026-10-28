@@ -240,6 +240,7 @@ pub(in crate::download) enum PendingOnDiskAdoption {
 pub(in crate::download) enum PendingRetryAdoption {
     NotFound,
     Adopted,
+    Deferred,
     StateWriteFailed,
 }
 

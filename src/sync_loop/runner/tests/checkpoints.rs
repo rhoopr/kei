@@ -14,7 +14,7 @@ use crate::sync_loop::test_support::{
     make_run_cycle_download_config_builder, make_run_cycle_download_config_builder_with_options,
     make_run_cycle_library_state, make_run_cycle_library_state_with_album,
     make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle, make_state_db,
-    media_without_photo_downloads, run_cycle_expected_date_dir, run_full_cycle_with_album,
+    run_cycle_expected_date_dir, run_full_cycle_with_album,
 };
 use crate::{download, state};
 
@@ -106,27 +106,265 @@ fn make_one_photo_incremental_album_with_download(
     )
 }
 
+const RECENT_MEDIA: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/data/media/pattern.jpg"
+));
+
+// Rank-query cursors are not zone-history cursors. The fixture keeps a real
+// authenticated selection scope while serving complete current inventory.
+#[derive(Clone)]
+struct RecentInventorySession {
+    records: Arc<Vec<serde_json::Value>>,
+    total: u64,
+    history_requests: Arc<std::sync::Mutex<Vec<String>>>,
+    emitted_ids: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl RecentInventorySession {
+    fn new(records: Vec<serde_json::Value>) -> Self {
+        let total = records
+            .iter()
+            .filter(|record| record["recordType"] == "CPLAsset")
+            .count() as u64;
+        Self {
+            records: Arc::new(records),
+            total,
+            history_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            emitted_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn emitted_ids(&self) -> Vec<String> {
+        self.emitted_ids.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for RecentInventorySession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        let request: serde_json::Value = serde_json::from_str(&body)?;
+        if url.contains("/zones/list") {
+            assert_eq!(request, serde_json::json!({}));
+            return Ok(serde_json::json!({
+                "zones": [{
+                    "zoneID": recent_zone(),
+                    "syncToken": "fixture-zone-history-boundary",
+                    "deleted": false
+                }]
+            }));
+        }
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(serde_json::json!({
+                "records": [{
+                    "recordName": "index",
+                    "fields": {"state": {"value": "FINISHED"}}
+                }]
+            }));
+        }
+        if url.contains("/internal/records/query/batch") {
+            return Ok(album_count_response(self.total));
+        }
+        if url.contains("/records/query?") {
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
+            if offset > 0 {
+                return Ok(serde_json::json!({
+                    "records": [],
+                    "syncToken": "rank-query-token"
+                }));
+            }
+            self.emitted_ids.lock().unwrap().extend(
+                self.records
+                    .iter()
+                    .filter(|record| record["recordType"] == "CPLAsset")
+                    .filter_map(|record| record["recordName"].as_str().map(str::to_owned)),
+            );
+            return Ok(serde_json::json!({
+                "records": self.records.as_ref().clone(),
+                "syncToken": "rank-query-token"
+            }));
+        }
+        if url.contains("/changes/zone?") {
+            let zone = &request["zones"][0];
+            assert_eq!(zone["zoneID"]["zoneName"], "PrimarySync");
+            let token = zone["syncToken"]
+                .as_str()
+                .expect("zone-history starting cursor");
+            assert!(
+                matches!(
+                    token,
+                    "fixture-zone-history-boundary" | "fixture-history-after"
+                ),
+                "rank token must never become a zone cursor: {token}"
+            );
+            self.history_requests.lock().unwrap().push(token.to_owned());
+            return Ok(
+                serde_json::json!({"zones":[{"zoneID":zone["zoneID"],"syncToken":"fixture-history-after","moreComing":false,"records":[]}]}),
+            );
+        }
+        if url.contains("/records/lookup?") {
+            let requested = request["records"].as_array().cloned().unwrap_or_default();
+            let records = self
+                .records
+                .iter()
+                .filter(|record| {
+                    requested
+                        .iter()
+                        .any(|query| query["recordName"] == record["recordName"])
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            return Ok(serde_json::json!({"records": records}));
+        }
+        anyhow::bail!("unexpected authenticated recent endpoint: {url}")
+    }
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+fn recent_zone() -> serde_json::Value {
+    serde_json::json!({"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"})
+}
+
+fn recent_pair(
+    id: &str,
+    filename: &str,
+    url: &str,
+    size: u64,
+    checksum: &str,
+) -> Vec<serde_json::Value> {
+    let mut records =
+        full_album_page_with_download("PrimarySync", id, "unused-rank-token", url, size, checksum)
+            ["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+    records[0]["fields"]["filenameEnc"] = serde_json::json!({"value": filename, "type": "STRING"});
+    records[1]["fields"]["masterRef"]["value"]["zoneID"] = recent_zone();
+    records
+}
+
+fn recent_owner() -> crate::state::db::account::AccountOwner {
+    crate::state::db::account::AccountOwner::authenticated(
+        "recent@example.invalid",
+        "com",
+        &serde_json::from_value(
+            serde_json::json!({"dsInfo":{"dsid":"synthetic-recent-selection"}}),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+async fn recent_inventory_records(
+    total: usize,
+    server: &wiremock::MockServer,
+) -> Vec<serde_json::Value> {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let mut records = Vec::new();
+    for index in 0..total {
+        let mut bytes = RECENT_MEDIA.to_vec();
+        bytes.push(index as u8);
+        let size = bytes.len() as u64;
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes));
+        let endpoint = format!("/media/{index:04}");
+        Mock::given(method("GET"))
+            .and(path(endpoint.as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(bytes)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(server)
+            .await;
+        records.extend(recent_pair(
+            &format!("recent-{index:04}"),
+            &format!("recent-{index:04}.jpg"),
+            &format!("{}{endpoint}", server.uri()),
+            size,
+            &checksum,
+        ));
+    }
+    records
+}
+
+async fn authenticated_recent_library_state(
+    db: Arc<state::SqliteStateDb>,
+    owner: &crate::state::db::account::AccountOwner,
+    session: Box<dyn crate::icloud::photos::PhotosSession>,
+) -> crate::sync_cycle::LibraryState {
+    let mut library = crate::icloud::photos::PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::new(std::collections::HashMap::new()),
+        session,
+        Arc::new(recent_zone()),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .expect("authenticated recent library");
+    library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db,
+        owner.clone(),
+        "com",
+    ));
+    let passes = vec![crate::commands::AlbumPass {
+        kind: crate::commands::PassKind::Unfiled,
+        album: library.all(),
+        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+    }];
+    let mut state = make_run_cycle_library_state_with_passes(
+        "PrimarySync",
+        "sync_token:v27:PrimarySync",
+        passes,
+    );
+    state.library = library;
+    state
+}
+
 #[tokio::test]
 async fn run_cycle_recent_exact_inventory_stores_zone_token() {
     let (capture, _guard) = crate::test_helpers::TracingCapture::install();
     let mut config = make_run_cycle_config();
     config.filters.recent = Some(40);
-    let db = make_state_db();
     let download_dir = tempfile::tempdir().expect("download tempdir");
+    let owner = recent_owner();
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&download_dir.path().join("state.db"), &owner)
+            .await
+            .expect("owned recent state"),
+    );
+    let server = crate::start_wiremock_or_skip!();
+    let records = recent_inventory_records(40, &server).await;
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-    let session = crate::test_helpers::DynamicRecentPhotosSession::new(40)
-        .with_filename_prefix("cycle-recent")
-        .with_token("zone-tok-recent");
-    let album = make_full_album_with_boxed_session("PrimarySync", Box::new(session));
-    let lib_state =
-        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+    let session = RecentInventorySession::new(records);
+    let inventory = session.clone();
+    let history_requests = Arc::clone(&session.history_requests);
+    let lib_state = authenticated_recent_library_state(db.clone(), &owner, Box::new(session)).await;
     let states = vec![&lib_state];
     let build_download_config = make_run_cycle_download_config_builder_with_options(
         download_dir.path(),
-        Arc::clone(&db),
+        Arc::clone(&db) as Arc<dyn download::DownloadStore>,
         RunCycleDownloadConfigOptions {
-            media: media_without_photo_downloads(),
             recent: Some(40),
+            concurrent_downloads: Some(10),
             ..RunCycleDownloadConfigOptions::default()
         },
     );
@@ -145,12 +383,21 @@ async fn run_cycle_recent_exact_inventory_stores_zone_token() {
     .expect("run recent cycle");
 
     assert_eq!(result.failed_count, 0);
+    assert_eq!(
+        *history_requests.lock().unwrap(),
+        ["fixture-zone-history-boundary"]
+    );
+    assert_eq!(
+        inventory.emitted_ids().len(),
+        config.filters.recent.unwrap() as usize
+    );
+    assert_eq!(result.stats.downloaded, 40);
     assert_eq!(result.stats.assets_seen, 40);
     assert_eq!(
-        db.get_metadata("sync_token:PrimarySync")
+        db.get_metadata("sync_token:v27:PrimarySync")
             .await
             .expect("read zone token"),
-        Some("zone-tok-recent".to_owned()),
+        Some("fixture-history-after".to_owned()),
         "an N+1 probe that proves exact EOF may persist the zone token"
     );
     let events = capture.events();
@@ -167,6 +414,7 @@ async fn run_cycle_recent_exact_inventory_stores_zone_token() {
         }),
         "recent-limited token suppression must not warn: {events:?}"
     );
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -257,58 +505,151 @@ async fn contract_malformed_required_asset_fields_block_checkpoint() {
 async fn watch_recent_exact_first_cycle_seeds_incremental_token() {
     let mut config = make_run_cycle_config();
     config.filters.recent = Some(20);
-    let db = make_state_db();
     let download_dir = tempfile::tempdir().expect("download tempdir");
+    let db_path = download_dir.path().join("state.db");
+    let owner = recent_owner();
+    let sentinel = download_dir.path().join("original.jpg");
+    std::fs::write(&sentinel, b"original bytes stay unchanged").unwrap();
+    let sentinel_mtime = std::fs::metadata(&sentinel).unwrap().modified().unwrap();
+    let server = crate::start_wiremock_or_skip!();
+    let records = recent_inventory_records(20, &server).await;
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
-    let session = crate::test_helpers::DynamicRecentPhotosSession::new(20)
-        .with_filename_prefix("watch-recent")
-        .with_token("zone-tok-watch");
-    let album = make_full_album_with_boxed_session("PrimarySync", Box::new(session));
-    let lib_state =
-        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
-    let states = vec![&lib_state];
-    let build_download_config = make_run_cycle_download_config_builder_with_options(
+    let session = RecentInventorySession::new(records.clone());
+    let inventory = session.clone();
+    let history_requests = Arc::clone(&session.history_requests);
+    let result = {
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&db_path, &owner)
+                .await
+                .expect("owned recent state"),
+        );
+        let lib_state =
+            authenticated_recent_library_state(db.clone(), &owner, Box::new(session)).await;
+        let build_download_config = make_run_cycle_download_config_builder_with_options(
+            download_dir.path(),
+            Arc::clone(&db) as Arc<dyn download::DownloadStore>,
+            RunCycleDownloadConfigOptions {
+                recent: Some(20),
+                concurrent_downloads: Some(10),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        run_cycle(
+            &[&lib_state],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run first watch-like recent cycle")
+    };
+
+    assert_eq!(result.failed_count, 0);
+    assert_eq!(
+        *history_requests.lock().unwrap(),
+        ["fixture-zone-history-boundary"]
+    );
+    assert_eq!(
+        inventory.emitted_ids().len(),
+        config.filters.recent.unwrap() as usize
+    );
+    assert_eq!(result.stats.downloaded, 20);
+    let reopened = Arc::new(
+        state::SqliteStateDb::open_owned(&db_path, &owner)
+            .await
+            .expect("reopen owned recent state"),
+    );
+    assert_eq!(
+        reopened
+            .get_metadata("sync_token:v27:PrimarySync")
+            .await
+            .expect("read zone token"),
+        Some("fixture-history-after".to_owned())
+    );
+    let next_mode = determine_sync_mode(
+        false,
+        1,
+        Some(reopened.as_ref()),
+        "sync_token:v27:PrimarySync",
+        "PrimarySync",
+    )
+    .await;
+    assert!(
+        matches!(next_mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "fixture-history-after"),
+        "a later watch cycle should use the token from proved recent EOF"
+    );
+
+    let mut second_session = RecentInventorySession::new(records);
+    second_session.history_requests = Arc::clone(&history_requests);
+    let second_inventory = second_session.clone();
+    let second_state =
+        authenticated_recent_library_state(reopened.clone(), &owner, Box::new(second_session))
+            .await;
+    let second_builder = make_run_cycle_download_config_builder_with_options(
         download_dir.path(),
-        Arc::clone(&db),
+        Arc::clone(&reopened) as Arc<dyn download::DownloadStore>,
         RunCycleDownloadConfigOptions {
-            media: media_without_photo_downloads(),
             recent: Some(20),
+            concurrent_downloads: Some(10),
             ..RunCycleDownloadConfigOptions::default()
         },
     );
-
-    let result = run_cycle(
-        &states,
+    let quiet = run_cycle(
+        &[&second_state],
         &config,
-        Some(db.as_ref()),
+        Some(reopened.as_ref()),
         false,
-        &build_download_config,
+        &second_builder,
         download::DownloadControls::download_hidden(),
         &shared_session,
         &CancellationToken::new(),
     )
     .await
-    .expect("run first watch-like recent cycle");
-
-    assert_eq!(result.failed_count, 0);
+    .expect("run quiet reopened recent cycle");
+    assert_eq!(quiet.failed_count, 0);
+    assert_eq!(quiet.stats.downloaded, 0);
     assert_eq!(
-        db.get_metadata("sync_token:PrimarySync")
-            .await
-            .expect("read zone token"),
-        Some("zone-tok-watch".to_owned())
+        second_inventory.emitted_ids().len(),
+        0,
+        "a current recent receipt must not repeat inventory on reopen"
     );
-    let next_mode = determine_sync_mode(
-        false,
-        1,
-        Some(db.as_ref()),
-        "sync_token:PrimarySync",
-        "PrimarySync",
-    )
-    .await;
     assert!(
-        matches!(next_mode, download::SyncMode::Incremental { ref zone_sync_token } if zone_sync_token == "zone-tok-watch"),
-        "a later watch cycle should use the token from proved recent EOF"
+        quiet.stats.full_enumeration_reason.is_none(),
+        "quiet recent cycle must stay incremental: {quiet:?}"
     );
+    assert!(quiet.can_advance_database_checkpoint());
+    assert_eq!(
+        reopened
+            .get_metadata("sync_token:v27:PrimarySync")
+            .await
+            .expect("read quiet zone token"),
+        Some("fixture-history-after".to_owned())
+    );
+    assert_eq!(
+        history_requests.lock().unwrap()[0],
+        "fixture-zone-history-boundary"
+    );
+    assert!(
+        history_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|token| token == "fixture-history-after"),
+        "quiet reopen should bridge from the stored successor"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"original bytes stay unchanged"
+    );
+    assert_eq!(
+        std::fs::metadata(&sentinel).unwrap().modified().unwrap(),
+        sentinel_mtime
+    );
+    server.verify().await;
 }
 
 /// Retry work is rehydrated independently from source enumeration, so a

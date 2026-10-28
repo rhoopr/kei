@@ -782,6 +782,7 @@ fn task_for(
     path: &Path,
 ) -> filter::DownloadTask {
     filter::DownloadTask {
+        require_created_entry: !config.allows_existing_mutation(),
         url: url.into(),
         download_path: path.to_owned(),
         replacement_fingerprint: None,
@@ -953,6 +954,7 @@ async fn prepare(
                 let written = crate::download::metadata_rewrite::write_download_metadata(
                     crate::download::metadata_rewrite::MetadataWriteRequest {
                         sidecar_namespace: None,
+                        require_created_entry: false,
                         final_path: &stage,
                         embed_path: Some(&stage),
                         expected_embed_fingerprint: Some(fingerprint),
@@ -1534,6 +1536,13 @@ pub(super) async fn recover(
     config: &DownloadConfig,
     cancel: &CancellationToken,
 ) -> Result<()> {
+    let checked = config.check_ownership().await?;
+    if !checked.allows_existing_mutation() {
+        tracing::warn!(
+            "Recorded layout operations remain pending while historical ownership is incomplete"
+        );
+        return Ok(());
+    }
     let Some(db) = config.state_db.as_deref() else {
         return Ok(());
     };
@@ -1550,7 +1559,10 @@ pub(super) async fn recover(
             db.save_primary_layout(op.clone()).await?;
             let protected =
                 crate::download::legacy_preservation::protected_replacement_paths(Some(db)).await?;
-            file::recover_conditional_replacements(&op.root.to_path(), &protected).await?;
+            if file::recover_conditional_replacements(&op.root.to_path(), &protected).await? > 0 {
+                tracing::warn!("Recorded layout retains protected replacement journals");
+                continue;
+            }
             finish(db, &mut op, cancel, &mut LayoutOutcome::default()).await?;
             continue;
         }
@@ -1590,7 +1602,10 @@ pub(super) async fn recover(
         crate::test_helpers::process_death_point("layout-recovery-prepared");
         let protected =
             crate::download::legacy_preservation::protected_replacement_paths(Some(db)).await?;
-        file::recover_conditional_replacements(&op.root.to_path(), &protected).await?;
+        if file::recover_conditional_replacements(&op.root.to_path(), &protected).await? > 0 {
+            tracing::warn!("Recorded layout retains protected replacement journals");
+            continue;
+        }
         finish(db, &mut op, cancel, &mut LayoutOutcome::default()).await?;
     }
     Ok(())

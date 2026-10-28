@@ -2631,6 +2631,110 @@ pub(super) fn record_readonly_destination(
     )
 }
 
+/// A native reuse may settle only when it can persist the existing marker on
+/// the exact compatibility receipt. Missing or unrepresentable evidence stays
+/// unresolved; a conflicting marker is refused.
+#[derive(Clone, Debug)]
+pub(crate) struct ReuseAuthorization {
+    pub(crate) current_metadata_flags: u8,
+    pub(crate) explicit_refresh_authorized: bool,
+    pub(crate) scope: String,
+    pub(crate) pass_key: String,
+    pub(crate) child: String,
+    pub(crate) generation: Option<String>,
+}
+
+/// One authorization rule for selection and compact-receipt reuse. Reuse may
+/// leave a destination writable only for the same exact active destination
+/// when it already owns pending metadata, or when the current/recorded
+/// explicit refresh matches the recorded metadata options.
+pub(super) fn reuse_metadata_is_writable(
+    conn: &Connection,
+    library: &str,
+    asset: &str,
+    version: &str,
+    path_key: &str,
+    provider_checksum: &str,
+    authorization: &ReuseAuthorization,
+) -> Result<bool, StateError> {
+    let mut stmt = conn.prepare(
+        "SELECT g.metadata_enabled,
+                json_extract(CAST(g.specification AS TEXT),'$.metadata_flags'),
+                json_extract(CAST(g.specification AS TEXT),'$.profile.explicit_metadata_refresh') IS NOT NULL,
+                w.verified_metadata
+         FROM provider_active_destinations w
+         JOIN provider_active_generations g ON g.id=w.generation
+         WHERE w.library=?1 AND w.asset_id=?2 AND w.version_size=?3
+           AND w.path=?4 AND w.checksum=?5 AND w.admitted=1
+           AND w.pass_key=?6 AND w.child=?7 AND g.scope=?8
+           AND (?9 IS NULL OR w.generation=?9)",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![
+                library,
+                asset,
+                version,
+                path_key,
+                provider_checksum,
+                authorization.pass_key,
+                authorization.child,
+                authorization.scope,
+                authorization.generation
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, bool>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        // A compact receipt can outlive its active generation. The caller's
+        // current explicit request still binds this exact resource and path.
+        return Ok(authorization.explicit_refresh_authorized);
+    }
+    Ok(rows
+        .into_iter()
+        .any(|(enabled, flags, profile_refresh, verified)| {
+            let flags = u8::try_from(flags).unwrap_or(u8::MAX);
+            let options_match = flags == authorization.current_metadata_flags;
+            (enabled && !verified)
+                || (options_match && (profile_refresh || authorization.explicit_refresh_authorized))
+        }))
+}
+
+fn persist_reuse_readonly_marker(
+    conn: &Connection,
+    library: &str,
+    asset: &str,
+    version: &str,
+    native_path: &Path,
+    provider_checksum: &str,
+    local: &str,
+    source: &str,
+) -> Result<bool, StateError> {
+    match super::primary_layout::persist_readonly_marker(
+        conn,
+        library,
+        asset,
+        version,
+        native_path,
+        provider_checksum,
+        local,
+        source,
+    )? {
+        super::primary_layout::ReadonlyMarker::Marked
+        | super::primary_layout::ReadonlyMarker::Unchanged => Ok(true),
+        super::primary_layout::ReadonlyMarker::Missing
+        | super::primary_layout::ReadonlyMarker::Unsupported => Ok(false),
+        super::primary_layout::ReadonlyMarker::Conflict => Err(StateError::ProviderWorkConflict),
+    }
+}
+
 fn record_destination_source(
     conn: &Connection,
     library: &str,
@@ -2723,20 +2827,33 @@ impl SqliteStateDb {
         child: String,
         path: super::provider_selection::SelectionPath,
         fingerprint: (String, u64),
+        authorization: ReuseAuthorization,
     ) -> Result<bool, StateError> {
         let (local, size) = fingerprint;
         self.with_conn_mut("reusing exact destination publication",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
-            let root=load_generation(&tx,&generation)?;let manifest=load_decision(&tx,&root,&key,&child)?;
+            let root=load_generation(&tx,&generation)?;
+            let manifest=load_decision(&tx,&root,&key,&child)?;
             if !manifest.decision.destinations.iter().any(|d|d.path==path) {return invalid()}
             let native=path.to_path();
             let selected=manifest.decision.destinations.iter().find(|d|d.path==path).ok_or(StateError::ProviderSelectionInvalid)?;
             let master=manifest.decision.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?;
+            let library=root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?;
+            let protect_readonly = !reuse_metadata_is_writable(
+                &tx,
+                library,
+                &manifest.state_id,
+                &selected.version_size,
+                &path.key()?,
+                &selected.checksum,
+                &authorization,
+            )?;
             for retained in super::download_receipts::matching_local(&tx,&root.spec.scope,&child,&path,&local)? {
                 if retained.master==master && retained.version_size==selected.version_size
                     && retained.provider_checksum==selected.checksum && retained.provider_size==selected.size
                     && (retained.source_checksum!=retained.local_checksum || size==retained.provider_size) {
-                    record_destination_source(&tx,root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,
+                    if protect_readonly && !persist_reuse_readonly_marker(&tx,library,&manifest.state_id,&selected.version_size,&native,&selected.checksum,&retained.local_checksum,&retained.source_checksum)? {tx.commit()?;return Ok(false)}
+                    record_destination_source(&tx,library,
                         &manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::RetainedNative(&retained.source_checksum))?;
                     retirement::receipt(&tx,&root,&manifest,selected)?.save(&tx)?;
                     tx.commit()?;return Ok(true)
@@ -2750,12 +2867,13 @@ impl SqliteStateDb {
                 let previous_manifest=load_decision(&tx,&previous_root,&previous_key,&child)?;
                 let layout_bound:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM primary_layout_bindings WHERE library=?1 AND child IN (?2,?3))",params![root.spec.zone.get("zoneName").and_then(Value::as_str),manifest.state_id,previous_manifest.state_id],|row|row.get(0))?;
                 if source!=local || size!=selected.size || layout_bound {tx.commit()?;return Ok(false)}
+                if protect_readonly && !persist_reuse_readonly_marker(&tx,library,&manifest.state_id,&selected.version_size,&native,&selected.checksum,&local,&source)? {tx.commit()?;return Ok(false)}
                 let prepared:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND prepared_checksum=?6 AND prepared_size=?7)",params![previous,previous_key,child,selected.version_size,path.key()?,local,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|r.get(0))?;
                 if prepared {
                     let pending=metadata_receipt(&tx,&previous,&previous_key,&child,&selected.version_size,&path.key()?)?;
                     super::metadata::settle_selection_prepared_input(&tx,&pending,&(local.clone(),size))?;
                 }
-                record_destination_source(&tx,root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::RetainedNative(&source))?;
+                record_destination_source(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,VerifiedDestinationSource::RetainedNative(&source))?;
                 tx.commit()?;return Ok(true)
             }
             // Historical generic re-adoption could preserve an unrelated
@@ -2765,8 +2883,8 @@ impl SqliteStateDb {
             let Some(text)=native.to_str() else {tx.commit()?;return Ok(false)};
             let receipt:Option<String>=tx.query_row("SELECT p.source_checksum FROM asset_metadata_paths p JOIN assets a USING(library,id,version_size) WHERE p.library=?1 AND p.id=?2 AND p.local_path=?3 AND p.local_checksum=?4 AND p.source_checksum IS NOT NULL AND a.metadata_hash IS ?5 AND p.version_size=?6 AND p.provider_checksum=?7 AND a.checksum=p.provider_checksum AND p.source_checksum=p.local_checksum AND a.size_bytes=?8 AND NOT EXISTS(SELECT 1 FROM primary_layout_bindings b WHERE b.library=p.library AND b.child=p.id)",params![root.spec.zone.get("zoneName").and_then(Value::as_str),manifest.state_id,text,local,manifest.decision.destinations.iter().find(|d|d.path==path).map(|d|&d.metadata_hash),manifest.decision.destinations.iter().find(|d|d.path==path).map(|d|&d.version_size),selected.checksum,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|r.get(0)).optional()?;
             if let Some(source)=receipt {
-                record_readonly_destination(&tx,root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?,&manifest.state_id,
-                    &manifest.decision.destinations.iter().find(|d|d.path==path).ok_or(StateError::ProviderSelectionInvalid)?.version_size,&native,&local,&source)?;
+                if protect_readonly && !persist_reuse_readonly_marker(&tx,library,&manifest.state_id,&selected.version_size,&native,&selected.checksum,&local,&source)? {tx.commit()?;return Ok(false)}
+                record_readonly_destination(&tx,library,&manifest.state_id,&selected.version_size,&native,&local,&source)?;
                 tx.commit()?;Ok(true)
             } else {tx.commit()?;Ok(false)}
         }).await

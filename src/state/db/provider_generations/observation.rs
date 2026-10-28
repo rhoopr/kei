@@ -281,6 +281,55 @@ impl ObservationProof {
         }
         Some(plans)
     }
+
+    /// A fresh full inventory may authorize skipping only the duplicate
+    /// recent inventory when it matches the current authenticated scope,
+    /// selection plans, owner, and provider policy.
+    fn matches_current_inventory(
+        &self,
+        conn: &Connection,
+        specs: &[GenerationSpec],
+    ) -> Result<bool, StateError> {
+        if self.kind != Kind::Inventory || !self.fresh_inventory {
+            return Ok(false);
+        }
+        let Some(first) = self.base.first() else {
+            return Ok(false);
+        };
+        if owner_keys(conn)? != (first.account.clone(), first.provider.clone())
+            || first.policy != policy(conn)?
+        {
+            return Ok(false);
+        }
+        let Some(plans) = self.plans() else {
+            return Ok(false);
+        };
+        let mut expected = specs.iter().map(Plan::of).collect::<Vec<_>>();
+        expected.sort_by(|left, right| left.scope.cmp(&right.scope));
+        Ok(plans == expected)
+    }
+}
+
+impl SqliteStateDb {
+    /// Read-only validation of a transient full-inventory proof before the
+    /// incremental bridge may omit its duplicate recent inventory.
+    pub(crate) async fn inventory_proof_matches(
+        &self,
+        owner: account::AccountOwner,
+        proof: ObservationProof,
+        specs: Vec<GenerationSpec>,
+    ) -> Result<bool, StateError> {
+        self.with_conn("validating prior inventory proof", move |conn| {
+            let Ok((account, provider)) = owner.authenticated_keys() else {
+                return Ok(false);
+            };
+            if owner_keys(conn)? != (account.to_owned(), provider.to_owned()) {
+                return Ok(false);
+            }
+            proof.matches_current_inventory(conn, &specs)
+        })
+        .await
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]

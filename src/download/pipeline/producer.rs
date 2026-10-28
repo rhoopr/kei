@@ -917,8 +917,16 @@ where
                                     let adoption=crate::download::baseline_matching::commit_match(
                                         decision,config,&asset,&task,&producer_shutdown).await;
                                     match adoption {
-                                        Ok(()) => {
+                                        Ok(true) => {
                                             disposition = disposition.max(AssetDisposition::OnDisk)
+                                        }
+                                        Ok(false) => {
+                                            uncertain_rendition = true;
+                                            disposition =
+                                                disposition.max(AssetDisposition::Uncertain);
+                                            tracing::warn!(
+                                                "Existing-file receipt cannot persist read-only protection; pending work retained"
+                                            );
                                         }
                                         Err(error) => {
                                             state_write_failures_producer

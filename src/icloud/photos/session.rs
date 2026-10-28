@@ -637,21 +637,30 @@ pub(crate) async fn retry_post_changes_body(
     headers: &[(&str, &str)],
     retry_config: &RetryConfig,
 ) -> anyhow::Result<Vec<u8>> {
-    retry::retry_with_backoff(retry_config, classify_api_error, || async {
-        let bytes = session
-            .post_changes_body(url, body.to_owned(), headers)
-            .await?;
-        anyhow::ensure!(
-            bytes.len() <= super::inbox::MAX_CHANGES_PAGE_BYTES,
-            super::error::ShadowPageError::from(anyhow::anyhow!(
-                "Provider changes page exceeded the capture byte limit"
-            ))
-        );
-        let value = super::changes_json::parse(&bytes)?;
-        check_cloudkit_errors(value)?;
-        Ok(bytes)
+    hydration_progress::request_started();
+    let result = retry::retry_with_backoff(retry_config, classify_api_error, || async {
+        hydration_progress::attempt_started();
+        let result = async {
+            let bytes = session
+                .post_changes_body(url, body.to_owned(), headers)
+                .await?;
+            anyhow::ensure!(
+                bytes.len() <= super::inbox::MAX_CHANGES_PAGE_BYTES,
+                super::error::ShadowPageError::from(anyhow::anyhow!(
+                    "Provider changes page exceeded the capture byte limit"
+                ))
+            );
+            let value = super::changes_json::parse(&bytes)?;
+            check_cloudkit_errors(value)?;
+            Ok(bytes)
+        }
+        .await;
+        hydration_progress::attempt_finished();
+        result
     })
-    .await
+    .await;
+    hydration_progress::request_finished();
+    result
 }
 
 /// Retry transport and HTTP failures while leaving record-level CloudKit

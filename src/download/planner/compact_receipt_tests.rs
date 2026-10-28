@@ -130,7 +130,7 @@ async fn v027_compact_only_changed_template_modified_file_is_uncertain() {
         .unwrap()
         .execute_batch("UPDATE assets SET status='pending';")
         .unwrap();
-    crate::download::baseline_matching::commit_match(
+    let settled = crate::download::baseline_matching::commit_match(
         decision,
         &config,
         &asset,
@@ -139,6 +139,7 @@ async fn v027_compact_only_changed_template_modified_file_is_uncertain() {
     )
     .await
     .unwrap();
+    assert!(settled);
     assert!(db.get_pending().await.unwrap().is_empty());
     assert_eq!(std::fs::read(&old).unwrap(), untouched_bytes);
     assert_eq!(

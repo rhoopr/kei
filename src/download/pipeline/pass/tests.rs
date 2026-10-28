@@ -64,6 +64,7 @@ fn test_run_download_pass_skips_all_tasks_when_cancelled() {
 
                     let tasks = vec![
                         DownloadTask {
+                            require_created_entry: true,
                             url: "https://p01.icloud-content.com/a".into(),
                             download_path: dir.path().join("a.jpg"),
                             replacement_fingerprint: None,
@@ -80,6 +81,7 @@ fn test_run_download_pass_skips_all_tasks_when_cancelled() {
                             media_type: crate::state::MediaType::Photo,
                         },
                         DownloadTask {
+                            require_created_entry: true,
                             url: "https://p01.icloud-content.com/b".into(),
                             download_path: dir.path().join("b.jpg"),
                             replacement_fingerprint: None,
@@ -143,6 +145,7 @@ fn test_run_download_pass_processes_tasks_when_not_cancelled() {
                     let token = CancellationToken::new();
 
                     let tasks = vec![DownloadTask {
+                        require_created_entry: true,
                         url: "https://0.0.0.0:1/nonexistent".into(),
                         download_path: dir.path().join("c.jpg"),
                         replacement_fingerprint: None,
@@ -219,6 +222,7 @@ async fn download_pass_invalid_unknown_media_marks_failed_not_downloaded() {
         crate::download::file::temp_download_path(&download_path, &checksum, ".kei-tmp")
             .expect("valid temp path");
     let task = DownloadTask {
+        require_created_entry: true,
         url: format!("{}/photo.jpg", server.uri()).into(),
         download_path: download_path.clone(),
         replacement_fingerprint: None,
@@ -309,6 +313,7 @@ async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
     let checksum = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
     let tasks: Vec<DownloadTask> = (0..STATE_DB_UNWRITABLE_THRESHOLD + 3)
         .map(|i| DownloadTask {
+            require_created_entry: true,
             url: format!("{}/photo_{i}.jpg", server.uri()).into(),
             download_path: dir.path().join(format!("photo_{i}.jpg")),
             replacement_fingerprint: None,
@@ -434,9 +439,11 @@ async fn shutdown_cancellation_exits_download_pass_promptly() {
         filename_exclude: std::sync::Arc::from(Vec::<glob::Pattern>::new()),
         temp_suffix: std::sync::Arc::from(".kei-tmp"),
         state_db: None,
+        ownership_check: None,
         sparse_targets: Arc::from([]),
         complete_path_selection: false,
         selection_context: None,
+        prior_inventory_proof: None,
         selection_run: None,
         selection_pass: None,
         retry_only: false,

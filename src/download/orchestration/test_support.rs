@@ -30,6 +30,7 @@ pub(super) fn retry_test_task(
     path: &str,
 ) -> DownloadTask {
     DownloadTask {
+        require_created_entry: true,
         url: format!("https://p01.icloud-content.com/{asset_id}").into(),
         download_path: Path::new("/tmp/codex/kei/retry-tests").join(path),
         replacement_fingerprint: None,

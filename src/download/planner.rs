@@ -49,6 +49,30 @@ struct ReconciliationPlanning {
     receipt_file_reads: std::sync::atomic::AtomicUsize,
 }
 
+/// A checked, transient restriction. It never supplies positive file ownership.
+/// Private construction prevents an unchecked context from granting mutation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OwnershipCheck {
+    complete: bool,
+}
+
+impl OwnershipCheck {
+    pub(crate) async fn inspect<D: crate::state::ReconciliationStateStore + ?Sized>(
+        db: &D,
+    ) -> Result<Self> {
+        let records = db.get_reconciliation_catalog_paths().await?;
+        Ok(Self {
+            complete: records
+                .iter()
+                .all(|record| PathPlanningMode::Reconciliation.key(&record.path).is_ok()),
+        })
+    }
+
+    pub(crate) fn allows_existing_mutation(self) -> bool {
+        self.complete
+    }
+}
+
 /// Mutable path-planning state carried across assets in one pass.
 #[derive(Debug)]
 pub(super) struct TaskPlanner {
@@ -59,6 +83,7 @@ pub(super) struct TaskPlanner {
     layout_session: Option<Arc<super::orchestration::primary_layout::LayoutSession>>,
     managed_plan: bool,
     baseline_matcher: super::baseline_matching::BaselineMatcher,
+    ownership_incomplete: bool,
 }
 
 impl TaskPlanner {
@@ -71,6 +96,7 @@ impl TaskPlanner {
             layout_session: None,
             managed_plan: false,
             baseline_matcher: super::baseline_matching::BaselineMatcher::default(),
+            ownership_incomplete: false,
         }
     }
 
@@ -139,10 +165,14 @@ impl TaskPlanner {
         };
         let reservations = db.get_reconciliation_reservations().await?;
         let catalog = db.get_reconciliation_catalog_paths().await?;
+        let mut ownership_incomplete = false;
         let mut planner = if reservations.is_empty() {
             let mut planner = Self::new();
             for record in catalog {
-                let key = PathPlanningMode::Reconciliation.key(&record.path)?;
+                let Ok(key) = PathPlanningMode::Reconciliation.key(&record.path) else {
+                    planner.ownership_incomplete = true;
+                    continue;
+                };
                 planner
                     .reconciliation
                     .path_owners
@@ -156,10 +186,19 @@ impl TaskPlanner {
             }
             planner
         } else {
+            let catalog = catalog
+                .into_iter()
+                .filter(|record| {
+                    let valid = PathPlanningMode::Reconciliation.key(&record.path).is_ok();
+                    ownership_incomplete |= !valid;
+                    valid
+                })
+                .collect::<Vec<_>>();
             let mut planner = Self::for_reconciliation(catalog, reservations)?;
             planner.path_mode = PathPlanningMode::ReservedDownload;
             planner
         };
+        planner.ownership_incomplete |= ownership_incomplete;
         let records = db.get_downloaded_path_records().await?;
         planner.add_downloaded_paths(records);
         planner.baseline_matcher =
@@ -181,6 +220,9 @@ impl TaskPlanner {
         &self,
         proof: &crate::state::PendingPublicationRecord,
     ) -> bool {
+        if self.ownership_incomplete {
+            return false;
+        }
         let Ok(key) = PathPlanningMode::Reconciliation.key(&proof.local_path) else {
             return false;
         };
@@ -242,6 +284,11 @@ impl TaskPlanner {
                 .or_default()
                 .push(record);
         }
+    }
+
+    /// A planner can only restrict the operation's earlier ownership check.
+    pub(super) fn allows_existing_mutation(&self, config: &DownloadConfig) -> bool {
+        !self.ownership_incomplete && config.allows_existing_mutation()
     }
 
     /// Accept only a current-content receipt in this pass's filename family.
@@ -497,6 +544,8 @@ impl TaskPlanner {
                 continue;
             }
             plan.tasks.push(DownloadTask {
+                require_created_entry: self.ownership_incomplete
+                    || !config.allows_existing_mutation(),
                 url: derived.url,
                 download_path: derived.path,
                 replacement_fingerprint: None,
@@ -1308,7 +1357,7 @@ impl TaskPlanner {
         }
 
         pre_ensure_asset_dir(&mut self.dir_cache, asset, config).await;
-        let tasks = if primary_filename.is_some() {
+        let mut tasks = if primary_filename.is_some() {
             super::filter::filter_asset_to_tasks_with_primary(
                 asset,
                 config,
@@ -1326,6 +1375,11 @@ impl TaskPlanner {
                 planning_mode,
             )?
         };
+        if self.ownership_incomplete {
+            for task in &mut tasks {
+                task.require_created_entry = true;
+            }
+        }
         let malformed_resource = if tasks.is_empty() {
             super::filter::malformed_no_task_resource(asset, config)
         } else {

@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 const ZONE: &str = "SharedSync-SYNTHETIC-853";
-const TOKEN: &str = "sync_token:SharedSync-SYNTHETIC-853";
+const TOKEN: &str = "sync_token:v27:SharedSync-SYNTHETIC-853";
 const USER: &str = "receipt-recovery@example.invalid";
 
 #[derive(Clone, Debug)]
@@ -33,6 +33,18 @@ struct Provider {
 impl PhotosSession for Provider {
     async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
         let request: Value = serde_json::from_str(&body)?;
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(
+                json!({"records":[{"recordName":"index","fields":{"state":{"value":"FINISHED"}}}]}),
+            );
+        }
+        if url.ends_with("/zones/list") {
+            assert_eq!(request, json!({}));
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":self.zone,"ownerRecordName":"_defaultOwner"},
+                "syncToken":format!("synthetic-observed-{}", self.records.len()),"deleted":false}]}),
+            );
+        }
         if url.contains("/records/query/batch?") {
             return Ok(album_count_response(
                 self.records
@@ -50,7 +62,7 @@ impl PhotosSession for Provider {
                 .and_then(|v| v["fieldValue"]["value"].as_u64())
                 .unwrap_or(0);
             return Ok(
-                json!({"records":if offset==0 {self.records.clone()} else {Vec::new()}, "syncToken":"inventory-after"}),
+                json!({"records":if offset==0 {self.records.clone()} else {Vec::new()}, "syncToken":format!("synthetic-observed-{}", self.records.len())}),
             );
         }
         if url.contains("/records/lookup?") {
@@ -66,10 +78,24 @@ impl PhotosSession for Provider {
             url.contains("/changes/zone?"),
             "unexpected synthetic provider endpoint: {url}"
         );
-        let delta = request["zones"][0]["syncToken"].is_string();
+        let cursor = request["zones"][0]["syncToken"].as_str();
+        let delta = cursor.is_some();
+        // Synthetic append-only observations: inventory and changes share the
+        // same boundary; later additions must be delivered exactly once.
+        let observed = match cursor {
+            None | Some("before" | "primary-before") => 0,
+            Some(value) => value
+                .strip_prefix("synthetic-observed-")
+                .and_then(|value| value.parse::<usize>().ok())
+                .expect("unknown synthetic zone cursor"),
+        };
+        assert!(
+            observed <= self.records.len(),
+            "synthetic cursor exceeds inventory"
+        );
         let mut response = json!({"zones":[{"zoneID":{"zoneName":self.zone,"ownerRecordName":"_defaultOwner"},
-            "syncToken":if delta {"delta-after"} else {"inventory-after"}, "moreComing":false,
-            "records":if delta {Vec::new()} else {self.records.clone()}}]});
+            "syncToken":format!("synthetic-observed-{}", self.records.len()), "moreComing":false,
+            "records":self.records[observed..].to_vec()}]});
         if delta && self.bridge_missing {
             response["zones"][0]["syncToken"] = json!("");
         }
@@ -326,7 +352,9 @@ impl Fixture {
             db.set_metadata_capture_revision_for_test(ZONE, &master, 0);
         }
         assert_eq!(targets.len(), 6, "exact six-rendition shape");
-        db.set_metadata(TOKEN, "before").await.unwrap();
+        db.set_metadata("sync_token:SharedSync-SYNTHETIC-853", "before")
+            .await
+            .unwrap();
         db.begin_metadata_capture_revision(ZONE, state::METADATA_CAPTURE_REVISION)
             .await
             .unwrap();
@@ -476,6 +504,39 @@ impl Fixture {
         }
         (usize::try_from(valid).unwrap(), eligible)
     }
+    async fn assert_current_accounting(&self, result: &crate::sync_cycle::CycleResult) {
+        assert_eq!(result.stats.state_write_failures, 0);
+        assert_eq!(result.failed_count, 0);
+        assert!(!result.stats.sync_token_blocked);
+        assert!(result.can_advance_database_checkpoint());
+        let db = state::SqliteStateDb::open(&self.database).await.unwrap();
+        assert_eq!(
+            db.get_metadata(TOKEN).await.unwrap(),
+            Some(format!(
+                "synthetic-observed-{}",
+                self.provider.records.len()
+            ))
+        );
+        let observed = db.observed_selection_status().await.unwrap();
+        assert_eq!(
+            observed.len(),
+            1,
+            "current observation has checkpoint-bound accounting, not inferred historical ownership"
+        );
+        assert_eq!(observed[0].selector_label, "Shared library");
+        assert!(!observed[0].settlement_unknown);
+        assert!(!observed[0].pending_media);
+        assert!(!observed[0].pending_metadata);
+        eprintln!(
+            "synthetic unresolved decisions: {}",
+            rows(
+                &self.database,
+                "SELECT g.scope,g.sealed,g.checkpoint_ready,w.pass_key,w.child,w.admission,w.reason,w.attempts,w.next_retry_at,w.manifest FROM provider_active_decisions w JOIN provider_active_generations g ON g.id=w.generation WHERE w.admission='deferred' ORDER BY w.child"
+            )
+        );
+        assert!(!observed[0].unresolved);
+    }
+
     async fn plan(&self) -> download::trusted_legacy::TrustedLegacyPlan {
         let db = state::SqliteStateDb::open_owned_read_only(
             &self.database,
@@ -511,7 +572,7 @@ impl Fixture {
         db.set_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY, "old-enum-hash")
             .await
             .unwrap();
-        db.set_metadata("sync_token:PrimarySync", "primary-before")
+        db.set_metadata("sync_token:v27:PrimarySync", "primary-before")
             .await
             .unwrap();
     }
@@ -540,13 +601,46 @@ impl Fixture {
         };
         let mut primary = make_run_cycle_library_state_with_album(
             "PrimarySync",
-            "sync_token:PrimarySync",
+            "sync_token:v27:PrimarySync",
             make_full_album_with_boxed_session("PrimarySync", Box::new(primary_provider.clone())),
         );
         primary.library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
             Box::new(primary_provider),
             "PrimarySync",
         );
+        let owner = crate::state::db::account::AccountOwner::authenticated(
+            USER,
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-only"}})).unwrap(),
+        )
+        .unwrap();
+        for (selected, provider, database) in [
+            (&mut shared, self.provider.clone(), "shared"),
+            (
+                &mut primary,
+                Provider {
+                    records: Vec::new(),
+                    zone: "PrimarySync".into(),
+                    bridge_missing: primary_hold,
+                },
+                "private",
+            ),
+        ] {
+            selected.library = crate::icloud::photos::PhotoLibrary::new(
+                format!("https://synthetic.example/database/1/photos/production/{database}"),
+                Arc::new(std::collections::HashMap::new()),
+                Box::new(provider),
+                Arc::new(json!({"zoneName":selected.zone_name,"ownerRecordName":"_defaultOwner"})),
+                database.into(),
+                crate::retry::RetryConfig::default(),
+            )
+            .await
+            .unwrap();
+            selected.library.shadow_capture = Some(
+                crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com"),
+            );
+            selected.plan.passes[0].album = selected.library.all();
+        }
         let mut libraries = vec![&shared];
         if primary_hold {
             libraries.push(&primary);
@@ -596,6 +690,18 @@ impl Fixture {
         drop(base);
         drop(store);
         drop(db);
+        eprintln!("synthetic cycle {label}: {summary}");
+        eprintln!(
+            "synthetic warnings: {}",
+            std::fs::read_to_string(self.root.join(format!("{label}.log"))).unwrap()
+        );
+        eprintln!(
+            "synthetic readiness: {}",
+            rows(
+                &self.database,
+                "SELECT id,version_size,status,metadata_write_failed_at,capture_repair_metadata_hash FROM assets WHERE id LIKE 'child-%' ORDER BY id,version_size"
+            )
+        );
         self.evidence(label, summary);
         result
     }
@@ -604,12 +710,21 @@ impl Fixture {
 #[tokio::test]
 async fn trusted_legacy_files_zero_get_reopen_and_quiet_followups() {
     let f = Fixture::new("accepted").await;
+    let historical_proof_before = rows(
+        &f.database,
+        "SELECT provider_evidence FROM unattributed_legacy_proofs ORDER BY asset_id,generation",
+    );
     assert_eq!(f.source_counts().await, (0, 0));
     let baseline = f
         .cycle("baseline", CancellationToken::new(), false)
         .await
         .unwrap();
-    assert!(baseline.stats.sync_token_blocked);
+    f.assert_current_accounting(&baseline).await;
+    assert_eq!(
+        f.source_counts().await,
+        (0, 0),
+        "current observation does not invent historical source or acceptance proof"
+    );
     let plan = f.plan().await;
     assert_eq!(plan.targets.len(), 6);
     assert_eq!(
@@ -634,8 +749,7 @@ async fn trusted_legacy_files_zero_get_reopen_and_quiet_followups() {
             .await
             .unwrap();
         assert_eq!(result.stats.downloaded, 0);
-        assert!(!result.stats.sync_token_blocked, "{label}");
-        assert!(result.can_advance_database_checkpoint());
+        f.assert_current_accounting(&result).await;
         assert_eq!(f.source_counts().await, (0, 6));
     }
     assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
@@ -644,7 +758,19 @@ async fn trusted_legacy_files_zero_get_reopen_and_quiet_followups() {
         &f.database,
         "SELECT provider_evidence FROM unattributed_legacy_proofs ORDER BY asset_id,generation",
     );
-    assert!(proof.to_string().contains("trusted_legacy_file"));
+    assert_eq!(
+        proof, historical_proof_before,
+        "ordinary sync does not manufacture historical family certification"
+    );
+    assert_eq!(
+        state::SqliteStateDb::open(&f.database)
+            .await
+            .unwrap()
+            .stored_trusted_legacy_file_count()
+            .await
+            .unwrap(),
+        6
+    );
 }
 
 #[tokio::test]
@@ -976,8 +1102,7 @@ async fn trusted_legacy_files_unaccepted_rendition_remains_held() {
         .cycle("unaccepted-control", CancellationToken::new(), false)
         .await
         .unwrap();
-    assert!(result.stats.sync_token_blocked);
-    assert!(!result.can_advance_database_checkpoint());
+    f.assert_current_accounting(&result).await;
     let db = state::SqliteStateDb::open(&f.database).await.unwrap();
     assert!(
         db.legacy_child_provenance(ZONE, &unaccepted.child, &unaccepted.rendition)
@@ -986,6 +1111,23 @@ async fn trusted_legacy_files_unaccepted_rendition_remains_held() {
             .is_none()
     );
     assert_eq!(f.source_counts().await, (0, 5));
+    assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
+    f.verify_old();
+    let reopened = f
+        .cycle("unaccepted-reopen", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    f.assert_current_accounting(&reopened).await;
+    assert_eq!(f.source_counts().await, (0, 5));
+    assert!(
+        state::SqliteStateDb::open(&f.database)
+            .await
+            .unwrap()
+            .legacy_child_provenance(ZONE, &unaccepted.child, &unaccepted.rendition)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
     f.verify_old();
 }
@@ -1375,7 +1517,7 @@ async fn trusted_legacy_mixed_six_acceptance_with_primary_hold_downloads_and_reo
     f.prepare_primary_hold().await;
     let before = {
         let db = state::SqliteStateDb::open(&f.database).await.unwrap();
-        db.get_metadata("sync_token:PrimarySync").await.unwrap()
+        db.get_metadata("sync_token:v27:PrimarySync").await.unwrap()
     };
     assert_eq!(before.as_deref(), Some("primary-before"));
     let (asset_id, provider_checksum) = add_independent_child(&mut f);
@@ -1391,7 +1533,7 @@ async fn trusted_legacy_mixed_six_acceptance_with_primary_hold_downloads_and_reo
     assert!(!first.can_advance_database_checkpoint());
     let db = state::SqliteStateDb::open(&f.database).await.unwrap();
     assert_eq!(
-        db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+        db.get_metadata("sync_token:v27:PrimarySync").await.unwrap(),
         before,
         "Primary cursor remains held at the prepared value"
     );
@@ -1426,7 +1568,7 @@ async fn trusted_legacy_mixed_six_acceptance_with_primary_hold_downloads_and_reo
     assert!(!reopen.can_advance_database_checkpoint());
     let db = state::SqliteStateDb::open(&f.database).await.unwrap();
     assert_eq!(
-        db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+        db.get_metadata("sync_token:v27:PrimarySync").await.unwrap(),
         before,
         "reopen does not rewrite the held Primary cursor"
     );

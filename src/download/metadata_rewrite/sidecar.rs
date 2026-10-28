@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub(super) async fn write_sidecar_metadata(
     path: &Path,
     namespace: Option<crate::fs_util::ConfinedPath>,
+    require_created_entry: bool,
     payload: Arc<MetadataPayload>,
     created_local: DateTime<FixedOffset>,
     source_checksum: Option<&str>,
@@ -55,6 +56,7 @@ pub(super) async fn write_sidecar_metadata(
     match Box::pin(crate::download::metadata::write_sidecar_in_namespace(
         path,
         namespace,
+        require_created_entry,
         &write,
         temp_suffix,
     ))

@@ -236,6 +236,7 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
         ..crate::config::MetadataConfig::default()
     });
     let make_task = |asset_id: &str, checksum_byte: u8, rating: u8| DownloadTask {
+        require_created_entry: true,
         url: format!("{}/{asset_id}.jpg", server.uri()).into(),
         download_path: download_path.clone(),
         replacement_fingerprint: None,
@@ -441,6 +442,7 @@ async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() 
             .failed
             .into_iter()
             .map(|task| DownloadTask {
+                require_created_entry: true,
                 url: format!("{}/fresh.jpg", server.uri()).into(),
                 ..task
             })
@@ -506,6 +508,7 @@ async fn unscoped_publication_proof_survives_finalization_and_other_transfer_int
         max_delay_secs: 0,
     };
     let make_task = |name: &str, checksum_byte: u8| DownloadTask {
+        require_created_entry: true,
         url: format!("https://example.invalid/{name}.jpg").into(),
         download_path: dir.path().join(format!("{name}.jpg")),
         replacement_fingerprint: None,
@@ -1178,4 +1181,101 @@ async fn complete_part_416_recovers_persists_and_skips_after_reopen() {
         vec![Some(format!("bytes={}-", body.len())), None]
     );
     server.verify().await;
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn restricted_new_media_preserves_sidecar_and_metadata_debt_after_reopen() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/fresh.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MINIMAL_JPEG))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = TempDir::new().unwrap();
+    let database = dir.path().join("state.db");
+    let db = Arc::new(crate::state::SqliteStateDb::open(&database).await.unwrap());
+    db.upsert_seen(&crate::test_helpers::TestAssetRecord::new("old-claim").build())
+        .await
+        .unwrap();
+    db.acquire_lock("synthetic malformed historical claim")
+        .unwrap()
+        .execute(
+            "UPDATE assets SET local_path='old/../legacy.jpg' WHERE id='old-claim'",
+            [],
+        )
+        .unwrap();
+    let asset = TestPhotoAsset::new("fresh")
+        .filename("fresh.jpg")
+        .item_type("public.jpeg")
+        .orig_file_type("public.jpeg")
+        .orig_size(MINIMAL_JPEG.len() as u64)
+        .orig_url(&format!("{}/fresh.jpg", server.uri()))
+        .orig_checksum(
+            &base64::engine::general_purpose::STANDARD.encode(Sha256::digest(MINIMAL_JPEG)),
+        )
+        .build();
+    let mut config = DownloadConfig::test_default();
+    config.directory = Arc::from(dir.path().join("media"));
+    config.metadata.xmp_sidecar = true;
+    config.state_db = Some(db.clone());
+    let media = crate::download::filter::derive_expected_paths(&asset, &config)[0]
+        .path
+        .clone();
+    fs::create_dir_all(media.parent().unwrap()).unwrap();
+    let sidecar = sidecar_path_for(&media);
+    fs::write(&sidecar, b"user sidecar must stay untouched").unwrap();
+    let mtime = fs::metadata(&sidecar).unwrap().modified().unwrap();
+    let config = Arc::new(config);
+    let result = stream_and_download_from_stream(
+        &Client::new(),
+        stream::iter(vec![
+            Ok::<crate::icloud::photos::PhotoAsset, anyhow::Error>(asset),
+        ]),
+        &config,
+        DownloadControls::download_hidden(),
+        1,
+        CancellationToken::new(),
+        StreamRuntime::new(None, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.downloaded, 1);
+    assert_eq!(result.exif_failures, 1);
+    assert!(result.failed.is_empty());
+    assert_eq!(fs::read(&media).unwrap(), MINIMAL_JPEG);
+    assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
+    drop(config);
+    drop(db);
+    for _ in 0..2 {
+        let reopened = crate::state::SqliteStateDb::open(&database).await.unwrap();
+        let pass = crate::download::metadata_rewrite::run_pending(
+            &reopened,
+            MetadataFlags::XMP_SIDECAR,
+            Arc::from(".part"),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!((pass.applied, pass.failed), (0, 1));
+        assert_eq!(
+            reopened
+                .get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            fs::read(&sidecar).unwrap(),
+            b"user sidecar must stay untouched"
+        );
+        assert_eq!(fs::metadata(&sidecar).unwrap().modified().unwrap(), mtime);
+        assert_eq!(fs::read(&media).unwrap(), MINIMAL_JPEG);
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }

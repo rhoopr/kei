@@ -71,16 +71,28 @@ pub(super) use self::{
 pub(super) async fn recover_conditional_replacements(
     root: &std::path::Path,
     protected_paths: &[std::path::PathBuf],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     replacement_recovery::recover_tree(root, protected_paths).await
+}
+
+/// Narrow cycle-test fixture for a real replacement journal. Production code
+/// never creates a journal directly through this path.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn seed_test_replacement_journal(
+    target: &std::path::Path,
+    part: &std::path::Path,
+    original: &[u8],
+    replacement: &[u8],
+) -> anyhow::Result<()> {
+    replacement_recovery::seed_test_journal(target, part, original, replacement)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(super) async fn recover_conditional_replacements(
     _root: &std::path::Path,
     _protected_paths: &[std::path::PathBuf],
-) -> anyhow::Result<()> {
-    Ok(())
+) -> anyhow::Result<usize> {
+    Ok(0)
 }
 
 #[cfg(all(target_os = "linux", feature = "xmp"))]

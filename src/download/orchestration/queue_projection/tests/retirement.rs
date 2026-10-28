@@ -4,12 +4,15 @@ use crate::download::orchestration::models::DownloadStore;
 use crate::download::planner::{TaskPlanner, pending_record_for_task};
 use crate::icloud::photos::inbox::ShadowCapture;
 use crate::state::DownloadStateStore;
+use crate::state::MetadataRewriteStore;
 use crate::state::SqliteStateDb;
 use crate::state::db::provider_generations::{
-    ActiveDecision, GenerationSpec, MAX_GENERATION_BYTES,
+    ActiveDecision, ActiveGeneration, GenerationSpec, MAX_GENERATION_BYTES, ReuseAuthorization,
 };
 use crate::state::db::provider_selection::{SelectionDecision, SelectionDestination};
 use crate::state::db::provider_selection::{SelectionOutcome, SelectionPath};
+use crate::state::db::{MetadataRewriteCompletion, MetadataRewriteQueue};
+use rusqlite::OptionalExtension as _;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -20,6 +23,22 @@ tokio::task_local! { static REFERENCE_RAW: bool; }
 
 const RAW: &[u8] = b"raw fixture bytes";
 pub(super) const BUDGET: u64 = 64 * 1024;
+fn authorization(
+    scope: &str,
+    generation: &str,
+    child: &str,
+    flags: u8,
+    explicit: bool,
+) -> ReuseAuthorization {
+    ReuseAuthorization {
+        current_metadata_flags: flags,
+        explicit_refresh_authorized: explicit,
+        scope: scope.to_owned(),
+        pass_key: "pass".into(),
+        child: child.to_owned(),
+        generation: Some(generation.to_owned()),
+    }
+}
 
 pub(super) fn spec() -> GenerationSpec {
     let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
@@ -1215,11 +1234,18 @@ async fn v027_layout_inherited_active_hash_cannot_authorize_publication_reuse() 
         let reused = db
             .reuse_selection_publication(
                 owner(),
-                root.id,
+                root.id.clone(),
                 "pass".into(),
-                manifest.decision.child,
+                manifest.decision.child.clone(),
                 SelectionPath::from_path(destination),
-                (sha, before.len() as u64),
+                (sha.clone(), before.len() as u64),
+                authorization(
+                    &root.spec.scope,
+                    &root.id,
+                    &manifest.decision.child,
+                    0,
+                    false,
+                ),
             )
             .await
             .unwrap();
@@ -1232,6 +1258,130 @@ async fn v027_layout_inherited_active_hash_cannot_authorize_publication_reuse() 
             std::fs::metadata(destination).unwrap().modified().unwrap(),
             mtime
         );
+        if trusted_compact {
+            let marker: String = db
+                .acquire_lock("read native reuse marker")
+                .unwrap()
+                .query_row(
+                    "SELECT preserved_path_key FROM asset_metadata_paths
+                     WHERE library='PrimarySync' AND id=?1 AND version_size='original'
+                       AND local_path=?2",
+                    rusqlite::params![manifest.state_id, destination.to_str().unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                marker,
+                crate::state::db::primary_layout::path_key(destination).unwrap()
+            );
+            assert!(db.guard_primary_writer(destination).await.is_err());
+            assert_eq!(
+                db.source_metadata_recovery(destination).await.unwrap(),
+                crate::state::db::SourceMetadataRecovery::ReadOnly
+            );
+            let mut sidecar = destination.as_os_str().to_os_string();
+            sidecar.push(".xmp");
+            let sidecar = std::path::PathBuf::from(sidecar);
+            let protected = db.protected_legacy_paths().await.unwrap();
+            assert!(protected.iter().any(|path| path == destination));
+            assert!(protected.iter().any(|path| path == &sidecar));
+            let reopened = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+                .await
+                .unwrap();
+            assert!(reopened.guard_primary_writer(destination).await.is_err());
+            assert_eq!(
+                reopened
+                    .source_metadata_recovery(destination)
+                    .await
+                    .unwrap(),
+                crate::state::db::SourceMetadataRecovery::ReadOnly
+            );
+            db.complete_selection_metadata(owner(), root.id.clone())
+                .await
+                .unwrap();
+            let marker_after_compaction: String = db
+                .acquire_lock("marker survives selection compaction")
+                .unwrap()
+                .query_row(
+                    "SELECT preserved_path_key FROM asset_metadata_paths
+                     WHERE library='PrimarySync' AND id=?1 AND version_size='original'
+                       AND local_path=?2",
+                    rusqlite::params![manifest.state_id, destination.to_str().unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(marker_after_compaction, marker);
+            db.acquire_lock("conflicting selection marker")
+                .unwrap()
+                .execute(
+                    "UPDATE asset_metadata_paths SET preserved_path_key='conflict'
+                     WHERE library='PrimarySync' AND id=?1 AND version_size='original'
+                       AND local_path=?2",
+                    rusqlite::params![manifest.state_id, destination.to_str().unwrap()],
+                )
+                .unwrap();
+            assert!(
+                db.reuse_selection_publication(
+                    owner(),
+                    root.id.clone(),
+                    "pass".into(),
+                    manifest.decision.child.clone(),
+                    SelectionPath::from_path(destination),
+                    (sha.clone(), before.len() as u64),
+                    authorization(
+                        &root.spec.scope,
+                        &root.id,
+                        &manifest.decision.child,
+                        0,
+                        false
+                    ),
+                )
+                .await
+                .is_err()
+            );
+            db.acquire_lock("remove selection compatibility receipt")
+                .unwrap()
+                .execute(
+                    "DELETE FROM asset_metadata_paths
+                     WHERE library='PrimarySync' AND id=?1 AND version_size='original'
+                       AND local_path=?2",
+                    rusqlite::params![manifest.state_id, destination.to_str().unwrap()],
+                )
+                .unwrap();
+            assert!(
+                !db.reuse_selection_publication(
+                    owner(),
+                    root.id.clone(),
+                    "pass".into(),
+                    manifest.decision.child.clone(),
+                    SelectionPath::from_path(destination),
+                    (sha, before.len() as u64),
+                    authorization(
+                        &root.spec.scope,
+                        &root.id,
+                        &manifest.decision.child,
+                        0,
+                        false
+                    ),
+                )
+                .await
+                .unwrap()
+            );
+        } else {
+            let marker: Option<Option<String>> = db
+                .acquire_lock("no native reuse marker")
+                .unwrap()
+                .query_row(
+                    "SELECT preserved_path_key FROM asset_metadata_paths
+                     WHERE library='PrimarySync' AND id=?1 AND version_size='original'
+                       AND local_path=?2",
+                    rusqlite::params![manifest.state_id, destination.to_str().unwrap()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+            assert!(marker.flatten().is_none());
+        }
     }
 }
 
@@ -1279,11 +1429,18 @@ async fn v027_layout_master_predecessor_cannot_launder_child_publication() {
     assert!(
         !db.reuse_selection_publication(
             owner(),
-            next.id,
+            next.id.clone(),
             "pass".into(),
-            manifest.decision.child,
+            manifest.decision.child.clone(),
             SelectionPath::from_path(path),
-            (sha, RAW.len() as u64)
+            (sha, RAW.len() as u64),
+            authorization(
+                &next.spec.scope,
+                &next.id,
+                &manifest.decision.child,
+                0,
+                false
+            ),
         )
         .await
         .unwrap()
@@ -2813,4 +2970,398 @@ async fn native_publication_with_equal_lossy_text_settles_only_exact_destination
     for task in tasks {
         assert_eq!(std::fs::read(task.download_path).unwrap(), RAW);
     }
+}
+
+#[tokio::test]
+async fn explicit_refresh_reuse_is_writable_and_completion_is_bound_to_recorded_identity_and_options()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    let mut specification = spec();
+    specification.metadata_enabled = true;
+    specification.metadata_flags = 1;
+    specification.profile["explicit_metadata_refresh"] = json!(1);
+    let root = db
+        .begin_selection_generation(owner(), specification, BUDGET)
+        .await
+        .unwrap();
+    let (manifest, tasks, _) =
+        admission(&db, &root.id, &dir.path().join("media"), 1, false, BUDGET).await;
+    publish(&db, &tasks[0]).await;
+    let task = &tasks[0];
+    let path = task.download_path.clone();
+    let sha = data_encoding::HEXLOWER.encode(&Sha256::digest(RAW));
+    let size = RAW.len() as u64;
+
+    assert!(
+        db.reuse_selection_publication(
+            owner(),
+            root.id.clone(),
+            "different-pass".into(),
+            manifest.decision.child.clone(),
+            SelectionPath::from_path(&path),
+            (sha.clone(), size),
+            authorization(
+                &root.spec.scope,
+                &root.id,
+                &manifest.decision.child,
+                1,
+                true
+            ),
+        )
+        .await
+        .is_err(),
+        "the recorded pass/key must bind the exception"
+    );
+    assert!(
+        db.reuse_selection_publication(
+            owner(),
+            root.id.clone(),
+            "pass".into(),
+            manifest.decision.child.clone(),
+            SelectionPath::from_path(&path.with_file_name("different.JPG")),
+            (sha.clone(), size),
+            authorization(
+                &root.spec.scope,
+                &root.id,
+                &manifest.decision.child,
+                1,
+                true
+            ),
+        )
+        .await
+        .is_err(),
+        "a different path cannot borrow the authorization"
+    );
+
+    let different_resource = data_encoding::HEXLOWER.encode(&Sha256::digest(b"different resource"));
+    assert!(
+        !db.reuse_selection_publication(
+            owner(),
+            root.id.clone(),
+            "pass".into(),
+            manifest.decision.child.clone(),
+            SelectionPath::from_path(&path),
+            (different_resource, size),
+            authorization(
+                &root.spec.scope,
+                &root.id,
+                &manifest.decision.child,
+                1,
+                true
+            ),
+        )
+        .await
+        .unwrap(),
+        "a different local resource cannot borrow the authorization"
+    );
+    assert!(
+        db.reuse_selection_publication(
+            owner(),
+            root.id.clone(),
+            "pass".into(),
+            manifest.decision.child.clone(),
+            SelectionPath::from_path(&path),
+            (sha.clone(), size),
+            authorization(
+                &root.spec.scope,
+                &root.id,
+                &manifest.decision.child,
+                1,
+                true
+            ),
+        )
+        .await
+        .unwrap()
+    );
+    assert!(db.guard_primary_writer(&path).await.is_ok());
+    // A later retry whose generation still records the explicit refresh remains
+    // writable even when the caller would otherwise install the marker.
+    assert!(
+        db.reuse_selection_publication(
+            owner(),
+            root.id.clone(),
+            "pass".into(),
+            manifest.decision.child.clone(),
+            SelectionPath::from_path(&path),
+            (sha.clone(), size),
+            authorization(
+                &root.spec.scope,
+                &root.id,
+                &manifest.decision.child,
+                1,
+                false
+            ),
+        )
+        .await
+        .unwrap()
+    );
+    assert!(db.guard_primary_writer(&path).await.is_ok());
+
+    let mut pending = db
+        .pending_selection_metadata(owner(), root.id.clone(), 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|pending| pending.asset.local_path.as_deref() == Some(path.as_path()))
+        .expect("the authorized selected metadata work remains pending");
+    let old_local = pending.asset.local_checksum.clone().unwrap();
+    let output = data_encoding::HEXLOWER.encode(&Sha256::digest(b"rewritten metadata"));
+    let output_size = b"rewritten metadata".len() as u64;
+    pending.selection_receipt = db
+        .record_selection_metadata_prepared(&pending, &output, output_size)
+        .await
+        .unwrap();
+    assert!(pending.selection_receipt.is_some());
+
+    let mut mismatched = pending.clone();
+    mismatched
+        .selection_receipt
+        .as_mut()
+        .unwrap()
+        .metadata_flags = 2;
+    assert!(matches!(
+        db.finish_metadata_rewrite(
+            &mismatched,
+            MetadataRewriteQueue::Ordinary,
+            Some(&output),
+            Some(&old_local),
+            MetadataRewriteCompletion::Ordinary,
+        )
+        .await,
+        Err(crate::state::error::StateError::ProviderWorkConflict)
+    ));
+    assert!(
+        db.finish_metadata_rewrite(
+            &pending,
+            MetadataRewriteQueue::Ordinary,
+            Some(&output),
+            Some(&old_local),
+            MetadataRewriteCompletion::Ordinary,
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        db.acquire_lock("explicit refresh completed").unwrap().query_row::<i64,_,_>(
+            "SELECT verified_metadata FROM provider_active_destinations WHERE generation=?1 AND pass_key='pass' AND child=?2",
+            rusqlite::params![root.id, manifest.decision.child],
+            |r| r.get(0),
+        ).unwrap(),
+        1
+    );
+
+    // A same-path generation with different metadata options cannot borrow
+    // the first generation's refresh authorization.
+    let cross = db
+        .begin_selection_generation(owner(), spec(), BUDGET)
+        .await
+        .unwrap();
+    let (cross_manifest, cross_tasks, _) =
+        admission(&db, &cross.id, &dir.path().join("media"), 1, false, BUDGET).await;
+    let cross_path = cross_tasks[0].download_path.clone();
+    publish(&db, &cross_tasks[0]).await;
+    let cross_sha = data_encoding::HEXLOWER.encode(&Sha256::digest(RAW));
+    assert!(db.guard_primary_writer(&cross_path).await.is_ok());
+    assert!(
+        db.reuse_selection_publication(
+            owner(),
+            cross.id.clone(),
+            "pass".into(),
+            cross_manifest.decision.child.clone(),
+            SelectionPath::from_path(&cross_path),
+            (cross_sha, RAW.len() as u64),
+            authorization(
+                &cross.spec.scope,
+                &cross.id,
+                &cross_manifest.decision.child,
+                1,
+                true,
+            ),
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        db.guard_primary_writer(&cross_path).await.is_err(),
+        "cross-generation option mismatch must install protection"
+    );
+
+    // A different generation with different metadata options cannot borrow
+    // the refresh authorization; reuse installs protection.
+    let other = db
+        .begin_selection_generation(owner(), spec(), BUDGET)
+        .await
+        .unwrap();
+    let (other_manifest, other_tasks, _) =
+        admission(&db, &other.id, &dir.path().join("media"), 2, false, BUDGET).await;
+    publish(&db, &other_tasks[0]).await;
+    let other_path = other_tasks[0].download_path.clone();
+    let other_sha = data_encoding::HEXLOWER.encode(&Sha256::digest(RAW));
+    assert!(
+        db.reuse_selection_publication(
+            owner(),
+            other.id.clone(),
+            "pass".into(),
+            other_manifest.decision.child.clone(),
+            SelectionPath::from_path(&other_path),
+            (other_sha.clone(), RAW.len() as u64),
+            authorization(
+                &other.spec.scope,
+                &other.id,
+                &other_manifest.decision.child,
+                1,
+                true,
+            ),
+        )
+        .await
+        .unwrap()
+    );
+    assert!(db.guard_primary_writer(&other_path).await.is_err());
+    // An explicit refresh request does not remove or bypass an existing marker.
+    let _ = db
+        .reuse_selection_publication(
+            owner(),
+            other.id.clone(),
+            "pass".into(),
+            other_manifest.decision.child.clone(),
+            SelectionPath::from_path(&other_path),
+            (other_sha, RAW.len() as u64),
+            authorization(
+                &other.spec.scope,
+                &other.id,
+                &other_manifest.decision.child,
+                0,
+                true,
+            ),
+        )
+        .await;
+    assert!(db.guard_primary_writer(&other_path).await.is_err());
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[tokio::test]
+async fn native_and_utf8_lossy_collision_does_not_settle_or_protect_the_sibling() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    let native_root = dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"native-root-\xff".to_vec()));
+    std::fs::create_dir(&native_root).unwrap();
+    let root = db
+        .begin_selection_generation(owner(), spec(), BUDGET)
+        .await
+        .unwrap();
+    let (manifest, tasks, _) = admission(&db, &root.id, &native_root, 1, false, BUDGET).await;
+    publish(&db, &tasks[0]).await;
+    let native = tasks[0].download_path.clone();
+    let lossy = std::path::PathBuf::from(native.to_string_lossy().as_ref());
+    assert_ne!(native, lossy);
+    std::fs::create_dir_all(lossy.parent().unwrap()).unwrap();
+    std::fs::write(&lossy, RAW).unwrap();
+    let sha = data_encoding::HEXLOWER.encode(&Sha256::digest(RAW));
+    let auth = authorization(
+        &root.spec.scope,
+        &root.id,
+        &manifest.decision.child,
+        0,
+        false,
+    );
+
+    assert!(
+        !db.reuse_selection_publication(
+            owner(),
+            root.id.clone(),
+            "pass".into(),
+            manifest.decision.child.clone(),
+            SelectionPath::from_path(&native),
+            (sha.clone(), RAW.len() as u64),
+            auth.clone(),
+        )
+        .await
+        .unwrap(),
+        "a colliding UTF-8 sibling must prevent native settlement"
+    );
+    assert!(db.guard_primary_writer(&native).await.is_ok());
+    assert_eq!(std::fs::read(&native).unwrap(), RAW);
+    assert_eq!(std::fs::read(&lossy).unwrap(), RAW);
+    let marker: Option<String> = db
+        .acquire_lock("native collision has no marker")
+        .unwrap()
+        .query_row(
+            "SELECT preserved_path_key FROM asset_metadata_paths WHERE id=?1",
+            [&manifest.state_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(marker.is_none());
+
+    drop(db);
+    let reopened = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        !reopened
+            .reuse_selection_publication(
+                owner(),
+                root.id.clone(),
+                "pass".into(),
+                manifest.decision.child.clone(),
+                SelectionPath::from_path(&native),
+                (sha, RAW.len() as u64),
+                auth,
+            )
+            .await
+            .unwrap(),
+        "reopen must retain the local refusal"
+    );
+    assert!(reopened.guard_primary_writer(&native).await.is_ok());
+    assert_eq!(std::fs::read(&native).unwrap(), RAW);
+
+    // A healthy UTF-8 destination in the same generation still settles.
+    let healthy_root = db_healthy_root(&reopened).await;
+    let (healthy_manifest, healthy_tasks, _) =
+        admission(&reopened, &healthy_root.id, dir.path(), 2, false, BUDGET).await;
+    publish(&reopened, &healthy_tasks[0]).await;
+    let healthy_path = healthy_tasks[0].download_path.clone();
+    let healthy_sha = data_encoding::HEXLOWER.encode(&Sha256::digest(RAW));
+    assert!(
+        reopened
+            .reuse_selection_publication(
+                owner(),
+                healthy_root.id.clone(),
+                "pass".into(),
+                healthy_manifest.decision.child.clone(),
+                SelectionPath::from_path(&healthy_path),
+                (healthy_sha, RAW.len() as u64),
+                authorization(
+                    &healthy_root.spec.scope,
+                    &healthy_root.id,
+                    &healthy_manifest.decision.child,
+                    0,
+                    false,
+                ),
+            )
+            .await
+            .unwrap()
+    );
+    assert!(reopened.guard_primary_writer(&healthy_path).await.is_err());
+}
+
+async fn db_healthy_root(db: &Arc<SqliteStateDb>) -> ActiveGeneration {
+    db.begin_selection_generation(owner(), spec(), BUDGET)
+        .await
+        .unwrap()
 }

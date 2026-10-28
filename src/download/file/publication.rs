@@ -50,6 +50,10 @@ pub(in crate::download) async fn publish_part_to_final(
             Ok(())
         }
         Ok(PublishResult::DestinationExists) => {
+            anyhow::ensure!(
+                !matches!(publication, FinalPublication::CreateOnly),
+                "Destination already exists; identical bytes cannot establish publication ownership; retained work needs independently verified read-only adoption"
+            );
             // CONTRACT: FILE_PUBLISH_NO_OVERWRITE
             let part_fingerprint = fingerprint_regular_file(part_path)
                 .await
@@ -93,6 +97,56 @@ mod tests {
 
     use super::super::rename_part_to_final;
     use super::FinalPathCollision;
+
+    #[tokio::test]
+    async fn create_only_preserves_equal_and_different_existing_entries() {
+        for existing in [b"same".as_slice(), b"other".as_slice()] {
+            let dir = TempDir::new().unwrap();
+            let part = dir.path().join("photo.part");
+            let destination = dir.path().join("photo.jpg");
+            tokio::fs::write(&part, b"same").await.unwrap();
+            tokio::fs::write(&destination, existing).await.unwrap();
+            let before = tokio::fs::metadata(&destination)
+                .await
+                .unwrap()
+                .modified()
+                .unwrap();
+            for _ in 0..2 {
+                assert!(
+                    super::publish_part_to_final(
+                        &part,
+                        &destination,
+                        super::FinalPublication::CreateOnly,
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(tokio::fs::read(&part).await.unwrap(), b"same");
+                assert_eq!(tokio::fs::read(&destination).await.unwrap(), existing);
+                assert_eq!(
+                    tokio::fs::metadata(&destination)
+                        .await
+                        .unwrap()
+                        .modified()
+                        .unwrap(),
+                    before
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_only_publishes_an_absent_destination() {
+        let dir = TempDir::new().unwrap();
+        let part = dir.path().join("photo.part");
+        let destination = dir.path().join("photo.jpg");
+        tokio::fs::write(&part, b"new bytes").await.unwrap();
+        super::publish_part_to_final(&part, &destination, super::FinalPublication::CreateOnly)
+            .await
+            .unwrap();
+        assert!(!part.exists());
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"new bytes");
+    }
 
     #[tokio::test]
     async fn rename_part_to_final_happy_path() {

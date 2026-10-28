@@ -232,6 +232,24 @@ async fn claim_legacy_owner_for_retry(
         .all(|child| child == asset.asset_record_name()))
 }
 
+fn apply_pending_retry_adoption(
+    adoption: pipeline::PendingRetryAdoption,
+    target: &PendingRetryTarget,
+    pending_targets: &mut FxHashSet<PendingRetryTarget>,
+    state_write_failed_targets: &mut FxHashSet<PendingRetryTarget>,
+) -> bool {
+    match adoption {
+        pipeline::PendingRetryAdoption::Adopted => pending_targets.remove(target),
+        pipeline::PendingRetryAdoption::StateWriteFailed => {
+            state_write_failed_targets.insert(target.clone());
+            false
+        }
+        pipeline::PendingRetryAdoption::Deferred | pipeline::PendingRetryAdoption::NotFound => {
+            false
+        }
+    }
+}
+
 struct PendingRetryPlanning<'a> {
     db: &'a dyn DownloadStore,
     run_mode: super::DownloadRunMode,
@@ -319,10 +337,38 @@ impl PendingRetryPlanning<'_> {
                         decision @ (crate::download::baseline_matching::BaselineMatch::Present { .. }
                             | crate::download::baseline_matching::BaselineMatch::ProviderPresent { .. }
                             | crate::download::baseline_matching::BaselineMatch::RecordedPresent { .. }) => {
-                            if !self.run_mode.downloads_files() || crate::download::baseline_matching::commit_match(
-                                decision,pass_config,asset,task,self.shutdown).await.is_ok()
-                            { pipeline::PendingRetryAdoption::Adopted }
-                            else { pipeline::PendingRetryAdoption::StateWriteFailed }
+                            if !self.run_mode.downloads_files() {
+                                pipeline::PendingRetryAdoption::Adopted
+                            } else {
+                                match crate::download::baseline_matching::commit_match(
+                                    decision,pass_config,asset,task,self.shutdown).await {
+                                    Ok(true) => pipeline::PendingRetryAdoption::Adopted,
+                                    Ok(false) => {
+                                        // The compact receipt is valid, but its
+                                        // exact compatibility row cannot carry
+                                        // durable read-only protection. Persist
+                                        // the pending retry owner before any
+                                        // scheduled transfer so process loss
+                                        // cannot turn deferred adoption into a
+                                        // silent success.
+                                        let mut explanation =
+                                            crate::state::db::match_diagnostics::MatchExplanation::default();
+                                        explanation.add(None, "compact_receipt_missing_exact_compatibility_row");
+                                        self.db
+                                            .defer_baseline_match(
+                                                &crate::download::baseline_matching::pending_record(
+                                                    pass_config,
+                                                    asset,
+                                                    task,
+                                                    explanation,
+                                                ),
+                                            )
+                                            .await?;
+                                        pipeline::PendingRetryAdoption::Deferred
+                                    }
+                                    Err(_) => pipeline::PendingRetryAdoption::StateWriteFailed,
+                                }
+                            }
                         }
                         decision @ (crate::download::baseline_matching::BaselineMatch::Missing
                             | crate::download::baseline_matching::BaselineMatch::Uncertain(_)) => {
@@ -398,23 +444,23 @@ impl PendingRetryPlanning<'_> {
                         }
                     }
                 };
-                match adoption {
-                    pipeline::PendingRetryAdoption::Adopted => {
-                        self.pending_targets.remove(&target);
-                        if !recovered_current && self.run_mode.downloads_files() {
-                            self.db
-                                .clear_asset_verification(
-                                    &target.library,
-                                    &target.asset_id,
-                                    target.version_size.as_str(),
-                                )
-                                .await?;
-                        }
-                    }
-                    pipeline::PendingRetryAdoption::StateWriteFailed => {
-                        state_write_failed_targets.insert(target);
-                    }
-                    pipeline::PendingRetryAdoption::NotFound => {}
+                let adopted = apply_pending_retry_adoption(
+                    adoption,
+                    &target,
+                    self.pending_targets,
+                    &mut state_write_failed_targets,
+                );
+                if adoption == pipeline::PendingRetryAdoption::Deferred {
+                    retained_targets.insert(target.clone());
+                }
+                if adopted && !recovered_current && self.run_mode.downloads_files() {
+                    self.db
+                        .clear_asset_verification(
+                            &target.library,
+                            &target.asset_id,
+                            target.version_size.as_str(),
+                        )
+                        .await?;
                 }
             }
             if let Some(reason) = plan.filter_reason {
@@ -482,6 +528,10 @@ impl PendingRetryPlanning<'_> {
                             .get(&target)
                             .is_some_and(|expected| *expected != fingerprint)
                         {
+                            retained_targets.insert(target);
+                            continue;
+                        }
+                        if task.require_created_entry {
                             retained_targets.insert(target);
                             continue;
                         }
@@ -1768,4 +1818,46 @@ mod current_publication_tests;
 #[cfg(test)]
 tokio::task_local! {
     pub(in crate::download) static AFTER_REPAIR_MATCH: Arc<dyn Fn() + Send + Sync>;
+}
+
+#[cfg(test)]
+mod deferred_adoption_tests {
+    use super::{PendingRetryTarget, apply_pending_retry_adoption};
+    use crate::download::pipeline::PendingRetryAdoption;
+    use crate::state::VersionSizeKey;
+    use std::sync::Arc;
+
+    #[test]
+    fn deferred_pending_retry_keeps_work_and_peer_then_adopted_removes_only_target() {
+        let target = PendingRetryTarget {
+            library: Arc::from("PrimarySync"),
+            asset_id: Arc::from("target"),
+            version_size: VersionSizeKey::Original,
+        };
+        let peer = PendingRetryTarget {
+            library: Arc::from("PrimarySync"),
+            asset_id: Arc::from("peer"),
+            version_size: VersionSizeKey::Original,
+        };
+        let mut pending = rustc_hash::FxHashSet::from_iter([target.clone(), peer.clone()]);
+        let mut state_write_failed = rustc_hash::FxHashSet::default();
+        assert!(!apply_pending_retry_adoption(
+            PendingRetryAdoption::Deferred,
+            &target,
+            &mut pending,
+            &mut state_write_failed,
+        ));
+        assert!(pending.contains(&target));
+        assert!(pending.contains(&peer));
+        assert!(state_write_failed.is_empty());
+        assert!(apply_pending_retry_adoption(
+            PendingRetryAdoption::Adopted,
+            &target,
+            &mut pending,
+            &mut state_write_failed,
+        ));
+        assert!(!pending.contains(&target));
+        assert!(pending.contains(&peer));
+        assert!(state_write_failed.is_empty());
+    }
 }

@@ -226,7 +226,7 @@ async fn cancelled_bridge_fixture_with_pages(
     db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
         .await
         .unwrap();
-    db.set_metadata("sync_token:PrimarySync", "prior-token")
+    db.set_metadata("sync_token:v27:PrimarySync", "prior-token")
         .await
         .unwrap();
     db.set_metadata(&marker, "1").await.unwrap();
@@ -256,7 +256,7 @@ async fn cancelled_bridge_fixture_with_pages(
     );
     let library = make_run_cycle_library_state_with_passes(
         "PrimarySync",
-        "sync_token:PrimarySync",
+        "sync_token:v27:PrimarySync",
         vec![crate::commands::AlbumPass {
             kind: if streaming {
                 crate::commands::PassKind::Unfiled
@@ -355,7 +355,7 @@ async fn cancelled_bridge_fixture_with_pages(
     drop(db);
     let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
     for (key, expected) in [
-        ("sync_token:PrimarySync", "prior-token"),
+        ("sync_token:v27:PrimarySync", "prior-token"),
         (ENUM_CONFIG_HASH_KEY, "old-enum-hash"),
         (marker.as_str(), "1"),
     ] {
@@ -446,7 +446,10 @@ async fn cancelled_bridge_fixture_with_pages(
         .await
         .expect("valid synthetic replay is bounded")
         .unwrap();
-        assert!(result.can_advance_database_checkpoint());
+        assert!(
+            result.can_advance_database_checkpoint(),
+            "{wait:?} streaming={streaming} replay={replay}: {result:?}"
+        );
         assert!(!result.stats.interrupted);
         assert_eq!(result.stats.downloaded, 0);
         assert_eq!(
@@ -461,7 +464,7 @@ async fn cancelled_bridge_fixture_with_pages(
             None
         );
         assert_eq!(
-            db.get_metadata("sync_token:PrimarySync")
+            db.get_metadata("sync_token:v27:PrimarySync")
                 .await
                 .unwrap()
                 .as_deref(),

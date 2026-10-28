@@ -1407,6 +1407,7 @@ pub(crate) async fn run_cycle(
             Arc::clone(&asset_groupings),
             Arc::from(lib_state.zone_name.as_str()),
         );
+        download_config = Arc::new(download_config.check_ownership().await?);
         if let Err(error) = download::prepare_retained_sources(
             &lib_state.plan.passes,
             &download_config,
@@ -1664,6 +1665,8 @@ pub(crate) async fn run_cycle(
                         );
                         Arc::make_mut(&mut bridge_config).sparse_targets =
                             Arc::clone(&download_config.sparse_targets);
+                        Arc::make_mut(&mut bridge_config).prior_inventory_proof =
+                            sync_result.checkpoint.observation.clone().map(Box::new);
                         let bridge_result = download::download_photos_with_sync(
                             &download_client,
                             &lib_state.plan.passes,

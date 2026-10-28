@@ -776,6 +776,10 @@ impl DownloadedFile {
         self.retained = tokio::task::spawn_blocking(move || {
             let mut file = final_confined.open_regular()?;
             if file_identity(&file)? != file_identity(&retained.file)? {
+                anyhow::ensure!(
+                    !matches!(publication, FinalPublication::CreateOnly),
+                    "New publication changed file identity; writer ownership remains unverified"
+                );
                 // An existing identical destination is a valid deduplicated publication.
                 use std::io::Seek;
                 let expected = if let Some(expected) = expected_replacement {

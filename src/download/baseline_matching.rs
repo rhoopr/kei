@@ -37,14 +37,16 @@ pub(in crate::download) enum BaselineMatch {
     Uncertain(MatchExplanation),
 }
 
-/// Commit only positive matches through their original durable proof owner.
+/// Commit a positive match through its original durable proof owner. A compact
+/// receipt may defer when it cannot persist exact read-only compatibility
+/// evidence; that deferred result is surfaced to the retry owner.
 pub(in crate::download) async fn commit_match(
     decision: BaselineMatch,
     config: &super::DownloadConfig,
     asset: &crate::icloud::photos::PhotoAsset,
     task: &DownloadTask,
     shutdown: &tokio_util::sync::CancellationToken,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let db = config
         .state_db
         .as_deref()
@@ -68,7 +70,17 @@ pub(in crate::download) async fn commit_match(
                 .publication_scope(&task.library)?
                 .ok_or_else(|| anyhow::anyhow!("Missing authenticated scope"))?;
             anyhow::ensure!(scope == binding.scope, "Publication scope changed");
-            capture
+            let authorization = crate::state::db::provider_generations::ReuseAuthorization {
+                current_metadata_flags: crate::download::pipeline::MetadataFlags::from(config)
+                    .bits(),
+                explicit_refresh_authorized: config.refresh_metadata
+                    && config.allows_existing_mutation(),
+                scope: binding.scope.clone(),
+                pass_key: binding.origin_pass.clone(),
+                child: binding.child.clone(),
+                generation: None,
+            };
+            return capture
                 .db
                 .reuse_bound_download(
                     binding,
@@ -81,8 +93,10 @@ pub(in crate::download) async fn commit_match(
                                 crate::state::error::StateError::ProviderSelectionInvalid
                             })
                     }),
+                    authorization,
                 )
-                .await?;
+                .await
+                .map_err(Into::into);
         }
         decision => {
             let provider = matches!(&decision, BaselineMatch::ProviderPresent { .. });
@@ -121,7 +135,7 @@ pub(in crate::download) async fn commit_match(
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Checked discovery only locates candidates; complete provider proof is still required.

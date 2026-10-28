@@ -1222,8 +1222,8 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 }
                 positive => {
                     state_skipped = state_skipped.saturating_add(1);
-                    if controls.run_mode.downloads_files()
-                        && let Err(error) = crate::download::baseline_matching::commit_match(
+                    if controls.run_mode.downloads_files() {
+                        match crate::download::baseline_matching::commit_match(
                             positive,
                             effective_config,
                             asset,
@@ -1231,10 +1231,23 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                             &shutdown_token,
                         )
                         .await
-                    {
-                        planning_state_write_failures =
-                            planning_state_write_failures.saturating_add(1);
-                        tracing::warn!(%error,"Collecting existing-file receipt remains pending");
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                uncertain_matches = uncertain_matches.saturating_add(1);
+                                tracing::warn!(
+                                    "Collecting existing-file receipt cannot persist read-only protection; pending work retained"
+                                );
+                            }
+                            Err(error) => {
+                                planning_state_write_failures =
+                                    planning_state_write_failures.saturating_add(1);
+                                tracing::warn!(
+                                    %error,
+                                    "Collecting existing-file receipt remains pending"
+                                );
+                            }
+                        }
                     }
                 }
             }

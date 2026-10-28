@@ -36,11 +36,18 @@ async fn recover_source_journals(
             continue;
         };
         match db.source_metadata_recovery(path).await {
-            Ok(crate::state::db::SourceMetadataRecovery::ProtectedLegacy) => {
+            Ok(
+                recovery @ (crate::state::db::SourceMetadataRecovery::ProtectedLegacy
+                | crate::state::db::SourceMetadataRecovery::ReadOnly),
+            ) => {
                 tracing::warn!(
                     stage = "path_reconciliation",
-                    reason = "protected_legacy_source",
-                    "Deferring protected legacy source recovery"
+                    reason = if recovery == crate::state::db::SourceMetadataRecovery::ReadOnly {
+                        "readonly_source"
+                    } else {
+                        "protected_legacy_source"
+                    },
+                    "Deferring protected source recovery"
                 );
                 continue;
             }
@@ -135,21 +142,35 @@ pub(crate) async fn recover_recorded_sources(
         return Ok(PathReconciliationResult::default());
     };
 
+    let config = Arc::new(config.check_ownership().await?);
+    if !config.allows_existing_mutation() {
+        tracing::warn!(
+            "Recorded file operations remain pending because historical ownership cannot be indexed; current read-only reuse and new publication may proceed"
+        );
+        return Ok(PathReconciliationResult::default());
+    }
     let protected_paths =
         crate::download::legacy_preservation::protected_replacement_paths(Some(db.as_ref()))
             .await?;
-    if let Err(error) =
-        file::recover_conditional_replacements(&config.directory, &protected_paths).await
-    {
-        tracing::warn!(error = %format!("{error:#}"), "Could not recover replacements before path reconciliation; keeping catalogue paths and checkpoints unchanged");
-        return Ok(PathReconciliationResult {
-            complete: false,
-            complete_after_smart_query: false,
-            stats: SyncStats {
-                failed: 1,
-                ..SyncStats::default()
-            },
-        });
+    match file::recover_conditional_replacements(&config.directory, &protected_paths).await {
+        Ok(0) => {}
+        Ok(_) => {
+            tracing::warn!(
+                "Protected replacement journals remain pending before source reconciliation"
+            );
+            return Ok(PathReconciliationResult::default());
+        }
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "Could not recover replacements before path reconciliation; keeping catalogue paths and checkpoints unchanged");
+            return Ok(PathReconciliationResult {
+                complete: false,
+                complete_after_smart_query: false,
+                stats: SyncStats {
+                    failed: 1,
+                    ..SyncStats::default()
+                },
+            });
+        }
     }
 
     let managed = config.edited_naming == crate::types::EditedNaming::Primary

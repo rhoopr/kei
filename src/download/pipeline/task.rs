@@ -101,6 +101,10 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
     metadata_flags: MetadataFlags,
     context: DownloadSingleContext<'_>,
 ) -> Result<DownloadSingleResult> {
+    anyhow::ensure!(
+        !(task.require_created_entry && task.replacement_fingerprint.is_some()),
+        "Existing-file replacement remains pending because historical ownership is incomplete"
+    );
     if let Some(db) = context.state_db {
         db.guard_primary_writer(&task.download_path).await?;
     }
@@ -196,6 +200,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
             let outcome = metadata_rewrite::write_download_metadata(
                 metadata_rewrite::MetadataWriteRequest {
                 sidecar_namespace: None,
+                require_created_entry: task.require_created_entry,
                     final_path: &task.download_path,
                     embed_path: Some(part),
                     expected_embed_fingerprint: downloaded_fingerprint,
@@ -259,6 +264,7 @@ pub(in crate::download) async fn download_single_task<C: crate::download::file::
         let outcome =
             metadata_rewrite::write_download_metadata(metadata_rewrite::MetadataWriteRequest {
                 sidecar_namespace: Some(downloaded.metadata_namespace()?),
+                require_created_entry: task.require_created_entry,
                 final_path: &task.download_path,
                 embed_path: None,
                 expected_embed_fingerprint: None,

@@ -18,6 +18,7 @@ async fn contract_metadata_writes_require_opt_in_leaves_files_untouched() {
 
     write_download_metadata(MetadataWriteRequest {
         sidecar_namespace: None,
+        require_created_entry: false,
         final_path: &photo_path,
         embed_path: Some(&photo_path),
         expected_embed_fingerprint: None,
@@ -57,6 +58,7 @@ async fn approved_heif_fingerprint_bypasses_changed_format_routing_gate() {
 
     let outcome = write_download_metadata(MetadataWriteRequest {
         sidecar_namespace: None,
+        require_created_entry: false,
         final_path: &photo_path,
         embed_path: Some(&photo_path),
         expected_embed_fingerprint: Some(approved),
@@ -120,6 +122,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
             write_sidecar_metadata(
                 &path,
                 None,
+                false,
                 payload,
                 now_local(),
                 Some(&checksum),
@@ -156,6 +159,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
             write_sidecar_metadata(
                 &path,
                 None,
+                false,
                 Arc::new(MetadataPayload {
                     latitude: Some(1.5),
                     longitude: Some(2.5),
@@ -278,6 +282,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_new_writes() {
             write_sidecar_metadata(
                 &path,
                 None,
+                false,
                 Arc::new(MetadataPayload {
                     latitude: Some(latitude),
                     longitude: Some(longitude),
@@ -323,6 +328,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_after_embed() {
     for (embed_path, sidecar_path) in [(Some(path.as_path()), None), (None, Some(path.as_path()))] {
         let outcome = write_download_metadata(MetadataWriteRequest {
             sidecar_namespace: None,
+            require_created_entry: false,
             final_path: &path,
             embed_path,
             expected_embed_fingerprint: None,

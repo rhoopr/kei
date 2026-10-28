@@ -57,12 +57,13 @@ pub(crate) async fn write_sidecar(
     write: &MetadataWrite,
     temp_suffix: &str,
 ) -> Result<()> {
-    write_sidecar_in_namespace(media_path, None, write, temp_suffix).await
+    write_sidecar_in_namespace(media_path, None, false, write, temp_suffix).await
 }
 
 pub(crate) async fn write_sidecar_in_namespace(
     media_path: &Path,
     namespace: Option<crate::fs_util::ConfinedPath>,
+    require_created_entry: bool,
     write: &MetadataWrite,
     temp_suffix: &str,
 ) -> Result<()> {
@@ -70,7 +71,13 @@ pub(crate) async fn write_sidecar_in_namespace(
     let write = write.clone();
     let temp_suffix = temp_suffix.to_owned();
     let prepared = tokio::task::spawn_blocking(move || {
-        prepare_sidecar_write(&media_path, namespace, &write, &temp_suffix)
+        prepare_sidecar_write(
+            &media_path,
+            namespace,
+            require_created_entry,
+            &write,
+            &temp_suffix,
+        )
     })
     .await
     .context("XMP sidecar preparation task panicked")??;
@@ -117,6 +124,7 @@ struct SidecarPublication {
 fn prepare_sidecar_write(
     media_path: &Path,
     namespace: Option<crate::fs_util::ConfinedPath>,
+    require_created_entry: bool,
     write: &MetadataWrite,
     temp_suffix: &str,
 ) -> Result<Option<PreparedSidecar>> {
@@ -143,11 +151,27 @@ fn prepare_sidecar_write(
         )?,
     };
     // Recovery refuses unsafe ancestors; retain the checked namespace afterward.
-    #[cfg(target_os = "linux")]
-    crate::download::file::recover_file_replacement_confined(&target)?;
+    if require_created_entry {
+        anyhow::ensure!(
+            !crate::download::file::has_replacement_journal_blocking(
+                sidecar_path.parent().context("Sidecar has no parent")?,
+                &sidecar_path,
+            )?,
+            "Existing sidecar recovery cannot establish creation ownership"
+        );
+    } else {
+        #[cfg(target_os = "linux")]
+        crate::download::file::recover_file_replacement_confined(&target)?;
+    }
     let existing = target
         .open_optional_regular()?
         .map(|mut file| {
+            if require_created_entry {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "Existing sidecar is read-only while historical ownership is incomplete",
+                ));
+            }
             let identity = crate::fs_util::file_identity(&file)?;
             let mut bytes = Vec::new();
             std::io::Read::read_to_end(&mut file, &mut bytes)?;
@@ -293,6 +317,88 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn creation_only_sidecar_preserves_existing_entry_and_journal() {
+        #[cfg(target_os = "linux")]
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::TempDir::new().unwrap();
+        let media = dir.path().join("new.jpg");
+        fs::write(&media, b"new media").unwrap();
+        let sidecar = dir.path().join("new.jpg.xmp");
+        let write = MetadataWrite {
+            rating: Some(4),
+            ..MetadataWrite::default()
+        };
+        // Unknown bytes must be refused before parsing or rewriting.
+        fs::write(&sidecar, b"foreign sidecar").unwrap();
+        let before = fs::metadata(&sidecar).unwrap().modified().unwrap();
+        assert!(
+            super::write_sidecar_in_namespace(&media, None, true, &write, ".part")
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&sidecar).unwrap(), b"foreign sidecar");
+        assert_eq!(fs::metadata(&sidecar).unwrap().modified().unwrap(), before);
+        fs::remove_file(&sidecar).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(b"new.jpg.xmp"));
+            let journal = dir.path().join(format!(".kei-replace-{digest}"));
+            fs::create_dir(&journal).unwrap();
+            fs::write(journal.join("retained"), b"journal evidence").unwrap();
+            assert!(
+                super::write_sidecar_in_namespace(&media, None, true, &write, ".part")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read(journal.join("retained")).unwrap(),
+                b"journal evidence"
+            );
+            assert!(!sidecar.exists());
+            fs::remove_dir_all(journal).unwrap();
+        }
+        super::write_sidecar_in_namespace(&media, None, true, &write, ".part")
+            .await
+            .unwrap();
+        assert!(sidecar.exists());
+        assert_eq!(fs::read(&media).unwrap(), b"new media");
+    }
+
+    #[tokio::test]
+    async fn creation_only_sidecar_refuses_concurrent_arrival() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let media = dir.path().join("new.jpg");
+        fs::write(&media, b"new media").unwrap();
+        let write = MetadataWrite {
+            rating: Some(4),
+            ..MetadataWrite::default()
+        };
+        let super::PreparedSidecar::Publish(prepared) =
+            prepare_sidecar_write(&media, None, true, &write, ".part")
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("missing sidecar should prepare creation");
+        };
+        fs::write(prepared.target.path(), b"concurrent sidecar").unwrap();
+        assert!(
+            crate::download::file::publish_sidecar_confined(
+                &prepared.temp,
+                &prepared.target,
+                prepared.expected,
+                prepared.output,
+                prepared.identity
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(prepared.target.path()).unwrap(),
+            b"concurrent sidecar"
+        );
+        assert!(prepared.temp.path().exists());
     }
 
     #[test]
@@ -474,12 +580,12 @@ mod tests {
                 fs::write(&other, &bytes).unwrap();
                 fs::remove_file(&sidecar).unwrap();
                 std::os::unix::fs::symlink(&other, &sidecar).unwrap();
-                assert!(prepare_sidecar_write(&media, None, &write, ".meta-tmp").is_err());
+                assert!(prepare_sidecar_write(&media, None, false, &write, ".meta-tmp").is_err());
                 assert_eq!(fs::read(&other).unwrap(), bytes);
                 continue;
             }
             let super::PreparedSidecar::Unchanged(snapshot) =
-                prepare_sidecar_write(&media, None, &write, ".meta-tmp")
+                prepare_sidecar_write(&media, None, false, &write, ".meta-tmp")
                     .unwrap()
                     .unwrap()
             else {
@@ -563,6 +669,7 @@ mod tests {
         let super::PreparedSidecar::Publish(prepared) = prepare_sidecar_write(
             &media_path,
             None,
+            false,
             &MetadataWrite {
                 rating: Some(4),
                 ..MetadataWrite::default()
@@ -608,6 +715,7 @@ mod tests {
         let super::PreparedSidecar::Publish(prepared) = prepare_sidecar_write(
             &media_path,
             None,
+            false,
             &MetadataWrite {
                 rating: Some(4),
                 ..MetadataWrite::default()
@@ -649,6 +757,7 @@ mod tests {
         let super::PreparedSidecar::Publish(prepared) = prepare_sidecar_write(
             &media_path,
             None,
+            false,
             &MetadataWrite {
                 rating: Some(4),
                 ..MetadataWrite::default()

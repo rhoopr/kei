@@ -484,6 +484,22 @@ impl SelectionContext {
     pub(super) fn current_sparse_scope(&self) -> Option<&str> {
         (self.format == 2).then_some(self.scope.as_str())
     }
+
+    async fn inventory_proof_matches(
+        &self,
+        config: &DownloadConfig,
+        proof: &ObservationProof,
+    ) -> Result<bool> {
+        let specs = std::iter::once(self)
+            .chain(self.source_contexts.iter())
+            .map(|source| source.spec(config, source.config_hash.clone()))
+            .collect();
+        self.capture
+            .db
+            .inventory_proof_matches(self.capture.owner.clone(), proof.clone(), specs)
+            .await
+            .map_err(Into::into)
+    }
     pub(super) fn uses_download_ledger(&self) -> bool {
         self.format == 2
     }
@@ -1512,6 +1528,18 @@ impl SelectionRun {
             tracing::warn!(reason = %projection.reason, "Selected work remains in the download ledger for retry");
             return Ok(false);
         }
+        // Reuse applies one authorization rule for pending metadata, explicit
+        // refresh, and recorded metadata options. Pre-existing markers remain
+        // authoritative in the writer guard.
+        let authorization = crate::state::db::provider_generations::ReuseAuthorization {
+            current_metadata_flags: crate::download::pipeline::MetadataFlags::from(config).bits(),
+            explicit_refresh_authorized: config.refresh_metadata
+                && config.allows_existing_mutation(),
+            scope: self.root.spec.scope.clone(),
+            pass_key: key.to_owned(),
+            child: manifest.decision.child.clone(),
+            generation: Some(self.root.id.clone()),
+        };
         for destination in &manifest.decision.destinations {
             if let Ok(fingerprint) = crate::download::file::fingerprint_downloaded_path(
                 &config.directory,
@@ -1519,7 +1547,8 @@ impl SelectionRun {
             )
             .await
             {
-                self.capture
+                let reused = self
+                    .capture
                     .db
                     .reuse_selection_publication(
                         self.capture.owner.clone(),
@@ -1531,8 +1560,16 @@ impl SelectionRun {
                             data_encoding::HEXLOWER.encode(&fingerprint.sha256),
                             fingerprint.size,
                         ),
+                        authorization.clone(),
                     )
                     .await?;
+                if !reused {
+                    tracing::debug!(
+                        asset_id = %asset.state_id(),
+                        path = %destination.path.to_path().display(),
+                        "Exact selection publication reuse did not settle; retaining normal planning"
+                    );
+                }
             }
         }
         let mut retained_tasks = Vec::with_capacity(plan.tasks.len());
@@ -1920,6 +1957,44 @@ async fn metadata_tail(
             )
             .await?
     };
+    if !config.allows_existing_mutation() {
+        // A later complete catalog cannot lift this operation's earlier refusal.
+        // Keep exact requested work durable; do not advance retry scheduling here.
+        let mut rows = current;
+        if config.refresh_metadata {
+            rows.extend(
+                db.get_pending_metadata_rewrites_page_for_queue(
+                    crate::state::db::MetadataRewriteQueue::Ordinary,
+                    None,
+                    offset,
+                    budget.saturating_sub(rows.len()),
+                )
+                .await?,
+            );
+        }
+        // The two bounded lanes can name the same physical request.
+        let pending = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.asset.library,
+                    row.asset.id,
+                    row.asset.version_size,
+                    row.asset.local_path,
+                    row.asset.checksum,
+                    row.asset.metadata.metadata_hash.clone(),
+                )
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if pending > 0 {
+            tracing::warn!(
+                pending,
+                "Requested metadata destinations in this bounded batch remain pending under the operation ownership restriction"
+            );
+        }
+        return Ok(pending);
+    }
     let current = if context.format == 2 && !current.is_empty() && !cancel.is_cancelled() {
         context
             .capture
@@ -2477,6 +2552,34 @@ async fn deliver_delta_single(
     Ok(result)
 }
 
+/// The prior full-inventory proof may replace only the duplicate recent
+/// inventory. Every failed, unsafe, interrupted, changed, or non-format-2
+/// case retains the ordinary inventory path.
+#[derive(Clone, Copy)]
+struct InventoryProofReuse {
+    needs_inventory: bool,
+    delta_completed: bool,
+    inventory_rank_changed: bool,
+    state_transition_failures: usize,
+    identity_incomplete: bool,
+    token_unsafe: bool,
+    cancelled: bool,
+    format: u8,
+    proof_matches: bool,
+}
+
+fn can_reuse_inventory_proof(reuse: InventoryProofReuse) -> bool {
+    reuse.needs_inventory
+        && reuse.delta_completed
+        && !reuse.inventory_rank_changed
+        && reuse.state_transition_failures == 0
+        && !reuse.identity_incomplete
+        && !reuse.token_unsafe
+        && !reuse.cancelled
+        && reuse.format == 2
+        && reuse.proof_matches
+}
+
 /// Reuse the existing completed-delta/full-selection veto composition. The
 /// only offered successor is the actual completed source stream's successor.
 pub(super) async fn after_delta(
@@ -2496,7 +2599,7 @@ pub(super) async fn after_delta(
     let recent = super::recent::active(config)
         .await
         .map_err(super::recent::RecentSelectionError)?;
-    let repeat_inventory = recent
+    let needs_inventory = recent
         && super::recent::needs_inventory(
             passes,
             config,
@@ -2505,6 +2608,43 @@ pub(super) async fn after_delta(
         )
         .await
         .map_err(super::recent::RecentSelectionError)?;
+    // The first full pass already admitted the current selected scope. Reuse
+    // that typed proof only for a completed, unchanged delta from the saved
+    // boundary; every other case keeps the ordinary inventory path and its
+    // existing vetoes.
+    let proof_matches = if needs_inventory
+        && delta.sync_token.is_some()
+        && !delta.inventory_rank_changed
+        && delta.state_transition_failures == 0
+        && !delta.identity_incomplete
+        && delta.token_unsafe_reason.is_none()
+        && !cancel.is_cancelled()
+        && context.format == 2
+    {
+        match config.prior_inventory_proof.as_deref() {
+            Some(proof) => Box::pin(context.inventory_proof_matches(config, proof)).await?,
+            None => false,
+        }
+    } else {
+        false
+    };
+    let reuse_inventory_proof = can_reuse_inventory_proof(InventoryProofReuse {
+        needs_inventory,
+        delta_completed: delta.sync_token.is_some(),
+        inventory_rank_changed: delta.inventory_rank_changed,
+        state_transition_failures: delta.state_transition_failures,
+        identity_incomplete: delta.identity_incomplete,
+        token_unsafe: delta.token_unsafe_reason.is_some(),
+        cancelled: cancel.is_cancelled(),
+        format: context.format,
+        proof_matches,
+    });
+    let repeat_inventory = needs_inventory && !reuse_inventory_proof;
+    if reuse_inventory_proof {
+        tracing::debug!(
+            "Reusing completed full-inventory proof for the recent bridge; skipping duplicate inventory"
+        );
+    }
     if recent {
         super::recent::record(passes, config, prior_cursor, false)
             .await
@@ -2645,6 +2785,9 @@ pub(super) async fn finish_prepared(
     if !controls.run_mode.downloads_files() {
         return Ok(0);
     }
+    if !config.allows_existing_mutation() {
+        return prepared_remaining(passes, config).await;
+    }
     let Some(context) = context_for_format(passes, config, controls, 1).await? else {
         return prepared_remaining(passes, config).await;
     };
@@ -2771,4 +2914,65 @@ pub(super) async fn prepared_remaining(
             .1;
     }
     Ok(remaining)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InventoryProofReuse, can_reuse_inventory_proof};
+
+    fn reusable() -> InventoryProofReuse {
+        InventoryProofReuse {
+            needs_inventory: true,
+            delta_completed: true,
+            inventory_rank_changed: false,
+            state_transition_failures: 0,
+            identity_incomplete: false,
+            token_unsafe: false,
+            cancelled: false,
+            format: 2,
+            proof_matches: true,
+        }
+    }
+
+    #[test]
+    fn inventory_proof_reuse_requires_every_condition() {
+        let base = reusable();
+        assert!(can_reuse_inventory_proof(base));
+        assert!(!can_reuse_inventory_proof(InventoryProofReuse {
+            needs_inventory: false,
+            ..base
+        }));
+        assert!(!can_reuse_inventory_proof(InventoryProofReuse {
+            delta_completed: false,
+            ..base
+        }));
+        assert!(!can_reuse_inventory_proof(InventoryProofReuse {
+            inventory_rank_changed: true,
+            ..base
+        }));
+        assert!(!can_reuse_inventory_proof(InventoryProofReuse {
+            state_transition_failures: 1,
+            ..base
+        }));
+        assert!(!can_reuse_inventory_proof(InventoryProofReuse {
+            identity_incomplete: true,
+            ..base
+        }));
+        assert!(!can_reuse_inventory_proof(InventoryProofReuse {
+            token_unsafe: true,
+            ..base
+        }));
+        assert!(!can_reuse_inventory_proof(InventoryProofReuse {
+            cancelled: true,
+            ..base
+        }));
+        assert!(!can_reuse_inventory_proof(InventoryProofReuse {
+            format: 1,
+            ..base
+        }));
+        assert!(!can_reuse_inventory_proof(InventoryProofReuse {
+            proof_matches: false,
+            ..base
+        }));
+    }
 }

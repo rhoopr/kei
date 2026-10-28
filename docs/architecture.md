@@ -1693,7 +1693,9 @@ inventory. The retry owner:
 3. Uses durable asset/master mappings and checksum/size evidence for legacy
    identities. A persisted legacy owner resolves matching siblings without
    changing the selected child.
-4. Adopts an existing matching local file when safe.
+4. Adopts an existing matching local file when safe. A deferred adoption
+   persists its pending owner before any transfer is scheduled, so process
+   loss cannot turn unresolved receipt evidence into silent success.
 5. Marks current filter exclusions as policy-excluded.
 6. Persists unknown or transient verification state.
 7. Queues exact unresolved asset/version/path tasks.
@@ -2804,3 +2806,56 @@ owner/content can resume without rediscovering the old file's identity. Occupied
 unverified destinations stay uncertain. Normal sync without explicit repair
 retains its conservative existing-file matching behavior. Old file paths,
 receipts and timestamps are preserved; this adds no queue, schema or repair mode.
+
+### Incomplete historical path ownership
+
+An unindexable historical path remains stored with its original spelling. It
+restricts existing-file mutation without preventing independently verified
+read-only reuse or genuinely new atomic publication. Download configuration
+carries a checked, transient restriction; operation boundaries refresh it and
+an earlier restriction cannot become permission within that operation. A newer
+planner restriction also blocks prepared-publication recovery.
+
+Creation-only publication refuses every existing entry, including equal bytes.
+An ambiguous interrupted publication retains its file and journal; hashes alone
+do not confer writer ownership. Metadata queues retain requested work when the
+ownership check refuses mutation. Active reservations and journal conflict checks
+remain authoritative. The check adds no durable provenance or user setting.
+
+### Durable read-only reuse protection
+
+Verified compact and selected-native reuse persist the existing
+`preserved_path_key` marker in the same transaction that settles the exact
+compatibility receipt. The marker is written only after the authenticated owner,
+provider resource, native destination, local checksum and source checksum match.
+A missing marker may become the correct marker and an identical marker is
+accepted; a conflicting marker or a non-matching path is refused. Native byte
+paths use the same encoded `SelectionPath` key in `preserved_path_key`; the
+lossy `local_path` text is only a row locator and a unique compatibility row is
+required. Missing compatibility evidence remains unresolved rather than being
+converted to a lossy path or a fabricated row.
+
+Selection and compact-receipt reuse share one authorization rule. A destination
+already carrying this operation's pending metadata remains writable so its
+recorded writer can finish. An authorized explicit refresh remains writable
+only when the current metadata options match the exact active or recorded
+generation. A recorded refresh setting cannot authorize a different operation,
+resource, path, or option set. New metadata work and unrelated reuse still
+install the marker. An existing marker remains authoritative for both reuse
+paths and refuses a write that is not the exact pending completion.
+
+Compact receipts carry no generation field. They bind authorization through
+their authenticated scope, origin pass, child, master, state id, version, exact
+native path, provider checksum and size, and the stored receipt identity. The
+active destination lookup filters the same scope, pass, child, path and
+provider checksum. A conflicting generation or resource cannot satisfy all of
+those fields, so no generation column is required. When no active generation
+remains, only the current explicit refresh of that exact receipt, path and
+resource may settle; an existing marker still blocks it.
+
+Media publication, sidecar writes and source/journal recovery honor the marker
+for the exact media path and its exact sidecar. Protection survives database
+reopen, ordinary receipt updates and completion compaction. A marker that no
+longer matches its recorded path keeps that recorded path protected and
+unresolved; the refusal stays local, and recovery retains its journal while
+unrelated healthy work continues.

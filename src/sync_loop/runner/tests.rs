@@ -13,6 +13,9 @@ mod mixed_provider_shapes;
 #[cfg(target_os = "linux")]
 mod process_death;
 
+#[cfg(target_os = "linux")]
+mod readonly_replacement;
+
 mod primary_layout;
 
 mod mixed_delta;

@@ -3483,6 +3483,7 @@ async fn private_metadata_recovery_fixture_with_signature(
         // generation, avoiding concurrently planned native download aliases in
         // the late-writer fault itself.
         f.config.metadata.embed_xmp = false;
+        f.config.refresh_metadata = true;
         let primed = crate::download::download_photos_with_sync(
             &reqwest::Client::new(),
             &passes,

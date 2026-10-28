@@ -151,6 +151,7 @@ async fn contract_xmp_gps_accuracy_requires_matching_location_native_boundaries(
                 write_sidecar_metadata(
                     &path,
                     None,
+                    false,
                     payload,
                     now_local(),
                     Some(&checksum),
@@ -192,6 +193,7 @@ async fn sidecar_write_carries_source_gps_and_corrected_coordinates() {
     let cloudkit_created = authority_cloudkit_time();
     let request = || MetadataWriteRequest {
         sidecar_namespace: None,
+        require_created_entry: false,
         final_path: &media_path,
         embed_path: None,
         expected_embed_fingerprint: None,
@@ -287,6 +289,7 @@ async fn sidecar_write_reads_source_gps_from_dng_content() {
 
         let outcome = write_download_metadata(MetadataWriteRequest {
             sidecar_namespace: None,
+            require_created_entry: false,
             final_path: &media_path,
             embed_path: None,
             expected_embed_fingerprint: None,
@@ -352,6 +355,7 @@ async fn production_sidecar_io_error_is_typed_support_evidence() {
     let ok = write_sidecar_metadata(
         &path,
         None,
+        false,
         Arc::new(MetadataPayload::default()),
         now_local(),
         None,

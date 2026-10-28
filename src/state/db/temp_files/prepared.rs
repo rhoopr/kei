@@ -100,7 +100,8 @@ impl SqliteStateDb {
         receipt: super::super::download_receipts::DownloadReceipt,
         record: crate::state::AssetRecord,
         validate_file: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
-    ) -> Result<(), StateError> {
+        authorization: super::super::provider_generations::ReuseAuthorization,
+    ) -> Result<bool, StateError> {
         self.with_conn_mut("reuse bound completed download", move |conn| {
             let tx=conn.transaction()?;
             binding.validate(&tx)?;
@@ -170,8 +171,41 @@ impl SqliteStateDb {
                 tx.execute("DELETE FROM asset_verifications WHERE library=?1 AND id=?2 AND version_size=?3",
                     params![receipt.library,receipt.state_id,receipt.version_size])?;
             }
+            let protect_readonly = !super::super::provider_generations::reuse_metadata_is_writable(
+                &tx,
+                &receipt.library,
+                &receipt.state_id,
+                &receipt.version_size,
+                &receipt.native_path.key()?,
+                &receipt.provider_checksum,
+                &authorization,
+            )?;
+            if protect_readonly {
+                match super::super::primary_layout::persist_readonly_marker(
+                &tx,&receipt.library,&receipt.state_id,&receipt.version_size,&path,
+                &receipt.provider_checksum,&receipt.local_checksum,&receipt.source_checksum,
+            )? {
+                super::super::primary_layout::ReadonlyMarker::Marked
+                | super::super::primary_layout::ReadonlyMarker::Unchanged => {}
+                super::super::primary_layout::ReadonlyMarker::Conflict => {
+                    return Err(StateError::ProviderWorkConflict)
+                }
+                super::super::primary_layout::ReadonlyMarker::Missing
+                    | super::super::primary_layout::ReadonlyMarker::Unsupported => {
+                        // The compact receipt is valid, but no exact
+                        // compatibility row can carry durable read-only
+                        // protection. Do not settle; leave the pending owner
+                        // for the caller to re-plan.
+                        return Ok(false);
+                    }
+                }
+            }
+            super::super::provider_generations::record_readonly_destination(
+                &tx,&receipt.library,&receipt.state_id,&receipt.version_size,&path,
+                &receipt.local_checksum,&receipt.source_checksum,
+            )?;
             tx.commit()?;
-            Ok(())
+            Ok(true)
         }).await
     }
 
@@ -695,11 +729,23 @@ mod finalization_tests {
 #[cfg(test)]
 mod binding_tests {
     use super::{PreparedPublication, PublicationBinding};
+    use crate::state::MetadataRewriteStore;
     use crate::state::db::{
         DownloadStateStore, TempFileOwnershipStore, account::AccountOwner,
-        provider_selection::SelectionPath,
+        provider_generations::ReuseAuthorization, provider_selection::SelectionPath,
     };
     use crate::state::{SqliteStateDb, VersionSizeKey};
+
+    fn authorization(flags: u8, explicit: bool) -> ReuseAuthorization {
+        ReuseAuthorization {
+            current_metadata_flags: flags,
+            explicit_refresh_authorized: explicit,
+            scope: "test-scope".into(),
+            pass_key: "selected-pass".into(),
+            child: "child".into(),
+            generation: None,
+        }
+    }
 
     fn owner() -> AccountOwner {
         AccountOwner::authenticated(
@@ -860,5 +906,332 @@ mod binding_tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn v027_bound_reuse_persists_marker_and_refuses_conflict_or_missing_row() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let db = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        let proof = fixture(&db, root.path(), true).await;
+        db.prepare_temp_publication(&proof.temporary.to_path(), &proof)
+            .await
+            .unwrap();
+        finish(&db, &proof).await.unwrap();
+        let destination = proof.destination.to_path();
+        let binding = proof.binding.clone().unwrap();
+        let receipt = db
+            .bound_download_receipts(
+                binding.clone(),
+                "original".into(),
+                "opaque-generation".into(),
+                4,
+            )
+            .await
+            .unwrap()
+            .remove(0);
+        let record = crate::test_helpers::TestAssetRecord::new("child")
+            .checksum("opaque-generation")
+            .size(4)
+            .build();
+        db.reuse_bound_download(
+            binding.clone(),
+            receipt.clone(),
+            record.clone(),
+            Box::new(|| Ok(())),
+            authorization(0, false),
+        )
+        .await
+        .unwrap();
+        let marker: String = db
+            .acquire_lock("read bound reuse marker")
+            .unwrap()
+            .query_row(
+                "SELECT preserved_path_key FROM asset_metadata_paths
+                 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4",
+                rusqlite::params![
+                    proof.library,
+                    proof.id,
+                    "original",
+                    destination.to_str().unwrap()
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            marker,
+            crate::state::db::primary_layout::path_key(&destination).unwrap()
+        );
+        let row: (String, String, String) = db
+            .acquire_lock("bound compatibility evidence")
+            .unwrap()
+            .query_row(
+                "SELECT provider_checksum,local_checksum,source_checksum
+                 FROM asset_metadata_paths
+                 WHERE library=?1 AND id=?2 AND version_size='original' AND local_path=?3",
+                rusqlite::params![proof.library, proof.id, destination.to_str().unwrap()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, receipt.provider_checksum);
+        assert_eq!(row.1, receipt.local_checksum);
+        assert_eq!(row.2, receipt.source_checksum);
+        db.mark_verified_download(
+            &proof.library,
+            &proof.id,
+            "original",
+            &destination,
+            &proof.local_checksum,
+            Some(&proof.source_checksum),
+            false,
+        )
+        .await
+        .unwrap();
+        let marker_after_receipt: String = db
+            .acquire_lock("marker survives bound receipt update")
+            .unwrap()
+            .query_row(
+                "SELECT preserved_path_key FROM asset_metadata_paths
+                 WHERE library=?1 AND id=?2 AND version_size='original' AND local_path=?3",
+                rusqlite::params![proof.library, proof.id, destination.to_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker_after_receipt, marker);
+        assert!(db.guard_primary_writer(&destination).await.is_err());
+        assert_eq!(
+            db.source_metadata_recovery(&destination).await.unwrap(),
+            crate::state::db::SourceMetadataRecovery::ReadOnly
+        );
+        let mut sidecar = destination.as_os_str().to_os_string();
+        sidecar.push(".xmp");
+        let sidecar = std::path::PathBuf::from(sidecar);
+        let protected = db.protected_legacy_paths().await.unwrap();
+        assert!(protected.iter().any(|path| path == &destination));
+        assert!(protected.iter().any(|path| path == &sidecar));
+        let reopened = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        assert!(reopened.guard_primary_writer(&destination).await.is_err());
+        assert_eq!(
+            reopened
+                .source_metadata_recovery(&destination)
+                .await
+                .unwrap(),
+            crate::state::db::SourceMetadataRecovery::ReadOnly
+        );
+        db.reuse_bound_download(
+            binding.clone(),
+            receipt.clone(),
+            record.clone(),
+            Box::new(|| Ok(())),
+            authorization(0, false),
+        )
+        .await
+        .unwrap();
+        db.acquire_lock("conflicting bound marker")
+            .unwrap()
+            .execute(
+                "UPDATE asset_metadata_paths SET preserved_path_key='conflict' WHERE id='child'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.reuse_bound_download(
+                binding.clone(),
+                receipt.clone(),
+                record.clone(),
+                Box::new(|| Ok(())),
+                authorization(0, false),
+            )
+            .await
+            .is_err()
+        );
+        db.acquire_lock("remove bound compatibility receipt")
+            .unwrap()
+            .execute(
+                "DELETE FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size='original' AND local_path=?3",
+                rusqlite::params![proof.library, proof.id, destination.to_str().unwrap()],
+            )
+            .unwrap();
+        assert!(
+            !db.reuse_bound_download(
+                binding,
+                receipt,
+                record,
+                Box::new(|| Ok(())),
+                authorization(0, false)
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn v027_bound_reuse_marker_failure_rolls_back_settlement() {
+        let root = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_owned(&root.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        let proof = fixture(&db, root.path(), true).await;
+        db.prepare_temp_publication(&proof.temporary.to_path(), &proof)
+            .await
+            .unwrap();
+        finish(&db, &proof).await.unwrap();
+        let binding = proof.binding.clone().unwrap();
+        let receipt = db
+            .bound_download_receipts(
+                binding.clone(),
+                "original".into(),
+                "opaque-generation".into(),
+                4,
+            )
+            .await
+            .unwrap()
+            .remove(0);
+        let record = crate::test_helpers::TestAssetRecord::new("child")
+            .checksum("opaque-generation")
+            .size(4)
+            .build();
+        db.acquire_lock("make bound reuse pending")
+            .unwrap()
+            .execute("UPDATE assets SET status='pending' WHERE id='child'", [])
+            .unwrap();
+        db.acquire_lock("fail readonly marker")
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_readonly_marker
+                 BEFORE UPDATE OF preserved_path_key ON asset_metadata_paths
+                 WHEN NEW.preserved_path_key IS NOT NULL
+                 BEGIN SELECT RAISE(ABORT,'injected marker failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.reuse_bound_download(
+                binding.clone(),
+                receipt.clone(),
+                record.clone(),
+                Box::new(|| Ok(())),
+                authorization(0, false),
+            )
+            .await
+            .is_err()
+        );
+        let status: String = db
+            .acquire_lock("bound rollback status")
+            .unwrap()
+            .query_row("SELECT status FROM assets WHERE id='child'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "pending");
+        let marker: Option<String> = db
+            .acquire_lock("bound rollback marker")
+            .unwrap()
+            .query_row(
+                "SELECT preserved_path_key FROM asset_metadata_paths WHERE id='child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker.is_none());
+        db.acquire_lock("allow readonly marker")
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_readonly_marker")
+            .unwrap();
+        db.reuse_bound_download(
+            binding,
+            receipt,
+            record,
+            Box::new(|| Ok(())),
+            authorization(0, false),
+        )
+        .await
+        .unwrap();
+        let marker: String = db
+            .acquire_lock("bound marker after retry")
+            .unwrap()
+            .query_row(
+                "SELECT preserved_path_key FROM asset_metadata_paths WHERE id='child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!marker.is_empty());
+    }
+    #[tokio::test]
+    async fn v027_bound_reuse_explicit_refresh_skips_new_marker_but_keeps_existing_marker_authoritative()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_owned(&root.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        let proof = fixture(&db, root.path(), true).await;
+        db.prepare_temp_publication(&proof.temporary.to_path(), &proof)
+            .await
+            .unwrap();
+        finish(&db, &proof).await.unwrap();
+        let binding = proof.binding.clone().unwrap();
+        let receipt = db
+            .bound_download_receipts(
+                binding.clone(),
+                "original".into(),
+                "opaque-generation".into(),
+                4,
+            )
+            .await
+            .unwrap()
+            .remove(0);
+        let record = crate::test_helpers::TestAssetRecord::new("child")
+            .checksum("opaque-generation")
+            .size(4)
+            .build();
+        let destination = proof.destination.to_path();
+        assert!(
+            db.reuse_bound_download(
+                binding.clone(),
+                receipt.clone(),
+                record.clone(),
+                Box::new(|| Ok(())),
+                authorization(0, true),
+            )
+            .await
+            .unwrap()
+        );
+        let marker: Option<String> = db
+            .acquire_lock("explicit refresh has no new marker")
+            .unwrap()
+            .query_row(
+                "SELECT preserved_path_key FROM asset_metadata_paths WHERE id='child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker.is_none());
+        assert!(db.guard_primary_writer(&destination).await.is_ok());
+
+        let marker = crate::state::db::primary_layout::path_key(&destination).unwrap();
+        db.acquire_lock("seed pre-existing compact marker")
+            .unwrap()
+            .execute(
+                "UPDATE asset_metadata_paths SET preserved_path_key=?1 WHERE id='child'",
+                [&marker],
+            )
+            .unwrap();
+        assert!(db.guard_primary_writer(&destination).await.is_err());
+        assert!(
+            db.reuse_bound_download(
+                binding,
+                receipt,
+                record,
+                Box::new(|| Ok(())),
+                authorization(0, true),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(db.guard_primary_writer(&destination).await.is_err());
     }
 }

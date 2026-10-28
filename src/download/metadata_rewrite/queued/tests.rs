@@ -2138,6 +2138,7 @@ async fn run_pending_matches_normal_grouped_xmp_payload() {
     std::fs::write(&normal_path, minimal_jpeg_bytes()).unwrap();
     let normal_outcome = write_download_metadata(MetadataWriteRequest {
         sidecar_namespace: None,
+        require_created_entry: false,
         final_path: &normal_path,
         embed_path: Some(&normal_path),
         expected_embed_fingerprint: None,
@@ -3605,4 +3606,91 @@ async fn run_pending_heif_metadata_limit_retains_debt_then_recovers_across_reope
         );
         assert_no_temp();
     }
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn readonly_marker_keeps_metadata_pending_and_preserves_sidecar_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, media, _) = seed_marked_jpeg(dir.path(), "protected-metadata", Some(5)).await;
+    let mut sidecar = media.as_os_str().to_os_string();
+    sidecar.push(".xmp");
+    let sidecar = PathBuf::from(sidecar);
+    std::fs::write(&sidecar, b"user sidecar survives").unwrap();
+    let sidecar_mtime = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
+    let media_bytes = std::fs::read(&media).unwrap();
+    let media_mtime = std::fs::metadata(&media).unwrap().modified().unwrap();
+    let marker = crate::state::db::primary_layout::path_key(&media).unwrap();
+    db.acquire_lock("mark protected metadata")
+        .unwrap()
+        .execute(
+            "UPDATE asset_metadata_paths SET preserved_path_key=?1 WHERE id='protected-metadata'",
+            [&marker],
+        )
+        .unwrap();
+    let flags = embedded_rating_flags();
+    let pass = run_pending(
+        &db,
+        flags,
+        Arc::from(".meta-tmp"),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(pass.applied, 0);
+    assert!(pass.failed > 0);
+    assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"user sidecar survives");
+    assert_eq!(
+        std::fs::metadata(&sidecar).unwrap().modified().unwrap(),
+        sidecar_mtime
+    );
+    assert_eq!(std::fs::read(&media).unwrap(), media_bytes);
+    assert_eq!(
+        std::fs::metadata(&media).unwrap().modified().unwrap(),
+        media_mtime
+    );
+    drop(db);
+    let reopened = crate::state::SqliteStateDb::open(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+    let pass = run_pending(
+        &reopened,
+        flags,
+        Arc::from(".meta-tmp"),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(pass.applied, 0);
+    assert_eq!(
+        reopened
+            .get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"user sidecar survives");
+    reopened
+        .acquire_lock("unmark protected metadata")
+        .unwrap()
+        .execute(
+            "UPDATE asset_metadata_paths SET preserved_path_key=NULL WHERE id='protected-metadata'",
+            [],
+        )
+        .unwrap();
+    let pass = run_pending(
+        &reopened,
+        flags,
+        Arc::from(".meta-tmp"),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(pass.applied > 0);
+    assert!(
+        reopened
+            .get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

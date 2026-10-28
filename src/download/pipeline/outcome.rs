@@ -203,7 +203,24 @@ pub(super) async fn finalize_streaming_download(
         && let Some(db) = &state_db
     {
         let metadata_flags = MetadataFlags::from(config.as_ref());
-        if metadata_flags.has_any_write() {
+        if metadata_flags.has_any_write() && !config.allows_existing_mutation() {
+            let pending = db
+                .get_pending_metadata_rewrites_page_for_queue(
+                    crate::state::db::MetadataRewriteQueue::Ordinary,
+                    None,
+                    0,
+                    500,
+                )
+                .await?
+                .len();
+            consumer.exif_failures += pending;
+            if pending > 0 {
+                tracing::warn!(
+                    pending,
+                    "Requested metadata remains pending under this operation's ownership restriction"
+                );
+            }
+        } else if metadata_flags.has_any_write() {
             consumer.exif_failures += metadata_rewrite::run_pending(
                 db.as_ref(),
                 metadata_flags,

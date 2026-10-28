@@ -168,7 +168,9 @@ where
     D: DownloadStateStore + ?Sized,
 {
     let durable_error = match task.publication() {
-        super::file::FinalPublication::NoReplace => error,
+        super::file::FinalPublication::NoReplace | super::file::FinalPublication::CreateOnly => {
+            error
+        }
         super::file::FinalPublication::ReplaceTruncated(_) => {
             crate::commands::reconcile::FILE_TRUNCATED_REASON
         }
@@ -427,6 +429,7 @@ mod tests {
 
     fn task(asset_id: &'static str, path: PathBuf) -> DownloadTask {
         DownloadTask {
+            require_created_entry: true,
             url: "https://example.test/photo.jpg".into(),
             download_path: path,
             replacement_fingerprint: None,

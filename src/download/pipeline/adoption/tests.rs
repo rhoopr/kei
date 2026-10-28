@@ -1746,6 +1746,60 @@ async fn record_verified_test_version(
 }
 
 #[tokio::test]
+async fn ownership_recheck_restricts_stale_context_and_keeps_prior_refusal() {
+    let dir = TempDir::new().unwrap();
+    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+    let asset = TestPhotoAsset::new("LEGACY").build();
+    let original = dir.path().join("OLD.JPG");
+    fs::write(&original, vec![1u8; 2000]).unwrap();
+    record_downloaded_test_version(
+        &db,
+        &asset,
+        VersionSizeKey::Original,
+        "legacy",
+        2000,
+        &original,
+    )
+    .await;
+    let mut config = DownloadConfig::test_default();
+    config.directory = Arc::from(dir.path());
+    config.state_db = Some(db.clone());
+    let permissive = config.check_ownership().await.unwrap();
+    assert!(permissive.allows_existing_mutation());
+    let rewrite_path = |path: &std::path::Path| {
+        let conn = db.acquire_lock("synthetic catalog drift").unwrap();
+        for table in ["assets", "asset_metadata_paths"] {
+            conn.execute(
+                &format!("UPDATE {table} SET local_path=?1 WHERE id='LEGACY'"),
+                rusqlite::params![path.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+    };
+    rewrite_path(&dir.path().join("old/../OLD.JPG"));
+    let planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+    assert!(!planner.allows_existing_mutation(&permissive));
+    let restricted = permissive.check_ownership().await.unwrap();
+    assert!(!restricted.allows_existing_mutation());
+    rewrite_path(&original);
+    assert!(
+        !restricted
+            .check_ownership()
+            .await
+            .unwrap()
+            .allows_existing_mutation()
+    );
+    assert!(
+        config
+            .check_ownership()
+            .await
+            .unwrap()
+            .allows_existing_mutation()
+    );
+    assert_eq!(fs::metadata(original).unwrap().len(), 2000);
+}
+
+#[tokio::test]
 async fn legacy_parent_receipt_does_not_block_current_download_pass() {
     let dir = TempDir::new().unwrap();
     let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
@@ -1757,9 +1811,22 @@ async fn legacy_parent_receipt_does_not_block_current_download_pass() {
         VersionSizeKey::Original,
         "legacy",
         2000,
-        &dir.path().join("old/../OLD.JPG"),
+        &dir.path().join("OLD.JPG"),
     )
     .await;
+    // Simulate persisted historical input, not a new write through the guarded
+    // current publication API. Preserve both historical path records verbatim.
+    let legacy_path = dir.path().join("old/../OLD.JPG");
+    {
+        let conn = db.acquire_lock("seed historical path spelling").unwrap();
+        for table in ["assets", "asset_metadata_paths"] {
+            conn.execute(
+                &format!("UPDATE {table} SET local_path=?1 WHERE library='PrimarySync' AND id='LEGACY' AND version_size='original'"),
+                rusqlite::params![legacy_path.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+    }
     let mut config = DownloadConfig::test_default();
     config.directory = Arc::from(dir.path());
     config.state_db = Some(db.clone());
@@ -1782,9 +1849,12 @@ async fn legacy_parent_receipt_does_not_block_current_download_pass() {
         planner
             .verified_downloaded_path(&asset, &config, current.version_size)
             .await
-            .is_none(),
-        "an incomplete ownership index must disable all receipt reuse"
+            .is_some(),
+        "independently verified read-only reuse remains available"
     );
+    let checked = config.check_ownership().await.unwrap();
+    assert!(!checked.allows_existing_mutation());
+    assert!(!planner.allows_existing_mutation(&checked));
     for _ in 0..2 {
         let result = stream_and_download_from_stream(
             &reqwest::Client::new(),

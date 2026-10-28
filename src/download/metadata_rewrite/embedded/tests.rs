@@ -21,6 +21,7 @@ async fn enabled_heif_embed_failure_preserves_invalid_media() {
 
     let outcome = write_download_metadata(MetadataWriteRequest {
         sidecar_namespace: None,
+        require_created_entry: false,
         final_path: &photo_path,
         embed_path: Some(&photo_path),
         expected_embed_fingerprint: None,
@@ -71,6 +72,7 @@ async fn heif_embed_reports_change_after_approved_retry_fingerprint() {
 
     let outcome = write_download_metadata(MetadataWriteRequest {
         sidecar_namespace: None,
+        require_created_entry: false,
         final_path: &photo_path,
         embed_path: Some(&photo_path),
         expected_embed_fingerprint: Some(approved),

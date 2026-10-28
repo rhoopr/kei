@@ -304,6 +304,7 @@ pub async fn download_photos_with_sync(
     controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
+    let config = Arc::new(config.check_ownership().await?);
     // Bound the complete cycle's new selection/replay state at its owner,
     // preserving one opaque public future and avoiding caller-specific boxing.
     // Settle published output before baseline matching snapshots receipts.
@@ -382,14 +383,19 @@ async fn download_photos_with_sync_inner(
     }
     let sync_started_at = chrono::Utc::now().timestamp();
     super::generation::freeze_before_sync(passes, &config, controls).await?;
-    if matches!(controls.run_mode, super::models::DownloadRunMode::Download) {
-        let protected = crate::download::legacy_preservation::protected_replacement_paths(
-            config.state_db.as_deref(),
-        )
-        .await?;
-        crate::download::file::recover_conditional_replacements(&config.directory, &protected)
+    let retained_replacements =
+        if matches!(controls.run_mode, super::models::DownloadRunMode::Download)
+            && config.allows_existing_mutation()
+        {
+            let protected = crate::download::legacy_preservation::protected_replacement_paths(
+                config.state_db.as_deref(),
+            )
             .await?;
-    }
+            crate::download::file::recover_conditional_replacements(&config.directory, &protected)
+                .await?
+        } else {
+            0
+        };
     if controls.run_mode.downloads_files() {
         super::primary_layout::recover(download_client, passes, &config, &shutdown_token).await?;
     }
@@ -667,6 +673,19 @@ async fn download_photos_with_sync_inner(
         }
     }
 
+    if retained_replacements > 0 {
+        tracing::warn!(
+            retained_replacements,
+            "Protected replacement journals remain pending; unrelated sync work continued"
+        );
+        result.stats.exif_failures += retained_replacements;
+        result.outcome = merge_download_outcomes(
+            &result.outcome,
+            &DownloadOutcome::PartialFailure {
+                failed_count: retained_replacements,
+            },
+        );
+    }
     Ok(result)
 }
 

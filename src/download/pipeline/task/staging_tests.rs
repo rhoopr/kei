@@ -75,6 +75,7 @@ impl DownloadClient for PausedClient {
 
 fn task(path: std::path::PathBuf, id: &str, size: u64) -> DownloadTask {
     DownloadTask {
+        require_created_entry: true,
         url: "synthetic".into(),
         download_path: path,
         replacement_fingerprint: None,

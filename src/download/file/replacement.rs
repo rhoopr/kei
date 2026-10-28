@@ -72,6 +72,9 @@ pub(in crate::download) enum FinalPublication {
     /// Preserve the global no-overwrite contract.
     #[default]
     NoReplace,
+    /// Require this operation to create the entry; equal existing bytes do not
+    /// establish writer ownership when historical claims cannot be indexed.
+    CreateOnly,
     /// Replace only the exact truncated bytes authorized by retry planning.
     ReplaceTruncated(ExistingFileFingerprint),
 }

@@ -44,7 +44,7 @@ pub(in crate::download) async fn run_pending<D>(
     shutdown_token: &CancellationToken,
 ) -> super::RewritePass
 where
-    D: MembershipStore + MetadataRewriteStore + ?Sized,
+    D: MembershipStore + MetadataRewriteStore + crate::state::ReconciliationStateStore + ?Sized,
 {
     run_pending_page(
         db,
@@ -67,7 +67,7 @@ pub(in crate::download) async fn run_pending_page<D>(
     offset: usize,
 ) -> super::RewritePass
 where
-    D: MembershipStore + MetadataRewriteStore + ?Sized,
+    D: MembershipStore + MetadataRewriteStore + crate::state::ReconciliationStateStore + ?Sized,
 {
     run_pending_budget(
         db,
@@ -91,7 +91,7 @@ pub(in crate::download) async fn run_pending_budget<D>(
     page: (usize, usize),
 ) -> super::RewritePass
 where
-    D: MembershipStore + MetadataRewriteStore + ?Sized,
+    D: MembershipStore + MetadataRewriteStore + crate::state::ReconciliationStateStore + ?Sized,
 {
     let selected_queue = if matches!(
         capture_timestamp_repair,
@@ -143,7 +143,7 @@ pub(in crate::download) async fn run_pending_rows<D>(
     archive_root: Option<&std::path::Path>,
 ) -> super::RewritePass
 where
-    D: MembershipStore + MetadataRewriteStore + ?Sized,
+    D: MembershipStore + MetadataRewriteStore + crate::state::ReconciliationStateStore + ?Sized,
 {
     let selected_queue = if matches!(
         capture_timestamp_repair,
@@ -156,6 +156,23 @@ where
     if pending.is_empty() {
         return RewritePass::default();
     }
+    // Direct maintenance and selected tails share this checked batch boundary.
+    // No failed/unknown ownership read may authorize a writer. Rows stay durable.
+    match crate::download::planner::OwnershipCheck::inspect(db).await {
+        Ok(check) if check.allows_existing_mutation() => {}
+        _ => {
+            tracing::warn!(
+                count = pending.len(),
+                "Requested metadata remains pending because historical ownership cannot be indexed"
+            );
+            return RewritePass {
+                fetched: pending.len(),
+                failed: pending.len(),
+                ..RewritePass::default()
+            };
+        }
+    }
+
     let needs_groupings = metadata_flags.uses_xmp_groupings()
         || pending.iter().any(|row| {
             row.selection_receipt.as_ref().is_some_and(|receipt| {
@@ -569,6 +586,7 @@ where
             outcome.sidecar_failed = !write_sidecar_metadata(
                 &path,
                 namespace,
+                false,
                 Arc::clone(&payload),
                 created_local,
                 pending_rewrite.source_checksum.as_deref(),

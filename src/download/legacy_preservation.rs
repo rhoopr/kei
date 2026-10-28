@@ -19,10 +19,15 @@ pub(in crate::download) async fn current_path_is_independent(
     db: &dyn DownloadStore,
     path: &Path,
 ) -> anyhow::Result<bool> {
-    Ok(db.source_metadata_recovery(path).await?
-        != crate::state::db::SourceMetadataRecovery::ProtectedLegacy
-        && db.source_metadata_recovery(&sidecar(path)).await?
-            != crate::state::db::SourceMetadataRecovery::ProtectedLegacy)
+    let protected = |recovery| {
+        matches!(
+            recovery,
+            crate::state::db::SourceMetadataRecovery::ProtectedLegacy
+                | crate::state::db::SourceMetadataRecovery::ReadOnly
+        )
+    };
+    Ok(!protected(db.source_metadata_recovery(path).await?)
+        && !protected(db.source_metadata_recovery(&sidecar(path)).await?))
 }
 
 fn sidecar(path: &Path) -> PathBuf {
