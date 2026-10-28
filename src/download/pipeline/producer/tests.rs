@@ -807,6 +807,8 @@ async fn filtered_embed_rewrite_keeps_stored_checksums_current() {
         .favorite(true)
         .build();
 
+    let config = Arc::new(config.check_ownership().await.unwrap());
+
     let result = stream_and_download_from_stream(
         &reqwest::Client::new(),
         stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(edited)]),
@@ -2010,6 +2012,112 @@ async fn restored_and_edited_asset_does_not_report_unsafe_state() {
     );
 }
 
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn unchecked_metadata_refresh_retains_debt_without_writing() {
+    use crate::icloud::photos::PhotoAsset;
+    use futures_util::stream;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let (db, mut config) =
+        crate::download::pipeline::test_support::owned_download_fixture(dir.path(), "PrimarySync")
+            .await;
+    config.metadata.xmp_sidecar = true;
+    config.refresh_metadata = true;
+    let config = Arc::new(config);
+    let stored = jpeg_asset("SIDECAR", "sidecar.jpg", false);
+    let edited = jpeg_asset("SIDECAR", "sidecar.jpg", true);
+    let path = seed_owned_jpeg(&db, &config, &stored).await;
+    // A direct pipeline caller has no authority to rewrite existing files until
+    // the operation boundary checks the current catalog.
+    let refused = stream_and_download_from_stream(
+        &reqwest::Client::new(),
+        stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(edited.clone())]),
+        &config,
+        DownloadControls::download_hidden(),
+        1,
+        CancellationToken::new(),
+        StreamRuntime::new(None, None),
+    )
+    .await
+    .unwrap();
+    assert!(refused.exif_failures > 0);
+    assert!(!sidecar_path_for(&path).exists());
+    assert_eq!(fs::read(&path).unwrap(), MINIMAL_JPEG);
+    assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn restricted_metadata_refresh_preserves_existing_sidecar_and_debt() {
+    use crate::icloud::photos::PhotoAsset;
+    use futures_util::stream;
+    use std::sync::Arc;
+
+    for restricted in [true, false] {
+        let dir = TempDir::new().unwrap();
+        let (db, mut config) = crate::download::pipeline::test_support::owned_download_fixture(
+            dir.path(),
+            "PrimarySync",
+        )
+        .await;
+        config.metadata.xmp_sidecar = true;
+        config.refresh_metadata = true;
+        let stored = jpeg_asset("SIDECAR", "sidecar.jpg", false);
+        let edited = jpeg_asset("SIDECAR", "sidecar.jpg", true);
+        let path = seed_owned_jpeg(&db, &config, &stored).await;
+        let sidecar = sidecar_path_for(&path);
+        let original_sidecar = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description rdf:about='' xmlns:xmp='http://ns.adobe.com/xap/1.0/' xmp:Rating='4'/></rdf:RDF></x:xmpmeta>";
+        fs::write(&sidecar, original_sidecar).unwrap();
+        let other = jpeg_asset("FOREIGN", "foreign.jpg", false);
+        let other_path = seed_owned_jpeg(&db, &config, &other).await;
+        if restricted {
+            let ambiguous = other_path.parent().unwrap().join("old/../foreign.jpg");
+            let conn = db
+                .acquire_lock("synthetic unindexable catalog path")
+                .unwrap();
+            for table in ["assets", "asset_metadata_paths"] {
+                conn.execute(
+                    &format!("UPDATE {table} SET local_path=?1 WHERE id='FOREIGN'"),
+                    rusqlite::params![ambiguous.to_str().unwrap()],
+                )
+                .unwrap();
+            }
+        }
+        let checked = config.check_ownership().await.unwrap();
+        assert_eq!(checked.allows_existing_mutation(), !restricted);
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(edited)]),
+            &Arc::new(checked),
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        let sidecar_bytes = fs::read(&sidecar).unwrap();
+        let pending = db.get_pending_metadata_rewrites(10).await.unwrap();
+        if restricted {
+            assert!(result.exif_failures > 0);
+            assert_eq!(sidecar_bytes, original_sidecar);
+            assert_eq!(pending.len(), 1);
+        } else {
+            assert_eq!(result.exif_failures, 0);
+            assert_ne!(sidecar_bytes, original_sidecar);
+            assert!(
+                std::str::from_utf8(&sidecar_bytes)
+                    .unwrap()
+                    .contains("Rating>5")
+            );
+            assert!(pending.is_empty());
+        }
+        assert_eq!(fs::read(&path).unwrap(), MINIMAL_JPEG);
+    }
+}
+
 /// #707 acceptance criterion 1, sidecar half: the rewrite must run from
 /// the refreshed catalogue and land the new value on disk. The direction
 /// matters. Un-favouriting clears the rating and writes nothing, so only
@@ -2035,6 +2143,8 @@ async fn metadata_drift_writes_fresh_value_into_the_sidecar() {
     let stored = jpeg_asset("SIDECAR", "sidecar.jpg", false);
     let edited = jpeg_asset("SIDECAR", "sidecar.jpg", true);
     let path = seed_owned_jpeg(&db, &config, &stored).await;
+
+    let config = Arc::new(config.check_ownership().await.unwrap());
 
     let result = stream_and_download_from_stream(
         &reqwest::Client::new(),
@@ -2518,6 +2628,8 @@ async fn rewrite_failure_retains_marker_holding_fresh_metadata() {
     let path = seed_owned_jpeg(&db, &config, &stored).await;
     db.fail_metadata_marker_clear_for_test();
 
+    let config = Arc::new(config.check_ownership().await.unwrap());
+
     let result = stream_and_download_from_stream(
         &reqwest::Client::new(),
         stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(edited)]),
@@ -2585,6 +2697,7 @@ async fn rewrite_failure_retains_marker_holding_fresh_metadata() {
             .await;
     retry_config.metadata.xmp_sidecar = true;
     retry_config.refresh_metadata = true;
+    let retry_config = retry_config.check_ownership().await.unwrap();
     let retry = stream_and_download_from_stream(
         &reqwest::Client::new(),
         stream::empty::<anyhow::Result<PhotoAsset>>(),
@@ -2732,6 +2845,8 @@ async fn retained_sidecar_temp_does_not_block_pending_rewrite_retry() {
     ));
     let retained_bytes = b"ambiguous bytes from an earlier publication";
     fs::write(&retained_path, retained_bytes).unwrap();
+
+    let config = Arc::new(config.check_ownership().await.unwrap());
 
     let result = stream_and_download_from_stream(
         &reqwest::Client::new(),

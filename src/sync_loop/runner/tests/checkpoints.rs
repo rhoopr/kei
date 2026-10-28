@@ -1068,7 +1068,11 @@ async fn run_cycle_zone_token_write_failure_blocks_database_precheck_token() {
             > 0,
         "the current scoped checkpoint write must reach the injected fault"
     );
-    assert_eq!(result.failed_count, 0);
+    assert_eq!(
+        result.failed_count, 1,
+        "checkpoint persistence failure must be reported"
+    );
+    assert_eq!(result.stats.state_write_failures, 1);
     assert!(
         !result.db_sync_token_advance_safe,
         "database precheck token must not advance after a zone-token write failure"

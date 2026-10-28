@@ -100,7 +100,10 @@ async fn issue845_l1_targeted_pending_recovery_keeps_current_legacy_movie_across
                 .unwrap();
             drop(db);
             for cycle in 0..3 {
-                let db = SqliteStateDb::open(&db_path).await.unwrap();
+                let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+                let mut checked_config = config.clone();
+                checked_config.state_db = Some(db.clone());
+                let configs = [Arc::new(checked_config.check_ownership().await.unwrap())];
                 if cycle < 2 {
                     db.mark_failed(
                         library,
@@ -128,12 +131,11 @@ async fn issue845_l1_targeted_pending_recovery_keeps_current_legacy_movie_across
                     .iter()
                     .map(PendingRetryTarget::from_record)
                     .collect();
-                let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
+                let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
                 let mut tasks = Vec::new();
                 let mut sources = FxHashMap::default();
-                let configs = [Arc::new(config.clone())];
                 PendingRetryPlanning {
-                    db: &db,
+                    db: db.as_ref(),
                     run_mode,
                     shutdown: &CancellationToken::new(),
                     pass_configs: &configs,
