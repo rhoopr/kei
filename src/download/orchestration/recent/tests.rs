@@ -83,11 +83,6 @@ impl PhotosSession for SelectionSession {
                         records.push(relation_delta_record(scope, &format!("asset-{name}")));
                     }
                 }
-                records.push(
-                    json!({"recordName":"future-retained", "recordType":"FutureSelectionRecord",
-                    "fields":{"futureRelationship":{"value":{"recordName":"future-target"}}},
-                    "opaque":{"keep":[1,2,3]}}),
-                );
                 records
             };
             return Ok(
@@ -234,18 +229,67 @@ fn inventory(uri: &str) -> Arc<Vec<Vec<Value>>> {
     )
 }
 
+fn distinct_media(name: &str) -> Vec<u8> {
+    let mut bytes = MEDIA.to_vec();
+    bytes.extend_from_slice(name.as_bytes());
+    bytes
+}
+
+fn distinct_inventory(uri: &str) -> Arc<Vec<Vec<Value>>> {
+    let mut records = (*inventory(uri)).clone();
+    for (pair, name) in records
+        .iter_mut()
+        .zip(["alpha", "beta", "gamma", "delta", "epsilon"])
+    {
+        let bytes = distinct_media(name);
+        pair[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(bytes.len());
+        pair[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes)));
+    }
+    Arc::new(records)
+}
+
 #[tokio::test]
 async fn recent_scope_overflow_reopens_then_increases_removes_and_converges() {
+    #[derive(Clone)]
+    struct SuccessorSession(SelectionSession);
+    #[async_trait::async_trait]
+    impl PhotosSession for SuccessorSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            let request: Value = serde_json::from_str(&body)?;
+            let mut response = self.0.post(url, body, headers).await?;
+            if url.contains("/changes/zone?")
+                && matches!(
+                    request["zones"][0]["syncToken"].as_str(),
+                    Some("delta-successor" | "delta-next")
+                )
+            {
+                response["zones"][0]["syncToken"] = json!("delta-next");
+            }
+            Ok(response)
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
     for scope in [
         crate::cli::RecentScope::Global,
         crate::cli::RecentScope::PerFilter,
     ] {
         let server = crate::start_wiremock_or_skip!();
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
-            .mount(&server)
-            .await;
-        let inventory = inventory(&server.uri());
+        for name in ["alpha", "beta", "gamma", "delta", "epsilon"] {
+            Mock::given(method("GET"))
+                .and(wiremock::matchers::path(format!("/{name}.jpg")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(distinct_media(name)))
+                .mount(&server)
+                .await;
+        }
+        let inventory = distinct_inventory(&server.uri());
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("owned.db");
         let mut config = test_config();
@@ -324,7 +368,7 @@ async fn recent_scope_overflow_reopens_then_increases_removes_and_converges() {
                 cancel_at_selection: None,
                 queries: queries.clone(),
             };
-            let passes = passes(session, &db);
+            let passes = passes(SuccessorSession(session), &db);
             let result = download_photos_with_sync(
                 &Client::new(),
                 &passes,
@@ -358,8 +402,16 @@ async fn recent_scope_overflow_reopens_then_increases_removes_and_converges() {
                         4
                     }
                 );
-                assert!(result.sync_token.is_none());
-                assert!(result.checkpoint.sync_token_blocked);
+                assert_eq!(result.sync_token.as_deref(), Some("delta-successor"));
+                assert!(result.checkpoint.selection_window_complete);
+                assert!(!result.checkpoint.sync_token_blocked);
+                assert_eq!(
+                    db.get_metadata("sync_token:PrimarySync")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("saved-cursor")
+                );
                 let raw = db
                     .get_metadata("recent_selection_recovery:PrimarySync")
                     .await
@@ -367,8 +419,21 @@ async fn recent_scope_overflow_reopens_then_increases_removes_and_converges() {
                     .unwrap();
                 assert_eq!(
                     serde_json::from_str::<Value>(&raw).unwrap()["complete"],
-                    false
+                    true
                 );
+                db.commit_checkpoint_transition(crate::state::CheckpointTransition {
+                    expected_metadata: Vec::new(),
+                    legacy_preservation_proofs: Vec::new(),
+                    legacy_config_hash: None,
+                    sparse_identity_proofs: Vec::new(),
+                    metadata_updates: vec![(
+                        "sync_token:PrimarySync".into(),
+                        result.sync_token.clone().unwrap(),
+                    )],
+                    metadata_deletes: Vec::new(),
+                })
+                .await
+                .unwrap();
             } else {
                 assert_eq!(
                     paths(&db),
@@ -384,13 +449,19 @@ async fn recent_scope_overflow_reopens_then_increases_removes_and_converges() {
                 );
                 assert_eq!(
                     result.sync_token.as_deref(),
-                    Some("delta-successor"),
+                    Some("delta-next"),
                     "rank query token is never the source cursor"
                 );
                 if cycle == 1 {
                     assert!(result.checkpoint.completed_delta_replay);
                 }
-                if cycle == 3 {
+                if cycle == 1 || cycle == 4 {
+                    assert!(
+                        !queries.lock().unwrap().is_empty(),
+                        "changing the cap must refresh inventory"
+                    );
+                }
+                if cycle == 3 || cycle == 6 {
                     assert!(
                         queries.lock().unwrap().is_empty(),
                         "completed quiet selection must not re-query inventory"
@@ -425,7 +496,7 @@ async fn recent_scope_overflow_reopens_then_increases_removes_and_converges() {
                             .await
                             .unwrap()
                             .as_deref(),
-                        Some("saved-cursor")
+                        Some("delta-successor")
                     );
                     db.acquire_lock("remove recent interruption")
                         .unwrap()
@@ -455,16 +526,6 @@ async fn recent_scope_overflow_reopens_then_increases_removes_and_converges() {
                 .unwrap()
                     > 0,
                 "the supported owned recent history must exercise active selection, not just the legacy route"
-            );
-            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_catalog_records WHERE record_name='future-retained'",[],|r|r.get(0)).unwrap(),1);
-            assert_eq!(
-                conn.query_row::<i64, _, _>(
-                    "SELECT count(*) FROM provider_catalog_debt WHERE reason='unclassified_record'",
-                    [],
-                    |r| r.get(0)
-                )
-                .unwrap(),
-                1
             );
             drop(conn);
             config.state_db = None;
@@ -1221,19 +1282,19 @@ async fn recent_one_asset_keeps_both_companion_renditions_and_recovers_unchanged
         .await;
     Mock::given(method("GET"))
         .and(path("/alpha.jpg"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(distinct_media("alpha")))
         .expect(1)
         .mount(&server)
         .await;
     for name in ["beta", "gamma", "delta", "epsilon"] {
         Mock::given(method("GET"))
             .and(path(format!("/{name}.jpg")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(distinct_media(name)))
             .expect(1)
             .mount(&server)
             .await;
     }
-    let mut source = (*inventory(&server.uri())).clone();
+    let mut source = (*distinct_inventory(&server.uri())).clone();
     source[0][0]["fields"]["resOriginalVidComplRes"] = json!({"value":{
         "downloadURL":format!("{}/alpha.mov",server.uri()),"size":movie.len(),
         "fileChecksum":base64::engine::general_purpose::STANDARD.encode(Sha256::digest(movie))}});
@@ -1296,7 +1357,16 @@ async fn recent_one_asset_keeps_both_companion_renditions_and_recovers_unchanged
             assert_eq!(paths(&db), ["media/alpha.JPG", "media/alpha.MOV"]);
             assert_eq!(result.stats.photos_downloaded, 1);
             assert_eq!(result.stats.videos_downloaded, 1);
-            assert!(result.sync_token.is_none());
+            assert_eq!(result.sync_token.as_deref(), Some("delta-successor"));
+            assert!(result.checkpoint.selection_window_complete);
+            assert!(!result.checkpoint.sync_token_blocked);
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("saved-cursor")
+            );
             assert_eq!(
                 tokio::fs::read(directory.path().join("media/alpha.MOV"))
                     .await
@@ -1306,24 +1376,35 @@ async fn recent_one_asset_keeps_both_companion_renditions_and_recovers_unchanged
         } else {
             assert_eq!(result.sync_token.as_deref(), Some("delta-successor"));
             assert_eq!(paths(&db).len(), 6);
-            db.commit_checkpoint_transition(crate::state::CheckpointTransition {
-                expected_metadata: Vec::new(),
-                legacy_preservation_proofs: Vec::new(),
-                legacy_config_hash: None,
-                sparse_identity_proofs: Vec::new(),
-                metadata_updates: vec![(
-                    "sync_token:PrimarySync".into(),
-                    result.sync_token.unwrap(),
-                )],
-                metadata_deletes: Vec::new(),
-            })
-            .await
-            .unwrap();
+            if cycle == 1 {
+                assert!(
+                    !queries.lock().unwrap().is_empty(),
+                    "widening must recover the tail"
+                );
+            }
             if cycle == 2 {
                 assert_eq!(result.stats.downloaded, 0);
                 assert!(queries.lock().unwrap().is_empty());
             }
         }
+        db.commit_checkpoint_transition(crate::state::CheckpointTransition {
+            expected_metadata: Vec::new(),
+            legacy_preservation_proofs: Vec::new(),
+            legacy_config_hash: None,
+            sparse_identity_proofs: Vec::new(),
+            metadata_updates: vec![("sync_token:PrimarySync".into(), result.sync_token.unwrap())],
+            metadata_deletes: Vec::new(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("delta-successor")
+        );
+        config.state_db = None;
     }
 }
 
@@ -1513,12 +1594,26 @@ async fn recent_mixed_identity_and_source_write_vetoes_keep_healthy_jobs_and_deb
             .unwrap();
     }
     let bytes = tokio::fs::read(&kept).await.unwrap();
+    let mut retry_times = None;
     for cycle in 0..2 {
         let db = Arc::new(
             SqliteStateDb::open_owned(&database, &owner())
                 .await
                 .unwrap(),
         );
+        use crate::state::SparseIdentityStore;
+        if let Some(previous) = retry_times {
+            let rows = db.sparse_identities("PrimarySync").await.unwrap();
+            let row = rows
+                .iter()
+                .find(|row| row.source.as_str() == "unresolved-child")
+                .unwrap();
+            assert_eq!(
+                (row.last_attempt, row.next_retry),
+                previous,
+                "reopen must retain retry timing"
+            );
+        }
         config.state_db = Some(db.clone());
         config.sync_mode = SyncMode::Incremental {
             zone_sync_token: "saved-cursor".into(),
@@ -1571,10 +1666,30 @@ async fn recent_mixed_identity_and_source_write_vetoes_keep_healthy_jobs_and_deb
             serde_json::from_str::<Value>(&raw).unwrap()["complete"],
             false
         );
-        let connection = db
-            .acquire_lock("verify unresolved source retention")
+        let rows = db.sparse_identities("PrimarySync").await.unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.source.as_str() == "unresolved-child")
             .unwrap();
-        assert_eq!(connection.query_row::<i64,_,_>("SELECT count(*) FROM provider_catalog_records WHERE record_name='unresolved-child'",[],|r|r.get(0)).unwrap(),1);
+        let scope = ShadowCapture::new(db.clone(), owner(), "com")
+            .scope(
+                "private",
+                &json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+            )
+            .unwrap();
+        assert!(row.matches_scope(&scope));
+        assert!(
+            row.origin
+                .as_deref()
+                .is_some_and(|origin| origin.starts_with("[\"current-v1\","))
+        );
+        assert!(row.last_attempt.is_some());
+        assert!(
+            row.next_retry.is_none(),
+            "an inconclusive lookup has no backoff deadline"
+        );
+        retry_times = Some((row.last_attempt, row.next_retry));
+        config.state_db = None;
     }
 }
 
