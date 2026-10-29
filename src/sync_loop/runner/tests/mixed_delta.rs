@@ -181,7 +181,11 @@ async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
         db.set_metadata("sync_token:PrimarySync", "retained-valid-cursor")
             .await
             .unwrap();
-        db.set_metadata(&marker, "1").await.unwrap();
+        // Empty drift replay has no scoped sparse observation to resolve.
+        // The cancellation replay negative covers unattributed markers.
+        if !drift {
+            db.set_metadata(&marker, "1").await.unwrap();
+        }
     }
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     // Every iteration releases all SQLite handles. A fault adds a retained-state
@@ -189,8 +193,6 @@ async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
     let recovery_cycle = usize::from(fault.is_some());
     for cycle in 0..=recovery_cycle + 2 {
         let held = cycle < recovery_cycle;
-        let resumes_candidate =
-            fault == Some(MixedFault::CheckpointWrite) && cycle == recovery_cycle;
         let active_fault = if held { fault } else { None };
         let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
         if active_fault == Some(MixedFault::CheckpointWrite) {
@@ -213,7 +215,7 @@ async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
             changes: changes.clone(),
             queries: unfiled_queries.clone(),
             cancel: cancel.clone(),
-            expected_cursor: if cycle <= recovery_cycle && !resumes_candidate {
+            expected_cursor: if cycle <= recovery_cycle {
                 "retained-valid-cursor"
             } else {
                 "validated-delta-successor"
@@ -286,7 +288,7 @@ async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
                     .as_deref(),
                 Some(current_hash.as_str())
             );
-            assert!(db.get_metadata(&marker).await.unwrap().is_some());
+            assert!(db.get_metadata(&marker).await.unwrap().is_none());
             if fault == Some(MixedFault::CheckpointWrite) {
                 assert_eq!(
                     db.get_metadata(&pending_zone_token_key(&current_hash, "PrimarySync"))
@@ -341,7 +343,7 @@ async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
                     .is_none(),
                 "activation consumes the pending candidate"
             );
-            if cycle > recovery_cycle || !drift || resumes_candidate {
+            if cycle > recovery_cycle || !drift {
                 assert_eq!(
                     unfiled_queries.load(Ordering::SeqCst),
                     0,
@@ -350,7 +352,7 @@ async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
             } else {
                 assert!(
                     unfiled_queries.load(Ordering::SeqCst) > 0,
-                    "initial drift requires current inventory"
+                    "drift without a matching current observation requires inventory"
                 );
             }
             assert!(
