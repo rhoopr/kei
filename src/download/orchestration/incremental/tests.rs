@@ -2730,6 +2730,269 @@ async fn malformed_delta_page_rejected_by_streaming_and_collecting_consumers() {
 }
 
 #[tokio::test]
+async fn missing_successor_with_unaccountable_record_remains_error_in_both_incremental_paths() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    for (collecting, unknown_type) in [(true, false), (true, true), (false, false), (false, true)] {
+        let server = crate::start_wiremock_or_skip!();
+        let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+        Mock::given(method("GET"))
+            .and(path("/earlier.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+            .expect(if collecting { 0 } else { 1 })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rejected.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut earlier = incremental_photo_records_with_url(
+            "EARLIER",
+            "earlier.jpg",
+            &format!("{}/earlier.jpg", server.uri()),
+            bytes.len() as u64,
+        );
+        earlier[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes)));
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open(&dir.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        db.set_metadata("sync_token:PrimarySync", "saved")
+            .await
+            .unwrap();
+        let mut rejected = incremental_photo_records_with_url(
+            "REJECTED_PAGE",
+            "rejected.jpg",
+            &format!("{}/rejected.jpg", server.uri()),
+            bytes.len() as u64,
+        );
+        rejected[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            earlier[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"].clone();
+        let page = |records: Vec<serde_json::Value>, token: &str, more: bool| {
+            json!({
+                "zones": [{"zoneID": {"zoneName": "PrimarySync"}, "records": records,
+                    "syncToken": token, "moreComing": more}]
+            })
+        };
+        let mut bad = page(rejected, "rejected-successor", false);
+        bad["zones"][0]["syncToken"] = json!("");
+        bad["zones"][0]["records"]
+            .as_array_mut()
+            .unwrap()
+            .push(if unknown_type {
+                json!({"recordName": "unknown-source", "recordType": "FutureType"})
+            } else {
+                json!({})
+            });
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album(
+                "",
+                crate::test_helpers::MockPhotosSession::new()
+                    .ok(page(earlier, "accepted-page", true))
+                    .ok(bad),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = incremental_test_config(&dir);
+        config.state_db = Some(db.clone());
+        config.recent = collecting.then_some(10);
+        let result = download_photos_incremental(
+            &Client::new(),
+            &[pass],
+            &Arc::new(config),
+            "saved",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await;
+        let error = result.expect_err("unaccountable page must remain a refusal");
+        assert!(
+            error
+                .downcast_ref::<crate::icloud::photos::error::UnaccountedChangeError>()
+                .is_some(),
+            "collecting={collecting}, unknown_type={unknown_type}: {error:#}"
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("saved")
+        );
+        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+        if collecting {
+            assert!(db.get_all_known_ids().await.unwrap().is_empty());
+        } else {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id.as_ref(), "asset-EARLIER");
+            assert_eq!(
+                std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+                bytes
+            );
+            assert_eq!(db.get_all_known_ids().await.unwrap().len(), 1);
+        }
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn missing_successor_retains_prior_page_in_both_incremental_paths() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    for collecting in [true, false] {
+        let server = crate::start_wiremock_or_skip!();
+        let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+        Mock::given(method("GET"))
+            .and(path("/earlier.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rejected.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut earlier = incremental_photo_records_with_url(
+            "EARLIER",
+            "earlier.jpg",
+            &format!("{}/earlier.jpg", server.uri()),
+            bytes.len() as u64,
+        );
+        earlier[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes)));
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open(&dir.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        db.set_metadata("sync_token:PrimarySync", "saved")
+            .await
+            .unwrap();
+        let mut rejected = incremental_photo_records_with_url(
+            "REJECTED_PAGE",
+            "rejected.jpg",
+            &format!("{}/rejected.jpg", server.uri()),
+            bytes.len() as u64,
+        );
+        rejected[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            earlier[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"].clone();
+        let page = |records: Vec<serde_json::Value>, token: &str, more: bool| {
+            json!({
+                "zones": [{"zoneID": {"zoneName": "PrimarySync"}, "records": records,
+                    "syncToken": token, "moreComing": more}]
+            })
+        };
+        let mut bad = page(rejected, "rejected-successor", false);
+        bad["zones"][0]["syncToken"] = json!("");
+
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album(
+                "",
+                crate::test_helpers::MockPhotosSession::new()
+                    .ok(page(earlier, "accepted-page", true))
+                    .ok(bad),
+            ),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = incremental_test_config(&dir);
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+        let result = if collecting {
+            download_photos_incremental_collecting_inner(
+                &Client::new(),
+                &[pass],
+                &config,
+                "saved",
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+                Duration::from_secs(3600),
+            )
+            .await
+        } else {
+            download_photos_incremental(
+                &Client::new(),
+                &[pass],
+                &config,
+                "saved",
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+        }
+        .unwrap();
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(result.sync_token, None);
+        assert_eq!(result.stats.downloaded, 1);
+
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("saved")
+        );
+        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id.as_ref(), "asset-EARLIER");
+        assert_eq!(
+            std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+            bytes
+        );
+        drop(rows);
+        drop(db);
+        let reopened = SqliteStateDb::open(&dir.path().join("state.db"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("saved")
+        );
+        let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id.as_ref(), "asset-EARLIER");
+        let receipt: (String, String, String) = {
+            let conn = reopened.acquire_lock("prior page receipt").unwrap();
+            conn.query_row(
+            "SELECT provider_checksum, local_checksum, source_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-EARLIER' AND version_size='original'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap()
+        };
+        let digest = Sha256::digest(bytes);
+        let hex = data_encoding::HEXLOWER.encode(&digest);
+        assert_eq!(
+            receipt,
+            (
+                base64::engine::general_purpose::STANDARD.encode(digest),
+                hex.clone(),
+                hex
+            )
+        );
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
 async fn recent_overflow_uses_current_inventory_and_preserves_checkpoint() {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};

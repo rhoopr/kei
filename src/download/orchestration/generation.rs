@@ -2608,6 +2608,10 @@ pub(super) async fn after_delta(
         .selection_context
         .as_ref()
         .context("Missing selection context")?;
+    if delta.missing_successor && context.format != 2 {
+        // Legacy selection cannot deliver a partial source replay safely.
+        return Err(crate::icloud::photos::error::MissingChangesSuccessor.into());
+    }
     let recent = super::recent::active(config)
         .await
         .map_err(super::recent::RecentSelectionError)?;
@@ -2651,7 +2655,7 @@ pub(super) async fn after_delta(
         format: context.format,
         proof_matches,
     });
-    let repeat_inventory = needs_inventory && !reuse_inventory_proof;
+    let repeat_inventory = needs_inventory && !reuse_inventory_proof && !delta.missing_successor;
     if reuse_inventory_proof {
         tracing::debug!(
             "Reusing completed full-inventory proof for the recent bridge; skipping duplicate inventory"
@@ -2696,7 +2700,11 @@ pub(super) async fn after_delta(
     } else {
         selection?
     };
-    if context.format == 2 && delta.inventory_rank_changed && !repeat_inventory {
+    if context.format == 2
+        && delta.inventory_rank_changed
+        && !repeat_inventory
+        && !delta.missing_successor
+    {
         let smart_passes: Vec<_> = passes
             .iter()
             .filter(|pass| pass.kind == PassKind::SmartFolder)

@@ -677,6 +677,7 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
     #[derive(Clone)]
     struct FallbackSession {
         expired: bool,
+        query_calls: Arc<AtomicUsize>,
     }
     #[async_trait::async_trait]
     impl PhotosSession for FallbackSession {
@@ -697,6 +698,7 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
                 }
                 return Ok(json!({"zones": [zone]}));
             }
+            self.query_calls.fetch_add(1, Ordering::SeqCst);
             if url.contains("/internal/records/query/batch?") {
                 return Ok(
                     json!({"batch": [{"records": [{"fields": {"itemCount": {"value": 0}}}]}]}),
@@ -710,9 +712,16 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
     }
     for expired in [false, true] {
         let directory = TempDir::new().unwrap();
+        let query_calls = Arc::new(AtomicUsize::new(0));
         let passes = vec![AlbumPass {
             kind: PassKind::Unfiled,
-            album: changes_album("", FallbackSession { expired }),
+            album: changes_album(
+                "",
+                FallbackSession {
+                    expired,
+                    query_calls: query_calls.clone(),
+                },
+            ),
             exclude_ids: Arc::new(FxHashSet::default()),
         }];
         let result = download_photos_with_sync(
@@ -724,10 +733,18 @@ async fn retained_token_fallback_distinguishes_expiry_from_missing_successor() {
         )
         .await
         .unwrap();
-        assert!(result.full_enumeration_ran);
         assert!(!result.checkpoint.completed_delta_replay);
         assert_eq!(result.checkpoint.retained_token_rejected, expired);
-        assert_eq!(result.sync_token.as_deref(), Some("healthy-query-eof"));
+        if expired {
+            assert!(result.full_enumeration_ran);
+            assert_eq!(result.sync_token.as_deref(), Some("healthy-query-eof"));
+            assert!(query_calls.load(Ordering::SeqCst) > 0);
+        } else {
+            assert!(!result.full_enumeration_ran);
+            assert!(result.stats.sync_token_blocked);
+            assert_eq!(result.sync_token, None);
+            assert_eq!(query_calls.load(Ordering::SeqCst), 0);
+        }
     }
 }
 

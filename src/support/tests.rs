@@ -196,12 +196,15 @@ fn owning_checkpoint_decisions_survive_support_allowlist_without_tokens() {
             fields
         );
     }
-    assert_eq!(
-        super::privacy::stats(
-            &serde_json::json!({"sync_token_blocked_reason":"inventory_delta_bridge_failed"})
-        )["sync_token_blocked_reason"],
-        "inventory_delta_bridge_failed"
-    );
+    for reason in [
+        "inventory_delta_bridge_failed",
+        "icloud_changes_successor_missing",
+    ] {
+        assert_eq!(
+            super::privacy::stats(&serde_json::json!({"sync_token_blocked_reason":reason}))["sync_token_blocked_reason"],
+            reason
+        );
+    }
 }
 
 #[test]

@@ -104,6 +104,7 @@ fn stream_incremental_assets_for_single_unfiled_pass(
         let mut album_events = Vec::new();
         let mut relation_events = Vec::new();
         let mut unpaired_asset_events = Vec::new();
+        let mut missing_successor = false;
 
         loop {
             let result = tokio::select! {
@@ -122,6 +123,19 @@ fn stream_incremental_assets_for_single_unfiled_pass(
                         _ = asset_tx.send(Err(error)) => {},
                     }
                     return Ok(delta.summary);
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::icloud::photos::error::MissingChangesSuccessor>()
+                        .is_some() =>
+                {
+                    delta
+                        .summary
+                        .token_unsafe_reason
+                        .get_or_insert("icloud_changes_successor_missing");
+                    delta.summary.missing_successor = true;
+                    missing_successor = true;
+                    break;
                 }
                 other => other?,
             };
@@ -184,7 +198,7 @@ fn stream_incremental_assets_for_single_unfiled_pass(
             token = token_rx => token.ok(),
         };
         delta.summary.inventory_rank_changed |= observed.load(std::sync::atomic::Ordering::Relaxed);
-        delta.record_completion(token);
+        delta.record_completion(if missing_successor { None } else { token });
         hydrate_unpaired_created_asset_deltas(
             &mut unpaired_asset_events,
             Some(&pass),
@@ -572,6 +586,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             .album
             .changes_stream_observed(zone_sync_token, collection_independent_rank(passes));
 
+        let mut missing_successor = false;
         loop {
             let result = tokio::select! {
                 biased;
@@ -579,7 +594,22 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 result = change_stream.next() => result,
             };
             let Some(result) = result else { break };
-            let event = result?;
+            let event = match result {
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::icloud::photos::error::MissingChangesSuccessor>()
+                        .is_some() =>
+                {
+                    delta
+                        .summary
+                        .token_unsafe_reason
+                        .get_or_insert("icloud_changes_successor_missing");
+                    delta.summary.missing_successor = true;
+                    missing_successor = true;
+                    break;
+                }
+                other => other?,
+            };
             if first_download_url_obtained_at.is_none() && event.asset.is_some() {
                 first_download_url_obtained_at = Some(Instant::now());
             }
@@ -595,7 +625,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             token = token_rx => token.ok(),
         };
         delta.summary.inventory_rank_changed |= observed.load(std::sync::atomic::Ordering::Relaxed);
-        delta.record_completion(token);
+        delta.record_completion(if missing_successor { None } else { token });
         tracing::debug!(
             phase_elapsed = %format_duration(phase_started.elapsed()),
             elapsed = %format_duration(started.elapsed()),

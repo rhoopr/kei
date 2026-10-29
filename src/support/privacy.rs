@@ -883,6 +883,7 @@ const LABELS: &[&str] = &[
     "icloud",
     "icloud_album_count_error",
     "icloud_blank_sync_token",
+    "icloud_changes_successor_missing",
     "icloud_sync_token_mismatch",
     "icloud_sync_token_missing",
     "incremental_delete_no_matching_state",

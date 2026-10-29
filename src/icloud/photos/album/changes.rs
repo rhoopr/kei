@@ -22,6 +22,16 @@ use crate::icloud::photos::session::check_changes_zone_error;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+fn validate_accountable_records(records: &[cloudkit::Record]) -> anyhow::Result<()> {
+    if records
+        .iter()
+        .any(|record| !crate::icloud::photos::asset::delta_record_is_accountable(record))
+    {
+        return Err(super::super::error::UnaccountedChangeError.into());
+    }
+    Ok(())
+}
+
 /// A complete, scoped page checked before pairing, callbacks or cursor acceptance.
 #[must_use]
 struct ValidatedChangesPage {
@@ -77,6 +87,32 @@ impl ValidatedChangesPage {
                 .all(|record| record.get("serverErrorCode").is_none_or(Value::is_null)),
             "Changes/zone record failed"
         );
+        if zone.get("syncToken").is_none_or(Value::is_null)
+            || zone
+                .get("syncToken")
+                .and_then(Value::as_str)
+                .is_some_and(|token| token.trim().is_empty())
+        {
+            // Validate the remaining envelope before classifying this as only
+            // a missing successor. Other malformed pages remain hard errors.
+            let mut candidate = response.clone();
+            candidate
+                .pointer_mut("/zones/0")
+                .and_then(Value::as_object_mut)
+                .context("Invalid changes/zone result")?
+                .insert(
+                    "syncToken".to_owned(),
+                    Value::String("validation-only".into()),
+                );
+            let checked = serde_json::from_value::<ChangesZoneResponse>(candidate)
+                .map_err(|_invalid_shape| anyhow::anyhow!("Invalid changes/zone page shape"))?;
+            let checked_zone = checked
+                .zones
+                .first()
+                .context("Missing changes/zone result")?;
+            validate_accountable_records(&checked_zone.records)?;
+            return Err(super::super::error::MissingChangesSuccessor.into());
+        }
         let zone_scope = zone_id.clone();
         let response: ChangesZoneResponse = serde_json::from_value(response)
             .map_err(|_invalid_shape| anyhow::anyhow!("Invalid changes/zone page shape"))?;
@@ -85,10 +121,6 @@ impl ValidatedChangesPage {
             .into_iter()
             .next()
             .context("Missing changes/zone result")?;
-        anyhow::ensure!(
-            !zone.sync_token.trim().is_empty(),
-            "Missing changes/zone successor"
-        );
         Ok(Self {
             zone_scope,
             records: zone.records,
@@ -386,10 +418,8 @@ impl PhotoAlbum {
                 {
                     observed.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                if zone_result.records.iter().any(|record| {
-                    !crate::icloud::photos::asset::delta_record_is_accountable(record)
-                }) {
-                    break Some(super::super::error::UnaccountedChangeError.into());
+                if let Err(error) = validate_accountable_records(&zone_result.records) {
+                    break Some(error);
                 }
 
                 // New observations are admitted by the download ledger before
@@ -456,6 +486,31 @@ impl PhotoAlbum {
 #[cfg(test)]
 mod tests {
     use super::{CancellationToken, FxHashSet, ProviderRecordId, Value};
+
+    #[test]
+    fn missing_successor_does_not_hide_malformed_page() {
+        let zone = serde_json::json!({"zoneName": "PrimarySync"});
+        let mut response = serde_json::json!({"zones": [{
+            "zoneID": zone, "records": [], "syncToken": "", "moreComing": false
+        }]});
+        let error = super::ValidatedChangesPage::parse(response.clone(), &zone)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .downcast_ref::<crate::icloud::photos::error::MissingChangesSuccessor>()
+                .is_some()
+        );
+        response["zones"][0]["moreComing"] = serde_json::json!("invalid");
+        let error = super::ValidatedChangesPage::parse(response, &zone)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .downcast_ref::<crate::icloud::photos::error::MissingChangesSuccessor>()
+                .is_none()
+        );
+    }
     use crate::icloud::photos::session::PhotosSession;
     use std::sync::{Arc, Mutex};
     #[tokio::test]

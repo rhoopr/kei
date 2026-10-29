@@ -152,6 +152,7 @@ struct Fixture {
     globals: crate::config::GlobalArgs,
     server: Arc<MockServer>,
     body: Vec<u8>,
+    primary_first: bool,
 }
 fn rows(path: &Path, sql: &str) -> Value {
     let conn =
@@ -441,6 +442,7 @@ impl Fixture {
             globals,
             server,
             body,
+            primary_first: false,
         };
         fixture.responses(200, false).await;
         fixture.evidence("seed",json!({"historical_source_receipts":false,"ready_children":4,"renditions":6,"mixed_owner_families":2}));
@@ -643,7 +645,11 @@ impl Fixture {
         }
         let mut libraries = vec![&shared];
         if primary_hold {
-            libraries.push(&primary);
+            if self.primary_first {
+                libraries.insert(0, &primary);
+            } else {
+                libraries.push(&primary);
+            }
         }
         let store = db.clone() as Arc<dyn download::DownloadStore>;
         let base = make_run_cycle_download_config_builder_with_options(
@@ -1503,7 +1509,14 @@ async fn trusted_legacy_mixed_six_acceptance_survives_readiness_failure_and_reop
 
 #[tokio::test]
 async fn trusted_legacy_mixed_six_acceptance_with_primary_hold_downloads_and_reopens() {
+    for primary_first in [false, true] {
+        mixed_primary_hold_downloads_and_reopens(primary_first).await;
+    }
+}
+
+async fn mixed_primary_hold_downloads_and_reopens(primary_first: bool) {
     let mut f = Fixture::new("mixed-primary-hold").await;
+    f.primary_first = primary_first;
     f.cycle("baseline", CancellationToken::new(), false)
         .await
         .unwrap();

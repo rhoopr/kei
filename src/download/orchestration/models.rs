@@ -745,6 +745,9 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
         "icloud_sync_token_missing" => {
             "iCloud did not return a sync token for this full enumeration"
         }
+        "icloud_changes_successor_missing" => {
+            "iCloud returned a changes page without a usable successor; the prior cursor remains held"
+        }
         "icloud_blank_sync_token" => {
             "iCloud returned a blank sync token, which kei treated as unusable"
         }

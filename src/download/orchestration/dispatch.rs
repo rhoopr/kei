@@ -48,6 +48,9 @@ fn classify_incremental_error(error: &anyhow::Error) -> IncrementalErrorClass {
     if error
         .downcast_ref::<crate::icloud::photos::error::UnaccountedChangeError>()
         .is_some()
+        || error
+            .downcast_ref::<crate::icloud::photos::error::MissingChangesSuccessor>()
+            .is_some()
     {
         return IncrementalErrorClass::CaptureRefused;
     }

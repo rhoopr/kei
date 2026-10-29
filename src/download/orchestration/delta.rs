@@ -453,6 +453,7 @@ pub(super) struct IncrementalDeltaSummary {
     pub(super) sparse_identity_proofs: Vec<SparseIdentityProof>,
     pub(super) identity_incomplete: bool,
     pub(super) sync_token: Option<String>,
+    pub(super) missing_successor: bool,
     pub(super) token_unsafe_reason: Option<&'static str>,
     pub(super) created_count: u64,
     pub(super) soft_deleted_count: u64,
