@@ -1735,9 +1735,8 @@ async fn bounded_full_sync_hydrates_live_legacy_pending_master() {
         .expect("live legacy pending master should hydrate and download");
 
         if guarded {
-            assert!(result.stats.identity_incomplete);
-            // A candidate token may be returned, but the cycle owner's
-            // identity_incomplete gate must not commit it.
+            // Retained pending debt is separate from current-source identity.
+            assert!(!result.stats.identity_incomplete);
             assert!(result.stats.failed > 0);
             assert_eq!(db.get_pending().await.unwrap()[0].added_at, record.added_at);
             assert!(
@@ -2541,7 +2540,8 @@ async fn hidden_invalid_capture_date_preserves_pending_recovery() {
                 assert_eq!(summary.policy_excluded, 0);
                 assert_eq!(summary.source_deleted, 0);
                 assert_eq!(summary.downloaded, u64::from(recovered));
-                assert_eq!(result.checkpoint.identity_incomplete, !recovered);
+                // Retained pending debt does not veto current-source accounting.
+                assert!(!result.checkpoint.identity_incomplete);
                 assert_eq!(
                     result.stats.downloaded,
                     usize::from(!with_sibling && if valid_epoch { cycle == 0 } else { cycle == 2 })
