@@ -113,22 +113,18 @@ pub(crate) async fn write_sidecar_in_namespace(
 /// temporary file's identity, carried through no-replace publication.
 pub(in crate::download) async fn create_layout_sidecar(
     root: &Path,
-    target_media: &Path,
+    target: crate::fs_util::ConfinedPath,
     seed: Option<(&Path, &crate::state::db::primary_layout::LayoutFingerprint)>,
     write: &MetadataWrite,
     temp_suffix: &str,
 ) -> Result<Option<crate::state::db::primary_layout::LayoutFingerprint>> {
     let root = root.to_owned();
-    let target_media = target_media.to_owned();
     let seed = seed.map(|(path, fingerprint)| (path.to_owned(), fingerprint.clone()));
     let write = write.clone();
     let temp_suffix = temp_suffix.to_owned();
     tokio::task::spawn_blocking(move || {
         use crate::fs_util::{ConfinedParents, ConfinedPath};
         use crate::state::db::primary_layout::LayoutFingerprint;
-        let mut target_name = target_media.as_os_str().to_os_string();
-        target_name.push(".xmp");
-        let target = ConfinedPath::open(&root, Path::new(&target_name), ConfinedParents::Create)?;
         let source = if let Some((path, expected)) = seed {
             let source = ConfinedPath::open(&root, &path, ConfinedParents::Existing)?;
             let mut file = source.open_regular()?;

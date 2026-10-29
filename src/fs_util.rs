@@ -236,7 +236,7 @@ impl ConfinedPath {
     }
 
     /// Descend into a retained directory entry without reopening its ancestors.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn child(&self, name: &std::ffi::OsStr) -> std::io::Result<Self> {
         use std::os::fd::AsRawFd;
         self.validate_namespace()?;
@@ -277,8 +277,42 @@ impl ConfinedPath {
         })
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn create_private_directory(&self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        self.validate_namespace()?;
+        // SAFETY: parent fd and C string are retained and live for this call.
+        if unsafe { libc::mkdirat(self.parent_dir.as_raw_fd(), self.name.as_ptr(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.sync_parent()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn remove_empty_directory(&self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        self.validate_namespace()?;
+        // SAFETY: the retained parent and C string remain live.
+        if unsafe {
+            libc::unlinkat(
+                self.parent_dir.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.sync_parent()
+    }
+
     /// Remove only the checked entry in the held parent, never a replacement parent.
-    #[cfg(feature = "xmp")]
+    #[cfg(any(
+        feature = "xmp",
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos"
+    ))]
     pub(crate) fn remove_regular(&self, expected: FileIdentity) -> std::io::Result<()> {
         let file = self.validate_identity(expected)?;
         #[cfg(unix)]

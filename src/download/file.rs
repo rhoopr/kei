@@ -16,6 +16,7 @@ pub(in crate::download) mod primary_layout;
 mod provider_signature;
 mod publication;
 mod reconciliation;
+pub(in crate::download) use reconciliation::reconciliation_source_root;
 mod replacement;
 #[cfg(target_os = "linux")]
 mod replacement_recovery;

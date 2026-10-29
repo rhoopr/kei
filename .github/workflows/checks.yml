@@ -165,6 +165,13 @@ jobs:
           # Requiring it where it is installed stops a failed install quietly
           # retiring that coverage.
           KEI_REQUIRE_HEIF_ORACLE: ${{ runner.os == 'Linux' && '1' || '' }}
+      - name: Native no-default embedded recovery
+        if: runner.os != 'Linux' && needs.detect.outputs.platform == 'true'
+        shell: bash
+        run: |
+          set -e
+          cargo test --locked --no-default-features --lib interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync
+          cargo test --locked --no-default-features --lib interrupted_embedded_scratch_reopens_without_adopting_or_removing_unknown_files
       - name: Platform build and smoke
         if: runner.os != 'Linux' && needs.detect.outputs.platform != 'true'
         run: cargo test --locked --all-features --test cli --test media_fixtures --test service_cli --test service_linux --test service_macos --test service_windows --test service_status

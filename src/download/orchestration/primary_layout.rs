@@ -1531,6 +1531,339 @@ pub(in crate::download) async fn plan_asset(
     Ok(Some(tasks))
 }
 
+/// Operation-owned private namespace; unknown entries and interrupted attempts are retained.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+struct EmbeddedScratch {
+    directory: crate::fs_util::ConfinedPath,
+    copy_root: PathBuf,
+    input: crate::fs_util::ConfinedPath,
+    #[cfg(not(target_os = "macos"))]
+    anchored_directory: PathBuf,
+    anchored_input: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl EmbeddedScratch {
+    async fn create(
+        root: &Path,
+        stage: &Path,
+        parent: Option<crate::fs_util::ConfinedPath>,
+    ) -> Result<Self> {
+        let root = root.to_owned();
+        let stage = stage.to_owned();
+        tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::DirBuilderExt;
+            let parent_path = stage.parent().context("Recorded stage has no parent")?;
+            let directory_path =
+                parent_path.join(format!(".kei-embedded-attempt-{}", uuid::Uuid::new_v4()));
+            let directory = if let Some(parent) = parent {
+                parent.sibling(&directory_path)?
+            } else {
+                crate::fs_util::ConfinedPath::open(
+                    &root,
+                    &directory_path,
+                    crate::fs_util::ConfinedParents::Create,
+                )?
+            };
+            directory.validate_namespace()?;
+            let anchored_directory =
+                PathBuf::from(format!("/proc/self/fd/{}", directory.parent_fd()))
+                    .join(directory_path.file_name().context("Missing attempt name")?);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&anchored_directory)?;
+            directory.sync_parent()?;
+            let input = directory.child(
+                stage
+                    .file_name()
+                    .context("Recorded stage has no filename")?,
+            )?;
+            input.validate_namespace()?;
+            let anchored_input = PathBuf::from(format!("/proc/self/fd/{}", input.parent_fd()))
+                .join(
+                    stage
+                        .file_name()
+                        .context("Recorded stage has no filename")?,
+                );
+            Ok(Self {
+                directory,
+                copy_root: root,
+                input,
+                anchored_directory,
+                anchored_input,
+            })
+        })
+        .await?
+    }
+
+    async fn cleanup(
+        self,
+        expected: &crate::state::db::primary_layout::LayoutFingerprint,
+    ) -> Result<()> {
+        let expected = expected.clone();
+        tokio::task::spawn_blocking(move || {
+            self.input.validate_namespace()?;
+            self.input.validate_identity(expected.identity)?;
+            self.input.remove_regular(expected.identity)?;
+            self.input.sync_parent()?;
+            self.directory.validate_namespace()?;
+            let held = std::fs::File::open(format!("/proc/self/fd/{}", self.input.parent_fd()))?;
+            let metadata = std::fs::symlink_metadata(&self.anchored_directory)?;
+            anyhow::ensure!(
+                metadata.file_type().is_dir(),
+                "Embedded attempt directory changed"
+            );
+            let current = std::fs::File::open(&self.anchored_directory)?;
+            anyhow::ensure!(
+                crate::fs_util::file_identity(&held)? == crate::fs_util::file_identity(&current)?,
+                "Embedded attempt directory changed identity"
+            );
+            self.input.validate_namespace()?;
+            // Remove only an empty directory created by this attempt; never
+            // recursively remove entries a different writer may have added.
+            std::fs::remove_dir(&self.anchored_directory)?;
+            self.directory.sync_parent()?;
+            Ok(())
+        })
+        .await?
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl EmbeddedScratch {
+    async fn create(
+        root: &Path,
+        stage: &Path,
+        parent: Option<crate::fs_util::ConfinedPath>,
+    ) -> Result<Self> {
+        let root = root.to_owned();
+        let stage = stage.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let parent_path = stage.parent().context("Recorded stage has no parent")?;
+            let directory_path =
+                parent_path.join(format!(".kei-embedded-attempt-{}", uuid::Uuid::new_v4()));
+            let directory = if let Some(parent) = parent {
+                parent.sibling(&directory_path)?
+            } else {
+                crate::fs_util::ConfinedPath::open(
+                    &root,
+                    &directory_path,
+                    crate::fs_util::ConfinedParents::Create,
+                )?
+            };
+            std::fs::create_dir(&directory_path)?;
+            let input_path = directory_path.join(
+                stage
+                    .file_name()
+                    .context("Recorded stage has no filename")?,
+            );
+            // ConfinedPath retains the directory chain without delete sharing.
+            let input = crate::fs_util::ConfinedPath::open(
+                &root,
+                &input_path,
+                crate::fs_util::ConfinedParents::Existing,
+            )?;
+            Ok(Self {
+                directory,
+                copy_root: root,
+                input,
+                anchored_directory: directory_path,
+                anchored_input: input_path,
+            })
+        })
+        .await?
+    }
+
+    async fn cleanup(
+        self,
+        expected: &crate::state::db::primary_layout::LayoutFingerprint,
+    ) -> Result<()> {
+        let expected = expected.clone();
+        tokio::task::spawn_blocking(move || {
+            self.input.validate_identity(expected.identity)?;
+            self.input.remove_regular(expected.identity)?;
+            self.input.sync_parent()?;
+            // The parent chain remains locked while releasing the attempt handle.
+            drop(self.input);
+            std::fs::remove_dir(&self.anchored_directory)?;
+            self.directory.sync_parent()?;
+            Ok(())
+        })
+        .await?
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl EmbeddedScratch {
+    async fn create(
+        _root: &Path,
+        stage: &Path,
+        _parent: Option<crate::fs_util::ConfinedPath>,
+    ) -> Result<Self> {
+        let stage = stage.to_owned();
+        tokio::task::spawn_blocking(move || {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let root = std::fs::canonicalize(std::env::temp_dir())?;
+            let metadata = std::fs::metadata(&root)?;
+            // SAFETY: geteuid has no preconditions.
+            anyhow::ensure!(
+                metadata.is_dir()
+                    && metadata.uid() == unsafe { libc::geteuid() }
+                    && metadata.permissions().mode() & 0o077 == 0,
+                "System temporary root is not private to this user"
+            );
+            let directory_path =
+                root.join(format!(".kei-embedded-attempt-{}", uuid::Uuid::new_v4()));
+            let directory = crate::fs_util::ConfinedPath::open(
+                &root,
+                &directory_path,
+                crate::fs_util::ConfinedParents::Existing,
+            )?;
+            directory.create_private_directory()?;
+            let input = directory.child(
+                stage
+                    .file_name()
+                    .context("Recorded stage has no filename")?,
+            )?;
+            let anchored_input = input.path().to_owned();
+            Ok(Self {
+                directory,
+                copy_root: root,
+                input,
+                anchored_input,
+            })
+        })
+        .await?
+    }
+
+    async fn cleanup(
+        self,
+        expected: &crate::state::db::primary_layout::LayoutFingerprint,
+    ) -> Result<()> {
+        let expected = expected.clone();
+        tokio::task::spawn_blocking(move || {
+            self.input.validate_namespace()?;
+            self.input.remove_regular(expected.identity)?;
+            self.input.sync_parent()?;
+            self.directory.remove_empty_directory()?;
+            Ok(())
+        })
+        .await?
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+async fn prepare_recorded_embedded_stage(
+    asset: &PhotoAsset,
+    config: &DownloadConfig,
+    record: &crate::state::AssetRecord,
+    source: &LayoutFile,
+    stage: &Path,
+    destination: crate::fs_util::ConfinedPath,
+    cancel: &CancellationToken,
+) -> Result<crate::state::db::primary_layout::LayoutFingerprint> {
+    // Avoid another scratch attempt for a known collision. Publication still
+    // uses exclusive creation to handle concurrent writers.
+    anyhow::ensure!(
+        snapshot(&config.directory, stage).await?.is_none(),
+        "Recorded embedded stage is occupied"
+    );
+    anyhow::ensure!(
+        snapshot(&config.directory, &sidecar(stage))
+            .await?
+            .is_none(),
+        "Recorded embedded stage sidecar is occupied"
+    );
+    destination.validate_namespace()?;
+    validate_file(&config.directory, source).await?;
+    let scratch =
+        EmbeddedScratch::create(&config.directory, stage, Some(destination.sibling(stage)?))
+            .await?;
+    let source_path = source.path.to_path();
+    let source_root = file::reconciliation_source_root(&config.directory, &source_path)?;
+    let input = file::primary_layout::copy_verified_between_roots(
+        &source_root,
+        &source_path,
+        &scratch.copy_root,
+        scratch.input.path(),
+        &source.fingerprint,
+    )
+    .await?;
+    #[cfg(all(
+        test,
+        any(target_os = "linux", target_os = "windows", target_os = "macos")
+    ))]
+    crate::test_helpers::process_death_point("recorded-embed-scratch");
+    anyhow::ensure!(
+        !cancel.is_cancelled(),
+        "Recorded embedded refresh interrupted"
+    );
+    scratch.input.validate_namespace()?;
+    let flags = crate::download::pipeline::MetadataFlags::from(config);
+    let fingerprint = crate::download::file::ExistingFileFingerprint {
+        size: input.size,
+        sha256: input.sha256,
+    };
+    let result = crate::download::metadata_rewrite::prepare_embed_metadata(
+        &scratch.anchored_input,
+        Some(fingerprint),
+        filter::build_selected_payload(asset, config, record.version_size),
+        asset.created_local(),
+        flags,
+        config.capture_timestamp_repair,
+        &config.temp_suffix,
+    )
+    .await;
+    scratch.input.validate_namespace()?;
+    anyhow::ensure!(
+        snapshot(&config.directory, scratch.input.path())
+            .await?
+            .as_ref()
+            == Some(&input),
+        "Embedded scratch input changed"
+    );
+    anyhow::ensure!(
+        !cancel.is_cancelled(),
+        "Recorded embedded refresh interrupted"
+    );
+    let stage_file = match result {
+        crate::download::metadata_rewrite::EmbedPrepareResult::Prepared(prepared) => {
+            let input_capability = scratch.input.sibling(scratch.input.path())?;
+            let (prepared, (output_path, witness)) = tokio::task::spawn_blocking(move || {
+                let witness = prepared.retained_output_witness(&input_capability)?;
+                anyhow::Ok((prepared, witness))
+            })
+            .await??;
+            let staged = file::primary_layout::copy_verified_to_confined(
+                &scratch.copy_root,
+                &output_path,
+                destination,
+                &witness,
+            )
+            .await?;
+            drop(prepared);
+            staged
+        }
+        crate::download::metadata_rewrite::EmbedPrepareResult::NoWrite => {
+            file::primary_layout::copy_verified_to_confined(
+                &scratch.copy_root,
+                scratch.input.path(),
+                destination,
+                &input,
+            )
+            .await?
+        }
+        crate::download::metadata_rewrite::EmbedPrepareResult::Failed => {
+            anyhow::bail!("Recorded embedded metadata preparation failed")
+        }
+        crate::download::metadata_rewrite::EmbedPrepareResult::InputChanged => {
+            anyhow::bail!("Recorded embedded metadata input changed")
+        }
+    };
+    scratch.cleanup(&input).await?;
+    Ok(stage_file)
+}
+
 /// Prepare only stages created by this attempt. Receipts stay in memory until
 /// the provider is reconfirmed; an interrupted occupied stage remains pending.
 async fn prepare_recorded_refresh(
@@ -1545,9 +1878,10 @@ async fn prepare_recorded_refresh(
         .as_deref()
         .context("Missing layout database")?;
     let flags = crate::download::pipeline::MetadataFlags::from(config);
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     anyhow::ensure!(
         !flags.any_embed(),
-        "Recorded embedded refresh needs an identity-bound metadata writer"
+        "Recorded embedded refresh is unavailable on this platform"
     );
     let selected = filter::derive_expected_paths(asset, config);
     let mut sources = Vec::new();
@@ -1634,23 +1968,52 @@ async fn prepare_recorded_refresh(
             ),
             "Recorded refresh source is read-only"
         );
-        let media = file::primary_layout::copy_verified_create_only(
+        let stage_cap = crate::fs_util::ConfinedPath::open(
             &config.directory,
-            &source.path.to_path(),
             &stage,
-            &source.fingerprint,
-        )
-        .await?;
+            crate::fs_util::ConfinedParents::Create,
+        )?;
+        validate_file(&config.directory, &source).await?;
+        let media = if flags.any_embed() && member.archive_source.is_none() {
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+            {
+                prepare_recorded_embedded_stage(
+                    asset,
+                    config,
+                    member
+                        .record
+                        .as_ref()
+                        .context("Missing embedded refresh record")?,
+                    &source,
+                    &stage,
+                    stage_cap.sibling(&stage)?,
+                    cancel,
+                )
+                .await?
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+            {
+                anyhow::bail!("Recorded embedded refresh is unavailable on this platform")
+            }
+        } else {
+            file::primary_layout::copy_verified_to_confined(
+                &config.directory,
+                &source.path.to_path(),
+                stage_cap.sibling(&stage)?,
+                &source.fingerprint,
+            )
+            .await?
+        };
         let source_xmp = sidecar(&source.path.to_path());
         let xmp = if member.archive_source.is_some()
             || !flags.contains(crate::download::pipeline::MetadataFlags::XMP_SIDECAR)
         {
             if let Some(expected) = &source.sidecar {
                 Some(
-                    file::primary_layout::copy_verified_create_only(
+                    file::primary_layout::copy_verified_to_confined(
                         &config.directory,
                         &source_xmp,
-                        &sidecar(&stage),
+                        stage_cap.sibling(&sidecar(&stage))?,
                         expected,
                     )
                     .await?,
@@ -1665,16 +2028,50 @@ async fn prepare_recorded_refresh(
                     .record
                     .as_ref()
                     .context("Missing recorded refresh member")?;
-                crate::download::metadata_rewrite::create_layout_sidecar(
-                    &config.directory,
-                    &stage,
-                    source.sidecar.as_ref().map(|f| (source_xmp.as_path(), f)),
-                    filter::build_selected_payload(asset, config, record.version_size),
-                    asset.created_local(),
-                    source.source_checksum.as_deref(),
-                    &config.temp_suffix,
-                )
-                .await?
+                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                {
+                    let planning = EmbeddedScratch::create(
+                        &config.directory,
+                        &stage,
+                        Some(stage_cap.sibling(&stage)?),
+                    )
+                    .await?;
+                    let planning_input = file::primary_layout::copy_verified_between_roots(
+                        &config.directory,
+                        &stage,
+                        &planning.copy_root,
+                        planning.input.path(),
+                        &media,
+                    )
+                    .await?;
+                    let result = crate::download::metadata_rewrite::create_layout_sidecar(
+                        &config.directory,
+                        &planning.anchored_input,
+                        stage_cap.sibling(&sidecar(&stage))?,
+                        source.sidecar.as_ref().map(|f| (source_xmp.as_path(), f)),
+                        filter::build_selected_payload(asset, config, record.version_size),
+                        asset.created_local(),
+                        source.source_checksum.as_deref(),
+                        &config.temp_suffix,
+                    )
+                    .await?;
+                    planning.cleanup(&planning_input).await?;
+                    result
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+                {
+                    crate::download::metadata_rewrite::create_layout_sidecar(
+                        &config.directory,
+                        &stage,
+                        stage_cap.sibling(&sidecar(&stage))?,
+                        source.sidecar.as_ref().map(|f| (source_xmp.as_path(), f)),
+                        filter::build_selected_payload(asset, config, record.version_size),
+                        asset.created_local(),
+                        source.source_checksum.as_deref(),
+                        &config.temp_suffix,
+                    )
+                    .await?
+                }
             }
             #[cfg(not(feature = "xmp"))]
             {

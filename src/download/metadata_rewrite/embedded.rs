@@ -16,14 +16,14 @@ pub(super) enum EmbedWriteResult {
     InputChanged,
 }
 
-pub(super) enum EmbedPrepareResult {
+pub(in crate::download) enum EmbedPrepareResult {
     Prepared(crate::download::metadata::PreparedMetadataFile),
     NoWrite,
     Failed,
     InputChanged,
 }
 
-pub(super) async fn prepare_embed_metadata(
+pub(in crate::download) async fn prepare_embed_metadata(
     path: &Path,
     expected_fingerprint: Option<crate::download::file::ExistingFileFingerprint>,
     payload: Arc<MetadataPayload>,

@@ -1266,10 +1266,9 @@ pub fn assert_source_gps_in_xmp(meta: &xmp_toolkit::XmpMeta) {
     );
 }
 
-/// Dedicated Linux subprocess fixture rendezvous; absent from release builds.
-/// The parent uses Child::kill and verifies SIGKILL, so no Rust unwinding or
-/// cooperative cancellation can complete the paused transition.
-#[cfg(target_os = "linux")]
+/// Dedicated subprocess fixture rendezvous; absent from release builds.
+/// The parent terminates the parked child without cooperative cancellation.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub(crate) fn process_death_point(point: &str) {
     if std::env::var("KEI_TEST_PROCESS_DEATH_POINT").as_deref() != Ok(point) {
         return;
