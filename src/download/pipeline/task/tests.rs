@@ -18,7 +18,7 @@ use reqwest::Client;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(feature = "xmp")]
+#[cfg(any(unix, feature = "xmp"))]
 use crate::download::DownloadStore;
 use crate::download::error::DownloadError;
 use crate::download::filter::{DownloadTask, MetadataPayload};
@@ -29,11 +29,13 @@ use crate::download::pipeline::task::{
     DownloadSingleContext, DownloadTaskErrorClass, classify_download_task_error,
     download_single_task, set_file_mtime,
 };
+#[cfg(any(unix, feature = "xmp"))]
+use crate::download::pipeline::test_support::MINIMAL_JPEG;
 #[cfg(feature = "xmp")]
-use crate::download::pipeline::test_support::{MINIMAL_JPEG, sidecar_path_for};
+use crate::download::pipeline::test_support::sidecar_path_for;
 use crate::download::{DownloadConfig, DownloadControls, DownloadReporting};
 use crate::retry::RetryConfig;
-#[cfg(feature = "xmp")]
+#[cfg(any(unix, feature = "xmp"))]
 use crate::state::AssetRecord;
 use crate::state::VersionSizeKey;
 
@@ -189,7 +191,7 @@ fn test_set_file_mtime_nonexistent_file() {
     assert!(set_file_mtime(&p, 0).is_err());
 }
 
-#[cfg(feature = "xmp")]
+#[cfg(any(unix, feature = "xmp"))]
 #[tokio::test]
 async fn different_byte_destination_race_keeps_loser_failed_without_metadata_write() {
     use crate::state::{MediaType, SqliteStateDb};
@@ -224,14 +226,20 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
 
     let dir = TempDir::new().unwrap();
     let download_path = dir.path().join("shared.jpg");
-    let winner_db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
-    let loser_db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+    let winner_db = Arc::new(
+        SqliteStateDb::open(&dir.path().join("winner.db"))
+            .await
+            .unwrap(),
+    );
+    let loser_path = dir.path().join("loser.db");
+    let loser_db = Arc::new(SqliteStateDb::open(&loser_path).await.unwrap());
     let retry = RetryConfig {
         max_retries: 0,
         base_delay_secs: 0,
         max_delay_secs: 0,
     };
     let metadata = MetadataFlags::from(&crate::config::MetadataConfig {
+        #[cfg(feature = "xmp")]
         xmp_sidecar: true,
         ..crate::config::MetadataConfig::default()
     });
@@ -304,7 +312,9 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
     assert_eq!(winner_result.downloaded, 1);
     assert!(winner_result.failed.is_empty());
 
+    #[cfg(feature = "xmp")]
     let sidecar_path = sidecar_path_for(&download_path);
+    #[cfg(feature = "xmp")]
     let winner_sidecar = fs::read(&sidecar_path).expect("winner sidecar must be written");
     let loser_store: Arc<dyn DownloadStore> = loser_db.clone();
     let loser_result = run_download_pass(
@@ -331,6 +341,7 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
     assert_eq!(loser_result.downloaded, 0);
     assert_eq!(loser_result.failed.len(), 1);
     assert_eq!(fs::read(&download_path).unwrap(), winner_body);
+    #[cfg(feature = "xmp")]
     assert_eq!(fs::read(&sidecar_path).unwrap(), winner_sidecar);
     assert_eq!(fs::read(&loser_part_path).unwrap(), loser_body);
     assert!(
@@ -340,15 +351,27 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
             .unwrap()
             .is_empty()
     );
-    let failed = loser_db.get_failed().await.unwrap();
-    assert_eq!(failed.len(), 1);
+    drop(loser_db);
+    let reopened = SqliteStateDb::open(&loser_path).await.unwrap();
     assert!(
-        failed[0]
-            .last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("verified bytes differ")),
-        "collision must remain durable failed work"
+        reopened
+            .get_downloaded_page(0, 10)
+            .await
+            .unwrap()
+            .is_empty()
     );
+    let failed = reopened.get_failed().await.unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].id.as_ref(), "LOSER");
+    let error = failed[0].last_error.as_deref().unwrap();
+    assert!(error.contains("Destination already exists"));
+    assert!(
+        error.contains("cannot establish publication ownership"),
+        "create-only collision must remain durable failed work"
+    );
+    assert_ne!(winner_body, loser_body);
+    assert_eq!(fs::read(&download_path).unwrap(), winner_body);
+    assert_eq!(fs::read(&loser_part_path).unwrap(), loser_body);
 }
 
 #[tokio::test]
