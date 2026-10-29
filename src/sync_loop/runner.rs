@@ -28,6 +28,84 @@ use crate::{
     download, health, make_password_provider, notifications, password, retry, shutdown, state,
 };
 
+/// Revalidate one bounded page after all cycle producers and the metadata tail have joined.
+async fn drain_source_revalidation(
+    libraries: &[&LibraryState],
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    use crate::icloud::photos::{ProviderRecordId, RecordLookupRequest, RecordResolution};
+    for library in libraries {
+        if shutdown.is_cancelled() {
+            break;
+        }
+        if library.plan_is_stale {
+            continue;
+        }
+        let Some(pass) = library
+            .plan
+            .passes
+            .iter()
+            .find(|p| p.kind == crate::commands::PassKind::Unfiled)
+        else {
+            continue;
+        };
+        let Some((capture, scope, _)) = pass.album.download_scope()? else {
+            continue;
+        };
+        let candidates = capture
+            .db
+            .due_source_revalidation(capture.owner.clone(), library.zone_name.clone(), scope)
+            .await?;
+        let requests = candidates
+            .iter()
+            .map(|c| {
+                let id = ProviderRecordId::new(c.id.clone());
+                let master = ProviderRecordId::new(c.master.clone());
+                match &c.child {
+                    Some(child) => RecordLookupRequest::paired(
+                        id,
+                        master,
+                        ProviderRecordId::new(child.clone()),
+                    ),
+                    None => RecordLookupRequest::master_only(id, master),
+                }
+            })
+            .collect::<Vec<_>>();
+        if requests.is_empty() {
+            continue;
+        }
+        let batch = pass.album.resolve_records(&requests).await;
+        let mut resolutions = batch
+            .results
+            .into_iter()
+            .map(|(id, r)| (id.as_str().to_owned(), r))
+            .collect::<std::collections::HashMap<_, _>>();
+        for candidate in candidates {
+            if shutdown.is_cancelled() {
+                break;
+            }
+            let (deleted, live) = match resolutions.remove(&candidate.id) {
+                Some(RecordResolution::Deleted {
+                    deleted_at,
+                    master_family,
+                }) if master_family
+                    || candidate.id != candidate.master
+                    || candidate.owned_child =>
+                {
+                    (Some((master_family, deleted_at)), false)
+                }
+                Some(RecordResolution::Present(_)) => (None, true),
+                _ => (None, false),
+            };
+            capture
+                .db
+                .settle_source_revalidation(capture.owner.clone(), candidate, deleted, live)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Run the sync command: authenticate, enumerate photos, download, and
 /// optionally loop in watch mode.
 pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> anyhow::Result<()> {
@@ -747,6 +825,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     failed = refresh_tail_failures,
                     "Some --refresh-metadata rewrites did not complete; sync will exit non-zero"
                 );
+            }
+            if !shutdown_token.is_cancelled()
+                && !cycle_result.session_expired
+                && refresh_tail_failures == 0
+            {
+                drain_source_revalidation(&cycle_library_states, &shutdown_token).await?;
             }
             super::reporting::record_cycle_run(
                 state_db.as_deref(),

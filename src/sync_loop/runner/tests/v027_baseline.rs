@@ -1415,6 +1415,25 @@ async fn v027_bound_baseline_unaccountable_inventory_keeps_cursor_unset() {
             Box::new(self.clone())
         }
     }
+    #[derive(Clone)]
+    struct ValidEmpty(BaselineSession);
+    #[async_trait::async_trait]
+    impl PhotosSession for ValidEmpty {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/internal/records/query/batch") {
+                return Ok(album_count_response(0));
+            }
+            self.0.post(url, body, headers).await
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
     for record in [
         json!({"recordName":"future-current","recordType":"FuturePhotoRecord","fields":{}}),
         json!({"recordName":"asset-without-master","recordType":"CPLAsset","fields":{}}),
@@ -1430,9 +1449,34 @@ async fn v027_bound_baseline_unaccountable_inventory_keeps_cursor_unset() {
                 .await
                 .unwrap(),
         );
+        let existing = crate::test_helpers::TestAssetRecord::new("existing-master")
+            .library(ZONE)
+            .version_size(crate::state::VersionSizeKey::Original)
+            .filename("old-untouched.JPG")
+            .build();
+        db.upsert_seen(&existing).await.unwrap();
+        db.mark_downloaded(
+            ZONE,
+            "existing-master",
+            "original",
+            &old,
+            "synthetic-local",
+            None,
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping(ZONE, "existing-child", "existing-master")
+            .await
+            .unwrap();
+        assert!(
+            db.claim_legacy_master_state_owner(ZONE, "existing-master", "existing-child")
+                .await
+                .unwrap()
+        );
         db.set_metadata(&format!("sync_token:{ZONE}"), OLD_TOKEN)
             .await
             .unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let provider = InvalidInventory {
             record,
             base: BaselineSession {
@@ -1441,7 +1485,7 @@ async fn v027_bound_baseline_unaccountable_inventory_keeps_cursor_unset() {
                 inventory: Arc::new(Vec::new()),
                 concurrent: Arc::new(Vec::new()),
                 incremental_addition: Arc::new(Vec::new()),
-                requests: Arc::new(Mutex::new(Vec::new())),
+                requests: Arc::clone(&requests),
                 inventory_queries: Arc::new(AtomicUsize::new(0)),
                 inventory_starts: Arc::new(AtomicUsize::new(0)),
                 boundaries: Arc::new(AtomicUsize::new(0)),
@@ -1501,8 +1545,138 @@ async fn v027_bound_baseline_unaccountable_inventory_keeps_cursor_unset() {
                 .as_deref(),
             Some(OLD_TOKEN)
         );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(url, _)| !url.contains("/records/lookup")),
+            "incomplete baseline cannot trigger source lookup"
+        );
+        let owned: (i64, String, String) = {
+            let conn = reopened
+                .acquire_lock("inspect preserved source ownership")
+                .unwrap();
+            conn.query_row("SELECT is_deleted,local_path,local_checksum FROM assets WHERE library=?1 AND id='existing-master' AND version_size='original'", [ZONE], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap()
+        };
+        assert_eq!(
+            owned,
+            (0, old.to_str().unwrap().into(), "synthetic-local".into())
+        );
+        let (active, debt): (i64, i64) = {
+            let conn = reopened
+                .acquire_lock("inspect incomplete source baseline")
+                .unwrap();
+            (
+                conn.query_row(
+                    "SELECT COUNT(*) FROM source_revalidation_rounds WHERE phase='active'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+                conn.query_row("SELECT COUNT(*) FROM source_revalidation_debt", [], |r| {
+                    r.get(0)
+                })
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            active, 0,
+            "unaccountable inventory cannot activate source debt"
+        );
+        assert!(debt > 0, "unfinished source candidates remain durable");
+        let summary = reopened.get_summary().await.unwrap();
+        assert_eq!(summary.source_revalidation_eligible, 0);
+        assert_eq!(summary.source_revalidation_retained, debt as u64);
         assert_eq!(std::fs::read(&old).unwrap(), MEDIA);
         assert_eq!(std::fs::metadata(&old).unwrap().modified().unwrap(), mtime);
+        drop(selected);
+        drop(db);
+        let recovered = Arc::new(reopened);
+        let retry_requests = Arc::new(Mutex::new(Vec::new()));
+        let valid = ValidEmpty(BaselineSession {
+            database: "private",
+            cycle: 0,
+            inventory: Arc::new(Vec::new()),
+            concurrent: Arc::new(Vec::new()),
+            incremental_addition: Arc::new(Vec::new()),
+            requests: Arc::clone(&retry_requests),
+            inventory_queries: Arc::new(AtomicUsize::new(0)),
+            inventory_starts: Arc::new(AtomicUsize::new(0)),
+            boundaries: Arc::new(AtomicUsize::new(0)),
+            changes: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/private".into(),
+            Arc::new(std::collections::HashMap::new()),
+            Box::new(valid),
+            Arc::new(zone()),
+            "private".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+            recovered.clone(),
+            baseline_owner(),
+            "com",
+        ));
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: library.all(),
+            exclude_ids: Default::default(),
+        }];
+        let mut selected = make_run_cycle_library_state_with_passes(ZONE, &key, passes);
+        selected.library = library;
+        let builder = make_run_cycle_download_config_builder(&media, recovered.clone());
+        let result = run_cycle(
+            &[&selected],
+            &make_run_cycle_config(),
+            Some(recovered.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.failed_count, 0,
+            "valid recovery baseline: {result:?}"
+        );
+        assert!(recovered.get_metadata(&key).await.unwrap().is_some());
+        assert!(
+            recovered
+                .get_summary()
+                .await
+                .unwrap()
+                .source_revalidation_eligible
+                > 0
+        );
+        assert_eq!(
+            recovered
+                .get_summary()
+                .await
+                .unwrap()
+                .source_revalidation_retained,
+            0,
+            "superseded unfinished rounds are not pending obligations"
+        );
+        crate::sync_loop::runner::drain_source_revalidation(
+            &[&selected],
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            retry_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(url, _)| url.contains("/records/lookup"))
+        );
+        assert_eq!(std::fs::read(&old).unwrap(), MEDIA);
     }
 }
 
@@ -1813,6 +1987,304 @@ async fn issue1044_confirmed_delta_deletion_survives_unrelated_sparse_hold_after
                 ("original".into(), "downloaded".into(), 1)
             ]
         );
+        for (path, expected) in paths.iter().zip(bytes) {
+            assert_eq!(std::fs::read(path).unwrap(), expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue1044_historical_missed_livephoto_deletion_retries_after_baseline() {
+    historical_source_revalidation_case(false).await;
+}
+
+#[tokio::test]
+async fn issue1044_historical_live_source_settles_after_unknown_and_reopen() {
+    historical_source_revalidation_case(true).await;
+}
+
+async fn historical_source_revalidation_case(live: bool) {
+    #[derive(Clone)]
+    struct DeletionSession {
+        live: bool,
+        cycle: usize,
+        lookups: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for DeletionSession {
+        async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
+            let request: Value = serde_json::from_str(&body)?;
+            let primary = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+            if url.contains("/zones/list") {
+                return Ok(
+                    json!({"zones":[{"zoneID":primary,"syncToken":"baseline-boundary","deleted":false}]}),
+                );
+            }
+            if request["query"]["recordType"] == "CheckIndexingState" {
+                return Ok(
+                    json!({"records":[{"recordName":"index-state","recordType":"CheckIndexingState","fields":{"state":{"value":"FINISHED"}}}]}),
+                );
+            }
+            if url.contains("/internal/records/query/batch") {
+                return Ok(album_count_response(0));
+            }
+            if url.contains("/records/query?") {
+                return Ok(json!({"records":[],"syncToken":"rank-token"}));
+            }
+            if url.contains("/changes/zone?") {
+                let expected = if self.cycle == 0 {
+                    "baseline-boundary"
+                } else {
+                    "baseline-complete"
+                };
+                assert_eq!(request["zones"][0]["syncToken"], expected);
+                return Ok(
+                    json!({"zones":[{"zoneID":primary,"syncToken":"baseline-complete","moreComing":false,"records":[]}]}),
+                );
+            }
+            if url.contains("/records/lookup?") {
+                assert_eq!(request["zoneID"]["zoneName"], "PrimarySync");
+                let mut names: Vec<&str> = request["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|record| record["recordName"].as_str().unwrap())
+                    .collect();
+                names.sort_unstable();
+                assert_eq!(names, vec!["live-child", "live-master"]);
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                if self.cycle == 0 {
+                    return Ok(json!({"records":[
+                        {"recordName":"live-master","serverErrorCode":"RETRY_LATER"},
+                        {"recordName":"live-child","serverErrorCode":"RETRY_LATER"}
+                    ]}));
+                }
+                if self.live {
+                    return Ok(json!({"records":[
+                        {"recordName":"live-master","recordType":"CPLMaster","zoneID":primary,"fields":{
+                            "filenameEnc":{"value":"photo.jpg","type":"STRING"},
+                            "resOriginalRes":{"value":{"downloadURL":"https://synthetic.example/photo.jpg","size":1024,"fileChecksum":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}},
+                            "resOriginalFileType":{"value":"public.jpeg"},"itemType":{"value":"public.jpeg"}}},
+                        {"recordName":"live-child","recordType":"CPLAsset","zoneID":primary,"fields":{
+                            "masterRef":{"value":{"recordName":"live-master","zoneID":primary},"type":"REFERENCE"},
+                            "assetDate":{"value":1700000000000_i64,"type":"TIMESTAMP"}}}
+                    ]}));
+                }
+                return Ok(json!({"records":[
+                    {"recordName":"live-master","recordType":"CPLMaster","zoneID":primary,"fields":{
+                        "isDeleted":{"value":1,"type":"INT64"},"isExpunged":{"value":1,"type":"INT64"},"dateExpunged":{"value":1792541032000_i64,"type":"TIMESTAMP"}}},
+                    {"recordName":"live-child","recordType":"CPLAsset","zoneID":primary,"fields":{
+                        "masterRef":{"value":{"recordName":"live-master"}},"isDeleted":{"value":1,"type":"INT64"},"isExpunged":{"value":1,"type":"INT64"},"dateExpunged":{"value":1792541032000_i64,"type":"TIMESTAMP"}}}
+                ]}));
+            }
+            anyhow::bail!("unexpected synthetic provider endpoint {url}")
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.db");
+    let root = dir.path().join("photos");
+    std::fs::create_dir(&root).unwrap();
+    let paths = [root.join("live.jpg"), root.join("live.mov")];
+    let bytes = [
+        b"synthetic still".as_slice(),
+        b"synthetic motion".as_slice(),
+    ];
+    let config = make_run_cycle_config();
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    for cycle in 0..3 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        if cycle == 0 {
+            for ((version, name), (path, content)) in [
+                (crate::state::VersionSizeKey::Original, "live.jpg"),
+                (crate::state::VersionSizeKey::LiveOriginal, "live.mov"),
+            ]
+            .into_iter()
+            .zip(paths.iter().zip(bytes))
+            {
+                std::fs::write(path, content).unwrap();
+                let record = crate::test_helpers::TestAssetRecord::new("live-master")
+                    .library("PrimarySync")
+                    .version_size(version)
+                    .added_at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap())
+                    .filename(name)
+                    .build();
+                db.upsert_seen(&record).await.unwrap();
+                db.mark_downloaded(
+                    "PrimarySync",
+                    "live-master",
+                    version.as_str(),
+                    path,
+                    "synthetic-local",
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            db.acquire_lock("seed existing verification debt").unwrap().execute(
+                "INSERT INTO asset_verifications(library,id,version_size,state,reason,checked_at) VALUES('PrimarySync','live-master','original','unknown','existing-obligation',1)", [],
+            ).unwrap();
+            db.upsert_asset_master_mapping("PrimarySync", "live-child", "live-master")
+                .await
+                .unwrap();
+            assert!(
+                db.claim_legacy_master_state_owner("PrimarySync", "live-master", "live-child")
+                    .await
+                    .unwrap()
+            );
+        }
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/private".into(),
+            Arc::new(std::collections::HashMap::new()),
+            Box::new(DeletionSession {
+                live,
+                cycle,
+                lookups: Arc::clone(&lookups),
+            }),
+            Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            "private".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            baseline_owner(),
+            "com",
+        ));
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: library.all(),
+            exclude_ids: Arc::default(),
+        }];
+        let mut selected = make_run_cycle_library_state_with_passes(
+            "PrimarySync",
+            "sync_token:v27:PrimarySync",
+            passes,
+        );
+        selected.library = library;
+        let builder = make_run_cycle_download_config_builder(&root, db.clone());
+        let result = run_cycle(
+            &[&selected],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_metadata("sync_token:v27:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("baseline-complete"),
+            "cycle={cycle}: {result:?}"
+        );
+        assert_eq!(result.failed_count, 0, "{result:?}");
+        assert!(
+            db.get_metadata("observed_selection:v27:PrimarySync")
+                .await
+                .unwrap()
+                .is_some(),
+            "the new baseline must have a durable selection proof"
+        );
+        let mut stale = make_run_cycle_library_state_with_passes(
+            "StaleSync",
+            "sync_token:v27:StaleSync",
+            Vec::new(),
+        );
+        stale.plan_is_stale = true;
+        crate::sync_loop::runner::drain_source_revalidation(
+            &[&stale, &selected],
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        drop(selected);
+        drop(db);
+        let reopened = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .get_metadata("sync_token:v27:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("baseline-complete")
+        );
+        let conn = reopened.acquire_lock("inspect synthetic deletion").unwrap();
+        let existing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_verifications WHERE reason='existing-obligation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(existing, 1);
+        if cycle == 2 {
+            assert_eq!(lookups.load(Ordering::SeqCst), 2);
+        }
+        let mut stmt = conn.prepare("SELECT version_size,status,is_deleted FROM assets WHERE library='PrimarySync' AND id='live-master' ORDER BY version_size").unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        if cycle == 0 {
+            assert!(rows.iter().all(|row| row.2 == 0));
+            let debt: i64 = conn
+                .query_row("SELECT COUNT(*) FROM source_revalidation_debt", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(debt, 1);
+            conn.execute("UPDATE source_revalidation_debt SET next_retry_at=0", [])
+                .unwrap();
+        } else {
+            let remaining: i64 = conn
+                .query_row("SELECT COUNT(*) FROM source_revalidation_debt", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                remaining, 0,
+                "confirmed live or deleted evidence must settle the debt"
+            );
+            assert_eq!(
+                rows,
+                vec![
+                    (
+                        "live_original".into(),
+                        "downloaded".into(),
+                        i64::from(!live)
+                    ),
+                    ("original".into(), "downloaded".into(), i64::from(!live))
+                ]
+            );
+            assert!(
+                lookups.load(Ordering::SeqCst) > 0,
+                "provider deletion must be confirmed"
+            );
+        }
         for (path, expected) in paths.iter().zip(bytes) {
             assert_eq!(std::fs::read(path).unwrap(), expected);
         }

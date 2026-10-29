@@ -1461,6 +1461,42 @@ pub(crate) async fn run_cycle(
         } else {
             None
         };
+        if let Some(boundary) = &baseline_cursor_at_start
+            && !lib_state.plan_is_stale
+            && let [pass] = lib_state.plan.passes.as_slice()
+            && pass.kind == crate::commands::PassKind::Unfiled
+            && pass.exclude_ids.is_empty()
+            && pass.album.has_collection_independent_rank()
+            && download_config.media.is_all()
+            && download_config.recent.is_none()
+            && download_config.skip_created_before.is_none()
+            && download_config.skip_created_after.is_none()
+            && download_config.filename_exclude.is_empty()
+            && !config.runtime.dry_run
+            && let Some((capture, scope, _)) = pass.album.download_scope()?
+        {
+            use sha2::{Digest, Sha256};
+            let expected_db = state_db
+                .ok_or_else(|| anyhow::anyhow!("Source revalidation requires durable state"))?;
+            anyhow::ensure!(
+                std::ptr::addr_eq(
+                    expected_db,
+                    capture.db.as_ref() as &dyn download::DownloadStore
+                ),
+                "Source revalidation database context mismatch"
+            );
+            capture
+                .db
+                .seed_source_revalidation(
+                    capture.owner,
+                    lib_state.zone_name.clone(),
+                    scope,
+                    enum_config_hash.clone(),
+                    format!("{:x}", Sha256::digest(boundary.as_bytes())),
+                    shutdown_token.clone(),
+                )
+                .await?;
+        }
         // FINISHED is a prerequisite, not proof that this inventory remained
         // complete. Deletion-capable maintenance stays deferred until the
         // full scope and its final readiness check have qualified.

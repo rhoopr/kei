@@ -344,6 +344,8 @@ struct Descriptor {
     policy: [Option<String>; 2],
     admission_hash: String,
     proof_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revalidation_round: Option<String>,
 }
 fn metadata(conn: &Connection, key: &str) -> Result<Option<String>, StateError> {
     Ok(conn
@@ -405,6 +407,21 @@ fn valid(conn: &Connection, key: &str, token: &str) -> Result<Option<Descriptor>
     value.proof_hash = saved;
     Ok(Some(value))
 }
+pub(in crate::state::db) fn revalidation_scope_current(
+    conn: &Connection,
+    library: &str,
+    scope: &str,
+    enum_hash: &str,
+) -> Result<bool, StateError> {
+    let Some(token) = metadata(conn, &format!("sync_token:v27:{library}"))? else {
+        return Ok(false);
+    };
+    let Some(saved) = valid(conn, &format!("{ACTIVE}{library}"), &token)? else {
+        return Ok(false);
+    };
+    Ok(saved.policy[0].as_deref() == Some(enum_hash)
+        && saved.plans.iter().any(|p| p.scope == scope))
+}
 fn store(conn: &Connection, key: &str, mut value: Descriptor) -> Result<(), StateError> {
     value.proof_hash.clear();
     value.proof_hash = digest(&encode(&value)?);
@@ -432,6 +449,46 @@ pub(in crate::state::db) fn invalidate(
 
 /// Prepared before token writes; applied inside that same transaction afterward.
 pub(in crate::state::db) struct Prepared(Vec<(String, Descriptor)>);
+impl Prepared {
+    /// Do not advance a matching baseline cursor while its candidate round lacks
+    /// the completed baseline proof that would make it retryable.
+    pub(in crate::state::db) fn guard_revalidation(
+        &self,
+        conn: &Connection,
+        updates: &[(String, String)],
+        expected: &[(String, Option<String>)],
+    ) -> Result<(), StateError> {
+        for (key, _) in updates {
+            let Some(zone) = super::super::legacy_preservation::checkpoint_library(key) else {
+                continue;
+            };
+            for (key, value) in expected {
+                if !key.starts_with("baseline_cursor:v27:") {
+                    continue;
+                }
+                let Some(boundary) = value else {
+                    continue;
+                };
+                let hash = digest(boundary.as_bytes());
+                let candidates: Vec<String> = conn.prepare("SELECT r.id FROM source_revalidation_rounds r WHERE r.library=?1 AND r.boundary=?2 AND r.enum_hash=COALESCE((SELECT value FROM metadata WHERE key='pending_enum_config_hash'),(SELECT value FROM metadata WHERE key='enum_config_hash')) AND (r.phase='marking' OR (r.phase='observing' AND EXISTS(SELECT 1 FROM source_revalidation_debt d WHERE d.round=r.id)))")?
+                    .query_map(params![zone,hash], |r| r.get(0))?.collect::<Result<_,_>>()?;
+                if !candidates.is_empty()
+                    && !self.0.iter().any(|(_, d)| {
+                        d.revalidation_round
+                            .as_ref()
+                            .is_some_and(|id| candidates.contains(id))
+                    })
+                {
+                    return Err(StateError::Invariant {
+                        operation: "commit_checkpoint_transition",
+                        detail: "baseline source revalidation lacks completed proof".to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
 pub(in crate::state::db) fn prepare(
     conn: &Connection,
     updates: &[(String, String)],
@@ -500,6 +557,11 @@ pub(in crate::state::db) fn prepare(
         Kind::Baseline { prior, next } => (prior, next, true),
         _ => return Ok(Prepared(out)),
     };
+    let revalidation_round: Option<String> = if baseline {
+        conn.query_row("SELECT id FROM source_revalidation_rounds WHERE library=?1 AND scope=?2 AND enum_hash=?3 AND boundary=?4 AND phase='observing' ORDER BY id LIMIT 1", params![zone, first.plan.scope, first.policy[0], prior], |r| r.get(0)).optional()?
+    } else {
+        None
+    };
     for (key, token) in updates {
         let Some(target) = descriptor_key(key) else {
             continue;
@@ -509,6 +571,7 @@ pub(in crate::state::db) fn prepare(
         {
             continue;
         }
+        let mut round = revalidation_round.clone();
         if !baseline {
             let mut predecessor = false;
             for token_key in [key.clone(), format!("sync_token:v27:{zone}")] {
@@ -519,6 +582,19 @@ pub(in crate::state::db) fn prepare(
                     && saved.plans == plans
                 {
                     predecessor = true;
+                    if old_key == target
+                        && target.starts_with(STAGED)
+                        && let Some(saved_round) = saved.revalidation_round
+                    {
+                        let observing: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM source_revalidation_rounds WHERE id=?1 AND library=?2 AND phase='observing')", params![saved_round,zone], |r| r.get(0))?;
+                        if !observing {
+                            return Err(StateError::Invariant {
+                                operation: "commit_checkpoint_transition",
+                                detail: "staged baseline source revalidation round changed".into(),
+                            });
+                        }
+                        round = Some(saved_round);
+                    }
                 }
             }
             if !predecessor {
@@ -538,6 +614,7 @@ pub(in crate::state::db) fn prepare(
                 policy: first.policy.clone(),
                 admission_hash: digest(&encode(&(&proof.base, &proof.supplemental))?),
                 proof_hash: String::new(),
+                revalidation_round: round,
             },
         ));
     }
@@ -545,7 +622,24 @@ pub(in crate::state::db) fn prepare(
 }
 pub(in crate::state::db) fn apply(conn: &Connection, prepared: Prepared) -> Result<(), StateError> {
     for (key, value) in prepared.0 {
+        if value.policy != policy(conn)? && value.revalidation_round.is_some() {
+            return Err(StateError::Invariant {
+                operation: "commit_checkpoint_transition",
+                detail: "baseline source revalidation policy changed".into(),
+            });
+        }
         if value.policy == policy(conn)? {
+            if key.starts_with(ACTIVE)
+                && let Some(round) = &value.revalidation_round
+            {
+                let activated = conn.execute("UPDATE source_revalidation_rounds SET phase='active' WHERE id=?1 AND library=?2 AND phase='observing'", params![round, value.library])?;
+                if activated != 1 {
+                    return Err(StateError::Invariant {
+                        operation: "commit_checkpoint_transition",
+                        detail: "baseline source revalidation round changed".into(),
+                    });
+                }
+            }
             store(conn, &key, value)?;
         }
     }

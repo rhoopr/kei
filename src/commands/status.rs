@@ -52,6 +52,18 @@ pub(crate) async fn run_status(
         "  Awaiting provider verification: {}",
         summary.awaiting_provider_verification
     );
+    if summary.source_revalidation_eligible > 0 {
+        println!(
+            "  Source revalidation obligations: {}",
+            summary.source_revalidation_eligible
+        );
+    }
+    if summary.source_revalidation_retained > 0 {
+        println!(
+            "  Retained source obligations not yet eligible: {}",
+            summary.source_revalidation_retained
+        );
+    }
     println!();
     println!(
         "Provider checkpoint: {}",
@@ -345,6 +357,18 @@ pub(crate) fn backup_status_line(summary: &state::types::SyncSummary) -> String 
         reasons.push(format!(
             "{} awaiting provider verification",
             count_phrase(summary.awaiting_provider_verification, "asset")
+        ));
+    }
+    if summary.source_revalidation_eligible > 0 {
+        reasons.push(format!(
+            "{} awaiting source verification",
+            count_phrase(summary.source_revalidation_eligible, "source obligation")
+        ));
+    }
+    if summary.source_revalidation_retained > 0 {
+        reasons.push(format!(
+            "{} retained for later source verification",
+            count_phrase(summary.source_revalidation_retained, "source obligation")
         ));
     }
     let unattributed: u64 = summary

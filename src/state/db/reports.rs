@@ -249,6 +249,7 @@ impl SqliteStateDb {
                 )
                 .map(|count| u64::try_from(count).unwrap_or(0))
                 .map_err(|e| StateError::query("get_summary::provider_verification", e))?;
+            let (source_revalidation_eligible, source_revalidation_retained) = super::source_revalidation::summary_counts(conn)?;
             let oldest_provider_verification_at = conn
                 .query_row(
                     "SELECT MIN(verification.checked_at) FROM asset_verifications AS verification \
@@ -478,6 +479,8 @@ impl SqliteStateDb {
                 policy_excluded,
                 failed,
                 awaiting_provider_verification,
+                source_revalidation_eligible,
+                source_revalidation_retained,
                 source_deleted,
                 oldest_provider_verification_at,
                 provider_checkpoint_status,
@@ -744,11 +747,11 @@ impl ReportStateStore for SqliteStateDb {
     async fn has_download_retry_work(&self, library: &str) -> Result<bool, StateError> {
         let library = library.to_owned();
         self.with_conn("has_download_retry_work", move |conn| {
-            conn.query_row(
+            let pending: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND is_deleted=0 AND status IN ('pending','failed'))",
-                [library],
-                |row| row.get(0),
-            ).map_err(|error| StateError::query("has_download_retry_work", error))
+                [&library], |row| row.get(0),
+            ).map_err(|error| StateError::query("has_download_retry_work", error))?;
+            Ok(pending || super::source_revalidation::has_due(conn, &library)?)
         }).await
     }
 

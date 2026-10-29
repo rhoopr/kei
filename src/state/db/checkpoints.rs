@@ -147,6 +147,11 @@ impl SqliteStateDb {
                 proof.as_ref(),
                 promote,
             )?;
+            prepared_observation.guard_revalidation(
+                &tx,
+                &transition.metadata_updates,
+                &transition.expected_metadata,
+            )?;
             let changed_keys = transition
                 .metadata_updates
                 .iter()

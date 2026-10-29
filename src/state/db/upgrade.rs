@@ -73,6 +73,171 @@ mod tests {
     use crate::state::schema;
     use rusqlite::Connection;
 
+    fn synthetic_owner() -> crate::state::db::account::AccountOwner {
+        crate::state::db::account::AccountOwner::authenticated(
+            "schema-test@example.invalid",
+            "com",
+            &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"schema-test"}})).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn source_revalidation_v39_owned_upgrade_preserves_and_reopens() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let media = root.path().join("original.jpg");
+        std::fs::write(&media, b"synthetic original").unwrap();
+        let owner = synthetic_owner();
+        let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
+            .await
+            .unwrap();
+        let downloaded = crate::test_helpers::TestAssetRecord::new("downloaded")
+            .library("PrimarySync")
+            .build();
+        let pending = crate::test_helpers::TestAssetRecord::new("pending")
+            .library("PrimarySync")
+            .build();
+        db.upsert_seen(&downloaded).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "downloaded",
+            "original",
+            &media,
+            "retained-local",
+            Some("retained-source"),
+        )
+        .await
+        .unwrap();
+        db.upsert_seen(&pending).await.unwrap();
+        db.set_asset_verification(
+            "PrimarySync",
+            "pending",
+            "original",
+            crate::state::AssetVerificationState::Unknown,
+            "retained unknown",
+        )
+        .await
+        .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "retained-cursor")
+            .await
+            .unwrap();
+        db.set_metadata("pending_download_config_hash", "retained-work")
+            .await
+            .unwrap();
+        {
+            let conn = db.acquire_lock("seed synthetic path receipt").unwrap();
+            conn.execute("INSERT OR REPLACE INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum) VALUES('PrimarySync','downloaded','original',?1,'retained-provider','retained-local','retained-source')", [media.to_str().unwrap()]).unwrap();
+        }
+        drop(db);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE source_revalidation_debt; DROP TABLE source_revalidation_rounds; PRAGMA user_version=39;").unwrap();
+        drop(conn);
+        for _ in 0..2 {
+            let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .unwrap();
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("retained-cursor")
+            );
+            assert_eq!(
+                db.get_metadata("pending_download_config_hash")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("retained-work")
+            );
+            let summary = db.get_summary().await.unwrap();
+            assert_eq!(
+                (
+                    summary.downloaded,
+                    summary.pending,
+                    summary.awaiting_provider_verification
+                ),
+                (1, 1, 1)
+            );
+            assert_eq!(
+                (
+                    summary.source_revalidation_eligible,
+                    summary.source_revalidation_retained
+                ),
+                (0, 0)
+            );
+            let conn = db.acquire_lock("inspect synthetic v39 upgrade").unwrap();
+            assert_eq!(schema::get_schema_version(&conn).unwrap(), 40);
+            let row: (String, String, Option<String>) = conn.query_row("SELECT local_path,local_checksum,download_checksum FROM assets WHERE library='PrimarySync' AND id='downloaded' AND version_size='original'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+            assert_eq!(
+                row,
+                (
+                    media.to_str().unwrap().into(),
+                    "retained-local".into(),
+                    Some("retained-source".into())
+                )
+            );
+            let receipt: (String, String, String, String) = conn.query_row("SELECT local_path,provider_checksum,local_checksum,download_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='downloaded' AND version_size='original'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+            assert_eq!(
+                receipt,
+                (
+                    media.to_str().unwrap().into(),
+                    "retained-provider".into(),
+                    "retained-local".into(),
+                    "retained-source".into()
+                )
+            );
+            let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('source_revalidation_rounds','source_revalidation_debt')", [], |row| row.get(0)).unwrap();
+            assert_eq!(tables, 2);
+            drop(conn);
+            drop(db);
+            assert_eq!(std::fs::read(&media).unwrap(), b"synthetic original");
+        }
+    }
+
+    #[tokio::test]
+    async fn source_revalidation_v39_upgrade_failure_rolls_back() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let owner = synthetic_owner();
+        let db = crate::state::SqliteStateDb::open_owned(&path, &owner)
+            .await
+            .unwrap();
+        db.set_metadata("sync_token:PrimarySync", "retained-cursor")
+            .await
+            .unwrap();
+        drop(db);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE source_revalidation_debt; DROP TABLE source_revalidation_rounds; CREATE TABLE source_revalidation_debt(unrecognized TEXT); INSERT INTO source_revalidation_debt VALUES('retain-me'); PRAGMA user_version=39;").unwrap();
+        drop(conn);
+        assert!(
+            crate::state::SqliteStateDb::open_owned(&path, &owner)
+                .await
+                .is_err()
+        );
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(schema::get_schema_version(&conn).unwrap(), 39);
+        let rounds: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='source_revalidation_rounds'", [], |row| row.get(0)).unwrap();
+        assert_eq!(rounds, 0);
+        let retained: String = conn
+            .query_row(
+                "SELECT unrecognized FROM source_revalidation_debt",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, "retain-me");
+        let token: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(token, "retained-cursor");
+    }
+
     #[test]
     fn v027_upgrade_snapshot_preserves_wal_work_and_original_schema() {
         let root = tempfile::tempdir().unwrap();

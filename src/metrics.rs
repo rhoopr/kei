@@ -1317,6 +1317,8 @@ mod tests {
             policy_excluded: 0,
             failed,
             awaiting_provider_verification: 0,
+            source_revalidation_eligible: 0,
+            source_revalidation_retained: 0,
             source_deleted: 0,
             oldest_provider_verification_at: None,
             provider_checkpoint_status: None,

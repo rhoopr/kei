@@ -631,6 +631,10 @@ pub struct SyncSummary {
     pub failed: u64,
     /// Pending or failed rows whose targeted provider lookup was inconclusive.
     pub awaiting_provider_verification: u64,
+    /// Baseline source-check obligations in a currently eligible scope.
+    pub(crate) source_revalidation_eligible: u64,
+    /// Active source-check obligations retained under an ineligible scope or policy.
+    pub(crate) source_revalidation_retained: u64,
     /// Provider-confirmed deletions retained as catalog history.
     pub source_deleted: u64,
     /// Oldest unresolved targeted provider verification.

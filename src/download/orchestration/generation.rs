@@ -1508,6 +1508,7 @@ impl SelectionRun {
                 destinations,
             },
         };
+        let freshly_confirmed = fresh.is_some();
         let projection = self
             .capture
             .db
@@ -1520,6 +1521,17 @@ impl SelectionRun {
                 MAX_GENERATION_BYTES,
             )
             .await?;
+        if freshly_confirmed {
+            self.capture
+                .db
+                .source_revalidation_seen(
+                    self.capture.owner.clone(),
+                    config.library.to_string(),
+                    self.root.spec.scope.clone(),
+                    asset.state_id().to_owned(),
+                )
+                .await?;
+        }
         if !projection.admitted && manifest.decision.outcome != SelectionOutcome::Excluded {
             tracing::debug!(reason = %projection.reason, "Selection destination admission deferred");
             if self.root.spec.format == 1 {

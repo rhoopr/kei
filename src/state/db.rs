@@ -38,6 +38,7 @@ pub(crate) use legacy_preservation::{LegacyActivationProof, LegacyFileEvidence};
 pub(crate) mod primary_layout;
 mod reconciliation;
 mod reports;
+pub(crate) mod source_revalidation;
 mod sparse_identity;
 pub(crate) mod support;
 pub(crate) use metadata_capture_retry::MetadataCaptureRetryGeneration;

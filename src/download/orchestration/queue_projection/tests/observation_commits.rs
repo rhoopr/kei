@@ -450,3 +450,481 @@ async fn observation_resume_requires_exact_plans_and_current_policy_after_reopen
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn staged_baseline_revalidation_survives_delta_and_reopen() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    db.set_metadata("pending_enum_config_hash", "next-enum")
+        .await
+        .unwrap();
+    db.set_metadata("pending_download_config_hash", "next-path")
+        .await
+        .unwrap();
+    let mut selected = spec();
+    selected.profile["current_download_metadata"] = serde_json::json!(1);
+    let boundary = format!("{:x}", Sha256::digest(b"before"));
+    {
+        let conn = db.acquire_lock("synthetic baseline round").unwrap();
+        conn.execute("INSERT INTO source_revalidation_rounds VALUES('round','PrimarySync',?1,'next-enum',?2,'','','observing')", rusqlite::params![selected.scope, boundary]).unwrap();
+    }
+    let root = db
+        .begin_selection_generation(owner(), selected.clone(), BUDGET)
+        .await
+        .unwrap();
+    admission(&db, &root.id, &dir.path().join("media"), 0, false, BUDGET).await;
+    let receipt = db
+        .seal_observed_selection(owner(), root.id, true, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let baseline = ObservationProof::inventory(vec![receipt.clone()])
+        .unwrap()
+        .bridge(
+            ObservationProof::delivery(receipt.clone())
+                .delta("before", "after")
+                .unwrap(),
+            "before",
+        )
+        .unwrap();
+    let staged = "pending_sync_token:v27:next-enum:PrimarySync";
+    let mut save = transition(&db, "after").await;
+    save.metadata_updates[0].0 = staged.into();
+    save.expected_metadata.push((staged.into(), None));
+    db.commit_observation_transition(save, Some(baseline), false)
+        .await
+        .unwrap();
+    drop(db);
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    let delta = ObservationProof::delivery(receipt)
+        .delta("after", "quiet")
+        .unwrap();
+    let mut advance = transition(&db, "quiet").await;
+    advance.metadata_updates[0].0 = staged.into();
+    advance
+        .expected_metadata
+        .push((staged.into(), Some("after".into())));
+    db.commit_observation_transition(advance, Some(delta), false)
+        .await
+        .unwrap();
+    let mut promote = transition(&db, "quiet").await;
+    promote.metadata_updates.extend([
+        ("enum_config_hash".into(), "next-enum".into()),
+        ("config_hash".into(), "next-path".into()),
+    ]);
+    promote.metadata_deletes = vec![
+        "pending_enum_config_hash".into(),
+        "pending_download_config_hash".into(),
+        staged.into(),
+    ];
+    promote
+        .expected_metadata
+        .push((staged.into(), Some("quiet".into())));
+    db.commit_observation_transition(promote, None, true)
+        .await
+        .unwrap();
+    drop(db);
+    let reopened = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+        .await
+        .unwrap();
+    {
+        let conn = reopened
+            .acquire_lock("verify promoted source round")
+            .unwrap();
+        let phase: String = conn
+            .query_row(
+                "SELECT phase FROM source_revalidation_rounds WHERE id='round'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "active");
+    }
+
+    // Seed more than two real due pages. Unknown results must yield to later
+    // candidates, and an authenticated live result settles only its own debt.
+    for index in 0..130 {
+        let id = format!("candidate-{index:03}");
+        let media = dir.path().join(&id);
+        std::fs::write(&media, b"preserved media").unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new(&id)
+            .library("PrimarySync")
+            .build();
+        reopened.upsert_seen(&record).await.unwrap();
+        reopened
+            .mark_downloaded("PrimarySync", &id, "original", &media, "synthetic", None)
+            .await
+            .unwrap();
+        if index == 128 {
+            reopened
+                .upsert_asset_master_mapping("PrimarySync", &id, "candidate-master")
+                .await
+                .unwrap();
+        }
+    }
+    {
+        let conn = reopened.acquire_lock("seed multiple source pages").unwrap();
+        for index in 0..130 {
+            conn.execute(
+                "INSERT INTO source_revalidation_debt(round,id) VALUES('round',?1)",
+                [format!("candidate-{index:03}")],
+            )
+            .unwrap();
+        }
+    }
+    // Status keeps existing per-rendition verification separate from source
+    // obligations, and distinguishes retained stale scopes and policies.
+    let verification = crate::test_helpers::TestAssetRecord::new("existing-verification")
+        .library("PrimarySync")
+        .build();
+    reopened.upsert_seen(&verification).await.unwrap();
+    reopened
+        .set_asset_verification(
+            "PrimarySync",
+            "existing-verification",
+            "original",
+            crate::state::AssetVerificationState::Unknown,
+            "synthetic inconclusive lookup",
+        )
+        .await
+        .unwrap();
+    {
+        let conn = reopened.acquire_lock("seed status scope drift").unwrap();
+        conn.execute("INSERT INTO source_revalidation_rounds VALUES('stale-scope','PrimarySync','other-scope','next-enum','stale-boundary','','','active')", []).unwrap();
+        conn.execute("INSERT INTO source_revalidation_rounds VALUES('stale-policy','PrimarySync',?1,'old-enum','stale-boundary','','','active')", [&selected.scope]).unwrap();
+        conn.execute("INSERT INTO source_revalidation_debt(round,id) VALUES('stale-scope','same-asset'),('stale-policy','same-asset')", []).unwrap();
+        conn.execute("UPDATE source_revalidation_debt SET next_retry_at=?1 WHERE round='round' AND id='candidate-129'", [chrono::Utc::now().timestamp()+3600]).unwrap();
+    }
+    let summary = reopened.get_summary().await.unwrap();
+    assert_eq!(summary.awaiting_provider_verification, 1);
+    assert_eq!(summary.source_revalidation_eligible, 130);
+    assert_eq!(summary.source_revalidation_retained, 2);
+    {
+        let conn = reopened
+            .acquire_lock("check pending policy and deferred reporting")
+            .unwrap();
+        conn.execute_batch("SAVEPOINT synthetic_policy_drift; INSERT INTO metadata(key,value) VALUES('pending_enum_config_hash','different-policy');").unwrap();
+        assert_eq!(
+            crate::state::db::source_revalidation::summary_counts(&conn).unwrap(),
+            (0, 132)
+        );
+        assert!(!crate::state::db::source_revalidation::has_due(&conn, "PrimarySync").unwrap());
+        conn.execute_batch("ROLLBACK TO synthetic_policy_drift; RELEASE synthetic_policy_drift;")
+            .unwrap();
+        conn.execute("UPDATE source_revalidation_debt SET next_retry_at=0 WHERE round='round' AND id='candidate-129'", []).unwrap();
+    }
+    assert!(
+        reopened
+            .due_source_revalidation(owner(), "PrimarySync".into(), "different-scope".into())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    for page in 0..3 {
+        let due = reopened
+            .due_source_revalidation(owner(), "PrimarySync".into(), selected.scope.clone())
+            .await
+            .unwrap();
+        assert_eq!(due.len(), if page < 2 { 64 } else { 2 });
+        for candidate in due {
+            let is_live = candidate.id == "candidate-128";
+            assert!(
+                reopened
+                    .settle_source_revalidation(owner(), candidate, None, is_live)
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+    assert!(
+        reopened
+            .due_source_revalidation(owner(), "PrimarySync".into(), selected.scope.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("candidate-128")).unwrap(),
+        b"preserved media"
+    );
+    // A legacy owner's mapping may move while another sibling remains under
+    // the old master. That sibling must never settle the owner's debt.
+    let legacy_path = dir.path().join("legacy-owner");
+    std::fs::write(&legacy_path, b"legacy bytes").unwrap();
+    let legacy = crate::test_helpers::TestAssetRecord::new("legacy-master")
+        .library("PrimarySync")
+        .build();
+    reopened.upsert_seen(&legacy).await.unwrap();
+    reopened
+        .mark_downloaded(
+            "PrimarySync",
+            "legacy-master",
+            "original",
+            &legacy_path,
+            "synthetic",
+            None,
+        )
+        .await
+        .unwrap();
+    reopened
+        .upsert_asset_master_mapping("PrimarySync", "owner-child", "legacy-master")
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .claim_legacy_master_state_owner("PrimarySync", "legacy-master", "owner-child")
+            .await
+            .unwrap()
+    );
+    reopened
+        .upsert_asset_master_mapping("PrimarySync", "owner-child", "new-master")
+        .await
+        .unwrap();
+    reopened
+        .upsert_asset_master_mapping("PrimarySync", "other-child", "legacy-master")
+        .await
+        .unwrap();
+    {
+        let conn = reopened.acquire_lock("seed conflicted owner debt").unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id) VALUES('round','legacy-master')",
+            [],
+        )
+        .unwrap();
+    }
+    let mut due = reopened
+        .due_source_revalidation(owner(), "PrimarySync".into(), selected.scope.clone())
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    let conflicted = due.pop().unwrap();
+    assert_eq!(conflicted.id, "legacy-master");
+    assert!(conflicted.child.is_none());
+    assert!(!conflicted.owned_child);
+    reopened
+        .settle_source_revalidation(owner(), conflicted, None, true)
+        .await
+        .unwrap();
+    {
+        let conn = reopened
+            .acquire_lock("verify conflicted owner is pending")
+            .unwrap();
+        let pending:bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM source_revalidation_debt WHERE round='round' AND id='legacy-master')", [], |r| r.get(0)).unwrap();
+        assert!(pending);
+        conn.execute(
+            "UPDATE source_revalidation_debt SET next_retry_at=0 WHERE id='legacy-master'",
+            [],
+        )
+        .unwrap();
+    }
+    reopened
+        .upsert_asset_master_mapping("PrimarySync", "owner-child", "legacy-master")
+        .await
+        .unwrap();
+    let mut due = reopened
+        .due_source_revalidation(owner(), "PrimarySync".into(), selected.scope.clone())
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    let owned = due.pop().unwrap();
+    assert_eq!(owned.child.as_deref(), Some("owner-child"));
+    assert!(owned.owned_child);
+    reopened
+        .settle_source_revalidation(owner(), owned, None, true)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(legacy_path).unwrap(), b"legacy bytes");
+
+    // A unique mapped sibling is still insufficient to identify an unowned
+    // master-keyed row. Its live result stays pending until owner evidence exists.
+    let unowned_path = dir.path().join("unowned-master");
+    std::fs::write(&unowned_path, b"unowned bytes").unwrap();
+    let unowned = crate::test_helpers::TestAssetRecord::new("unowned-master")
+        .library("PrimarySync")
+        .build();
+    reopened.upsert_seen(&unowned).await.unwrap();
+    reopened
+        .mark_downloaded(
+            "PrimarySync",
+            "unowned-master",
+            "original",
+            &unowned_path,
+            "synthetic",
+            None,
+        )
+        .await
+        .unwrap();
+    reopened
+        .upsert_asset_master_mapping("PrimarySync", "unowned-sibling", "unowned-master")
+        .await
+        .unwrap();
+    {
+        let conn = reopened.acquire_lock("seed unowned source debt").unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id) VALUES('round','unowned-master')",
+            [],
+        )
+        .unwrap();
+    }
+    let mut due = reopened
+        .due_source_revalidation(owner(), "PrimarySync".into(), selected.scope.clone())
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    let unowned_candidate = due.pop().unwrap();
+    assert!(unowned_candidate.child.is_none());
+    assert!(!unowned_candidate.owned_child);
+    reopened
+        .settle_source_revalidation(owner(), unowned_candidate, Some((false, None)), false)
+        .await
+        .unwrap();
+    {
+        let conn = reopened.acquire_lock("retry unowned source debt").unwrap();
+        let deleted: i64 = conn
+            .query_row(
+                "SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id='unowned-master'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted, 0);
+        conn.execute(
+            "UPDATE source_revalidation_debt SET next_retry_at=0 WHERE id='unowned-master'",
+            [],
+        )
+        .unwrap();
+    }
+    let mut due = reopened
+        .due_source_revalidation(owner(), "PrimarySync".into(), selected.scope.clone())
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    reopened
+        .settle_source_revalidation(owner(), due.pop().unwrap(), None, true)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(unowned_path).unwrap(), b"unowned bytes");
+    {
+        let conn = reopened.acquire_lock("verify fair source pages").unwrap();
+        let (count,status,deleted):(i64,String,i64) = conn.query_row("SELECT (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='round'), status,is_deleted FROM assets WHERE library='PrimarySync' AND id='candidate-128'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!((count, status.as_str(), deleted), (130, "downloaded", 0));
+        conn.execute(
+            "UPDATE source_revalidation_debt SET next_retry_at=0 WHERE id='candidate-129'",
+            [],
+        )
+        .unwrap();
+    }
+    let mut selected_before_drift = reopened
+        .due_source_revalidation(owner(), "PrimarySync".into(), selected.scope.clone())
+        .await
+        .unwrap();
+    assert_eq!(selected_before_drift.len(), 1);
+    let candidate_before_drift = selected_before_drift.pop().unwrap();
+    reopened
+        .set_metadata("enum_config_hash", "changed-policy")
+        .await
+        .unwrap();
+    assert!(
+        !reopened
+            .settle_source_revalidation(owner(), candidate_before_drift, Some((true, None)), false)
+            .await
+            .unwrap()
+    );
+    assert!(
+        reopened
+            .due_source_revalidation(owner(), "PrimarySync".into(), selected.scope.clone())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    {
+        let conn = reopened
+            .acquire_lock("verify scope drift keeps debt")
+            .unwrap();
+        let (count,deleted):(i64,i64) = conn.query_row("SELECT (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='round'), is_deleted FROM assets WHERE library='PrimarySync' AND id='candidate-129'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!((count, deleted), (130, 0));
+    }
+    let summary = reopened.get_summary().await.unwrap();
+    assert_eq!(summary.awaiting_provider_verification, 1);
+    assert_eq!(summary.source_revalidation_eligible, 0);
+    assert_eq!(summary.source_revalidation_retained, 132);
+}
+
+#[tokio::test]
+async fn source_revalidation_interrupted_marking_cannot_advance_without_baseline_proof() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
+    db.set_metadata("enum_config_hash", "policy").await.unwrap();
+    let baseline_key = "baseline_cursor:v27:synthetic:policy:";
+    db.set_metadata(baseline_key, "before").await.unwrap();
+    let record = crate::test_helpers::TestAssetRecord::new("historical")
+        .library("PrimarySync")
+        .build();
+    db.upsert_seen(&record).await.unwrap();
+    db.mark_downloaded(
+        "PrimarySync",
+        "historical",
+        "original",
+        &dir.path().join("historical"),
+        "synthetic",
+        None,
+    )
+    .await
+    .unwrap();
+    let boundary = format!("{:x}", Sha256::digest(b"before"));
+    let cancelled = tokio_util::sync::CancellationToken::new();
+    cancelled.cancel();
+    db.seed_source_revalidation(
+        owner(),
+        "PrimarySync".into(),
+        "scope".into(),
+        "policy".into(),
+        boundary.clone(),
+        cancelled,
+    )
+    .await
+    .unwrap();
+    let mut attempt = transition(&db, "after").await;
+    attempt
+        .expected_metadata
+        .push((baseline_key.into(), Some("before".into())));
+    assert!(
+        db.commit_observation_transition(attempt.clone(), None, false)
+            .await
+            .is_err()
+    );
+    drop(db);
+    let db = Arc::new(SqliteStateDb::open_owned(&path, &owner()).await.unwrap());
+    db.seed_source_revalidation(
+        owner(),
+        "PrimarySync".into(),
+        "scope".into(),
+        "policy".into(),
+        boundary,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        db.commit_observation_transition(attempt, None, false)
+            .await
+            .is_err()
+    );
+    {
+        let conn = db.acquire_lock("verify resumed candidate marking").unwrap();
+        let (rounds, phase, debt): (i64,String,i64) = conn.query_row("SELECT COUNT(*), MIN(phase), (SELECT COUNT(*) FROM source_revalidation_debt) FROM source_revalidation_rounds", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!((rounds, phase.as_str(), debt), (1, "observing", 1));
+    }
+    assert!(db.get_metadata(TOKEN).await.unwrap().is_none());
+}
