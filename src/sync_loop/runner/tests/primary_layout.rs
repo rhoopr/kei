@@ -60,6 +60,8 @@ fn records_at(uri: &str, edit: Option<(&str, &[u8])>) -> Vec<Value> {
     }
     page["records"].as_array().unwrap().clone()
 }
+type RequestTrace = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
 #[derive(Clone)]
 struct Session {
     records: Vec<Value>,
@@ -68,6 +70,8 @@ struct Session {
     current: Option<Arc<std::sync::Mutex<Vec<Value>>>>,
     lookup_change: Option<(usize, Vec<Value>)>,
     indexing: Option<IndexingOptions>,
+    baseline_successor: Option<&'static str>,
+    trace: Option<RequestTrace>,
 }
 #[async_trait::async_trait]
 impl PhotosSession for Session {
@@ -90,6 +94,12 @@ impl PhotosSession for Session {
             );
         }
         if url.contains("/changes/zone?") {
+            if let Some(trace) = &self.trace {
+                trace
+                    .lock()
+                    .unwrap()
+                    .push(("changes".into(), request.clone()));
+            }
             if let Some(indexing) = &self.indexing {
                 indexing.cursors.lock().unwrap().push(
                     request["zones"][0]["syncToken"]
@@ -99,10 +109,16 @@ impl PhotosSession for Session {
                 );
             }
             return Ok(
-                json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"cycle-token","moreComing":false,"records":if self.quiet || request["zones"][0]["syncToken"] == "fixture-zone-history-boundary" {vec![]} else {self.records.clone()}}]}),
+                json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":if request["zones"][0]["syncToken"] == "fixture-zone-history-boundary" {self.baseline_successor.unwrap_or("cycle-token")} else {"cycle-token"},"moreComing":false,"records":if self.quiet || request["zones"][0]["syncToken"] == "fixture-zone-history-boundary" {vec![]} else {self.records.clone()}}]}),
             );
         }
         if url.contains("/records/lookup?") {
+            if let Some(trace) = &self.trace {
+                trace
+                    .lock()
+                    .unwrap()
+                    .push(("lookup".into(), request.clone()));
+            }
             let lookup = self.lookups.fetch_add(1, Ordering::SeqCst);
             let request: Value = serde_json::from_str(&body)?;
             let current = self
@@ -153,7 +169,7 @@ impl PhotosSession for Session {
                 .and_then(|i| i["fieldValue"]["value"].as_u64())
                 .unwrap_or(0);
             return Ok(
-                json!({"records":if offset==0 {self.records.clone()} else {vec![]},"syncToken":self.indexing.as_ref().map_or(Some("query-token"), |indexing| indexing.token)}),
+                json!({"records":if offset==0 {self.records.clone()} else {vec![]},"syncToken":self.indexing.as_ref().map_or(Some(if self.baseline_successor.is_some() {"fixture-rank-token"} else {"query-token"}), |indexing| indexing.token)}),
             );
         }
         anyhow::bail!("unexpected synthetic provider endpoint: {url}")
@@ -198,6 +214,8 @@ async fn cycle_resolution(
 }
 struct CycleOptions {
     indexing: Option<IndexingOptions>,
+    baseline_successor: Option<&'static str>,
+    trace: Option<RequestTrace>,
     refresh_metadata: bool,
     embed_rating: bool,
     media_directory: &'static str,
@@ -220,6 +238,8 @@ impl Default for CycleOptions {
     fn default() -> Self {
         Self {
             indexing: None,
+            baseline_successor: None,
+            trace: None,
             refresh_metadata: false,
             embed_rating: false,
             media_directory: "media",
@@ -268,6 +288,8 @@ async fn try_cycle_options(
         current: options.current.clone(),
         lookup_change: options.lookup_change.clone(),
         indexing: options.indexing.clone(),
+        baseline_successor: options.baseline_successor,
+        trace: options.trace.clone(),
     };
     let owner = state::db::account::AccountOwner::authenticated(
         "synthetic@example.invalid",
@@ -446,15 +468,39 @@ async fn portable_prepolicy_fixture(
     publishing: bool,
 ) -> String {
     let unedited = records(server, None);
+    let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (initial, _) = cycle_options(
         root,
         unedited,
         false,
         EditedNaming::Primary,
-        CycleOptions::default(),
+        CycleOptions {
+            baseline_successor: Some("query-token"),
+            trace: Some(trace.clone()),
+            ..CycleOptions::default()
+        },
     )
     .await;
     assert_eq!(initial.failed_count, 0, "{initial:?}");
+    assert_eq!(initial.stats.downloaded, 1);
+    assert_eq!(initial.stats.state_write_failures, 0);
+    assert!(initial.db_sync_token_advance_safe);
+    {
+        let requests = trace.lock().unwrap();
+        let changes: Vec<_> = requests
+            .iter()
+            .filter(|(kind, _)| kind == "changes")
+            .collect();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0].1["zones"][0]["syncToken"],
+            "fixture-zone-history-boundary"
+        );
+        assert_eq!(
+            changes[0].1["zones"][0]["zoneID"]["zoneName"],
+            "PrimarySync"
+        );
+    }
     let media = root.join("media");
     assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
     let owner = state::db::account::AccountOwner::authenticated(
@@ -505,6 +551,8 @@ async fn portable_prepolicy_fixture(
         current: None,
         lookup_change: None,
         indexing: None,
+        baseline_successor: None,
+        trace: None,
     };
     let mut album = crate::icloud::photos::PhotoAlbum::new(
         crate::icloud::photos::PhotoAlbumConfig {
@@ -575,18 +623,8 @@ async fn portable_prepolicy_fixture(
     let db = state::SqliteStateDb::open_owned(&root.join("adopted.db"), &owner)
         .await
         .unwrap();
-    // The released fixture completed its baseline at query-token before the
-    // interrupted edit. Preserve that recorded cursor in the synthetic copy.
-    if db
-        .get_metadata("sync_token:PrimarySync")
-        .await
-        .unwrap()
-        .is_none()
-    {
-        db.set_metadata("sync_token:PrimarySync", "query-token")
-            .await
-            .unwrap();
-    }
+    // The synthetic bridge committed the released fixture's cursor through
+    // the current checkpoint owner; do not replace durable cursor state here.
     assert_eq!(
         db.get_metadata("sync_token:PrimarySync")
             .await
@@ -666,6 +704,23 @@ async fn portable_prepolicy_fixture(
                 checksum.clone()
             )
         );
+        for table in [
+            "provider_selection_generations",
+            "provider_active_generations",
+            "provider_active_decisions",
+            "provider_active_destinations",
+            "download_receipts",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "unexpected selected work in release-shaped snapshot: {table}"
+            );
+        }
         let receipt: (String, String) = conn.query_row("SELECT provider_checksum,local_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?1", [root.join("media/IMG_0501.JPG").to_str().unwrap()], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
         assert_eq!(receipt, (provider_hash(ORIGINAL), checksum));
     }
@@ -763,9 +818,11 @@ async fn portable_prepolicy_reconfirmation_preserves_edit_and_quiet_reopen() {
         );
     }
     let edited = records(&server, Some(("edit-one", EDIT_ONE)));
+    let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
     let options = || CycleOptions {
         private: true,
         state_file: "adopted.db",
+        trace: Some(trace.clone()),
         ..CycleOptions::default()
     };
     let (result, lookups) = try_cycle_options(
@@ -779,6 +836,27 @@ async fn portable_prepolicy_reconfirmation_preserves_edit_and_quiet_reopen() {
     .unwrap();
     assert_eq!(result.failed_count, 0, "{result:?}");
     assert!(lookups >= 2);
+    {
+        let requests = trace.lock().unwrap();
+        let changes: Vec<_> = requests
+            .iter()
+            .filter(|(kind, _)| kind == "changes")
+            .collect();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].1["zones"][0]["syncToken"], "query-token");
+        assert_eq!(
+            changes[0].1["zones"][0]["zoneID"]["zoneName"],
+            "PrimarySync"
+        );
+        let lookups: Vec<_> = requests
+            .iter()
+            .filter(|(kind, _)| kind == "lookup")
+            .collect();
+        assert!(lookups.iter().all(|(_, request)| request["zoneID"]
+            == json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})));
+        assert!(lookups.iter().any(|(_, request)| request["records"]
+            == json!([{"recordName":"asset-501"},{"recordName":"501"}])));
+    }
     assert_bytes(&root.path().join("media/IMG_0501.JPG"), EDIT_ONE);
     assert_bytes(&root.path().join("media/IMG_0501_original.JPG"), ORIGINAL);
     let (quiet, lookups) =
@@ -898,6 +976,8 @@ async fn portable_prepolicy_recovery_gate_rejects_root_and_store_drift() {
             current: None,
             lookup_change: None,
             indexing: None,
+            baseline_successor: None,
+            trace: None,
         };
         let mut album = crate::icloud::photos::PhotoAlbum::new(
             crate::icloud::photos::PhotoAlbumConfig {
@@ -1727,6 +1807,8 @@ async fn recorded_edited_family_recovery_scenario() {
         current: None,
         lookup_change: None,
         indexing: None,
+        baseline_successor: None,
+        trace: None,
     };
     let pass = AlbumPass {
         kind: PassKind::Unfiled,
@@ -2684,6 +2766,8 @@ async fn primary_layout_read_only_conflict_discloses_and_keeps_local_changes() {
         current: None,
         lookup_change: None,
         indexing: None,
+        baseline_successor: None,
+        trace: None,
     };
     let pass = AlbumPass {
         kind: PassKind::Unfiled,
@@ -4236,6 +4320,8 @@ async fn interrupted_unprepared_embedded_refresh_remains_held() {
         current: None,
         lookup_change: None,
         indexing: None,
+        baseline_successor: None,
+        trace: None,
     };
     let pass = AlbumPass {
         kind: PassKind::Unfiled,
@@ -4341,6 +4427,8 @@ async fn interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync() {
             current: None,
             lookup_change: None,
             indexing: None,
+            baseline_successor: None,
+            trace: None,
         };
         let pass = AlbumPass {
             kind: PassKind::Unfiled,
@@ -4574,6 +4662,8 @@ async fn interrupted_embedded_scratch_reopens_without_adopting_or_removing_unkno
         current: None,
         lookup_change: None,
         indexing: None,
+        baseline_successor: None,
+        trace: None,
     };
     let pass = AlbumPass {
         kind: PassKind::Unfiled,
@@ -4818,6 +4908,8 @@ async fn interrupted_unprepared_refresh_retries_on_ordinary_sync() {
         current: None,
         lookup_change: None,
         indexing: None,
+        baseline_successor: None,
+        trace: None,
     };
     let pass = AlbumPass {
         kind: PassKind::Unfiled,
@@ -4949,6 +5041,8 @@ async fn interrupted_unprepared_refresh_rejects_drift_and_occupied_paths() {
             current: None,
             lookup_change: None,
             indexing: None,
+            baseline_successor: None,
+            trace: None,
         };
         let pass = AlbumPass {
             kind: PassKind::Unfiled,
