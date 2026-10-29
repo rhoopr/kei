@@ -94,6 +94,35 @@ impl SqliteStateDb {
         .await
     }
 
+    /// Old completed resources can identify their own unchanged occupants only.
+    pub(crate) async fn bound_historical_downloads(
+        &self,
+        binding: PublicationBinding,
+        version: String,
+        checksum: String,
+        size: u64,
+    ) -> Result<Vec<super::super::download_receipts::DownloadReceipt>, StateError> {
+        self.with_conn("read bound historical downloads", move |conn| {
+            binding.validate(conn)?;
+            Ok(super::super::download_receipts::historical(
+                conn,
+                &binding.scope,
+                &binding.child,
+                &binding.master,
+                &version,
+            )?
+            .into_iter()
+            .filter(|receipt| {
+                receipt.library == binding.library
+                    && receipt.state_id == binding.state_id
+                    && receipt.fulfills_pass(&binding.origin_pass)
+                    && (receipt.provider_checksum != checksum || receipt.provider_size != size)
+            })
+            .collect())
+        })
+        .await
+    }
+
     pub(crate) async fn reuse_bound_download(
         &self,
         binding: PublicationBinding,
@@ -906,6 +935,50 @@ mod binding_tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn historical_receipts_require_exact_binding_and_different_resource() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let db = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        let proof = fixture(&db, root.path(), true).await;
+        db.prepare_temp_publication(&proof.temporary.to_path(), &proof)
+            .await
+            .unwrap();
+        finish(&db, &proof).await.unwrap();
+        drop(db);
+        let db = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        let binding = proof.binding.clone().unwrap();
+        let find = |binding: super::PublicationBinding, checksum: &'static str, size| {
+            db.bound_historical_downloads(binding, "original".into(), checksum.into(), size)
+        };
+        assert_eq!(find(binding.clone(), "changed", 5).await.unwrap().len(), 1);
+        assert!(
+            find(binding.clone(), "opaque-generation", 4)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for field in ["child", "master", "state", "pass", "library"] {
+            let mut other = binding.clone();
+            match field {
+                "child" => other.child.push_str("-other"),
+                "master" => other.master.push_str("-other"),
+                "state" => other.state_id.push_str("-other"),
+                "pass" => other.origin_pass.push_str("-other"),
+                _ => other.library.push_str("-other"),
+            }
+            let result = find(other, "changed", 5).await;
+            assert!(result.is_err() || result.unwrap().is_empty(), "{field}");
+        }
+        let mut foreign = binding;
+        foreign.account_key.push_str("-other");
+        assert!(find(foreign, "changed", 5).await.is_err());
     }
 
     #[tokio::test]

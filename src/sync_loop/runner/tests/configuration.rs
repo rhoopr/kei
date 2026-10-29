@@ -35,6 +35,7 @@ struct ConfigBridgeSession {
     bridge_token: Arc<str>,
     wait: BridgeWait,
     hydration_pages: usize,
+    omit_source_completion: bool,
     gate_active: Arc<std::sync::atomic::AtomicBool>,
     bridge_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     calls: Arc<Mutex<Vec<(&'static str, String)>>>,
@@ -48,6 +49,7 @@ impl ConfigBridgeSession {
             bridge_token: Arc::from(bridge_token),
             wait: BridgeWait::Replay,
             hydration_pages: 0,
+            omit_source_completion: false,
             gate_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             bridge_gate: None,
             calls: Arc::new(Mutex::new(Vec::new())),
@@ -108,12 +110,13 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
                 match self.wait {
                     BridgeWait::Replay => Vec::new(),
                     BridgeWait::AssetIdentity | BridgeWait::PairedAsset => {
-                        let mut asset = serde_json::json!({
-                            "recordName": "WAIT_CHILD", "recordType": "CPLAsset",
-                            "fields": {"masterRef": {"value": {"recordName": "WAIT_MASTER"}}}
-                        });
-                        if self.wait == BridgeWait::AssetIdentity {
-                            asset["fields"].as_object_mut().unwrap().remove("masterRef");
+                        // A real sparse source supplies durable retry identity
+                        // before either identity or paired-master lookup waits.
+                        let mut asset = crate::test_helpers::sparse_shared_asset_record();
+                        asset["recordName"] = serde_json::json!("WAIT_CHILD");
+                        if self.wait == BridgeWait::PairedAsset {
+                            asset["fields"]["masterRef"] =
+                                serde_json::json!({"value": {"recordName": "WAIT_MASTER"}});
                         }
                         vec![asset]
                     }
@@ -138,13 +141,27 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
             }));
         }
         if url.contains("/records/lookup?") {
-            self.calls.lock().unwrap().push(("lookup", String::new()));
+            self.calls.lock().unwrap().push(("lookup", body.clone()));
             if self.wait != BridgeWait::AlbumRelation
                 && self.gate_active.load(std::sync::atomic::Ordering::SeqCst)
                 && let Some((requested, release)) = &self.bridge_gate
             {
                 requested.notify_one();
                 release.notified().await;
+            }
+            if !self.gate_active.load(std::sync::atomic::Ordering::SeqCst)
+                && !self.omit_source_completion
+                && matches!(
+                    self.wait,
+                    BridgeWait::AssetIdentity | BridgeWait::PairedAsset
+                )
+            {
+                let request: serde_json::Value = serde_json::from_str(&body)?;
+                let records: Vec<_> = request["records"].as_array().into_iter().flatten()
+                    .filter(|record| record["recordName"] == "WAIT_CHILD")
+                    .map(|_| serde_json::json!({"recordName":"WAIT_CHILD","serverErrorCode":"UNKNOWN_ITEM"}))
+                    .collect();
+                return Ok(serde_json::json!({"records":records}));
             }
         }
         Ok(serde_json::json!({"records": []}))
@@ -188,6 +205,8 @@ async fn issue958_cancel_after_paged_relation_scan_preserves_then_replays() {
         BridgeWait::AlbumRelation,
         false,
         2,
+        false,
+        false,
     ))
     .await;
 }
@@ -202,14 +221,44 @@ async fn issue958_cancel_relation_lookup_preserves_checkpoint_then_replays() {
 }
 
 async fn cancelled_bridge_fixture(wait: BridgeWait, streaming: bool) {
-    Box::pin(cancelled_bridge_fixture_with_pages(wait, streaming, 0)).await;
+    Box::pin(cancelled_bridge_fixture_with_pages(
+        wait, streaming, 0, false, false,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn cancellation_replay_with_unattributed_current_marker_remains_held_across_reopens() {
+    Box::pin(cancelled_bridge_fixture_with_pages(
+        BridgeWait::Replay,
+        false,
+        0,
+        true,
+        false,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn cancellation_replay_with_missing_source_proof_retains_retry_across_reopens() {
+    Box::pin(cancelled_bridge_fixture_with_pages(
+        BridgeWait::AssetIdentity,
+        false,
+        0,
+        false,
+        true,
+    ))
+    .await;
 }
 
 async fn cancelled_bridge_fixture_with_pages(
     wait: BridgeWait,
     streaming: bool,
     hydration_pages: usize,
+    unattributed_current: bool,
+    omit_source_completion: bool,
 ) {
+    use crate::state::SparseIdentityStore;
     use std::time::Duration;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -223,19 +272,26 @@ async fn cancelled_bridge_fixture_with_pages(
     std::fs::write(&sentinel, b"existing synthetic media").unwrap();
     let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
     let marker = state::unresolved_identity_key("PrimarySync");
+    let historical_marker = format!("{}PrimarySync", state::HISTORICAL_IDENTITY_PREFIX);
+    db.set_metadata(&historical_marker, "1").await.unwrap();
     db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-enum-hash")
         .await
         .unwrap();
     db.set_metadata("sync_token:v27:PrimarySync", "prior-token")
         .await
         .unwrap();
-    db.set_metadata(&marker, "1").await.unwrap();
+    if unattributed_current {
+        // An unattributed current marker is real debt. Empty replay cannot
+        // invent source identity or completion evidence to clear it.
+        db.set_metadata(&marker, "1").await.unwrap();
+    }
     let requested = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let mut session = ConfigBridgeSession::new("PrimarySync", "inventory-token", "bridge-token");
     session.bridge_gate = Some((requested.clone(), release.clone()));
     session.wait = wait;
     session.hydration_pages = hydration_pages;
+    session.omit_source_completion = omit_source_completion;
     let gate_active = session.gate_active.clone();
     let calls = session.calls.clone();
     let album = crate::icloud::photos::PhotoAlbum::new(
@@ -357,13 +413,24 @@ async fn cancelled_bridge_fixture_with_pages(
     for (key, expected) in [
         ("sync_token:v27:PrimarySync", "prior-token"),
         (ENUM_CONFIG_HASH_KEY, "old-enum-hash"),
-        (marker.as_str(), "1"),
+        (historical_marker.as_str(), "1"),
     ] {
         assert_eq!(
             db.get_metadata(key).await.unwrap().as_deref(),
             Some(expected)
         );
     }
+    let observed_sparse = matches!(wait, BridgeWait::AssetIdentity | BridgeWait::PairedAsset);
+    assert_eq!(
+        db.get_metadata(&marker).await.unwrap().as_deref(),
+        (unattributed_current || observed_sparse).then_some("1")
+    );
+    let sparse = db.sparse_identities("PrimarySync").await.unwrap();
+    assert_eq!(sparse.len(), usize::from(observed_sparse));
+    if observed_sparse {
+        assert_eq!(sparse[0].source.as_str(), "WAIT_CHILD");
+    }
+    let mut previous_sparse_generation = sparse.first().map(|row| row.generation);
     let expected_hash = download::compute_config_hash(&config);
     assert_eq!(
         db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY)
@@ -425,6 +492,8 @@ async fn cancelled_bridge_fixture_with_pages(
     );
     drop(db);
     let mut replay_queries = 0;
+    let mut prior_call_count = initial_calls.len();
+    let mut prior_query_count = inventory_queries;
     for replay in 0..2 {
         let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
         let builder = make_run_cycle_download_config_builder(&media, db.clone());
@@ -446,6 +515,107 @@ async fn cancelled_bridge_fixture_with_pages(
         .await
         .expect("valid synthetic replay is bounded")
         .unwrap();
+        if unattributed_current || omit_source_completion {
+            assert!(
+                !result.can_advance_database_checkpoint(),
+                "replay {replay}: {result:?}"
+            );
+            assert!(!result.db_sync_token_advance_safe);
+            assert!(!result.stats.interrupted);
+            assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(
+                db.get_metadata("sync_token:v27:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("prior-token")
+            );
+            assert_eq!(
+                db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("old-enum-hash")
+            );
+            assert_eq!(
+                db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(expected_hash.as_str())
+            );
+            assert_eq!(
+                db.get_metadata(&pending_zone_token_key(&expected_hash, "PrimarySync"))
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                db.get_metadata(&marker).await.unwrap().as_deref(),
+                Some("1")
+            );
+            assert_eq!(
+                db.get_metadata(&historical_marker)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("1")
+            );
+            let retained = db.sparse_identities("PrimarySync").await.unwrap();
+            assert_eq!(retained.len(), sparse.len());
+            if observed_sparse {
+                assert_eq!(retained[0].source, sparse[0].source);
+                let previous = previous_sparse_generation.unwrap();
+                assert!(
+                    retained[0].generation > previous,
+                    "retry must retain a fresh generation fence"
+                );
+                previous_sparse_generation = Some(retained[0].generation);
+                assert_eq!(retained[0].original, sparse[0].original);
+                assert_eq!(retained[0].observed, sparse[0].observed);
+            }
+            let observed = calls.lock().unwrap().clone();
+            let cursors: Vec<_> = observed
+                .iter()
+                .filter(|(kind, cursor)| {
+                    *kind == "changes"
+                        && !cursor.is_empty()
+                        && !cursor.starts_with("synthetic-hydration-")
+                })
+                .map(|(_, cursor)| cursor.as_str())
+                .collect();
+            assert_eq!(cursors, vec!["prior-token"; replay + 2]);
+            let queries = observed.iter().filter(|(kind, _)| *kind == "query").count();
+            assert!(
+                queries > prior_query_count,
+                "each held replay must reconcile inventory"
+            );
+            prior_query_count = queries;
+            if observed_sparse {
+                let retried = observed.iter().skip(prior_call_count).any(|(kind, body)| {
+                    *kind == "lookup"
+                        && serde_json::from_str::<serde_json::Value>(body)
+                            .ok()
+                            .is_some_and(|request| {
+                                request["records"].as_array().is_some_and(|records| {
+                                    records
+                                        .iter()
+                                        .any(|record| record["recordName"] == "WAIT_CHILD")
+                                })
+                            })
+                });
+                assert!(
+                    retried,
+                    "retained source must be queried, not inferred from an empty replay"
+                );
+            }
+            prior_call_count = observed.len();
+            assert_eq!(
+                std::fs::read(&sentinel).unwrap(),
+                b"existing synthetic media"
+            );
+            continue;
+        }
         assert!(
             result.can_advance_database_checkpoint(),
             "{wait:?} streaming={streaming} replay={replay}: {result:?}"
@@ -471,13 +641,46 @@ async fn cancelled_bridge_fixture_with_pages(
             Some("bridge-token")
         );
         assert_eq!(db.get_metadata(&marker).await.unwrap(), None);
+        assert_eq!(
+            db.get_metadata(&historical_marker)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        assert!(
+            db.sparse_identities("PrimarySync")
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let observed = calls.lock().unwrap().clone();
+        if observed_sparse {
+            assert!(
+                observed
+                    .iter()
+                    .skip(initial_calls.len())
+                    .any(|(kind, body)| {
+                        *kind == "lookup"
+                            && serde_json::from_str::<serde_json::Value>(body)
+                                .ok()
+                                .is_some_and(|request| {
+                                    request["records"].as_array().is_some_and(|records| {
+                                        records
+                                            .iter()
+                                            .any(|record| record["recordName"] == "WAIT_CHILD")
+                                    })
+                                })
+                    }),
+                "completion must query the retained source"
+            );
+        }
         assert_eq!(
             observed
                 .iter()
                 .filter(|(kind, _)| *kind == "lookup")
                 .count(),
-            initial_lookups
+            initial_lookups + usize::from(observed_sparse)
         );
         let queries = observed.iter().filter(|(kind, _)| *kind == "query").count();
         if replay == 0 {

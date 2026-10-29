@@ -737,6 +737,39 @@ impl TaskPlanner {
                 }
             }
         }
+        let historical = if let (Some(binding), Some(album)) =
+            (&task.publication_binding, &config.primary_layout_source)
+        {
+            let capture = match album.publication_scope(&task.library) {
+                Ok(Some((capture, scope, _))) if scope == binding.scope => capture,
+                _ => {
+                    return super::baseline_matching::uncertain(
+                        "scoped_receipt_or_reservation_validation_failed",
+                        Some(&task.download_path),
+                    );
+                }
+            };
+            match capture
+                .db
+                .bound_historical_downloads(
+                    binding.as_ref().clone(),
+                    task.version_size.as_str().into(),
+                    task.checksum.to_string(),
+                    task.size,
+                )
+                .await
+            {
+                Ok(receipts) => receipts,
+                Err(_) => {
+                    return super::baseline_matching::uncertain(
+                        "scoped_receipt_or_reservation_validation_failed",
+                        Some(&task.download_path),
+                    );
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let derived = super::filter::derive_expected_paths(asset, config);
         let requested = derived
             .iter()
@@ -787,6 +820,7 @@ impl TaskPlanner {
                     && config.primary_layout_pass_kind != Some(crate::commands::PassKind::Unfiled),
                 &selected_copy_scope,
                 &discovered,
+                &historical,
             )
             .await;
         if matches!(matched, super::baseline_matching::BaselineMatch::Missing)

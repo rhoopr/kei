@@ -283,15 +283,20 @@ impl PhotosSession for ReplacementView {
 
 #[tokio::test]
 async fn v027_recent_same_child_master_changed_resource_preserves_old_bytes() {
-    same_child_master_changed_resource(false).await;
+    same_child_master_changed_resource(false, false).await;
 }
 
 #[tokio::test]
 async fn v027_recent_same_child_master_mmcs_v1_resource_preserves_old_bytes() {
-    same_child_master_changed_resource(true).await;
+    same_child_master_changed_resource(true, false).await;
 }
 
-async fn same_child_master_changed_resource(mmcs_v1: bool) {
+#[tokio::test]
+async fn v027_changed_resource_foreign_collision_survives_reopen_while_healthy_work_progresses() {
+    same_child_master_changed_resource(false, true).await;
+}
+
+async fn same_child_master_changed_resource(mmcs_v1: bool, collision: bool) {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
 
@@ -328,6 +333,18 @@ async fn same_child_master_changed_resource(mmcs_v1: bool) {
             .mount(&server)
             .await;
     }
+    if collision {
+        Mock::given(method("GET"))
+            .and(path("/identity-healthy"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(changed_bytes.clone())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
     let mut old = pair(
         "first",
         "first.JPG",
@@ -352,6 +369,11 @@ async fn same_child_master_changed_resource(mmcs_v1: bool) {
         &format!("{}/identity-second", server.uri()),
         12,
     );
+    let mut healthy = second.clone();
+    healthy[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+        json!(format!("{}/identity-healthy", server.uri()));
+    healthy[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(changed_bytes.len());
+    healthy[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(changed_checksum);
     let concurrent = pair(
         "concurrent",
         "concurrent.JPG",
@@ -364,32 +386,56 @@ async fn same_child_master_changed_resource(mmcs_v1: bool) {
     let db_path = dir.path().join("state.db");
     let key = sync_token_key(ZONE);
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
-    let mut previous_path = None;
+    let mut previous_path: Option<std::path::PathBuf> = None;
     let mut previous_mtime = None;
     let mut current_path = None;
+    let mut foreign_mtime = None;
+    let mut pending_snapshot = None;
 
-    for cycle in 0..3 {
+    for cycle in 0..if collision { 6 } else { 3 } {
+        let foreign = root.join("first-foreign.JPG");
+        let preserved_foreign = dir.path().join("preserved-foreign.JPG");
+        if collision && cycle == 4 {
+            std::fs::rename(&foreign, &preserved_foreign).unwrap();
+        }
+        if collision && cycle == 1 {
+            std::fs::write(&foreign, b"foreign occupant").unwrap();
+            foreign_mtime = Some(std::fs::metadata(&foreign).unwrap().modified().unwrap());
+        }
         let db = Arc::new(
             SqliteStateDb::open_owned(&db_path, &baseline_owner())
                 .await
                 .unwrap(),
         );
+        if collision && cycle == 4 {
+            db.make_selection_retry_due(baseline_owner(), "asset-first".into())
+                .await
+                .unwrap();
+        }
         let mut inventory = if cycle == 0 {
             old.clone()
         } else {
             changed.clone()
         };
-        inventory.extend(second.clone());
+        inventory.extend(if collision && cycle > 0 {
+            healthy.clone()
+        } else {
+            second.clone()
+        });
+        let mut additions = if cycle == 1 {
+            changed.clone()
+        } else {
+            Vec::new()
+        };
+        if collision && cycle == 1 {
+            additions.extend(healthy.clone());
+        }
         let session = BaselineSession {
             database: "private",
             cycle,
             inventory: Arc::new(inventory),
             concurrent: Arc::new(concurrent.clone()),
-            incremental_addition: Arc::new(if cycle == 1 {
-                changed.clone()
-            } else {
-                Vec::new()
-            }),
+            incremental_addition: Arc::new(additions),
             requests: Arc::new(Mutex::new(Vec::new())),
             inventory_queries: Arc::new(AtomicUsize::new(0)),
             inventory_starts: Arc::new(AtomicUsize::new(0)),
@@ -452,6 +498,158 @@ async fn same_child_master_changed_resource(mmcs_v1: bool) {
                 let reason: Option<String> = db.acquire_lock("synthetic changed resource diagnostic").unwrap().query_row("SELECT last_error FROM assets WHERE library=?1 AND id='asset-first' AND version_size='original'", [ZONE], |row| row.get(0)).unwrap();
                 eprintln!("synthetic mmcs_v1={mmcs_v1} match diagnostic: {reason:?}");
             }
+        }
+        if collision && cycle > 0 && cycle < 4 {
+            assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign occupant");
+            assert_eq!(
+                std::fs::metadata(&foreign).unwrap().modified().unwrap(),
+                foreign_mtime.unwrap()
+            );
+            assert_eq!(
+                result.stats.state_write_failures, 0,
+                "cycle {cycle}: {result:?}"
+            );
+            assert_eq!(
+                result.stats.downloaded,
+                if cycle == 1 { 1 } else { 0 },
+                "cycle {cycle}: {result:?}"
+            );
+            assert!(
+                result.db_sync_token_advance_safe,
+                "durably retained work permits the cursor: {result:?}"
+            );
+            assert_eq!(
+                db.get_metadata(&key).await.unwrap(),
+                Some(format!("v27-after-cycle-{}", cycle + 1))
+            );
+            assert_eq!(session.boundaries.load(Ordering::SeqCst), 0);
+            if cycle == 1 {
+                assert_eq!(result.failed_count, 1, "cycle {cycle}: {result:?}");
+                assert_eq!(
+                    result.stats.skipped.uncertain, 1,
+                    "foreign candidate must cause the hold: {result:?}"
+                );
+            }
+            assert!(
+                !server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.url.path() == "/identity-new")
+            );
+            {
+                let conn = db.acquire_lock("collision remains pending").unwrap();
+                let (pending, verified): (i64, i64) = conn.query_row(
+                "SELECT count(*),coalesce(sum(verified_media),0) FROM provider_active_destinations WHERE library=?1 AND child='asset-first' AND checksum=?2",
+                rusqlite::params![ZONE, changed_checksum], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+                assert!(
+                    pending > 0,
+                    "current changed resource must stay represented: {result:?}"
+                );
+                assert_eq!(
+                    verified, 0,
+                    "foreign candidate cannot verify the current resource"
+                );
+                let current_receipts: i64 = conn.query_row(
+                "SELECT count(*) FROM download_receipts WHERE library=?1 AND child='asset-first' AND provider_checksum=?2 AND provider_size=?3",
+                rusqlite::params![ZONE, changed_checksum, changed_bytes.len() as i64], |row| row.get(0)).unwrap();
+                assert_eq!(
+                    current_receipts, 0,
+                    "foreign occupant cannot settle current receipt"
+                );
+                let (status, checksum, local_path, reason): (String, String, Option<String>, Option<String>) = conn.query_row(
+                "SELECT status,checksum,local_path,last_error FROM assets WHERE library=?1 AND id='asset-first' AND version_size='original'", [ZONE],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+                if cycle == 1 {
+                    let reason = reason.as_deref().unwrap();
+                    assert!(reason.contains("unsupported_provider_proof_without_valid_receipt"));
+                    assert!(reason.contains("first-foreign.JPG"));
+                }
+                assert!(
+                    checksum != changed_checksum || status != "downloaded",
+                    "current asset cannot be falsely settled"
+                );
+                assert_eq!(
+                    local_path.as_deref(),
+                    previous_path.as_ref().unwrap().to_str()
+                );
+                assert_eq!(result.failed_count, 1);
+                assert_eq!(result.stats.skipped.uncertain, 1);
+                let (generation, pass, path, admitted, admission): (String, String, String, i64, String) = conn.query_row(
+                "SELECT w.generation,w.pass_key,w.path,w.admitted,d.admission FROM provider_active_destinations w JOIN provider_active_decisions d ON d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child WHERE w.library=?1 AND w.child='asset-first' AND w.checksum=?2 ORDER BY w.generation,w.pass_key,w.path LIMIT 1",
+                rusqlite::params![ZONE, changed_checksum], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).unwrap();
+                assert_eq!(admitted, 1);
+                assert_eq!(admission, "admitted");
+                let snapshot = (pending, verified, generation, pass, path);
+                if let Some(previous) = &pending_snapshot {
+                    assert_eq!(&snapshot, previous, "quiet reopen must retain debt");
+                }
+                pending_snapshot = Some(snapshot);
+                let healthy_count: i64 = conn.query_row(
+                "SELECT count(*) FROM download_receipts WHERE library=?1 AND child='asset-second' AND provider_checksum=?2 AND provider_size=?3",
+                rusqlite::params![ZONE, changed_checksum, changed_bytes.len() as i64], |row| row.get(0)).unwrap();
+                assert_eq!(
+                    healthy_count, 1,
+                    "independent changed resource must complete"
+                );
+            }
+            let rows = db.get_downloaded_page(0, 100).await.unwrap();
+            let healthy_row = rows
+                .iter()
+                .find(|row| row.library.as_ref() == ZONE && row.id.as_ref() == "asset-second")
+                .unwrap();
+            assert_eq!(
+                std::fs::read(healthy_row.local_path.as_ref().unwrap()).unwrap(),
+                changed_bytes
+            );
+            continue;
+        }
+        if collision && cycle >= 4 {
+            assert_eq!(
+                std::fs::read(&preserved_foreign).unwrap(),
+                b"foreign occupant"
+            );
+            assert_eq!(
+                std::fs::metadata(&preserved_foreign)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                foreign_mtime.unwrap()
+            );
+            assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
+            assert_eq!(result.stats.state_write_failures, 0);
+            assert_eq!(
+                result.stats.downloaded,
+                if cycle == 4 { 1 } else { 0 },
+                "cycle {cycle}: {result:?}"
+            );
+            assert!(result.db_sync_token_advance_safe);
+            assert_eq!(
+                db.get_metadata(&key).await.unwrap(),
+                Some(format!("v27-after-cycle-{}", cycle + 1))
+            );
+            let rows = db.get_downloaded_page(0, 100).await.unwrap();
+            let row = rows
+                .iter()
+                .find(|row| row.library.as_ref() == ZONE && row.id.as_ref() == "asset-first")
+                .unwrap();
+            let output = row.local_path.clone().unwrap();
+            assert_ne!(&output, previous_path.as_ref().unwrap());
+            assert_eq!(std::fs::read(&output).unwrap(), changed_bytes);
+            if let Some(prior) = &current_path {
+                assert_eq!(&output, prior);
+            }
+            current_path = Some(output);
+            let conn = db.acquire_lock("completed collision recovery").unwrap();
+            let count: i64 = conn.query_row("SELECT count(*) FROM download_receipts WHERE library=?1 AND child='asset-first' AND provider_checksum=?2 AND provider_size=?3", rusqlite::params![ZONE, changed_checksum, changed_bytes.len() as i64], |row| row.get(0)).unwrap();
+            assert_eq!(count, 1);
+            let verified: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE library=?1 AND child='asset-first' AND checksum=?2 AND admitted=1 AND verified_media=1", rusqlite::params![ZONE, changed_checksum], |row| row.get(0)).unwrap();
+            assert!(
+                verified > 0,
+                "the selected destination must be verified after retry"
+            );
+            continue;
         }
         assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
         assert_eq!(

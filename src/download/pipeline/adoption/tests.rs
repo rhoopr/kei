@@ -311,34 +311,183 @@ async fn producer_adopts_smaller_metadata_rewritten_pending_file() {
 
 #[tokio::test]
 async fn producer_does_not_adopt_metadata_rewritten_file_after_provider_change() {
-    let (result, _, db, _dir, target_path, _) =
-        run_producer_metadata_rewritten_pending_file("old-provider-checksum").await;
+    use crate::download::pipeline::test_support::owned_download_fixture;
+    use crate::state::{
+        TempFileOwnershipStore,
+        db::{PreparedPublication, provider_selection::SelectionPath},
+    };
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
 
-    assert_eq!(result.downloaded, 0);
-    assert!(result.failed.is_empty());
-    assert_eq!(result.skip_summary.uncertain, 1);
-    assert_eq!(
-        result.state_write_failures, 1,
-        "current generation was not admitted, so coverage must remain held"
-    );
-    assert_eq!(fs::read(&target_path).unwrap(), b"shorter");
-    assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
-    assert!(db.get_failed().await.unwrap().is_empty());
-    let pending = db.get_pending().await.unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(
-        pending[0].checksum.as_ref(),
-        "old-provider-checksum",
-        "refused admission cannot relabel the old receipt"
-    );
-    assert_eq!(
-        pending[0].local_path.as_deref(),
-        Some(target_path.as_path())
-    );
-    assert_eq!(
-        pending[0].download_checksum.as_deref(),
-        Some(format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b"original")).as_str())
-    );
+    let current_bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    let current_checksum =
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(current_bytes));
+    let old_checksum =
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(b"original"));
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rewritten.jpg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(current_bytes.to_vec())
+                .insert_header("content-type", "image/jpeg"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let asset_for = |checksum: &str, size| {
+        TestPhotoAsset::new("METADATA_REWRITTEN_PENDING")
+            .filename("rewritten.jpg")
+            .item_type("public.jpeg")
+            .orig_file_type("public.jpeg")
+            .orig_size(size)
+            .orig_url(&format!("{}/rewritten.jpg", server.uri()))
+            .orig_checksum(checksum)
+            .build()
+            .with_source_zone(Arc::from("SharedSync-abc"))
+    };
+    let dir = TempDir::new().unwrap();
+    let (db, config) = owned_download_fixture(dir.path(), "SharedSync-abc").await;
+    let prior = asset_for(&old_checksum, 8);
+    let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+    let plan = planner.plan_download_asset(&prior, &config).await.unwrap();
+    let task = &plan.tasks[0];
+    db.upsert_seen(&crate::download::planner::pending_record_for_task(
+        &config, &prior, task,
+    ))
+    .await
+    .unwrap();
+    let old_path = task.download_path.clone();
+    fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+    fs::write(&old_path, b"shorter").unwrap();
+    let old_mtime = fs::metadata(&old_path).unwrap().modified().unwrap();
+    let local_checksum = format!("{:x}", Sha256::digest(b"shorter"));
+    let source_checksum = format!("{:x}", Sha256::digest(b"original"));
+    assert_ne!(local_checksum, source_checksum);
+    let temporary = dir.path().join("owned.part");
+    db.claim_temp_file(&temporary).await.unwrap();
+    let proof = PreparedPublication {
+        binding: task.publication_binding.as_deref().cloned(),
+        library: task.library.to_string(),
+        id: task.asset_id.to_string(),
+        version: task.version_size.as_str().into(),
+        provider_checksum: task.checksum.to_string(),
+        provider_size: task.size,
+        temporary: SelectionPath::from_path(&temporary),
+        destination: SelectionPath::from_path(&old_path),
+        local_checksum: local_checksum.clone(),
+        source_checksum: source_checksum.clone(),
+    };
+    let binding = proof.binding.clone().unwrap();
+    db.prepare_temp_publication(&temporary, &proof)
+        .await
+        .unwrap();
+    db.mark_verified_download(
+        &proof.library,
+        &proof.id,
+        &proof.version,
+        &old_path,
+        &local_checksum,
+        Some(&source_checksum),
+        false,
+    )
+    .await
+    .unwrap();
+    db.mark_failed(
+        &proof.library,
+        &proof.id,
+        &proof.version,
+        "prior false truncation",
+    )
+    .await
+    .unwrap();
+    db.prepare_for_retry(
+        Some(&proof.library),
+        crate::state::RetryErrorRetention::Clear,
+    )
+    .await
+    .unwrap();
+    drop(config);
+    drop(db);
+
+    let mut current_path = None;
+    for cycle in 0..2 {
+        let (db, config) = owned_download_fixture(dir.path(), "SharedSync-abc").await;
+        let asset = asset_for(&current_checksum, current_bytes.len() as u64);
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert!(result.failed.is_empty(), "cycle {cycle}: {result:?}");
+        assert_eq!(result.downloaded, if cycle == 0 { 1 } else { 0 });
+        assert_eq!(result.skip_summary.uncertain, 0);
+        assert_eq!(result.state_write_failures, 0);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(fs::read(&old_path).unwrap(), b"shorter");
+        assert_eq!(
+            fs::metadata(&old_path).unwrap().modified().unwrap(),
+            old_mtime
+        );
+        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let current = rows[0].local_path.as_ref().unwrap();
+        assert_ne!(current, &old_path);
+        assert_eq!(fs::read(current).unwrap(), current_bytes);
+        assert_eq!(rows[0].checksum.as_ref(), current_checksum);
+        let current_sha = format!("{:x}", Sha256::digest(current_bytes));
+        assert_eq!(
+            rows[0].local_checksum.as_deref(),
+            Some(current_sha.as_str())
+        );
+        assert_eq!(
+            rows[0].download_checksum.as_deref(),
+            Some(current_sha.as_str())
+        );
+        let current_receipts = db
+            .bound_download_receipts(
+                binding.clone(),
+                "original".into(),
+                current_checksum.clone(),
+                current_bytes.len() as u64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(current_receipts.len(), 1);
+        assert_eq!(current_receipts[0].native_path.to_path(), *current);
+        assert_eq!(current_receipts[0].local_checksum, current_sha);
+        assert_eq!(current_receipts[0].source_checksum, current_sha);
+        if let Some(previous) = &current_path {
+            assert_eq!(current, previous);
+        }
+        current_path = Some(current.clone());
+        let history = db
+            .bound_historical_downloads(
+                binding.clone(),
+                "original".into(),
+                current_checksum.clone(),
+                current_bytes.len() as u64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].provider_checksum, old_checksum);
+        assert_eq!(history[0].native_path.to_path(), old_path);
+        assert_eq!(history[0].local_checksum, local_checksum);
+        assert_eq!(history[0].source_checksum, source_checksum);
+        assert!(db.get_failed().await.unwrap().is_empty());
+    }
+    server.verify().await;
 }
 
 #[tokio::test]

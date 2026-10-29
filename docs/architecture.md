@@ -422,6 +422,11 @@ Unchanged historical raw-file receipts require source SHA-256,
 recorded local SHA-256 and freshly read bytes to agree. Old source/local
 mismatches cannot certify metadata edits because older generic adoption could
 preserve a source hash while replacing the local hash with unrelated bytes.
+A bound completed receipt for an older resource can classify its unchanged
+native occupant when the account, source, child, master, rendition and pass
+match. It cannot prove the selected resource. The selected resource still uses
+a distinct reserved destination and the ordinary verified publication path;
+changed or unsafe historical occupants remain uncertain.
 
 The selected resource's fileChecksum can independently verify raw local bytes
 for the explicitly supported MMCS v1 variant: strict Base64 of byte 0x01 followed
@@ -2515,7 +2520,7 @@ operations in that recovery pass remain pending. Reconciliation retains its
 checkpoint hold. A separately completed independent family does not establish
 continuation past a blocked operation in the coordinator.
 
-An unprepared recorded metadata refresh can retry from a verified local source after a fresh matching provider decision. The owner creates each stage exclusively, retains its file identity through preparation, reconfirms the provider, and saves new preparation receipts together. The experimental embedded refresh preparation uses private staging with platform-specific confinement; macOS and Windows paths require native qualification, and sidecar preparation still needs a retained-namespace proof before this draft can be integrated. An occupied stage without a receipt remains pending.
+An unprepared recorded metadata refresh can retry from a verified local source after a fresh matching provider decision. The owner creates each stage exclusively, retains its file identity through preparation, reconfirms the provider, and saves new preparation receipts together. Embedded refresh preparation uses an operation-owned private directory and a retained output handle; sidecar planning uses a verified private copy and publication retains the stage namespace. Linux anchors the private directory through a retained descriptor, macOS requires a user-owned private temporary root, and Windows pins each stage ancestor with read access while allowing write sharing and denying delete sharing. An occupied stage without a receipt remains pending and is not adopted.
 
 Recorded layout claims fence ordinary transfer, finalization, adoption and queued metadata. Recovery checks the recorded generation, local-byte claims and retained source fingerprints before publication or retirement. Pending operations recover before ordinary source dispatch. Unknown ownership or local changes hold completion and protect existing contents. Historical catalogue receipts remain evidence, not permission to write a superseded slot. Original archives retain prior metadata and retry evidence outside the ordinary writer queue.
 

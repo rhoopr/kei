@@ -204,6 +204,7 @@ impl BaselineMatcher {
                 other: [].to_vec(),
             },
             &BaselineCandidates::default(),
+            &[],
         )
         .await
     }
@@ -217,6 +218,7 @@ impl BaselineMatcher {
         require_requested_parent: bool,
         selected: &SelectedCopyScope,
         discovered: &BaselineCandidates,
+        historical: &[crate::state::db::download_receipts::DownloadReceipt],
     ) -> BaselineMatch {
         if task.checksum.trim().is_empty() {
             return uncertain("provider_signature_missing", None);
@@ -283,6 +285,18 @@ impl BaselineMatcher {
             .filter(is_identity)
             .chain(candidates.iter().filter(|receipt| !is_identity(receipt)));
         for receipt in ordered.filter(|receipt| !belongs_to_other_copy(receipt)) {
+            if let Some(changed) =
+                historical_candidate(root, task, &receipt.local_path, historical).await
+            {
+                if changed {
+                    explanation.add(
+                        Some(&receipt.local_path),
+                        "historical_occupant_changed_or_unsafe",
+                    );
+                    uncertain = true;
+                }
+                continue;
+            }
             let other_parent = if require_requested_parent {
                 let parent_key = |path: &Path| {
                     path.parent()
@@ -402,6 +416,20 @@ impl BaselineMatcher {
                 }
                 continue;
             }
+            if !historical.is_empty() {
+                match selected_destination_matches(task, &receipt.local_path) {
+                    Some(true) => {}
+                    Some(false) => continue,
+                    None => {
+                        uncertain = true;
+                        explanation.add(
+                            Some(&receipt.local_path),
+                            "path_or_receipt_validation_failed",
+                        );
+                        continue;
+                    }
+                }
+            }
             return if provider_verified {
                 BaselineMatch::ProviderPresent {
                     receipt: provider_receipt(task, &receipt.local_path, &actual),
@@ -430,6 +458,13 @@ impl BaselineMatcher {
                         .as_ref()
                         .is_some_and(|old| old.local_path == path)
             }) {
+                continue;
+            }
+            if let Some(changed) = historical_candidate(root, task, path, historical).await {
+                if changed {
+                    explanation.add(Some(path), "historical_occupant_changed_or_unsafe");
+                    uncertain = true;
+                }
                 continue;
             }
             // No known content proof can result from hashing this unreceipted
@@ -463,6 +498,16 @@ impl BaselineMatcher {
                             Ok(Some(true))
                         )
                     {
+                        if !historical.is_empty()
+                            && selected_destination_matches(task, path) != Some(true)
+                        {
+                            explanation.add(
+                                Some(path),
+                                "different_selected_destination_requires_confirmation",
+                            );
+                            uncertain = true;
+                            continue;
+                        }
                         let local = data_encoding::HEXLOWER.encode(&file.fingerprint.sha256);
                         return BaselineMatch::ProviderPresent {
                             receipt: provider_receipt(task, path, &local),
@@ -487,6 +532,46 @@ impl BaselineMatcher {
             BaselineMatch::Missing
         }
     }
+}
+
+/// A changed resource with bound history must settle its selected destination.
+fn selected_destination_matches(task: &DownloadTask, path: &Path) -> Option<bool> {
+    let destination = crate::fs_util::confined_path_key(&task.download_path).ok()?;
+    let candidate = crate::fs_util::confined_path_key(path).ok()?;
+    Some(destination == candidate)
+}
+
+/// `Some(false)` classifies absent or unchanged history, never current content.
+/// `Some(true)` holds a changed, unsafe, or selected historical destination.
+async fn historical_candidate(
+    root: &Path,
+    task: &DownloadTask,
+    path: &Path,
+    historical: &[crate::state::db::download_receipts::DownloadReceipt],
+) -> Option<bool> {
+    let old_receipts: Vec<_> = historical
+        .iter()
+        .filter(|receipt| receipt.native_path.to_path() == path)
+        .collect();
+    if old_receipts.is_empty() {
+        return None;
+    }
+    let destination = crate::fs_util::confined_path_key(&task.download_path);
+    let candidate = crate::fs_util::confined_path_key(path);
+    Some(match retain_pending_file(root, path).await {
+        Ok(None) => false,
+        Ok(Some(file))
+            if matches!((destination, candidate), (Ok(destination), Ok(candidate)) if destination != candidate)
+                && old_receipts.iter().all(|receipt| {
+                    receipt.local_checksum
+                        == data_encoding::HEXLOWER.encode(&file.fingerprint.sha256)
+                })
+                && file.validate().await.is_ok() =>
+        {
+            false
+        }
+        _ => true,
+    })
 }
 
 pub(in crate::download) fn uncertain(reason: &str, path: Option<&Path>) -> BaselineMatch {
@@ -589,6 +674,161 @@ mod tests {
             local_checksum: Some(digest.clone()),
             source_checksum: Some(digest),
         }
+    }
+
+    #[tokio::test]
+    async fn historical_occupant_requires_exact_local_bytes_and_distinct_destination() {
+        use super::{BaselineCandidates, SelectedCopyScope};
+        use crate::state::db::download_receipts::DownloadReceipt;
+        use crate::state::db::provider_selection::SelectionPath;
+        let dir = tempfile::tempdir().unwrap();
+        let mut target = task(dir.path());
+        let old = target.download_path.clone();
+        target.download_path = dir.path().join("IMG_0001-current.JPG");
+        std::fs::write(&old, b"good").unwrap();
+        let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(b"good"));
+        let historical = DownloadReceipt {
+            account_key: "account".into(),
+            provider_key: "provider".into(),
+            scope: "scope".into(),
+            library: target.library.to_string(),
+            child: "child".into(),
+            master: "master".into(),
+            state_id: target.asset_id.to_string(),
+            origin_pass: "pass".into(),
+            version_size: target.version_size.as_str().into(),
+            provider_checksum: "old-resource".into(),
+            provider_size: 4,
+            native_path: SelectionPath::from_path(&old),
+            source_checksum: digest.clone(),
+            local_checksum: digest,
+        };
+        let matcher = BaselineMatcher::new(Vec::new());
+        let selected = SelectedCopyScope {
+            admitted: false,
+            other: vec![],
+        };
+        let discovered = BaselineCandidates {
+            paths: vec![old.clone()],
+            complete: true,
+        };
+        assert!(matches!(
+            matcher
+                .match_task_in_scope(
+                    dir.path(),
+                    &target,
+                    &old,
+                    false,
+                    &selected,
+                    &discovered,
+                    std::slice::from_ref(&historical)
+                )
+                .await,
+            BaselineMatch::Missing
+        ));
+        assert!(matches!(
+            matcher
+                .match_task_in_scope(
+                    dir.path(),
+                    &target,
+                    &old,
+                    false,
+                    &selected,
+                    &discovered,
+                    &[]
+                )
+                .await,
+            BaselineMatch::Uncertain(_)
+        ));
+        std::fs::write(&old, b"evil").unwrap();
+        assert!(matches!(
+            matcher
+                .match_task_in_scope(
+                    dir.path(),
+                    &target,
+                    &old,
+                    false,
+                    &selected,
+                    &discovered,
+                    std::slice::from_ref(&historical)
+                )
+                .await,
+            BaselineMatch::Uncertain(_)
+        ));
+        // A modified historical path cannot be adopted even when its bytes
+        // match the currently selected provider resource.
+        use base64::Engine as _;
+        let mut provider = sha1::Sha1::new();
+        provider.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+        provider.update(b"evil");
+        target.checksum = base64::engine::general_purpose::STANDARD
+            .encode([vec![1], provider.finalize().to_vec()].concat())
+            .into();
+        assert!(matches!(
+            matcher
+                .match_task_in_scope(
+                    dir.path(),
+                    &target,
+                    &old,
+                    false,
+                    &selected,
+                    &discovered,
+                    std::slice::from_ref(&historical)
+                )
+                .await,
+            BaselineMatch::Uncertain(_)
+        ));
+        assert_eq!(std::fs::read(&old).unwrap(), b"evil");
+        // A contradictory generic current receipt must not bypass history.
+        let generic = receipt(&target, &old);
+        assert!(matches!(
+            BaselineMatcher::new(vec![generic])
+                .match_task_in_scope(
+                    dir.path(),
+                    &target,
+                    &old,
+                    false,
+                    &selected,
+                    &discovered,
+                    std::slice::from_ref(&historical)
+                )
+                .await,
+            BaselineMatch::Uncertain(_)
+        ));
+        target.checksum = "current-generation".into();
+        std::fs::write(&old, b"good").unwrap();
+        std::fs::write(&target.download_path, b"good").unwrap();
+        let exact = receipt(&target, &target.download_path);
+        assert!(matches!(
+            BaselineMatcher::new(vec![exact])
+                .match_task_in_scope(
+                    dir.path(),
+                    &target,
+                    &old,
+                    false,
+                    &selected,
+                    &discovered,
+                    std::slice::from_ref(&historical)
+                )
+                .await,
+            BaselineMatch::Present { .. }
+        ));
+        target.download_path = old.clone();
+        assert!(matches!(
+            matcher
+                .match_task_in_scope(
+                    dir.path(),
+                    &target,
+                    &old,
+                    false,
+                    &selected,
+                    &discovered,
+                    &[historical]
+                )
+                .await,
+            BaselineMatch::Uncertain(_)
+        ));
+        assert_eq!(std::fs::read(old).unwrap(), b"good");
     }
 
     #[tokio::test]
@@ -1154,7 +1394,8 @@ mod selected_destination_tests {
                         admitted: false,
                         other: [].to_vec()
                     },
-                    &BaselineCandidates::default()
+                    &BaselineCandidates::default(),
+                    &[],
                 )
                 .await,
             BaselineMatch::Uncertain(_)
@@ -1170,7 +1411,8 @@ mod selected_destination_tests {
                         admitted: true,
                         other: [].to_vec()
                     },
-                    &BaselineCandidates::default()
+                    &BaselineCandidates::default(),
+                    &[],
                 )
                 .await,
             BaselineMatch::Missing
@@ -1188,7 +1430,8 @@ mod selected_destination_tests {
                         admitted: true,
                         other: [].to_vec()
                     },
-                    &BaselineCandidates::default()
+                    &BaselineCandidates::default(),
+                    &[],
                 )
                 .await,
             BaselineMatch::Uncertain(_)
@@ -1229,7 +1472,8 @@ mod selected_copy_scope_tests {
                         admitted: true,
                         other: [(native.clone(), None)].to_vec()
                     },
-                    &BaselineCandidates::default()
+                    &BaselineCandidates::default(),
+                    &[],
                 )
                 .await,
             BaselineMatch::Uncertain(_)
@@ -1249,7 +1493,8 @@ mod selected_copy_scope_tests {
                         admitted: true,
                         other: [(native.clone(), Some(candidate.clone()))].to_vec()
                     },
-                    &BaselineCandidates::default()
+                    &BaselineCandidates::default(),
+                    &[],
                 )
                 .await,
             BaselineMatch::Uncertain(_)
@@ -1268,7 +1513,8 @@ mod selected_copy_scope_tests {
                         admitted: true,
                         other: [(native.clone(), Some(unrelated))].to_vec()
                     },
-                    &BaselineCandidates::default()
+                    &BaselineCandidates::default(),
+                    &[],
                 )
                 .await,
             BaselineMatch::Uncertain(_)
