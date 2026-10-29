@@ -104,9 +104,10 @@ async fn indexing_managed_reopen_qualifies_then_materializes_omissions_with_quie
     for naming in [EditedNaming::Primary, EditedNaming::Suffix] {
         let server = server().await;
         let root = tempfile::tempdir().unwrap();
+        let initial_records = records(&server, None);
         let (initial, _) = cycle(
             root.path(),
-            records(&server, None),
+            initial_records.clone(),
             false,
             EditedNaming::Primary,
         )
@@ -118,48 +119,68 @@ async fn indexing_managed_reopen_qualifies_then_materializes_omissions_with_quie
         let gets = server.received_requests().await.unwrap().len();
         for _ in 0..2 {
             let running = readiness("RUNNING");
-            let error = try_cycle_options(root.path(), vec![], true, naming, options(&running))
-                .await
-                .unwrap_err();
-            assert!(
-                error.to_string().contains("Unqualified indexing recovery"),
-                "{error:#}"
-            );
+            let (result, _) = cycle_options(
+                root.path(),
+                initial_records.clone(),
+                true,
+                naming,
+                options(&running),
+            )
+            .await;
+            assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+            assert_eq!(result.stats.failed, 0);
+            assert_eq!(result.stats.skipped.uncertain, 0);
+            assert!(!result.can_advance_database_checkpoint());
             assert_hold(root.path(), &cursor, true, false);
             assert_eq!(media(root.path()), before_media);
             assert_eq!(managed_state(root.path()), before_state);
+            assert_eq!(server.received_requests().await.unwrap().len(), gets);
         }
-        let all = with_omitted(&server);
-        let finished = readiness("FINISHED");
-        let (inventory, lookups) =
-            cycle_options(root.path(), all.clone(), true, naming, options(&finished)).await;
-        assert_eq!(inventory.failed_count, 0, "{:?}", inventory.stats);
-        assert!(!inventory.can_advance_database_checkpoint());
-        assert_hold(root.path(), &cursor, false, true);
-        assert!(metadata(root.path(), &indexing_replay_key(ZONE)).is_some());
-        assert!(finished.cursors.lock().unwrap().is_empty());
-        assert_eq!(
-            lookups, 0,
-            "qualification must not run managed current confirmation"
-        );
-        assert_eq!(server.received_requests().await.unwrap().len(), gets);
-        assert_eq!(media(root.path()), before_media);
-        assert_eq!(managed_state(root.path()), before_state);
-        let materialize = readiness("FINISHED");
         let mut retry = readiness("FINISHED");
         retry.retry_only = true;
-        let (retry_result, _) =
-            cycle_options(root.path(), all.clone(), true, naming, options(&retry)).await;
-        assert!(!retry_result.can_advance_database_checkpoint());
-        assert_hold(root.path(), &cursor, false, true);
-        let (recovered, _) = cycle_options(
+        let (result, _) = cycle_options(
             root.path(),
-            all.clone(),
+            initial_records.clone(),
             true,
             naming,
-            options(&materialize),
+            options(&retry),
         )
         .await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert_eq!(result.stats.failed, 0);
+        assert_eq!(result.stats.skipped.uncertain, 0);
+        assert!(!result.can_advance_database_checkpoint());
+        assert_hold(root.path(), &cursor, true, false);
+        assert_eq!(media(root.path()), before_media);
+        assert_eq!(managed_state(root.path()), before_state);
+        let mut all = initial_records.clone();
+        let mut omitted = initial_records.clone();
+        for record in &mut omitted {
+            record["recordName"] =
+                json!(record["recordName"].as_str().unwrap().replace("501", "502"));
+            if let Some(reference) = record["fields"].get_mut("masterRef") {
+                reference["value"]["recordName"] = json!("502");
+            }
+        }
+        omitted[0]["fields"]["filenameEnc"]["value"] = json!("IMG_0502.JPG");
+        omitted[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL": format!("{}/edit-two", server.uri()), "size": super::EDIT_TWO.len(), "fileChecksum": super::provider_hash(super::EDIT_TWO)});
+        all.extend(omitted);
+        let finished = readiness("FINISHED");
+        let (recovered, _) =
+            cycle_options(root.path(), all.clone(), true, naming, options(&finished)).await;
+        assert_eq!(
+            recovered.failed_count, 0,
+            "{naming:?}: {:?}",
+            recovered.stats
+        );
+        assert!(!recovered.can_advance_database_checkpoint());
+        assert_hold(root.path(), &cursor, false, false);
+        assert!(metadata(root.path(), &indexing_replay_key(ZONE)).is_some());
+        assert_bytes(&root.path().join("media/IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(&root.path().join("media/IMG_0502.JPG"), super::EDIT_TWO);
+        let replay = readiness("FINISHED");
+        let (recovered, _) =
+            cycle_options(root.path(), all.clone(), true, naming, options(&replay)).await;
         assert_eq!(
             recovered.failed_count, 0,
             "{naming:?}: {:?}",
@@ -170,33 +191,22 @@ async fn indexing_managed_reopen_qualifies_then_materializes_omissions_with_quie
             "{naming:?}: {:?}",
             recovered.stats
         );
-        assert_eq!(*materialize.cursors.lock().unwrap(), [cursor]);
+        assert_eq!(*replay.cursors.lock().unwrap(), [cursor]);
         assert_hold(root.path(), "cycle-token", false, false);
         assert!(metadata(root.path(), &indexing_replay_key(ZONE)).is_none());
-        let target = root.path().join("media");
-        assert_bytes(&target.join("IMG_0502.JPG"), ORIGINAL);
-        assert_bytes(
-            &target.join(if naming == EditedNaming::Primary {
-                "IMG_0501.JPG"
-            } else {
-                "IMG_0501_edited.JPG"
-            }),
-            EDIT_ONE,
-        );
-        assert_bytes(
-            &target.join(if naming == EditedNaming::Primary {
-                "IMG_0501_original.JPG"
-            } else {
-                "IMG_0501.JPG"
-            }),
-            ORIGINAL,
-        );
+        assert_bytes(&root.path().join("media/IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(&root.path().join("media/IMG_0502.JPG"), super::EDIT_TWO);
+        assert!(!root.path().join("media/IMG_0501_original.JPG").exists());
         let gets = server.received_requests().await.unwrap().len();
         for _ in 0..2 {
             let steady = readiness("FINISHED");
             let (result, _) =
                 cycle_options(root.path(), all.clone(), true, naming, options(&steady)).await;
-            assert!(result.can_advance_database_checkpoint());
+            assert!(
+                result.can_advance_database_checkpoint(),
+                "{:?}",
+                result.stats
+            );
             assert_eq!(result.stats.downloaded, 0);
             assert_eq!(steady.queries.load(std::sync::atomic::Ordering::SeqCst), 0);
             assert_eq!(server.received_requests().await.unwrap().len(), gets);

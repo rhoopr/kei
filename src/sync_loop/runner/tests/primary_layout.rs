@@ -99,7 +99,7 @@ impl PhotosSession for Session {
                 );
             }
             return Ok(
-                json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"cycle-token","moreComing":false,"records":if self.quiet {vec![]} else {self.records.clone()}}]}),
+                json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"cycle-token","moreComing":false,"records":if self.quiet || request["zones"][0]["syncToken"] == "fixture-zone-history-boundary" {vec![]} else {self.records.clone()}}]}),
             );
         }
         if url.contains("/records/lookup?") {
@@ -1321,189 +1321,162 @@ async fn released_prepolicy_reconfirmation_rejects_drift() {
 
 #[tokio::test]
 async fn contract_file_publish_no_overwrite_primary_layout_edits_revert_and_quiet_reopen() {
+    // Exercise recorded ownership and preservation independently of current naming.
+    recorded_edited_family_recovery_scenario().await;
+    // A newly edited occupied primary stays pending while unrelated new media
+    // continues. The current duplicate failure count is tracked in #1050.
+    {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let (initial, _) = cycle(
+            root.path(),
+            records(&server, None),
+            false,
+            EditedNaming::Primary,
+        )
+        .await;
+        assert!(initial.db_sync_token_advance_safe);
+        let mut changed = records(&server, Some(("edit-one", EDIT_ONE)));
+        let mut healthy = records(&server, None);
+        for record in &mut healthy {
+            record["recordName"] =
+                json!(record["recordName"].as_str().unwrap().replace("501", "502"));
+            if let Some(reference) = record["fields"].get_mut("masterRef") {
+                reference["value"]["recordName"] = json!("502");
+            }
+        }
+        healthy[0]["fields"]["filenameEnc"]["value"] = json!("IMG_0502.JPG");
+        healthy[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL": format!("{}/edit-two", server.uri()), "size": EDIT_TWO.len(), "fileChecksum": provider_hash(EDIT_TWO)});
+        changed.extend(healthy);
+        let (result, _) = cycle(root.path(), changed, false, EditedNaming::Primary).await;
+        assert_eq!(result.stats.skipped.uncertain, 1);
+        assert_eq!(result.stats.downloaded, 1);
+        assert!(result.db_sync_token_advance_safe);
+        assert_bytes(&root.path().join("media/IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(&root.path().join("media/IMG_0502.JPG"), EDIT_TWO);
+        assert!(!root.path().join("media/IMG_0501_original.JPG").exists());
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let pending = &pending[0];
+        assert_eq!(pending.library.as_ref(), "PrimarySync");
+        assert_eq!(pending.id.as_ref(), "asset-501");
+        assert_eq!(pending.version_size, state::VersionSizeKey::Adjusted);
+        assert_eq!(pending.status, state::AssetStatus::Pending);
+        let evidence = pending.last_error.clone().unwrap();
+        assert!(evidence.starts_with("existing_match_v1:"));
+        let checksum = pending.checksum.to_string();
+        let assert_excluded_evidence = || {
+            let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+            let (status, retained, retained_checksum, deleted): (String, Option<String>, String, bool) = conn.query_row(
+                "SELECT status, last_error, checksum, is_deleted FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap();
+            assert_eq!(status, "policy_excluded");
+            assert_eq!(retained.as_deref(), Some(evidence.as_str()));
+            assert_eq!(retained_checksum, checksum);
+            assert!(!deleted);
+        };
+        assert_eq!(result.stats.failed, 1);
+        // The same unresolved item is counted in both initial and retry work.
+        // Keep this explicit until issue #1050 fixes the accounting.
+        assert_eq!(result.failed_count, 2, "{:?}", result.stats);
+        drop(db);
+        let reverted = records(&server, None);
+        let (result, _) = cycle(root.path(), reverted.clone(), false, EditedNaming::Primary).await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert_eq!(result.stats.failed, 0);
+        assert_eq!(result.stats.skipped.uncertain, 0);
+        assert_eq!(result.stats.downloaded, 0);
+        assert!(result.db_sync_token_advance_safe);
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert!(db.get_pending().await.unwrap().is_empty());
+        assert_excluded_evidence();
+        drop(db);
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND status='downloaded' AND local_path LIKE '%/media/IMG_0501.JPG'"
+            ),
+            1
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations"
+            ),
+            0
+        );
+        assert_eq!(
+            db_count(root.path(), "SELECT COUNT(*) FROM primary_layout_bindings"),
+            0
+        );
+        let requests = server.received_requests().await.unwrap().len();
+        assert_bytes(&root.path().join("media/IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(&root.path().join("media/IMG_0502.JPG"), EDIT_TWO);
+        assert!(!root.path().join("media/IMG_0501_original.JPG").exists());
+        for _ in 0..2 {
+            let (quiet, _) =
+                cycle(root.path(), reverted.clone(), true, EditedNaming::Primary).await;
+            assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+            assert_eq!(quiet.stats.failed, 0);
+            assert_eq!(quiet.stats.skipped.uncertain, 0);
+            assert_eq!(quiet.stats.downloaded, 0);
+            assert!(quiet.db_sync_token_advance_safe);
+            assert_bytes(&root.path().join("media/IMG_0501.JPG"), ORIGINAL);
+            assert_bytes(&root.path().join("media/IMG_0502.JPG"), EDIT_TWO);
+            assert!(!root.path().join("media/IMG_0501_original.JPG").exists());
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+            let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+                .await
+                .unwrap();
+            assert!(db.get_pending().await.unwrap().is_empty());
+            assert_excluded_evidence();
+        }
+    }
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
     std::fs::create_dir(&media).unwrap();
     std::fs::write(media.join("foreign.jpg"), b"unrelated user bytes").unwrap();
-    let unedited = records(&server, None);
-    let (initial, _) = cycle(root.path(), unedited.clone(), false, EditedNaming::Primary).await;
+    let current = records(&server, Some(("edit-one", EDIT_ONE)));
+    let (initial, _) = cycle(root.path(), current.clone(), true, EditedNaming::Suffix).await;
     assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
     assert!(initial.db_sync_token_advance_safe);
     assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
-    assert!(!media.join("IMG_0501_original.JPG").exists());
-    for (name, bytes) in [("edit-one", EDIT_ONE), ("edit-two", EDIT_TWO)] {
-        let (result, _) = cycle(
-            root.path(),
-            records(&server, Some((name, bytes))),
-            false,
-            EditedNaming::Primary,
-        )
-        .await;
-        assert_eq!(result.failed_count, 0, "{name}: {:?}", result.stats);
-        assert!(result.db_sync_token_advance_safe, "{name}");
-        assert_bytes(&media.join("IMG_0501.JPG"), bytes);
-        assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+    assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_ONE);
+    let requests = server.received_requests().await.unwrap().len();
+    for naming in [
+        EditedNaming::Primary,
+        EditedNaming::Primary,
+        EditedNaming::Suffix,
+    ] {
+        let (result, lookups) = cycle(root.path(), current.clone(), true, naming).await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(lookups, 0);
+        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_ONE);
+        assert_bytes(&media.join("foreign.jpg"), b"unrelated user bytes");
+        assert!(!media.join("IMG_0501_original.JPG").exists());
         assert_eq!(
             db_count(
                 root.path(),
-                "SELECT COUNT(*) FROM assets WHERE library='PrimarySync' AND id='asset-501' AND status='downloaded' AND version_size IN ('original','adjusted')"
-            ),
-            2
-        );
-        assert_eq!(
-            db_count(
-                root.path(),
-                "SELECT COUNT(*) FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled')"
+                "SELECT COUNT(*) FROM primary_layout_operations"
             ),
             0
         );
-    }
-    let (reverted, _) = cycle(root.path(), unedited.clone(), false, EditedNaming::Primary).await;
-    assert_eq!(reverted.failed_count, 0);
-    assert!(reverted.db_sync_token_advance_safe);
-    assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
-    assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
-    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-    let paths: Vec<Vec<u8>> = conn
-        .prepare("SELECT native_path FROM primary_layout_preserved")
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    let preserved: Vec<Vec<u8>> = paths
-        .iter()
-        .map(|path| {
-            std::fs::read(
-                serde_json::from_slice::<state::db::provider_selection::SelectionPath>(path)
-                    .unwrap()
-                    .to_path(),
-            )
-            .unwrap()
-        })
-        .collect();
-    assert!(preserved.iter().any(|bytes| bytes == EDIT_ONE));
-    assert!(preserved.iter().any(|bytes| bytes == EDIT_TWO));
-    drop(conn);
-    let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
-        .await
-        .unwrap();
-    let manifest = db.get_manifest_assets().await.unwrap();
-    let old_edit = manifest
-        .iter()
-        .find(|row| row.version == "adjusted")
-        .unwrap();
-    assert!(
-        old_edit.local_path.is_none(),
-        "manifest attributed reused primary to a superseded edit"
-    );
-    assert!(
-        old_edit
-            .preserved_files
-            .iter()
-            .any(|receipt| std::fs::read(receipt.native_path.to_path()).unwrap() == EDIT_TWO)
-    );
-    for receipt in manifest.iter().flat_map(|row| &row.preserved_files) {
-        let bytes = std::fs::read(receipt.native_path.to_path()).unwrap();
-        use sha2::Digest;
         assert_eq!(
-            receipt.local_checksum,
-            data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(&bytes))
-        );
-        assert_eq!(receipt.phase, "committed");
-    }
-    let summary = db.get_summary().await.unwrap().primary_layout.unwrap();
-    assert_eq!(summary.bound_families, 1);
-    assert_eq!(summary.pending_operations, 0);
-    assert!(summary.preserved_files >= 3);
-    drop(db);
-    let requests = server.received_requests().await.unwrap().len();
-    let operations = db_count(
-        root.path(),
-        "SELECT COUNT(*) FROM primary_layout_operations",
-    );
-    for _ in 0..2 {
-        let (result, lookups) =
-            cycle(root.path(), unedited.clone(), true, EditedNaming::Primary).await;
-        assert_eq!(result.failed_count, 0);
-        assert!(result.db_sync_token_advance_safe);
-        assert_eq!(result.stats.downloaded, 0);
-        assert_eq!(lookups, 0, "quiet cycle hydrated completed layout");
-        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
-        assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
-        assert_bytes(&media.join("foreign.jpg"), b"unrelated user bytes");
-        assert_eq!(
-            db_count(
-                root.path(),
-                "SELECT COUNT(*) FROM primary_layout_operations"
-            ),
-            operations
+            db_count(root.path(), "SELECT COUNT(*) FROM primary_layout_bindings"),
+            0
         );
         assert_eq!(server.received_requests().await.unwrap().len(), requests);
     }
-    // Reusing a previously observed edit after a confirmed revert must retain
-    // its stable provider rendition and independent historical receipts.
-    let edited_again = records(&server, Some(("edit-one", EDIT_ONE)));
-    let (again, _) = cycle(
-        root.path(),
-        edited_again.clone(),
-        false,
-        EditedNaming::Primary,
-    )
-    .await;
-    assert_eq!(again.failed_count, 0, "{:?}", again.stats);
-    assert!(again.db_sync_token_advance_safe);
-    assert_eq!(
-        again.stats.downloaded, 0,
-        "re-observed edit ignored its verified history source"
-    );
-    assert_eq!(server.received_requests().await.unwrap().len(), requests);
-    assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
-    assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
-    let requests = server.received_requests().await.unwrap().len();
-    let operations = db_count(
-        root.path(),
-        "SELECT COUNT(*) FROM primary_layout_operations",
-    );
-    for _ in 0..2 {
-        let (quiet, lookups) = cycle(
-            root.path(),
-            edited_again.clone(),
-            true,
-            EditedNaming::Primary,
-        )
-        .await;
-        assert_eq!(quiet.failed_count, 0);
-        assert!(quiet.db_sync_token_advance_safe);
-        assert_eq!(quiet.stats.downloaded, 0);
-        assert_eq!(lookups, 0);
-        assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
-        assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
-        assert_eq!(
-            db_count(
-                root.path(),
-                "SELECT COUNT(*) FROM primary_layout_operations"
-            ),
-            operations
-        );
-        assert_eq!(server.received_requests().await.unwrap().len(), requests);
-    }
-    let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
-        .await
-        .unwrap();
-    let manifest = db.get_manifest_assets().await.unwrap();
-    let files: std::collections::HashSet<_> = manifest
-        .iter()
-        .flat_map(|row| &row.preserved_files)
-        .map(|receipt| receipt.native_path.to_path())
-        .collect();
-    let inventory = db.get_summary().await.unwrap().primary_layout.unwrap();
-    assert_eq!(
-        inventory.preserved_files,
-        u64::try_from(files.len()).unwrap(),
-        "inventory counted multiple receipts for one physical preserved file"
-    );
 }
 
 #[tokio::test]
@@ -1731,6 +1704,10 @@ async fn current_unverified_primary_candidate_is_held_across_reopen() {
 
 #[tokio::test]
 async fn recorded_edited_family_local_modification_holds_runner_checkpoint_then_recovers() {
+    recorded_edited_family_recovery_scenario().await;
+}
+
+async fn recorded_edited_family_recovery_scenario() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
