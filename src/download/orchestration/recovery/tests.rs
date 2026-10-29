@@ -311,65 +311,135 @@ async fn pending_retry_reuses_missing_recorded_path_when_it_matches_planned_path
 
 #[tokio::test]
 async fn name_id7_targeted_retry_adopts_intact_recorded_path_without_planned_task() {
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let dir = TempDir::new().expect("temp dir");
-    let mut config = test_config();
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-    config.file_match_policy = FileMatchPolicy::NameId7;
+    use sha1::{Digest, Sha1};
 
-    let mut records = incremental_photo_records_with_url(
-        "ID7_ADOPT",
-        "id7.jpg",
-        "https://p01.icloud-content.com/id7.jpg",
-        8,
-    );
-    records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!("ck_id7");
-    let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
-    let recorded_path = filter::expected_paths_for(&asset, &config)
-        .into_iter()
-        .next()
-        .expect("asset should derive a path")
-        .path;
-    tokio::fs::create_dir_all(recorded_path.parent().expect("recorded path parent"))
-        .await
-        .expect("create recorded path parent");
-    tokio::fs::write(&recorded_path, b"12345678")
-        .await
-        .expect("seed intact recorded file");
-    seed_pending_retry_with_recorded_path(db.as_ref(), &asset, "ck_id7", 8, &recorded_path).await;
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session(
-            "PrimarySync",
-            "",
-            Box::new(PendingLookupSession {
-                records: Arc::new(records),
-            }),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
+    for verified in [true, false] {
+        let dir = TempDir::new().expect("temp dir");
+        let database = dir.path().join("state.db");
+        let db = Arc::new(
+            crate::state::SqliteStateDb::open(&database)
+                .await
+                .expect("state db"),
+        );
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.file_match_policy = FileMatchPolicy::NameId7;
 
-    let plan = build_pending_retry_download_tasks(
-        &passes,
-        &config,
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-    )
-    .await
-    .expect("adopt targeted retry");
+        let body = b"12345678";
+        let mut hash = Sha1::new();
+        hash.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+        hash.update(body);
+        let signature = data_encoding::BASE64.encode(&[vec![1], hash.finalize().to_vec()].concat());
+        let checksum = if verified {
+            signature.as_str()
+        } else {
+            "opaque-unverified"
+        };
+        let mut records = incremental_photo_records_with_url(
+            "ID7_ADOPT",
+            "id7.jpg",
+            "https://p01.icloud-content.com/id7.jpg",
+            8,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let recorded_path = filter::expected_paths_for(&asset, &config)
+            .into_iter()
+            .next()
+            .expect("asset should derive a path")
+            .path;
+        tokio::fs::create_dir_all(recorded_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&recorded_path, body).await.unwrap();
+        seed_pending_retry_with_recorded_path(db.as_ref(), &asset, checksum, 8, &recorded_path)
+            .await;
+        drop(config);
+        drop(db);
 
-    assert!(plan.tasks.is_empty());
-    let summary = db.get_summary().await.expect("state summary");
-    assert_eq!(summary.downloaded, 1);
-    assert_eq!(summary.policy_excluded, 0);
-    assert_eq!(summary.pending, 0);
-    assert_eq!(summary.failed, 0);
-    let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
-    assert_eq!(
-        downloaded[0].local_path.as_deref(),
-        Some(recorded_path.as_path())
-    );
+        for stage in 0..4 {
+            let current_verified = verified || stage >= 2;
+            if current_verified {
+                records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(signature);
+            }
+            let db = Arc::new(crate::state::SqliteStateDb::open(&database).await.unwrap());
+            if !verified && stage == 2 {
+                // A normal provider observation must update durable pending identity
+                // before targeted retry can match a changed generation.
+                let observed = TestAssetRecord::new(asset.state_id())
+                    .filename(recorded_path.file_name().unwrap().to_str().unwrap())
+                    .checksum(&signature)
+                    .size(8)
+                    .added_at(asset.added_date())
+                    .build();
+                db.upsert_seen(&observed).await.unwrap();
+            }
+            let mut config = test_config();
+            config.directory = Arc::from(dir.path());
+            config.state_db = Some(db.clone());
+            config.file_match_policy = FileMatchPolicy::NameId7;
+            let passes = vec![AlbumPass {
+                kind: PassKind::Unfiled,
+                album: album_with_session(
+                    "PrimarySync",
+                    "",
+                    Box::new(PendingLookupSession {
+                        records: Arc::new(records.clone()),
+                    }),
+                ),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            }];
+            let plan = build_pending_retry_download_tasks(
+                &passes,
+                &config,
+                DownloadRunMode::Download,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("plan targeted retry");
+            assert!(plan.tasks.is_empty());
+            let summary = db.get_summary().await.expect("state summary");
+            assert_eq!(summary.downloaded, u64::from(current_verified));
+            assert_eq!(summary.pending, u64::from(!current_verified));
+            assert_eq!(summary.policy_excluded, 0);
+            assert_eq!(summary.failed, 0);
+            assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), body);
+            let (provider, local, source): (String, Option<String>, Option<String>) = db
+                .acquire_lock("inspect recovery provenance")
+                .unwrap()
+                .query_row(
+                    "SELECT provider_checksum, local_checksum, source_checksum FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND provider_checksum=?5",
+                    rusqlite::params!["PrimarySync", asset.state_id(), VersionSizeKey::Original.as_str(), recorded_path.to_str().unwrap(), if current_verified { signature.as_str() } else { "opaque-unverified" }],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            if current_verified {
+                let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+                assert_eq!(
+                    downloaded[0].local_path.as_deref(),
+                    Some(recorded_path.as_path())
+                );
+                let sha256 = file::compute_sha256(&recorded_path).await.unwrap();
+                assert_eq!(
+                    downloaded[0].local_checksum.as_deref(),
+                    Some(sha256.as_str())
+                );
+                assert_eq!(
+                    downloaded[0].download_checksum.as_deref(),
+                    Some(sha256.as_str())
+                );
+                assert_eq!(provider, signature);
+                assert_eq!(local.as_deref(), Some(sha256.as_str()));
+                assert_eq!(source.as_deref(), Some(sha256.as_str()));
+            } else {
+                assert_eq!(provider, "opaque-unverified");
+                assert_eq!(local.as_deref(), Some("previous-local-checksum"));
+                assert_eq!(source, None);
+                assert_eq!(plan.unmatched_targets.len(), 1);
+            }
+        }
+    }
 }
 
 #[tokio::test]
