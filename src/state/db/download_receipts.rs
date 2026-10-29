@@ -223,6 +223,22 @@ pub(super) fn matching(
         .collect()
 }
 
+/// Historical receipts classify an occupied old path, never current content.
+pub(super) fn historical(
+    conn: &Connection,
+    scope: &str,
+    child: &str,
+    master: &str,
+    version: &str,
+) -> Result<Vec<DownloadReceipt>, StateError> {
+    let ids: Vec<String> = conn.prepare("SELECT id FROM download_receipts WHERE scope=?1 AND child=?2 AND master=?3 AND version_size=?4 ORDER BY native_path")?
+        .query_map(params![scope, child, master, version], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    ids.into_iter()
+        .map(|id| load(conn, &id)?.ok_or_else(invalid))
+        .collect()
+}
+
 pub(super) fn matching_local(
     conn: &Connection,
     scope: &str,

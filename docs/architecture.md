@@ -422,6 +422,11 @@ Unchanged historical raw-file receipts require source SHA-256,
 recorded local SHA-256 and freshly read bytes to agree. Old source/local
 mismatches cannot certify metadata edits because older generic adoption could
 preserve a source hash while replacing the local hash with unrelated bytes.
+A bound completed receipt for an older resource can classify its unchanged
+native occupant when the account, source, child, master, rendition and pass
+match. It cannot prove the selected resource. The selected resource still uses
+a distinct reserved destination and the ordinary verified publication path;
+changed or unsafe historical occupants remain uncertain.
 
 The selected resource's fileChecksum can independently verify raw local bytes
 for the explicitly supported MMCS v1 variant: strict Base64 of byte 0x01 followed
