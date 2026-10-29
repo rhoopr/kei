@@ -1788,7 +1788,7 @@ async fn bounded_full_sync_hydrates_live_legacy_pending_master() {
 }
 
 #[tokio::test]
-async fn bounded_full_sync_adopts_filtered_legacy_pending_file() {
+async fn bounded_full_sync_preserves_filtered_legacy_pending_file() {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
 
@@ -1807,7 +1807,13 @@ async fn bounded_full_sync_adopts_filtered_legacy_pending_file() {
     }});
     records[0]["fields"]["resOriginalVidComplFileType"] =
         json!({"value": "com.apple.quicktime-movie"});
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+    let dir = TempDir::new().expect("temp dir");
+    let database = dir.path().join("state.db");
+    let db = Arc::new(
+        crate::state::SqliteStateDb::open(&database)
+            .await
+            .expect("state db"),
+    );
     let session = LegacyPendingHydrationSession {
         lookup_records: Arc::new(vec![records[0].clone()]),
         hydration_records: Arc::new(records.clone()),
@@ -1819,7 +1825,6 @@ async fn bounded_full_sync_adopts_filtered_legacy_pending_file() {
         exclude_ids: Arc::new(FxHashSet::default()),
     }];
 
-    let dir = TempDir::new().expect("temp dir");
     let mut config = test_config();
     config.directory = Arc::from(dir.path());
     config.state_db = Some(db.clone());
@@ -1855,27 +1860,54 @@ async fn bounded_full_sync_adopts_filtered_legacy_pending_file() {
     let result = download_photos_with_sync(
         &Client::new(),
         &passes,
-        Arc::new(config),
+        Arc::new(config.clone()),
         DownloadControls::download_hidden(),
         CancellationToken::new(),
     )
     .await
-    .expect("filtered legacy pending file should be adopted");
+    .expect("filtered legacy pending file should remain excluded");
 
     assert!(matches!(result.outcome, DownloadOutcome::Success));
     let summary = db.get_summary().await.expect("summary");
-    assert_eq!(summary.downloaded, 1);
+    assert_eq!(summary.downloaded, 0);
     assert_eq!(summary.pending, 0);
+    assert_eq!(summary.policy_excluded, 1);
     assert_eq!(summary.failed, 0);
     assert_eq!(summary.awaiting_provider_verification, 0);
-    let downloaded = db
-        .get_downloaded_page(0, 10)
-        .await
-        .expect("downloaded page");
+    assert_eq!(summary.source_deleted, 0);
+    assert!(db.get_downloaded_file_records().await.unwrap().is_empty());
+    assert_eq!(tokio::fs::read(&expected_path).await.unwrap(), body);
     assert_eq!(
-        downloaded[0].local_path.as_deref(),
-        Some(expected_path.as_path())
+        db.get_policy_excluded_ids_for_revalidation("PrimarySync")
+            .await
+            .unwrap(),
+        vec!["LEGACY_FILTERED_ON_DISK".to_owned()]
     );
+    drop(config);
+    drop(db);
+
+    let reopened = crate::state::SqliteStateDb::open(&database)
+        .await
+        .expect("reopen state");
+    let summary = reopened.get_summary().await.expect("reopened summary");
+    assert_eq!(summary.policy_excluded, 1);
+    assert_eq!(summary.downloaded, 0);
+    assert_eq!(summary.source_deleted, 0);
+    assert!(
+        reopened
+            .get_downloaded_file_records()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        reopened
+            .get_policy_excluded_ids_for_revalidation("PrimarySync")
+            .await
+            .unwrap(),
+        vec!["LEGACY_FILTERED_ON_DISK".to_owned()]
+    );
+    assert_eq!(tokio::fs::read(&expected_path).await.unwrap(), body);
 }
 
 #[tokio::test]
