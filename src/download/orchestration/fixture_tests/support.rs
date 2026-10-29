@@ -16,6 +16,7 @@ use super::{SyncMode, cycle, fixture, records, sha256};
 struct CurrentView {
     session: Box<dyn crate::icloud::photos::PhotosSession>,
     records: Vec<Value>,
+    zone: Value,
 }
 
 #[async_trait::async_trait]
@@ -30,10 +31,7 @@ impl crate::icloud::photos::PhotosSession for CurrentView {
             return self.session.post(url, body, headers).await;
         }
         let request: Value = serde_json::from_str(&body)?;
-        assert_eq!(
-            request["zoneID"],
-            json!({"zoneName":"PrimarySync", "ownerRecordName":"_defaultOwner"})
-        );
+        assert_eq!(request["zoneID"], self.zone);
         let names = request["records"].as_array().unwrap();
         let mut selected = Vec::new();
         for requested in names {
@@ -57,6 +55,7 @@ impl crate::icloud::photos::PhotosSession for CurrentView {
         Box::new(Self {
             session: self.session.clone_box(),
             records: self.records.clone(),
+            zone: self.zone.clone(),
         })
     }
 }
@@ -128,6 +127,33 @@ impl Harness {
         self.db = Some(db);
     }
 
+    pub async fn lookup_cycle(&self, records: Vec<Value>) -> super::super::models::SyncResult {
+        let count = records
+            .iter()
+            .filter(|record| record["recordType"] == "CPLMaster")
+            .count() as u64;
+        let session = crate::test_helpers::MockPhotosFlow::new()
+            .album_count(count)
+            .query_page(records.clone(), Some("fixture-token"))
+            .empty_query_page(Some("fixture-token"))
+            .build();
+        let album = super::super::test_support::album_with_session(
+            "PrimarySync",
+            "",
+            Box::new(CurrentView {
+                session: Box::new(session),
+                records,
+                zone: json!({"zoneName":"PrimarySync"}),
+            }),
+        );
+        let pass = crate::commands::AlbumPass {
+            kind: crate::commands::PassKind::Unfiled,
+            album,
+            exclude_ids: Arc::default(),
+        };
+        super::cycle_passes(&self.config, &[pass]).await
+    }
+
     pub async fn owned_cycle(&self, records: Vec<Value>) -> super::super::models::SyncResult {
         let count = records
             .iter()
@@ -158,6 +184,7 @@ impl Harness {
             Box::new(CurrentView {
                 session: Box::new(session),
                 records: current,
+                zone: json!({"zoneName":"PrimarySync", "ownerRecordName":"_defaultOwner"}),
             }),
         );
         album.set_shadow_capture(

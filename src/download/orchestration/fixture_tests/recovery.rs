@@ -149,7 +149,7 @@ async fn bundled_partial_failure_recovers_after_restart() {
         .await;
     records.extend(bad);
     assert!(h.db().get_downloaded_page(0, 10).await.unwrap().is_empty());
-    let result = cycle(&h.config, records.clone()).await;
+    let result = h.lookup_cycle(records.clone()).await;
     assert!(
         matches!(
             result.outcome,
@@ -172,7 +172,7 @@ async fn bundled_partial_failure_recovers_after_restart() {
         .mount(&h.server)
         .await;
     for downloaded in [1, 0] {
-        let result = cycle(&h.config, records.clone()).await;
+        let result = h.lookup_cycle(records.clone()).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{result:?}"
