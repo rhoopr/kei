@@ -406,6 +406,77 @@ fn progress_hash(
     ))?))
 }
 
+// Versioned local trust is distinct from the legacy source-backed progress hash.
+// The immutable acceptance key remains available after selection compaction.
+const LOCAL_TRUST_PREFIX: &str = "local_trust:v1:";
+
+fn local_trust_progress_hash(
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    destination: &SelectionDestination,
+    intent: Option<&str>,
+    metadata: bool,
+    local: &str,
+    receipt: &str,
+) -> Result<String, StateError> {
+    let hash = digest(&encode(&(
+        1_u8,
+        &root.id,
+        digest(&encode(manifest)?),
+        destination,
+        intent,
+        metadata,
+        local,
+        receipt,
+    ))?);
+    Ok(format!("{LOCAL_TRUST_PREFIX}{receipt}:{hash}"))
+}
+
+fn local_trust_receipt(progress: &str) -> Option<&str> {
+    let (receipt, hash) = progress
+        .strip_prefix(LOCAL_TRUST_PREFIX)?
+        .rsplit_once(':')?;
+    if receipt.is_empty() || hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(receipt)
+}
+
+fn validate_local_trust_progress(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    destination: &SelectionDestination,
+    intent: Option<&str>,
+    metadata: bool,
+    local: &str,
+    progress: &str,
+) -> Result<bool, StateError> {
+    let Some(receipt) = local_trust_receipt(progress) else {
+        return Ok(false);
+    };
+    let Some(accepted) = super::trusted_legacy::receipt_file(conn, receipt)? else {
+        return Ok(false);
+    };
+    let library = root.spec.zone.get("zoneName").and_then(Value::as_str);
+    Ok(library == Some(accepted.library.as_str())
+        && manifest.state_id == accepted.child
+        && manifest.decision.child == accepted.child
+        && manifest.decision.master.as_deref() == Some(accepted.master.as_str())
+        && destination.version_size == accepted.rendition
+        && destination.path.to_path() == accepted.path
+        && local == accepted.local_sha256
+        && local_trust_progress_hash(
+            root,
+            manifest,
+            destination,
+            intent,
+            metadata,
+            local,
+            receipt,
+        )? == progress)
+}
+
 /// The output belongs to this exact immutable writer intent and verified
 /// input. It is retained across publication/finalization interruption only.
 fn prepared_metadata_hash(
@@ -459,21 +530,36 @@ fn refresh_progress_hash(
     destination: &SelectionDestination,
 ) -> Result<(), StateError> {
     let path = destination.path.key()?;
-    let (media,metadata,local,source,intent):(bool,bool,Option<String>,Option<String>,Option<String>)=conn.query_row("SELECT verified_media,verified_metadata,local_checksum,source_checksum,intent_hash FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![root.id,manifest.decision.pass_key,manifest.decision.child,destination.version_size,path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+    let (media,metadata,local,source,intent,previous):(bool,bool,Option<String>,Option<String>,Option<String>,Option<String>)=conn.query_row("SELECT verified_media,verified_metadata,local_checksum,source_checksum,intent_hash,progress_hash FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![root.id,manifest.decision.pass_key,manifest.decision.child,destination.version_size,path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
     let hash = if media {
-        Some(progress_hash(
-            root,
-            manifest,
-            destination,
-            intent.as_deref(),
-            metadata,
-            local
+        let local = local
+            .as_deref()
+            .ok_or(StateError::ProviderSelectionInvalid)?;
+        if let Some(source) = source.as_deref() {
+            Some(progress_hash(
+                root,
+                manifest,
+                destination,
+                intent.as_deref(),
+                metadata,
+                local,
+                source,
+            )?)
+        } else {
+            let receipt = previous
                 .as_deref()
-                .ok_or(StateError::ProviderSelectionInvalid)?,
-            source
-                .as_deref()
-                .ok_or(StateError::ProviderSelectionInvalid)?,
-        )?)
+                .and_then(local_trust_receipt)
+                .ok_or(StateError::ProviderSelectionInvalid)?;
+            Some(local_trust_progress_hash(
+                root,
+                manifest,
+                destination,
+                intent.as_deref(),
+                metadata,
+                local,
+                receipt,
+            )?)
+        }
     } else {
         None
     };
@@ -1291,7 +1377,7 @@ fn validate_decision_rows(
         }
     }
     for destination in &d.destinations {
-        let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND asset_id=?4 AND version_size=?5 AND path=?6 AND compat_path=?12 AND checksum=?7 AND size_bytes=?8 AND metadata_hash=?9 AND master=?10 AND library=?11 AND (verified_media=0 OR (admitted=1 AND length(local_checksum)=64 AND length(source_checksum)=64)))",params![root.id,d.pass_key,d.child,manifest.state_id,destination.version_size,destination.path.key()?,destination.checksum,i64::try_from(destination.size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,destination.metadata_hash,d.master,root.spec.zone.get("zoneName").and_then(Value::as_str),destination.path.to_path().to_string_lossy()],|r|r.get(0))?;
+        let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND asset_id=?4 AND version_size=?5 AND path=?6 AND compat_path=?12 AND checksum=?7 AND size_bytes=?8 AND metadata_hash=?9 AND master=?10 AND library=?11 AND (verified_media=0 OR (length(local_checksum)=64 AND ((admitted=1 AND length(source_checksum)=64) OR (source_checksum IS NULL AND progress_hash LIKE 'local_trust:v1:%')))))",params![root.id,d.pass_key,d.child,manifest.state_id,destination.version_size,destination.path.key()?,destination.checksum,i64::try_from(destination.size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,destination.metadata_hash,d.master,root.spec.zone.get("zoneName").and_then(Value::as_str),destination.path.to_path().to_string_lossy()],|r|r.get(0))?;
         if !valid {
             return invalid();
         }
@@ -1317,28 +1403,37 @@ fn validate_decision_rows(
             return invalid();
         }
         if media {
-            let (Some(local), Some(source), Some(stored)) = (local, source, progress) else {
+            let (Some(local), Some(stored)) = (local, progress) else {
                 return invalid();
             };
-            // The progress receipt binds independent local/source SHA-256 to
-            // the immutable provider generation and destination above. MMCS
-            // is opaque and has no content-hash equality relationship.
-            if source.len() != 64
-                || local.len() != 64
-                || !source
-                    .bytes()
-                    .chain(local.bytes())
-                    .all(|b| b.is_ascii_hexdigit())
-                || progress_hash(
+            if local.len() != 64 || !local.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return invalid();
+            }
+            let valid = if let Some(source) = source {
+                source.len() == 64
+                    && source.bytes().all(|b| b.is_ascii_hexdigit())
+                    && progress_hash(
+                        root,
+                        manifest,
+                        destination,
+                        intent.as_deref(),
+                        metadata,
+                        &local,
+                        &source,
+                    )? == stored
+            } else {
+                validate_local_trust_progress(
+                    conn,
                     root,
                     manifest,
                     destination,
                     intent.as_deref(),
                     metadata,
                     &local,
-                    &source,
-                )? != stored
-            {
+                    &stored,
+                )?
+            };
+            if !valid {
                 return invalid();
             }
         } else if local.is_some() || source.is_some() || progress.is_some() {
@@ -2816,6 +2911,85 @@ fn record_destination_source(
 }
 
 impl SqliteStateDb {
+    /// Settle accepted renditions from one fresh scope and held file set.
+    pub(crate) async fn settle_trusted_selection<F>(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        key: String,
+        child: String,
+        targets: Vec<super::trusted_legacy::TrustedLegacyFile>,
+        fresh: Vec<u8>,
+        validate_files: F,
+    ) -> Result<bool, StateError>
+    where
+        F: FnOnce() -> Result<(), StateError> + Send + 'static,
+    {
+        self.with_conn_mut("settling trusted selected renditions", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            account::validate_authenticated(&tx, &owner)?;
+            let root = load_generation(&tx, &generation)?;
+            let manifest = load_decision(&tx, &root, &key, &child)?;
+            let (admission, reason): (String, String) = tx.query_row(
+                "SELECT admission,reason FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+                params![generation,key,child], |r| Ok((r.get(0)?,r.get(1)?)))?;
+            if admission != "deferred" || reason != "identity_conflict" || fresh.len() > MAX_CHUNK_BYTES {
+                tx.commit()?; return Ok(false);
+            }
+            let master = manifest.decision.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?;
+            let library = root.spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?;
+            let old = crate::icloud::photos::current_asset(manifest.decision.confirmation.as_deref().ok_or(StateError::ProviderSelectionInvalid)?, &child, master, &root.spec.zone).map_err(|_error| StateError::ProviderSelectionInvalid)?;
+            let current = crate::icloud::photos::current_asset(&fresh, &child, master, &root.spec.zone).map_err(|_error| StateError::ProviderSelectionInvalid)?;
+            selector_binding::validate_membership(&root.spec, pass(&root, &key)?, &child, &fresh)?;
+            if !crate::icloud::photos::same_selected_facts(&old, &current) || manifest.state_id != child {
+                tx.commit()?; return Ok(false);
+            }
+            // An earlier partial proof is not a present file check. Replace it
+            // with the exact held set for this fresh confirmation.
+            tx.execute("UPDATE provider_active_destinations SET verified_media=0,verified_metadata=0,local_checksum=NULL,progress_hash=NULL WHERE generation=?1 AND pass_key=?2 AND child=?3 AND source_checksum IS NULL",
+                params![generation,key,child])?;
+            let mut seen = std::collections::HashSet::new();
+            for target in &targets {
+                let Some(destination) = manifest.decision.destinations.iter().find(|d| d.version_size == target.rendition && d.path.to_path() == target.path) else { return invalid(); };
+                if !seen.insert((&target.rendition, &target.path)) { return invalid(); }
+                let Some((receipt, accepted)) = super::trusted_legacy::accepted_file(&tx, library, &child, &target.rendition)? else { return Err(StateError::ProviderWorkConflict); };
+                if accepted != *target || target.master != master { return Err(StateError::ProviderWorkConflict); }
+                let matches: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND checksum=?4 AND size_bytes=?5 AND metadata_hash=?6 AND local_path=?7 AND local_checksum=?8 AND created_at IS ?9 AND added_at IS ?10 AND is_deleted=0)",
+                    params![library,child,target.rendition,destination.checksum,i64::try_from(destination.size).map_err(|_error| StateError::ProviderSelectionInvalid)?,destination.metadata_hash,target.path.to_string_lossy(),target.local_sha256,encode_asset_date(current.created()),Some(encode_asset_date(current.added_date()))], |r| r.get(0))?;
+                if !matches { return Err(StateError::ProviderWorkConflict); }
+                let path = destination.path.key()?;
+                let (intent, metadata): (Option<String>, bool) = tx.query_row(
+                    "SELECT intent_hash,verified_metadata FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+                    params![generation,key,child,target.rendition,path], |r| Ok((r.get(0)?,r.get(1)?)))?;
+                let proof = local_trust_progress_hash(&root,&manifest,destination,intent.as_deref(),metadata,&target.local_sha256,&receipt)?;
+                tx.execute("UPDATE provider_active_destinations SET verified_media=1,local_checksum=?6,source_checksum=NULL,progress_hash=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+                    params![generation,key,child,target.rendition,path,target.local_sha256,proof])?;
+            }
+            validate_files()?;
+            let complete = targets.len() == manifest.decision.destinations.len()
+                && !targets.is_empty()
+                && root.spec.profile.get("explicit_metadata_refresh").is_none();
+            if complete {
+                tx.execute("UPDATE provider_active_destinations SET admitted=1 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,key,child])?;
+                tx.execute("UPDATE provider_active_decisions SET admission='admitted',reason='',attempts=0,next_retry_at=0 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,key,child])?;
+                refresh_admission_hash(&tx,&root,&key,&child)?;
+                if root.spec.metadata_enabled && root.spec.profile.get("explicit_metadata_refresh").is_none() {
+                    let group = grouping_hash(&tx,library,&manifest.state_id)?;
+                    freeze_asset_intents(&tx,&root,library,&manifest.state_id,&group)?;
+                    tx.execute("UPDATE provider_active_destinations SET verified_metadata=1 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,key,child])?;
+                    for destination in &manifest.decision.destinations { refresh_progress_hash(&tx,&root,&manifest,destination)?; }
+                }
+            }
+            if complete && root.sealed {
+                let hash = seal_hash(&tx,&root,root.checkpoint_ready,root.checkpoint_veto.as_deref())?;
+                let header = seal_header(&root,root.checkpoint_ready,root.checkpoint_veto.as_deref(),&hash)?;
+                tx.execute("UPDATE provider_active_generations SET seal_hash=?2,seal_header_hash=?3 WHERE id=?1",params![generation,hash,header])?;
+            }
+            tx.commit()?;
+            Ok(complete)
+        }).await
+    }
+
     /// Reuse independently verified active publication at the same lossless
     /// physical path across compatible passes. Legacy receipts require exact
     /// UTF-8 identity; every reuse requires an independently re-read local SHA.
@@ -2859,7 +3033,7 @@ impl SqliteStateDb {
                     tx.commit()?;return Ok(true)
                 }
             }
-            let previous:Option<(String,String,String)>=tx.query_row("SELECT w.generation,w.source_checksum,w.pass_key FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.child=?3 AND w.version_size=?4 AND w.path=?5 AND w.checksum=?6 AND w.size_bytes=?7 AND w.master=?8 AND w.admitted=1 AND w.verified_media=1 AND (w.local_checksum=?9 OR (w.prepared_checksum=?9 AND w.prepared_size=?10)) ORDER BY g.created_at DESC LIMIT 1",params![root.spec.scope,key,child,selected.version_size,path.key()?,selected.checksum,i64::try_from(selected.size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,manifest.decision.master,local,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+            let previous:Option<(String,String,String)>=tx.query_row("SELECT w.generation,w.source_checksum,w.pass_key FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.child=?3 AND w.version_size=?4 AND w.path=?5 AND w.checksum=?6 AND w.size_bytes=?7 AND w.master=?8 AND w.admitted=1 AND w.verified_media=1 AND w.source_checksum IS NOT NULL AND (w.local_checksum=?9 OR (w.prepared_checksum=?9 AND w.prepared_size=?10)) ORDER BY g.created_at DESC LIMIT 1",params![root.spec.scope,key,child,selected.version_size,path.key()?,selected.checksum,i64::try_from(selected.size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?,manifest.decision.master,local,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
             if let Some((previous,source,previous_key))=previous {
                 // Old progress can inherit a legacy source field. Modified
                 // output requires independently trusted compact proof above.
@@ -3202,6 +3376,14 @@ impl SqliteStateDb {
             for receipt in compact {
                 if !paths.contains(&receipt.native_path) {paths.push(receipt.native_path);}
             }
+            let local_ids: Vec<String> = conn.prepare("SELECT id FROM download_receipts WHERE source_checksum IS NULL AND scope=?1 AND child=?2 AND master=?3 AND version_size=?4 AND provider_checksum=?5 AND provider_size=?6 ORDER BY native_path LIMIT 32")?
+                .query_map(params![scope,child,master,version,checksum,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|row|row.get(0))?.collect::<Result<_,_>>()?;
+            for id in local_ids {
+                let receipt = super::download_receipts::load_local_trust(conn,&id)?.ok_or(StateError::ProviderSelectionInvalid)?;
+                if super::download_receipts::local_trust_is_current(conn,&receipt)? && !paths.contains(&receipt.native_path) {
+                    paths.push(receipt.native_path);
+                }
+            }
             Ok(paths)
         }).await
     }
@@ -3226,11 +3408,17 @@ impl SqliteStateDb {
             let root = load_generation(conn, &generation)?;
             if root.spec.scope != scope { return invalid(); }
             let unfiled = pass(&root, &key)?.get("kind").and_then(Value::as_str) == Some("Unfiled");
-            let ids:Vec<String>=conn.prepare("SELECT id FROM download_receipts WHERE scope=?1 AND child=?2 AND native_path=?3")?
+            let ids:Vec<String>=conn.prepare("SELECT id FROM download_receipts WHERE source_checksum IS NOT NULL AND scope=?1 AND child=?2 AND native_path=?3")?
                 .query_map(params![scope,child,path.key()?],|row|row.get(0))?.collect::<Result<_,_>>()?;
             for id in ids {
                 let receipt=super::download_receipts::load(conn,&id)?.ok_or(StateError::ProviderSelectionInvalid)?;
                 if receipt.fulfills_pass(&key) { return Ok(true); }
+            }
+            let local_ids: Vec<String> = conn.prepare("SELECT id FROM download_receipts WHERE source_checksum IS NULL AND scope=?1 AND child=?2 AND native_path=?3 AND origin_pass=?4 LIMIT 32")?
+                .query_map(params![scope,child,path.key()?,key],|row|row.get(0))?.collect::<Result<_,_>>()?;
+            for id in local_ids {
+                let receipt = super::download_receipts::load_local_trust(conn,&id)?.ok_or(StateError::ProviderSelectionInvalid)?;
+                if super::download_receipts::local_trust_is_current(conn,&receipt)? { return Ok(true); }
             }
             if !unfiled { return Ok(false); }
             let other: Vec<String> = conn.prepare(
@@ -3253,10 +3441,19 @@ impl SqliteStateDb {
         let (local, size) = fingerprint;
         self.with_conn("checking independent publication fingerprint",move|conn|{
             account::validate_authenticated(conn,&owner)?;
-            let previous:Option<(String,String)>=conn.query_row("SELECT w.generation,w.pass_key FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.child=?3 AND w.path=?4 AND (w.local_checksum=?5 OR (w.prepared_checksum=?5 AND w.prepared_size=?6)) AND w.admitted=1 AND w.verified_media=1 ORDER BY (w.pass_key=?2) DESC,g.created_at DESC LIMIT 1",params![scope,key,child,path.key()?,local,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let previous:Option<(String,String)>=conn.query_row("SELECT w.generation,w.pass_key FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE g.scope=?1 AND w.child=?3 AND w.path=?4 AND (w.local_checksum=?5 OR (w.prepared_checksum=?5 AND w.prepared_size=?6)) AND w.admitted=1 AND w.verified_media=1 AND w.source_checksum IS NOT NULL ORDER BY (w.pass_key=?2) DESC,g.created_at DESC LIMIT 1",params![scope,key,child,path.key()?,local,i64::try_from(size).map_err(|_invalid|StateError::ProviderSelectionInvalid)?],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
             if let Some((generation,previous_key))=previous {let root=load_generation(conn,&generation)?;load_decision(conn,&root,&previous_key,&child)?;return Ok(true)}
-            Ok(super::download_receipts::matching_local(conn,&scope,&child,&path,&local)?.iter()
-                .any(|receipt|receipt.source_checksum!=receipt.local_checksum || receipt.provider_size==size))
+            if super::download_receipts::matching_local(conn,&scope,&child,&path,&local)?.iter()
+                .any(|receipt|receipt.source_checksum!=receipt.local_checksum || receipt.provider_size==size) { return Ok(true); }
+            let local_ids: Vec<String> = conn.prepare("SELECT id FROM download_receipts WHERE source_checksum IS NULL AND scope=?1 AND child=?2 AND native_path=?3 AND local_checksum=?4 LIMIT 32")?
+                .query_map(params![scope,child,path.key()?,local],|row|row.get(0))?.collect::<Result<_,_>>()?;
+            for id in local_ids {
+                let receipt = super::download_receipts::load_local_trust(conn,&id)?.ok_or(StateError::ProviderSelectionInvalid)?;
+                if !super::download_receipts::local_trust_is_current(conn,&receipt)? { continue; }
+                let Some((_, target)) = super::trusted_legacy::accepted_file(conn,&receipt.library,&receipt.child,&receipt.version_size)? else { continue; };
+                if target.local_size == size { return Ok(true); }
+            }
+            Ok(false)
         }).await
     }
 }
@@ -3343,7 +3540,7 @@ impl SqliteStateDb {
                  AND size_bytes=?7 AND admitted=1 AND verified_media=1"
             )?.query_map(params![generation,key,child,state_id,version,checksum,size], |row| {
                 Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,
-                    row.get::<_,String>(3)?,row.get::<_,String>(4)?))
+                    row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?))
             })?.collect::<Result<Vec<_>,_>>()?;
             for (other_key, encoded, compatibility, local, source) in rows {
                 let other = load_decision(conn, &root, &other_key, &child)?;
@@ -3355,6 +3552,10 @@ impl SqliteStateDb {
                 ).ok_or(StateError::ProviderSelectionInvalid)?;
                 let native = selected.path.to_path();
                 if native == path.to_path() || native == requested.to_path() { continue; }
+                let Some(source) = source else {
+                    scope.other.push((native, None));
+                    continue;
+                };
                 // Lossy compatibility paths are not native path identity. Only
                 // exclude a TEXT receipt when exactly one durable native path
                 // binds its identity, rendition, provider bytes and local hashes.
@@ -3381,7 +3582,7 @@ impl SqliteStateDb {
                 } else { None };
                 scope.other.push((native, compatible));
             }
-            let compact:Vec<String>=conn.prepare("SELECT id FROM download_receipts WHERE scope=?1 AND child=?2
+            let compact:Vec<String>=conn.prepare("SELECT id FROM download_receipts WHERE source_checksum IS NOT NULL AND scope=?1 AND child=?2
                 AND state_id=?3 AND version_size=?4 AND provider_checksum=?5 AND provider_size=?6")?
                 .query_map(params![root.spec.scope,child,state_id,version,checksum,size],|row|row.get(0))?.collect::<Result<_,_>>()?;
             for id in compact {
@@ -3393,6 +3594,15 @@ impl SqliteStateDb {
                 }
                 if native!=path.to_path() && native!=requested.to_path()
                     && !scope.other.iter().any(|(previous,_)|previous==&native) {
+                    scope.other.push((native,None));
+                }
+            }
+            let local_ids: Vec<String> = conn.prepare("SELECT id FROM download_receipts WHERE source_checksum IS NULL AND scope=?1 AND child=?2 AND state_id=?3 AND version_size=?4 AND provider_checksum=?5 AND provider_size=?6")?
+                .query_map(params![root.spec.scope,child,state_id,version,checksum,size],|row|row.get(0))?.collect::<Result<_,_>>()?;
+            for id in local_ids {
+                let receipt = super::download_receipts::load_local_trust(conn,&id)?.ok_or(StateError::ProviderSelectionInvalid)?;
+                let native = receipt.native_path.to_path();
+                if native != path.to_path() && native != requested.to_path() && !scope.other.iter().any(|(other,_)| *other == native) {
                     scope.other.push((native,None));
                 }
             }
@@ -3464,4 +3674,97 @@ pub(crate) fn inspect_selection_validation_budget(
     pages.capacity = capacity;
     let result = validate_decision_with_pages(conn, root, manifest, true, &mut pages);
     (result, RANK_DECODE_METRICS.with(std::cell::Cell::get))
+}
+
+#[cfg(test)]
+mod local_trust_proof_tests {
+    use super::*;
+    use crate::state::db::provider_selection::{SelectionDecision, SelectionPath};
+
+    #[test]
+    fn versioned_local_trust_progress_binds_generation_destination_and_receipt() {
+        let root = ActiveGeneration {
+            id: "generation".into(),
+            spec: GenerationSpec {
+                format: 2,
+                scope: "scope".into(),
+                zone: serde_json::json!({"zoneName":"zone"}),
+                config_hash: "config".into(),
+                basis: "basis".into(),
+                profile: serde_json::json!({}),
+                metadata_enabled: false,
+                metadata_flags: 0,
+            },
+            sealed: false,
+            checkpoint_ready: false,
+            checkpoint_veto: None,
+        };
+        let destination = SelectionDestination {
+            version_size: "original".into(),
+            path: SelectionPath::Utf8("/media/a".into()),
+            checksum: "provider".into(),
+            size: 20,
+            metadata_hash: "metadata".into(),
+        };
+        let manifest = ActiveDecision {
+            state_id: "child".into(),
+            sources: vec![],
+            decision: SelectionDecision {
+                pass_key: "pass".into(),
+                child: "child".into(),
+                master: Some("master".into()),
+                confirmation: Some(vec![1]),
+                outcome: SelectionOutcome::Selected,
+                reason: String::new(),
+                destinations: vec![destination.clone()],
+            },
+        };
+        let local = "a".repeat(64);
+        let receipt = "trusted_legacy_file:v1:library:binding";
+        let proof =
+            local_trust_progress_hash(&root, &manifest, &destination, None, false, &local, receipt)
+                .unwrap();
+        assert_eq!(local_trust_receipt(&proof), Some(receipt));
+        assert_ne!(
+            proof,
+            progress_hash(&root, &manifest, &destination, None, false, &local, &local).unwrap()
+        );
+        assert_ne!(
+            proof,
+            local_trust_progress_hash(
+                &root,
+                &manifest,
+                &destination,
+                None,
+                false,
+                &local,
+                "another"
+            )
+            .unwrap()
+        );
+        let mut other = destination.clone();
+        other.checksum = "drift".into();
+        assert_ne!(
+            proof,
+            local_trust_progress_hash(&root, &manifest, &other, None, false, &local, receipt)
+                .unwrap()
+        );
+        let mut other_root = root.clone();
+        other_root.id = "other generation".into();
+        assert_ne!(
+            proof,
+            local_trust_progress_hash(
+                &other_root,
+                &manifest,
+                &destination,
+                None,
+                false,
+                &local,
+                receipt
+            )
+            .unwrap()
+        );
+        assert!(local_trust_receipt("local_trust:v2:unknown").is_none());
+        assert!(local_trust_receipt("local_trust:v1:missing:bad").is_none());
+    }
 }

@@ -16,10 +16,10 @@ pub(crate) struct TrustedLegacyPlan {
     pub(crate) targets: Vec<TrustedLegacyFile>,
 }
 
-struct Retained {
+pub(super) struct Retained {
     path: crate::fs_util::ConfinedPath,
     file: std::fs::File,
-    target: TrustedLegacyFile,
+    pub(super) target: TrustedLegacyFile,
 }
 fn check_temporary(root: &Path, path: &Path, suffix: &str) -> anyhow::Result<()> {
     for suffix in [suffix, ".part"] {
@@ -37,7 +37,7 @@ fn check_temporary(root: &Path, path: &Path, suffix: &str) -> anyhow::Result<()>
     }
     Ok(())
 }
-fn retain(
+pub(super) fn retain(
     root: &Path,
     target: &TrustedLegacyFile,
     suffix: &str,
@@ -66,6 +66,42 @@ fn retain(
     let mut target = target.clone();
     target.local_size = actual.size;
     Ok(Retained { path, file, target })
+}
+
+impl Retained {
+    pub(super) fn validate(
+        mut self,
+        root: &Path,
+        suffix: &str,
+        allow_hardlinks: bool,
+    ) -> anyhow::Result<()> {
+        use std::io::{Seek, SeekFrom};
+        check_temporary(root, &self.target.path, suffix)?;
+        anyhow::ensure!(
+            !super::file::has_replacement_journal_blocking(root, &self.target.path)?,
+            "Replacement recovery pending"
+        );
+        let links = crate::fs_util::file_link_count(&self.file)?;
+        anyhow::ensure!(
+            links == 1 || (allow_hardlinks && links > 0),
+            "Hardlink policy changed"
+        );
+        let identity = crate::fs_util::file_identity(&self.file)?;
+        self.path.validate_identity(identity)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        let actual = super::file::fingerprint_open_file_snapshot_blocking(
+            &mut self.file,
+            &self.target.path,
+        )?
+        .fingerprint;
+        anyhow::ensure!(
+            actual.size == self.target.local_size
+                && data_encoding::HEXLOWER.encode(&actual.sha256) == self.target.local_sha256,
+            "Accepted file changed"
+        );
+        self.path.validate_identity(identity)?;
+        Ok(())
+    }
 }
 
 pub(crate) async fn plan(

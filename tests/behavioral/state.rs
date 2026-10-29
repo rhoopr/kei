@@ -27,7 +27,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` in support to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 40;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 41;
     let production_schema = include_str!("../../src/state/schema.rs");
     assert!(
         production_schema.contains(&format!(
@@ -42,6 +42,43 @@ fn behavioral_helper_schema_matches_production() {
          production={PRODUCTION_SCHEMA_VERSION}). Bump both, plus the DDL \
          block in create_state_db, then update this test."
     );
+}
+
+#[test]
+fn behavioral_local_trust_receipt_schema_matches_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let actual = create_state_db(dir.path(), "receipt_schema@example.com");
+    let source = include_str!("../../src/state/db/download_receipts.rs").replace("\r\n", "\n");
+    let ddl = |name: &str| {
+        source
+            .split_once(&format!("pub(crate) const {name}: &str = r\""))
+            .unwrap()
+            .1
+            .split_once("\";")
+            .unwrap()
+            .0
+    };
+    let expected = rusqlite::Connection::open_in_memory().unwrap();
+    expected.execute_batch(ddl("DDL")).unwrap();
+    expected
+        .execute_batch(ddl("LOCAL_TRUST_MIGRATION"))
+        .unwrap();
+    let shape = |conn: &rusqlite::Connection| {
+        conn.prepare("PRAGMA table_info(download_receipts)")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, bool>(3)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(shape(&actual), shape(&expected));
 }
 
 #[test]

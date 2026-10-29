@@ -196,14 +196,23 @@ impl SqliteStateDb {
                 .into_values()
                 .map(ProfileAccumulator::finish)
                 .collect();
-            let ids: Vec<String> = tx
-                .prepare("SELECT id FROM download_receipts ORDER BY id")?
-                .query_map([], |row| row.get(0))?
+            let ids: Vec<(String, bool)> = tx
+                .prepare("SELECT id,source_checksum IS NULL FROM download_receipts ORDER BY id")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<Result<_, _>>()?;
-            for id in ids {
-                match super::super::download_receipts::load(&tx, &id) {
-                    Ok(Some(_)) => result.stored_media_receipts += 1,
-                    _ => result.invalid_receipts += 1,
+            for (id, local_trust) in ids {
+                if local_trust {
+                    if !matches!(
+                        super::super::download_receipts::load_local_trust(&tx, &id),
+                        Ok(Some(_))
+                    ) {
+                        result.invalid_receipts += 1;
+                    }
+                } else {
+                    match super::super::download_receipts::load(&tx, &id) {
+                        Ok(Some(_)) => result.stored_media_receipts += 1,
+                        _ => result.invalid_receipts += 1,
+                    }
                 }
             }
             let (current, historical, unclassified) =

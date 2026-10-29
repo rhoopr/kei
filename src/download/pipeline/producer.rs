@@ -510,7 +510,15 @@ where
                             }
                         };
                         match run
-                            .project(key, &asset, body, &mut plan, &mut task_planner, config)
+                            .project(
+                                key,
+                                &asset,
+                                body,
+                                &mut plan,
+                                &mut task_planner,
+                                config,
+                                &producer_shutdown,
+                            )
                             .await
                         {
                             Ok(true) => selected_plan = Some(plan),

@@ -168,7 +168,10 @@ mod tests {
                 (0, 0)
             );
             let conn = db.acquire_lock("inspect synthetic v39 upgrade").unwrap();
-            assert_eq!(schema::get_schema_version(&conn).unwrap(), 40);
+            assert_eq!(
+                schema::get_schema_version(&conn).unwrap(),
+                schema::SCHEMA_VERSION
+            );
             let row: (String, String, Option<String>) = conn.query_row("SELECT local_path,local_checksum,download_checksum FROM assets WHERE library='PrimarySync' AND id='downloaded' AND version_size='original'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
             assert_eq!(
                 row,

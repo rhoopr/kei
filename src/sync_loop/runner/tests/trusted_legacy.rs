@@ -28,6 +28,7 @@ struct Provider {
     records: Vec<Value>,
     zone: String,
     bridge_missing: bool,
+    lookups: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
 }
 #[async_trait::async_trait]
 impl PhotosSession for Provider {
@@ -66,6 +67,10 @@ impl PhotosSession for Provider {
             );
         }
         if url.contains("/records/lookup?") {
+            self.lookups
+                .lock()
+                .unwrap()
+                .push((self.zone.clone(), request.clone()));
             let names = request["records"].as_array().unwrap();
             let records: Vec<_> = self
                 .records
@@ -149,6 +154,7 @@ struct Fixture {
     old: Vec<OldFile>,
     moved: Vec<(PathBuf, PathBuf)>,
     originals: Value,
+    legacy_rows: Value,
     globals: crate::config::GlobalArgs,
     server: Arc<MockServer>,
     body: Vec<u8>,
@@ -421,6 +427,10 @@ impl Fixture {
         }
         drop(db);
         let originals = rows(&database, ORIGINAL_SQL);
+        let legacy_rows = rows(
+            &database,
+            "SELECT library,asset_id,original_evidence FROM unattributed_legacy ORDER BY library,asset_id",
+        );
         let old = old
             .into_iter()
             .map(|entry| OldFile::capture(entry.path))
@@ -434,11 +444,13 @@ impl Fixture {
                 records,
                 zone: ZONE.into(),
                 bridge_missing: false,
+                lookups: Arc::default(),
             },
             targets,
             old,
             moved: Vec::new(),
             originals,
+            legacy_rows,
             globals,
             server,
             body,
@@ -469,6 +481,14 @@ impl Fixture {
             rows(&self.database, ORIGINAL_SQL),
             self.originals,
             "legacy rows/dates/checksums/owners unchanged"
+        );
+        assert_eq!(
+            rows(
+                &self.database,
+                "SELECT library,asset_id,original_evidence FROM unattributed_legacy ORDER BY library,asset_id"
+            ),
+            self.legacy_rows,
+            "protected family evidence remains unchanged"
         );
         assert_eq!(
             rows(&self.database, "SELECT * FROM legacy_master_state_owners"),
@@ -506,7 +526,11 @@ impl Fixture {
         }
         (usize::try_from(valid).unwrap(), eligible)
     }
-    async fn assert_current_accounting(&self, result: &crate::sync_cycle::CycleResult) {
+    async fn assert_current_accounting(
+        &self,
+        result: &crate::sync_cycle::CycleResult,
+        deferred: i64,
+    ) {
         assert_eq!(result.stats.state_write_failures, 0);
         assert_eq!(result.failed_count, 0);
         assert!(!result.stats.sync_token_blocked);
@@ -529,14 +553,16 @@ impl Fixture {
         assert!(!observed[0].settlement_unknown);
         assert!(!observed[0].pending_media);
         assert!(!observed[0].pending_metadata);
-        eprintln!(
-            "synthetic unresolved decisions: {}",
-            rows(
-                &self.database,
-                "SELECT g.scope,g.sealed,g.checkpoint_ready,w.pass_key,w.child,w.admission,w.reason,w.attempts,w.next_retry_at,w.manifest FROM provider_active_decisions w JOIN provider_active_generations g ON g.id=w.generation WHERE w.admission='deferred' ORDER BY w.child"
-            )
+        assert_eq!(observed[0].unresolved, deferred > 0);
+        let conn = rusqlite::Connection::open(&self.database).unwrap();
+        let (count, correctly_sealed): (i64, i64) = conn.query_row(
+            "SELECT count(*),coalesce(sum(g.sealed=1 AND g.checkpoint_ready=1 AND d.reason='identity_conflict' AND d.attempts>0 AND d.next_retry_at>0),0) FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE d.admission='deferred'",
+            [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(
+            (count, correctly_sealed),
+            (deferred, deferred),
+            "cursor advancement is backed by sealed, retryable selected debt"
         );
-        assert!(!observed[0].unresolved);
     }
 
     async fn plan(&self) -> download::trusted_legacy::TrustedLegacyPlan {
@@ -600,6 +626,7 @@ impl Fixture {
             records: Vec::new(),
             zone: "PrimarySync".into(),
             bridge_missing: primary_hold,
+            lookups: Arc::default(),
         };
         let mut primary = make_run_cycle_library_state_with_album(
             "PrimarySync",
@@ -624,6 +651,7 @@ impl Fixture {
                     records: Vec::new(),
                     zone: "PrimarySync".into(),
                     bridge_missing: primary_hold,
+                    lookups: Arc::default(),
                 },
                 "private",
             ),
@@ -725,7 +753,7 @@ async fn trusted_legacy_files_zero_get_reopen_and_quiet_followups() {
         .cycle("baseline", CancellationToken::new(), false)
         .await
         .unwrap();
-    f.assert_current_accounting(&baseline).await;
+    f.assert_current_accounting(&baseline, 4).await;
     assert_eq!(
         f.source_counts().await,
         (0, 0),
@@ -749,14 +777,21 @@ async fn trusted_legacy_files_zero_get_reopen_and_quiet_followups() {
         (0, 6),
         "local acceptance never fabricates source receipts"
     );
+    trust_make_all_due(&f).await;
+    f.provider.lookups.lock().unwrap().clear();
     for label in ["accepted-cycle", "quiet-one", "quiet-two"] {
         let result = f
             .cycle(label, CancellationToken::new(), false)
             .await
             .unwrap();
         assert_eq!(result.stats.downloaded, 0);
-        f.assert_current_accounting(&result).await;
+        f.assert_current_accounting(&result, 0).await;
         assert_eq!(f.source_counts().await, (0, 6));
+        assert_eq!(
+            f.provider.lookups.lock().unwrap().len(),
+            16,
+            "four children get scoped reads once, then reopen quietly"
+        );
     }
     assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
     f.verify_old();
@@ -1104,11 +1139,13 @@ async fn trusted_legacy_files_unaccepted_rendition_remains_held() {
     let unaccepted = plan.targets.pop().unwrap();
     assert_eq!(f.apply(plan, &CancellationToken::new()).await.unwrap(), 5);
     assert_eq!(f.source_counts().await, (0, 5));
+    trust_make_all_due(&f).await;
+    f.provider.lookups.lock().unwrap().clear();
     let result = f
         .cycle("unaccepted-control", CancellationToken::new(), false)
         .await
         .unwrap();
-    f.assert_current_accounting(&result).await;
+    f.assert_current_accounting(&result, 1).await;
     let db = state::SqliteStateDb::open(&f.database).await.unwrap();
     assert!(
         db.legacy_child_provenance(ZONE, &unaccepted.child, &unaccepted.rendition)
@@ -1123,7 +1160,8 @@ async fn trusted_legacy_files_unaccepted_rendition_remains_held() {
         .cycle("unaccepted-reopen", CancellationToken::new(), false)
         .await
         .unwrap();
-    f.assert_current_accounting(&reopened).await;
+    f.assert_current_accounting(&reopened, 1).await;
+    assert_eq!(f.provider.lookups.lock().unwrap().len(), 16);
     assert_eq!(f.source_counts().await, (0, 5));
     assert!(
         state::SqliteStateDb::open(&f.database)
@@ -1133,6 +1171,698 @@ async fn trusted_legacy_files_unaccepted_rendition_remains_held() {
             .await
             .unwrap()
             .is_none()
+    );
+    assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
+    f.verify_old();
+}
+
+#[tokio::test]
+async fn trusted_legacy_due_retry_revalidates_pair_and_retains_destinations() {
+    let f = Fixture::new("due-retry").await;
+    f.cycle("baseline", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    let mut plan = f.plan().await;
+    let unaccepted = plan.targets.pop().unwrap();
+    let mut remaining_plan = plan.clone();
+    remaining_plan.targets = vec![unaccepted.clone()];
+    assert_eq!(f.apply(plan, &CancellationToken::new()).await.unwrap(), 5);
+    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    for (child, version) in &f.targets {
+        let provenance = db
+            .legacy_child_provenance(ZONE, child, version.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            provenance.is_some(),
+            child != &unaccepted.child || version.as_str() != unaccepted.rendition
+        );
+    }
+    let before = rows(
+        &f.database,
+        "SELECT child,master,library,asset_id,version_size,checksum,size_bytes,admitted,verified_media,local_checksum,source_checksum FROM provider_active_destinations ORDER BY child,version_size",
+    );
+    assert_eq!(
+        before.as_array().unwrap().len(),
+        6,
+        "all six actual destinations must exist"
+    );
+    {
+        let conn = rusqlite::Connection::open(&f.database).unwrap();
+        let mut stmt = conn.prepare("SELECT child,master,library,asset_id,version_size,compat_path,checksum,size_bytes,admitted,verified_media,local_checksum,source_checksum FROM provider_active_destinations ORDER BY child,version_size").unwrap();
+        let destinations = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, i64>(7)?,
+                    r.get::<_, bool>(8)?,
+                    r.get::<_, bool>(9)?,
+                    r.get::<_, Option<String>>(10)?,
+                    r.get::<_, Option<String>>(11)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for (
+            child,
+            master,
+            library,
+            asset,
+            rendition,
+            path,
+            checksum,
+            size,
+            admitted,
+            verified,
+            local,
+            source,
+        ) in destinations
+        {
+            assert!(
+                f.targets
+                    .iter()
+                    .any(|(id, version)| id == &child && version.as_str() == rendition)
+            );
+            assert_eq!(
+                master,
+                if child.starts_with("child-0-") {
+                    "family-0"
+                } else {
+                    "family-1"
+                }
+            );
+            assert_eq!((library.as_str(), asset.as_str()), (ZONE, child.as_str()));
+            assert!(!path.is_empty() && !checksum.is_empty() && size > 0);
+            assert!(!admitted && !verified && local.is_none() && source.is_none());
+        }
+    }
+    let owner = crate::state::db::account::AccountOwner::authenticated(
+        USER,
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-only"}})).unwrap(),
+    )
+    .unwrap();
+    for child in ["child-0-0", "child-0-1", "child-1-0", "child-1-1"] {
+        db.make_selection_retry_due(owner.clone(), child.into())
+            .await
+            .unwrap();
+    }
+    drop(db);
+    f.provider.lookups.lock().unwrap().clear();
+    let due = f
+        .cycle("due", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(due.stats.state_write_failures, 0);
+    let lookups = f.provider.lookups.lock().unwrap().clone();
+    assert_eq!(lookups.len(), 16);
+    for (zone, request) in &lookups {
+        assert_eq!(zone, ZONE);
+        assert_eq!(
+            request["zoneID"],
+            json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})
+        );
+    }
+    for family in 0..2 {
+        for child in 0..2 {
+            let name = format!("child-{family}-{child}");
+            let master = format!("family-{family}");
+            let single = json!([{"recordName":name}]);
+            let pair = json!([{"recordName":name},{"recordName":master}]);
+            assert_eq!(
+                lookups
+                    .iter()
+                    .filter(|(_, r)| r["records"] == single)
+                    .count(),
+                2
+            );
+            assert_eq!(
+                lookups.iter().filter(|(_, r)| r["records"] == pair).count(),
+                2
+            );
+            let records: Vec<_> = f
+                .provider
+                .records
+                .iter()
+                .filter(|r| r["recordName"] == name || r["recordName"] == master)
+                .cloned()
+                .collect();
+            crate::icloud::photos::current_asset(
+                &serde_json::to_vec(&json!({"records":records})).unwrap(),
+                &name,
+                &master,
+                &json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"}),
+            )
+            .unwrap();
+        }
+    }
+    let completed = rows(
+        &f.database,
+        "SELECT COUNT(*) FROM (SELECT child,version_size FROM provider_active_destinations WHERE verified_media=1 UNION SELECT child,version_size FROM download_receipts WHERE trust_receipt IS NOT NULL)",
+    );
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT count(*) FROM download_receipts WHERE source_checksum IS NULL AND trust_receipt IS NOT NULL"
+        ),
+        json!([["Integer(4)"]])
+    );
+    assert_eq!(completed, json!([["Integer(5)"]]));
+    let pending = rows(
+        &f.database,
+        "SELECT child,version_size FROM provider_active_destinations WHERE verified_media=0 ORDER BY child,version_size",
+    );
+    assert_eq!(
+        pending,
+        json!([[
+            format!("Text(\"{}\")", unaccepted.child),
+            format!("Text(\"{}\")", unaccepted.rendition)
+        ]])
+    );
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT COUNT(*) FROM provider_active_destinations WHERE source_checksum IS NOT NULL"
+        ),
+        json!([["Integer(0)"]])
+    );
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT COUNT(*) FROM download_receipts WHERE source_checksum IS NOT NULL"
+        ),
+        json!([["Integer(0)"]])
+    );
+    let decisions = rows(
+        &f.database,
+        "SELECT child,admission,reason,attempts FROM provider_active_decisions WHERE admission='deferred' ORDER BY child",
+    );
+    assert_eq!(
+        decisions,
+        json!([[
+            format!("Text(\"{}\")", unaccepted.child),
+            "Text(\"deferred\")",
+            "Text(\"identity_conflict\")",
+            "Integer(2)"
+        ]])
+    );
+    assert_eq!(f.source_counts().await, (0, 5));
+    assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
+    f.verify_old();
+    f.cycle("due-reopen", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT COUNT(*) FROM (SELECT child,version_size FROM provider_active_destinations WHERE verified_media=1 UNION SELECT child,version_size FROM download_receipts WHERE trust_receipt IS NOT NULL)"
+        ),
+        completed
+    );
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT child,version_size FROM provider_active_destinations WHERE verified_media=0 ORDER BY child,version_size"
+        ),
+        pending
+    );
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT child,admission,reason,attempts FROM provider_active_decisions WHERE admission='deferred' ORDER BY child"
+        ),
+        decisions
+    );
+    assert_eq!(f.source_counts().await, (0, 5));
+    assert_eq!(
+        f.provider.lookups.lock().unwrap().len(),
+        16,
+        "quiet reopen respects retry backoff"
+    );
+    assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
+    trust_make_all_due(&f).await;
+    f.cycle("bounded-retry", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.provider.lookups.lock().unwrap().len(),
+        20,
+        "only the one pending child is retried"
+    );
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT COUNT(*) FROM (SELECT child,version_size FROM provider_active_destinations WHERE verified_media=1 UNION SELECT child,version_size FROM download_receipts WHERE trust_receipt IS NOT NULL)"
+        ),
+        completed
+    );
+    assert_eq!(
+        f.apply(remaining_plan, &CancellationToken::new())
+            .await
+            .unwrap(),
+        1
+    );
+    trust_make_all_due(&f).await;
+    let settled = f
+        .cycle("last-accepted", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(settled.stats.state_write_failures, 0);
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT COUNT(*) FROM (SELECT child,version_size FROM provider_active_destinations WHERE verified_media=1 UNION SELECT child,version_size FROM download_receipts WHERE trust_receipt IS NOT NULL)"
+        ),
+        json!([["Integer(6)"]])
+    );
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT COUNT(*) FROM provider_active_destinations WHERE verified_media=0"
+        ),
+        json!([["Integer(0)"]])
+    );
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT COUNT(*) FROM download_receipts WHERE source_checksum IS NOT NULL"
+        ),
+        json!([["Integer(0)"]])
+    );
+    assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
+    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    for (child, version) in &f.targets {
+        assert!(
+            db.legacy_child_provenance(ZONE, child, version.as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+    f.verify_old();
+}
+
+async fn trust_make_all_due(f: &Fixture) {
+    let owner = crate::state::db::account::AccountOwner::authenticated(
+        USER,
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-only"}})).unwrap(),
+    )
+    .unwrap();
+    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    for child in ["child-0-0", "child-0-1", "child-1-0", "child-1-1"] {
+        db.make_selection_retry_due(owner.clone(), child.into())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn trusted_legacy_due_provider_and_file_drift_keep_the_affected_rendition_pending() {
+    for case in [
+        "provider_missing",
+        "provider_missing_master",
+        "provider_drift",
+        "provider_master_drift",
+        "file_drift",
+        "binding_drift",
+    ] {
+        let mut f = Fixture::new(case).await;
+        f.cycle("baseline", CancellationToken::new(), false)
+            .await
+            .unwrap();
+        let plan = f.plan().await;
+        let target = plan
+            .targets
+            .iter()
+            .find(|t| t.child == "child-0-0")
+            .unwrap()
+            .clone();
+        f.apply(plan, &CancellationToken::new()).await.unwrap();
+        match case {
+            "provider_missing" => {
+                let record = f
+                    .provider
+                    .records
+                    .iter_mut()
+                    .find(|r| r["recordName"] == "child-0-0")
+                    .unwrap();
+                record["recordName"] = json!("missing-child");
+            }
+            "provider_missing_master" => {
+                let record = f
+                    .provider
+                    .records
+                    .iter_mut()
+                    .find(|r| r["recordName"] == "family-0")
+                    .unwrap();
+                record["recordName"] = json!("missing-family");
+            }
+            "provider_master_drift" => {
+                let record = f
+                    .provider
+                    .records
+                    .iter_mut()
+                    .find(|r| r["recordName"] == "child-0-0")
+                    .unwrap();
+                record["fields"]["masterRef"]["value"]["recordName"] = json!("family-1");
+            }
+            "provider_drift" => {
+                let record = f
+                    .provider
+                    .records
+                    .iter_mut()
+                    .find(|r| r["recordName"] == "child-0-0")
+                    .unwrap();
+                record["fields"]["addedDate"]["value"] = json!(1_610_000_000_000_i64);
+            }
+            "file_drift" => {
+                std::fs::write(&target.path, b"changed local file").unwrap();
+                for old in &mut f.old {
+                    *old = OldFile::capture(old.path.clone());
+                }
+            }
+            "binding_drift" => {
+                let conn = rusqlite::Connection::open(&f.database).unwrap();
+                conn.execute(
+                    "UPDATE assets SET metadata_hash='changed' WHERE library=?1 AND id='child-0-0'",
+                    [ZONE],
+                )
+                .unwrap();
+            }
+            other => panic!("unexpected drift case: {other}"),
+        }
+        trust_make_all_due(&f).await;
+        let result = f.cycle("drift", CancellationToken::new(), false).await;
+        if case == "provider_master_drift" {
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<crate::state::error::StateError>(),
+                Some(crate::state::error::StateError::ProviderSelectionInvalid)
+            ));
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(
+            rows(
+                &f.database,
+                "SELECT count(*) FROM provider_active_destinations WHERE child='child-0-0' AND verified_media=1"
+            ),
+            json!([["Integer(0)"]]),
+            "{case}"
+        );
+        assert_eq!(
+            rows(
+                &f.database,
+                "SELECT count(*) FROM download_receipts WHERE child='child-0-0'"
+            ),
+            json!([["Integer(0)"]]),
+            "{case}"
+        );
+        assert_eq!(
+            f.server.received_requests().await.unwrap().len(),
+            0,
+            "{case}"
+        );
+        assert_eq!(
+            rows(
+                &f.database,
+                "SELECT count(*) FROM legacy_master_state_owners"
+            ),
+            json!([["Integer(0)"]]),
+            "{case}"
+        );
+        f.verify_old();
+    }
+}
+
+#[tokio::test]
+async fn trusted_legacy_due_rechecks_previously_settled_sibling_before_completion() {
+    let mut f = Fixture::new("trusted-partial-drift").await;
+    f.cycle("baseline", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    let mut plan = f.plan().await;
+    let last = plan.targets.pop().unwrap();
+    let earlier = plan
+        .targets
+        .iter()
+        .find(|t| t.child == last.child)
+        .unwrap()
+        .clone();
+    let mut final_plan = plan.clone();
+    final_plan.targets = vec![last.clone()];
+    f.apply(plan, &CancellationToken::new()).await.unwrap();
+    trust_make_all_due(&f).await;
+    f.cycle("partial", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    std::fs::write(&earlier.path, b"changed sibling").unwrap();
+    for old in &mut f.old {
+        *old = OldFile::capture(old.path.clone());
+    }
+    f.apply(final_plan, &CancellationToken::new())
+        .await
+        .unwrap();
+    trust_make_all_due(&f).await;
+    f.cycle("drifted-sibling", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(&f.database).unwrap();
+    let (pending, complete): (i64,i64) = conn.query_row(
+        "SELECT sum(verified_media=0),sum(verified_media=1) FROM provider_active_destinations WHERE child=?1",
+        [&last.child], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!((pending, complete), (1, 1));
+    let admitted: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE child=?1 AND admission='admitted')", [&last.child], |r| r.get(0)).unwrap();
+    assert!(!admitted);
+    drop(conn);
+    assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
+    f.verify_old();
+}
+
+#[tokio::test]
+async fn trusted_legacy_due_compaction_revalidates_in_successor_generation() {
+    let f = Fixture::new("trusted-successor").await;
+    f.cycle("baseline", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    f.apply(f.plan().await, &CancellationToken::new())
+        .await
+        .unwrap();
+    trust_make_all_due(&f).await;
+    let first = f
+        .cycle("completed", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(first.stats.state_write_failures, 0);
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT count(*) FROM download_receipts WHERE source_checksum IS NULL AND trust_receipt IS NOT NULL"
+        ),
+        json!([["Integer(6)"]])
+    );
+    let owner = crate::state::db::account::AccountOwner::authenticated(
+        USER,
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-only"}})).unwrap(),
+    )
+    .unwrap();
+    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    let (scope, key, child, master, version, checksum, size, path, local): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        String,
+    ) = {
+        let conn = rusqlite::Connection::open(&f.database).unwrap();
+        conn.query_row("SELECT scope,origin_pass,child,master,version_size,provider_checksum,provider_size,native_path,local_checksum FROM download_receipts WHERE source_checksum IS NULL ORDER BY child,version_size LIMIT 1", [], |r|
+            Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).unwrap()
+    };
+    let path: crate::state::db::provider_selection::SelectionPath =
+        serde_json::from_str(&path).unwrap();
+    let candidate = db
+        .accepted_trusted_legacy_file(ZONE.into(), child.clone(), version.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        db.selection_path_matches_local(
+            owner.clone(),
+            scope.clone(),
+            key.clone(),
+            child.clone(),
+            path.clone(),
+            (local, candidate.local_size)
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        db.verified_selection_paths(
+            owner,
+            scope,
+            key,
+            child,
+            master,
+            version,
+            (checksum, u64::try_from(size).unwrap())
+        )
+        .await
+        .unwrap()
+        .contains(&path)
+    );
+    drop(db);
+    let before = f.provider.lookups.lock().unwrap().len();
+    let conn = rusqlite::Connection::open(&f.database).unwrap();
+    conn.execute("DELETE FROM metadata WHERE key=?1", [TOKEN])
+        .unwrap();
+    drop(conn);
+    let next = f
+        .cycle("successor", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(next.stats.state_write_failures, 0);
+    assert!(
+        f.provider.lookups.lock().unwrap().len() > before,
+        "successor performs current scoped confirmation"
+    );
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT count(*) FROM download_receipts WHERE source_checksum IS NOT NULL"
+        ),
+        json!([["Integer(0)"]])
+    );
+    assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
+    f.verify_old();
+    let before_quiet = f.provider.lookups.lock().unwrap().len();
+    let quiet = f
+        .cycle("successor-reopen", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(quiet.stats.state_write_failures, 0);
+    assert_eq!(f.provider.lookups.lock().unwrap().len(), before_quiet);
+    f.verify_old();
+}
+
+#[tokio::test]
+async fn trusted_legacy_due_cancel_before_commit_rolls_back_completion() {
+    let f = Fixture::new("trusted-cancel-commit").await;
+    f.cycle("baseline", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    f.apply(f.plan().await, &CancellationToken::new())
+        .await
+        .unwrap();
+    let owner = crate::state::db::account::AccountOwner::authenticated(
+        USER,
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-only"}})).unwrap(),
+    )
+    .unwrap();
+    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    let target = db
+        .accepted_trusted_legacy_file(ZONE.into(), "child-0-0".into(), "original".into())
+        .await
+        .unwrap()
+        .unwrap();
+    let (generation, key, manifest): (String, String, Vec<u8>) = {
+        let conn = rusqlite::Connection::open(&f.database).unwrap();
+        conn.query_row("SELECT generation,pass_key,manifest FROM provider_active_decisions WHERE child='child-0-0'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap()
+    };
+    let manifest: Value = serde_json::from_slice(&manifest).unwrap();
+    let fresh: Vec<u8> =
+        serde_json::from_value(manifest["decision"]["confirmation"].clone()).unwrap();
+    let cancelled = db
+        .settle_trusted_selection(
+            owner,
+            generation,
+            key,
+            "child-0-0".into(),
+            vec![target],
+            fresh,
+            || Err(crate::state::error::StateError::ProviderWorkConflict),
+        )
+        .await;
+    assert!(cancelled.is_err());
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT count(*) FROM provider_active_destinations WHERE child='child-0-0' AND verified_media=1"
+        ),
+        json!([["Integer(0)"]])
+    );
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT count(*) FROM download_receipts WHERE child='child-0-0'"
+        ),
+        json!([["Integer(0)"]])
+    );
+    f.verify_old();
+}
+
+#[tokio::test]
+async fn trusted_legacy_due_transaction_failure_rolls_back_and_retries() {
+    let f = Fixture::new("trusted-due-rollback").await;
+    f.cycle("baseline", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    f.apply(f.plan().await, &CancellationToken::new())
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(&f.database).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_local_completion BEFORE UPDATE OF verified_media ON provider_active_destinations WHEN NEW.child='child-0-1' AND NEW.verified_media=1 BEGIN SELECT RAISE(ABORT,'injected local completion failure'); END;").unwrap();
+    drop(conn);
+    trust_make_all_due(&f).await;
+    let failed = f
+        .cycle("failed", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert!(failed.stats.state_write_failures > 0);
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT count(*) FROM provider_active_destinations WHERE child='child-0-1' AND verified_media=1"
+        ),
+        json!([["Integer(0)"]])
+    );
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT count(*) FROM download_receipts WHERE child='child-0-1'"
+        ),
+        json!([["Integer(0)"]])
+    );
+    let conn = rusqlite::Connection::open(&f.database).unwrap();
+    conn.execute_batch("DROP TRIGGER fail_local_completion")
+        .unwrap();
+    drop(conn);
+    trust_make_all_due(&f).await;
+    let recovered = f
+        .cycle("recovered", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(recovered.stats.state_write_failures, 0);
+    assert_eq!(
+        rows(
+            &f.database,
+            "SELECT count(*) FROM download_receipts WHERE child='child-0-1' AND source_checksum IS NOT NULL"
+        ),
+        json!([["Integer(0)"]])
     );
     assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
     f.verify_old();
@@ -1155,6 +1885,32 @@ fn add_independent_child(f: &mut Fixture) -> (&'static str, String) {
     (asset_id, checksum)
 }
 
+#[tokio::test]
+async fn trusted_legacy_due_does_not_starve_independent_download() {
+    let mut f = Fixture::new("trusted-due-fairness").await;
+    f.cycle("baseline", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    let (asset_id, checksum) = add_independent_child(&mut f);
+    let mut plan = f.plan().await;
+    let unaccepted = plan.targets.pop().unwrap();
+    f.apply(plan, &CancellationToken::new()).await.unwrap();
+    trust_make_all_due(&f).await;
+    let result = f
+        .cycle("due-fairness", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    assert_eq!(result.stats.downloaded, 1);
+    assert_eq!(result.stats.state_write_failures, 0);
+    assert_independent_download(&f, asset_id, &checksum).await;
+    let conn = rusqlite::Connection::open(&f.database).unwrap();
+    let pending: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE child=?1 AND version_size=?2 AND verified_media=0)", rusqlite::params![unaccepted.child,unaccepted.rendition], |r| r.get(0)).unwrap();
+    assert!(pending);
+    drop(conn);
+    assert_eq!(accepted_child_source_count(&f.database, &f.targets), 0);
+    f.verify_old();
+}
+
 fn add_missing_parent_reference(f: &mut Fixture) -> String {
     let mut orphan = f
         .provider
@@ -1170,6 +1926,7 @@ fn add_missing_parent_reference(f: &mut Fixture) -> String {
         .clone();
     let record_name = "orphan-missing-parent-1".to_string();
     orphan["recordName"] = json!(record_name);
+    orphan["fields"]["isHidden"]["value"] = json!(0);
     orphan["fields"]
         .as_object_mut()
         .unwrap()
@@ -1260,8 +2017,72 @@ async fn assert_independent_download(f: &Fixture, asset_id: &str, provider_check
     );
 }
 
+fn assert_due_scoped_lookups(f: &Fixture) -> usize {
+    let lookups = f.provider.lookups.lock().unwrap();
+    for family in 0..2 {
+        for index in 0..2 {
+            let child = format!("child-{family}-{index}");
+            let master = format!("family-{family}");
+            let single = json!([{"recordName":child}]);
+            let pair = json!([{"recordName":child},{"recordName":master}]);
+            for (zone, request) in lookups
+                .iter()
+                .filter(|(_, request)| request["records"] == single || request["records"] == pair)
+            {
+                assert_eq!(zone, ZONE);
+                assert_eq!(
+                    request["zoneID"],
+                    json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})
+                );
+            }
+            assert_eq!(
+                lookups
+                    .iter()
+                    .filter(|(zone, request)| zone == ZONE && request["records"] == single)
+                    .count(),
+                2
+            );
+            assert_eq!(
+                lookups
+                    .iter()
+                    .filter(|(zone, request)| zone == ZONE && request["records"] == pair)
+                    .count(),
+                2
+            );
+        }
+    }
+    lookups.len()
+}
+
+fn assert_single_sealed_identity_debt(f: &Fixture, child: &str, completed: i64) -> Value {
+    let conn = rusqlite::Connection::open(&f.database).unwrap();
+    let (count, exact): (i64,i64) = conn.query_row(
+        "SELECT count(*),coalesce(sum(d.child=?1 AND d.reason='identity_conflict' AND d.attempts=2 AND d.next_retry_at>0 AND g.sealed=1 AND g.checkpoint_ready=1),0) FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE d.admission='deferred'",
+        [child], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(
+        (count, exact),
+        (1, 1),
+        "only the specified child remains sealed retry debt"
+    );
+    let verified: i64 = conn.query_row("SELECT count(*) FROM (SELECT child,version_size FROM provider_active_destinations WHERE child LIKE 'child-%' AND verified_media=1 UNION SELECT child,version_size FROM download_receipts WHERE child LIKE 'child-%' AND trust_receipt IS NOT NULL)",[],|r|r.get(0)).unwrap();
+    assert_eq!(verified, completed);
+    let source: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM provider_active_destinations WHERE child LIKE 'child-%' AND source_checksum IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(source, 0);
+    drop(conn);
+    rows(
+        &f.database,
+        "SELECT d.child,d.reason,d.attempts,d.next_retry_at,g.sealed,g.checkpoint_ready FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE d.admission='deferred' ORDER BY d.child",
+    )
+}
+
 #[tokio::test]
-async fn trusted_legacy_mixed_blocked_cohort_downloads_ready_child_and_holds() {
+async fn trusted_legacy_mixed_blocked_cohort_downloads_ready_child_and_retains_debt() {
     let mut f = Fixture::new("mixed-blocked").await;
     f.cycle("baseline", CancellationToken::new(), false)
         .await
@@ -1277,16 +2098,24 @@ async fn trusted_legacy_mixed_blocked_cohort_downloads_ready_child_and_holds() {
         (0, 5),
         "five local receipts only; no VerifiedSource"
     );
+    trust_make_all_due(&f).await;
+    f.provider.lookups.lock().unwrap().clear();
     let first = f
         .cycle("mixed-blocked", CancellationToken::new(), false)
         .await
         .unwrap();
     assert_eq!(first.stats.downloaded, 1, "ready child transfers once");
-    assert!(
-        first.stats.sync_token_blocked,
-        "unresolved cohort keeps the checkpoint held"
+    assert!(!first.stats.sync_token_blocked);
+    assert!(first.can_advance_database_checkpoint());
+    let debt = assert_single_sealed_identity_debt(&f, &unresolved.child, 5);
+    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    let cursor = db.get_metadata(TOKEN).await.unwrap();
+    assert_eq!(
+        cursor,
+        Some(format!("synthetic-observed-{}", f.provider.records.len()))
     );
-    assert!(!first.can_advance_database_checkpoint());
+    drop(db);
+    let lookup_count = assert_due_scoped_lookups(&f);
     assert_independent_download(&f, asset_id, &provider_checksum).await;
     assert_eq!(
         accepted_child_source_count(&f.database, &f.targets),
@@ -1314,11 +2143,22 @@ async fn trusted_legacy_mixed_blocked_cohort_downloads_ready_child_and_holds() {
         .await
         .unwrap();
     assert_eq!(reopen.stats.downloaded, 0, "no duplicate eligible transfer");
-    assert!(
-        reopen.stats.sync_token_blocked,
-        "refusal/held checkpoint survives reopen"
+    assert!(!reopen.stats.sync_token_blocked);
+    assert!(reopen.can_advance_database_checkpoint());
+    assert_eq!(
+        assert_single_sealed_identity_debt(&f, &unresolved.child, 5),
+        debt
     );
-    assert!(!reopen.can_advance_database_checkpoint());
+    assert_eq!(f.provider.lookups.lock().unwrap().len(), lookup_count);
+    assert_eq!(
+        state::SqliteStateDb::open(&f.database)
+            .await
+            .unwrap()
+            .get_metadata(TOKEN)
+            .await
+            .unwrap(),
+        cursor
+    );
     assert_independent_download(&f, asset_id, &provider_checksum).await;
     assert_eq!(
         f.source_counts().await,
@@ -1411,6 +2251,8 @@ async fn trusted_legacy_mixed_six_acceptance_survives_readiness_failure_and_reop
     assert_eq!(db.stored_trusted_legacy_file_count().await.unwrap(), 6);
     drop(db);
     let (asset_id, provider_checksum) = add_independent_child(&mut f);
+    trust_make_all_due(&f).await;
+    f.provider.lookups.lock().unwrap().clear();
     let first = f
         .cycle("mixed-readiness", CancellationToken::new(), false)
         .await
@@ -1419,11 +2261,17 @@ async fn trusted_legacy_mixed_six_acceptance_survives_readiness_failure_and_reop
         first.stats.downloaded, 1,
         "independent child still transfers"
     );
-    assert!(
-        first.stats.sync_token_blocked,
-        "disqualified child keeps the checkpoint held"
+    assert!(!first.stats.sync_token_blocked);
+    assert!(first.can_advance_database_checkpoint());
+    let debt = assert_single_sealed_identity_debt(&f, "child-1-1", 4);
+    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    let cursor = db.get_metadata(TOKEN).await.unwrap();
+    assert_eq!(
+        cursor,
+        Some(format!("synthetic-observed-{}", f.provider.records.len()))
     );
-    assert!(!first.can_advance_database_checkpoint());
+    drop(db);
+    let lookup_count = assert_due_scoped_lookups(&f);
     let (rows_failed, rows_total): (i64, i64) = {
         let conn = rusqlite::Connection::open(&f.database).unwrap();
         conn.query_row(
@@ -1474,11 +2322,19 @@ async fn trusted_legacy_mixed_six_acceptance_survives_readiness_failure_and_reop
         .await
         .unwrap();
     assert_eq!(reopen.stats.downloaded, 0, "no duplicate transfer");
-    assert!(
-        reopen.stats.sync_token_blocked,
-        "readiness failure keeps the checkpoint held on reopen"
+    assert!(!reopen.stats.sync_token_blocked);
+    assert!(reopen.can_advance_database_checkpoint());
+    assert_eq!(assert_single_sealed_identity_debt(&f, "child-1-1", 4), debt);
+    assert_eq!(f.provider.lookups.lock().unwrap().len(), lookup_count);
+    assert_eq!(
+        state::SqliteStateDb::open(&f.database)
+            .await
+            .unwrap()
+            .get_metadata(TOKEN)
+            .await
+            .unwrap(),
+        cursor
     );
-    assert!(!reopen.can_advance_database_checkpoint());
     assert_eq!(
         reopen.stats.failed, 0,
         "reopen remains quiet without new failures"
@@ -1594,6 +2450,72 @@ async fn mixed_primary_hold_downloads_and_reopens(primary_first: bool) {
 }
 
 #[tokio::test]
+async fn trusted_legacy_unaccountable_delta_keeps_prior_cursor_and_acceptances() {
+    let mut f = Fixture::new("trusted-unaccountable-delta").await;
+    f.cycle("baseline", CancellationToken::new(), false)
+        .await
+        .unwrap();
+    f.apply(f.plan().await, &CancellationToken::new())
+        .await
+        .unwrap();
+    let cursor = state::SqliteStateDb::open(&f.database)
+        .await
+        .unwrap()
+        .get_metadata(TOKEN)
+        .await
+        .unwrap();
+    assert_eq!(
+        cursor,
+        Some(format!("synthetic-observed-{}", f.provider.records.len()))
+    );
+    let (asset_id, _) = add_independent_child(&mut f);
+    f.provider
+        .records
+        .push(json!({"recordName":"unknown-source","recordType":"FuturePhotoRecord","fields":{}}));
+    let error = f
+        .cycle("unaccountable", CancellationToken::new(), false)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<crate::icloud::photos::error::UnaccountedChangeError>()
+            .is_some(),
+        "{error:#}"
+    );
+    let db = state::SqliteStateDb::open(&f.database).await.unwrap();
+    assert_eq!(db.get_metadata(TOKEN).await.unwrap(), cursor);
+    assert_eq!(db.stored_trusted_legacy_file_count().await.unwrap(), 6);
+    drop(db);
+    assert!(
+        independent_receipts(&f.database, asset_id).is_empty(),
+        "the unaccountable page is refused before its successor or media are accepted"
+    );
+    assert_eq!(f.source_counts().await, (0, 6));
+    assert_eq!(f.server.received_requests().await.unwrap().len(), 0);
+    f.verify_old();
+    let reopened = f
+        .cycle("unaccountable-reopen", CancellationToken::new(), false)
+        .await
+        .unwrap_err();
+    assert!(
+        reopened
+            .downcast_ref::<crate::icloud::photos::error::UnaccountedChangeError>()
+            .is_some()
+    );
+    assert_eq!(
+        state::SqliteStateDb::open(&f.database)
+            .await
+            .unwrap()
+            .get_metadata(TOKEN)
+            .await
+            .unwrap(),
+        cursor
+    );
+    assert_eq!(f.source_counts().await, (0, 6));
+    f.verify_old();
+}
+
+#[tokio::test]
 async fn trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances() {
     let mut f = Fixture::new("mixed-missing-parent").await;
     f.cycle("baseline", CancellationToken::new(), false)
@@ -1673,6 +2595,7 @@ async fn trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances() {
 
     // A fresh cycle reaches the precise mixed state: the independent child
     // transfers once, while the missing-parent reference withholds authority.
+    f.provider.lookups.lock().unwrap().clear();
     let first = f
         .cycle("mixed-missing-parent", CancellationToken::new(), false)
         .await
@@ -1687,10 +2610,55 @@ async fn trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances() {
     );
     assert_eq!(
         first.stats.sync_token_blocked_reason,
-        Some("legacy_preservation_incomplete"),
-        "the hold is the missing-reference preservation refusal"
+        Some("asset_delta_hydration_incomplete"),
+        "the current-source hydration refusal owns this hold"
     );
     assert!(!first.can_advance_database_checkpoint());
+    let orphan_lookups = f
+        .provider
+        .lookups
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(zone, request)| {
+            zone == ZONE
+                && request["records"]
+                    .as_array()
+                    .is_some_and(|names| names.iter().any(|name| name["recordName"] == orphan))
+        })
+        .count();
+    assert!(
+        orphan_lookups > 0,
+        "the missing-parent source is actually looked up in its zone"
+    );
+    for (zone, request) in f
+        .provider
+        .lookups
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, request)| {
+            request["records"]
+                .as_array()
+                .is_some_and(|names| names.iter().any(|name| name["recordName"] == orphan))
+        })
+    {
+        assert_eq!(zone, ZONE);
+        assert_eq!(
+            request["zoneID"],
+            json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})
+        );
+    }
+    let current_debt: (i64, i64) = {
+        let conn = rusqlite::Connection::open(&f.database).unwrap();
+        conn.query_row("SELECT count(*),coalesce(sum(json_extract(observation_origin,'$[0]')='current-v1'),0) FROM unresolved_sparse_identities WHERE epoch=1 AND library=?1 AND source_record_name=?2",
+            rusqlite::params![ZONE,orphan], |r| Ok((r.get(0)?,r.get(1)?))).unwrap()
+    };
+    assert_eq!(
+        current_debt,
+        (1, 1),
+        "the exact orphan has durable current-scope identity debt"
+    );
     assert_independent_download(&f, asset_id, &provider_checksum).await;
     assert_eq!(
         accepted_child_source_count(&f.database, &f.targets),
@@ -1737,8 +2705,8 @@ async fn trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances() {
     );
     assert_eq!(
         reopen.stats.sync_token_blocked_reason,
-        Some("legacy_preservation_incomplete"),
-        "the missing-reference refusal survives reopen"
+        Some("asset_delta_hydration_incomplete"),
+        "the current-source hydration refusal survives reopen"
     );
     assert!(!reopen.can_advance_database_checkpoint());
     assert_eq!(reopen.stats.failed, 0, "reopen is quiet");
@@ -1754,6 +2722,12 @@ async fn trusted_legacy_mixed_missing_parent_holds_and_preserves_acceptances() {
             "reopen still leaves the checkpoint token untouched"
         );
     }
+    let conn = rusqlite::Connection::open(&f.database).unwrap();
+    let retained_debt: (i64,i64) = conn.query_row(
+        "SELECT count(*),coalesce(sum(json_extract(observation_origin,'$[0]')='current-v1'),0) FROM unresolved_sparse_identities WHERE epoch=1 AND library=?1 AND source_record_name=?2",
+        rusqlite::params![ZONE,orphan], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(retained_debt, current_debt);
+    drop(conn);
     let conn = rusqlite::Connection::open(&f.database).unwrap();
     let retained_orphan_mappings: i64 = conn
         .query_row(

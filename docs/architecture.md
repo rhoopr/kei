@@ -844,7 +844,17 @@ or source changes create a distinct generation or require existing validated
 reseed. They cannot acknowledge omitted eligibility or old unresolved debt.
 
 Destination media completion requires an actual confined file fingerprint and
-independently verified selected source checksum. An exact active physical
+independently verified selected source checksum. A versioned local-trust
+alternative can settle an explicitly accepted legacy file after a fresh scoped
+child/master confirmation matches the selected generation, the immutable
+acceptance binding still matches, and all accepted files used by that child
+remain confined and unchanged through the transaction. An unaccepted rendition
+remains due independently. This proof retains a NULL source checksum and cannot
+establish historical ownership or source verification. The compact completion
+store retains its distinct receipt reference and selected provider, metadata,
+path, account and generation binding after retirement. Existing source-backed
+receipt readers remain source-only. Explicit metadata refresh remains separate
+work and is not completed by local acceptance. An exact active physical
 receipt can be reused across compatible passes after current selection and
 file verification; another path retains its own obligation. Opaque provider
 signatures remain independent from source and local SHA-256. Fresh or legacy

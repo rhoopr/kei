@@ -488,7 +488,7 @@ pub(in crate::state::db) fn retire_handed_off_publication(
 ) -> Result<(), StateError> {
     let ids: Vec<String> = conn
         .prepare(
-            "SELECT id FROM download_receipts WHERE library=?1 AND state_id=?2 AND version_size=?3
+            "SELECT id FROM download_receipts WHERE source_checksum IS NOT NULL AND library=?1 AND state_id=?2 AND version_size=?3
          AND provider_checksum=?4 AND provider_size=?5 AND native_path=?6
          AND local_checksum=?7 AND source_checksum=?8",
         )?

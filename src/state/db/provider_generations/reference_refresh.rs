@@ -91,6 +91,11 @@ impl SqliteStateDb {
                 let (media,metadata,prepared,frozen):(bool,bool,bool,bool)=tx.query_row("SELECT verified_media,verified_metadata,prepared_hash IS NOT NULL,frozen_metadata IS NOT NULL FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",params![generation,old.decision.pass_key,old.decision.child,destination.version_size,destination.path.key()?],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
                 if prepared || frozen || (media && root.spec.metadata_enabled && !metadata) {return Err(StateError::ProviderWorkConflict);}
                 if media {
+                    let source_backed: bool = tx.query_row(
+                        "SELECT source_checksum IS NOT NULL FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+                        params![generation,old.decision.pass_key,old.decision.child,destination.version_size,destination.path.key()?],
+                        |r| r.get(0))?;
+                    if !source_backed { return Err(StateError::ProviderWorkConflict); }
                     // Validate existing completed provenance before any hash changes.
                     let mut receipt=retirement::receipt(&tx,&root,&old,destination)?;
                     let saved=super::super::download_receipts::load(&tx,&receipt.id()?)?.ok_or(StateError::ProviderSelectionInvalid)?;

@@ -1672,6 +1672,41 @@ Run it with default and `--no-default-features` profiles when changing trusted
 legacy receipts. Existing `legacy_preservation` tests retain the no-acceptance
 verified-source controls.
 
+### Selected local-trust completion
+
+The trusted_legacy_due production-cycle tests force real due retries after
+local acceptance. They check scoped child/master lookups, five accepted
+renditions and one pending rendition, local-only compact receipts and NULL
+source hashes, bounded retry and final acceptance, provider and file drift,
+transaction rollback, revalidation of a previously settled sibling, independent
+healthy work, preserved historical rows and no media GETs. The versioned proof
+and migration tests exercise the compact receipt format and preserve old
+source-backed rows. This does not claim historical source verification.
+
+
+The earlier zero-acceptance and partial-acceptance controls expected no
+unresolved work at baseline, although the sealed selection had four deferred
+identity conflicts. They now assert the exact checkpoint-bound retry debt, then
+force scoped due lookups and reach the acceptance and quiet-reopen checks. Full
+acceptance settles all six; partial acceptance leaves one child and rendition.
+
+The earlier mixed blocked-cohort and readiness-failure controls expected the
+source cursor to stay held. They now prove that a sealed selected-work owner
+retains one exact deferred child while the independent healthy delta advances
+the cursor. They separately check five and four accepted completions, scoped
+lookups, unchanged retry deadline, and historical family evidence on reopen.
+The original failing mixed blocked-cohort name ended in
+downloads_ready_child_and_holds; its replacement ends in
+downloads_ready_child_and_retains_debt.
+
+The earlier missing-parent control copied a hidden record, which is processed as
+a hidden-state transition and does not exercise unresolved created identity.
+The fixture now emits a created asset without a parent, verifies its scoped
+lookup and current identity debt, and retains the prior cursor with the
+asset_delta_hydration_incomplete reason across reopen. A separate unknown-type
+delta control proves the typed unaccountable-page refusal and prior cursor.
+Neither control manufactures a source receipt or historical family owner.
+
 ## Recovery evidence regressions
 
 The recovery scenarios separate historical path claims from sparse shared-library

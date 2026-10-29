@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 40;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 41;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -741,7 +741,10 @@ CREATE TABLE IF NOT EXISTS download_receipts (
  scope TEXT NOT NULL, library TEXT NOT NULL, child TEXT NOT NULL, master TEXT NOT NULL,
  state_id TEXT NOT NULL, origin_pass TEXT NOT NULL, version_size TEXT NOT NULL, provider_checksum TEXT NOT NULL,
  provider_size INTEGER NOT NULL CHECK(provider_size>=0), native_path TEXT NOT NULL,
- source_checksum TEXT NOT NULL, local_checksum TEXT NOT NULL, proof_hash TEXT NOT NULL
+ source_checksum TEXT, local_checksum TEXT NOT NULL, proof_hash TEXT NOT NULL,
+ trust_receipt TEXT, selected_metadata_hash TEXT, generation_id TEXT,
+ CHECK ((source_checksum IS NOT NULL AND trust_receipt IS NULL AND selected_metadata_hash IS NULL AND generation_id IS NULL) OR
+        (source_checksum IS NULL AND trust_receipt IS NOT NULL AND selected_metadata_hash IS NOT NULL AND generation_id IS NOT NULL))
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS download_receipts_identity ON download_receipts(scope,child,master,version_size,provider_checksum,provider_size);
 CREATE INDEX IF NOT EXISTS download_receipts_library ON download_receipts(library,scope);

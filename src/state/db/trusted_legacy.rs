@@ -49,6 +49,25 @@ fn key(target: &TrustedLegacyFile) -> String {
     format!("{}{}", prefix(&target.library), digest(&target.binding))
 }
 
+/// Read and validate the immutable receipt referenced by a completion proof.
+pub(super) fn receipt_file(
+    conn: &Connection,
+    receipt: &str,
+) -> Result<Option<TrustedLegacyFile>, StateError> {
+    let value: Option<String> = conn
+        .query_row("SELECT value FROM metadata WHERE key=?1", [receipt], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let Some(value) = value else { return Ok(None) };
+    let accepted: TrustedLegacyFile =
+        serde_json::from_str(&value).map_err(|_private_error| invalid())?;
+    if key(&accepted) != receipt {
+        return Ok(None);
+    }
+    Ok(Some(accepted))
+}
+
 pub(super) fn dependency_rows(
     conn: &Connection,
     library: &str,
@@ -151,6 +170,18 @@ pub(super) fn provenance(
     if verified {
         return Ok(Some(LegacyReceiptProvenance::VerifiedSource));
     }
+    Ok(accepted_file(conn, library, child, rendition)?
+        .map(|(receipt, _)| LegacyReceiptProvenance::TrustedLegacyFile { receipt }))
+}
+
+/// Resolve the immutable receipt only when its complete current binding still matches.
+/// This is local-byte acceptance and never establishes a source checksum.
+pub(super) fn accepted_file(
+    conn: &Connection,
+    library: &str,
+    child: &str,
+    rendition: &str,
+) -> Result<Option<(String, TrustedLegacyFile)>, StateError> {
     // Preserve the strict no-acceptance path, including older synthetic stores
     // without owned-account headers. No receipt means no alternate provenance.
     let accepted: bool = conn.query_row(
@@ -177,10 +208,22 @@ pub(super) fn provenance(
     if current != accepted {
         return Ok(None);
     }
-    Ok(Some(LegacyReceiptProvenance::TrustedLegacyFile { receipt }))
+    Ok(Some((receipt, accepted)))
 }
 
 impl SqliteStateDb {
+    pub(crate) async fn accepted_trusted_legacy_file(
+        &self,
+        library: String,
+        child: String,
+        rendition: String,
+    ) -> Result<Option<TrustedLegacyFile>, StateError> {
+        self.with_conn("reading accepted legacy file", move |conn| {
+            Ok(accepted_file(conn, &library, &child, &rendition)?.map(|(_, file)| file))
+        })
+        .await
+    }
+
     pub(crate) async fn stored_trusted_legacy_file_count(&self) -> Result<u64, StateError> {
         self.with_conn("stored_trusted_legacy_file_count", |conn| {
             let count: i64 = conn.query_row(

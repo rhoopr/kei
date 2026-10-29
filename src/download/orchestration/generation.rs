@@ -1268,6 +1268,7 @@ impl SelectionRun {
         plan: &mut AssetTaskPlan,
         planner: &mut TaskPlanner,
         config: &DownloadConfig,
+        cancel: &CancellationToken,
     ) -> Result<bool> {
         let SelectionConfirmation {
             retained: body,
@@ -1509,7 +1510,8 @@ impl SelectionRun {
             },
         };
         let freshly_confirmed = fresh.is_some();
-        let projection = self
+        let fresh_for_trust = fresh.clone();
+        let mut projection = self
             .capture
             .db
             .project_selection_decision_with_proof(
@@ -1531,6 +1533,90 @@ impl SelectionRun {
                     asset.state_id().to_owned(),
                 )
                 .await?;
+        }
+        if !projection.admitted
+            && projection.reason == "identity_conflict"
+            && let Some(fresh) = fresh_for_trust
+        {
+            let mut targets = Vec::new();
+            let mut files = Vec::new();
+            for destination in &manifest.decision.destinations {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let Some(target) = self
+                    .capture
+                    .db
+                    .accepted_trusted_legacy_file(
+                        self.root
+                            .spec
+                            .zone
+                            .get("zoneName")
+                            .and_then(Value::as_str)
+                            .context("Missing selected source zone")?
+                            .to_owned(),
+                        manifest.decision.child.clone(),
+                        destination.version_size.clone(),
+                    )
+                    .await?
+                else {
+                    continue;
+                };
+                if target.path != destination.path.to_path()
+                    || crate::download::file::has_replacement_journal(
+                        &config.directory,
+                        &target.path,
+                    )
+                    .await?
+                {
+                    continue;
+                }
+                let root = config.directory.to_path_buf();
+                let suffix = config.temp_suffix.to_string();
+                let allow = config.legacy_preservation_allow_hardlinks;
+                let candidate = target.clone();
+                let retained = tokio::task::spawn_blocking(move || {
+                    crate::download::trusted_legacy::retain(&root, &candidate, &suffix, allow)
+                })
+                .await?;
+                let Ok(retained) = retained else { continue };
+                if retained.target != target {
+                    continue;
+                }
+                files.push(retained);
+                targets.push(target);
+            }
+            if !targets.is_empty() {
+                let root = config.directory.to_path_buf();
+                let suffix = config.temp_suffix.to_string();
+                let allow_hardlinks = config.legacy_preservation_allow_hardlinks;
+                let cancel = cancel.clone();
+                projection.admitted = self
+                    .capture
+                    .db
+                    .settle_trusted_selection(
+                        self.capture.owner.clone(),
+                        self.root.id.clone(),
+                        key.to_owned(),
+                        manifest.decision.child.clone(),
+                        targets,
+                        fresh,
+                        move || {
+                            let check = || -> anyhow::Result<()> {
+                                for retained in files {
+                                    anyhow::ensure!(!cancel.is_cancelled(), "Selection cancelled");
+                                    retained.validate(&root, &suffix, allow_hardlinks)?;
+                                }
+                                anyhow::ensure!(!cancel.is_cancelled(), "Selection cancelled");
+                                Ok(())
+                            };
+                            check().map_err(|_error| {
+                                crate::state::error::StateError::ProviderWorkConflict
+                            })
+                        },
+                    )
+                    .await?;
+            }
         }
         if !projection.admitted && manifest.decision.outcome != SelectionOutcome::Excluded {
             tracing::debug!(reason = %projection.reason, "Selection destination admission deferred");

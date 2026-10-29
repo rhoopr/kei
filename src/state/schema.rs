@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 40;
+pub(crate) const SCHEMA_VERSION: i32 = 41;
 
 fn migrate_active_selection(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(r"CREATE TABLE IF NOT EXISTS provider_active_generations (
@@ -1487,6 +1487,12 @@ pub(crate) fn migrate_to_version(
             }
         }
         40 => conn.execute_batch(super::db::source_revalidation::DDL)?,
+        41 => {
+            if !column_exists(conn, "download_receipts", "trust_receipt")? {
+                conn.execute_batch(super::db::download_receipts::LOCAL_TRUST_MIGRATION)?;
+            }
+        }
+
         other => {
             return Err(StateError::UnsupportedSchemaVersion {
                 found: other,

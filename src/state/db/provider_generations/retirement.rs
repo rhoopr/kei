@@ -59,6 +59,67 @@ pub(super) fn receipt(
     })
 }
 
+fn local_completion(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    manifest: &ActiveDecision,
+    destination: &SelectionDestination,
+) -> Result<Option<download_receipts::LocalTrustCompletion>, StateError> {
+    let (source, local, progress, intent, metadata): (Option<String>, Option<String>, Option<String>, Option<String>, bool) =
+        conn.query_row("SELECT source_checksum,local_checksum,progress_hash,intent_hash,verified_metadata FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+            params![root.id,manifest.decision.pass_key,manifest.decision.child,destination.version_size,destination.path.key()?],
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
+    if source.is_some() {
+        return Ok(None);
+    }
+    let local = local.ok_or(StateError::ProviderSelectionInvalid)?;
+    let progress = progress.ok_or(StateError::ProviderSelectionInvalid)?;
+    if !super::validate_local_trust_progress(
+        conn,
+        root,
+        manifest,
+        destination,
+        intent.as_deref(),
+        metadata,
+        &local,
+        &progress,
+    )? {
+        return invalid();
+    }
+    let receipt =
+        super::local_trust_receipt(&progress).ok_or(StateError::ProviderSelectionInvalid)?;
+    let (account_key, provider_key) = owner_keys(conn)?;
+    Ok(Some(download_receipts::LocalTrustCompletion {
+        version: 1,
+        account_key,
+        provider_key,
+        scope: root.spec.scope.clone(),
+        library: root
+            .spec
+            .zone
+            .get("zoneName")
+            .and_then(Value::as_str)
+            .ok_or(StateError::ProviderSelectionInvalid)?
+            .to_owned(),
+        child: manifest.decision.child.clone(),
+        master: manifest
+            .decision
+            .master
+            .clone()
+            .ok_or(StateError::ProviderSelectionInvalid)?,
+        state_id: manifest.state_id.clone(),
+        origin_pass: manifest.decision.pass_key.clone(),
+        version_size: destination.version_size.clone(),
+        provider_checksum: destination.checksum.clone(),
+        provider_size: destination.size,
+        native_path: destination.path.clone(),
+        local_checksum: local,
+        trust_receipt: receipt.to_owned(),
+        selected_metadata_hash: destination.metadata_hash.clone(),
+        generation_id: root.id.clone(),
+    }))
+}
+
 fn same_receipt(left: &DownloadReceipt, right: &DownloadReceipt) -> bool {
     let mut left = left.clone();
     left.origin_pass = right.origin_pass.clone();
@@ -114,11 +175,19 @@ pub(super) fn validate_compacted(
         if !complete {
             return invalid();
         }
-        let expected = receipt(conn, root, manifest, destination)?;
-        let actual = download_receipts::load(conn, &expected.id()?)?
-            .ok_or(StateError::ProviderSelectionInvalid)?;
-        if !same_receipt(&expected, &actual) {
-            return invalid();
+        if let Some(expected) = local_completion(conn, root, manifest, destination)? {
+            if download_receipts::load_local_trust(conn, &expected.id()?)?.as_ref()
+                != Some(&expected)
+            {
+                return invalid();
+            }
+        } else {
+            let expected = receipt(conn, root, manifest, destination)?;
+            let actual = download_receipts::load(conn, &expected.id()?)?
+                .ok_or(StateError::ProviderSelectionInvalid)?;
+            if !same_receipt(&expected, &actual) {
+                return invalid();
+            }
         }
     }
     Ok(())
@@ -205,8 +274,13 @@ pub(super) fn compact_batch(
         }
         let mut manifest = load_decision(conn, &root, &key, &child)?;
         let mut receipts = Vec::new();
+        let mut local_receipts = Vec::new();
         let mut eligible = true;
         for destination in &manifest.decision.destinations {
+            if let Some(local) = local_completion(conn, &root, &manifest, destination)? {
+                local_receipts.push(local);
+                continue;
+            }
             let expected = receipt(conn, &root, &manifest, destination)?;
             let existing = download_receipts::load(conn, &expected.id()?)?;
             if let Some(existing) = existing {
@@ -240,6 +314,9 @@ pub(super) fn compact_batch(
             continue;
         }
         for receipt in receipts {
+            receipt.save(conn)?;
+        }
+        for receipt in local_receipts {
             receipt.save(conn)?;
         }
         #[cfg(all(test, target_os = "linux"))]
