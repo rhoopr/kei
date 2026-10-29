@@ -9,7 +9,7 @@ use rusqlite::OptionalExtension;
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 37). The shared helper
+/// `state::schema::SCHEMA_VERSION`. The shared helper
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
@@ -27,7 +27,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` in support to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 39;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 40;
     let production_schema = include_str!("../../src/state/schema.rs");
     assert!(
         production_schema.contains(&format!(
@@ -42,6 +42,29 @@ fn behavioral_helper_schema_matches_production() {
          production={PRODUCTION_SCHEMA_VERSION}). Bump both, plus the DDL \
          block in create_state_db, then update this test."
     );
+}
+
+#[test]
+fn behavioral_source_revalidation_schema_matches_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let actual = create_state_db(dir.path(), "schema_check@example.com");
+    let source = include_str!("../../src/state/db/source_revalidation.rs").replace("\r\n", "\n");
+    let ddl = source
+        .split_once("pub(crate) const DDL: &str = r\"")
+        .unwrap()
+        .1
+        .split_once("\";")
+        .unwrap()
+        .0;
+    let expected = rusqlite::Connection::open_in_memory().unwrap();
+    expected.execute_batch(ddl).unwrap();
+    let shapes = |db: &rusqlite::Connection| {
+        db.prepare("SELECT type,name,sql FROM sqlite_master WHERE name GLOB 'source_revalidation_*' ORDER BY type,name")
+            .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+            .unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+    };
+    assert_eq!(shapes(&actual), shapes(&expected));
+    assert_eq!(shapes(&actual).len(), 3);
 }
 
 #[test]

@@ -3952,7 +3952,7 @@ mod sparse_origin_migration_tests {
         for version in [26, 28, 35, 36] {
             let (_dir, conn) = seeded(version);
             migrate(&conn).unwrap();
-            assert_eq!(get_schema_version(&conn).unwrap(), 39);
+            assert_eq!(get_schema_version(&conn).unwrap(), super::SCHEMA_VERSION);
             assert_eq!(epoch(&conn), 0);
             assert_eq!(report_observation_counts(&conn), (0, 1, 0));
             conn.execute("UPDATE unresolved_sparse_identities SET observation_origin='opaque malformed history'", []).unwrap();

@@ -190,6 +190,8 @@ mod tests {
             );
             let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('source_revalidation_rounds','source_revalidation_debt')", [], |row| row.get(0)).unwrap();
             assert_eq!(tables, 2);
+            let due_index: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='source_revalidation_due')", [], |row| row.get(0)).unwrap();
+            assert!(due_index);
             drop(conn);
             drop(db);
             assert_eq!(std::fs::read(&media).unwrap(), b"synthetic original");

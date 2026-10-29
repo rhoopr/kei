@@ -80,7 +80,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 39;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 40;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -745,6 +745,19 @@ CREATE TABLE IF NOT EXISTS download_receipts (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS download_receipts_identity ON download_receipts(scope,child,master,version_size,provider_checksum,provider_size);
 CREATE INDEX IF NOT EXISTS download_receipts_library ON download_receipts(library,scope);
+").unwrap();
+    conn.execute_batch(r"
+CREATE TABLE IF NOT EXISTS source_revalidation_rounds (
+ id TEXT PRIMARY KEY, library TEXT NOT NULL, scope TEXT NOT NULL,
+ enum_hash TEXT NOT NULL, boundary TEXT NOT NULL, high_id TEXT NOT NULL,
+ after_id TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('marking','observing','active','abandoned'))
+);
+CREATE TABLE IF NOT EXISTS source_revalidation_debt (
+ round TEXT NOT NULL REFERENCES source_revalidation_rounds(id),
+ id TEXT NOT NULL, next_retry_at INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(round,id)
+);
+CREATE INDEX IF NOT EXISTS source_revalidation_due ON source_revalidation_debt(next_retry_at,round,id);
 ").unwrap();
     conn.pragma_update(None, "user_version", HELPER_SCHEMA_VERSION)
         .unwrap();
