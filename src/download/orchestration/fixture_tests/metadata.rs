@@ -18,6 +18,62 @@ fn provider_metadata(records: &mut [Value]) {
     fields["captionEnc"] = json!({"value": "Café fixture", "type": "STRING"});
 }
 
+fn bound_receipt(
+    h: &Harness,
+    id: &str,
+    source: &[u8],
+    output: &[u8],
+    path: &std::path::Path,
+) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let conn = h
+        .db()
+        .acquire_lock("inspect fixture publication receipt")
+        .unwrap();
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM download_receipts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1);
+    let receipt: String = conn.query_row(
+        "SELECT json_array(account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum) FROM download_receipts",
+        [], |row| row.get(0),
+    ).unwrap();
+    let row: Value = serde_json::from_str(&receipt).unwrap();
+    let owner: (String, String) = conn
+        .query_row(
+            "SELECT account_key,provider_key FROM account_owner WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row[0], owner.0);
+    assert_eq!(row[1], owner.1);
+    let scope: Value = serde_json::from_str(row[2].as_str().unwrap()).unwrap();
+    assert_eq!(scope["database"], "private");
+    assert_eq!(scope["zone"]["zoneName"], "PrimarySync");
+    assert_eq!(scope["zone"]["ownerRecordName"], "_defaultOwner");
+    assert_eq!(row[3], "PrimarySync");
+    assert_eq!(row[4], format!("asset-{id}"));
+    assert_eq!(row[5], id);
+    assert_eq!(row[6], format!("asset-{id}"));
+    assert!(!row[7].as_str().unwrap().is_empty());
+    assert_eq!(row[8], "original");
+    assert_eq!(
+        row[9],
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(source))
+    );
+    assert_eq!(row[10], source.len());
+    let native: crate::state::db::provider_selection::SelectionPath =
+        serde_json::from_str(row[11].as_str().unwrap()).unwrap();
+    assert_eq!(native.to_path(), path);
+    assert_eq!(row[12], sha256(source));
+    assert_eq!(row[13], sha256(output));
+    receipt
+}
+
 // Retain codec tables, frame headers and compressed scan, excluding only metadata.
 fn jpeg_payload(bytes: &[u8]) -> Vec<u8> {
     assert_eq!(&bytes[..2], b"\xff\xd8");
@@ -43,7 +99,7 @@ fn jpeg_payload(bytes: &[u8]) -> Vec<u8> {
 #[tokio::test]
 async fn bundled_metadata_roundtrips() {
     for populated in [true, false] {
-        let mut h = Harness::new().await;
+        let mut h = Harness::new_owned().await;
         h.config.metadata = MetadataConfig {
             set_exif_datetime: true,
             set_exif_rating: true,
@@ -69,7 +125,7 @@ async fn bundled_metadata_roundtrips() {
             records[1]["fields"]["isFavorite"] = json!({"value": 0});
             records[1]["fields"]["timeZoneOffset"] = json!({"value": 0});
         }
-        let result = cycle(&h.config, records.clone()).await;
+        let result = h.owned_cycle(records.clone()).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{result:?}"
@@ -143,7 +199,12 @@ async fn bundled_metadata_roundtrips() {
                     .is_none()
             );
         }
+        let receipt = bound_receipt(&h, "metadata", &fixture("media/pattern.jpg"), &bytes, &path);
         h.reopen().await;
+        assert_eq!(
+            bound_receipt(&h, "metadata", &fixture("media/pattern.jpg"), &bytes, &path),
+            receipt
+        );
         let row = h.db().get_downloaded_page(0, 10).await.unwrap().remove(0);
         assert_eq!(
             row.download_checksum.as_deref(),
@@ -152,12 +213,16 @@ async fn bundled_metadata_roundtrips() {
         assert_eq!(row.local_checksum.as_deref(), Some(sha256(&bytes).as_str()));
         assert_ne!(row.local_checksum, row.download_checksum);
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let result = cycle(&h.config, records).await;
+        let result = h.owned_cycle(records).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{result:?}"
         );
         assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(
+            bound_receipt(&h, "metadata", &fixture("media/pattern.jpg"), &bytes, &path),
+            receipt
+        );
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),
@@ -175,7 +240,7 @@ async fn bundled_metadata_roundtrips() {
 async fn bundled_sidecar_roundtrip() {
     use xmp_toolkit::{OpenFileOptions, XmpFile, XmpMeta, xmp_ns};
     for sidecar in [false, true] {
-        let mut h = Harness::new().await;
+        let mut h = Harness::new_owned().await;
         h.config.metadata.set_exif_datetime = !sidecar;
         h.config.metadata.set_exif_rating = !sidecar;
         h.config.metadata.set_exif_gps = !sidecar;
@@ -186,7 +251,7 @@ async fn bundled_sidecar_roundtrip() {
             .asset("xmp", "Packet.jpg", "public.jpeg", "media/pattern.jpg", 1)
             .await;
         provider_metadata(&mut records);
-        let result = cycle(&h.config, records.clone()).await;
+        let result = h.owned_cycle(records.clone()).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{result:?}"
@@ -237,13 +302,22 @@ async fn bundled_sidecar_roundtrip() {
             })
             .collect();
         assert_eq!(snapshots.len(), if sidecar { 2 } else { 1 });
+        let receipt = bound_receipt(&h, "xmp", &fixture("media/pattern.jpg"), &bytes, &path);
         h.reopen().await;
-        let result = cycle(&h.config, records).await;
+        assert_eq!(
+            bound_receipt(&h, "xmp", &fixture("media/pattern.jpg"), &bytes, &path),
+            receipt
+        );
+        let result = h.owned_cycle(records).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{result:?}"
         );
         assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(
+            bound_receipt(&h, "xmp", &fixture("media/pattern.jpg"), &bytes, &path),
+            receipt
+        );
         for (path, bytes, modified) in &snapshots {
             assert_eq!(std::fs::read(path).unwrap(), *bytes);
             assert_eq!(
@@ -258,7 +332,7 @@ async fn bundled_sidecar_roundtrip() {
 
 #[tokio::test]
 async fn bundled_existing_metadata_survives_rating_update() {
-    let mut h = Harness::new().await;
+    let mut h = Harness::new_owned().await;
     h.config.metadata.set_exif_rating = true;
     let records = h
         .asset(
@@ -273,7 +347,7 @@ async fn bundled_existing_metadata_survives_rating_update() {
     let source_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/media/metadata.jpg");
     let before = Metadata::new_from_path(&source_path).unwrap();
-    let result = cycle(&h.config, records.clone()).await;
+    let result = h.owned_cycle(records.clone()).await;
     assert!(
         matches!(result.outcome, DownloadOutcome::Success),
         "{result:?}"
@@ -298,13 +372,47 @@ async fn bundled_existing_metadata_survives_rating_update() {
         Some(sha256(&original).as_str())
     );
     assert_eq!(row.local_checksum.as_deref(), Some(sha256(&bytes).as_str()));
-    let result = cycle(&h.config, records).await;
+    let result = h.owned_cycle(records).await;
     assert!(
         matches!(result.outcome, DownloadOutcome::Success),
         "{result:?}"
     );
     assert_eq!(result.stats.downloaded, 0);
     assert!(std::fs::read(&path).unwrap() == bytes);
+    assert_eq!(files(&h.config.directory), vec![path]);
+    h.server.verify().await;
+}
+
+#[tokio::test]
+async fn unbound_rewritten_fixture_remains_uncertain_after_reopen() {
+    let mut h = Harness::new().await;
+    h.config.metadata.set_exif_datetime = true;
+    let records = h
+        .asset(
+            "unbound",
+            "Unbound.jpg",
+            "public.jpeg",
+            "media/pattern.jpg",
+            1,
+        )
+        .await;
+    let result = cycle(&h.config, records.clone()).await;
+    assert!(
+        matches!(result.outcome, DownloadOutcome::Success),
+        "{result:?}"
+    );
+    let path = h.config.directory.join("Unbound.JPG");
+    let bytes = std::fs::read(&path).unwrap();
+    assert_ne!(bytes, fixture("media/pattern.jpg"));
+    h.reopen().await;
+    let result = cycle(&h.config, records).await;
+    assert!(
+        matches!(result.outcome, DownloadOutcome::PartialFailure { .. }),
+        "{result:?}"
+    );
+    assert_eq!(result.stats.skipped.uncertain, 1);
+    assert_eq!(result.stats.downloaded, 0);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
     assert_eq!(files(&h.config.directory), vec![path]);
     h.server.verify().await;
 }
