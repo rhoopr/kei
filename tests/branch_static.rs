@@ -2068,6 +2068,7 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_heif_metadata_limit",
         "classify_incremental_error",
         "classify_legacy_inventory_error",
+        "classify_missing_changes_successor",
         "classify_provider_lookup_error",
         "classify_rate_limit_error",
         "classify_reconciliation_io_error",

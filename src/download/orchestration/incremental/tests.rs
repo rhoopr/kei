@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 #[cfg(feature = "xmp")]
 use super::super::test_support::mock_album_with_container;
 #[cfg(feature = "xmp")]

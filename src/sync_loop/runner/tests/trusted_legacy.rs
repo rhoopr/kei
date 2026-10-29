@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Trusted Legacy File migration through the real cycle owner. Synthetic accounts and bytes only.
 #![cfg(target_os = "linux")]
 

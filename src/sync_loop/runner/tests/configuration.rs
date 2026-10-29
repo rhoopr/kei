@@ -1282,13 +1282,18 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
         "{}",
         cycles[1]
     );
-    assert_eq!(component(1, "delta_bridge")["token_present"], true);
-    assert_eq!(component(1, "delta_bridge")["token_usable"], true);
+    assert_eq!(component(1, "delta_bridge")["token_present"], false);
+    assert_eq!(component(1, "delta_bridge")["token_usable"], false);
+    assert_eq!(component(1, "delta_bridge")["sync_token_blocked"], true);
+    assert_eq!(
+        component(1, "delta_bridge")["sync_token_blocked_reason"],
+        "icloud_changes_successor_missing"
+    );
     assert_eq!(
         component(1, "delta_bridge")["completed_delta_replay"],
         false
     );
-    assert_eq!(component(1, "delta_bridge")["phase"], "full");
+    assert_eq!(component(1, "delta_bridge")["phase"], "incremental");
     assert_eq!(component(1, "combined")["sync_token_blocked"], true);
     assert_eq!(
         component(1, "combined")["sync_token_blocked_reason"],

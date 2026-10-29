@@ -81,6 +81,12 @@ fn collection_independent_rank(passes: &[crate::commands::AlbumPass]) -> bool {
         })
 }
 
+fn classify_missing_changes_successor(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::icloud::photos::error::MissingChangesSuccessor>()
+        .is_some()
+}
+
 fn stream_incremental_assets_for_single_unfiled_pass(
     pass: crate::commands::AlbumPass,
     config: Arc<DownloadConfig>,
@@ -124,11 +130,7 @@ fn stream_incremental_assets_for_single_unfiled_pass(
                     }
                     return Ok(delta.summary);
                 }
-                Err(error)
-                    if error
-                        .downcast_ref::<crate::icloud::photos::error::MissingChangesSuccessor>()
-                        .is_some() =>
-                {
+                Err(error) if classify_missing_changes_successor(&error) => {
                     delta
                         .summary
                         .token_unsafe_reason
@@ -595,11 +597,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             };
             let Some(result) = result else { break };
             let event = match result {
-                Err(error)
-                    if error
-                        .downcast_ref::<crate::icloud::photos::error::MissingChangesSuccessor>()
-                        .is_some() =>
-                {
+                Err(error) if classify_missing_changes_successor(&error) => {
                     delta
                         .summary
                         .token_unsafe_reason
