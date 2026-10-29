@@ -235,8 +235,31 @@ impl ConfinedPath {
         })
     }
 
+    /// Hold each existing ancestor with read access and no delete sharing.
+    /// Abort if any ancestor changed while the stronger handles were opened.
+    #[cfg(windows)]
+    pub(crate) fn pin_windows_namespace(&mut self) -> std::io::Result<()> {
+        let parent = self.path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Confined path has no parent",
+            )
+        })?;
+        let pinned = open_windows_directory_chain_with_access(parent, true)?;
+        if pinned.len() != self.directory_handles.len() {
+            return Err(confined_identity_changed_error(&self.path));
+        }
+        for (before, after) in self.directory_handles.iter().zip(&pinned) {
+            if file_identity(before)? != file_identity(after)? {
+                return Err(confined_identity_changed_error(&self.path));
+            }
+        }
+        self.directory_handles = pinned;
+        Ok(())
+    }
+
     /// Descend into a retained directory entry without reopening its ancestors.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn child(&self, name: &std::ffi::OsStr) -> std::io::Result<Self> {
         use std::os::fd::AsRawFd;
         self.validate_namespace()?;
@@ -277,8 +300,42 @@ impl ConfinedPath {
         })
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn create_private_directory(&self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        self.validate_namespace()?;
+        // SAFETY: parent fd and C string are retained and live for this call.
+        if unsafe { libc::mkdirat(self.parent_dir.as_raw_fd(), self.name.as_ptr(), 0o700) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.sync_parent()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn remove_empty_directory(&self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        self.validate_namespace()?;
+        // SAFETY: the retained parent and C string remain live.
+        if unsafe {
+            libc::unlinkat(
+                self.parent_dir.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.sync_parent()
+    }
+
     /// Remove only the checked entry in the held parent, never a replacement parent.
-    #[cfg(feature = "xmp")]
+    #[cfg(any(
+        feature = "xmp",
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos"
+    ))]
     pub(crate) fn remove_regular(&self, expected: FileIdentity) -> std::io::Result<()> {
         let file = self.validate_identity(expected)?;
         #[cfg(unix)]
@@ -647,15 +704,21 @@ fn confined_cstring(value: &std::ffi::OsStr) -> std::io::Result<std::ffi::CStrin
 
 #[cfg(windows)]
 fn open_windows_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    open_windows_directory_with_access(path, false)
+}
+
+#[cfg(windows)]
+fn open_windows_directory_with_access(path: &Path, pin: bool) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
     };
 
     let file = std::fs::OpenOptions::new()
-        .access_mode(FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ)
+        .access_mode(FILE_READ_ATTRIBUTES | if pin { FILE_LIST_DIRECTORY } else { 0 })
+        .share_mode(FILE_SHARE_READ | if pin { FILE_SHARE_WRITE } else { 0 })
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     let attributes = windows_file_attributes(&file)?;
@@ -671,6 +734,14 @@ fn open_windows_directory(path: &Path) -> std::io::Result<std::fs::File> {
 
 #[cfg(windows)]
 fn open_windows_directory_chain(path: &Path) -> std::io::Result<Vec<std::fs::File>> {
+    open_windows_directory_chain_with_access(path, false)
+}
+
+#[cfg(windows)]
+fn open_windows_directory_chain_with_access(
+    path: &Path,
+    pin: bool,
+) -> std::io::Result<Vec<std::fs::File>> {
     let path = absolute_lexical(path)?;
     let mut current = PathBuf::new();
     let mut handles = Vec::new();
@@ -682,10 +753,10 @@ fn open_windows_directory_chain(path: &Path) -> std::io::Result<Vec<std::fs::Fil
         ) {
             continue;
         }
-        handles.push(open_windows_directory(&current)?);
+        handles.push(open_windows_directory_with_access(&current, pin)?);
     }
     if handles.is_empty() {
-        handles.push(open_windows_directory(&path)?);
+        handles.push(open_windows_directory_with_access(&path, pin)?);
     }
     Ok(handles)
 }

@@ -145,9 +145,56 @@ pub(in crate::download) struct PreparedMetadataFile {
     pub(super) guard: TmpGuard,
     pub(super) expected_input: crate::download::file::ExistingFileFingerprint,
     pub(super) expected_output: crate::download::file::ExistingFileFingerprint,
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    pub(super) output_file: std::fs::File,
 }
 
 impl PreparedMetadataFile {
+    #[cfg(all(test, target_os = "linux", feature = "xmp"))]
+    pub(super) fn prototype_temporary_path(&self) -> &Path {
+        &self.guard.path
+    }
+
+    /// Bind the actual open writer output to its confined private pathname.
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    pub(in crate::download) fn retained_output_witness(
+        &self,
+        scratch_input: &crate::fs_util::ConfinedPath,
+    ) -> Result<(PathBuf, crate::state::db::primary_layout::LayoutFingerprint)> {
+        let name = self
+            .guard
+            .path
+            .file_name()
+            .context("Embedded output has no filename")?;
+        let output_path = scratch_input.path().with_file_name(name);
+        let output = scratch_input.sibling(&output_path)?;
+        let identity = crate::fs_util::file_identity(&self.output_file)?;
+        anyhow::ensure!(
+            crate::fs_util::file_link_count(&self.output_file)? == 1,
+            "Embedded output has unexpected links"
+        );
+        let mut file = self.output_file.try_clone()?;
+        std::io::Seek::rewind(&mut file)?;
+        let actual = crate::download::file::fingerprint_open_file_snapshot_blocking(
+            &mut file,
+            &output_path,
+        )?
+        .fingerprint;
+        anyhow::ensure!(
+            actual == self.expected_output,
+            "Embedded output bytes changed"
+        );
+        output.validate_identity(identity)?;
+        Ok((
+            output_path,
+            crate::state::db::primary_layout::LayoutFingerprint {
+                size: actual.size,
+                sha256: actual.sha256,
+                identity,
+            },
+        ))
+    }
+
     pub(in crate::download) fn output_fingerprint(
         &self,
     ) -> crate::download::file::ExistingFileFingerprint {
@@ -171,10 +218,16 @@ impl PreparedMetadataFile {
             crate::download::file::ExistingFileFingerprint,
         ) -> anyhow::Result<()>,
     ) -> Result<crate::download::file::ExistingFileFingerprint> {
+        // Ordinary Windows replacement needs exclusive access to the prepared
+        // path. Recorded-layout preparation retains the handle separately
+        // until its verified copy has finished and never calls this method.
+        #[cfg(windows)]
+        drop(self.output_file);
         let Self {
             guard,
             expected_input,
             expected_output,
+            ..
         } = self;
         let temp_path = guard.path.clone();
         if let Err(error) = install(&temp_path, final_path, expected_input, expected_output) {
@@ -206,6 +259,40 @@ mod tests {
     use super::super::test_support::test_tmp_dir;
     use super::{TmpGuard, create_unique_embed_temp_with_sequence, embed_temp_path};
     use std::fs;
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_publication_releases_prepared_handle_before_install() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("prepared.tmp");
+        let output_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .unwrap();
+        let fingerprint = crate::download::file::ExistingFileFingerprint {
+            size: 0,
+            sha256: [0; 32],
+        };
+        let prepared = super::PreparedMetadataFile {
+            guard: TmpGuard::new(&temp),
+            expected_input: fingerprint,
+            expected_output: fingerprint,
+            output_file,
+        };
+        prepared
+            .publish_with(&dir.path().join("final.jpg"), |path, _, _, _| {
+                let _exclusive = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .share_mode(0)
+                    .open(path)?;
+                Ok(())
+            })
+            .unwrap();
+    }
 
     #[test]
     fn tmp_guard_cleans_up_on_drop() {

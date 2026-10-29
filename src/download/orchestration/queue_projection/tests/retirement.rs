@@ -6,8 +6,10 @@ use crate::icloud::photos::inbox::ShadowCapture;
 use crate::state::DownloadStateStore;
 use crate::state::MetadataRewriteStore;
 use crate::state::SqliteStateDb;
+#[cfg(target_os = "linux")]
+use crate::state::db::provider_generations::ActiveGeneration;
 use crate::state::db::provider_generations::{
-    ActiveDecision, ActiveGeneration, GenerationSpec, MAX_GENERATION_BYTES, ReuseAuthorization,
+    ActiveDecision, GenerationSpec, MAX_GENERATION_BYTES, ReuseAuthorization,
 };
 use crate::state::db::provider_selection::{SelectionDecision, SelectionDestination};
 use crate::state::db::provider_selection::{SelectionOutcome, SelectionPath};
@@ -561,19 +563,24 @@ async fn v027_compact_native_receipts_remain_reachable_beyond_sixty_four_copies(
             .begin_selection_generation(owner(), spec(), BUDGET)
             .await
             .unwrap();
-        let mut component = std::ffi::OsString::from(format!("copy-{copy}"));
-        #[cfg(unix)]
-        if copy >= 64 {
-            use std::os::unix::ffi::OsStringExt;
-            component = std::ffi::OsString::from_vec(vec![
-                b'c',
-                b'o',
-                b'p',
-                b'y',
-                b'-',
-                if copy == 64 { 0xfe } else { 0xff },
-            ]);
-        }
+        let component = {
+            #[cfg(unix)]
+            if copy >= 64 {
+                use std::os::unix::ffi::OsStringExt;
+                std::ffi::OsString::from_vec(vec![
+                    b'c',
+                    b'o',
+                    b'p',
+                    b'y',
+                    b'-',
+                    if copy == 64 { 0xfe } else { 0xff },
+                ])
+            } else {
+                std::ffi::OsString::from(format!("copy-{copy}"))
+            }
+            #[cfg(not(unix))]
+            std::ffi::OsString::from(format!("copy-{copy}"))
+        };
         let (_, tasks, _) = admission(
             &db,
             &root.id,
@@ -3360,6 +3367,7 @@ async fn native_and_utf8_lossy_collision_does_not_settle_or_protect_the_sibling(
     assert!(reopened.guard_primary_writer(&healthy_path).await.is_err());
 }
 
+#[cfg(target_os = "linux")]
 async fn db_healthy_root(db: &Arc<SqliteStateDb>) -> ActiveGeneration {
     db.begin_selection_generation(owner(), spec(), BUDGET)
         .await

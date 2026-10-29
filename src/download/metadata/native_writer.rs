@@ -165,11 +165,14 @@ pub(super) fn prepare_metadata_native(
         .with_context(|| format!("Could not preserve permissions on {}", tmp_path.display()))?;
     file.sync_all()
         .with_context(|| format!("Could not fsync {}", tmp_path.display()))?;
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     drop(file);
     Ok(PreparedMetadataFile {
         guard,
         expected_input: expected,
         expected_output: output_fingerprint,
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        output_file: file,
     })
 }
 

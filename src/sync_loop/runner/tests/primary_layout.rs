@@ -3025,6 +3025,7 @@ async fn review501_explicit_metadata_refresh_uses_preserving_layout_owner() {
     }
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 #[tokio::test]
 async fn interrupted_unprepared_embedded_refresh_remains_held() {
     let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, EDIT_TWO).await;
@@ -3112,6 +3113,489 @@ async fn interrupted_unprepared_embedded_refresh_remains_held() {
             .members
             .iter()
             .any(|m| m.stage.is_some() && m.prepared.is_none())
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[tokio::test]
+async fn interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync() {
+    let cases: &[(&str, &[u8], bool)] = &[
+        ("IMG_0501.JPG", VALID_ORIGINAL, false),
+        #[cfg(feature = "xmp")]
+        (
+            "IMG_0501.HEIC",
+            include_bytes!("../../../../tests/data/sample.heic"),
+            true,
+        ),
+    ];
+    for &(filename, original_bytes, is_heif) in cases {
+        let server = server_with_media(original_bytes, VALID_EDIT, EDIT_TWO).await;
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("media");
+        let mut current = records_with_original(&server, original_bytes, None);
+        current[0]["fields"]["filenameEnc"]["value"] = json!(filename);
+        if is_heif {
+            current[0]["fields"]["itemType"] = json!({"value":"public.heic"});
+            current[0]["fields"]["resOriginalFileType"] = json!({"value":"public.heic"});
+        }
+        current[1]["fields"]["isFavorite"] = json!({"value":1});
+        let (initial, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            CycleOptions::default(),
+        )
+        .await;
+        assert_eq!(initial.failed_count, 0, "{filename}: {:?}", initial.stats);
+        let original = media.join(filename);
+        assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
+        let sidecar = media.join(format!("{filename}.xmp"));
+        let old_sidecar = b"independent synthetic sidecar";
+        std::fs::write(&sidecar, old_sidecar).unwrap();
+        let provider = Session {
+            records: current.clone(),
+            quiet: true,
+            lookups: Arc::new(AtomicUsize::new(0)),
+            current: None,
+            lookup_change: None,
+            indexing: None,
+        };
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: make_full_album_with_boxed_session("PrimarySync", Box::new(provider)),
+            exclude_ids: Arc::default(),
+        };
+        let db = Arc::new(
+            state::SqliteStateDb::open(&root.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        let db_store: Arc<dyn download::DownloadStore> = db.clone();
+        let base = make_run_cycle_download_config_builder(&media, db_store);
+        let mut config = base(
+            download::SyncMode::Full,
+            Arc::default(),
+            Arc::default(),
+            Arc::from("PrimarySync"),
+        )
+        .as_ref()
+        .clone();
+        config.folder_structure = String::new();
+        config.folder_structure_albums = Arc::from("");
+        config.folder_structure_smart_folders = Arc::from("");
+        config.edited = true;
+        config.edited_naming = EditedNaming::Primary;
+        config.refresh_metadata = true;
+        config.metadata.set_exif_rating = true;
+        let operation = download::seed_unprepared_refresh(&config, &pass).await;
+        let stage = operation
+            .members
+            .iter()
+            .find_map(|member| member.stage.as_ref())
+            .unwrap()
+            .to_path();
+        assert!(!stage.exists());
+        drop(config);
+        drop(base);
+        drop(db);
+        let options = || CycleOptions {
+            embed_rating: true,
+            ..CycleOptions::default()
+        };
+        let (recovered, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            options(),
+        )
+        .await;
+        assert_eq!(
+            recovered.failed_count, 0,
+            "{filename}: {:?}",
+            recovered.stats
+        );
+        assert!(recovered.db_sync_token_advance_safe);
+        assert_eq!(recovered.stats.downloaded, 0);
+        assert_ne!(std::fs::read(&original).unwrap(), original_bytes);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), old_sidecar);
+        #[cfg(feature = "xmp")]
+        {
+            let meta: xmp_toolkit::XmpMeta = if is_heif {
+                let mut file = std::fs::File::open(&original).unwrap();
+                let len = file.metadata().unwrap().len();
+                let layout = download::heif::FileLayout::read(&mut file, len).unwrap();
+                std::str::from_utf8(&layout.xmp(&mut file).unwrap().unwrap())
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            } else {
+                let mut file = xmp_toolkit::XmpFile::new().unwrap();
+                file.open_file(
+                    &original,
+                    xmp_toolkit::OpenFileOptions::default().for_read(),
+                )
+                .unwrap();
+                file.xmp().unwrap()
+            };
+            assert_eq!(
+                meta.property_i32(xmp_toolkit::xmp_ns::XMP, "Rating")
+                    .unwrap()
+                    .value,
+                5
+            );
+        }
+        #[cfg(not(feature = "xmp"))]
+        {
+            use little_exif::exif_tag::ExifTag;
+            use little_exif::ifd::ExifTagGroup;
+            let metadata = little_exif::metadata::Metadata::new_from_path(&original).unwrap();
+            let rating = metadata
+                .get_tag(&ExifTag::UnknownINT16U(
+                    Vec::new(),
+                    0x4746,
+                    ExifTagGroup::GENERIC,
+                ))
+                .next();
+            assert!(
+                matches!(rating, Some(ExifTag::UnknownINT16U(values, _, _)) if values.first() == Some(&5))
+            );
+        }
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let manifest = db.get_manifest_assets().await.unwrap();
+        assert!(
+            manifest
+                .iter()
+                .flat_map(|asset| &asset.preserved_files)
+                .any(|item| std::fs::read(item.native_path.to_path())
+                    .is_ok_and(|bytes| bytes == original_bytes))
+        );
+        drop(db);
+        assert!(
+            std::fs::read_dir(stage.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".kei-embedded-attempt-"))
+        );
+        let output = std::fs::read(&original).unwrap();
+        let (quiet, lookups) = cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            options(),
+        )
+        .await;
+        assert_eq!(quiet.failed_count, 0);
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_eq!(lookups, 0);
+        assert_eq!(std::fs::read(&original).unwrap(), output);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), old_sidecar);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[tokio::test]
+#[ignore = "dedicated process-death fixture, spawned by its parent test"]
+async fn recorded_embedded_scratch_death_worker() {
+    let root = std::path::PathBuf::from(std::env::var_os("KEI_TEST_PROCESS_DEATH_ROOT").unwrap());
+    let uri = std::env::var("KEI_TEST_PROCESS_DEATH_URL").unwrap();
+    let mut current = records_at(&uri, None);
+    current[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(VALID_ORIGINAL.len());
+    current[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+        json!(provider_hash(VALID_ORIGINAL));
+    current[1]["fields"]["isFavorite"] = json!({"value":1});
+    cycle_options(
+        &root,
+        current,
+        true,
+        EditedNaming::Primary,
+        CycleOptions {
+            embed_rating: true,
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    panic!("embedded scratch death worker passed its rendezvous");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "dedicated private-temp retry fixture, spawned by its parent test"]
+async fn recorded_embedded_scratch_retry_worker() {
+    let root = std::path::PathBuf::from(std::env::var_os("KEI_TEST_PROCESS_DEATH_ROOT").unwrap());
+    let uri = std::env::var("KEI_TEST_PROCESS_DEATH_URL").unwrap();
+    let mut current = records_at(&uri, None);
+    current[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(VALID_ORIGINAL.len());
+    current[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+        json!(provider_hash(VALID_ORIGINAL));
+    current[1]["fields"]["isFavorite"] = json!({"value":1});
+    let (recovered, _) = cycle_options(
+        &root,
+        current,
+        true,
+        EditedNaming::Primary,
+        CycleOptions {
+            embed_rating: true,
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
+    assert!(recovered.db_sync_token_advance_safe);
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[tokio::test]
+async fn interrupted_embedded_scratch_reopens_without_adopting_or_removing_unknown_files() {
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+    struct Worker(std::process::Child);
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, EDIT_TWO).await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let mut current = records_with_original(&server, VALID_ORIGINAL, None);
+    current[1]["fields"]["isFavorite"] = json!({"value":1});
+    let (initial, _) = cycle_options(
+        root.path(),
+        current.clone(),
+        true,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0);
+    let original = media.join("IMG_0501.JPG");
+    assert_eq!(std::fs::read(&original).unwrap(), VALID_ORIGINAL);
+    let provider = Session {
+        records: current.clone(),
+        quiet: true,
+        lookups: Arc::new(AtomicUsize::new(0)),
+        current: None,
+        lookup_change: None,
+        indexing: None,
+    };
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: make_full_album_with_boxed_session("PrimarySync", Box::new(provider)),
+        exclude_ids: Arc::default(),
+    };
+    let db = Arc::new(
+        state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap(),
+    );
+    let db_store: Arc<dyn download::DownloadStore> = db.clone();
+    let base = make_run_cycle_download_config_builder(&media, db_store);
+    let mut config = base(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from("PrimarySync"),
+    )
+    .as_ref()
+    .clone();
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    config.edited_naming = EditedNaming::Primary;
+    config.refresh_metadata = true;
+    config.metadata.set_exif_rating = true;
+    let operation = download::seed_unprepared_refresh(&config, &pass).await;
+    let stage = operation
+        .members
+        .iter()
+        .find_map(|member| member.stage.as_ref())
+        .unwrap()
+        .to_path();
+    drop(config);
+    drop(base);
+    drop(db);
+    std::fs::write(
+        root.path().join("fixture-owner"),
+        b"kei-synthetic-process-death",
+    )
+    .unwrap();
+    let log = std::fs::File::create(root.path().join("worker.log")).unwrap();
+    #[cfg(target_os = "macos")]
+    let attempt_parent = {
+        use std::os::unix::fs::DirBuilderExt;
+        let path = root.path().join("private-temp");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        path
+    };
+    #[cfg(not(target_os = "macos"))]
+    let attempt_parent = stage.parent().unwrap().to_path_buf();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    #[cfg(target_os = "macos")]
+    command.env("TMPDIR", &attempt_parent);
+    let mut worker = Worker(
+        command
+            .args([
+                "--exact",
+                "sync_loop::runner::tests::primary_layout::recorded_embedded_scratch_death_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KEI_TEST_PROCESS_DEATH_ROOT", root.path())
+            .env("KEI_TEST_PROCESS_DEATH_POINT", "recorded-embed-scratch")
+            .env("KEI_TEST_PROCESS_DEATH_URL", server.uri())
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    while !root.path().join("ready").exists() {
+        assert!(
+            worker.0.try_wait().unwrap().is_none(),
+            "worker exited: {}",
+            std::fs::read_to_string(root.path().join("worker.log")).unwrap()
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "scratch death worker timed out"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let attempts: Vec<_> = std::fs::read_dir(&attempt_parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".kei-embedded-attempt-")
+        })
+        .collect();
+    assert_eq!(attempts.len(), 1);
+    let old_attempt = &attempts[0];
+    let old_input = old_attempt.join("IMG_0501.JPG");
+    assert_eq!(std::fs::read(&old_input).unwrap(), VALID_ORIGINAL);
+    std::fs::write(old_attempt.join("unknown-marker"), b"do not delete").unwrap();
+    worker.0.kill().unwrap();
+    let status = worker.0.wait().unwrap();
+    #[cfg(unix)]
+    assert_eq!(status.signal(), Some(9));
+    #[cfg(windows)]
+    assert!(!status.success());
+    assert!(!stage.exists());
+    assert_eq!(std::fs::read(&original).unwrap(), VALID_ORIGINAL);
+    let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+        .await
+        .unwrap();
+    let pending = db
+        .primary_layout_operations("PrimarySync".into())
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(
+        pending[0]
+            .members
+            .iter()
+            .any(|member| member.stage.is_some() && member.prepared.is_none())
+    );
+    drop(db);
+    let options = || CycleOptions {
+        embed_rating: true,
+        ..CycleOptions::default()
+    };
+    #[cfg(not(target_os = "macos"))]
+    {
+        let (recovered, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            options(),
+        )
+        .await;
+        assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
+        assert!(recovered.db_sync_token_advance_safe);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let log_path = root.path().join("retry-worker.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut retry = Worker(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "sync_loop::runner::tests::primary_layout::recorded_embedded_scratch_retry_worker", "--ignored", "--nocapture"])
+            .env("KEI_TEST_PROCESS_DEATH_ROOT", root.path())
+            .env("KEI_TEST_PROCESS_DEATH_URL", server.uri())
+            .env("TMPDIR", &attempt_parent)
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+        loop {
+            if let Some(status) = retry.0.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "retry worker exited: {}",
+                    std::fs::read_to_string(&log_path).unwrap()
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "retry worker timed out"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    assert_eq!(std::fs::read(&old_input).unwrap(), VALID_ORIGINAL);
+    assert_eq!(
+        std::fs::read(old_attempt.join("unknown-marker")).unwrap(),
+        b"do not delete"
+    );
+    let remaining: Vec<_> = std::fs::read_dir(&attempt_parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".kei-embedded-attempt-")
+        })
+        .collect();
+    assert_eq!(
+        remaining,
+        vec![old_attempt.clone()],
+        "successful retry must clean only its own attempt"
+    );
+    let output = std::fs::read(&original).unwrap();
+    assert_ne!(output, VALID_ORIGINAL);
+    let (quiet, lookups) =
+        cycle_options(root.path(), current, true, EditedNaming::Primary, options()).await;
+    assert_eq!(quiet.failed_count, 0);
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(lookups, 0);
+    assert_eq!(std::fs::read(&original).unwrap(), output);
+    assert_eq!(
+        std::fs::read(old_attempt.join("unknown-marker")).unwrap(),
+        b"do not delete"
     );
 }
 
@@ -3251,6 +3735,9 @@ async fn interrupted_unprepared_refresh_rejects_drift_and_occupied_paths() {
         "occupied_stage",
         "occupied_sidecar",
         "changed_after_preparation",
+        "embedded_changed_after_preparation",
+        "embedded_occupied_stage",
+        "embedded_occupied_sidecar",
     ] {
         let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, EDIT_TWO).await;
         let root = tempfile::tempdir().unwrap();
@@ -3309,6 +3796,7 @@ async fn interrupted_unprepared_refresh_rejects_drift_and_occupied_paths() {
         config.edited_naming = EditedNaming::Primary;
         config.refresh_metadata = true;
         config.metadata.xmp_sidecar = true;
+        config.metadata.set_exif_rating = scenario.starts_with("embedded_");
         let op = download::seed_unprepared_refresh(&config, &pass).await;
         let stage = op
             .members
@@ -3323,9 +3811,9 @@ async fn interrupted_unprepared_refresh_rejects_drift_and_occupied_paths() {
             let conn = db.acquire_lock("mark source read-only").unwrap();
             assert!(conn.execute("UPDATE asset_metadata_paths SET preserved_path_key='foreign-marker' WHERE local_path=?1", [original.to_str().unwrap()]).unwrap() > 0);
         }
-        if scenario == "occupied_stage" || scenario == "occupied_sidecar" {
+        if scenario.ends_with("occupied_stage") || scenario.ends_with("occupied_sidecar") {
             std::fs::create_dir_all(stage.parent().unwrap()).unwrap();
-            let path = if scenario == "occupied_stage" {
+            let path = if scenario.ends_with("occupied_stage") {
                 &stage
             } else {
                 &stage_sidecar
@@ -3344,7 +3832,12 @@ async fn interrupted_unprepared_refresh_rejects_drift_and_occupied_paths() {
             json!(provider_hash(EDIT_TWO));
         let options = CycleOptions {
             sidecar: scenario != "option_drift",
-            lookup_change: (scenario == "changed_after_preparation").then_some((2, later)),
+            lookup_change: matches!(
+                scenario,
+                "changed_after_preparation" | "embedded_changed_after_preparation"
+            )
+            .then_some((2, later)),
+            embed_rating: scenario.starts_with("embedded_"),
             ..CycleOptions::default()
         };
         let result = try_cycle_options(
@@ -3378,12 +3871,28 @@ async fn interrupted_unprepared_refresh_rejects_drift_and_occupied_paths() {
                 .any(|m| m.stage.is_some() && m.prepared.is_none()),
             "{scenario}"
         );
+        if scenario.starts_with("embedded_occupied_") {
+            assert!(
+                std::fs::read_dir(stage.parent().unwrap())
+                    .unwrap()
+                    .all(|entry| {
+                        !entry
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".kei-embedded-attempt-")
+                    }),
+                "{scenario}: collision created scratch"
+            );
+        }
         match scenario {
-            "occupied_stage" => assert_eq!(std::fs::read(&stage).unwrap(), b"foreign entry"),
-            "occupied_sidecar" => {
+            "occupied_stage" | "embedded_occupied_stage" => {
+                assert_eq!(std::fs::read(&stage).unwrap(), b"foreign entry")
+            }
+            "occupied_sidecar" | "embedded_occupied_sidecar" => {
                 assert_eq!(std::fs::read(&stage_sidecar).unwrap(), b"foreign entry")
             }
-            "changed_after_preparation" => {
+            "changed_after_preparation" | "embedded_changed_after_preparation" => {
                 let media_stage = std::fs::read(&stage).unwrap();
                 let sidecar_stage = std::fs::read(&stage_sidecar).unwrap();
                 drop(db);
@@ -3394,6 +3903,7 @@ async fn interrupted_unprepared_refresh_rejects_drift_and_occupied_paths() {
                     EditedNaming::Primary,
                     CycleOptions {
                         sidecar: true,
+                        embed_rating: scenario.starts_with("embedded_"),
                         ..CycleOptions::default()
                     },
                 )

@@ -238,11 +238,10 @@ mod tests {
         report.attempts[0].explanation.candidates[0].reason = "x".repeat(131_073);
         let bounded = MatchDiagnostics::decode(&report.encode().unwrap()).unwrap();
         assert!(bounded.omitted > report.omitted);
-        report = bounded;
-
         assert!(MatchDiagnostics::decode("existing_match_v1:{broken").is_none());
         #[cfg(unix)]
         {
+            let mut report = bounded;
             use std::os::unix::ffi::OsStringExt;
             let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
                 b"/archive/nonutf8-\xff.JPG".to_vec(),

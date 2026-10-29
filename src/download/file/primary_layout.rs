@@ -110,6 +110,59 @@ pub(in crate::download) async fn copy_verified_create_only(
     Ok(result)
 }
 
+/// Create a copy across separately confined roots without widening either root.
+pub(in crate::download) async fn copy_verified_between_roots(
+    source_root: &Path,
+    source: &Path,
+    destination_root: &Path,
+    destination: &Path,
+    expected: &LayoutFingerprint,
+) -> Result<LayoutFingerprint> {
+    let source_root = crate::fs_util::absolute_confined_path(source_root)?;
+    let source = crate::fs_util::absolute_confined_path(source)?;
+    anyhow::ensure!(
+        source.starts_with(&source_root),
+        "Copy source is outside its declared root"
+    );
+    let destination = ConfinedPath::open(destination_root, destination, ConfinedParents::Create)?;
+    copy_verified_to_confined(&source_root, &source, destination, expected).await
+}
+
+/// Copy to a destination whose parent was retained before preparation.
+pub(in crate::download) async fn copy_verified_to_confined(
+    source_root: &Path,
+    source: &Path,
+    destination: ConfinedPath,
+    expected: &LayoutFingerprint,
+) -> Result<LayoutFingerprint> {
+    anyhow::ensure!(
+        snapshot(source_root, source).await?.as_ref() == Some(expected),
+        "Primary source changed before preparation"
+    );
+    let copy = super::reconciliation::copy_local_file_create_only_confined(
+        source_root,
+        source,
+        destination,
+    )
+    .await?;
+    let identity = copy.destination_identity()?;
+    copy.validate().await?;
+    let result = tokio::task::spawn_blocking({
+        let copy = copy.clone();
+        move || snapshot_confined(&copy.destination)
+    })
+    .await??
+    .context("Missing primary stage")?;
+    anyhow::ensure!(
+        result.identity == identity
+            && bytes_match(expected, &result)
+            && identity != expected.identity,
+        "Primary stage copy changed or is not independent"
+    );
+    copy.validate().await?;
+    Ok(result)
+}
+
 /// Only the layout owner can construct this authorization, after a durable
 /// preservation receipt. It is distinct from truncated-repair authorization.
 #[derive(Debug)]

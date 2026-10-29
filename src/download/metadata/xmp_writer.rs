@@ -10,6 +10,17 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use xmp_toolkit::{OpenFileOptions, XmpFile, XmpMeta};
 
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static PRIVATE_STAGE_IDENTITIES: std::cell::RefCell<Vec<crate::fs_util::FileIdentity>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn observe_private_stage(file: &std::fs::File) {
+    let identity = crate::fs_util::file_identity(file).expect("synthetic temporary identity");
+    PRIVATE_STAGE_IDENTITIES.with(|identities| identities.borrow_mut().push(identity));
+}
+
 pub(super) fn prepare_metadata_xmp_toolkit(
     path: &Path,
     write: &MetadataWrite,
@@ -35,6 +46,8 @@ pub(super) fn prepare_metadata_xmp_toolkit(
         );
     }
     let (file, tmp_path) = create_unique_embed_temp(path, temp_suffix)?;
+    #[cfg(all(test, target_os = "linux"))]
+    observe_private_stage(&file);
     let cleanup_permissions = file
         .metadata()
         .with_context(|| format!("Could not inspect permissions of {}", tmp_path.display()))?
@@ -60,6 +73,8 @@ pub(super) fn prepare_metadata_xmp_toolkit(
         );
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    observe_private_stage(&std::fs::File::open(&tmp_path)?);
     validate_movie_metadata_layout(&tmp_path)?;
     let result: Result<()> = (|| {
         let mut file = XmpFile::new().context("Could not create XMP handle")?;
@@ -98,9 +113,12 @@ pub(super) fn prepare_metadata_xmp_toolkit(
                 tmp_path.display()
             )
         })?;
+    #[cfg(all(test, target_os = "linux"))]
+    observe_private_stage(&temp);
     keep_source_mtime(&temp, path);
     temp.sync_all()
         .with_context(|| format!("Could not fsync {}", tmp_path.display()))?;
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     drop(temp);
     let output = crate::download::file::fingerprint_regular_file_snapshot_blocking(&tmp_path)
         .with_context(|| format!("Could not fingerprint {}", tmp_path.display()))?
@@ -109,6 +127,8 @@ pub(super) fn prepare_metadata_xmp_toolkit(
         guard,
         expected_input: expected,
         expected_output: output,
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        output_file: temp,
     })
 }
 
@@ -233,6 +253,394 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use xmp_toolkit::xmp_ns;
+
+    /// Synthetic Linux experiment only: an exclusive private directory and a
+    /// retained directory descriptor anchor XMP Toolkit's pathname even when
+    /// its original parent entry is replaced with a symlink. The observations
+    /// measure the toolkit's real temporary inode before and after close.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn prototype_private_staging_observes_toolkit_output_identity() {
+        use crate::download::file::primary_layout::{copy_verified_create_only, snapshot};
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+
+        for (name, input) in [
+            (
+                "image.jpg",
+                include_bytes!("../../../tests/data/media/metadata.jpg").as_slice(),
+            ),
+            (
+                "video.mov",
+                include_bytes!("../../../tests/data/media/apple-live.mov").as_slice(),
+            ),
+        ] {
+            for swap_parent in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let archive = root.path().join(name);
+                fs::write(&archive, input).unwrap();
+                let private = root
+                    .path()
+                    .join(format!("kei-private-{}", uuid::Uuid::new_v4()));
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&private)
+                    .unwrap();
+                assert_eq!(
+                    fs::metadata(private.as_path())
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
+                );
+                let directory = std::fs::File::open(private.as_path()).unwrap();
+                let anchored =
+                    std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+                        .join(name);
+                let mut scratch = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&anchored)
+                    .unwrap();
+                scratch.write_all(input).unwrap();
+                scratch.sync_all().unwrap();
+                drop(scratch);
+                let before =
+                    crate::download::file::fingerprint_regular_file_snapshot_blocking(&anchored)
+                        .unwrap()
+                        .fingerprint;
+                let foreign_dir = root.path().join("foreign");
+                let displaced_dir = root.path().join("displaced");
+                if swap_parent {
+                    fs::create_dir(&foreign_dir).unwrap();
+                    fs::write(foreign_dir.join(name), b"foreign data").unwrap();
+                    fs::rename(private.as_path(), &displaced_dir).unwrap();
+                    symlink(&foreign_dir, private.as_path()).unwrap();
+                }
+                super::PRIVATE_STAGE_IDENTITIES.with(|values| values.borrow_mut().clear());
+                let prepared = prepare_metadata_xmp_toolkit(
+                    &anchored,
+                    &MetadataWrite {
+                        rating: Some(3),
+                        ..MetadataWrite::default()
+                    },
+                    ".meta-tmp",
+                    Some(before),
+                )
+                .unwrap();
+                let identities =
+                    super::PRIVATE_STAGE_IDENTITIES.with(|values| values.borrow().clone());
+                assert_eq!(identities.len(), 3);
+                assert_eq!(
+                    identities[0], identities[1],
+                    "copy replaced the exclusive temporary"
+                );
+                let output_fingerprint = prepared.output_fingerprint();
+                let publication = prepared.publish(&anchored);
+                if std::env::var_os("KEI_TEST_TERMINAL_ROOT").is_some() {
+                    let error = publication.expect_err(
+                        "forced fallback unexpectedly accepted the descriptor pathname",
+                    );
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("Could not install metadata update")
+                    );
+                    assert_eq!(fs::read(&anchored).unwrap(), input);
+                    assert_eq!(fs::read(&archive).unwrap(), input);
+                    if swap_parent {
+                        assert_eq!(fs::read(foreign_dir.join(name)).unwrap(), b"foreign data");
+                        fs::remove_file(private.as_path()).unwrap();
+                        fs::rename(&displaced_dir, private.as_path()).unwrap();
+                    }
+                    continue;
+                }
+                publication.unwrap();
+                let output = std::fs::File::open(&anchored).unwrap();
+                assert_eq!(
+                    crate::fs_util::file_identity(&output).unwrap(),
+                    identities[2]
+                );
+                assert_eq!(
+                    crate::download::file::fingerprint_regular_file_snapshot_blocking(&anchored)
+                        .unwrap()
+                        .fingerprint,
+                    output_fingerprint
+                );
+                assert_eq!(
+                    read_meta(&anchored)
+                        .property_i32(xmp_ns::XMP, "Rating")
+                        .unwrap()
+                        .value,
+                    3
+                );
+                assert_eq!(fs::read(&archive).unwrap(), input);
+                assert_eq!(identities[0] == identities[2], name == "video.mov");
+                if swap_parent {
+                    assert_eq!(fs::read(foreign_dir.join(name)).unwrap(), b"foreign data");
+                    let target = root.path().join("published");
+                    let witness = crate::state::db::primary_layout::LayoutFingerprint {
+                        size: output_fingerprint.size,
+                        sha256: output_fingerprint.sha256,
+                        identity: identities[2],
+                    };
+                    assert!(
+                        copy_verified_create_only(
+                            root.path(),
+                            &private.as_path().join(name),
+                            &target,
+                            &witness
+                        )
+                        .await
+                        .is_err()
+                    );
+                    assert!(!target.exists());
+                    assert_eq!(fs::read(foreign_dir.join(name)).unwrap(), b"foreign data");
+                    fs::remove_file(private.as_path()).unwrap();
+                    fs::rename(&displaced_dir, private.as_path()).unwrap();
+                } else {
+                    let witness = snapshot(root.path(), &private.as_path().join(name))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(witness.identity, identities[2]);
+                    let target = root.path().join("published");
+                    let staged = copy_verified_create_only(
+                        root.path(),
+                        &private.as_path().join(name),
+                        &target,
+                        &witness,
+                    )
+                    .await
+                    .unwrap();
+                    assert_ne!(staged.identity, witness.identity);
+                    assert_eq!(fs::read(&target).unwrap(), fs::read(&anchored).unwrap());
+                }
+            }
+        }
+    }
+
+    /// The writer's prepared output can be copied into the immutable stage
+    /// directly, avoiding replacement of the private input and its journal
+    /// fallback. This is a Linux-only synthetic feasibility experiment.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn prototype_private_prepared_output_publishes_create_only() {
+        use crate::download::file::primary_layout::{copy_verified_create_only, snapshot};
+        use crate::state::db::primary_layout::LayoutFingerprint;
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+
+        for (name, input) in [
+            (
+                "image.jpg",
+                include_bytes!("../../../tests/data/media/metadata.jpg").as_slice(),
+            ),
+            (
+                "video.mov",
+                include_bytes!("../../../tests/data/media/apple-live.mov").as_slice(),
+            ),
+        ] {
+            for swap_parent in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let archive = root.path().join(name);
+                fs::write(&archive, input).unwrap();
+                let private = root
+                    .path()
+                    .join(format!("kei-private-{}", uuid::Uuid::new_v4()));
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&private)
+                    .unwrap();
+                assert_eq!(
+                    fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+                let directory = std::fs::File::open(&private).unwrap();
+                let anchored =
+                    std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+                        .join(name);
+                let mut scratch = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&anchored)
+                    .unwrap();
+                scratch.write_all(input).unwrap();
+                scratch.sync_all().unwrap();
+                drop(scratch);
+                let before =
+                    crate::download::file::fingerprint_regular_file_snapshot_blocking(&anchored)
+                        .unwrap()
+                        .fingerprint;
+                let foreign = root.path().join("foreign");
+                let displaced = root.path().join("displaced");
+                if swap_parent {
+                    fs::create_dir(&foreign).unwrap();
+                    fs::write(foreign.join(name), b"foreign data").unwrap();
+                    fs::rename(&private, &displaced).unwrap();
+                    symlink(&foreign, &private).unwrap();
+                }
+                super::PRIVATE_STAGE_IDENTITIES.with(|values| values.borrow_mut().clear());
+                let prepared = super::super::embedded::prepare_metadata_with_expected_fingerprint(
+                    &anchored,
+                    &MetadataWrite {
+                        rating: Some(3),
+                        ..MetadataWrite::default()
+                    },
+                    ".meta-tmp",
+                    Some(before),
+                )
+                .unwrap();
+                let identities =
+                    super::PRIVATE_STAGE_IDENTITIES.with(|values| values.borrow().clone());
+                assert_eq!(identities.len(), 3);
+                assert_eq!(identities[0], identities[1]);
+                let output = prepared.output_fingerprint();
+                let witness = LayoutFingerprint {
+                    size: output.size,
+                    sha256: output.sha256,
+                    identity: identities[2],
+                };
+                let temp_name = prepared.prototype_temporary_path().file_name().unwrap();
+                let source = private.join(temp_name);
+                let stage = root.path().join(format!("published-{name}"));
+                if swap_parent {
+                    assert!(
+                        copy_verified_create_only(root.path(), &source, &stage, &witness)
+                            .await
+                            .is_err()
+                    );
+                    assert!(!stage.exists());
+                    assert_eq!(fs::read(foreign.join(name)).unwrap(), b"foreign data");
+                } else {
+                    assert_eq!(
+                        snapshot(root.path(), &source).await.unwrap().unwrap(),
+                        witness
+                    );
+                    let installed =
+                        copy_verified_create_only(root.path(), &source, &stage, &witness)
+                            .await
+                            .unwrap();
+                    assert_ne!(installed.identity, witness.identity);
+                    assert_eq!(
+                        read_meta(&stage)
+                            .property_i32(xmp_ns::XMP, "Rating")
+                            .unwrap()
+                            .value,
+                        3
+                    );
+                    let bytes = fs::read(&stage).unwrap();
+                    assert!(
+                        copy_verified_create_only(root.path(), &source, &stage, &witness)
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!(fs::read(&stage).unwrap(), bytes);
+                }
+                assert_eq!(fs::read(&archive).unwrap(), input);
+                assert_eq!(fs::read(&anchored).unwrap(), input);
+                assert_eq!(identities[0] != identities[2], name == "image.jpg");
+                drop(prepared);
+                if swap_parent {
+                    fs::remove_file(&private).unwrap();
+                    fs::rename(&displaced, &private).unwrap();
+                }
+            }
+        }
+    }
+
+    /// Spawned only by the synthetic concurrent-stage test below.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn prototype_stage_race_worker() {
+        use crate::download::file::primary_layout::{copy_verified_create_only, snapshot};
+        let Some(root) = std::env::var_os("KEI_PROTOTYPE_RACE_ROOT") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let id = std::env::var("KEI_PROTOTYPE_RACE_ID").unwrap();
+        let source = root.join(format!("private-{id}/source.jpg"));
+        let stage = root.join("stage.jpg");
+        let witness = snapshot(&root, &source).await.unwrap().unwrap();
+        fs::write(root.join(format!("ready-{id}")), b"ready").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !root.join("go").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "synthetic race start timed out"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        match copy_verified_create_only(&root, &source, &stage, &witness).await {
+            Ok(_) => fs::write(root.join(format!("result-{id}")), b"created").unwrap(),
+            Err(_) => fs::write(root.join(format!("result-{id}")), b"refused").unwrap(),
+        }
+    }
+
+    /// Both children enter the existing creation-only stage owner concurrently.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn prototype_private_independent_processes_compete_for_stage() {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"same synthetic prepared output";
+        let mut children = Vec::new();
+        for id in ["one", "two"] {
+            let private = root.path().join(format!("private-{id}"));
+            fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
+            fs::write(private.join("source.jpg"), bytes).unwrap();
+            children.push(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "download::metadata::xmp_writer::tests::prototype_stage_race_worker",
+                        "--nocapture",
+                    ])
+                    .env("KEI_PROTOTYPE_RACE_ROOT", root.path())
+                    .env("KEI_PROTOTYPE_RACE_ID", id)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !root.path().join("ready-one").exists() || !root.path().join("ready-two").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "synthetic race workers did not become ready"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        fs::write(root.path().join("go"), b"go").unwrap();
+        let mut created = 0;
+        let mut refused = 0;
+        for (id, child) in ["one", "two"].into_iter().zip(children) {
+            let output = tokio::task::spawn_blocking(move || child.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result = fs::read(root.path().join(format!("result-{id}"))).unwrap();
+            created += usize::from(result == b"created");
+            refused += usize::from(result == b"refused");
+        }
+        assert_eq!((created, refused), (1, 1));
+        assert_eq!(fs::read(root.path().join("stage.jpg")).unwrap(), bytes);
+        for id in ["one", "two"] {
+            assert_eq!(
+                fs::read(root.path().join(format!("private-{id}/source.jpg"))).unwrap(),
+                bytes
+            );
+        }
+    }
 
     #[test]
     fn quicktime_rewrite_rejects_bare_track_metadata_before_damage() {
