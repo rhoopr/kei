@@ -201,10 +201,13 @@ struct CycleOptions {
     refresh_metadata: bool,
     embed_rating: bool,
     media_directory: &'static str,
+    state_file: &'static str,
     folder_structure: &'static str,
     pass_kind: PassKind,
     resolution: crate::types::PhotoResolution,
     private: bool,
+    disable_capture: bool,
+    other_capture_db: bool,
     #[cfg(feature = "xmp")]
     sidecar: bool,
     controls: download::DownloadControls,
@@ -220,10 +223,13 @@ impl Default for CycleOptions {
             refresh_metadata: false,
             embed_rating: false,
             media_directory: "media",
+            state_file: "state.db",
             folder_structure: "",
             pass_kind: PassKind::Unfiled,
             resolution: crate::types::PhotoResolution::Original,
             private: false,
+            disable_capture: false,
+            other_capture_db: false,
             #[cfg(feature = "xmp")]
             sidecar: false,
             controls: download::DownloadControls::download_hidden(),
@@ -270,11 +276,11 @@ async fn try_cycle_options(
     )
     .unwrap();
     let inner = Arc::new(if options.private {
-        state::SqliteStateDb::open_owned(&root.join("state.db"), &owner)
+        state::SqliteStateDb::open_owned(&root.join(options.state_file), &owner)
             .await
             .unwrap()
     } else {
-        state::SqliteStateDb::open(&root.join("state.db"))
+        state::SqliteStateDb::open(&root.join(options.state_file))
             .await
             .unwrap()
     });
@@ -299,9 +305,18 @@ async fn try_cycle_options(
             },
             Box::new(provider.clone()),
         );
-        if options.private {
+        if options.private && !options.disable_capture {
+            let capture_db = if options.other_capture_db {
+                Arc::new(
+                    state::SqliteStateDb::open_owned(&root.join("other-account.db"), &owner)
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                inner.clone()
+            };
             album.set_shadow_capture(
-                crate::icloud::photos::inbox::ShadowCapture::new(inner.clone(), owner, "com"),
+                crate::icloud::photos::inbox::ShadowCapture::new(capture_db, owner, "com"),
                 Arc::from("private"),
             );
         }
@@ -423,6 +438,887 @@ async fn server() -> MockServer {
     }
     server
 }
+/// Recreate the saved released writer's prepared edit transition using the
+/// current planner, then restore the earlier synthetic catalogue observation.
+async fn portable_prepolicy_fixture(
+    root: &std::path::Path,
+    server: &MockServer,
+    publishing: bool,
+) -> String {
+    let unedited = records(server, None);
+    let (initial, _) = cycle_options(
+        root,
+        unedited,
+        false,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0, "{initial:?}");
+    let media = root.join("media");
+    assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    state::db::account::adopt_legacy(
+        &root.join("state.db"),
+        &root.join("adopted.db"),
+        &owner,
+        "synthetic@example.invalid",
+        "com",
+    )
+    .await
+    .unwrap();
+    {
+        let conn = rusqlite::Connection::open(root.join("adopted.db")).unwrap();
+        // The released source schema had no preserved_path_key column. Model
+        // its migration as NULL in this test-only copy; do not alter live rows.
+        conn.execute_batch("CREATE TABLE synthetic_prepolicy_assets AS SELECT * FROM assets WHERE library='PrimarySync' AND id='asset-501'; CREATE TABLE synthetic_prepolicy_paths AS SELECT * FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501'; UPDATE synthetic_prepolicy_paths SET preserved_path_key=NULL;").unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM synthetic_prepolicy_assets",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&root.join("adopted.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    let source = records(server, Some(("edit-one", EDIT_ONE)));
+    let provider = Session {
+        records: source,
+        quiet: true,
+        lookups: Arc::new(AtomicUsize::new(0)),
+        current: None,
+        lookup_change: None,
+        indexing: None,
+    };
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::default(),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from("TestAlbum"),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(provider),
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner, "com"),
+        Arc::from("private"),
+    );
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::default(),
+    };
+    let store: Arc<dyn download::DownloadStore> = db.clone();
+    let build = make_run_cycle_download_config_builder(&media, store);
+    let mut config = build(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from("PrimarySync"),
+    )
+    .as_ref()
+    .clone();
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    config.edited_naming = EditedNaming::Primary;
+    let mut op = download::seed_prepared_edited_compat(&config, &pass).await;
+    if publishing {
+        download::seed_partly_published_compat(&config, &mut op).await;
+    }
+    assert_eq!(op.phase, if publishing { "publishing" } else { "prepared" });
+    assert!(
+        op.members
+            .iter()
+            .filter(|member| member.prepared.is_some())
+            .count()
+            >= 2
+    );
+    drop(config);
+    drop(build);
+    drop(pass);
+    drop(db);
+    {
+        let conn = rusqlite::Connection::open(root.join("adopted.db")).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE; DELETE FROM assets WHERE library='PrimarySync' AND id='asset-501'; INSERT INTO assets SELECT * FROM synthetic_prepolicy_assets; DELETE FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501'; INSERT INTO asset_metadata_paths SELECT * FROM synthetic_prepolicy_paths; DROP TABLE synthetic_prepolicy_assets; DROP TABLE synthetic_prepolicy_paths; COMMIT;").unwrap();
+    }
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let db = state::SqliteStateDb::open_owned(&root.join("adopted.db"), &owner)
+        .await
+        .unwrap();
+    // The released fixture completed its baseline at query-token before the
+    // interrupted edit. Preserve that recorded cursor in the synthetic copy.
+    if db
+        .get_metadata("sync_token:PrimarySync")
+        .await
+        .unwrap()
+        .is_none()
+    {
+        db.set_metadata("sync_token:PrimarySync", "query-token")
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("query-token")
+    );
+    let pending = db
+        .primary_layout_operations("PrimarySync".into())
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    let op = &pending[0];
+    assert_eq!(op.phase, if publishing { "publishing" } else { "prepared" });
+    if publishing {
+        assert!(op.members.iter().any(|member| {
+            member.installed.is_some()
+                && member
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|file| !file.path.to_path().exists())
+        }));
+    }
+    let original = op
+        .members
+        .iter()
+        .find(|member| {
+            member
+                .record
+                .as_ref()
+                .is_some_and(|record| record.version_size == state::VersionSizeKey::Original)
+        })
+        .unwrap();
+    let adjusted = op
+        .members
+        .iter()
+        .find(|member| {
+            member
+                .record
+                .as_ref()
+                .is_some_and(|record| record.version_size == state::VersionSizeKey::Adjusted)
+        })
+        .unwrap();
+    assert_eq!(
+        original.record.as_ref().unwrap().filename.as_ref(),
+        "IMG_0501_original.JPG"
+    );
+    assert_eq!(
+        adjusted.record.as_ref().unwrap().filename.as_ref(),
+        "IMG_0501.JPG"
+    );
+    assert!(adjusted.old.is_some() && original.prepared.is_some() && adjusted.prepared.is_some());
+    if publishing {
+        let installed = original
+            .installed
+            .as_ref()
+            .expect("original archive installed");
+        assert_eq!(original.destination.as_ref(), Some(&installed.path));
+        assert!(!original.prepared.as_ref().unwrap().path.to_path().exists());
+        assert_bytes(&installed.path.to_path(), ORIGINAL);
+        assert!(adjusted.installed.is_none());
+        assert_bytes(
+            &adjusted.prepared.as_ref().unwrap().path.to_path(),
+            EDIT_ONE,
+        );
+    }
+    {
+        let conn = rusqlite::Connection::open(root.join("adopted.db")).unwrap();
+        let row: (String, String, String, String) = conn.query_row("SELECT filename,checksum,local_path,local_checksum FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='original'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        let checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL));
+        assert_eq!(
+            row,
+            (
+                "IMG_0501.JPG".into(),
+                provider_hash(ORIGINAL),
+                root.join("media/IMG_0501.JPG").to_str().unwrap().into(),
+                checksum.clone()
+            )
+        );
+        let receipt: (String, String) = conn.query_row("SELECT provider_checksum,local_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?1", [root.join("media/IMG_0501.JPG").to_str().unwrap()], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(receipt, (provider_hash(ORIGINAL), checksum));
+    }
+    let error = db
+        .save_primary_layout(op.clone())
+        .await
+        .expect_err("released-shaped observation must hit the strict fence");
+    assert!(
+        error
+            .to_string()
+            .contains("recorded layout differs from current provider observation"),
+        "{error}"
+    );
+    op.operation.clone()
+}
+
+async fn assert_portable_prepolicy_completed(root: &std::path::Path, operation: &str) {
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let db = state::SqliteStateDb::open_owned(&root.join("adopted.db"), &owner)
+        .await
+        .unwrap();
+    assert!(
+        db.primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("cycle-token")
+    );
+    drop(db);
+    let conn = rusqlite::Connection::open(root.join("adopted.db")).unwrap();
+    let phase: String = conn
+        .query_row(
+            "SELECT phase FROM primary_layout_operations WHERE operation=?1",
+            [operation],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(phase, "committed");
+    let receipts: Vec<(Vec<u8>, String)> = conn
+        .prepare(
+            "SELECT native_path,media_checksum FROM primary_layout_preserved WHERE operation=?1",
+        )
+        .unwrap()
+        .query_map([operation], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let original_checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL));
+    assert!(receipts.iter().any(|(receipt, checksum)| {
+        let path = serde_json::from_slice::<state::db::provider_selection::SelectionPath>(receipt)
+            .unwrap()
+            .to_path();
+        checksum == &original_checksum && std::fs::read(path).is_ok_and(|bytes| bytes == ORIGINAL)
+    }));
+    assert_bytes(&root.join("media/IMG_0501.JPG"), EDIT_ONE);
+    assert_bytes(&root.join("media/IMG_0501_original.JPG"), ORIGINAL);
+}
+
+#[tokio::test]
+async fn portable_prepolicy_reconfirmation_preserves_edit_and_quiet_reopen() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let operation = portable_prepolicy_fixture(root.path(), &server, false).await;
+    {
+        let conn = rusqlite::Connection::open(root.path().join("adopted.db")).unwrap();
+        let markers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_metadata_paths WHERE preserved_path_key IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let legacy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM unattributed_legacy_paths",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (markers, legacy),
+            (0, 0),
+            "synthetic fixture must not invent read-only ownership"
+        );
+    }
+    let edited = records(&server, Some(("edit-one", EDIT_ONE)));
+    let options = || CycleOptions {
+        private: true,
+        state_file: "adopted.db",
+        ..CycleOptions::default()
+    };
+    let (result, lookups) = try_cycle_options(
+        root.path(),
+        edited.clone(),
+        true,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.failed_count, 0, "{result:?}");
+    assert!(lookups >= 2);
+    assert_bytes(&root.path().join("media/IMG_0501.JPG"), EDIT_ONE);
+    assert_bytes(&root.path().join("media/IMG_0501_original.JPG"), ORIGINAL);
+    let (quiet, lookups) =
+        try_cycle_options(root.path(), edited, true, EditedNaming::Primary, options())
+            .await
+            .unwrap();
+    assert_eq!(quiet.failed_count, 0, "{quiet:?}");
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(lookups, 0);
+    assert_bytes(&root.path().join("media/IMG_0501.JPG"), EDIT_ONE);
+    assert_bytes(&root.path().join("media/IMG_0501_original.JPG"), ORIGINAL);
+    assert_portable_prepolicy_completed(root.path(), &operation).await;
+}
+
+#[tokio::test]
+async fn portable_prepolicy_reconfirmation_reopens_consumed_publishing_stage() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let operation = portable_prepolicy_fixture(root.path(), &server, true).await;
+    let edited = records(&server, Some(("edit-one", EDIT_ONE)));
+    let options = || CycleOptions {
+        private: true,
+        state_file: "adopted.db",
+        ..CycleOptions::default()
+    };
+    let (result, lookups) = try_cycle_options(
+        root.path(),
+        edited.clone(),
+        true,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.failed_count, 0, "{result:?}");
+    assert!(lookups >= 2);
+    assert_bytes(&root.path().join("media/IMG_0501.JPG"), EDIT_ONE);
+    assert_bytes(&root.path().join("media/IMG_0501_original.JPG"), ORIGINAL);
+    let (quiet, lookups) =
+        try_cycle_options(root.path(), edited, true, EditedNaming::Primary, options())
+            .await
+            .unwrap();
+    assert_eq!(quiet.failed_count, 0, "{quiet:?}");
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(lookups, 0);
+    assert_portable_prepolicy_completed(root.path(), &operation).await;
+}
+
+#[tokio::test]
+async fn portable_prepolicy_reconfirmation_accepts_equivalent_rendered_name() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let operation = portable_prepolicy_fixture(root.path(), &server, false).await;
+    let mut edited = records(&server, Some(("edit-one", EDIT_ONE)));
+    // The fresh provider spelling differs, but slash cleaning renders the
+    // same native filenames as the recorded underscore spelling.
+    edited[0]["fields"]["filenameEnc"]["value"] = json!("IMG/0501.JPG");
+    let options = || CycleOptions {
+        private: true,
+        state_file: "adopted.db",
+        ..CycleOptions::default()
+    };
+    let (result, lookups) = try_cycle_options(
+        root.path(),
+        edited.clone(),
+        true,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.failed_count, 0, "{result:?}");
+    assert!(lookups >= 2);
+    assert_bytes(&root.path().join("media/IMG_0501.JPG"), EDIT_ONE);
+    assert_bytes(&root.path().join("media/IMG_0501_original.JPG"), ORIGINAL);
+    let (quiet, lookups) =
+        try_cycle_options(root.path(), edited, true, EditedNaming::Primary, options())
+            .await
+            .unwrap();
+    assert_eq!(quiet.failed_count, 0, "{quiet:?}");
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(lookups, 0);
+    assert_portable_prepolicy_completed(root.path(), &operation).await;
+}
+
+#[tokio::test]
+async fn portable_prepolicy_recovery_gate_rejects_root_and_store_drift() {
+    for variant in ["root", "wrong-store"] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        portable_prepolicy_fixture(root.path(), &server, false).await;
+        let owner = state::db::account::AccountOwner::authenticated(
+            "synthetic@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+        )
+        .unwrap();
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&root.path().join("adopted.db"), &owner)
+                .await
+                .unwrap(),
+        );
+        let capture_db = if variant == "wrong-store" {
+            Arc::new(
+                state::SqliteStateDb::open_owned(&root.path().join("other.db"), &owner)
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            db.clone()
+        };
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let provider = Session {
+            records: records(&server, Some(("edit-one", EDIT_ONE))),
+            quiet: true,
+            lookups: lookups.clone(),
+            current: None,
+            lookup_change: None,
+            indexing: None,
+        };
+        let mut album = crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::default(),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from("TestAlbum"),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(
+                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                ),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(provider),
+        );
+        album.set_shadow_capture(
+            crate::icloud::photos::inbox::ShadowCapture::new(capture_db, owner, "com"),
+            Arc::from("private"),
+        );
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album,
+            exclude_ids: Arc::default(),
+        };
+        let media = root.path().join(if variant == "root" {
+            "other-media"
+        } else {
+            "media"
+        });
+        std::fs::create_dir_all(&media).unwrap();
+        let store: Arc<dyn download::DownloadStore> = db.clone();
+        let build = make_run_cycle_download_config_builder(&media, store);
+        let mut config = build(
+            download::SyncMode::Full,
+            Arc::default(),
+            Arc::default(),
+            Arc::from("PrimarySync"),
+        )
+        .as_ref()
+        .clone();
+        config.folder_structure = String::new();
+        config.folder_structure_albums = Arc::from("");
+        config.folder_structure_smart_folders = Arc::from("");
+        config.edited = true;
+        config.edited_naming = EditedNaming::Primary;
+        let error = download::probe_recorded_recovery_gate(&config, &pass)
+            .await
+            .expect_err("changed authority must be held");
+        let message = format!("{error:#}");
+        let reason = if variant == "root" {
+            "Recorded recovery options or source changed"
+        } else {
+            "Recorded recovery account context changed"
+        };
+        assert!(message.contains(reason), "{variant}: {message}");
+        assert_eq!(lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("query-token")
+        );
+        assert_eq!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_bytes(&root.path().join("media/IMG_0501.JPG"), ORIGINAL);
+    }
+}
+
+#[tokio::test]
+async fn portable_prepolicy_reconfirmation_retains_work_on_drift() {
+    for variant in [
+        "added",
+        "resource",
+        "metadata",
+        "path",
+        "missing",
+        "scope",
+        "unowned",
+        "wrong-store",
+        "master",
+        "root",
+        "options",
+        "sidecar",
+        "local",
+    ] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        portable_prepolicy_fixture(root.path(), &server, false).await;
+        let mut source = records(&server, Some(("edit-one", EDIT_ONE)));
+        let mut options = CycleOptions {
+            private: true,
+            state_file: "adopted.db",
+            ..CycleOptions::default()
+        };
+        let original = root.path().join("media/IMG_0501.JPG");
+        let expected = if variant == "local" {
+            std::fs::write(&original, b"local edit retained").unwrap();
+            b"local edit retained".as_slice()
+        } else {
+            ORIGINAL
+        };
+        match variant {
+            "added" => {
+                source[1]["fields"]["addedDate"] =
+                    json!({"value":1_700_100_000_000_i64,"type":"TIMESTAMP"})
+            }
+            "resource" => {
+                source[1]["fields"]["resJPEGFullRes"]["value"]["fileChecksum"] =
+                    json!(provider_hash(EDIT_TWO))
+            }
+            "metadata" => source[1]["fields"]["isFavorite"] = json!({"value":1,"type":"INT64"}),
+            "path" => source[0]["fields"]["filenameEnc"]["value"] = json!("IMG_0502.JPG"),
+            "missing" => {
+                source[1]["fields"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("masterRef");
+            }
+            "scope" => options.pass_kind = PassKind::Album,
+            "unowned" => options.disable_capture = true,
+            "wrong-store" => options.other_capture_db = true,
+            "master" => {
+                source[0]["recordName"] = json!("other-master");
+                source[1]["fields"]["masterRef"]["value"]["recordName"] = json!("other-master");
+            }
+            "root" => options.media_directory = "other-media",
+            "options" => options.embed_rating = true,
+            "sidecar" => std::fs::write(
+                root.path().join("media/IMG_0501.JPG.xmp"),
+                b"foreign sidecar retained",
+            )
+            .unwrap(),
+            "local" => {}
+            other => panic!("unexpected synthetic variant: {other}"),
+        }
+        let result =
+            try_cycle_options(root.path(), source, true, EditedNaming::Primary, options).await;
+        if matches!(variant, "wrong-store" | "root") {
+            match result {
+                Ok((cycle, lookups)) => {
+                    assert!(
+                        cycle.failed_count > 0 && !cycle.db_sync_token_advance_safe,
+                        "{variant}: {cycle:?}"
+                    );
+                    assert_eq!(lookups, 0, "{variant}: must block before provider lookup");
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    let expected = if variant == "root" {
+                        "Recorded recovery options or source changed"
+                    } else {
+                        "Recorded recovery account context changed"
+                    };
+                    assert!(message.contains(expected), "{variant}: {message}");
+                }
+            }
+        } else {
+            let error = result
+                .err()
+                .unwrap_or_else(|| panic!("{variant}: expected an error"));
+            let message = format!("{error:#}");
+            let reason = match variant {
+                "added" => "Recorded recovery provider metadata changed",
+                "resource" | "metadata" | "path" | "master" => {
+                    "Recorded recovery provider facts changed"
+                }
+                "missing" => "Unresolved current master identity",
+                "scope" => "Recorded recovery has no matching current pass",
+                "unowned" => "Recorded recovery lacks authenticated scope",
+                "root" | "options" => "Recorded recovery options or source changed",
+                "sidecar" => "Owned layout sidecar changed locally",
+                "local" => "Owned layout file changed locally",
+                other => panic!("unexpected synthetic variant: {other}"),
+            };
+            assert!(message.contains(reason), "{variant}: {message}");
+        }
+        assert_bytes(&original, expected);
+        if variant == "sidecar" {
+            assert_bytes(
+                &root.path().join("media/IMG_0501.JPG.xmp"),
+                b"foreign sidecar retained",
+            );
+        }
+        assert!(!root.path().join("media/IMG_0501_original.JPG").exists());
+        let owner = state::db::account::AccountOwner::authenticated(
+            "synthetic@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+        )
+        .unwrap();
+        let db = state::SqliteStateDb::open_owned(&root.path().join("adopted.db"), &owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("query-token"),
+            "{variant}"
+        );
+        let pending = db
+            .primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "{variant}");
+        assert_eq!(pending[0].phase, "prepared", "{variant}");
+        for member in &pending[0].members {
+            if let Some(prepared) = &member.prepared {
+                let expected = match prepared.version.as_str() {
+                    "original" => ORIGINAL,
+                    "adjusted" => EDIT_ONE,
+                    other => panic!("unexpected prepared version {other}"),
+                };
+                assert_bytes(&prepared.path.to_path(), expected);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "synthetic released-writer fixture is generated separately"]
+async fn released_prepolicy_reconfirmed_recovery_and_quiet_reopen() {
+    let root = std::path::PathBuf::from(std::env::var_os("KEI_SYNTHETIC_COMPAT_ROOT").unwrap());
+    assert_eq!(
+        std::fs::read(root.join("fixture-owner")).unwrap(),
+        b"kei-synthetic-process-death"
+    );
+    let publishing = std::env::var("KEI_SYNTHETIC_EXPECT_PUBLISHING").as_deref() == Ok("yes");
+    assert_eq!(
+        std::fs::read(root.join("ready")).unwrap(),
+        if publishing {
+            b"layout-member-published".as_slice()
+        } else {
+            b"layout-prepared".as_slice()
+        }
+    );
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    state::db::account::adopt_legacy(
+        &root.join("state.db"),
+        &root.join("adopted.db"),
+        &owner,
+        "synthetic@example.invalid",
+        "com",
+    )
+    .await
+    .unwrap();
+    assert_bytes(&root.join("media/IMG_0501.JPG"), ORIGINAL);
+    if publishing {
+        let db = state::SqliteStateDb::open_owned(&root.join("adopted.db"), &owner)
+            .await
+            .unwrap();
+        let pending = db
+            .primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].phase, "publishing");
+        assert!(
+            pending[0]
+                .members
+                .iter()
+                .any(|member| member.installed.is_some()
+                    && member
+                        .prepared
+                        .as_ref()
+                        .is_some_and(|file| !file.path.to_path().exists())),
+            "an installed stage must already be consumed"
+        );
+    }
+    let server = server().await;
+    let records = records(&server, Some(("edit-one", EDIT_ONE)));
+    let options = || CycleOptions {
+        private: true,
+        state_file: "adopted.db",
+        ..CycleOptions::default()
+    };
+    let (result, lookups) = try_cycle_options(
+        &root,
+        records.clone(),
+        true,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.failed_count, 0, "{result:?}");
+    assert!(lookups >= 2, "fresh child/master confirmation required");
+    assert_bytes(&root.join("media/IMG_0501.JPG"), EDIT_ONE);
+    assert_bytes(&root.join("media/IMG_0501_original.JPG"), ORIGINAL);
+    let db = state::SqliteStateDb::open_owned(&root.join("adopted.db"), &owner)
+        .await
+        .unwrap();
+    assert!(
+        db.primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(db);
+    let (quiet, lookups) =
+        try_cycle_options(&root, records, true, EditedNaming::Primary, options())
+            .await
+            .unwrap();
+    assert_eq!(quiet.failed_count, 0, "{quiet:?}");
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(lookups, 0);
+    assert_bytes(&root.join("media/IMG_0501.JPG"), EDIT_ONE);
+    assert_bytes(&root.join("media/IMG_0501_original.JPG"), ORIGINAL);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "synthetic released-writer fixture is generated separately"]
+async fn released_prepolicy_reconfirmation_rejects_drift() {
+    let root = std::path::PathBuf::from(std::env::var_os("KEI_SYNTHETIC_COMPAT_ROOT").unwrap());
+    let variant = std::env::var("KEI_SYNTHETIC_RECONFIRM_VARIANT").unwrap();
+    assert_eq!(
+        std::fs::read(root.join("fixture-owner")).unwrap(),
+        b"kei-synthetic-process-death"
+    );
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    state::db::account::adopt_legacy(
+        &root.join("state.db"),
+        &root.join("adopted.db"),
+        &owner,
+        "synthetic@example.invalid",
+        "com",
+    )
+    .await
+    .unwrap();
+    let server = server().await;
+    let mut source = records(&server, Some(("edit-one", EDIT_ONE)));
+    let mut options = CycleOptions {
+        private: true,
+        state_file: "adopted.db",
+        ..CycleOptions::default()
+    };
+    let expected = if variant == "local" {
+        std::fs::write(root.join("media/IMG_0501.JPG"), b"local edit retained").unwrap();
+        b"local edit retained".as_slice()
+    } else {
+        ORIGINAL
+    };
+    match variant.as_str() {
+        "added" => {
+            source[1]["fields"]["addedDate"] =
+                json!({"value":1_700_100_000_000_i64,"type":"TIMESTAMP"})
+        }
+        "resource" => {
+            source[1]["fields"]["resJPEGFullRes"]["value"]["fileChecksum"] =
+                json!(provider_hash(EDIT_TWO))
+        }
+        "metadata" => source[1]["fields"]["isFavorite"] = json!({"value":1,"type":"INT64"}),
+        "path" => source[0]["fields"]["filenameEnc"]["value"] = json!("IMG_0502.JPG"),
+        "missing" => source[1]["fields"]
+            .as_object_mut()
+            .unwrap()
+            .remove("masterRef")
+            .map(|_| ())
+            .unwrap(),
+        "scope" => options.pass_kind = PassKind::Album,
+        "local" => {}
+        _ => panic!("unknown synthetic variant"),
+    }
+    let result = try_cycle_options(&root, source, true, EditedNaming::Primary, options).await;
+    let error = result.expect_err("changed released operation must remain held");
+    let message = format!("{error:#}");
+    let expected_error = match variant.as_str() {
+        "added" => "Recorded recovery provider metadata changed",
+        "resource" | "metadata" | "path" => "Recorded recovery provider facts changed",
+        "missing" => "Unresolved current master identity",
+        "scope" => "Recorded recovery has no matching current pass",
+        "local" => "Owned layout file changed locally",
+        other => panic!("unexpected synthetic variant: {other}"),
+    };
+    assert!(message.contains(expected_error), "{variant}: {message}");
+    assert_bytes(&root.join("media/IMG_0501.JPG"), expected);
+    assert!(!root.join("media/IMG_0501_original.JPG").exists());
+    let db = state::SqliteStateDb::open_owned(&root.join("adopted.db"), &owner)
+        .await
+        .unwrap();
+    let pending = db
+        .primary_layout_operations("PrimarySync".into())
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "{variant}");
+    assert_eq!(pending[0].phase, "prepared", "{variant}");
+    for member in &pending[0].members {
+        if let Some(prepared) = &member.prepared {
+            let expected = match prepared.version.as_str() {
+                "original" => ORIGINAL,
+                "adjusted" => EDIT_ONE,
+                other => panic!("unexpected prepared version {other}"),
+            };
+            assert_bytes(&prepared.path.to_path(), expected);
+        }
+    }
+}
+
 #[tokio::test]
 async fn contract_file_publish_no_overwrite_primary_layout_edits_revert_and_quiet_reopen() {
     let server = server().await;

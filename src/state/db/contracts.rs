@@ -252,6 +252,35 @@ pub(crate) trait ReconciliationStateStore: Send + Sync {
             detail: "state store does not support primary layouts".into(),
         })
     }
+    async fn capture_layout_recovery(
+        &self,
+        _op: super::primary_layout::LayoutOperation,
+    ) -> Result<Option<super::primary_layout::LayoutRecoverySnapshot>, StateError> {
+        Err(StateError::Invariant {
+            operation: "primary_layout",
+            detail: "state store does not support layout recovery confirmation".into(),
+        })
+    }
+    async fn save_primary_layout_with_recovery(
+        &self,
+        _op: super::primary_layout::LayoutOperation,
+        _proof: super::primary_layout::LayoutRecoverySnapshot,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "primary_layout",
+            detail: "state store does not support layout recovery confirmation".into(),
+        })
+    }
+    async fn commit_primary_layout_with_recovery(
+        &self,
+        _op: super::primary_layout::LayoutOperation,
+        _proof: super::primary_layout::LayoutRecoverySnapshot,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "primary_layout",
+            detail: "state store does not support layout recovery confirmation".into(),
+        })
+    }
     async fn save_primary_layout(
         &self,
         _op: super::primary_layout::LayoutOperation,

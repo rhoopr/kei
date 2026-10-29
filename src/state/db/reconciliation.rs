@@ -37,6 +37,28 @@ impl ReconciliationStateStore for SqliteStateDb {
     async fn hold_primary_layout(&self, operation: String) -> Result<(), StateError> {
         self.hold_primary_layout(operation).await
     }
+    async fn capture_layout_recovery(
+        &self,
+        op: super::primary_layout::LayoutOperation,
+    ) -> Result<Option<super::primary_layout::LayoutRecoverySnapshot>, StateError> {
+        self.capture_layout_recovery(op).await
+    }
+    async fn save_primary_layout_with_recovery(
+        &self,
+        op: super::primary_layout::LayoutOperation,
+        proof: super::primary_layout::LayoutRecoverySnapshot,
+    ) -> Result<(), StateError> {
+        self.save_primary_layout_with_recovery(op, Some(proof))
+            .await
+    }
+    async fn commit_primary_layout_with_recovery(
+        &self,
+        op: super::primary_layout::LayoutOperation,
+        proof: super::primary_layout::LayoutRecoverySnapshot,
+    ) -> Result<(), StateError> {
+        self.commit_primary_layout_with_recovery(op, Some(proof))
+            .await
+    }
     async fn save_primary_layout(
         &self,
         op: super::primary_layout::LayoutOperation,

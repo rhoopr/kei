@@ -180,8 +180,13 @@ pub(crate) async fn recover_recorded_sources(
     // commit, so an old operation cannot later restore stale rendition facts.
     // The layout owner also recovers replacements at each recorded old root.
     if managed
-        && let Err(error) =
-            super::primary_layout::recover(client, passes, &config, &shutdown_token).await
+        && let Err(error) = Box::pin(super::primary_layout::recover(
+            client,
+            passes,
+            &config,
+            &shutdown_token,
+        ))
+        .await
     {
         tracing::warn!(error = %format!("{error:#}"), "Could not recover managed layouts before path reconciliation; keeping checkpoints unchanged");
         return Ok(PathReconciliationResult {

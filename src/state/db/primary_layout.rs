@@ -120,6 +120,334 @@ pub(crate) struct LayoutOperation {
     pub(crate) members: Vec<LayoutMember>,
 }
 
+/// Ephemeral observation for one pending recovery. It is never persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SnapshotValue {
+    Null,
+    Integer(i64),
+    Real(u64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LayoutRecoverySnapshot {
+    operation: LayoutOperation,
+    catalogue: Vec<Vec<SnapshotValue>>,
+    metadata_paths: Vec<Vec<SnapshotValue>>,
+    path_owners: Vec<Vec<SnapshotValue>>,
+    mappings: Vec<Vec<SnapshotValue>>,
+    binding: Vec<Vec<SnapshotValue>>,
+    claims: Vec<Vec<SnapshotValue>>,
+}
+
+impl LayoutRecoverySnapshot {
+    pub(crate) fn matches_master(&self, master: &str) -> bool {
+        self.mappings.iter().filter(|row| matches!(row.as_slice(),
+            [SnapshotValue::Text(library), SnapshotValue::Text(child), SnapshotValue::Text(recorded_master), ..]
+            if library.as_slice() == self.operation.library.as_bytes()
+                && child.as_slice() == self.operation.asset_record_name.as_bytes()
+                && recorded_master.as_slice() == master.as_bytes())).count() == 1
+    }
+}
+
+fn snapshot_rows(
+    conn: &Connection,
+    sql: &str,
+    values: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<Vec<SnapshotValue>>, StateError> {
+    let mut statement = conn.prepare(sql)?;
+    let columns = statement.column_count();
+    let mut rows = statement.query(values)?;
+    let mut result = Vec::new();
+    let mut retained_bytes = 0usize;
+    while let Some(row) = rows.next()? {
+        if result.len() >= 256 {
+            return Err(invalid("layout recovery snapshot exceeds budget"));
+        }
+        let mut values = Vec::with_capacity(columns);
+        for index in 0..columns {
+            let value = row.get_ref(index)?;
+            let size = match value {
+                rusqlite::types::ValueRef::Text(bytes) | rusqlite::types::ValueRef::Blob(bytes) => {
+                    bytes.len()
+                }
+                _ => 8,
+            };
+            retained_bytes = retained_bytes
+                .checked_add(size)
+                .ok_or_else(|| invalid("layout recovery snapshot exceeds budget"))?;
+            if retained_bytes > 4 * 1024 * 1024 {
+                return Err(invalid("layout recovery snapshot exceeds budget"));
+            }
+            values.push(match value {
+                rusqlite::types::ValueRef::Null => SnapshotValue::Null,
+                rusqlite::types::ValueRef::Integer(value) => SnapshotValue::Integer(value),
+                rusqlite::types::ValueRef::Real(value) => SnapshotValue::Real(value.to_bits()),
+                rusqlite::types::ValueRef::Text(value) => SnapshotValue::Text(value.to_vec()),
+                rusqlite::types::ValueRef::Blob(value) => SnapshotValue::Blob(value.to_vec()),
+            });
+        }
+        result.push(values);
+    }
+    Ok(result)
+}
+
+fn recovery_snapshot(
+    conn: &Connection,
+    op: &LayoutOperation,
+) -> Result<LayoutRecoverySnapshot, StateError> {
+    let mut paths = Vec::new();
+    for member in &op.members {
+        for path in [
+            member.destination.as_ref(),
+            member.stage.as_ref(),
+            member.preserved_path.as_ref(),
+            member.retirement.as_ref(),
+            member.old.as_ref().map(|file| &file.path),
+            member.archive_source.as_ref().map(|file| &file.path),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let path = path.to_path();
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(".xmp");
+            paths.push(path);
+            paths.push(std::path::PathBuf::from(sidecar));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    let mut keys = paths
+        .iter()
+        .map(|path| path_key(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    // Legacy TEXT locators can be lossy; include their spelling conservatively
+    // while retaining native keys for exact path and marker comparisons.
+    let path_texts: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    for text in &path_texts {
+        keys.push(path_key(std::path::Path::new(text))?);
+    }
+    keys.sort();
+    keys.dedup();
+    let text_set: std::collections::HashSet<&str> = path_texts.iter().map(String::as_str).collect();
+    let mut args: Vec<&dyn rusqlite::ToSql> = vec![&op.library, &op.child, &op.asset_record_name];
+    args.extend(path_texts.iter().map(|path| path as &dyn rusqlite::ToSql));
+    let path_slots = (4..4 + paths.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let path_filter = if paths.is_empty() {
+        "0".to_owned()
+    } else {
+        format!("local_path IN ({path_slots})")
+    };
+    let catalogue = snapshot_rows(
+        conn,
+        &format!(
+            "SELECT * FROM assets WHERE (library=?1 AND (id=?2 OR id=?3 OR id IN (SELECT asset_record_name FROM asset_master_mappings WHERE library=?1 AND master_record_name=?2))) OR {path_filter} ORDER BY library,id,version_size"
+        ),
+        &args,
+    )?;
+    args.extend(keys.iter().map(|key| key as &dyn rusqlite::ToSql));
+    let key_slots = (4 + paths.len()..4 + paths.len() + keys.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let key_filter = if keys.is_empty() {
+        "0".to_owned()
+    } else {
+        format!("preserved_path_key IN ({key_slots})")
+    };
+    let metadata_paths = snapshot_rows(
+        conn,
+        &format!(
+            "SELECT * FROM asset_metadata_paths WHERE (library=?1 AND (id=?2 OR id=?3 OR id IN (SELECT asset_record_name FROM asset_master_mappings WHERE library=?1 AND master_record_name=?2))) OR {path_filter} OR {key_filter} ORDER BY library,id,version_size,local_path"
+        ),
+        &args,
+    )?;
+    let key_set: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+    let mut path_owners = Vec::new();
+    for table in ["assets", "asset_metadata_paths"] {
+        let sql = format!(
+            "SELECT library,id,version_size,local_path FROM {table} WHERE local_path IS NOT NULL ORDER BY library,id,version_size,local_path"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let library: String = row.get(0)?;
+            let child: String = row.get(1)?;
+            let version: String = row.get(2)?;
+            let native: String = row.get(3)?;
+            let key = path_key(std::path::Path::new(&native))?;
+            if !key_set.contains(key.as_str()) && !text_set.contains(native.as_str()) {
+                continue;
+            }
+            if library != op.library || child != op.child {
+                return Err(invalid("foreign owner occupies layout recovery path"));
+            }
+            if path_owners.len() >= 256 {
+                return Err(invalid("layout recovery path owners exceed budget"));
+            }
+            path_owners.push(vec![
+                SnapshotValue::Text(table.as_bytes().to_vec()),
+                SnapshotValue::Text(library.into_bytes()),
+                SnapshotValue::Text(child.into_bytes()),
+                SnapshotValue::Text(version.into_bytes()),
+                SnapshotValue::Text(native.into_bytes()),
+            ]);
+        }
+    }
+    let readonly_keys: std::collections::HashSet<_> = protected_readonly_paths(conn)?
+        .iter()
+        .map(|path| crate::fs_util::confined_path_key(path))
+        .collect::<std::io::Result<_>>()
+        .map_err(|_error| invalid("invalid protected recovery path"))?;
+    for path in &paths {
+        let key = crate::fs_util::confined_path_key(path)
+            .map_err(|_error| invalid("invalid recovery path"))?;
+        let lossy = std::path::PathBuf::from(path.to_string_lossy().as_ref());
+        let lossy_key = crate::fs_util::confined_path_key(&lossy)
+            .map_err(|_error| invalid("invalid recovery path"))?;
+        if readonly_keys.contains(&key)
+            || readonly_keys.contains(&lossy_key)
+            || path_is_readonly(conn, path)?
+            || (lossy != *path && path_is_readonly(conn, &lossy)?)
+        {
+            return Err(invalid("layout recovery path is read-only"));
+        }
+        if super::legacy_preservation::path_is_protected(conn, path)?
+            || (lossy != *path && super::legacy_preservation::path_is_protected(conn, &lossy)?)
+        {
+            return Err(invalid("layout recovery path is legacy-protected"));
+        }
+    }
+    let mappings = snapshot_rows(
+        conn,
+        "SELECT * FROM asset_master_mappings WHERE library=?1 AND (master_record_name=?2 OR asset_record_name=?3) ORDER BY asset_record_name",
+        &[&op.library, &op.child, &op.asset_record_name],
+    )?;
+    let binding = snapshot_rows(
+        conn,
+        "SELECT * FROM primary_layout_bindings WHERE family=?1",
+        &[&op.family],
+    )?;
+    let mut claim_args: Vec<&dyn rusqlite::ToSql> = vec![&op.family];
+    claim_args.extend(keys.iter().map(|key| key as &dyn rusqlite::ToSql));
+    let claim_slots = (2..2 + keys.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let claim_filter = if keys.is_empty() {
+        "0".to_owned()
+    } else {
+        format!("path_key IN ({claim_slots})")
+    };
+    let claims = snapshot_rows(
+        conn,
+        &format!(
+            "SELECT * FROM primary_layout_claims WHERE family=?1 OR {claim_filter} ORDER BY path_key"
+        ),
+        &claim_args,
+    )?;
+    for claim in &claims {
+        if !matches!(claim.as_slice(), [_, SnapshotValue::Text(family), operation, ..] if family.as_slice() == op.family.as_bytes() && (matches!(operation, SnapshotValue::Null) || matches!(operation, SnapshotValue::Text(value) if value.as_slice() == op.operation.as_bytes())))
+        {
+            return Err(invalid("foreign claim occupies layout recovery path"));
+        }
+    }
+    let header: Vec<u8> = conn.query_row("SELECT header FROM primary_layout_operations WHERE operation=?1 AND family=?2 AND library=?3 AND source_library=?4 AND prior_generation=?5 AND decision=?6 AND policy=?7 AND phase=?8 AND phase NOT IN ('committed','cancelled')", params![op.operation, op.family, op.library, op.source_library, op.generation, op.decision, op.policy, op.phase], |row| row.get(0))?;
+    let mut expected_header = op.clone();
+    expected_header.members.clear();
+    if encode(&expected_header)? != header {
+        return Err(invalid("layout recovery journal changed"));
+    }
+    let members: Vec<Vec<u8>> = conn
+        .prepare("SELECT evidence FROM primary_layout_members WHERE operation=?1 ORDER BY member")?
+        .query_map([&op.operation], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if members.len() != op.members.len()
+        || op
+            .members
+            .iter()
+            .zip(members)
+            .any(|(member, stored)| encode(member).map_or(true, |value| value != stored))
+    {
+        return Err(invalid("layout recovery member changed"));
+    }
+    Ok(LayoutRecoverySnapshot {
+        operation: op.clone(),
+        catalogue,
+        metadata_paths,
+        path_owners,
+        mappings,
+        binding,
+        claims,
+    })
+}
+
+fn guard_recovery_snapshot(
+    conn: &Connection,
+    op: &LayoutOperation,
+    proof: &LayoutRecoverySnapshot,
+) -> Result<(), StateError> {
+    let mut identity = op.clone();
+    identity.phase = proof.operation.phase.clone();
+    identity.members.clear();
+    let mut original = proof.operation.clone();
+    original.members.clear();
+    if encode(&identity)? != encode(&original)? || op.members.len() != proof.operation.members.len()
+    {
+        return Err(invalid("layout recovery identity changed"));
+    }
+    for (member, prior) in op.members.iter().zip(&proof.operation.members) {
+        let mut identity = member.clone();
+        identity.prepared = prior.prepared.clone();
+        identity.preserved = prior.preserved.clone();
+        identity.installed = prior.installed.clone();
+        if encode(&identity)? != encode(prior)? {
+            return Err(invalid("layout recovery member identity changed"));
+        }
+        for (old, new) in [
+            (&prior.prepared, &member.prepared),
+            (&prior.preserved, &member.preserved),
+            (&prior.installed, &member.installed),
+        ] {
+            if let Some(old) = old
+                && new.as_ref().map(encode).transpose()?.as_ref() != Some(&encode(old)?)
+            {
+                return Err(invalid("layout recovery evidence changed"));
+            }
+        }
+    }
+    let header: Vec<u8> = conn.query_row("SELECT header FROM primary_layout_operations WHERE operation=?1 AND phase NOT IN ('committed','cancelled')", [&op.operation], |row| row.get(0))?;
+    let mut persisted: LayoutOperation = decode(&header)?;
+    let members: Vec<Vec<u8>> = conn
+        .prepare("SELECT evidence FROM primary_layout_members WHERE operation=?1 ORDER BY member")?
+        .query_map([&op.operation], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    persisted.members = members
+        .iter()
+        .map(|member| decode(member))
+        .collect::<Result<_, _>>()?;
+    guard_recorded_catalogue_inner(conn, &persisted, true)?;
+    let current = recovery_snapshot(conn, &persisted)?;
+    if current.catalogue != proof.catalogue
+        || current.metadata_paths != proof.metadata_paths
+        || current.path_owners != proof.path_owners
+        || current.mappings != proof.mappings
+        || current.binding != proof.binding
+        || current.claims != proof.claims
+    {
+        return Err(invalid("layout recovery catalogue changed"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PreservedManifestFile {
     pub(crate) operation: String,
@@ -526,6 +854,13 @@ pub(super) fn protected_readonly_paths(
 // observations back through its stored AssetRecord. This check runs inside the
 // phase/finalization transaction, independently of orchestration preflight.
 fn guard_recorded_catalogue(conn: &Connection, op: &LayoutOperation) -> Result<(), StateError> {
+    guard_recorded_catalogue_inner(conn, op, false)
+}
+fn guard_recorded_catalogue_inner(
+    conn: &Connection,
+    op: &LayoutOperation,
+    confirmed_observation: bool,
+) -> Result<(), StateError> {
     for member in &op.members {
         if let Some(expected) = &member.record {
             let current = conn
@@ -563,19 +898,20 @@ fn guard_recorded_catalogue(conn: &Connection, op: &LayoutOperation) -> Result<(
                 serde_json::to_value(metadata)
                     .map_err(|_error| invalid("invalid journal metadata snapshot"))
             };
-            if current.checksum != expected.checksum
-                || current.filename != expected.filename
-                || current.size_bytes != expected.size_bytes
-                || current.media_type != expected.media_type
-                || super::rows::encode_asset_date(current.created_at).to_bits()
-                    != super::rows::encode_asset_date(expected.created_at).to_bits()
-                || current
-                    .added_at
-                    .map(|date| super::rows::encode_asset_date(date).to_bits())
-                    != expected
+            if !confirmed_observation
+                && (current.checksum != expected.checksum
+                    || current.filename != expected.filename
+                    || current.size_bytes != expected.size_bytes
+                    || current.media_type != expected.media_type
+                    || super::rows::encode_asset_date(current.created_at).to_bits()
+                        != super::rows::encode_asset_date(expected.created_at).to_bits()
+                    || current
                         .added_at
                         .map(|date| super::rows::encode_asset_date(date).to_bits())
-                || stored_metadata(&current)? != stored_metadata(expected)?
+                        != expected
+                            .added_at
+                            .map(|date| super::rows::encode_asset_date(date).to_bits())
+                    || stored_metadata(&current)? != stored_metadata(expected)?)
             {
                 return Err(invalid(
                     "recorded layout differs from current provider observation",
@@ -718,12 +1054,39 @@ impl SqliteStateDb {
             Ok(())
         }).await
     }
+    pub(crate) async fn capture_layout_recovery(
+        &self,
+        op: LayoutOperation,
+    ) -> Result<Option<LayoutRecoverySnapshot>, StateError> {
+        self.with_conn("capture_layout_recovery", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            match guard_recorded_catalogue(&tx, &op) {
+                Ok(()) => Ok(None),
+                Err(StateError::Invariant {
+                    operation: "primary_layout",
+                    ref detail,
+                }) if detail == "recorded layout differs from current provider observation" => {
+                    guard_recorded_catalogue_inner(&tx, &op, true)?;
+                    Ok(Some(recovery_snapshot(&tx, &op)?))
+                }
+                Err(error) => Err(error),
+            }
+        })
+        .await
+    }
     pub(crate) async fn save_primary_layout(&self, op: LayoutOperation) -> Result<(), StateError> {
+        self.save_primary_layout_with_recovery(op, None).await
+    }
+    pub(crate) async fn save_primary_layout_with_recovery(
+        &self,
+        op: LayoutOperation,
+        proof: Option<LayoutRecoverySnapshot>,
+    ) -> Result<(), StateError> {
         self.with_conn("save_primary_layout", move |conn| {
             let tx=conn.unchecked_transaction()?;
             let previous:Vec<u8>=tx.query_row("SELECT header FROM primary_layout_operations WHERE operation=?1 AND phase NOT IN ('committed','cancelled')",[&op.operation],|row|row.get(0))?;
             let old:LayoutOperation=decode(&previous)?;
-            guard_recorded_catalogue(&tx, &op)?;
+            if let Some(proof) = &proof { guard_recovery_snapshot(&tx, &op, proof)?; } else { guard_recorded_catalogue(&tx, &op)?; }
             let phase=|phase:&str|match phase {"planned"=>0,"prepared"=>1,"preserved"=>2,"publishing"=>3,_=>4};
             if phase(&op.phase)<phase(&old.phase) || phase(&op.phase)>phase(&old.phase)+1 {return Err(invalid("invalid layout phase transition"));}
             let mut identity=op.clone();identity.members.clear();identity.phase=old.phase.clone();
@@ -760,6 +1123,13 @@ impl SqliteStateDb {
         &self,
         op: LayoutOperation,
     ) -> Result<(), StateError> {
+        self.commit_primary_layout_with_recovery(op, None).await
+    }
+    pub(crate) async fn commit_primary_layout_with_recovery(
+        &self,
+        op: LayoutOperation,
+        proof: Option<LayoutRecoverySnapshot>,
+    ) -> Result<(), StateError> {
         self.with_conn("commit_primary_layout", move |conn| {
             let tx=conn.unchecked_transaction()?;
             let generation:i64=tx.query_row("SELECT generation FROM primary_layout_bindings WHERE family=?1",[&op.family],|r|r.get(0)).optional()?.unwrap_or(0);
@@ -771,7 +1141,7 @@ impl SqliteStateDb {
             if encode(&identity)?!=stored {return Err(invalid("commit differs from recorded layout identity"));}
             let stored_members:Vec<Vec<u8>>=tx.prepare("SELECT evidence FROM primary_layout_members WHERE operation=?1 ORDER BY member")?.query_map([&op.operation],|r|r.get(0))?.collect::<Result<_,_>>()?;
             if stored_members.len()!=op.members.len() || op.members.iter().zip(stored_members).any(|(member,stored)|encode(member).map_or(true,|bytes|bytes!=stored)) {return Err(invalid("commit differs from recorded member evidence"));}
-            guard_recorded_catalogue(&tx, &op)?;
+            if let Some(proof) = &proof { guard_recovery_snapshot(&tx, &op, proof)?; } else { guard_recorded_catalogue(&tx, &op)?; }
             let mut files=Vec::new();
             for member in &op.members {
                 if let Some(old)=&member.old {
@@ -982,6 +1352,337 @@ mod tests {
         let decoded: LayoutBinding = decode(&encode(&binding).unwrap()).unwrap();
         assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
         assert!(decode::<LayoutOperation>(b"malformed journal").is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_snapshot_rejects_changed_catalogue_mapping_and_journal() {
+        for changed in [
+            "catalogue",
+            "mapping",
+            "journal",
+            "foreign_path",
+            "foreign_alias",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let db = SqliteStateDb::open(&root.path().join("state.db"))
+                .await
+                .unwrap();
+            let op = fixture(root.path());
+            db.begin_primary_layout(op.clone()).await.unwrap();
+            let mut current = op.members[0].record.clone().unwrap();
+            current.filename = "older-name.HEIC".into();
+            db.upsert_seen(&current).await.unwrap();
+            db.upsert_asset_master_mapping(&op.library, &op.asset_record_name, "synthetic-master")
+                .await
+                .unwrap();
+            assert!(db.save_primary_layout(op.clone()).await.is_err());
+            let proof = db
+                .capture_layout_recovery(op.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(proof.matches_master("synthetic-master"));
+            assert!(!proof.matches_master("other-master"));
+            db.save_primary_layout_with_recovery(op.clone(), Some(proof.clone()))
+                .await
+                .unwrap();
+            match changed {
+                "catalogue" => {
+                    current.filename = "newer-name.HEIC".into();
+                    db.upsert_seen(&current).await.unwrap();
+                }
+                "mapping" => {
+                    db.upsert_asset_master_mapping(
+                        &op.library,
+                        &op.asset_record_name,
+                        "other-master",
+                    )
+                    .await
+                    .unwrap();
+                }
+                "foreign_path" | "foreign_alias" => {
+                    let destination = op.members[0]
+                        .destination
+                        .as_ref()
+                        .unwrap()
+                        .to_path()
+                        .to_str()
+                        .unwrap()
+                        .to_owned();
+                    let destination = if changed == "foreign_alias" {
+                        destination.to_uppercase()
+                    } else {
+                        destination
+                    };
+                    db.with_conn("insert synthetic foreign metadata path", move |conn| {
+                        conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum) VALUES('Other','foreign','original',?1,'other','other')", [&destination])?;
+                        Ok(())
+                    }).await.unwrap();
+                }
+                "journal" => {
+                    db.with_conn("change synthetic journal", |conn| {
+                        conn.execute("UPDATE primary_layout_operations SET header=X'7B7D'", [])?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                }
+                other => panic!("unexpected synthetic change: {other}"),
+            }
+            assert!(
+                db.save_primary_layout_with_recovery(op.clone(), Some(proof))
+                    .await
+                    .is_err(),
+                "{changed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_snapshot_rejects_changed_catalogue_at_commit_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let mut op = fixture(root.path());
+        db.begin_primary_layout(op.clone()).await.unwrap();
+        let mut current = op.members[0].record.clone().unwrap();
+        current.filename = "older-name.HEIC".into();
+        db.upsert_seen(&current).await.unwrap();
+        let proof = db
+            .capture_layout_recovery(op.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        op.members[0].prepared = op.members[0].old.clone();
+        op.phase = "prepared".into();
+        db.save_primary_layout_with_recovery(op.clone(), Some(proof.clone()))
+            .await
+            .unwrap();
+        op.members[0].preserved = op.members[0].old.clone();
+        op.phase = "preserved".into();
+        db.save_primary_layout_with_recovery(op.clone(), Some(proof.clone()))
+            .await
+            .unwrap();
+        op.phase = "publishing".into();
+        db.save_primary_layout_with_recovery(op.clone(), Some(proof.clone()))
+            .await
+            .unwrap();
+        op.members[0].installed = op.members[0].prepared.clone();
+        db.save_primary_layout_with_recovery(op.clone(), Some(proof.clone()))
+            .await
+            .unwrap();
+        current.filename = "newer-name.HEIC".into();
+        db.upsert_seen(&current).await.unwrap();
+        assert!(
+            db.commit_primary_layout_with_recovery(op.clone(), Some(proof))
+                .await
+                .is_err()
+        );
+        let pending = db
+            .primary_layout_operations(op.source_library.clone())
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].phase, "publishing");
+        assert!(
+            db.primary_layout_binding(op.family)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_snapshot_rejects_preexisting_normalized_foreign_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let op = fixture(root.path());
+        db.begin_primary_layout(op.clone()).await.unwrap();
+        let mut current = op.members[0].record.clone().unwrap();
+        current.filename = "older-name.HEIC".into();
+        db.upsert_seen(&current).await.unwrap();
+        let path = op.members[0]
+            .destination
+            .as_ref()
+            .unwrap()
+            .to_path()
+            .to_str()
+            .unwrap()
+            .to_uppercase();
+        db.with_conn("insert preexisting synthetic foreign owner", move |conn| {
+            conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum) VALUES('Other','foreign','original',?1,'other','other')", [&path])?;
+            Ok(())
+        }).await.unwrap();
+        assert!(db.capture_layout_recovery(op).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_snapshot_accepts_native_path_but_rejects_ambiguous_lossy_owner() {
+        use std::os::unix::ffi::OsStringExt;
+        for (before_capture, normalized_alias) in
+            [(true, false), (true, true), (false, false), (false, true)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let db = SqliteStateDb::open(&root.path().join("state.db"))
+                .await
+                .unwrap();
+            let mut op = fixture(root.path());
+            let native = root
+                .path()
+                .join(std::ffi::OsString::from_vec(b"native-\xff.JPG".to_vec()));
+            op.members[0].stage = Some(SelectionPath::from_path(&native));
+            db.begin_primary_layout(op.clone()).await.unwrap();
+            let mut current = op.members[0].record.clone().unwrap();
+            current.filename = "older-name.HEIC".into();
+            db.upsert_seen(&current).await.unwrap();
+            let proof = if before_capture {
+                None
+            } else {
+                let proof = db
+                    .capture_layout_recovery(op.clone())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                db.save_primary_layout_with_recovery(op.clone(), Some(proof.clone()))
+                    .await
+                    .unwrap();
+                Some(proof)
+            };
+            let lossy = native.to_string_lossy().into_owned();
+            let lossy = if normalized_alias {
+                lossy.to_uppercase()
+            } else {
+                lossy
+            };
+            db.with_conn("insert ambiguous synthetic locator", move |conn| {
+                conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum) VALUES('Other','foreign','original',?1,'other','other')", [&lossy])?;
+                Ok(())
+            }).await.unwrap();
+            if let Some(proof) = proof {
+                assert!(
+                    db.save_primary_layout_with_recovery(op, Some(proof))
+                        .await
+                        .is_err()
+                );
+            } else {
+                assert!(db.capture_layout_recovery(op).await.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_snapshot_rejects_readonly_marker_before_and_after_capture() {
+        for before_capture in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let db = SqliteStateDb::open(&root.path().join("state.db"))
+                .await
+                .unwrap();
+            let op = fixture(root.path());
+            db.begin_primary_layout(op.clone()).await.unwrap();
+            let mut current = op.members[0].record.clone().unwrap();
+            current.filename = "older-name.HEIC".into();
+            db.upsert_seen(&current).await.unwrap();
+            let proof = if before_capture {
+                None
+            } else {
+                Some(
+                    db.capture_layout_recovery(op.clone())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+            };
+            let path = op.members[0].destination.as_ref().unwrap().to_path();
+            let marker = path_key(&path).unwrap();
+            let text = path.to_str().unwrap().to_owned();
+            db.with_conn("insert synthetic read-only marker", move |conn| {
+                conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum,preserved_path_key) VALUES('FullLibrary-Zone','stable-child','original',?1,'old','old',?2)", rusqlite::params![text, marker])?;
+                Ok(())
+            }).await.unwrap();
+            if let Some(proof) = proof {
+                assert!(
+                    db.save_primary_layout_with_recovery(op, Some(proof))
+                        .await
+                        .is_err()
+                );
+            } else {
+                assert!(db.capture_layout_recovery(op).await.is_err());
+            }
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn recovery_snapshot_rejects_case_alias_readonly_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let op = fixture(root.path());
+        db.begin_primary_layout(op.clone()).await.unwrap();
+        let mut current = op.members[0].record.clone().unwrap();
+        current.filename = "older-name.HEIC".into();
+        db.upsert_seen(&current).await.unwrap();
+        let alias = op.members[0]
+            .destination
+            .as_ref()
+            .unwrap()
+            .to_path()
+            .to_str()
+            .unwrap()
+            .to_uppercase();
+        let marker = path_key(std::path::Path::new(&alias)).unwrap();
+        db.with_conn("insert synthetic read-only alias", move |conn| {
+            conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum,preserved_path_key) VALUES('FullLibrary-Zone','stable-child','original',?1,'old','old',?2)", rusqlite::params![alias, marker])?;
+            Ok(())
+        }).await.unwrap();
+        assert!(db.capture_layout_recovery(op).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_snapshot_never_waives_archive_source_guard() {
+        let root = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let mut op = fixture(root.path());
+        let old = op.members[0].old.clone().unwrap();
+        op.members.push(LayoutMember {
+            record: None,
+            destination: None,
+            path_key: None,
+            stage: None,
+            old: None,
+            archive_source: Some(old.clone()),
+            preserved_path: None,
+            retirement: None,
+            prepared: None,
+            preserved: None,
+            installed: None,
+        });
+        db.begin_primary_layout(op.clone()).await.unwrap();
+        let mut current = op.members[0].record.clone().unwrap();
+        current.filename = "older-name.HEIC".into();
+        db.upsert_seen(&current).await.unwrap();
+        let mut original = current.clone();
+        original.version_size = VersionSizeKey::Original;
+        original.checksum = old.provider_checksum.clone().into();
+        db.upsert_seen(&original).await.unwrap();
+        db.mark_downloaded(
+            &op.library,
+            &op.child,
+            "original",
+            &root.path().join("wrong-path"),
+            "wrong-checksum",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(db.capture_layout_recovery(op).await.is_err());
     }
 
     #[tokio::test]

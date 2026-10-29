@@ -381,8 +381,13 @@ async fn download_photos_with_sync_inner(
         // Finish only previously recorded operations. Incomplete provider
         // listings cannot authorize new layout plans or checkpoint retirement.
         if controls.run_mode.downloads_files() {
-            super::primary_layout::recover(download_client, passes, &config, &shutdown_token)
-                .await?;
+            Box::pin(super::primary_layout::recover(
+                download_client,
+                passes,
+                &config,
+                &shutdown_token,
+            ))
+            .await?;
         }
         // Do not turn incomplete listings/lookups into deletion, membership,
         // generation activation, retry retirement, or incremental evidence.
@@ -412,7 +417,13 @@ async fn download_photos_with_sync_inner(
             0
         };
     if controls.run_mode.downloads_files() {
-        super::primary_layout::recover(download_client, passes, &config, &shutdown_token).await?;
+        Box::pin(super::primary_layout::recover(
+            download_client,
+            passes,
+            &config,
+            &shutdown_token,
+        ))
+        .await?;
     }
     if controls.run_mode.downloads_files() {
         cleanup_orphan_part_files(&config).await;

@@ -1127,6 +1127,30 @@ pub(in crate::download) async fn finish(
     cancel: &CancellationToken,
     outcome: &mut LayoutOutcome,
 ) -> Result<()> {
+    finish_with_recovery(db, op, cancel, outcome, None).await
+}
+
+async fn save_recovery(
+    db: &dyn DownloadStore,
+    op: &LayoutOperation,
+    proof: Option<&crate::state::db::primary_layout::LayoutRecoverySnapshot>,
+) -> Result<()> {
+    if let Some(proof) = proof {
+        db.save_primary_layout_with_recovery(op.clone(), proof.clone())
+            .await?;
+    } else {
+        db.save_primary_layout(op.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn finish_with_recovery(
+    db: &dyn DownloadStore,
+    op: &mut LayoutOperation,
+    cancel: &CancellationToken,
+    outcome: &mut LayoutOutcome,
+    proof: Option<&crate::state::db::primary_layout::LayoutRecoverySnapshot>,
+) -> Result<()> {
     let root = op.root.to_path();
     let mut paths: Vec<_> = op
         .members
@@ -1192,12 +1216,12 @@ pub(in crate::download) async fn finish(
             sidecar: xmp,
             ..old.clone()
         });
-        db.save_primary_layout(op.clone()).await?;
+        save_recovery(db, op, proof).await?;
         outcome.preserved += 1;
     }
     if op.phase != "publishing" {
         op.phase = "preserved".into();
-        db.save_primary_layout(op.clone()).await?;
+        save_recovery(db, op, proof).await?;
         #[cfg(all(test, target_os = "linux"))]
         crate::test_helpers::process_death_point("layout-preserved");
         anyhow::ensure!(
@@ -1205,7 +1229,7 @@ pub(in crate::download) async fn finish(
             "Primary layout interrupted before publication"
         );
         op.phase = "publishing".into();
-        db.save_primary_layout(op.clone()).await?;
+        save_recovery(db, op, proof).await?;
     }
     for index in 0..op.members.len() {
         let member = op.members.get(index).context("Layout member disappeared")?;
@@ -1219,6 +1243,10 @@ pub(in crate::download) async fn finish(
             )
             .await?;
             continue;
+        }
+        if let Some(proof) = proof {
+            db.save_primary_layout_with_recovery(op.clone(), proof.clone())
+                .await?;
         }
         if let (Some(target), Some(prepared)) = (&member.destination, &member.prepared) {
             let target = target.to_path();
@@ -1329,7 +1357,7 @@ pub(in crate::download) async fn finish(
                 sidecar: xmp,
                 ..prepared.clone()
             });
-            db.save_primary_layout(op.clone()).await?;
+            save_recovery(db, op, proof).await?;
             #[cfg(all(test, target_os = "linux"))]
             crate::test_helpers::process_death_point("layout-member-published");
         }
@@ -1360,7 +1388,12 @@ pub(in crate::download) async fn finish(
             validate_file(&root, file).await?;
         }
     }
-    db.commit_primary_layout(op.clone()).await?;
+    if let Some(proof) = proof {
+        db.commit_primary_layout_with_recovery(op.clone(), proof.clone())
+            .await?;
+    } else {
+        db.commit_primary_layout(op.clone()).await?;
+    }
     op.phase = "committed".into();
     #[cfg(all(test, target_os = "linux"))]
     crate::test_helpers::process_death_point("layout-committed");
@@ -2185,6 +2218,145 @@ async fn prepare_recorded_refresh(
     Ok(sources)
 }
 
+async fn confirm_recorded_recovery(
+    db: &dyn DownloadStore,
+    op: &LayoutOperation,
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+) -> Result<Option<crate::state::db::primary_layout::LayoutRecoverySnapshot>> {
+    let Some(proof) = db.capture_layout_recovery(op.clone()).await? else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        matches!(op.phase.as_str(), "prepared" | "preserved" | "publishing"),
+        "Recorded observation conflict requires prepared recovery"
+    );
+    let mut matches = passes
+        .iter()
+        .filter(|pass| super::generation::pass_key(pass) == op.pass);
+    let pass = matches
+        .next()
+        .context("Recorded recovery has no matching current pass")?;
+    anyhow::ensure!(
+        matches.next().is_none(),
+        "Recorded recovery pass is ambiguous"
+    );
+    let current = config.with_pass(pass);
+    anyhow::ensure!(
+        current.library.as_ref() == op.source_library
+            && SelectionPath::from_path(&std::path::absolute(&current.directory)?) == op.root
+            && policy(&current) == op.policy
+            && crate::download::pipeline::MetadataFlags::from(&current).bits() == op.metadata_flags,
+        "Recorded recovery options or source changed"
+    );
+    let (capture, _, _) = pass
+        .album
+        .publication_scope(&op.library)?
+        .context("Recorded recovery lacks authenticated scope")?;
+    let source = Arc::clone(&capture.db) as Arc<dyn DownloadStore>;
+    anyhow::ensure!(
+        current
+            .state_db
+            .as_ref()
+            .is_some_and(|state| Arc::ptr_eq(state, &source)),
+        "Recorded recovery account context changed"
+    );
+    let asset = pass
+        .album
+        .confirm_layout_asset(&op.asset_record_name, &op.library)
+        .await?
+        .asset;
+    anyhow::ensure!(
+        proof.matches_master(asset.id())
+            && asset.asset_record_name() == op.asset_record_name
+            && asset.state_id() == op.child
+            && asset.source_zone() == Some(op.library.as_str())
+            && family(&asset, &current)? == op.family
+            && decision(&asset, &current)? == op.decision,
+        "Recorded recovery provider facts changed"
+    );
+    let paths = filter::derive_expected_paths(&asset, &current);
+    let selected: Vec<_> = op
+        .members
+        .iter()
+        .filter_map(|member| member.record.as_ref().map(|record| (member, record)))
+        .collect();
+    anyhow::ensure!(
+        selected.len() == paths.len(),
+        "Recorded recovery selection changed"
+    );
+    for derived in paths {
+        let destination = qualified_path(&derived.path, &op.qualifier, derived.naming_role)?;
+        let matching: Vec<_> = selected
+            .iter()
+            .filter(|(member, record)| {
+                record.version_size == derived.version_size
+                    && record.checksum.as_ref() == derived.checksum.as_ref()
+                    && record.size_bytes == derived.size
+                    && member
+                        .destination
+                        .as_ref()
+                        .is_some_and(|path| path.to_path() == destination)
+            })
+            .collect();
+        anyhow::ensure!(
+            matching.len() == 1,
+            "Recorded recovery destination or resource changed"
+        );
+        let (_, recorded) = matching
+            .first()
+            .context("Missing confirmed recovery selection")?;
+        let task = task_for(
+            &asset,
+            &current,
+            &derived.url,
+            &derived.checksum,
+            derived.size,
+            derived.version_size,
+            &destination,
+        );
+        let observed = planner::pending_record_for_task(&current, &asset, &task);
+        anyhow::ensure!(
+            recorded.library == observed.library
+                && recorded.id == observed.id
+                && recorded.version_size == observed.version_size
+                && recorded.checksum == observed.checksum
+                && recorded.filename == observed.filename
+                && recorded.size_bytes == observed.size_bytes
+                && recorded.media_type == observed.media_type
+                && recorded.created_at == observed.created_at
+                && recorded.added_at == observed.added_at
+                && serde_json::to_value(&recorded.metadata)?
+                    == serde_json::to_value(&observed.metadata)?,
+            "Recorded recovery provider metadata changed"
+        );
+    }
+    for member in &op.members {
+        if member.record.is_none()
+            && let Some(source) = &member.archive_source
+        {
+            let original = source.path.to_path();
+            let filename = original
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("Recorded archive filename unavailable")?;
+            let expected = original.with_file_name(crate::download::paths::role_filename(
+                filename,
+                "",
+                "_original",
+            ));
+            anyhow::ensure!(
+                member
+                    .destination
+                    .as_ref()
+                    .is_some_and(|path| path.to_path() == expected),
+                "Recorded archive destination changed"
+            );
+        }
+    }
+    Ok(Some(proof))
+}
+
 pub(super) async fn recover(
     _client: &reqwest::Client,
     passes: &[crate::commands::AlbumPass],
@@ -2208,17 +2380,29 @@ pub(super) async fn recover(
         return Ok(());
     }
     for mut op in operations {
+        let proof = if matches!(op.phase.as_str(), "prepared" | "preserved" | "publishing") {
+            Box::pin(confirm_recorded_recovery(db, &op, passes, config)).await?
+        } else {
+            None
+        };
         if op.phase == "publishing" {
             // Publication may already have consumed a stage. Its existing
             // recovery handles installed links and repeats the catalogue guard.
-            db.save_primary_layout(op.clone()).await?;
+            save_recovery(db, &op, proof.as_ref()).await?;
             let protected =
                 crate::download::legacy_preservation::protected_replacement_paths(Some(db)).await?;
             if file::recover_conditional_replacements(&op.root.to_path(), &protected).await? > 0 {
                 tracing::warn!("Recorded layout retains protected replacement journals");
                 continue;
             }
-            finish(db, &mut op, cancel, &mut LayoutOutcome::default()).await?;
+            finish_with_recovery(
+                db,
+                &mut op,
+                cancel,
+                &mut LayoutOutcome::default(),
+                proof.as_ref(),
+            )
+            .await?;
             continue;
         }
         if op.phase == "planned"
@@ -2353,7 +2537,7 @@ pub(super) async fn recover(
         }
         // Even a same-phase save validates current catalogue facts atomically.
         // A changed pass/root never cancels the operation or invents a successor.
-        db.save_primary_layout(op.clone()).await?;
+        save_recovery(db, &op, proof.as_ref()).await?;
         #[cfg(all(test, target_os = "linux"))]
         crate::test_helpers::process_death_point("layout-recovery-prepared");
         let protected =
@@ -2362,7 +2546,14 @@ pub(super) async fn recover(
             tracing::warn!("Recorded layout retains protected replacement journals");
             continue;
         }
-        finish(db, &mut op, cancel, &mut LayoutOutcome::default()).await?;
+        finish_with_recovery(
+            db,
+            &mut op,
+            cancel,
+            &mut LayoutOutcome::default(),
+            proof.as_ref(),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -2398,6 +2589,130 @@ pub(crate) mod tests {
         library: &str,
     ) -> LayoutOperation {
         prepared_layout_with_refresh(db, root, filename, library, false).await
+    }
+
+    pub(crate) async fn probe_recorded_recovery_gate(
+        config: &DownloadConfig,
+        pass: &crate::commands::AlbumPass,
+    ) -> anyhow::Result<()> {
+        let db = config.state_db.as_deref().unwrap();
+        let mut pending = db
+            .primary_layout_operations(config.library.to_string())
+            .await?;
+        anyhow::ensure!(pending.len() == 1, "expected one synthetic operation");
+        super::confirm_recorded_recovery(
+            db,
+            &pending.remove(0),
+            std::slice::from_ref(pass),
+            config,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Build an equivalent prepared edited-family journal through the real
+    /// planner and preparation owner for portable compatibility tests.
+    pub(crate) async fn seed_prepared_edited_compat(
+        config: &DownloadConfig,
+        pass: &crate::commands::AlbumPass,
+    ) -> LayoutOperation {
+        let config = config.with_pass(pass).check_ownership().await.unwrap();
+        let asset = pass
+            .album
+            .confirm_layout_asset("asset-501", "PrimarySync")
+            .await
+            .unwrap()
+            .asset;
+        let db = config.state_db.as_deref().unwrap();
+        let session = LayoutSession::load(db).await.unwrap();
+        let key = family(&asset, &config).unwrap();
+        let binding = db.primary_layout_binding(key.clone()).await.unwrap();
+        let mut op = plan(
+            &asset,
+            &config,
+            &session,
+            binding.as_ref(),
+            key,
+            decision(&asset, &config).unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+        for member in &op.members {
+            if let Some(record) = &member.record {
+                db.upsert_seen(record).await.unwrap();
+            }
+        }
+        super::prepare(
+            &reqwest::Client::new(),
+            &asset,
+            &config,
+            &session,
+            &mut op,
+            &CancellationToken::new(),
+            &mut LayoutOutcome::default(),
+        )
+        .await
+        .unwrap();
+        op.phase = "prepared".into();
+        db.save_primary_layout(op.clone()).await.unwrap();
+        op
+    }
+
+    /// Stop after the first create-only member has been installed and its
+    /// receipt persisted, matching the released publishing-phase boundary.
+    pub(crate) async fn seed_partly_published_compat(
+        config: &DownloadConfig,
+        op: &mut LayoutOperation,
+    ) {
+        let db = config.state_db.as_deref().unwrap();
+        let root = op.root.to_path();
+        for index in 0..op.members.len() {
+            let member = &op.members[index];
+            if let Some(old) = &member.old {
+                let path = member.preserved_path.as_ref().unwrap().to_path();
+                let fingerprint =
+                    super::copy_verified(&root, &old.path.to_path(), &path, &old.fingerprint)
+                        .await
+                        .unwrap();
+                assert!(old.sidecar.is_none());
+                let mut receipt = old.clone();
+                receipt.path =
+                    crate::state::db::provider_selection::SelectionPath::from_path(&path);
+                receipt.fingerprint = fingerprint;
+                op.members[index].preserved = Some(receipt);
+                db.save_primary_layout(op.clone()).await.unwrap();
+            }
+        }
+        op.phase = "preserved".into();
+        db.save_primary_layout(op.clone()).await.unwrap();
+        op.phase = "publishing".into();
+        db.save_primary_layout(op.clone()).await.unwrap();
+        let index = op
+            .members
+            .iter()
+            .position(|member| {
+                member.destination.is_some() && member.old.is_none() && member.prepared.is_some()
+            })
+            .unwrap();
+        let member = &op.members[index];
+        let target = member.destination.as_ref().unwrap().to_path();
+        let prepared = member.prepared.as_ref().unwrap().clone();
+        let installed = crate::download::file::primary_layout::publish(
+            &root,
+            &prepared.path.to_path(),
+            &target,
+            &prepared.fingerprint,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut receipt = prepared.clone();
+        receipt.path = crate::state::db::provider_selection::SelectionPath::from_path(&target);
+        receipt.fingerprint = installed;
+        op.members[index].installed = Some(receipt);
+        db.save_primary_layout(op.clone()).await.unwrap();
+        assert!(!prepared.path.to_path().exists());
     }
 
     pub(crate) async fn seed_unprepared_refresh(
