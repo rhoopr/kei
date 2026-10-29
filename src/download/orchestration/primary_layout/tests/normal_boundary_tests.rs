@@ -1479,3 +1479,197 @@ async fn v027_recorded_journal_commit_cannot_replace_observation_arriving_after_
         );
     }
 }
+
+#[tokio::test]
+async fn recorded_owned_refresh_holds_modified_or_foreign_destination_then_recovers() {
+    use crate::state::DownloadStateStore as _;
+
+    for conflict in ["local-modification", "foreign-destination"] {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.sqlite");
+        let root = dir.path().join("old-root");
+        std::fs::create_dir(&root).unwrap();
+        let db = Arc::new(SqliteStateDb::open(&state).await.unwrap());
+        let media = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/media/metadata.jpg"
+        ));
+        let asset = TestPhotoAsset::new("recorded-owned")
+            .filename("owned.JPG")
+            .item_type("public.jpeg")
+            .orig_file_type("public.jpeg")
+            .orig_size(media.len() as u64)
+            .orig_checksum("synthetic-provider-checksum")
+            .orig_url("http://127.0.0.1/unused")
+            .build()
+            .with_source_zone("PrimarySync".into());
+        let config = DownloadConfig {
+            directory: Arc::from(root.as_path()),
+            folder_structure: String::new(),
+            edited_naming: EditedNaming::Primary,
+            refresh_metadata: true,
+            state_db: Some(db.clone()),
+            ..DownloadConfig::test_default()
+        };
+        let derived = crate::download::filter::derive_expected_paths(&asset, &config).remove(0);
+        std::fs::write(&derived.path, media).unwrap();
+        let task = super::super::task_for(
+            &asset,
+            &config,
+            &derived.url,
+            &derived.checksum,
+            derived.size,
+            derived.version_size,
+            &derived.path,
+        );
+        let record = crate::download::planner::pending_record_for_task(&config, &asset, &task);
+        db.upsert_seen(&record).await.unwrap();
+        let checksum = super::digest(media);
+        db.mark_verified_download(
+            "PrimarySync",
+            asset.state_id(),
+            derived.version_size.as_str(),
+            &derived.path,
+            &checksum,
+            Some(&checksum),
+            false,
+        )
+        .await
+        .unwrap();
+        let config = config.check_ownership().await.unwrap();
+        let session = super::LayoutSession::load(db.as_ref()).await.unwrap();
+        let mut op = super::plan(
+            &asset,
+            &config,
+            &session,
+            None,
+            super::family(&asset, &config).unwrap(),
+            super::decision(&asset, &config).unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(op.refresh_metadata);
+        assert!(op.members[0].old.is_some());
+        super::super::prepare(
+            &reqwest::Client::new(),
+            &asset,
+            &config,
+            &session,
+            &mut op,
+            &CancellationToken::new(),
+            &mut super::LayoutOutcome::default(),
+        )
+        .await
+        .unwrap();
+        op.phase = "prepared".into();
+        db.save_primary_layout(op.clone()).await.unwrap();
+        let stage = op.members[0].stage.as_ref().unwrap().to_path();
+        let prepared = serde_json::to_value(&op.members[0].prepared).unwrap();
+        let old = serde_json::to_value(&op.members[0].old).unwrap();
+        let staged_bytes = std::fs::read(&stage).unwrap();
+        let displaced = dir.path().join("displaced-owned.JPG");
+        let foreign_saved = dir.path().join("foreign-preserved.JPG");
+        if conflict == "local-modification" {
+            std::fs::write(&derived.path, b"local user changes").unwrap();
+        } else {
+            std::fs::rename(&derived.path, &displaced).unwrap();
+            std::fs::write(&derived.path, b"foreign occupant").unwrap();
+        }
+        drop(config);
+        drop(db);
+        for _ in 0..2 {
+            let db = Arc::new(SqliteStateDb::open(&state).await.unwrap());
+            let config = DownloadConfig {
+                directory: dir.path().join("new-root").into(),
+                state_db: Some(db.clone()),
+                ..DownloadConfig::test_default()
+            };
+            assert!(!config.refresh_metadata);
+            let result = crate::download::recover_recorded_sources(
+                &reqwest::Client::new(),
+                &[recorded_recovery_pass()],
+                Arc::new(config),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(!result.complete, "{conflict}");
+            assert!(result.stats.failed > 0, "{conflict}");
+            let held = db
+                .primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap();
+            assert_eq!(held.len(), 1);
+            assert!(held[0].refresh_metadata);
+            assert_eq!(serde_json::to_value(&held[0].members[0].old).unwrap(), old);
+            assert_eq!(
+                serde_json::to_value(&held[0].members[0].prepared).unwrap(),
+                prepared
+            );
+            assert_eq!(std::fs::read(&stage).unwrap(), staged_bytes);
+            if conflict == "local-modification" {
+                assert_eq!(std::fs::read(&derived.path).unwrap(), b"local user changes");
+            } else {
+                assert_eq!(std::fs::read(&derived.path).unwrap(), b"foreign occupant");
+                assert_eq!(std::fs::read(&displaced).unwrap(), media);
+            }
+        }
+        if conflict == "local-modification" {
+            std::fs::write(&derived.path, media).unwrap();
+        } else {
+            std::fs::rename(&derived.path, &foreign_saved).unwrap();
+            std::fs::rename(&displaced, &derived.path).unwrap();
+        }
+        let mut completed = None;
+        for _ in 0..2 {
+            let db = Arc::new(SqliteStateDb::open(&state).await.unwrap());
+            let config = DownloadConfig {
+                directory: dir.path().join("new-root").into(),
+                state_db: Some(db.clone()),
+                ..DownloadConfig::test_default()
+            };
+            let result = crate::download::recover_recorded_sources(
+                &reqwest::Client::new(),
+                &[recorded_recovery_pass()],
+                Arc::new(config),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(result.complete, "{conflict}");
+            assert_eq!(result.stats.failed, 0);
+            assert_eq!(std::fs::read(&derived.path).unwrap(), media);
+            if conflict == "foreign-destination" {
+                assert_eq!(std::fs::read(&foreign_saved).unwrap(), b"foreign occupant");
+            }
+            assert!(
+                db.primary_layout_operations("PrimarySync".into())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let manifest = db.get_manifest_assets().await.unwrap();
+            let receipts: Vec<_> = manifest
+                .iter()
+                .flat_map(|row| &row.preserved_files)
+                .collect();
+            assert_eq!(receipts.len(), 1);
+            let receipt = receipts[0];
+            assert_eq!(receipt.operation, op.operation);
+            assert_eq!(receipt.family, op.family);
+            assert_eq!(receipt.previous_generation, op.generation);
+            assert_eq!(receipt.phase, "committed");
+            assert_eq!(receipt.provider_checksum, "synthetic-provider-checksum");
+            assert_eq!(receipt.local_checksum, checksum);
+            assert_eq!(receipt.source_checksum.as_deref(), Some(checksum.as_str()));
+            assert_eq!(receipt.size_bytes, media.len() as u64);
+            assert_eq!(std::fs::read(receipt.native_path.to_path()).unwrap(), media);
+            let snapshot = durable_state(&db);
+            if let Some(previous) = &completed {
+                assert_eq!(&snapshot, previous, "quiet reopen changed durable state");
+            }
+            completed = Some(snapshot);
+        }
+    }
+}

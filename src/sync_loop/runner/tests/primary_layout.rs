@@ -747,7 +747,96 @@ async fn naming_switch_preserves_existing_paths_without_redownload() {
 }
 
 #[tokio::test]
-async fn primary_layout_foreign_collision_and_local_modification_hold() {
+async fn ordinary_naming_change_does_not_initiate_layout_migration() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let current = records(&server, Some(("edit-one", EDIT_ONE)));
+    let (initial, _) = cycle(root.path(), current.clone(), true, EditedNaming::Suffix).await;
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    assert!(initial.db_sync_token_advance_safe);
+    assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+    assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_ONE);
+    let requests = server.received_requests().await.unwrap().len();
+    for _ in 0..2 {
+        let (result, _) = cycle(root.path(), current.clone(), true, EditedNaming::Primary).await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_ONE);
+        assert!(!media.join("IMG_0501_original.JPG").exists());
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations"
+            ),
+            0
+        );
+        assert_eq!(
+            db_count(root.path(), "SELECT COUNT(*) FROM primary_layout_bindings"),
+            0
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    }
+}
+
+#[tokio::test]
+async fn current_unverified_primary_candidate_is_held_across_reopen() {
+    use sha1::{Digest as _, Sha1};
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    std::fs::create_dir(&media).unwrap();
+    let foreign = media.join("IMG_0501.JPG");
+    std::fs::write(&foreign, b"foreign primary bytes").unwrap();
+    let mtime = std::fs::metadata(&foreign).unwrap().modified().unwrap();
+    let mut current = records(&server, Some(("edit-one", EDIT_ONE)));
+    let signature = |bytes: &[u8]| {
+        let mut hash = Sha1::new();
+        hash.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+        hash.update(bytes);
+        base64::engine::general_purpose::STANDARD.encode([&[1][..], &hash.finalize()[..]].concat())
+    };
+    current[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(signature(ORIGINAL));
+    current[1]["fields"]["resJPEGFullRes"]["value"]["fileChecksum"] = json!(signature(EDIT_ONE));
+    for _ in 0..2 {
+        let (result, _) = cycle(root.path(), current.clone(), true, EditedNaming::Primary).await;
+        assert!(
+            result.failed_count > 0 || result.stats.skipped.uncertain > 0,
+            "unverified candidate must remain visible: {result:?}"
+        );
+        assert_eq!(result.stats.downloaded, 0);
+        assert_bytes(&foreign, b"foreign primary bytes");
+        assert_eq!(
+            std::fs::metadata(&foreign).unwrap().modified().unwrap(),
+            mtime
+        );
+        assert_eq!(std::fs::read_dir(&media).unwrap().count(), 1);
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert!(!db.get_pending().await.unwrap().is_empty());
+        assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
+        drop(db);
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations"
+            ),
+            0
+        );
+        assert_eq!(
+            db_count(root.path(), "SELECT COUNT(*) FROM primary_layout_bindings"),
+            0
+        );
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 0);
+}
+
+// Unresolved: retain runner checkpoint veto and independent original/edit bytes
+// until a recorded edited-family operation replaces this retired setup.
+#[tokio::test]
+async fn unresolved_recorded_edited_family_local_modification_holds_runner_checkpoint() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
