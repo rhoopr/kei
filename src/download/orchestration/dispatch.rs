@@ -323,6 +323,11 @@ pub async fn download_photos_with_sync(
             1
         }
     };
+    let recorded_conflicts = if controls.run_mode.downloads_files() {
+        0
+    } else {
+        super::primary_layout::inspect_recorded_conflicts(&config).await?
+    };
     let mut result = Box::pin(download_photos_with_sync_inner(
         download_client,
         passes,
@@ -331,6 +336,16 @@ pub async fn download_photos_with_sync(
         shutdown_token,
     ))
     .await?;
+    if recorded_conflicts > 0 {
+        result.stats.failed += recorded_conflicts;
+        result.outcome = merge_download_outcomes(
+            &result.outcome,
+            &DownloadOutcome::PartialFailure {
+                failed_count: recorded_conflicts,
+            },
+        );
+        result.block_incremental_token(super::models::RECORDED_LAYOUT_CONFLICT_REASON);
+    }
     if remaining > 0 {
         // Explicit work inside the cycle may have settled the same old owner.
         remaining = super::generation::prepared_remaining(passes, &config)

@@ -1568,6 +1568,17 @@ async fn recorded_owned_refresh_holds_modified_or_foreign_destination_then_recov
         let prepared = serde_json::to_value(&op.members[0].prepared).unwrap();
         let old = serde_json::to_value(&op.members[0].old).unwrap();
         let staged_bytes = std::fs::read(&stage).unwrap();
+        let inspection_config = DownloadConfig {
+            directory: dir.path().join("new-root").into(),
+            state_db: Some(db.clone()),
+            ..DownloadConfig::test_default()
+        };
+        assert_eq!(
+            super::super::inspect_recorded_conflicts(&inspection_config)
+                .await
+                .unwrap(),
+            0
+        );
         let displaced = dir.path().join("displaced-owned.JPG");
         let foreign_saved = dir.path().join("foreign-preserved.JPG");
         if conflict == "local-modification" {
@@ -1576,6 +1587,23 @@ async fn recorded_owned_refresh_holds_modified_or_foreign_destination_then_recov
             std::fs::rename(&derived.path, &displaced).unwrap();
             std::fs::write(&derived.path, b"foreign occupant").unwrap();
         }
+        let before_inspection = durable_state(&db);
+        assert_eq!(
+            super::super::inspect_recorded_conflicts(&inspection_config)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            durable_state(&db),
+            before_inspection,
+            "inspection cannot change the recorded owner"
+        );
+        assert!(
+            !inspection_config.directory.exists(),
+            "inspection uses the recorded root"
+        );
+        drop(inspection_config);
         drop(config);
         drop(db);
         for _ in 0..2 {
@@ -1672,4 +1700,44 @@ async fn recorded_owned_refresh_holds_modified_or_foreign_destination_then_recov
             completed = Some(snapshot);
         }
     }
+}
+
+#[tokio::test]
+async fn read_only_recorded_inspection_selects_only_evidence_needed_by_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open(&dir.path().join("state.sqlite"))
+            .await
+            .unwrap(),
+    );
+    let mut op =
+        prepared_layout_with_refresh(&db, dir.path(), "phase.JPG", "PrimarySync", true).await;
+    let original = op.members[0].prepared.clone().unwrap();
+    op.members[0].old = Some(original.clone());
+    op.members[0].archive_source = Some(original.clone());
+    op.members[0].preserved = Some(original);
+    op.phase = "planned".into();
+    op.members[0].prepared = None;
+    assert_eq!(
+        super::super::recorded_inspection_evidence(&op).len(),
+        2,
+        "an unprepared refresh requires both retained sources"
+    );
+    op.phase = "prepared".into();
+    assert!(
+        super::super::recorded_inspection_evidence(&op).is_empty(),
+        "a prepared archive and preserved old file do not need their old source"
+    );
+    op.members[0].preserved = None;
+    let files = super::super::recorded_inspection_evidence(&op);
+    assert_eq!(files.len(), 1);
+    assert!(
+        std::ptr::eq(files[0], op.members[0].old.as_ref().unwrap()),
+        "the unpreserved old owner still needs validation"
+    );
+    op.phase = "publishing".into();
+    assert!(
+        super::super::recorded_inspection_evidence(&op).is_empty(),
+        "publication may have legitimately replaced old paths"
+    );
 }

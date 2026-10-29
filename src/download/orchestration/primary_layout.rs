@@ -182,6 +182,74 @@ async fn validate_file(root: &Path, file: &LayoutFile) -> Result<()> {
     Ok(())
 }
 
+fn recorded_inspection_evidence(op: &LayoutOperation) -> Vec<&LayoutFile> {
+    if !matches!(op.phase.as_str(), "planned" | "prepared") {
+        return Vec::new();
+    }
+    let needs_preparation = op.phase == "planned"
+        && op.refresh_metadata
+        && op
+            .members
+            .iter()
+            .any(|member| member.stage.is_some() && member.prepared.is_none());
+    op.members
+        .iter()
+        .flat_map(|member| {
+            member
+                .old
+                .as_ref()
+                .filter(|_| needs_preparation || member.preserved.is_none())
+                .into_iter()
+                .chain(member.archive_source.as_ref().filter(|_| needs_preparation))
+        })
+        .collect()
+}
+
+/// Inspect only unpreserved recorded owners. This reports conflicts without
+/// advancing the journal or authorizing any filesystem mutation.
+pub(super) async fn inspect_recorded_conflicts(config: &DownloadConfig) -> Result<usize> {
+    let Some(db) = config.state_db.as_deref() else {
+        return Ok(0);
+    };
+    let library = config.library.to_string();
+    let operations = db.primary_layout_operations(library.clone()).await?;
+    let mut conflicts = 0;
+    for op in operations {
+        let root = op.root.to_path();
+        let mut failure = None;
+        for file in recorded_inspection_evidence(&op) {
+            if let Err(error) = validate_file(&root, file).await {
+                failure = Some(error);
+                break;
+            }
+        }
+        let Some(error) = failure else { continue };
+        // A concurrent publisher may have advanced the operation after the
+        // snapshot. Report that observation as inconclusive, not as proof of
+        // a changed file; no recorded state is modified by inspection.
+        let latest = db.primary_layout_operations(library.clone()).await?;
+        let unchanged = match latest
+            .iter()
+            .find(|candidate| candidate.operation == op.operation)
+        {
+            Some(candidate) => serde_json::to_vec(candidate)? == serde_json::to_vec(&op)?,
+            None => false,
+        };
+        if unchanged {
+            tracing::debug!(%error, "Recorded layout owner verification failed");
+            tracing::warn!(
+                "[PLAN] Recorded layout owner cannot be verified; files and intent remain unchanged"
+            );
+        } else {
+            tracing::warn!(
+                "[PLAN] Recorded layout changed during inspection; retry to verify its owner"
+            );
+        }
+        conflicts += 1;
+    }
+    Ok(conflicts)
+}
+
 fn qualified_path(path: &Path, qualifier: &str, role: filter::NamingRole) -> Result<PathBuf> {
     let name = path
         .file_name()

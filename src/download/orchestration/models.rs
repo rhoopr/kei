@@ -684,6 +684,8 @@ pub(super) const SMART_FOLDER_REFRESH_FAILED_REASON: &str = "smart_folder_refres
 
 pub(super) const TARGETED_ALBUM_BACKFILL_FAILED_REASON: &str = "targeted_album_backfill_failed";
 
+pub(super) const RECORDED_LAYOUT_CONFLICT_REASON: &str = "recorded_layout_conflict";
+
 pub(in crate::download) const PENDING_RETRY_UNMATCHED_REASON: &str = "pending_retry_unmatched";
 
 const PAGINATION_SHORTFALL_REASON: &str = "pagination_shortfall";
@@ -709,6 +711,7 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
         | SMART_FOLDER_REFRESH_FAILED_REASON
         | TARGETED_ALBUM_BACKFILL_FAILED_REASON
         | PENDING_RETRY_UNMATCHED_REASON
+        | RECORDED_LAYOUT_CONFLICT_REASON
         | "selection_generation_deferred" => "kei",
         INCREMENTAL_DELETE_ZERO_ROWS_REASON
         | INCREMENTAL_HIDDEN_ZERO_ROWS_REASON
@@ -727,6 +730,9 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
 
 pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
     match reason {
+        RECORDED_LAYOUT_CONFLICT_REASON => {
+            "kei could not verify a recorded layout owner during read-only inspection"
+        }
         "selection_generation_deferred" => {
             "kei retained unfinished selected destination or identity work, so it held token advancement"
         }

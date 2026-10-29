@@ -1795,53 +1795,159 @@ async fn primary_layout_read_only_conflict_discloses_and_keeps_local_changes() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
-    let edited = records(&server, Some(("edit-one", EDIT_ONE)));
-    let (first, _) = cycle(root.path(), edited.clone(), false, EditedNaming::Primary).await;
-    assert_eq!(first.failed_count, 0);
-    std::fs::write(media.join("IMG_0501.JPG"), b"local user changes").unwrap();
-    let operations = db_count(
-        root.path(),
-        "SELECT COUNT(*) FROM primary_layout_operations",
-    );
-    let claims = db_count(root.path(), "SELECT COUNT(*) FROM primary_layout_claims");
+    let current = records(&server, Some(("edit-one", EDIT_ONE)));
+    let (initial, _) = cycle(root.path(), current.clone(), true, EditedNaming::Suffix).await;
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    assert!(initial.db_sync_token_advance_safe);
+    let original = media.join("IMG_0501.JPG");
+    let edited = media.join("IMG_0501_edited.JPG");
+    assert_bytes(&original, ORIGINAL);
+    assert_bytes(&edited, EDIT_ONE);
     let requests = server.received_requests().await.unwrap().len();
-    for run_mode in [
-        download::DownloadRunMode::DryRun,
-        download::DownloadRunMode::PrintFilenames,
-    ] {
-        let (result, _) = cycle_options(
-            root.path(),
-            edited.clone(),
-            false,
-            EditedNaming::Primary,
-            CycleOptions {
-                controls: download::DownloadControls::new(
-                    run_mode,
-                    download::DownloadReporting::hidden(),
-                ),
-                ..CycleOptions::default()
-            },
-        )
-        .await;
-        assert!(!result.db_sync_token_advance_safe);
-        assert!(
-            result.stats.enumeration_errors > 0,
-            "conflict was silently skipped"
-        );
-        assert_bytes(&media.join("IMG_0501.JPG"), b"local user changes");
-        assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
-        assert_eq!(
-            db_count(
+    let provider = Session {
+        records: current.clone(),
+        quiet: true,
+        lookups: Arc::new(AtomicUsize::new(0)),
+        current: None,
+        lookup_change: None,
+        indexing: None,
+    };
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: make_full_album_with_boxed_session("PrimarySync", Box::new(provider)),
+        exclude_ids: Arc::default(),
+    };
+    let db = Arc::new(
+        state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap(),
+    );
+    let checkpoint = db.get_metadata("sync_token:PrimarySync").await.unwrap();
+    assert!(checkpoint.is_some());
+    let store: Arc<dyn download::DownloadStore> = db.clone();
+    let base = make_run_cycle_download_config_builder(&media, store);
+    let mut config = base(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from("PrimarySync"),
+    )
+    .as_ref()
+    .clone();
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    config.edited_naming = EditedNaming::Suffix;
+    config.refresh_metadata = true;
+    let operation = download::seed_unprepared_refresh(&config, &pass).await;
+    assert!(operation.refresh_metadata);
+    let before = serde_json::to_value(&operation).unwrap();
+    let claims = db_count(root.path(), "SELECT COUNT(*) FROM primary_layout_claims");
+    drop(config);
+    drop(base);
+    drop(db);
+    let displaced = root.path().join("temporarily-missing-edited.JPG");
+    let sidecar = media.join("IMG_0501_edited.JPG.xmp");
+    for scenario in ["clean", "local-change", "missing", "sidecar-change"] {
+        match scenario {
+            "local-change" => std::fs::write(&edited, b"local user changes").unwrap(),
+            "missing" => std::fs::rename(&edited, &displaced).unwrap(),
+            "sidecar-change" => std::fs::write(&sidecar, b"new foreign sidecar").unwrap(),
+            _ => {}
+        }
+        for run_mode in [
+            download::DownloadRunMode::DryRun,
+            download::DownloadRunMode::PrintFilenames,
+        ] {
+            let (result, _) = try_cycle_options(
                 root.path(),
-                "SELECT COUNT(*) FROM primary_layout_operations"
-            ),
-            operations
-        );
-        assert_eq!(
-            db_count(root.path(), "SELECT COUNT(*) FROM primary_layout_claims"),
-            claims
-        );
+                current.clone(),
+                true,
+                EditedNaming::Suffix,
+                CycleOptions {
+                    controls: download::DownloadControls::new(
+                        run_mode,
+                        download::DownloadReporting::hidden(),
+                    ),
+                    ..CycleOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!result.db_sync_token_advance_safe);
+            if scenario == "clean" {
+                assert_eq!(result.failed_count, 0, "clean recorded owner: {result:?}");
+            } else {
+                assert_eq!(result.failed_count, 1, "{scenario}: {result:?}");
+                assert_eq!(result.stats.failed, 1, "{scenario}");
+                assert_eq!(
+                    result.stats.sync_token_blocked_reason,
+                    Some("recorded_layout_conflict")
+                );
+            }
+            assert_bytes(&original, ORIGINAL);
+            match scenario {
+                "local-change" => assert_bytes(&edited, b"local user changes"),
+                "missing" => {
+                    assert!(!edited.exists());
+                    assert_bytes(&displaced, EDIT_ONE);
+                }
+                "sidecar-change" => {
+                    assert_bytes(&edited, EDIT_ONE);
+                    assert_bytes(&sidecar, b"new foreign sidecar");
+                }
+                _ => assert_bytes(&edited, EDIT_ONE),
+            }
+            assert_eq!(
+                db_count(root.path(), "SELECT COUNT(*) FROM primary_layout_claims"),
+                claims
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+            let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+                .await
+                .unwrap();
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+                checkpoint
+            );
+            let pending = db
+                .primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(serde_json::to_value(&pending[0]).unwrap(), before);
+            assert!(
+                pending[0]
+                    .members
+                    .iter()
+                    .filter_map(|member| member.stage.as_ref())
+                    .all(|path| !path.to_path().exists())
+            );
+        }
+        match scenario {
+            "local-change" => std::fs::write(&edited, EDIT_ONE).unwrap(),
+            "missing" => std::fs::rename(&displaced, &edited).unwrap(),
+            "sidecar-change" => std::fs::remove_file(&sidecar).unwrap(),
+            _ => {}
+        }
+    }
+    for _ in 0..2 {
+        let (result, _) = cycle(root.path(), current.clone(), true, EditedNaming::Suffix).await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+        assert_bytes(&original, ORIGINAL);
+        assert_bytes(&edited, EDIT_ONE);
         assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 
