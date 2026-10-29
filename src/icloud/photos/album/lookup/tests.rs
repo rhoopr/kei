@@ -530,6 +530,287 @@ async fn targeted_record_lookup_distinguishes_present_deleted_and_omitted() {
 }
 
 #[tokio::test]
+async fn issue1044_returned_deleted_and_expunged_pair_resolves_with_timestamp() {
+    let timestamp = 1_792_541_032_000_i64;
+    let mut master = test_master_record("deleted-master");
+    let mut child = test_asset_record_for("deleted-child", "deleted-master");
+    for record in [&mut master, &mut child] {
+        record["fields"]["isDeleted"] = json!({"value":1,"type":"INT64"});
+        record["fields"]["isExpunged"] = json!({"value":1,"type":"INT64"});
+        record["fields"]["dateExpunged"] = json!({"value":timestamp,"type":"TIMESTAMP"});
+    }
+    let album = make_album_with_session(
+        100,
+        Box::new(MockPhotosSession::new().ok(json!({"records":[master, child]}))),
+    );
+    let batch = album
+        .resolve_records(&[lookup_request(
+            "deleted-child",
+            "deleted-master",
+            "deleted-child",
+        )])
+        .await;
+    assert!(
+        matches!(batch.results.as_slice(), [(_, RecordResolution::Deleted { deleted_at: Some(date), .. })] if date.timestamp_millis() == timestamp),
+        "{:?}",
+        batch.results
+    );
+}
+
+#[tokio::test]
+async fn issue1044_returned_deleted_pair_rejects_wrong_scope_or_pair() {
+    for fault in ["wrong_zone", "wrong_master", "omitted_child"] {
+        let mut master = test_master_record("deleted-master");
+        let mut child = test_asset_record_for("deleted-child", "deleted-master");
+        for record in [&mut master, &mut child] {
+            record["fields"]["isDeleted"] = json!({"value":1,"type":"INT64"});
+            record["fields"]["isExpunged"] = json!({"value":1,"type":"INT64"});
+            record["fields"]["dateExpunged"] =
+                json!({"value":1_792_541_032_000_i64,"type":"TIMESTAMP"});
+        }
+        if fault == "wrong_zone" {
+            child["zoneID"] = json!({"zoneName":"wrong-zone"});
+        }
+        if fault == "wrong_master" {
+            child["fields"]["masterRef"]["value"]["recordName"] = json!("other-master");
+        }
+        let records = if fault == "omitted_child" {
+            vec![master]
+        } else {
+            vec![master, child]
+        };
+        let album = make_album_with_session(
+            100,
+            Box::new(MockPhotosSession::new().ok(json!({"records":records}))),
+        );
+        let batch = album
+            .resolve_records(&[lookup_request(
+                "deleted-child",
+                "deleted-master",
+                "deleted-child",
+            )])
+            .await;
+        if fault == "omitted_child" {
+            assert!(!batch.complete, "{fault}: {:?}", batch.results);
+        }
+        assert!(
+            matches!(batch.results.as_slice(), [(_, RecordResolution::Unknown)]),
+            "{fault}: {:?}",
+            batch.results
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue1044_field_deletion_requires_valid_typed_pair_and_rejects_errors() {
+    for fault in [
+        "bad_flag",
+        "bad_type",
+        "provider_error",
+        "master_only_deleted",
+    ] {
+        let mut master = test_master_record("deleted-master");
+        let mut child = test_asset_record_for("deleted-child", "deleted-master");
+        master["fields"]["isDeleted"] = json!({"value":1,"type":"INT64"});
+        child["fields"]["isDeleted"] = json!({"value":1,"type":"INT64"});
+        match fault {
+            "bad_flag" => child["fields"]["isExpunged"] = json!({"value":"yes"}),
+            "bad_type" => child["recordType"] = json!("CPLAlbum"),
+            "provider_error" => child["serverErrorCode"] = json!("ACCESS_DENIED"),
+            "master_only_deleted" => child["fields"]["isDeleted"] = json!({"value":0}),
+            _ => {}
+        }
+        let album = make_album_with_session(
+            100,
+            Box::new(MockPhotosSession::new().ok(json!({"records":[master,child]}))),
+        );
+        let batch = album
+            .resolve_records(&[lookup_request(
+                "deleted-child",
+                "deleted-master",
+                "deleted-child",
+            )])
+            .await;
+        assert!(
+            !batch.complete && matches!(batch.results.as_slice(), [(_, RecordResolution::Unknown)]),
+            "{fault}: {:?}",
+            batch.results
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue1044_family_deletion_uses_only_master_timestamp() {
+    for master_timestamp in [None, Some(1_700_000_000_000_i64)] {
+        let mut master = test_master_record("deleted-master");
+        let mut child = test_asset_record_for("deleted-child", "deleted-master");
+        master["fields"]["isDeleted"] = json!({"value":1});
+        child["fields"]["isDeleted"] = json!({"value":1});
+        child["fields"]["dateExpunged"] = json!({"value":1_792_541_032_000_i64});
+        if let Some(timestamp) = master_timestamp {
+            master["fields"]["dateExpunged"] = json!({"value":timestamp});
+        }
+        let album = make_album_with_session(
+            100,
+            Box::new(MockPhotosSession::new().ok(json!({"records":[master,child]}))),
+        );
+        let batch = album
+            .resolve_records(&[lookup_request(
+                "deleted-child",
+                "deleted-master",
+                "deleted-child",
+            )])
+            .await;
+        match &batch.results[0].1 {
+            RecordResolution::Deleted {
+                master_family: true,
+                deleted_at,
+            } => assert_eq!(
+                deleted_at.map(|date| date.timestamp_millis()),
+                master_timestamp
+            ),
+            other => panic!("unexpected resolution: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue1044_tombstoned_master_does_not_use_flagged_child_timestamp() {
+    let mut master = test_master_record("deleted-master");
+    master["deleted"] = json!(true);
+    let mut child = test_asset_record_for("deleted-child", "deleted-master");
+    child["fields"]["isDeleted"] = json!({"value":1});
+    child["fields"]["dateExpunged"] = json!({"value":1_792_541_032_000_i64});
+    let album = make_album_with_session(
+        100,
+        Box::new(MockPhotosSession::new().ok(json!({"records":[master,child]}))),
+    );
+    let batch = album
+        .resolve_records(&[lookup_request(
+            "deleted-child",
+            "deleted-master",
+            "deleted-child",
+        )])
+        .await;
+    assert!(
+        matches!(
+            batch.results.as_slice(),
+            [(
+                _,
+                RecordResolution::Deleted {
+                    master_family: true,
+                    deleted_at: None
+                }
+            )]
+        ),
+        "{:?}",
+        batch.results
+    );
+}
+
+#[tokio::test]
+async fn issue1044_duplicate_lookup_records_are_inconclusive_in_both_orders() {
+    for deleted_last in [false, true] {
+        let master = test_master_record("duplicate-master");
+        let live = test_asset_record_for("duplicate-child", "duplicate-master");
+        let mut deleted = live.clone();
+        deleted["fields"]["isDeleted"] = json!({"value":1,"type":"INT64"});
+        let healthy_master = test_master_record("healthy-master");
+        let healthy_child = test_asset_record_for("healthy-child", "healthy-master");
+        let pair = if deleted_last {
+            vec![live, deleted]
+        } else {
+            vec![deleted, live]
+        };
+        let mut records = vec![master];
+        records.extend(pair);
+        records.extend([healthy_master, healthy_child]);
+        let album = make_album_with_session(
+            100,
+            Box::new(MockPhotosSession::new().ok(json!({"records":records}))),
+        );
+        let batch = album
+            .resolve_records(&[
+                lookup_request("duplicate-child", "duplicate-master", "duplicate-child"),
+                lookup_request("healthy-child", "healthy-master", "healthy-child"),
+            ])
+            .await;
+        assert!(!batch.complete, "{deleted_last}: {:?}", batch.results);
+        assert!(
+            matches!(batch.results[0].1, RecordResolution::Unknown),
+            "{deleted_last}: {:?}",
+            batch.results
+        );
+        assert!(
+            matches!(batch.results[1].1, RecordResolution::Present(_)),
+            "{deleted_last}: {:?}",
+            batch.results
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue1044_deleted_child_with_live_master_is_child_scoped() {
+    let mut master = test_master_record("master-shared");
+    master["fields"]["dateExpunged"] = json!({"value":1_700_000_000_000_i64,"type":"TIMESTAMP"});
+    let mut child = test_asset_record_for("deleted-child", "master-shared");
+    child["fields"]["isExpunged"] = json!({"value":1,"type":"INT64"});
+    child["fields"]["dateExpunged"] = json!({"value":1_792_541_032_000_i64,"type":"TIMESTAMP"});
+    let album = make_album_with_session(
+        100,
+        Box::new(MockPhotosSession::new().ok(json!({"records":[master,child]}))),
+    );
+    let batch = album
+        .resolve_records(&[lookup_request(
+            "deleted-child",
+            "master-shared",
+            "deleted-child",
+        )])
+        .await;
+    assert!(
+        matches!(
+            batch.results.as_slice(),
+            [(
+                _,
+                RecordResolution::Deleted {
+                    master_family: false,
+                    deleted_at: Some(date)
+                }
+            )] if date.timestamp_millis() == 1_792_541_032_000_i64
+        ),
+        "{:?}",
+        batch.results
+    );
+}
+
+#[tokio::test]
+async fn issue1044_deleted_child_cannot_tombstone_live_shared_master() {
+    let master = test_master_record("master-shared");
+    let mut deleted = test_asset_record_for("deleted-child", "master-shared");
+    deleted["fields"]["isDeleted"] = json!({"value":1,"type":"INT64"});
+    deleted["fields"]["isExpunged"] = json!({"value":1,"type":"INT64"});
+    let live = test_asset_record_for("live-child", "master-shared");
+    let album = make_album_with_session(
+        100,
+        Box::new(MockPhotosSession::new().ok(json!({"records":[master,deleted,live]}))),
+    );
+    let batch = album
+        .resolve_records(&[
+            lookup_request("master-shared", "master-shared", "deleted-child"),
+            lookup_request("master-shared", "master-shared", "live-child"),
+        ])
+        .await;
+    assert!(
+        matches!(
+            batch.results.as_slice(),
+            [(_, RecordResolution::Present(asset))] if asset.asset_record_name() == "live-child"
+        ),
+        "{:?}",
+        batch.results
+    );
+}
+
+#[tokio::test]
 async fn targeted_record_lookup_present_sibling_keeps_shared_master_state() {
     let response = json!({
         "records": [

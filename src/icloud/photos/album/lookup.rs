@@ -291,6 +291,39 @@ fn resolution_evidence(resolution: &RecordResolution) -> ResolutionEvidence {
     }
 }
 
+// Returned records can carry deletion state as fields rather than a CloudKit
+// tombstone. Malformed flags are inconclusive, not permission to delete.
+fn returned_deletion(record: Option<&Value>, expected_type: &str) -> Result<bool, ()> {
+    let Some(record) = record else {
+        return Ok(false);
+    };
+    if record
+        .get("serverErrorCode")
+        .is_some_and(|value| !value.is_null())
+        || record.get("deleted").and_then(Value::as_bool) == Some(true)
+    {
+        return Ok(false);
+    }
+    let mut deleted = false;
+    for key in ["isDeleted", "isExpunged"] {
+        let Some(field) = record.pointer(&format!("/fields/{key}")) else {
+            continue;
+        };
+        let value = field.get("value").ok_or(())?;
+        let flag = match value {
+            Value::Bool(value) => *value,
+            Value::Number(value) if value.as_i64() == Some(0) => false,
+            Value::Number(value) if value.as_i64() == Some(1) => true,
+            _ => return Err(()),
+        };
+        deleted |= flag;
+    }
+    if deleted && record.get("recordType").and_then(Value::as_str) != Some(expected_type) {
+        return Err(());
+    }
+    Ok(deleted)
+}
+
 // Missing optional zone fields inherit the authenticated lookup request scope.
 // Every supplied field, including an owner, must agree. A bare or malformed
 // zone cannot redirect lookup to another account or library.
@@ -497,15 +530,15 @@ impl PhotoAlbum {
                 }));
                 continue;
             };
-            let by_name: FxHashMap<&str, &Value> = response_records
-                .iter()
-                .filter_map(|record| {
-                    record
-                        .get("recordName")
-                        .and_then(Value::as_str)
-                        .map(|name| (name, record))
-                })
-                .collect();
+            let mut by_name: FxHashMap<&str, &Value> = FxHashMap::default();
+            let mut duplicates = FxHashSet::default();
+            for record in response_records {
+                if let Some(name) = record.get("recordName").and_then(Value::as_str) {
+                    if by_name.insert(name, record).is_some() {
+                        duplicates.insert(name);
+                    }
+                }
+            }
 
             for request in batch {
                 let master = by_name.get(request.master_record_name.as_str()).copied();
@@ -536,6 +569,13 @@ impl PhotoAlbum {
 
                 let primary_deleted = explicit_not_found(master) || tombstoned(master);
                 let asset_deleted = explicit_not_found(asset) || tombstoned(asset);
+                let primary_type = if request.target == RecordLookupTarget::Asset {
+                    "CPLAsset"
+                } else {
+                    "CPLMaster"
+                };
+                let primary_fields = returned_deletion(master, primary_type);
+                let asset_fields = returned_deletion(asset, "CPLAsset");
                 let scoped = |record: Option<&Value>| {
                     record.is_none_or(|record| {
                         record
@@ -553,7 +593,32 @@ impl PhotoAlbum {
                             .and_then(Value::as_str)
                             == Some(request.master_record_name.as_str())
                     });
-                let resolution = if !scoped(master) || !scoped(asset) {
+                let field_deletion = primary_fields.as_ref().is_ok_and(|value| *value)
+                    || asset_fields.as_ref().is_ok_and(|value| *value);
+                let returned_pair_complete =
+                    master.is_some_and(|record| {
+                        record.get("recordType").and_then(Value::as_str) == Some(primary_type)
+                            && record.get("serverErrorCode").is_none_or(Value::is_null)
+                    }) && request.asset_record_name.as_ref().is_none_or(|_| {
+                        asset.is_some_and(|record| {
+                            record.get("recordType").and_then(Value::as_str) == Some("CPLAsset")
+                                && record.get("serverErrorCode").is_none_or(Value::is_null)
+                        })
+                    });
+                let contradictory_pair = request.asset_record_name.is_some()
+                    && primary_fields.as_ref().is_ok_and(|value| *value)
+                    && !asset_fields.as_ref().is_ok_and(|value| *value);
+                let resolution = if duplicates.contains(request.master_record_name.as_str())
+                    || request
+                        .asset_record_name
+                        .as_ref()
+                        .is_some_and(|name| duplicates.contains(name.as_str()))
+                    || !scoped(master)
+                    || !scoped(asset)
+                    || primary_fields.is_err()
+                    || asset_fields.is_err()
+                    || (field_deletion && (!returned_pair_complete || contradictory_pair))
+                {
                     RecordResolution::Unknown
                 } else if !pair_matches {
                     asset
@@ -582,10 +647,29 @@ impl PhotoAlbum {
                                 master_record_name: ProviderRecordId::new(master_record_name),
                             }
                         })
-                } else if primary_deleted || asset_deleted {
+                } else if primary_deleted || asset_deleted || field_deletion {
+                    // The family/primary record is authoritative when it is
+                    // flagged. A child timestamp cannot date a family deletion.
+                    let primary_flagged = primary_fields.as_ref().is_ok_and(|value| *value);
+                    let field_deleted_at = if primary_deleted {
+                        master
+                            .and_then(|record| record.pointer("/fields/deletedDate/value"))
+                            .and_then(Value::as_i64)
+                            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                    } else {
+                        (if primary_flagged { master } else { asset })
+                            .and_then(|record| record.pointer("/fields/dateExpunged/value"))
+                            .and_then(Value::as_f64)
+                            .and_then(crate::icloud::photos::asset::f64_to_millis_datetime)
+                    };
                     RecordResolution::Deleted {
-                        deleted_at,
-                        master_family: primary_deleted
+                        deleted_at: if field_deletion {
+                            field_deleted_at
+                        } else {
+                            deleted_at
+                        },
+                        master_family: (primary_deleted
+                            || primary_fields.as_ref().is_ok_and(|value| *value))
                             && request.target == RecordLookupTarget::Master,
                     }
                 } else if master.is_some_and(|record| {
