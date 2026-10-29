@@ -716,13 +716,90 @@ async fn private_recent_equal_dates_preserve_provider_ties_and_recover_after_cap
 
 #[cfg(feature = "xmp")]
 #[tokio::test]
-async fn private_master_metadata_and_relationship_only_invalidation_reseeds_current_facts_without_deletion()
- {
+async fn private_current_metadata_and_relationship_changes_preserve_owned_files_and_reopen_quietly()
+{
+    #[derive(Clone)]
+    struct DependencySession {
+        base: SelectionSession,
+        pages: Arc<Vec<Vec<Value>>>,
+        prior: Option<String>,
+        intermediate: String,
+        successor: String,
+        changes: Arc<Mutex<Vec<Option<String>>>>,
+        lookups: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for DependencySession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/records/lookup?") {
+                let request: Value = serde_json::from_str(&body)?;
+                assert_eq!(
+                    request["zoneID"],
+                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                    "lookup must remain in the selected scope"
+                );
+                let names = request["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|row| row["recordName"].as_str().map(str::to_owned))
+                    .collect();
+                self.lookups.lock().unwrap().push(names);
+            }
+            if !url.contains("/changes/zone?") {
+                return self.base.post(url, body, headers).await;
+            }
+            let request: Value = serde_json::from_str(&body)?;
+            let token = request["zones"][0]["syncToken"].as_str().map(str::to_owned);
+            self.changes.lock().unwrap().push(token.clone());
+            let (records, next, more) = match token.as_deref() {
+                None => (
+                    self.base
+                        .inventory
+                        .iter()
+                        .flatten()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    "scan-successor".to_string(),
+                    false,
+                ),
+                Some(value) if value == self.intermediate => (
+                    self.pages.get(1).cloned().unwrap_or_default(),
+                    self.successor.clone(),
+                    false,
+                ),
+                Some(value) if Some(value) == self.prior.as_deref() => (
+                    self.pages.first().cloned().unwrap_or_default(),
+                    if self.pages.len() > 1 {
+                        self.intermediate.clone()
+                    } else {
+                        self.successor.clone()
+                    },
+                    self.pages.len() > 1,
+                ),
+                _ => anyhow::bail!("unexpected synthetic source cursor"),
+            };
+            Ok(
+                json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"records":records,"syncToken":next,"moreComing":more}]}),
+            )
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
     let server = crate::start_wiremock_or_skip!();
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
-        .mount(&server)
-        .await;
+    for name in ["alpha", "beta", "gamma", "delta", "epsilon"] {
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path(format!("/{name}.jpg")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(distinct_media(name)))
+            .mount(&server)
+            .await;
+    }
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("dependencies.db");
     let mut config = test_config();
@@ -730,9 +807,12 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
     config.folder_structure = String::new();
     config.folder_structure_albums = Arc::from("{album}");
     config.metadata.xmp_sidecar = true;
-    let mut current = (*inventory(&server.uri())).clone();
+    let mut current = (*distinct_inventory(&server.uri())).clone();
     let mut stable_sidecars = None;
-    for cycle in 0..7 {
+    let mut initial_alpha_sidecars = None;
+    let mut ordinary_alpha_sidecars = None;
+    let mut retained_removed_sidecar = None;
+    for cycle in 0..8 {
         let db = Arc::new(
             SqliteStateDb::open_owned(&database, &owner())
                 .await
@@ -741,15 +821,18 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
         config.state_db = Some(db.clone());
         if cycle == 1 {
             current[0][0]["futureMasterDependency"] = json!({"unknown":[0,255,9]});
+            current[0][0]["fields"]["resOriginalWidth"] = json!({"value":200,"type":"INT64"});
+            current[0][0]["recordChangeTag"] = json!("ct-master-current-1");
         }
         if cycle == 2 {
             current[0][1]["fields"]["captionEnc"] =
                 json!({"value":"Current alpha title","type":"STRING"});
+            current[0][1]["recordChangeTag"] = json!("ct-child-current-2");
         }
         let memberships: HashMap<String, FxHashSet<String>> = [
             (
                 "A",
-                if cycle < 3 {
+                if cycle < 4 {
                     vec!["alpha", "delta"]
                 } else {
                     vec!["alpha"]
@@ -757,7 +840,7 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
             ),
             (
                 "B",
-                if cycle < 3 {
+                if cycle < 4 {
                     vec!["alpha", "beta", "epsilon"]
                 } else {
                     vec!["alpha", "beta", "epsilon", "gamma"]
@@ -773,12 +856,43 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
         })
         .collect();
         let queries = Arc::new(Mutex::new(Vec::new()));
-        let session = SelectionSession {
+        let base = SelectionSession {
             inventory: Arc::new(current.clone()),
             changed: false,
             memberships: Some(Arc::new(memberships.clone())),
             cancel_at_selection: None,
             queries: queries.clone(),
+        };
+        let prior = db.get_metadata("sync_token:PrimarySync").await.unwrap();
+        let pages = match cycle {
+            1 => vec![vec![current[0][0].clone()], vec![current[0][1].clone()]],
+            2 => vec![vec![current[0][1].clone()]],
+            4 => {
+                let add = relation_delta_record("B", "asset-gamma");
+                let mut remove = relation_delta_record("A", "asset-delta");
+                remove["deleted"] = json!(true);
+                vec![vec![add, remove]]
+            }
+            5 => vec![
+                vec![
+                    current[0][1].clone(),
+                    current[2][0].clone(),
+                    current[0][1].clone(),
+                ],
+                vec![current[0][0].clone(), current[2][1].clone()],
+            ],
+            _ => Vec::new(),
+        };
+        let changes = Arc::new(Mutex::new(Vec::new()));
+        let lookups = Arc::new(Mutex::new(Vec::new()));
+        let session = DependencySession {
+            base: base.clone(),
+            pages: Arc::new(pages.clone()),
+            prior: prior.clone(),
+            intermediate: format!("dependency-{cycle}-page"),
+            successor: format!("dependency-{cycle}-successor"),
+            changes: changes.clone(),
+            lookups: lookups.clone(),
         };
         let mut selected = passes(session, &db);
         selected[2].exclude_ids = Arc::new(
@@ -788,49 +902,79 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
                 .flat_map(|name| [name.clone(), format!("asset-{name}")])
                 .collect(),
         );
-        let (_, scope, zone) = selected[0].album.owned_private_scope().unwrap().unwrap();
-        let capture = ShadowCapture::new(db.clone(), owner(), "com");
-        let observed = match cycle {
-            1 => vec![current[0][0].clone()],
-            2 => vec![current[0][1].clone()],
-            3 => {
-                let add = relation_delta_record("B", "asset-gamma");
-                let mut remove = relation_delta_record("A", "asset-delta");
-                remove["deleted"] = json!(true);
-                vec![add, remove]
-            }
-            4 => vec![
-                current[0][1].clone(),
-                current[2][0].clone(),
-                current[0][1].clone(),
-            ],
-            _ => Vec::new(),
-        };
-        if !observed.is_empty() {
-            let raw=serde_json::to_vec(&json!({"zones":[{"zoneID":zone,"records":observed,"syncToken":format!("dependency-{cycle}-successor"),"moreComing":false}]})).unwrap();
-            capture
-                .capture(
-                    crate::icloud::photos::catalog_observed_page(
-                        raw,
-                        &scope,
-                        &format!("dependency-{cycle}"),
+        if cycle == 1 {
+            // A single current master has no child ownership proof. It must not
+            // commit a source cursor or modify existing media and sidecars.
+            let before_paths = paths(&db);
+            let before_files: Vec<_> = before_paths
+                .iter()
+                .map(|relative| {
+                    let relative = relative.strip_prefix("media/").unwrap_or(relative);
+                    let media = config.directory.join(relative);
+                    let sidecar = media.with_file_name(format!(
+                        "{}.xmp",
+                        media.file_name().unwrap().to_str().unwrap()
+                    ));
+                    (
+                        media.clone(),
+                        std::fs::read(&media).unwrap(),
+                        sidecar.clone(),
+                        std::fs::read(&sidecar).unwrap(),
+                        std::fs::metadata(&sidecar).unwrap().modified().unwrap(),
                     )
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
+                })
+                .collect();
+            let refused = DependencySession {
+                base: base.clone(),
+                pages: Arc::new(vec![vec![current[0][0].clone()]]),
+                prior: prior.clone(),
+                intermediate: "unused-page".into(),
+                successor: "unpaired-must-not-commit".into(),
+                changes: Arc::default(),
+                lookups: Arc::default(),
+            };
+            let mut refused_passes = passes(refused, &db);
+            refused_passes[2].exclude_ids = selected[2].exclude_ids.clone();
+            let mut refused_config = config.clone();
+            refused_config.sync_mode = SyncMode::Incremental {
+                zone_sync_token: prior.clone().unwrap(),
+            };
+            let refused_result = download_photos_with_sync(
+                &Client::new(),
+                &refused_passes,
+                Arc::new(refused_config),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(refused_result.sync_token.is_none());
+            assert!(refused_result.checkpoint.sync_token_blocked);
+            assert_eq!(
+                refused_result.stats.sync_token_blocked_reason,
+                Some("unpaired_current_master")
+            );
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+                prior
+            );
+            assert_eq!(paths(&db), before_paths);
+            for (media, bytes, sidecar, sidecar_bytes, modified) in before_files {
+                assert_eq!(std::fs::read(media).unwrap(), bytes);
+                assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_bytes);
+                assert_eq!(
+                    std::fs::metadata(sidecar).unwrap().modified().unwrap(),
+                    modified
+                );
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 6);
         }
-        if cycle == 4 {
-            let raw=serde_json::to_vec(&json!({"zones":[{"zoneID":zone,"records":[current[0][0].clone(),current[2][1].clone()],"syncToken":"split-dependency-successor","moreComing":false}]})).unwrap();
-            capture
-                .capture(
-                    crate::icloud::photos::catalog_observed_page(raw, &scope, "split-dependency")
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-        }
-        if cycle > 0 {
+        // Existing sidecars are changed only by an explicit full refresh.
+        // This lower-level refresh does not own the source checkpoint bridge.
+        config.refresh_metadata = cycle == 3;
+        if cycle == 3 {
+            config.sync_mode = SyncMode::Full;
+        } else if cycle > 0 {
             config.sync_mode = SyncMode::Incremental {
                 zone_sync_token: db
                     .get_metadata("sync_token:PrimarySync")
@@ -856,14 +1000,14 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
             result.stats.downloaded,
             match cycle {
                 0 => 6,
-                3 => 2,
+                4 => 1,
                 _ => 0,
             },
             "cycle{cycle}: {result:?}"
         );
         assert_eq!(
             server.received_requests().await.unwrap().len(),
-            if cycle < 3 { 6 } else { 8 }
+            if cycle < 4 { 6 } else { 7 }
         );
         let mut expected = vec![
             "A/alpha.JPG",
@@ -873,8 +1017,12 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
             "B/epsilon.JPG",
             "media/gamma.JPG",
         ];
-        if cycle >= 3 {
-            expected.extend(["B/gamma.JPG", "media/delta.JPG"]);
+        if cycle >= 4 {
+            expected.push("B/gamma.JPG");
+            assert!(
+                !config.directory.join("delta.JPG").exists(),
+                "current Unfiled may reuse the positively owned historical copy"
+            );
         }
         expected.sort_unstable();
         assert_eq!(
@@ -884,24 +1032,108 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
         );
         for relative in &expected {
             let relative = relative.strip_prefix("media/").unwrap_or(relative);
+            let name = std::path::Path::new(relative)
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_ascii_lowercase();
             assert_eq!(
                 std::fs::read(config.directory.join(relative)).unwrap(),
-                MEDIA
+                distinct_media(&name)
             );
         }
-        if cycle >= 2 {
-            for album in ["A", "B"] {
+        if cycle == 2 {
+            assert!(
+                lookups.lock().unwrap().iter().any(|names| names
+                    .iter()
+                    .any(|name| name == "alpha" || name == "asset-alpha")),
+                "child-only source must hydrate its current pair through a scoped lookup"
+            );
+        }
+        let alpha_sidecars: Vec<_> = ["A", "B"]
+            .into_iter()
+            .map(|album| {
+                let path = config.directory.join(album).join("alpha.JPG.xmp");
+                (
+                    std::fs::read(&path).unwrap(),
+                    std::fs::metadata(path).unwrap().modified().unwrap(),
+                )
+            })
+            .collect();
+        if cycle == 0 {
+            initial_alpha_sidecars = Some(alpha_sidecars.clone());
+        }
+        if cycle == 1 {
+            assert_eq!(
+                initial_alpha_sidecars.as_ref(),
+                Some(&alpha_sidecars),
+                "ordinary master metadata changes cannot rewrite existing sidecars"
+            );
+            let rows = db.get_downloaded_page(0, 100).await.unwrap();
+            let alpha = rows
+                .iter()
+                .find(|row| row.id.as_ref() == "alpha" || row.id.as_ref() == "asset-alpha")
+                .expect("owned alpha catalogue row");
+            assert_eq!(
+                alpha.metadata.width,
+                Some(200),
+                "current split-page master metadata must update the catalogue"
+            );
+            ordinary_alpha_sidecars = Some(alpha_sidecars.clone());
+        }
+        if cycle == 2 {
+            assert_eq!(
+                ordinary_alpha_sidecars.as_ref(),
+                Some(&alpha_sidecars),
+                "ordinary source metadata changes cannot rewrite existing sidecars"
+            );
+            let rows = db.get_downloaded_page(0, 100).await.unwrap();
+            let alpha = rows
+                .iter()
+                .find(|row| row.id.as_ref() == "alpha" || row.id.as_ref() == "asset-alpha")
+                .expect("owned alpha catalogue row");
+            assert_eq!(
+                alpha.metadata.title.as_deref(),
+                Some("Current alpha title"),
+                "current child metadata must update the catalogue"
+            );
+        }
+        if cycle >= 3 {
+            for (bytes, _) in &alpha_sidecars {
                 assert!(
-                    std::fs::read_to_string(config.directory.join(album).join("alpha.JPG.xmp"))
+                    std::str::from_utf8(bytes)
                         .unwrap()
-                        .contains("Current alpha title")
+                        .contains("Current alpha title"),
+                    "explicit refresh must update each owned sidecar"
                 );
             }
         }
-        if cycle == 1 || cycle == 2 || cycle == 3 {
+        if cycle == 3 {
             assert!(
                 !queries.lock().unwrap().is_empty(),
-                "dependency-only source must dirty and reseed scoped selection"
+                "explicit full metadata refresh must enumerate current selection"
+            );
+        }
+        if cycle > 0 && cycle != 3 {
+            let observed: Vec<_> = changes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(Clone::clone)
+                .collect();
+            let mut expected_tokens = vec![prior.clone().unwrap()];
+            if pages.len() > 1 {
+                expected_tokens.push(format!("dependency-{cycle}-page"));
+            }
+            assert_eq!(
+                observed, expected_tokens,
+                "source replay must start from the committed cursor and consume each continuation"
+            );
+            assert_eq!(
+                result.sync_token.as_deref(),
+                Some(format!("dependency-{cycle}-successor").as_str()),
+                "only the terminal changes cursor may be committed"
             );
         }
         let sidecars: Vec<_> = expected
@@ -920,7 +1152,25 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
                 )
             })
             .collect();
-        if cycle >= 5 {
+        let removed_sidecar = config.directory.join("A/delta.JPG.xmp");
+        let removed_evidence = (
+            std::fs::read(&removed_sidecar).unwrap(),
+            std::fs::metadata(&removed_sidecar)
+                .unwrap()
+                .modified()
+                .unwrap(),
+        );
+        if cycle == 3 {
+            retained_removed_sidecar = Some(removed_evidence.clone());
+        }
+        if cycle >= 4 {
+            assert_eq!(
+                retained_removed_sidecar.as_ref(),
+                Some(&removed_evidence),
+                "a removed membership cannot rewrite or delete the old sidecar"
+            );
+        }
+        if cycle >= 6 {
             assert!(queries.lock().unwrap().is_empty());
             assert_eq!(
                 stable_sidecars.as_ref().unwrap(),
@@ -928,22 +1178,60 @@ async fn private_master_metadata_and_relationship_only_invalidation_reseeds_curr
                 "quiet cycles cannot repeat completed metadata writes"
             );
         }
-        if cycle == 4 {
+        if cycle == 5 {
             stable_sidecars = Some(sidecars);
         }
-        let successor = result
-            .sync_token
-            .expect("complete current coverage preserves source checkpoint gate");
-        db.commit_checkpoint_transition(crate::state::CheckpointTransition {
-            expected_metadata: Vec::new(),
-            legacy_preservation_proofs: Vec::new(),
-            legacy_config_hash: None,
-            sparse_identity_proofs: Vec::new(),
-            metadata_updates: vec![("sync_token:PrimarySync".into(), successor)],
-            metadata_deletes: Vec::new(),
-        })
-        .await
-        .unwrap();
+        if cycle == 3 {
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+                prior,
+                "a rank-query result is not a source changes checkpoint"
+            );
+        } else {
+            let successor = result
+                .sync_token
+                .expect("complete current coverage preserves source checkpoint gate");
+            db.commit_checkpoint_transition(crate::state::CheckpointTransition {
+                expected_metadata: Vec::new(),
+                legacy_preservation_proofs: Vec::new(),
+                legacy_config_hash: None,
+                sparse_identity_proofs: Vec::new(),
+                metadata_updates: vec![("sync_token:PrimarySync".into(), successor)],
+                metadata_deletes: Vec::new(),
+            })
+            .await
+            .unwrap();
+        }
+        if cycle >= 4 {
+            assert!(
+                db.get_live_selected_album_memberships_for_asset(
+                    "PrimarySync",
+                    "asset-delta",
+                    &["A", "B"]
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+                "removed source must have no selected album membership"
+            );
+            let (_, scope, _) = selected[0].album.owned_private_scope().unwrap().unwrap();
+            let conn = db
+                .acquire_lock("retained Unfiled completion evidence")
+                .unwrap();
+            let pass_key: String = conn.query_row("SELECT json_extract(p.value,'$.key') FROM provider_active_generations g,json_each(CAST(g.specification AS TEXT),'$.profile.passes') p WHERE g.scope=?1 AND json_extract(p.value,'$.kind')='Unfiled' ORDER BY g.created_at DESC LIMIT 1", [&scope], |row| row.get(0)).unwrap();
+            let native = crate::state::db::provider_selection::SelectionPath::from_path(
+                &config.directory.join("A/delta.JPG"),
+            )
+            .key()
+            .unwrap();
+            let aliases: Vec<String> = conn.prepare("SELECT origin_pass FROM download_receipts WHERE library='PrimarySync' AND child='asset-delta' AND native_path=?1").unwrap().query_map([native], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+            assert!(
+                aliases.into_iter().any(|alias| alias == pass_key
+                    || serde_json::from_str::<Vec<String>>(&alias)
+                        .is_ok_and(|keys| keys.contains(&pass_key))),
+                "retaining the old path alone does not prove current Unfiled completion"
+            );
+        }
         assert!(
             db.acquire_lock("active dependency history")
                 .unwrap()
