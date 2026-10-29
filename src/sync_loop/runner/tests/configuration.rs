@@ -3403,12 +3403,14 @@ async fn issue956_missing_old_master_confirms_current_pair_then_commits_and_reop
 async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Option<&'static str>) {
     use crate::icloud::photos::{PhotoAsset, PhotosSession};
     use serde_json::{Value, json};
+    use sha1::{Digest, Sha1};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone)]
     struct CurrentPair {
         records: Vec<Value>,
         lookups: Arc<AtomicUsize>,
+        changes: Arc<AtomicUsize>,
         queries: Arc<AtomicUsize>,
         old_master_error: Option<&'static str>,
     }
@@ -3417,8 +3419,20 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
         async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
             let request: Value = serde_json::from_str(&body)?;
             if url.contains("/records/lookup?") {
-                assert!(self.lookups.fetch_add(1, Ordering::SeqCst) < 2);
+                let call = self.lookups.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    call < 2,
+                    "confirmation is bounded to the old and current pair"
+                );
                 let wanted = request["records"].as_array().unwrap();
+                let master = if call == 0 { "PREVIOUS" } else { "CURRENT" };
+                assert_eq!(wanted.len(), 2);
+                assert!(wanted.iter().any(|item| item["recordName"] == master));
+                assert!(
+                    wanted
+                        .iter()
+                        .any(|item| item["recordName"] == "asset-CURRENT")
+                );
                 let mut records: Vec<_> = self
                     .records
                     .iter()
@@ -3437,8 +3451,16 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
                 return Ok(json!({"records":records}));
             }
             if url.contains("/changes/zone?") {
+                let call = self.changes.fetch_add(1, Ordering::SeqCst);
+                assert!(call < 2);
+                let expected = if call == 0 {
+                    "prior-token"
+                } else {
+                    "current-token"
+                };
+                assert_eq!(request["zones"][0]["syncToken"], expected);
                 let mut child = self.records[1].clone();
-                child["fields"].as_object_mut().unwrap().remove("masterRef");
+                child["fields"]["masterRef"]["value"]["recordName"] = json!("PREVIOUS");
                 let records = if request["zones"][0]["syncToken"] == "prior-token" {
                     vec![child]
                 } else {
@@ -3467,6 +3489,11 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
     let kept = media.join("2023/11/14/photo.JPG");
     std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
     let original = vec![0u8; 1024];
+    let mut signature = Sha1::new();
+    signature.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+    signature.update(&original);
+    let provider_signature =
+        data_encoding::BASE64.encode(&[vec![1], signature.finalize().to_vec()].concat());
     std::fs::write(&kept, &original).unwrap();
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -3481,7 +3508,7 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
         "inventory-token",
         &download_url,
         original.len() as u64,
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        &provider_signature,
     )["records"]
         .as_array()
         .unwrap()
@@ -3490,13 +3517,12 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
     let photo = PhotoAsset::new(records[0].clone(), records[1].clone());
     let config = make_run_cycle_config();
     let hash = download::compute_config_hash(&config);
-    let marker = state::unresolved_identity_key("PrimarySync");
     {
         let db = state::SqliteStateDb::open(&database).await.unwrap();
         let record = crate::test_helpers::TestAssetRecord::new("asset-CURRENT")
             .filename("photo.JPG")
             .size(1024)
-            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .checksum(&provider_signature)
             .created_at(photo.created())
             .added_at(photo.added_date())
             .metadata(photo.metadata().clone())
@@ -3517,24 +3543,25 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
             .await
             .unwrap();
         db.set_metadata(ENUM_CONFIG_HASH_KEY, &hash).await.unwrap();
-        db.set_metadata("sync_token:PrimarySync", "prior-token")
+        db.set_metadata("sync_token:v27:PrimarySync", "prior-token")
             .await
             .unwrap();
-        db.set_metadata(&marker, "1").await.unwrap();
     }
     let lookups = Arc::new(AtomicUsize::new(0));
+    let changes = Arc::new(AtomicUsize::new(0));
     let queries = Arc::new(AtomicUsize::new(0));
     let album = make_full_album_with_boxed_session(
         "PrimarySync",
         Box::new(CurrentPair {
             records,
             lookups: lookups.clone(),
+            changes: changes.clone(),
             queries: queries.clone(),
             old_master_error,
         }),
     );
     let library =
-        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:v27:PrimarySync", album);
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
     for cycle in 0..2 {
         let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
@@ -3562,6 +3589,8 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
             queries.load(Ordering::SeqCst)
         );
         assert_eq!(outcome.stats.downloaded, 0, "existing media must be reused");
+        assert_eq!(changes.load(Ordering::SeqCst), cycle + 1);
+        assert!(db.get_pending().await.unwrap().is_empty());
         assert_eq!(
             lookups.load(Ordering::SeqCst),
             2,
@@ -3580,7 +3609,7 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
             Some("CURRENT")
         );
         assert_eq!(
-            db.get_metadata("sync_token:PrimarySync")
+            db.get_metadata("sync_token:v27:PrimarySync")
                 .await
                 .unwrap()
                 .as_deref(),
@@ -3597,7 +3626,12 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
             db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY).await.unwrap(),
             None
         );
-        assert_eq!(db.get_metadata(&marker).await.unwrap(), None);
+        assert_eq!(
+            db.get_metadata(&state::unresolved_identity_key("PrimarySync"))
+                .await
+                .unwrap(),
+            None
+        );
         assert_eq!(std::fs::read(&kept).unwrap(), original);
     }
 }
