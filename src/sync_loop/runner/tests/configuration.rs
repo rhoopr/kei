@@ -39,6 +39,8 @@ struct ConfigBridgeSession {
     gate_active: Arc<std::sync::atomic::AtomicBool>,
     bridge_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     calls: Arc<Mutex<Vec<(&'static str, String)>>>,
+    delta_records: Vec<serde_json::Value>,
+    inventory_records: Vec<serde_json::Value>,
 }
 
 impl ConfigBridgeSession {
@@ -53,6 +55,8 @@ impl ConfigBridgeSession {
             gate_active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             bridge_gate: None,
             calls: Arc::new(Mutex::new(Vec::new())),
+            delta_records: Vec::new(),
+            inventory_records: Vec::new(),
         }
     }
 }
@@ -66,12 +70,22 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<serde_json::Value> {
         if url.contains("/internal/records/query/batch") {
-            return Ok(album_count_response(0));
+            return Ok(album_count_response(
+                self.inventory_records.len() as u64 / 2,
+            ));
         }
         if url.contains("/records/query?") {
             self.calls.lock().unwrap().push(("query", String::new()));
+            let request: serde_json::Value = serde_json::from_str(&body)?;
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
             return Ok(serde_json::json!({
-                "records": [],
+                "records": if offset == 0 { self.inventory_records.clone() } else { Vec::new() },
                 "syncToken": self.inventory_token.as_ref()
             }));
         }
@@ -128,6 +142,8 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
                         })]
                     }
                 }
+            } else if cursor == Some("prior-token") {
+                self.delta_records.clone()
             } else {
                 Vec::new()
             };
@@ -142,6 +158,27 @@ impl crate::icloud::photos::PhotosSession for ConfigBridgeSession {
         }
         if url.contains("/records/lookup?") {
             self.calls.lock().unwrap().push(("lookup", body.clone()));
+            if !self.delta_records.is_empty() {
+                let request: serde_json::Value = serde_json::from_str(&body)?;
+                let names: Vec<_> = request["records"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item["recordName"].as_str())
+                    .collect();
+                let records: Vec<_> = self
+                    .delta_records
+                    .iter()
+                    .chain(self.inventory_records.iter())
+                    .filter(|record| {
+                        record["recordName"]
+                            .as_str()
+                            .is_some_and(|name| names.contains(&name))
+                    })
+                    .cloned()
+                    .collect();
+                return Ok(serde_json::json!({"records": records}));
+            }
             if self.wait != BridgeWait::AlbumRelation
                 && self.gate_active.load(std::sync::atomic::Ordering::SeqCst)
                 && let Some((requested, release)) = &self.bridge_gate
@@ -803,6 +840,301 @@ async fn run_cycle_config_hash_stage_failure_forces_full_without_replacing_check
             .as_deref(),
         Some("zone-tok-prev"),
         "failed reconciliation staging must preserve the last safe zone token"
+    );
+}
+
+#[tokio::test]
+async fn explicit_metadata_refresh_bridges_existing_source_cursor() {
+    let mut config = make_run_cycle_config();
+    config.runtime.refresh_metadata = true;
+    let db = make_state_db();
+    db.set_metadata(
+        ENUM_CONFIG_HASH_KEY,
+        &download::compute_config_hash(&config),
+    )
+    .await
+    .unwrap();
+    db.set_metadata("sync_token:PrimarySync", "prior-token")
+        .await
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let builder = make_run_cycle_download_config_builder(directory.path(), Arc::clone(&db));
+    let built = builder(
+        download::SyncMode::Full,
+        Arc::new(rustc_hash::FxHashSet::default()),
+        Arc::new(download::AssetGroupings::default()),
+        Arc::from("PrimarySync"),
+    );
+    db.set_metadata(
+        download::DOWNLOAD_CONFIG_HASH_KEY,
+        &download::hash_download_config(&built),
+    )
+    .await
+    .unwrap();
+    let provider = ConfigBridgeSession::new("PrimarySync", "inventory-token", "bridge-token");
+    let calls = provider.calls.clone();
+    let album = make_full_album_with_boxed_session("PrimarySync", Box::new(provider));
+    let lib =
+        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+    let (_dir, shared) = make_shared_session_for_run_cycle().await;
+    let result = run_cycle(
+        &[&lib],
+        &config,
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        &shared,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.failed_count, 0, "{result:?}");
+    assert!(result.db_sync_token_advance_safe);
+    let calls = calls.lock().unwrap().clone();
+    assert!(calls.iter().any(|(kind, _)| *kind == "query"));
+    assert!(
+        calls
+            .iter()
+            .any(|(kind, cursor)| *kind == "changes" && cursor == "prior-token"),
+        "{calls:?}"
+    );
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("bridge-token")
+    );
+}
+
+#[tokio::test]
+async fn explicit_metadata_refresh_bridge_applies_delta_only_asset() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
+    let server = crate::start_wiremock_or_skip!();
+    let media = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/media/pattern.jpg"
+    ));
+    let mut delta_media = media.to_vec();
+    delta_media.extend_from_slice(b"delta-only");
+    Mock::given(method("GET"))
+        .and(path("/delta-only"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(delta_media.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for endpoint in ["/inventory-one", "/inventory-two"] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(media.as_slice()))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let mut config = make_run_cycle_config();
+    config.runtime.refresh_metadata = true;
+    let db = make_state_db();
+    db.set_metadata(
+        ENUM_CONFIG_HASH_KEY,
+        &download::compute_config_hash(&config),
+    )
+    .await
+    .unwrap();
+    db.set_metadata("sync_token:PrimarySync", "prior-token")
+        .await
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let base = make_run_cycle_download_config_builder(directory.path(), Arc::clone(&db));
+    let builder = |mode, excludes, groups, zone| {
+        let mut config = base(mode, excludes, groups, zone);
+        Arc::make_mut(&mut config).retry.max_retries = 0;
+        Arc::make_mut(&mut config).refresh_metadata = true;
+        config
+    };
+    let built = builder(
+        download::SyncMode::Full,
+        Arc::new(rustc_hash::FxHashSet::default()),
+        Arc::new(download::AssetGroupings::default()),
+        Arc::from("PrimarySync"),
+    );
+    db.set_metadata(
+        download::DOWNLOAD_CONFIG_HASH_KEY,
+        &download::hash_download_config(&built),
+    )
+    .await
+    .unwrap();
+    let mut provider = ConfigBridgeSession::new("PrimarySync", "inventory-token", "bridge-token");
+    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(media));
+    let delta_checksum =
+        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&delta_media));
+    provider.delta_records = full_album_page_with_download(
+        "PrimarySync",
+        "delta-only",
+        "unused",
+        &format!("{}/delta-only", server.uri()),
+        delta_media.len() as u64,
+        &delta_checksum,
+    )["records"]
+        .as_array()
+        .unwrap()
+        .clone();
+    for (id, endpoint, filename) in [
+        ("inventory-one", "inventory-one", "one.jpg"),
+        ("inventory-two", "inventory-two", "two.jpg"),
+    ] {
+        let mut records = full_album_page_with_download(
+            "PrimarySync",
+            id,
+            "unused",
+            &format!("{}/{endpoint}", server.uri()),
+            media.len() as u64,
+            &checksum,
+        )["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        records[0]["fields"]["filenameEnc"]["value"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(filename));
+        provider.inventory_records.extend(records);
+    }
+    let calls = provider.calls.clone();
+    let album = make_full_album_with_boxed_session("PrimarySync", Box::new(provider));
+    let lib =
+        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+    let (_dir, shared) = make_shared_session_for_run_cycle().await;
+    let (trace, _guard) = crate::test_helpers::TracingCapture::install();
+    let result = run_cycle(
+        &[&lib],
+        &config,
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        &shared,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result.failed_count,
+        0,
+        "{result:?}; events={:?}",
+        trace.events()
+    );
+    assert!(result.db_sync_token_advance_safe);
+    let calls = calls.lock().unwrap().clone();
+    let inventory_index = calls.iter().position(|(kind, _)| *kind == "query").unwrap();
+    let bridge_index = calls
+        .iter()
+        .position(|(kind, cursor)| *kind == "changes" && cursor == "prior-token")
+        .unwrap();
+    assert!(
+        inventory_index < bridge_index,
+        "bridge must follow the complete inventory: {calls:?}"
+    );
+    assert!(calls.iter().any(|(kind, _)| *kind == "query"));
+    assert!(
+        calls
+            .iter()
+            .any(|(kind, cursor)| *kind == "changes" && cursor == "prior-token"),
+        "{calls:?}"
+    );
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("bridge-token")
+    );
+    let rows = db.get_downloaded_page(0, 10).await.unwrap();
+    for id in ["asset-inventory-one", "asset-inventory-two"] {
+        let row = rows
+            .iter()
+            .find(|row| row.id.as_ref() == id)
+            .expect("full refresh omitted selected inventory asset");
+        assert_eq!(
+            std::fs::read(row.local_path.as_ref().unwrap()).unwrap(),
+            media
+        );
+    }
+    let row = rows
+        .iter()
+        .find(|row| row.id.as_ref() == "asset-delta-only")
+        .expect("bridge-only asset was not completed");
+    assert_eq!(
+        std::fs::read(row.local_path.as_ref().unwrap()).unwrap(),
+        delta_media
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn explicit_metadata_refresh_failed_bridge_preserves_source_cursor() {
+    let mut config = make_run_cycle_config();
+    config.runtime.refresh_metadata = true;
+    let db = make_state_db();
+    db.set_metadata(
+        ENUM_CONFIG_HASH_KEY,
+        &download::compute_config_hash(&config),
+    )
+    .await
+    .unwrap();
+    db.set_metadata("sync_token:PrimarySync", "prior-token")
+        .await
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let builder = make_run_cycle_download_config_builder(directory.path(), Arc::clone(&db));
+    let built = builder(
+        download::SyncMode::Full,
+        Arc::new(rustc_hash::FxHashSet::default()),
+        Arc::new(download::AssetGroupings::default()),
+        Arc::from("PrimarySync"),
+    );
+    db.set_metadata(
+        download::DOWNLOAD_CONFIG_HASH_KEY,
+        &download::hash_download_config(&built),
+    )
+    .await
+    .unwrap();
+    let provider = ConfigBridgeSession::new("PrimarySync", "inventory-token", "");
+    let calls = provider.calls.clone();
+    let album = make_full_album_with_boxed_session("PrimarySync", Box::new(provider));
+    let lib =
+        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+    let (_dir, shared) = make_shared_session_for_run_cycle().await;
+    let result = run_cycle(
+        &[&lib],
+        &config,
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        &shared,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(!result.db_sync_token_advance_safe, "{result:?}");
+    let calls = calls.lock().unwrap().clone();
+    assert!(calls.iter().any(|(kind, _)| *kind == "query"));
+    assert!(
+        calls
+            .iter()
+            .any(|(kind, cursor)| *kind == "changes" && cursor == "prior-token"),
+        "{calls:?}"
+    );
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("prior-token")
     );
 }
 

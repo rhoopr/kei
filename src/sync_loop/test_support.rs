@@ -1609,6 +1609,16 @@ pub(crate) async fn run_prepared_fixture_cycle(
     passes: Vec<crate::commands::AlbumPass>,
     base: crate::download::DownloadConfig,
 ) -> crate::sync_cycle::CycleResult {
+    run_prepared_fixture_cycle_with_refresh(db, passes, base, false).await
+}
+
+#[cfg(feature = "xmp")]
+pub(crate) async fn run_prepared_fixture_cycle_with_refresh(
+    db: Arc<crate::state::SqliteStateDb>,
+    passes: Vec<crate::commands::AlbumPass>,
+    base: crate::download::DownloadConfig,
+    refresh_metadata: bool,
+) -> crate::sync_cycle::CycleResult {
     let key = crate::sync_cycle::sync_token_key(&base.library);
     let selected = make_run_cycle_library_state_with_passes(&base.library, &key, passes);
     let (_dir, shared) = make_shared_session_for_run_cycle().await;
@@ -1620,9 +1630,11 @@ pub(crate) async fn run_prepared_fixture_cycle(
         config.library = library;
         Arc::new(config)
     };
+    let mut cycle_config = make_run_cycle_config();
+    cycle_config.runtime.refresh_metadata = refresh_metadata;
     crate::sync_cycle::run_cycle(
         &[&selected],
-        &make_run_cycle_config(),
+        &cycle_config,
         Some(db.as_ref()),
         false,
         &builder,

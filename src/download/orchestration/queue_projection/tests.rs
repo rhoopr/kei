@@ -24,6 +24,7 @@ struct CurrentSession {
     records: Arc<Mutex<Vec<Value>>>,
     calls: Arc<AtomicUsize>,
     rank_calls: Arc<AtomicUsize>,
+    changes_cursors: Arc<Mutex<Vec<Option<String>>>>,
     corrupt: Arc<Mutex<Option<&'static str>>>,
     discovery: bool,
     zone_name: Arc<str>,
@@ -58,6 +59,11 @@ impl PhotosSession for CurrentSession {
             );
         }
         if url.contains("/changes/zone?") {
+            let request: Value = serde_json::from_str(&body)?;
+            self.changes_cursors
+                .lock()
+                .unwrap()
+                .push(request["zones"][0]["syncToken"].as_str().map(str::to_owned));
             return Ok(
                 json!({"zones":[{"zoneID":{"zoneName":self.zone_name.as_ref(),"ownerRecordName":"_defaultOwner"},"records":[],"syncToken":"quiet-zone-cursor","moreComing":false}]}),
             );
@@ -196,6 +202,7 @@ impl Fixture {
             records: Arc::new(Mutex::new(records("m", CURRENT, "current"))),
             calls: Arc::new(AtomicUsize::new(0)),
             rank_calls: Arc::new(AtomicUsize::new(0)),
+            changes_cursors: Arc::new(Mutex::new(Vec::new())),
             corrupt: Arc::new(Mutex::new(None)),
             discovery: false,
             zone_name: Arc::from("PrimarySync"),
@@ -3943,25 +3950,61 @@ async fn private_metadata_recovery_fixture_with_signature(
         assert!(refresh && native && !shared);
         let blocked = media_paths[0].with_file_name(format!("{}.xmp", filename));
         let saved = blocked.with_extension("saved-xmp");
+        let original_sidecar = std::fs::read(&blocked).unwrap();
         std::fs::rename(&blocked, &saved).unwrap();
         std::fs::create_dir(&blocked).unwrap();
-        let failed = crate::download::download_photos_with_sync(
-            &reqwest::Client::new(),
-            &passes,
-            Arc::new(f.config.clone()),
-            controls(),
-            CancellationToken::new(),
+        let token_key = crate::sync_cycle::sync_token_key("PrimarySync");
+        f.db.set_metadata(&token_key, "refresh-prior-cursor")
+            .await
+            .unwrap();
+        let ranks_before = f.session.rank_calls.load(Ordering::SeqCst);
+        f.session.changes_cursors.lock().unwrap().clear();
+        let failed = crate::sync_loop::run_prepared_fixture_cycle_with_refresh(
+            f.db.clone(),
+            passes.clone(),
+            f.config.clone(),
+            true,
         )
-        .await
-        .unwrap();
+        .await;
+        assert!(
+            f.session.rank_calls.load(Ordering::SeqCst) >= ranks_before + 2,
+            "one-shot refresh must enumerate the full selected scope"
+        );
+        let source_cursor = f.db.get_metadata(&token_key).await.unwrap().unwrap();
+        assert_ne!(
+            source_cursor, "destination-rank-proof",
+            "inventory cursor must not replace the source checkpoint"
+        );
+        if source_cursor == "quiet-zone-cursor" {
+            assert!(
+                f.session
+                    .changes_cursors
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|cursor| cursor.as_deref() == Some("refresh-prior-cursor"))
+            );
+        } else {
+            assert_eq!(source_cursor, "refresh-prior-cursor");
+        }
         assert_eq!(failed.stats.downloaded, 0);
         assert!(failed.stats.exif_failures > 0, "{failed:?}");
-        assert!(!matches!(
-            failed.outcome,
-            crate::download::DownloadOutcome::Success
-        ));
+        assert!(failed.failed_count > 0 || !failed.db_sync_token_advance_safe);
         assert!(f.db.acquire_lock("failed explicit native refresh remains durable").unwrap()
             .query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap()>0);
+        let pending_evidence = {
+            let conn =
+                f.db.acquire_lock("capture exact failed writer authority")
+                    .unwrap();
+            let mut stmt = conn.prepare("SELECT json_array(generation,pass_key,child,version_size,path,hex(frozen_metadata),hex(intent_hash)) FROM provider_active_destinations WHERE child='asset-m' AND verified_media=1 AND verified_metadata=0 ORDER BY generation,pass_key,path").unwrap();
+            let evidence: Vec<String> = stmt
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(!evidence.is_empty());
+            evidence
+        };
         let sibling = media_paths[1].with_file_name(format!("{}.xmp", filename));
         let bytes = std::fs::read(&sibling).unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("new-explicit-title"));
@@ -3973,15 +4016,100 @@ async fn private_metadata_recovery_fixture_with_signature(
         for path in &media_paths {
             assert_eq!(std::fs::read(path).unwrap(), media);
         }
+        assert_eq!(std::fs::read(&saved).unwrap(), original_sidecar);
         std::fs::remove_dir(&blocked).unwrap();
-        std::fs::rename(saved, blocked).unwrap();
+        std::fs::rename(saved, &blocked).unwrap();
         drop(passes);
         f = reopen_destination_fixture(f).await;
         f.config.refresh_metadata = false;
         f.db.make_selection_retry_due(owner(), "asset-m".into())
             .await
             .unwrap();
-        vec![destination_pass(&f, "A"), destination_pass(&f, "B")]
+        let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
+        let mut changed_options = f.config.clone();
+        changed_options.metadata.xmp_sidecar = false;
+        let drift = crate::sync_loop::run_prepared_fixture_cycle_with_refresh(
+            f.db.clone(),
+            passes.clone(),
+            changed_options,
+            false,
+        )
+        .await;
+        assert_eq!(std::fs::read(&blocked).unwrap(), original_sidecar);
+        assert!(f.db.acquire_lock("option drift preserves recorded writer").unwrap()
+            .query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap() > 0, "{drift:?}");
+        let after_drift = {
+            let conn =
+                f.db.acquire_lock("verify exact writer authority after option drift")
+                    .unwrap();
+            let mut stmt = conn.prepare("SELECT json_array(generation,pass_key,child,version_size,path,hex(frozen_metadata),hex(intent_hash)) FROM provider_active_destinations WHERE child='asset-m' AND verified_media=1 AND verified_metadata=0 ORDER BY generation,pass_key,path").unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<Vec<String>, _>>()
+                .unwrap()
+        };
+        assert_eq!(after_drift, pending_evidence);
+        for path in &media_paths {
+            assert_eq!(std::fs::read(path).unwrap(), media);
+        }
+        let (sibling, sibling_bytes, sibling_mtime) = refreshed_sibling.as_ref().unwrap();
+        assert_eq!(&std::fs::read(sibling).unwrap(), sibling_bytes);
+        assert_eq!(
+            &std::fs::metadata(sibling).unwrap().modified().unwrap(),
+            sibling_mtime
+        );
+        f.db.make_selection_retry_due(owner(), "asset-m".into())
+            .await
+            .unwrap();
+        let resumed = crate::sync_loop::run_prepared_fixture_cycle_with_refresh(
+            f.db.clone(),
+            passes.clone(),
+            f.config.clone(),
+            false,
+        )
+        .await;
+        assert_eq!(resumed.failed_count, 0, "{resumed:?}");
+        assert_eq!(resumed.stats.downloaded, 0);
+        assert!(resumed.db_sync_token_advance_safe, "{resumed:?}");
+        assert!(
+            String::from_utf8_lossy(&std::fs::read(&blocked).unwrap())
+                .contains("new-explicit-title")
+        );
+        assert_eq!(f.db.acquire_lock("runner completed metadata obligations").unwrap()
+            .query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND (verified_media=0 OR verified_metadata=0)",[],|r|r.get(0)).unwrap(),0);
+        let (sibling, sibling_bytes, sibling_mtime) = refreshed_sibling.as_ref().unwrap();
+        assert_eq!(&std::fs::read(sibling).unwrap(), sibling_bytes);
+        assert_eq!(
+            &std::fs::metadata(sibling).unwrap().modified().unwrap(),
+            sibling_mtime
+        );
+        let quiet_ranks = f.session.rank_calls.load(Ordering::SeqCst);
+        let quiet_lookups = f.session.calls.load(Ordering::SeqCst);
+        let after_retry = std::fs::read(&blocked).unwrap();
+        let after_mtime = std::fs::metadata(&blocked).unwrap().modified().unwrap();
+        let quiet = crate::sync_loop::run_prepared_fixture_cycle_with_refresh(
+            f.db.clone(),
+            passes.clone(),
+            f.config.clone(),
+            false,
+        )
+        .await;
+        assert_eq!(quiet.failed_count, 0, "{quiet:?}");
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert!(quiet.db_sync_token_advance_safe, "{quiet:?}");
+        assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), quiet_ranks);
+        assert_eq!(f.session.calls.load(Ordering::SeqCst), quiet_lookups);
+        assert_eq!(&std::fs::read(sibling).unwrap(), sibling_bytes);
+        assert_eq!(
+            &std::fs::metadata(sibling).unwrap().modified().unwrap(),
+            sibling_mtime
+        );
+        assert_eq!(std::fs::read(&blocked).unwrap(), after_retry);
+        assert_eq!(
+            std::fs::metadata(&blocked).unwrap().modified().unwrap(),
+            after_mtime
+        );
+        passes
     } else {
         passes
     };

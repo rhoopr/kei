@@ -1609,6 +1609,7 @@ pub(crate) async fn run_cycle(
             false
         };
         if (baseline_cursor_at_start.is_some()
+            || (config.runtime.refresh_metadata && retained_cursor_at_start.is_some())
             || matches!(enum_config_hash_outcome, EnumConfigHashOutcome::Changed)
             || pending_download_config_hash.is_some()
             || unresolved_identity

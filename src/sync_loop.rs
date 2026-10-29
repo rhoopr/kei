@@ -55,4 +55,6 @@ pub(crate) struct SyncArgs {
 }
 
 #[cfg(all(test, feature = "xmp"))]
-pub(crate) use test_support::run_prepared_fixture_cycle;
+pub(crate) use test_support::{
+    run_prepared_fixture_cycle, run_prepared_fixture_cycle_with_refresh,
+};
