@@ -224,85 +224,50 @@ All records and media in these fixtures are synthetic.
 
 ### Seeded recovery sequences
 
-The bounded next phase adds four fixed seeds: 862, 873, 869, and 870.
-The expanded 15-test slice took 27.4 seconds with a warm default-feature cache;
-the four sequence tests took 0.94 seconds.
-Each runs eleven production cycles against its own file-backed SQLite database
-and nonempty media directory. This targets evidence that regresses after a valid
-owner survives a failed refresh, beyond the initial invalid-to-valid matrices.
+Four fixed seeds, 862, 873, 869 and 870, run the same fault schedule through
+two separate current operations: scoped sparse-identity retry and metadata
+refresh driven by the source cursor. Their evidence remains separate. Each
+schedule starts with unresolved work, deferral and a metadata write failure;
+it then shuffles missing, null and out-of-range dates, interrupted lookup and
+another refresh failure. A recovery event and two steady events finish the
+schedule. The tests reopen SQLite and check retry and cursor persistence,
+completion, preserved files and bounded quiet follow-up. Historical stale
+revision alone does not authorize a repair.
 
-Every trace begins with ambiguous evidence, a provider-only improvement during
-backoff, then an explicitly due retry whose valid owner claim survives an injected refresh
-failure. Five seeded events reorder missing, null, and out-of-range provider
-dates, cancellation during lookup, and another refresh failure. The tail always
-supplies a new valid date, then runs two unchanged cycles. Recovery must complete
-on that first fault-free cycle; seeded ordering cannot postpone the liveness
-deadline. Each cycle releases production DB handles and reopens SQLite before
-checking dates, owner, capture receipt, retry row, checkpoint, statuses, media
-and an unrelated sidecar. The quiet tail permits normal delta polling but no
-repeat metadata hydration, inventory scan, repair, or download.
-
-Replay one schedule with
-`cargo test --lib capture_recovery_sequence_seed_862 -- --nocapture`
-(substitute any listed seed). Each step prints the seed, event index, event and
-complete expanded trace. The fixed seeds use the existing locked rand dependency;
-retain the expanded trace when comparing different dependency revisions.
-
-The deadline mutation is confined to the fixture, and cancellation is cooperative.
-This does not qualify abrupt process termination, filesystem recovery or NAS
-durability. The bounded generated histories below extend these fixed schedules.
+Replay a seed with
+`cargo test --lib current_recovery_sequence_seed_862 -- --nocapture`
+(substitute any listed seed). The trace is printed; save it when comparing
+dependency revisions. These cooperative fault tests do not qualify abrupt
+process termination, filesystem recovery or NAS durability.
 
 ### Reconstructed and generated histories
 
-`tests/data/recovery-histories.json` contains three **reconstructed** histories
-based on public descriptions in [#861](https://github.com/rhoopr/kei/issues/861),
-[#765](https://github.com/rhoopr/kei/issues/765),
-[#853](https://github.com/rhoopr/kei/issues/853), and
-[#862](https://github.com/rhoopr/kei/issues/862). These are synthetic compositions,
-not captured reporter databases, photos, provider traffic, or exact incident
-replays. Each entry records its provenance and relationships among the provider
-family, SQLite evidence, files, and configuration. The runner instantiates those
-relationships using the existing synthetic recovery fixture.
+`tests/data/recovery-histories.json` contains three synthetic current-work
+scenarios inspired by themes in public issues. They are not captured reporter
+databases, photos, provider traffic, or exact incident replays. The same fault
+schedule exercises scoped sparse retry and current metadata refresh separately;
+it does not restore automatic historical capture repair.
 
-Eight default seeds draw 1-18 faults with replacement from nine events. They vary
-length, repetition, missing child evidence, invalid dates, visibility, temporary
-recent-item filtering, interrupted lookup, and failed refresh. Every history has
-the same required ambiguity/deferred/failed-refresh prefix and valid/two-quiet
-cycle tail. The prefix establishes a known durable owner; generated faults test
-that retained owner's recovery, not arbitrary attribution of unknown families.
-The original four fixed schedules remain separately runnable. Together, the six
-tests execute 192 production cycles. The initial all-feature run took 7.02 seconds
-with a warm build cache; compilation is excluded.
-
-All histories enter the production cycle and reopen SQLite after every operation.
-The oracle uses fixture facts to check exact ownership, status, dates, checksums,
-retry/revision state, checkpoints, original bytes, unrelated sidecar bytes, and
-bounded work. Recovery must complete on the first valid tail cycle. Two further
-cycles must not repeat metadata hydration, repair, or download. Configuration
-changes here cover recent-item selection only; metadata writers remain disabled.
-
+Eight default seeds draw 1–18 faults with replacement from ten events. The
+fixed unresolved/deferral/failed-refresh prefix and recovery/two-steady tail
+make completion and quiet follow-up observable after reopened operations.
 Run the focused slice with `just test scenario identity-recovery`. Replay a seed:
 
 ```sh
-KEI_RECOVERY_SEED=765 cargo test --lib capture_generated_histories -- --nocapture
+KEI_RECOVERY_SEED=765 cargo test --lib current_generated_histories -- --nocapture
 ```
 
-On failure, at most 24 fresh fixture replays try deleting fault events while
-preserving the prefix, mandatory tail, and original panic message. The original
-failure is always rethrown. The reported reduced trace is a bounded reduction,
-not a claim of global minimality. A temporary byte-loss mutation was detected and
-reduced from four faults to `MissingChild` in six replays; that mutation is not
-part of the committed tests. Replay a fault array directly (no dependence
-on the RNG version):
+On failure, at most 24 fresh replays try deleting faults while preserving the
+prefix, tail and original panic signature. The reported reduction is bounded,
+not necessarily minimal. Replay a fault array without depending on the RNG:
 
 ```sh
-KEI_RECOVERY_FAULTS='["MissingChild","FailRefresh"]' cargo test --lib capture_generated_histories -- --nocapture
+KEI_RECOVERY_FAULTS='["MissingChild","FailRefresh"]' cargo test --lib current_generated_histories -- --nocapture
 ```
 
-Save the printed seed, full original trace, reduced trace, and assertion before
-changing code. Promote any demonstrated product defect to its own deterministic
-regression. These tests do not exercise arbitrary library shapes, real-account
-state, abrupt process death, or power-loss durability.
+Save the seed, original and reduced traces, and assertion before changing code.
+These tests do not exercise arbitrary libraries, real-account state, abrupt
+process death, or power-loss durability.
 
 ### Legacy current-content provenance
 

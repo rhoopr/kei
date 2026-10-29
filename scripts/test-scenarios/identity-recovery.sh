@@ -23,8 +23,8 @@ run_scenario_test lib v027_normal_selected_sync_preserves_shared_historical_clai
 run_scenario_test lib v027_baseline_preserves_queued_existing_metadata_while_new_files_get_sidecars
 
 # Fixed seeded orderings: deferred work, regressing evidence, interruption and a quiet tail.
-run_scenario_test lib capture_recovery_sequence_seed_
+run_scenario_test lib current_recovery_sequence_seed_
 
-# Public-incident reconstructions and bounded generated histories with reduction.
-run_scenario_test lib capture_reconstructed_incident_histories
-run_scenario_test lib capture_generated_histories
+# Synthetic current-work histories inspired by public issues, and bounded generation with reduction.
+run_scenario_test lib current_reconstructed_histories
+run_scenario_test lib current_generated_histories
