@@ -24,6 +24,8 @@ mod sidecar;
 #[cfg(test)]
 mod test_support;
 
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+pub(in crate::download) use embedded::{EmbedPrepareResult, prepare_embed_metadata};
 pub(crate) use immediate::MetadataWriteOutcome;
 pub(super) use immediate::{MetadataWriteRequest, write_download_metadata};
 pub(crate) use planning::CaptureTimestampRepair;

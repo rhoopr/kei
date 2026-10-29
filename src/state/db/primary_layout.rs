@@ -834,6 +834,7 @@ mod tests {
         ReadonlyMarker, decode, encode, path_is_readonly, path_key, persist_readonly_marker,
         protected_readonly_paths,
     };
+    #[cfg(target_os = "linux")]
     use crate::state::MetadataRewriteStore;
     use crate::state::db::provider_selection::SelectionPath;
     use crate::state::{

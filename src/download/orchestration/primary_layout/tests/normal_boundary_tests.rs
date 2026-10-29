@@ -265,6 +265,304 @@ async fn v027_wrapper_prepared_layout_completes_across_reopen() {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[tokio::test]
+async fn embedded_attempt_cleanup_retains_unknown_entry_and_only_removes_owned_input() {
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("original.jpg");
+    std::fs::write(&original, b"synthetic owned input").unwrap();
+    let stage = root.path().join("stages/target.jpg");
+    let scratch = super::super::EmbeddedScratch::create(root.path(), &stage, None)
+        .await
+        .unwrap();
+    let source = crate::download::file::primary_layout::snapshot(root.path(), &original)
+        .await
+        .unwrap()
+        .unwrap();
+    let input_path = scratch.input.path().to_path_buf();
+    let input = crate::download::file::primary_layout::copy_verified_between_roots(
+        root.path(),
+        &original,
+        &scratch.copy_root,
+        &input_path,
+        &source,
+    )
+    .await
+    .unwrap();
+    let marker = input_path.parent().unwrap().join("unknown-marker");
+    std::fs::write(&marker, b"keep this entry").unwrap();
+    assert!(scratch.cleanup(&input).await.is_err());
+    assert_eq!(std::fs::read(&marker).unwrap(), b"keep this entry");
+    assert!(!input_path.exists());
+    assert!(!stage.exists());
+    assert_eq!(std::fs::read(&original).unwrap(), b"synthetic owned input");
+    std::fs::remove_file(&marker).unwrap();
+    std::fs::remove_dir(marker.parent().unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn embedded_private_copy_crosses_confined_roots_without_adopting_collision() {
+    let archive = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let original = archive.path().join("original.jpg");
+    let input = scratch.path().join("input.jpg");
+    std::fs::write(&original, b"synthetic source").unwrap();
+    let source = crate::download::file::primary_layout::snapshot(archive.path(), &original)
+        .await
+        .unwrap()
+        .unwrap();
+    let copied = crate::download::file::primary_layout::copy_verified_between_roots(
+        archive.path(),
+        &original,
+        scratch.path(),
+        &input,
+        &source,
+    )
+    .await
+    .unwrap();
+    assert_ne!(copied.identity, source.identity);
+    assert_eq!(std::fs::read(&input).unwrap(), b"synthetic source");
+    let denied = scratch.path().join("outside-source.jpg");
+    assert!(
+        crate::download::file::primary_layout::copy_verified_between_roots(
+            scratch.path(),
+            &original,
+            scratch.path(),
+            &denied,
+            &source,
+        )
+        .await
+        .is_err()
+    );
+    assert!(!denied.exists());
+    assert!(
+        crate::download::file::primary_layout::copy_verified_between_roots(
+            archive.path(),
+            &original,
+            scratch.path(),
+            &input,
+            &source
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&original).unwrap(), b"synthetic source");
+    assert_eq!(std::fs::read(&input).unwrap(), b"synthetic source");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn embedded_planning_scratch_rejects_replaced_archive_root() {
+    let parent = tempfile::tempdir().unwrap();
+    let archive = parent.path().join("archive");
+    let displaced = parent.path().join("displaced");
+    std::fs::create_dir(&archive).unwrap();
+    let stage = archive.join("stage.jpg");
+    let stage_cap = crate::fs_util::ConfinedPath::open(
+        &archive,
+        &stage,
+        crate::fs_util::ConfinedParents::Existing,
+    )
+    .unwrap();
+    std::fs::rename(&archive, &displaced).unwrap();
+    std::fs::create_dir(&archive).unwrap();
+    std::fs::write(archive.join("foreign-marker"), b"foreign bytes").unwrap();
+    assert!(
+        super::super::EmbeddedScratch::create(&archive, &stage, Some(stage_cap))
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read_dir(&archive).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(&displaced).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::read(archive.join("foreign-marker")).unwrap(),
+        b"foreign bytes"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn embedded_final_copy_rejects_replaced_archive_root() {
+    let parent = tempfile::tempdir().unwrap();
+    let archive = parent.path().join("archive");
+    let displaced = parent.path().join("displaced");
+    let scratch = tempfile::tempdir().unwrap();
+    std::fs::create_dir(&archive).unwrap();
+    let stage = archive.join("stage.jpg");
+    let output = scratch.path().join("output.jpg");
+    std::fs::write(&output, b"synthetic toolkit output").unwrap();
+    let expected = crate::download::file::primary_layout::snapshot(scratch.path(), &output)
+        .await
+        .unwrap()
+        .unwrap();
+    let destination = crate::fs_util::ConfinedPath::open(
+        &archive,
+        &stage,
+        crate::fs_util::ConfinedParents::Existing,
+    )
+    .unwrap();
+    std::fs::rename(&archive, &displaced).unwrap();
+    std::fs::create_dir(&archive).unwrap();
+    let marker = archive.join("foreign-marker");
+    std::fs::write(&marker, b"foreign bytes").unwrap();
+    assert!(
+        crate::download::file::primary_layout::copy_verified_to_confined(
+            scratch.path(),
+            &output,
+            destination,
+            &expected
+        )
+        .await
+        .is_err()
+    );
+    assert!(!stage.exists());
+    assert!(!displaced.join("stage.jpg").exists());
+    assert_eq!(std::fs::read(marker).unwrap(), b"foreign bytes");
+}
+
+#[cfg(windows)]
+#[test]
+fn embedded_stage_capability_prevents_archive_parent_rename() {
+    let parent = tempfile::tempdir().unwrap();
+    let archive = parent.path().join("archive");
+    let displaced = parent.path().join("displaced");
+    std::fs::create_dir(&archive).unwrap();
+    let stage = archive.join("stage.jpg");
+    let mut cap = crate::fs_util::ConfinedPath::open(
+        &archive,
+        &stage,
+        crate::fs_util::ConfinedParents::Existing,
+    )
+    .unwrap();
+    cap.pin_windows_namespace().unwrap();
+    assert!(std::fs::rename(&archive, &displaced).is_err());
+    assert!(archive.is_dir());
+    assert!(!displaced.exists());
+    drop(cap);
+    std::fs::rename(&archive, &displaced).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn embedded_stage_capability_prevents_nested_parent_rename() {
+    let parent = tempfile::tempdir().unwrap();
+    let archive = parent.path().join("archive");
+    let nested = archive.join("nested");
+    let displaced = archive.join("displaced");
+    std::fs::create_dir_all(&nested).unwrap();
+    let stage = nested.join("stage.jpg");
+    let mut cap = crate::fs_util::ConfinedPath::open(
+        &archive,
+        &stage,
+        crate::fs_util::ConfinedParents::Existing,
+    )
+    .unwrap();
+    cap.pin_windows_namespace().unwrap();
+    assert!(std::fs::rename(&nested, &displaced).is_err());
+    assert!(nested.is_dir());
+    assert!(!displaced.exists());
+    drop(cap);
+    std::fs::rename(&nested, &displaced).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn embedded_stage_capability_prevents_parent_rename_but_allows_child_rename() {
+    let parent = tempfile::tempdir().unwrap();
+    let archive = parent.path().join("archive");
+    let displaced = parent.path().join("displaced");
+    std::fs::create_dir(&archive).unwrap();
+    let stage = archive.join("stage.jpg");
+    let mut cap = crate::fs_util::ConfinedPath::open(
+        &archive,
+        &stage,
+        crate::fs_util::ConfinedParents::Existing,
+    )
+    .unwrap();
+    cap.pin_windows_namespace().unwrap();
+    let marker = parent.path().join("ready.tmp");
+    let published = parent.path().join("ready");
+    std::fs::write(&marker, b"synthetic marker").unwrap();
+    std::fs::rename(&marker, &published).unwrap();
+    assert_eq!(std::fs::read(&published).unwrap(), b"synthetic marker");
+    assert!(std::fs::rename(&archive, &displaced).is_err());
+    drop(cap);
+    std::fs::rename(&archive, &displaced).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn embedded_stage_capability_prevents_cross_process_parent_rename() {
+    use std::process::Command;
+    if let Some(from) = std::env::var_os("KEI_TEST_RENAME_FROM") {
+        let to = std::env::var_os("KEI_TEST_RENAME_TO").unwrap();
+        let blocked = std::env::var_os("KEI_TEST_RENAME_BLOCKED").unwrap() == "yes";
+        assert_eq!(std::fs::rename(from, to).is_err(), blocked);
+        return;
+    }
+    let parent = tempfile::tempdir().unwrap();
+    let archive = parent.path().join("archive");
+    let displaced = parent.path().join("displaced");
+    std::fs::create_dir(&archive).unwrap();
+    let stage = archive.join("stage.jpg");
+    let mut cap = crate::fs_util::ConfinedPath::open(
+        &archive,
+        &stage,
+        crate::fs_util::ConfinedParents::Existing,
+    )
+    .unwrap();
+    cap.pin_windows_namespace().unwrap();
+    let try_rename = |blocked: bool| {
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "download::orchestration::primary_layout::tests::normal_boundary_tests::embedded_stage_capability_prevents_cross_process_parent_rename", "--nocapture"])
+            .env("KEI_TEST_RENAME_FROM", &archive)
+            .env("KEI_TEST_RENAME_TO", &displaced)
+            .env("KEI_TEST_RENAME_BLOCKED", if blocked { "yes" } else { "no" })
+            .status().unwrap().success()
+    };
+    assert!(try_rename(true));
+    assert!(archive.is_dir());
+    assert!(!displaced.exists());
+    drop(cap);
+    assert!(try_rename(false));
+    assert!(!archive.exists());
+    assert!(displaced.is_dir());
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn embedded_sidecar_rejects_replaced_archive_after_planning() {
+    let parent = tempfile::tempdir().unwrap();
+    let archive = parent.path().join("archive");
+    let displaced = parent.path().join("displaced");
+    std::fs::create_dir(&archive).unwrap();
+    let stage = archive.join("stage.jpg");
+    std::fs::write(&stage, b"synthetic prepared stage").unwrap();
+    let stage_cap = crate::fs_util::ConfinedPath::open(
+        &archive,
+        &stage,
+        crate::fs_util::ConfinedParents::Existing,
+    )
+    .unwrap();
+    let target = stage_cap.sibling(&archive.join("stage.jpg.xmp")).unwrap();
+    let write = crate::download::metadata::MetadataWrite {
+        rating: Some(3),
+        ..Default::default()
+    };
+    std::fs::rename(&archive, &displaced).unwrap();
+    std::fs::create_dir(&archive).unwrap();
+    let marker = archive.join("foreign-marker");
+    std::fs::write(&marker, b"foreign bytes").unwrap();
+    let result = crate::download::metadata::create_layout_sidecar(
+        &archive, target, None, &write, ".kei-tmp",
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(!archive.join("stage.jpg.xmp").exists());
+    assert!(!displaced.join("stage.jpg.xmp").exists());
+    assert_eq!(std::fs::read(marker).unwrap(), b"foreign bytes");
+}
+
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn v027_recorded_prepared_refresh_replays_metadata_and_preserves_sidecar() {

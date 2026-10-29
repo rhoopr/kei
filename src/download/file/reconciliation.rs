@@ -97,10 +97,33 @@ fn copy_local_file_create_only_blocking(
     before_creation: impl FnOnce(&Path),
     after_copy: impl FnOnce(),
 ) -> anyhow::Result<Arc<ReconciledFile>> {
-    use std::io::Seek;
     let source_root = reconciliation_source_root(root, source)?;
     let source = ConfinedPath::open(&source_root, source, ConfinedParents::Existing)?;
     let destination = ConfinedPath::open(root, destination, ConfinedParents::Create)?;
+    copy_local_file_create_only_confined_blocking(source, destination, before_creation, after_copy)
+}
+
+pub(in crate::download) async fn copy_local_file_create_only_confined(
+    root: &Path,
+    source: &Path,
+    destination: ConfinedPath,
+) -> anyhow::Result<Arc<ReconciledFile>> {
+    let source_root = reconciliation_source_root(root, source)?;
+    let source = source.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let source = ConfinedPath::open(&source_root, &source, ConfinedParents::Existing)?;
+        copy_local_file_create_only_confined_blocking(source, destination, |_| {}, || {})
+    })
+    .await?
+}
+
+fn copy_local_file_create_only_confined_blocking(
+    source: ConfinedPath,
+    destination: ConfinedPath,
+    before_creation: impl FnOnce(&Path),
+    after_copy: impl FnOnce(),
+) -> anyhow::Result<Arc<ReconciledFile>> {
+    use std::io::Seek;
     let mut source_file = source.open_regular()?;
     let source_identity = file_identity(&source_file)?;
     let expected =
