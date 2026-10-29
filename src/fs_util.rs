@@ -713,11 +713,12 @@ fn open_windows_directory_with_access(path: &Path, pin: bool) -> std::io::Result
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
     };
 
     let file = std::fs::OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES | if pin { FILE_LIST_DIRECTORY } else { 0 })
-        .share_mode(FILE_SHARE_READ)
+        .share_mode(FILE_SHARE_READ | if pin { FILE_SHARE_WRITE } else { 0 })
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     let attributes = windows_file_attributes(&file)?;

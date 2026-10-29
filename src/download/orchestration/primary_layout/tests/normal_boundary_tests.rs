@@ -467,6 +467,31 @@ fn embedded_stage_capability_prevents_nested_parent_rename() {
 
 #[cfg(windows)]
 #[test]
+fn embedded_stage_capability_prevents_parent_rename_but_allows_child_rename() {
+    let parent = tempfile::tempdir().unwrap();
+    let archive = parent.path().join("archive");
+    let displaced = parent.path().join("displaced");
+    std::fs::create_dir(&archive).unwrap();
+    let stage = archive.join("stage.jpg");
+    let mut cap = crate::fs_util::ConfinedPath::open(
+        &archive,
+        &stage,
+        crate::fs_util::ConfinedParents::Existing,
+    )
+    .unwrap();
+    cap.pin_windows_namespace().unwrap();
+    let marker = parent.path().join("ready.tmp");
+    let published = parent.path().join("ready");
+    std::fs::write(&marker, b"synthetic marker").unwrap();
+    std::fs::rename(&marker, &published).unwrap();
+    assert_eq!(std::fs::read(&published).unwrap(), b"synthetic marker");
+    assert!(std::fs::rename(&archive, &displaced).is_err());
+    drop(cap);
+    std::fs::rename(&archive, &displaced).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
 fn embedded_stage_capability_prevents_cross_process_parent_rename() {
     use std::process::Command;
     if let Some(from) = std::env::var_os("KEI_TEST_RENAME_FROM") {
