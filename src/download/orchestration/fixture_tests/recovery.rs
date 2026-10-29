@@ -284,43 +284,75 @@ async fn bundled_partial_failure_recovers_after_restart() {
 #[tokio::test]
 async fn bundled_no_overwrite_preserves_existing_media() {
     let mut h = Harness::new().await;
-    let records = h
+    let mut records = h
         .asset(
             "collision",
             "Photo.jpg",
             "public.jpeg",
             "media/pattern.jpg",
-            1,
+            0,
         )
         .await;
+    records.extend(
+        h.asset(
+            "healthy",
+            "Healthy.jpg",
+            "public.jpeg",
+            "media/metadata.jpg",
+            1,
+        )
+        .await,
+    );
     std::fs::create_dir_all(&h.config.directory).unwrap();
     let existing = h.config.directory.join("Photo.JPG");
     let existing_bytes = fixture("media/metadata.jpg");
     std::fs::write(&existing, &existing_bytes).unwrap();
     let modified = std::fs::metadata(&existing).unwrap().modified().unwrap();
+    let healthy = h.config.directory.join("Healthy.JPG");
     let source = fixture("media/pattern.jpg");
-    let expected = h
-        .config
-        .directory
-        .join(format!("Photo-{}.JPG", source.len()));
+    let checksum = records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut healthy_modified = None;
     for downloaded in [1, 0] {
         let result = cycle(&h.config, records.clone()).await;
         assert!(
-            matches!(result.outcome, DownloadOutcome::Success),
+            matches!(result.outcome, DownloadOutcome::PartialFailure { .. }),
             "{result:?}"
         );
+        assert_eq!(result.stats.skipped.uncertain, 1);
         assert_eq!(result.stats.downloaded, downloaded);
-        assert!(std::fs::read(&existing).unwrap() == existing_bytes);
+        assert_eq!(std::fs::read(&existing).unwrap(), existing_bytes);
         assert_eq!(
             std::fs::metadata(&existing).unwrap().modified().unwrap(),
             modified
         );
-        assert!(std::fs::read(&expected).unwrap() == source);
+        assert_eq!(
+            std::fs::read(&healthy).unwrap(),
+            fixture("media/metadata.jpg")
+        );
+        let current_modified = std::fs::metadata(&healthy).unwrap().modified().unwrap();
+        if let Some(previous) = healthy_modified {
+            assert_eq!(current_modified, previous);
+        }
+        healthy_modified = Some(current_modified);
+        assert_eq!(
+            super::support::files(&h.config.directory),
+            vec![healthy.clone(), existing.clone()]
+        );
         h.reopen().await;
         let rows = h.db().get_downloaded_page(0, 10).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].local_path.as_ref(), Some(&expected));
-        assert_eq!(super::support::files(&h.config.directory).len(), 2);
+        assert_eq!(rows[0].id.as_ref(), "asset-healthy");
+        assert_eq!(rows[0].local_path.as_ref(), Some(&healthy));
+        let pending = h.db().get_pending().await.unwrap();
+        let held = pending
+            .iter()
+            .find(|row| row.id.as_ref() == "asset-collision")
+            .expect("unresolved resource stays pending");
+        assert_eq!(held.checksum.as_ref(), checksum);
+        assert_eq!(held.size_bytes, source.len() as u64);
     }
     h.server.verify().await;
 }
