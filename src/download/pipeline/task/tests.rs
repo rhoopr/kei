@@ -1026,8 +1026,9 @@ async fn resumed_task_rejects_symlink_and_preserves_regular_resume() {
             .await
             .unwrap();
         let client = Client::new();
-        // Repeat the unchanged production cycle: unsafe input remains failed;
-        // successful resume becomes a state-backed skip with no second GET.
+        // This direct caller has no authenticated publication scope. A rewritten
+        // output is retained as uncertain on reopen; no hash alone binds it.
+        let mut first_output = None;
         for cycle in 0..2 {
             let result = stream_and_download_from_stream(
                 &client,
@@ -1042,6 +1043,16 @@ async fn resumed_task_rejects_symlink_and_preserves_regular_resume() {
             .unwrap();
             assert_eq!(fs::read(&sentinel).unwrap(), prefix);
             let reopened = crate::state::SqliteStateDb::open(&db_path).await.unwrap();
+            if embed {
+                let receipts: i64 = reopened
+                    .acquire_lock("unbound resume cannot mint a scoped receipt")
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM download_receipts", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(receipts, 0);
+            }
             if rejected {
                 assert_eq!(result.downloaded, 0);
                 assert_eq!(result.failed.len(), 1);
@@ -1078,7 +1089,55 @@ async fn resumed_task_rejects_symlink_and_preserves_regular_resume() {
                     assert_eq!(bytes, body);
                 }
                 use sha2::{Digest, Sha256};
+                if embed && cycle == 1 {
+                    assert_eq!(result.skip_summary.uncertain, 1);
+                    assert!(
+                        reopened
+                            .get_downloaded_page(0, 10)
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                    let pending = reopened.get_pending().await.unwrap();
+                    assert_eq!(pending.len(), 1);
+                    assert_eq!(pending[0].local_path.as_deref(), Some(final_path.as_path()));
+                    assert!(pending[0].last_error.as_deref().is_some_and(|error| {
+                        error.contains("no_valid_receipt_or_supported_provider_proof")
+                    }));
+                    assert_eq!(
+                        pending[0].download_checksum.as_deref(),
+                        Some(
+                            data_encoding::HEXLOWER
+                                .encode(&Sha256::digest(&body))
+                                .as_str()
+                        )
+                    );
+                    assert_eq!(
+                        pending[0].local_checksum.as_deref(),
+                        Some(
+                            data_encoding::HEXLOWER
+                                .encode(&Sha256::digest(&bytes))
+                                .as_str()
+                        )
+                    );
+                    assert_eq!(
+                        Some((
+                            bytes,
+                            fs::metadata(&final_path).unwrap().modified().unwrap()
+                        )),
+                        first_output
+                    );
+                    assert!(!part.exists());
+                    continue;
+                }
+                if embed {
+                    first_output = Some((
+                        bytes.clone(),
+                        fs::metadata(&final_path).unwrap().modified().unwrap(),
+                    ));
+                }
                 let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+                assert_eq!(rows.len(), 1);
                 assert_eq!(
                     rows[0].download_checksum.as_deref(),
                     Some(
@@ -1101,6 +1160,239 @@ async fn resumed_task_rejects_symlink_and_preserves_regular_resume() {
         }
         server.verify().await;
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bound_embedded_resume_records_source_and_local_proof_then_reopens_quietly() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = crate::start_wiremock_or_skip!();
+    let body = crate::download::pipeline::test_support::MINIMAL_JPEG.to_vec();
+    let prefix = &body[..2];
+    let response_body = body[2..].to_vec();
+    let content_range = format!("bytes 2-{}/{}", body.len() - 1, body.len());
+    Mock::given(method("GET"))
+        .and(path("/bound-resume.jpg"))
+        .and(header("range", "bytes=2-"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", content_range)
+                .insert_header("content-type", "image/jpeg")
+                .set_body_bytes(response_body),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = TempDir::new().unwrap();
+    // An opaque provider checksum cannot itself prove an embedded output.
+    let provider_checksum = base64::engine::general_purpose::STANDARD.encode([0x73; 32]);
+    let source_checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(&body));
+    let asset = TestPhotoAsset::new("BOUND_RESUME")
+        .filename("bound-resume.jpg")
+        .orig_size(body.len() as u64)
+        .orig_url(&format!("{}/bound-resume.jpg", server.uri()))
+        .orig_checksum(&provider_checksum)
+        .build()
+        .with_source_zone(Arc::from("PrimarySync"));
+    let mut first_receipt = None;
+    let mut first_bytes = None;
+    let mut first_destination = None;
+    for cycle in 0..3 {
+        let (db, mut config) = crate::download::pipeline::test_support::owned_download_fixture(
+            dir.path(),
+            "PrimarySync",
+        )
+        .await;
+        config.directory = Arc::from(dir.path().join("media"));
+        config.retry.max_retries = 0;
+        config.metadata.set_exif_datetime = true;
+        let config = Arc::new(config);
+        let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+        let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let task = &plan.tasks[0];
+        let binding = task
+            .publication_binding
+            .as_ref()
+            .expect("owned selected source must bind publication")
+            .as_ref()
+            .clone();
+        assert_eq!(binding.library, "PrimarySync");
+        assert_eq!(binding.child, asset.asset_record_name());
+        assert_eq!(binding.master, asset.id());
+        assert_eq!(binding.state_id, asset.state_id());
+        assert_eq!(binding.origin_pass, "selected-pass");
+        let planned_destination = task.download_path.clone();
+        let destination = first_destination
+            .clone()
+            .unwrap_or_else(|| planned_destination.clone());
+        let part = crate::download::file::temp_download_path(
+            &destination,
+            &task.checksum,
+            &config.temp_suffix,
+        )
+        .unwrap();
+        if cycle == 0 {
+            assert!(
+                db.bound_download_receipts(
+                    binding.clone(),
+                    "original".into(),
+                    provider_checksum.clone(),
+                    body.len() as u64
+                )
+                .await
+                .unwrap()
+                .is_empty()
+            );
+            fs::create_dir_all(part.parent().unwrap()).unwrap();
+            fs::write(&part, prefix).unwrap();
+            planner::upsert_seen_for_task(db.as_ref(), &config, &asset, task)
+                .await
+                .unwrap();
+        }
+        let result = stream_and_download_from_stream(
+            &Client::new(),
+            stream::iter(vec![Ok(asset.clone())]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.downloaded,
+            usize::from(cycle == 0),
+            "cycle {cycle}: {result:?}"
+        );
+        assert!(result.failed.is_empty());
+        assert_eq!(result.exif_failures, 0);
+        assert_eq!(result.skip_summary.uncertain, 0);
+        if cycle > 0 {
+            assert_eq!(
+                result.skip_summary.on_disk, 1,
+                "the bound receipt must settle the selected work"
+            );
+            if planned_destination != destination {
+                assert!(
+                    !planned_destination.exists(),
+                    "a prospective fallback must not be published"
+                );
+            }
+        }
+        let output = fs::read(&destination).unwrap();
+        assert_ne!(
+            output, body,
+            "metadata embedding must produce distinct local bytes"
+        );
+        let local_checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(&output));
+        assert_ne!(source_checksum, local_checksum);
+        let receipts = db
+            .bound_download_receipts(
+                binding.clone(),
+                "original".into(),
+                provider_checksum.clone(),
+                body.len() as u64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
+        let receipt = &receipts[0];
+        assert_eq!(receipt.account_key, binding.account_key);
+        assert_eq!(receipt.provider_key, binding.provider_key);
+        assert_eq!(receipt.library, binding.library);
+        assert_eq!(receipt.child, binding.child);
+        assert_eq!(receipt.master, binding.master);
+        assert_eq!(receipt.state_id, binding.state_id);
+        assert_eq!(receipt.scope, binding.scope);
+        assert_eq!(receipt.origin_pass, binding.origin_pass);
+        assert_eq!(receipt.version_size, "original");
+        assert_eq!(receipt.provider_checksum, provider_checksum);
+        assert_eq!(receipt.provider_size, body.len() as u64);
+        assert_eq!(receipt.native_path.to_path(), destination);
+        assert_eq!(receipt.source_checksum, source_checksum);
+        assert_eq!(receipt.local_checksum, local_checksum);
+        let changed_checksum = base64::engine::general_purpose::STANDARD.encode([0x74; 32]);
+        assert!(
+            db.bound_download_receipts(
+                binding.clone(),
+                "original".into(),
+                changed_checksum,
+                body.len() as u64
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            db.bound_download_receipts(
+                binding.clone(),
+                "original".into(),
+                provider_checksum.clone(),
+                body.len() as u64 + 1
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        let mut foreign_child = binding.clone();
+        foreign_child.child.push_str("-foreign");
+        assert!(
+            db.bound_download_receipts(
+                foreign_child,
+                "original".into(),
+                provider_checksum.clone(),
+                body.len() as u64
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        let mut foreign_master = binding.clone();
+        foreign_master.master.push_str("-foreign");
+        assert!(
+            db.bound_download_receipts(
+                foreign_master,
+                "original".into(),
+                provider_checksum.clone(),
+                body.len() as u64
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].download_checksum.as_deref(),
+            Some(source_checksum.as_str())
+        );
+        assert_eq!(
+            rows[0].local_checksum.as_deref(),
+            Some(local_checksum.as_str())
+        );
+        assert!(db.get_pending().await.unwrap().is_empty());
+        assert!(!part.exists());
+        if let Some(previous) = &first_receipt {
+            assert_eq!(receipt, previous);
+        }
+        if let Some(previous) = &first_bytes {
+            assert_eq!(&output, previous);
+        }
+        first_receipt = Some(receipt.clone());
+        first_bytes = Some(output);
+        first_destination = Some(destination);
+        drop(plan);
+        drop(planner);
+        drop(config);
+        drop(db);
+    }
+    server.verify().await;
 }
 
 #[tokio::test]
