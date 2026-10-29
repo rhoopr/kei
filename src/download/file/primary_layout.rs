@@ -80,6 +80,36 @@ pub(in crate::download) async fn copy_verified(
     Ok(result)
 }
 
+/// An operation-bound stage copy. The returned identity comes from the file
+/// descriptor opened by the successful no-replace publication, not a later
+/// independent lookup of the destination path.
+pub(in crate::download) async fn copy_verified_create_only(
+    root: &Path,
+    source: &Path,
+    destination: &Path,
+    expected: &LayoutFingerprint,
+) -> Result<LayoutFingerprint> {
+    anyhow::ensure!(
+        snapshot(root, source).await?.as_ref() == Some(expected),
+        "Primary source changed before preparation"
+    );
+    let copy =
+        super::reconciliation::copy_local_file_create_only(root, source, destination).await?;
+    let identity = copy.destination_identity()?;
+    copy.validate().await?;
+    let result = snapshot(root, destination)
+        .await?
+        .context("Missing primary stage")?;
+    anyhow::ensure!(
+        result.identity == identity
+            && bytes_match(expected, &result)
+            && identity != expected.identity,
+        "Primary stage copy changed or is not independent"
+    );
+    copy.validate().await?;
+    Ok(result)
+}
+
 /// Only the layout owner can construct this authorization, after a durable
 /// preservation receipt. It is distinct from truncated-repair authorization.
 #[derive(Debug)]

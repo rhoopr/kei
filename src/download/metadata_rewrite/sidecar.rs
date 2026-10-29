@@ -90,6 +90,27 @@ pub(super) async fn write_sidecar_metadata(
     }
 }
 
+pub(in crate::download) async fn create_layout_sidecar(
+    root: &Path,
+    stage: &Path,
+    seed: Option<(&Path, &crate::state::db::primary_layout::LayoutFingerprint)>,
+    payload: Arc<MetadataPayload>,
+    created_local: DateTime<FixedOffset>,
+    source_checksum: Option<&str>,
+    temp_suffix: &str,
+) -> anyhow::Result<Option<crate::state::db::primary_layout::LayoutFingerprint>> {
+    let stage_owned = stage.to_owned();
+    let checksum = source_checksum.map(str::to_owned);
+    let (write, source_error) = tokio::task::spawn_blocking(move || {
+        plan_sidecar_write(&stage_owned, &payload, &created_local, checksum.as_deref())
+    })
+    .await?;
+    if let Some(error) = source_error {
+        return Err(error);
+    }
+    crate::download::metadata::create_layout_sidecar(root, stage, seed, &write, temp_suffix).await
+}
+
 /// Comprehensive snapshot of every field a payload can contribute. Used as
 /// the sidecar plan (sidecars are fresh files; no probe gating applies).
 /// Source-media GPS facts are read here on every attempt so metadata-only

@@ -66,6 +66,7 @@ struct Session {
     quiet: bool,
     lookups: Arc<AtomicUsize>,
     current: Option<Arc<std::sync::Mutex<Vec<Value>>>>,
+    lookup_change: Option<(usize, Vec<Value>)>,
     indexing: Option<IndexingOptions>,
 }
 #[async_trait::async_trait]
@@ -102,13 +103,19 @@ impl PhotosSession for Session {
             );
         }
         if url.contains("/records/lookup?") {
-            self.lookups.fetch_add(1, Ordering::SeqCst);
+            let lookup = self.lookups.fetch_add(1, Ordering::SeqCst);
             let request: Value = serde_json::from_str(&body)?;
             let current = self
-                .current
+                .lookup_change
                 .as_ref()
-                .map(|current| current.lock().unwrap().clone())
-                .unwrap_or_else(|| self.records.clone());
+                .filter(|(after, _)| lookup >= *after)
+                .map(|(_, records)| records.clone())
+                .unwrap_or_else(|| {
+                    self.current
+                        .as_ref()
+                        .map(|current| current.lock().unwrap().clone())
+                        .unwrap_or_else(|| self.records.clone())
+                });
             let records: Vec<_> = request["records"]
                 .as_array()
                 .unwrap()
@@ -192,6 +199,7 @@ async fn cycle_resolution(
 struct CycleOptions {
     indexing: Option<IndexingOptions>,
     refresh_metadata: bool,
+    embed_rating: bool,
     media_directory: &'static str,
     folder_structure: &'static str,
     pass_kind: PassKind,
@@ -203,12 +211,14 @@ struct CycleOptions {
     mov_policy: crate::types::LivePhotoMovFilenamePolicy,
     live_mode: crate::types::LivePhotoMode,
     current: Option<Arc<std::sync::Mutex<Vec<Value>>>>,
+    lookup_change: Option<(usize, Vec<Value>)>,
 }
 impl Default for CycleOptions {
     fn default() -> Self {
         Self {
             indexing: None,
             refresh_metadata: false,
+            embed_rating: false,
             media_directory: "media",
             folder_structure: "",
             pass_kind: PassKind::Unfiled,
@@ -220,6 +230,7 @@ impl Default for CycleOptions {
             mov_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
             live_mode: crate::types::LivePhotoMode::Both,
             current: None,
+            lookup_change: None,
         }
     }
 }
@@ -249,6 +260,7 @@ async fn try_cycle_options(
         quiet,
         lookups: lookups.clone(),
         current: options.current.clone(),
+        lookup_change: options.lookup_change.clone(),
         indexing: options.indexing.clone(),
     };
     let owner = state::db::account::AccountOwner::authenticated(
@@ -328,6 +340,7 @@ async fn try_cycle_options(
         let mut config = base(mode, exclude, groups, zone);
         let config = Arc::make_mut(&mut config);
         config.refresh_metadata = options.refresh_metadata;
+        config.metadata.set_exif_rating = options.embed_rating;
         config.edited = true;
         config.edited_naming = naming;
         config.recent = options
@@ -356,6 +369,7 @@ async fn try_cycle_options(
     config.download.folder_structure_albums = options.folder_structure.to_owned();
     config.download.folder_structure_smart_folders = options.folder_structure.to_owned();
     config.runtime.refresh_metadata = options.refresh_metadata;
+    config.metadata.set_exif_rating = options.embed_rating;
     config.photos.edited = true;
     config.photos.edited_naming = naming;
     config.photos.resolution = resolution;
@@ -3008,6 +3022,404 @@ async fn review501_explicit_metadata_refresh_uses_preserving_layout_owner() {
             assert_eq!(lookups, 0);
         }
         assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    }
+}
+
+#[tokio::test]
+async fn interrupted_unprepared_embedded_refresh_remains_held() {
+    let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, EDIT_TWO).await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let mut current = records_with_original(&server, VALID_ORIGINAL, None);
+    current[1]["fields"]["isFavorite"] = json!({"value":1});
+    let options = || CycleOptions {
+        embed_rating: true,
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
+        root.path(),
+        current.clone(),
+        true,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0);
+    let original = media.join("IMG_0501.JPG");
+    let old_bytes = std::fs::read(&original).unwrap();
+    let provider = Session {
+        records: current.clone(),
+        quiet: true,
+        lookups: Arc::new(AtomicUsize::new(0)),
+        current: None,
+        lookup_change: None,
+        indexing: None,
+    };
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: make_full_album_with_boxed_session("PrimarySync", Box::new(provider)),
+        exclude_ids: Arc::default(),
+    };
+    let db = Arc::new(
+        state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap(),
+    );
+    let db_store: Arc<dyn download::DownloadStore> = db.clone();
+    let base = make_run_cycle_download_config_builder(&media, db_store);
+    let mut config = base(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from("PrimarySync"),
+    )
+    .as_ref()
+    .clone();
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    config.edited_naming = EditedNaming::Primary;
+    config.refresh_metadata = true;
+    config.metadata.set_exif_rating = true;
+    let operation = download::seed_unprepared_refresh(&config, &pass).await;
+    let stage = operation
+        .members
+        .iter()
+        .find_map(|m| m.stage.as_ref())
+        .unwrap()
+        .to_path();
+    drop(config);
+    drop(base);
+    drop(db);
+    let result =
+        try_cycle_options(root.path(), current, true, EditedNaming::Primary, options()).await;
+    if let Ok((result, _)) = result {
+        assert!(!result.db_sync_token_advance_safe || result.failed_count > 0);
+    }
+    assert!(!stage.exists());
+    assert_eq!(std::fs::read(&original).unwrap(), old_bytes);
+    let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+        .await
+        .unwrap();
+    let pending = db
+        .primary_layout_operations("PrimarySync".into())
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(
+        pending[0]
+            .members
+            .iter()
+            .any(|m| m.stage.is_some() && m.prepared.is_none())
+    );
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn interrupted_unprepared_refresh_retries_on_ordinary_sync() {
+    let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, EDIT_TWO).await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let mut current = records_with_original(&server, VALID_ORIGINAL, None);
+    current[1]["fields"]["isFavorite"] = json!({"value":1});
+    let options = |refresh_metadata| CycleOptions {
+        refresh_metadata,
+        sidecar: true,
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
+        root.path(),
+        current.clone(),
+        true,
+        EditedNaming::Primary,
+        options(false),
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0);
+    let original = media.join("IMG_0501.JPG");
+    let old_media = std::fs::read(&original).unwrap();
+    let sidecar = media.join("IMG_0501.JPG.xmp");
+    let original_packet = std::fs::read_to_string(&sidecar)
+        .unwrap()
+        .replace("Rating>5", "Rating>4");
+    assert!(original_packet.contains("Rating>4"));
+    std::fs::write(&sidecar, original_packet.as_bytes()).unwrap();
+    let old_sidecar = std::fs::read(&sidecar).unwrap();
+    let provider = Session {
+        records: current.clone(),
+        quiet: true,
+        lookups: Arc::new(AtomicUsize::new(0)),
+        current: None,
+        lookup_change: None,
+        indexing: None,
+    };
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: make_full_album_with_boxed_session("PrimarySync", Box::new(provider)),
+        exclude_ids: Arc::default(),
+    };
+    let db = Arc::new(
+        state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap(),
+    );
+    let db_store: Arc<dyn download::DownloadStore> = db.clone();
+    let base = make_run_cycle_download_config_builder(&media, db_store);
+    let mut config = base(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from("PrimarySync"),
+    )
+    .as_ref()
+    .clone();
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    config.edited_naming = EditedNaming::Primary;
+    config.refresh_metadata = true;
+    config.metadata.xmp_sidecar = true;
+    let op = download::seed_unprepared_refresh(&config, &pass).await;
+    assert!(
+        op.members
+            .iter()
+            .any(|m| m.stage.is_some() && m.prepared.is_none())
+    );
+    drop(config);
+    drop(base);
+    drop(db);
+    let (recovered, _) = cycle_options(
+        root.path(),
+        current.clone(),
+        true,
+        EditedNaming::Primary,
+        options(false),
+    )
+    .await;
+    assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
+    assert!(recovered.db_sync_token_advance_safe);
+    assert_eq!(std::fs::read(&original).unwrap(), old_media);
+    let fresh = std::fs::read(&sidecar).unwrap();
+    assert_ne!(fresh, old_sidecar);
+    assert!(std::str::from_utf8(&fresh).unwrap().contains("Rating>5"));
+    let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+        .await
+        .unwrap();
+    assert!(
+        db.primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        db.get_manifest_assets()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|asset| &asset.preserved_files)
+            .any(|file| {
+                let mut path = file.native_path.to_path().as_os_str().to_os_string();
+                path.push(".xmp");
+                std::fs::read(std::path::PathBuf::from(path))
+                    .is_ok_and(|bytes| bytes == old_sidecar)
+            }),
+        "prior sidecar must be independently preserved"
+    );
+    drop(db);
+    let (quiet, lookups) = cycle_options(
+        root.path(),
+        current,
+        true,
+        EditedNaming::Primary,
+        options(false),
+    )
+    .await;
+    assert_eq!(quiet.failed_count, 0);
+    assert_eq!(lookups, 0);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), fresh);
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn interrupted_unprepared_refresh_rejects_drift_and_occupied_paths() {
+    for scenario in [
+        "changed_source",
+        "option_drift",
+        "readonly",
+        "occupied_stage",
+        "occupied_sidecar",
+        "changed_after_preparation",
+    ] {
+        let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, EDIT_TWO).await;
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("media");
+        let mut current = records_with_original(&server, VALID_ORIGINAL, None);
+        current[1]["fields"]["isFavorite"] = json!({"value":1});
+        let initial = CycleOptions {
+            sidecar: true,
+            ..CycleOptions::default()
+        };
+        let (result, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            initial,
+        )
+        .await;
+        assert_eq!(result.failed_count, 0);
+        let original = media.join("IMG_0501.JPG");
+        let old_media = std::fs::read(&original).unwrap();
+        let original_sidecar = media.join("IMG_0501.JPG.xmp");
+        std::fs::remove_file(&original_sidecar).unwrap();
+        let provider = Session {
+            records: current.clone(),
+            quiet: true,
+            lookups: Arc::new(AtomicUsize::new(0)),
+            current: None,
+            lookup_change: None,
+            indexing: None,
+        };
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: make_full_album_with_boxed_session("PrimarySync", Box::new(provider)),
+            exclude_ids: Arc::default(),
+        };
+        let db = Arc::new(
+            state::SqliteStateDb::open(&root.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        let db_store: Arc<dyn download::DownloadStore> = db.clone();
+        let base = make_run_cycle_download_config_builder(&media, db_store);
+        let mut config = base(
+            download::SyncMode::Full,
+            Arc::default(),
+            Arc::default(),
+            Arc::from("PrimarySync"),
+        )
+        .as_ref()
+        .clone();
+        config.folder_structure = String::new();
+        config.folder_structure_albums = Arc::from("");
+        config.folder_structure_smart_folders = Arc::from("");
+        config.edited = true;
+        config.edited_naming = EditedNaming::Primary;
+        config.refresh_metadata = true;
+        config.metadata.xmp_sidecar = true;
+        let op = download::seed_unprepared_refresh(&config, &pass).await;
+        let stage = op
+            .members
+            .iter()
+            .find_map(|m| m.stage.as_ref())
+            .unwrap()
+            .to_path();
+        let mut sidecar_name = stage.as_os_str().to_os_string();
+        sidecar_name.push(".xmp");
+        let stage_sidecar = std::path::PathBuf::from(sidecar_name);
+        if scenario == "readonly" {
+            let conn = db.acquire_lock("mark source read-only").unwrap();
+            assert!(conn.execute("UPDATE asset_metadata_paths SET preserved_path_key='foreign-marker' WHERE local_path=?1", [original.to_str().unwrap()]).unwrap() > 0);
+        }
+        if scenario == "occupied_stage" || scenario == "occupied_sidecar" {
+            std::fs::create_dir_all(stage.parent().unwrap()).unwrap();
+            let path = if scenario == "occupied_stage" {
+                &stage
+            } else {
+                &stage_sidecar
+            };
+            std::fs::write(path, b"foreign entry").unwrap();
+        }
+        drop(config);
+        drop(base);
+        drop(db);
+        if scenario == "changed_source" {
+            current[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+                json!(provider_hash(EDIT_TWO));
+        }
+        let mut later = current.clone();
+        later[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(provider_hash(EDIT_TWO));
+        let options = CycleOptions {
+            sidecar: scenario != "option_drift",
+            lookup_change: (scenario == "changed_after_preparation").then_some((2, later)),
+            ..CycleOptions::default()
+        };
+        let result = try_cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            options,
+        )
+        .await;
+        if let Ok((result, _)) = result {
+            assert!(
+                !result.db_sync_token_advance_safe || result.failed_count > 0,
+                "{scenario}"
+            );
+        }
+        assert_eq!(std::fs::read(&original).unwrap(), old_media, "{scenario}");
+        assert!(!original_sidecar.exists(), "{scenario}");
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let pending = db
+            .primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "{scenario}");
+        assert!(
+            pending[0]
+                .members
+                .iter()
+                .any(|m| m.stage.is_some() && m.prepared.is_none()),
+            "{scenario}"
+        );
+        match scenario {
+            "occupied_stage" => assert_eq!(std::fs::read(&stage).unwrap(), b"foreign entry"),
+            "occupied_sidecar" => {
+                assert_eq!(std::fs::read(&stage_sidecar).unwrap(), b"foreign entry")
+            }
+            "changed_after_preparation" => {
+                let media_stage = std::fs::read(&stage).unwrap();
+                let sidecar_stage = std::fs::read(&stage_sidecar).unwrap();
+                drop(db);
+                let retry = try_cycle_options(
+                    root.path(),
+                    current.clone(),
+                    true,
+                    EditedNaming::Primary,
+                    CycleOptions {
+                        sidecar: true,
+                        ..CycleOptions::default()
+                    },
+                )
+                .await;
+                if let Ok((retry, _)) = retry {
+                    assert!(!retry.db_sync_token_advance_safe || retry.failed_count > 0);
+                }
+                let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+                    .await
+                    .unwrap();
+                let pending = db
+                    .primary_layout_operations("PrimarySync".into())
+                    .await
+                    .unwrap();
+                assert_eq!(pending.len(), 1);
+                assert!(
+                    pending[0]
+                        .members
+                        .iter()
+                        .any(|member| member.stage.is_some() && member.prepared.is_none())
+                );
+                assert_eq!(std::fs::read(&stage).unwrap(), media_stage);
+                assert_eq!(std::fs::read(&stage_sidecar).unwrap(), sidecar_stage);
+            }
+            _ => assert!(!stage.exists(), "{scenario}"),
+        }
     }
 }
 

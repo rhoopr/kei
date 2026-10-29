@@ -1,5 +1,6 @@
 //! Confined local copies and retained verification through state finalization.
 
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -19,6 +20,10 @@ pub(crate) struct ReconciledFile {
 }
 
 impl ReconciledFile {
+    pub(in crate::download) fn destination_identity(&self) -> std::io::Result<FileIdentity> {
+        file_identity(&self.destination_file)
+    }
+
     pub(in crate::download) async fn validate(self: &Arc<Self>) -> anyhow::Result<()> {
         let copy = Arc::clone(self);
         tokio::task::spawn_blocking(move || copy.validate_blocking()).await?
@@ -69,6 +74,69 @@ pub(crate) async fn copy_local_file_no_replace(
         )
     })
     .await?
+}
+
+/// Create the private stage exclusively and retain its open file identity.
+/// An interrupted or failed copy is retained as an unreceipted occupied stage.
+pub(in crate::download) async fn copy_local_file_create_only(
+    root: &Path,
+    source: &Path,
+    destination: &Path,
+) -> anyhow::Result<Arc<ReconciledFile>> {
+    let (root, source, destination) = (root.to_owned(), source.to_owned(), destination.to_owned());
+    tokio::task::spawn_blocking(move || {
+        copy_local_file_create_only_blocking(&root, &source, &destination, |_| {}, || {})
+    })
+    .await?
+}
+
+fn copy_local_file_create_only_blocking(
+    root: &Path,
+    source: &Path,
+    destination: &Path,
+    before_creation: impl FnOnce(&Path),
+    after_copy: impl FnOnce(),
+) -> anyhow::Result<Arc<ReconciledFile>> {
+    use std::io::Seek;
+    let source_root = reconciliation_source_root(root, source)?;
+    let source = ConfinedPath::open(&source_root, source, ConfinedParents::Existing)?;
+    let destination = ConfinedPath::open(root, destination, ConfinedParents::Create)?;
+    let mut source_file = source.open_regular()?;
+    let source_identity = file_identity(&source_file)?;
+    let expected =
+        fingerprint_open_file_snapshot_blocking(&mut source_file, source.path())?.fingerprint;
+    before_creation(destination.path());
+    let mut stage = destination.create_new_regular()?;
+    let stage_identity = file_identity(&stage)?;
+    source_file.rewind()?;
+    std::io::copy(&mut source_file, &mut stage)?;
+    stage.set_permissions(source_file.metadata()?.permissions())?;
+    stage.sync_all()?;
+    stage.rewind()?;
+    anyhow::ensure!(
+        fingerprint_open_file_snapshot_blocking(&mut stage, destination.path())?.fingerprint
+            == expected,
+        "Primary stage copy checksum mismatch"
+    );
+    source_file.rewind()?;
+    anyhow::ensure!(
+        file_identity(&source.validate_identity(source_identity)?)? == source_identity
+            && fingerprint_open_file_snapshot_blocking(&mut source_file, source.path())?
+                .fingerprint
+                == expected,
+        "Primary source changed during copy"
+    );
+    destination.validate_identity(stage_identity)?;
+    destination.sync_parent()?;
+    after_copy();
+    finish_reconciled_copy(
+        source,
+        source_file,
+        destination,
+        expected,
+        Some(stage_identity),
+    )?
+    .context("Primary stage copy changed")
 }
 
 fn copy_local_file_no_replace_blocking(
@@ -203,6 +271,38 @@ mod tests {
     use super::copy_local_file_no_replace;
     #[cfg(unix)]
     use super::copy_local_file_no_replace_blocking;
+
+    #[test]
+    fn create_only_layout_copy_rejects_racing_and_substituted_entries() {
+        for replace_after_publish in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source.jpg");
+            let target = dir.path().join("stage.jpg");
+            let retained = dir.path().join("retained.jpg");
+            std::fs::write(&source, b"same bytes").unwrap();
+            let result = super::copy_local_file_create_only_blocking(
+                dir.path(),
+                &source,
+                &target,
+                |_| {
+                    if !replace_after_publish {
+                        std::fs::write(&target, b"same bytes").unwrap();
+                    }
+                },
+                || {
+                    if replace_after_publish {
+                        std::fs::rename(&target, &retained).unwrap();
+                        std::fs::write(&target, b"same bytes").unwrap();
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"same bytes");
+            if replace_after_publish {
+                assert_eq!(std::fs::read(&retained).unwrap(), b"same bytes");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn local_reconciliation_copy_preserves_source_and_refuses_conflict() {

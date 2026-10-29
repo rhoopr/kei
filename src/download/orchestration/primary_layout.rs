@@ -825,7 +825,7 @@ async fn prepare(
                 .as_ref()
                 .context("Missing retained original stage")?
                 .to_path();
-            let fingerprint = copy_verified(
+            let fingerprint = file::primary_layout::copy_verified_create_only(
                 &config.directory,
                 &source.path.to_path(),
                 &stage,
@@ -834,7 +834,7 @@ async fn prepare(
             .await?;
             let xmp = if let Some(xmp) = &source.sidecar {
                 Some(
-                    copy_verified(
+                    file::primary_layout::copy_verified_create_only(
                         &config.directory,
                         &sidecar(&source.path.to_path()),
                         &sidecar(&stage),
@@ -927,7 +927,7 @@ async fn prepare(
         };
         let transform = metadata_decision(asset, config, record.version_size, &record.checksum)?;
         let prepared = if let Some(source) = source {
-            let media = copy_verified(
+            let media = file::primary_layout::copy_verified_create_only(
                 &config.directory,
                 &source.path.to_path(),
                 &stage,
@@ -935,7 +935,7 @@ async fn prepare(
             )
             .await?;
             if let Some(xmp) = &source.sidecar {
-                copy_verified(
+                file::primary_layout::copy_verified_create_only(
                     &config.directory,
                     &sidecar(&source.path.to_path()),
                     &sidecar(&stage),
@@ -954,7 +954,7 @@ async fn prepare(
                 let written = crate::download::metadata_rewrite::write_download_metadata(
                     crate::download::metadata_rewrite::MetadataWriteRequest {
                         sidecar_namespace: None,
-                        require_created_entry: false,
+                        require_created_entry: source.sidecar.is_none(),
                         final_path: &stage,
                         embed_path: Some(&stage),
                         expected_embed_fingerprint: Some(fingerprint),
@@ -986,7 +986,7 @@ async fn prepare(
                 !cancel.is_cancelled(),
                 "Primary layout interrupted before preparation"
             );
-            let task = task_for(
+            let mut task = task_for(
                 asset,
                 config,
                 &expected.url,
@@ -995,6 +995,7 @@ async fn prepare(
                 expected.version_size,
                 &stage,
             );
+            task.require_created_entry = true;
             let context = crate::download::pipeline::DownloadSingleContext {
                 temp_suffix: &config.temp_suffix,
                 state_db: Some(db),
@@ -1530,9 +1531,192 @@ pub(in crate::download) async fn plan_asset(
     Ok(Some(tasks))
 }
 
+/// Prepare only stages created by this attempt. Receipts stay in memory until
+/// the provider is reconfirmed; an interrupted occupied stage remains pending.
+async fn prepare_recorded_refresh(
+    asset: &PhotoAsset,
+    config: &DownloadConfig,
+    session: &LayoutSession,
+    op: &mut LayoutOperation,
+    cancel: &CancellationToken,
+) -> Result<Vec<LayoutFile>> {
+    let db = config
+        .state_db
+        .as_deref()
+        .context("Missing layout database")?;
+    let flags = crate::download::pipeline::MetadataFlags::from(config);
+    anyhow::ensure!(
+        !flags.any_embed(),
+        "Recorded embedded refresh needs an identity-bound metadata writer"
+    );
+    let selected = filter::derive_expected_paths(asset, config);
+    let mut sources = Vec::new();
+    for index in 0..op.members.len() {
+        let member = op
+            .members
+            .get(index)
+            .context("Recorded refresh member disappeared")?;
+        if member.prepared.is_some() || member.stage.is_none() {
+            continue;
+        }
+        anyhow::ensure!(!cancel.is_cancelled(), "Recorded refresh interrupted");
+        let stage = member
+            .stage
+            .as_ref()
+            .context("Missing refresh stage")?
+            .to_path();
+        let source = if let Some(source) = &member.archive_source {
+            source.clone()
+        } else {
+            let record = member
+                .record
+                .as_ref()
+                .context("Missing recorded refresh member")?;
+            selected
+                .iter()
+                .find(|p| {
+                    p.version_size == record.version_size
+                        && p.checksum.as_ref() == record.checksum.as_ref()
+                })
+                .context("Recorded refresh selected resource changed")?;
+            let mut source = op
+                .members
+                .iter()
+                .filter_map(|m| m.old.as_ref())
+                .find(|old| {
+                    old.version == record.version_size.as_str()
+                        && old.provider_checksum == record.checksum.as_ref()
+                })
+                .cloned();
+            if source.is_none() {
+                for receipt in session.receipts(&op.library, &op.child).filter(|r| {
+                    r.version_size == record.version_size && r.checksum == record.checksum.as_ref()
+                }) {
+                    let (Some(path), Some(checksum)) =
+                        (&receipt.local_path, &receipt.local_checksum)
+                    else {
+                        continue;
+                    };
+                    let Some(actual) = snapshot(&config.directory, path).await? else {
+                        continue;
+                    };
+                    if data_encoding::HEXLOWER.encode(&actual.sha256) != *checksum {
+                        continue;
+                    }
+                    let candidate = file_receipt(
+                        &config.directory,
+                        path,
+                        record.version_size.as_str(),
+                        &receipt.checksum,
+                        receipt.download_checksum.clone(),
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        candidate.fingerprint == actual,
+                        "Retained refresh source changed"
+                    );
+                    anyhow::ensure!(
+                        candidate.sidecar.is_none(),
+                        "Retained receipt does not establish ownership of an unrecorded sidecar"
+                    );
+                    source = Some(candidate);
+                    break;
+                }
+            }
+            source.context("Recorded refresh has no verified local source")?
+        };
+        validate_file(&config.directory, &source).await?;
+        anyhow::ensure!(
+            !matches!(
+                db.source_metadata_recovery(&source.path.to_path()).await?,
+                crate::state::db::SourceMetadataRecovery::ReadOnly
+                    | crate::state::db::SourceMetadataRecovery::ProtectedLegacy
+            ),
+            "Recorded refresh source is read-only"
+        );
+        let media = file::primary_layout::copy_verified_create_only(
+            &config.directory,
+            &source.path.to_path(),
+            &stage,
+            &source.fingerprint,
+        )
+        .await?;
+        let source_xmp = sidecar(&source.path.to_path());
+        let xmp = if member.archive_source.is_some()
+            || !flags.contains(crate::download::pipeline::MetadataFlags::XMP_SIDECAR)
+        {
+            if let Some(expected) = &source.sidecar {
+                Some(
+                    file::primary_layout::copy_verified_create_only(
+                        &config.directory,
+                        &source_xmp,
+                        &sidecar(&stage),
+                        expected,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            }
+        } else {
+            #[cfg(feature = "xmp")]
+            {
+                let record = member
+                    .record
+                    .as_ref()
+                    .context("Missing recorded refresh member")?;
+                crate::download::metadata_rewrite::create_layout_sidecar(
+                    &config.directory,
+                    &stage,
+                    source.sidecar.as_ref().map(|f| (source_xmp.as_path(), f)),
+                    filter::build_selected_payload(asset, config, record.version_size),
+                    asset.created_local(),
+                    source.source_checksum.as_deref(),
+                    &config.temp_suffix,
+                )
+                .await?
+            }
+            #[cfg(not(feature = "xmp"))]
+            {
+                anyhow::bail!("XMP sidecar support is unavailable")
+            }
+        };
+        let mut prepared = source.clone();
+        prepared.path = SelectionPath::from_path(&stage);
+        prepared.fingerprint = media;
+        prepared.sidecar = xmp;
+        if let Some(record) = &member.record {
+            let expected = selected
+                .iter()
+                .find(|p| {
+                    p.version_size == record.version_size
+                        && p.checksum.as_ref() == record.checksum.as_ref()
+                })
+                .context("Recorded refresh selected resource changed")?;
+            prepared.archive_original = expected.naming_role == filter::NamingRole::OriginalArchive;
+            prepared.metadata_decision = Some(metadata_decision(
+                asset,
+                config,
+                record.version_size,
+                &record.checksum,
+            )?);
+        } else {
+            prepared.archive_original = true;
+        }
+        validate_file(&config.directory, &source).await?;
+        validate_file(&config.directory, &prepared).await?;
+        sources.push(source);
+        op.members
+            .get_mut(index)
+            .context("Recorded refresh member disappeared")?
+            .prepared = Some(prepared);
+    }
+    Ok(sources)
+}
+
 pub(super) async fn recover(
     _client: &reqwest::Client,
-    _passes: &[crate::commands::AlbumPass],
+    passes: &[crate::commands::AlbumPass],
     config: &DownloadConfig,
     cancel: &CancellationToken,
 ) -> Result<()> {
@@ -1563,6 +1747,107 @@ pub(super) async fn recover(
                 tracing::warn!("Recorded layout retains protected replacement journals");
                 continue;
             }
+            finish(db, &mut op, cancel, &mut LayoutOutcome::default()).await?;
+            continue;
+        }
+        if op.phase == "planned"
+            && op.refresh_metadata
+            && op
+                .members
+                .iter()
+                .any(|member| member.stage.is_some() && member.prepared.is_none())
+        {
+            let mut matches = passes
+                .iter()
+                .filter(|pass| super::generation::pass_key(pass) == op.pass);
+            let pass = matches
+                .next()
+                .context("Recorded refresh has no matching current pass")?;
+            anyhow::ensure!(
+                matches.next().is_none(),
+                "Recorded refresh pass is ambiguous"
+            );
+            let current_config = config.with_pass(pass);
+            anyhow::ensure!(
+                SelectionPath::from_path(&std::path::absolute(&current_config.directory)?)
+                    == op.root
+                    && policy(&current_config) == op.policy
+                    && crate::download::pipeline::MetadataFlags::from(&current_config).bits()
+                        == op.metadata_flags,
+                "Recorded refresh options or root changed"
+            );
+            let asset = pass
+                .album
+                .confirm_layout_asset(&op.asset_record_name, &op.library)
+                .await?
+                .asset;
+            anyhow::ensure!(
+                asset.state_id() == op.child
+                    && family(&asset, &current_config)? == op.family
+                    && decision(&asset, &current_config)? == op.decision,
+                "Recorded refresh source changed"
+            );
+            for member in &op.members {
+                for file in [
+                    &member.old,
+                    &member.archive_source,
+                    &member.prepared,
+                    &member.preserved,
+                    &member.installed,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    validate_file(&op.root.to_path(), file).await?;
+                    anyhow::ensure!(
+                        !matches!(
+                            db.source_metadata_recovery(&file.path.to_path()).await?,
+                            crate::state::db::SourceMetadataRecovery::ReadOnly
+                                | crate::state::db::SourceMetadataRecovery::ProtectedLegacy
+                        ),
+                        "Recorded refresh source is read-only"
+                    );
+                }
+            }
+            db.save_primary_layout(op.clone()).await?;
+            let session = LayoutSession::load(db).await?;
+            let sources =
+                prepare_recorded_refresh(&asset, &current_config, &session, &mut op, cancel)
+                    .await?;
+            let confirmed = confirm(&asset, &current_config).await?;
+            anyhow::ensure!(
+                decision(&confirmed, &current_config)? == op.decision,
+                "Provider changed during recorded refresh preparation"
+            );
+            for member in &op.members {
+                for file in [&member.old, &member.archive_source, &member.prepared]
+                    .into_iter()
+                    .flatten()
+                {
+                    validate_file(&op.root.to_path(), file).await?;
+                    anyhow::ensure!(
+                        !matches!(
+                            db.source_metadata_recovery(&file.path.to_path()).await?,
+                            crate::state::db::SourceMetadataRecovery::ReadOnly
+                                | crate::state::db::SourceMetadataRecovery::ProtectedLegacy
+                        ),
+                        "Recorded refresh source became read-only"
+                    );
+                }
+            }
+            for source in &sources {
+                validate_file(&op.root.to_path(), source).await?;
+                anyhow::ensure!(
+                    !matches!(
+                        db.source_metadata_recovery(&source.path.to_path()).await?,
+                        crate::state::db::SourceMetadataRecovery::ReadOnly
+                            | crate::state::db::SourceMetadataRecovery::ProtectedLegacy
+                    ),
+                    "Recorded refresh source became read-only"
+                );
+            }
+            op.phase = "prepared".into();
+            db.save_primary_layout(op.clone()).await?;
             finish(db, &mut op, cancel, &mut LayoutOutcome::default()).await?;
             continue;
         }
@@ -1642,6 +1927,44 @@ pub(crate) mod tests {
         library: &str,
     ) -> LayoutOperation {
         prepared_layout_with_refresh(db, root, filename, library, false).await
+    }
+
+    pub(crate) async fn seed_unprepared_refresh(
+        config: &DownloadConfig,
+        pass: &crate::commands::AlbumPass,
+    ) -> LayoutOperation {
+        let config = config.with_pass(pass).check_ownership().await.unwrap();
+        let asset = pass
+            .album
+            .confirm_layout_asset("asset-501", "PrimarySync")
+            .await
+            .unwrap()
+            .asset;
+        let db = config.state_db.as_deref().unwrap();
+        let session = LayoutSession::load(db).await.unwrap();
+        let binding = db
+            .primary_layout_binding(family(&asset, &config).unwrap())
+            .await
+            .unwrap();
+        let op = plan(
+            &asset,
+            &config,
+            &session,
+            binding.as_ref(),
+            family(&asset, &config).unwrap(),
+            decision(&asset, &config).unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(op.refresh_metadata);
+        assert!(
+            op.members
+                .iter()
+                .filter_map(|m| m.stage.as_ref())
+                .all(|p| !p.to_path().exists())
+        );
+        op
     }
 
     pub(crate) async fn prepared_layout_with_refresh(

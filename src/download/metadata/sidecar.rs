@@ -108,6 +108,89 @@ pub(crate) async fn write_sidecar_in_namespace(
     .context("Sidecar publication task panicked")?
 }
 
+/// Build a sidecar from an independently verified source and publish it only
+/// into an absent stage. The returned identity is the exclusively created
+/// temporary file's identity, carried through no-replace publication.
+pub(in crate::download) async fn create_layout_sidecar(
+    root: &Path,
+    target_media: &Path,
+    seed: Option<(&Path, &crate::state::db::primary_layout::LayoutFingerprint)>,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+) -> Result<Option<crate::state::db::primary_layout::LayoutFingerprint>> {
+    let root = root.to_owned();
+    let target_media = target_media.to_owned();
+    let seed = seed.map(|(path, fingerprint)| (path.to_owned(), fingerprint.clone()));
+    let write = write.clone();
+    let temp_suffix = temp_suffix.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use crate::fs_util::{ConfinedParents, ConfinedPath};
+        use crate::state::db::primary_layout::LayoutFingerprint;
+        let mut target_name = target_media.as_os_str().to_os_string();
+        target_name.push(".xmp");
+        let target = ConfinedPath::open(&root, Path::new(&target_name), ConfinedParents::Create)?;
+        let source = if let Some((path, expected)) = seed {
+            let source = ConfinedPath::open(&root, &path, ConfinedParents::Existing)?;
+            let mut file = source.open_regular()?;
+            let identity = crate::fs_util::file_identity(&file)?;
+            anyhow::ensure!(
+                identity == expected.identity && crate::fs_util::file_link_count(&file)? == 1,
+                "Recorded sidecar identity changed"
+            );
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes)?;
+            let actual = fingerprint_bytes(&bytes)?;
+            anyhow::ensure!(
+                actual.size == expected.size && actual.sha256 == expected.sha256,
+                "Recorded sidecar bytes changed"
+            );
+            source.validate_identity(identity)?;
+            Some((source, file, bytes, expected))
+        } else {
+            None
+        };
+        if write.is_empty() && source.is_none() {
+            return Ok(None);
+        }
+        let bytes = if write.is_empty() {
+            source.as_ref().context("Missing sidecar source")?.2.clone()
+        } else {
+            ensure_initialized();
+            let mut meta = match source.as_ref() {
+                Some((_, _, bytes, _)) => parse_existing_sidecar(std::str::from_utf8(bytes)?)?,
+                None => XmpMeta::new().context("creating XmpMeta")?,
+            };
+            apply_to_owned_sidecar(&mut meta, &write)?;
+            meta.to_string().into_bytes()
+        };
+        let (mut temp, part) = create_unique_sidecar_temp(&target, &temp_suffix)?;
+        std::io::Write::write_all(&mut temp, &bytes)?;
+        temp.sync_all()?;
+        let identity = crate::fs_util::file_identity(&temp)?;
+        let output = fingerprint_bytes(&bytes)?;
+        if let Some((path, mut file, bytes, expected)) = source {
+            use std::io::{Read, Seek};
+            file.rewind()?;
+            let mut current = Vec::new();
+            file.read_to_end(&mut current)?;
+            anyhow::ensure!(
+                current == bytes
+                    && crate::fs_util::file_identity(&path.validate_identity(expected.identity)?)?
+                        == expected.identity,
+                "Recorded sidecar changed during preparation"
+            );
+        }
+        crate::download::file::publish_sidecar_confined(&part, &target, None, output, identity)?;
+        target.validate_identity(identity)?;
+        Ok(Some(LayoutFingerprint {
+            size: output.size,
+            sha256: output.sha256,
+            identity,
+        }))
+    })
+    .await?
+}
+
 enum PreparedSidecar {
     Publish(SidecarPublication),
     Unchanged(ReconciledSidecarSnapshot),

@@ -2515,6 +2515,8 @@ operations in that recovery pass remain pending. Reconciliation retains its
 checkpoint hold. A separately completed independent family does not establish
 continuation past a blocked operation in the coordinator.
 
+An unprepared recorded metadata refresh can retry from a verified local source after a fresh matching provider decision. The owner creates each stage exclusively, retains its file identity through sidecar publication, reconfirms the provider, and saves new preparation receipts together. Embedded metadata refreshes without preparation receipts remain pending until their writers can prove the created output identity. An occupied stage without a receipt also remains pending.
+
 Recorded layout claims fence ordinary transfer, finalization, adoption and queued metadata. Recovery checks the recorded generation, local-byte claims and retained source fingerprints before publication or retirement. Pending operations recover before ordinary source dispatch. Unknown ownership or local changes hold completion and protect existing contents. Historical catalogue receipts remain evidence, not permission to write a superseded slot. Original archives retain prior metadata and retry evidence outside the ordinary writer queue.
 
 Previously recorded Live Photo layout operations reserve and prepare their family together. Publication across separate files is recoverable rather than simultaneously atomic to external readers. Filesystems without the required conditional publication or retirement operations leave recorded work pending. See [edited primary usage](edited-primary.md) for storage, exclusion and downgrade guidance.
