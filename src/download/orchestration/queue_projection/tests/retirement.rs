@@ -6,8 +6,10 @@ use crate::icloud::photos::inbox::ShadowCapture;
 use crate::state::DownloadStateStore;
 use crate::state::MetadataRewriteStore;
 use crate::state::SqliteStateDb;
+#[cfg(target_os = "linux")]
+use crate::state::db::provider_generations::ActiveGeneration;
 use crate::state::db::provider_generations::{
-    ActiveDecision, ActiveGeneration, GenerationSpec, MAX_GENERATION_BYTES, ReuseAuthorization,
+    ActiveDecision, GenerationSpec, MAX_GENERATION_BYTES, ReuseAuthorization,
 };
 use crate::state::db::provider_selection::{SelectionDecision, SelectionDestination};
 use crate::state::db::provider_selection::{SelectionOutcome, SelectionPath};
