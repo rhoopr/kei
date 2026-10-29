@@ -1973,6 +1973,12 @@ async fn prepare_recorded_refresh(
             &stage,
             crate::fs_util::ConfinedParents::Create,
         )?;
+        #[cfg(windows)]
+        let stage_cap = {
+            let mut pinned = stage_cap;
+            pinned.pin_windows_namespace()?;
+            pinned
+        };
         validate_file(&config.directory, &source).await?;
         let media = if flags.any_embed() && member.archive_source.is_none() {
             #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]

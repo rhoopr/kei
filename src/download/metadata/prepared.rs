@@ -218,6 +218,11 @@ impl PreparedMetadataFile {
             crate::download::file::ExistingFileFingerprint,
         ) -> anyhow::Result<()>,
     ) -> Result<crate::download::file::ExistingFileFingerprint> {
+        // Ordinary Windows replacement needs exclusive access to the prepared
+        // path. Recorded-layout preparation retains the handle separately
+        // until its verified copy has finished and never calls this method.
+        #[cfg(windows)]
+        drop(self.output_file);
         let Self {
             guard,
             expected_input,
@@ -254,6 +259,40 @@ mod tests {
     use super::super::test_support::test_tmp_dir;
     use super::{TmpGuard, create_unique_embed_temp_with_sequence, embed_temp_path};
     use std::fs;
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_publication_releases_prepared_handle_before_install() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join("prepared.tmp");
+        let output_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .unwrap();
+        let fingerprint = crate::download::file::ExistingFileFingerprint {
+            size: 0,
+            sha256: [0; 32],
+        };
+        let prepared = super::PreparedMetadataFile {
+            guard: TmpGuard::new(&temp),
+            expected_input: fingerprint,
+            expected_output: fingerprint,
+            output_file,
+        };
+        prepared
+            .publish_with(&dir.path().join("final.jpg"), |path, _, _, _| {
+                let _exclusive = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .share_mode(0)
+                    .open(path)?;
+                Ok(())
+            })
+            .unwrap();
+    }
 
     #[test]
     fn tmp_guard_cleans_up_on_drop() {

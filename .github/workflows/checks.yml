@@ -165,13 +165,33 @@ jobs:
           # Requiring it where it is installed stops a failed install quietly
           # retiring that coverage.
           KEI_REQUIRE_HEIF_ORACLE: ${{ runner.os == 'Linux' && '1' || '' }}
-      - name: Native no-default embedded recovery
-        if: runner.os != 'Linux' && needs.detect.outputs.platform == 'true'
+      - name: Native all-feature embedded recovery
+        if: ${{ !cancelled() && runner.os != 'Linux' && needs.detect.outputs.platform == 'true' }}
         shell: bash
         run: |
-          set -e
-          cargo test --locked --no-default-features --lib interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync
-          cargo test --locked --no-default-features --lib interrupted_embedded_scratch_reopens_without_adopting_or_removing_unknown_files
+          status=0
+          run_check() { "$@" || status=1; }
+          run_check cargo test --locked --all-features --lib interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync
+          run_check cargo test --locked --all-features --lib interrupted_embedded_scratch_reopens_without_adopting_or_removing_unknown_files
+          run_check cargo test --locked --all-features --lib interrupted_unprepared_refresh_retries_on_ordinary_sync
+          run_check cargo test --locked --all-features --lib interrupted_unprepared_refresh_rejects_drift_and_occupied_paths
+          run_check cargo test --locked --all-features --lib apply_metadata_keeps_source_mtime
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            run_check cargo test --locked --all-features --lib embedded_stage_capability_prevents_
+            run_check cargo test --locked --all-features --lib ordinary_publication_releases_prepared_handle_before_install
+            run_check cargo test --locked --all-features --lib private_embedded_metadata_state_fault_recovers_exact_prepared_output_after_reopen
+          fi
+          exit "$status"
+      - name: Native no-default embedded recovery
+        if: ${{ !cancelled() && runner.os != 'Linux' && needs.detect.outputs.platform == 'true' }}
+        shell: bash
+        run: |
+          status=0
+          run_check() { "$@" || status=1; }
+          run_check cargo test --locked --no-default-features --lib interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync
+          run_check cargo test --locked --no-default-features --lib interrupted_embedded_scratch_reopens_without_adopting_or_removing_unknown_files
+          run_check cargo test --locked --no-default-features --lib native_apply_metadata_writes_jpeg_exif_without_xmp_feature
+          exit "$status"
       - name: Platform build and smoke
         if: runner.os != 'Linux' && needs.detect.outputs.platform != 'true'
         run: cargo test --locked --all-features --test cli --test media_fixtures --test service_cli --test service_linux --test service_macos --test service_windows --test service_status

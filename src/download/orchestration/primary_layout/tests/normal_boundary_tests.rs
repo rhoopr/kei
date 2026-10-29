@@ -428,17 +428,80 @@ fn embedded_stage_capability_prevents_archive_parent_rename() {
     let displaced = parent.path().join("displaced");
     std::fs::create_dir(&archive).unwrap();
     let stage = archive.join("stage.jpg");
-    let cap = crate::fs_util::ConfinedPath::open(
+    let mut cap = crate::fs_util::ConfinedPath::open(
         &archive,
         &stage,
         crate::fs_util::ConfinedParents::Existing,
     )
     .unwrap();
+    cap.pin_windows_namespace().unwrap();
     assert!(std::fs::rename(&archive, &displaced).is_err());
     assert!(archive.is_dir());
     assert!(!displaced.exists());
     drop(cap);
     std::fs::rename(&archive, &displaced).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn embedded_stage_capability_prevents_nested_parent_rename() {
+    let parent = tempfile::tempdir().unwrap();
+    let archive = parent.path().join("archive");
+    let nested = archive.join("nested");
+    let displaced = archive.join("displaced");
+    std::fs::create_dir_all(&nested).unwrap();
+    let stage = nested.join("stage.jpg");
+    let mut cap = crate::fs_util::ConfinedPath::open(
+        &archive,
+        &stage,
+        crate::fs_util::ConfinedParents::Existing,
+    )
+    .unwrap();
+    cap.pin_windows_namespace().unwrap();
+    assert!(std::fs::rename(&nested, &displaced).is_err());
+    assert!(nested.is_dir());
+    assert!(!displaced.exists());
+    drop(cap);
+    std::fs::rename(&nested, &displaced).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn embedded_stage_capability_prevents_cross_process_parent_rename() {
+    use std::process::Command;
+    if let Some(from) = std::env::var_os("KEI_TEST_RENAME_FROM") {
+        let to = std::env::var_os("KEI_TEST_RENAME_TO").unwrap();
+        let blocked = std::env::var_os("KEI_TEST_RENAME_BLOCKED").unwrap() == "yes";
+        assert_eq!(std::fs::rename(from, to).is_err(), blocked);
+        return;
+    }
+    let parent = tempfile::tempdir().unwrap();
+    let archive = parent.path().join("archive");
+    let displaced = parent.path().join("displaced");
+    std::fs::create_dir(&archive).unwrap();
+    let stage = archive.join("stage.jpg");
+    let mut cap = crate::fs_util::ConfinedPath::open(
+        &archive,
+        &stage,
+        crate::fs_util::ConfinedParents::Existing,
+    )
+    .unwrap();
+    cap.pin_windows_namespace().unwrap();
+    let try_rename = |blocked: bool| {
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "download::orchestration::primary_layout::tests::normal_boundary_tests::embedded_stage_capability_prevents_cross_process_parent_rename", "--nocapture"])
+            .env("KEI_TEST_RENAME_FROM", &archive)
+            .env("KEI_TEST_RENAME_TO", &displaced)
+            .env("KEI_TEST_RENAME_BLOCKED", if blocked { "yes" } else { "no" })
+            .status().unwrap().success()
+    };
+    assert!(try_rename(true));
+    assert!(archive.is_dir());
+    assert!(!displaced.exists());
+    drop(cap);
+    assert!(try_rename(false));
+    assert!(!archive.exists());
+    assert!(displaced.is_dir());
 }
 
 #[cfg(all(feature = "xmp", unix))]
