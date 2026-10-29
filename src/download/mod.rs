@@ -73,4 +73,4 @@ pub(crate) mod sparse_target;
 mod live_baseline_test;
 
 #[cfg(test)]
-pub(crate) use orchestration::primary_layout::tests::prepared_layout_in_library;
+pub(crate) use orchestration::primary_layout::tests::prepared_layout_with_refresh;

@@ -1641,6 +1641,16 @@ pub(crate) mod tests {
         filename: &str,
         library: &str,
     ) -> LayoutOperation {
+        prepared_layout_with_refresh(db, root, filename, library, false).await
+    }
+
+    pub(crate) async fn prepared_layout_with_refresh(
+        db: &Arc<SqliteStateDb>,
+        root: &Path,
+        filename: &str,
+        library: &str,
+        refresh_metadata: bool,
+    ) -> LayoutOperation {
         let asset = TestPhotoAsset::new(filename)
             .filename(filename)
             .orig_size(PREPARED.len() as u64)
@@ -1652,6 +1662,7 @@ pub(crate) mod tests {
             library: Arc::from(library),
             folder_structure: String::new(),
             edited_naming: EditedNaming::Primary,
+            refresh_metadata,
             state_db: Some(db.clone()),
             ..DownloadConfig::test_default()
         };

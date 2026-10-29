@@ -802,13 +802,15 @@ async fn baseline_contract(
         let retained = if retained_operation {
             let retained_root = root.parent().unwrap().join("retained-layout-root");
             std::fs::create_dir_all(&retained_root).unwrap();
-            let operation = download::prepared_layout_in_library(
+            let operation = download::prepared_layout_with_refresh(
                 &db,
                 &retained_root,
                 "retained-independent.JPG",
                 ZONE,
+                true,
             )
             .await;
+            assert!(operation.refresh_metadata);
             let before = serde_json::to_vec(&operation).unwrap();
             let stage = operation.members[0].stage.as_ref().unwrap().to_path();
             // Valid prepared journals now finish from their recorded proof.

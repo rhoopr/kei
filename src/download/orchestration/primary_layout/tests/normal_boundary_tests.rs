@@ -1,5 +1,8 @@
 //! Normal-sync boundaries around existing layout ownership.
-use super::{DownloadConfig, EditedNaming, PREPARED, durable_state, prepared_layout, recover};
+use super::{
+    DownloadConfig, EditedNaming, PREPARED, durable_state, prepared_layout,
+    prepared_layout_with_refresh, recover,
+};
 use crate::download::baseline_matching::BaselineMatch;
 use crate::download::planner::TaskPlanner;
 use crate::state::SqliteStateDb;
@@ -260,6 +263,354 @@ async fn v027_wrapper_prepared_layout_completes_across_reopen() {
         completed = Some(current);
         assert!(!config.directory.exists());
     }
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn v027_recorded_prepared_refresh_replays_metadata_and_preserves_sidecar() {
+    use crate::state::DownloadStateStore as _;
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state.sqlite");
+    let root = dir.path().join("old-root");
+    std::fs::create_dir(&root).unwrap();
+    let db = Arc::new(SqliteStateDb::open(&state).await.unwrap());
+    let media = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/media/metadata.jpg"
+    ));
+    let asset = TestPhotoAsset::new("refresh-owned")
+        .filename("refresh.JPG")
+        .item_type("public.jpeg")
+        .orig_file_type("public.jpeg")
+        .orig_size(media.len() as u64)
+        .orig_checksum("synthetic-provider-checksum")
+        .orig_url("http://127.0.0.1/unused")
+        .favorite(true)
+        .build()
+        .with_source_zone("PrimarySync".into());
+    let mut config = DownloadConfig {
+        directory: Arc::from(root.as_path()),
+        folder_structure: String::new(),
+        edited_naming: EditedNaming::Primary,
+        refresh_metadata: true,
+        state_db: Some(db.clone()),
+        ..DownloadConfig::test_default()
+    };
+    config.metadata.xmp_sidecar = true;
+    let derived = crate::download::filter::derive_expected_paths(&asset, &config).remove(0);
+    std::fs::write(&derived.path, media).unwrap();
+    let old_sidecar = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description rdf:about='' xmlns:xmp='http://ns.adobe.com/xap/1.0/' xmp:Rating='4'/></rdf:RDF></x:xmpmeta>";
+    std::fs::write(super::sidecar(&derived.path), old_sidecar).unwrap();
+    let task = super::super::task_for(
+        &asset,
+        &config,
+        &derived.url,
+        &derived.checksum,
+        derived.size,
+        derived.version_size,
+        &derived.path,
+    );
+    let record = crate::download::planner::pending_record_for_task(&config, &asset, &task);
+    db.upsert_seen(&record).await.unwrap();
+    let checksum = super::digest(media);
+    db.mark_verified_download(
+        "PrimarySync",
+        asset.state_id(),
+        derived.version_size.as_str(),
+        &derived.path,
+        &checksum,
+        Some(&checksum),
+        false,
+    )
+    .await
+    .unwrap();
+    let checked_config = config.check_ownership().await.unwrap();
+    drop(config);
+    let config = checked_config;
+    assert!(config.allows_existing_mutation());
+    let session = super::LayoutSession::load(db.as_ref()).await.unwrap();
+    let mut op = super::plan(
+        &asset,
+        &config,
+        &session,
+        None,
+        super::family(&asset, &config).unwrap(),
+        super::decision(&asset, &config).unwrap(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(op.refresh_metadata);
+    super::super::prepare(
+        &reqwest::Client::new(),
+        &asset,
+        &config,
+        &session,
+        &mut op,
+        &CancellationToken::new(),
+        &mut super::LayoutOutcome::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(op.phase, "planned");
+    assert!(
+        op.members
+            .iter()
+            .all(|member| member.stage.is_none() || member.prepared.is_some())
+    );
+    let preserved = op.members[0].preserved_path.as_ref().unwrap().to_path();
+    db.acquire_lock("inject prepared phase failure").unwrap().execute_batch(
+        "CREATE TRIGGER fail_refresh_prepared BEFORE UPDATE OF phase ON primary_layout_operations WHEN NEW.phase='prepared' BEGIN SELECT RAISE(FAIL,'injected refresh preparation failure'); END"
+    ).unwrap();
+    op.phase = "prepared".into();
+    assert!(db.save_primary_layout(op.clone()).await.is_err());
+    let recorded = db
+        .primary_layout_operations("PrimarySync".into())
+        .await
+        .unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].phase, "planned");
+    assert!(recorded[0].refresh_metadata);
+    assert!(
+        recorded[0]
+            .members
+            .iter()
+            .all(|member| member.stage.is_none() || member.prepared.is_some())
+    );
+    assert_eq!(std::fs::read(&derived.path).unwrap(), media);
+    assert_eq!(
+        std::fs::read(super::sidecar(&derived.path)).unwrap(),
+        old_sidecar
+    );
+    db.acquire_lock("replace preparation failure with commit failure")
+        .unwrap()
+        .execute_batch(
+            "DROP TRIGGER fail_refresh_prepared;
+             CREATE TRIGGER fail_refresh_binding BEFORE INSERT ON primary_layout_bindings
+             BEGIN SELECT RAISE(FAIL,'injected refresh binding failure'); END",
+        )
+        .unwrap();
+    drop(config);
+    assert_eq!(Arc::strong_count(&db), 1);
+    drop(db);
+
+    // Reopen without the one-shot option. A failed catalogue commit must retain
+    // the actual displaced bytes and operation evidence for the next recovery.
+    let db = Arc::new(SqliteStateDb::open(&state).await.unwrap());
+    let retry_config = DownloadConfig {
+        directory: dir.path().join("new-root").into(),
+        state_db: Some(db.clone()),
+        ..DownloadConfig::test_default()
+    };
+    assert!(!retry_config.refresh_metadata);
+    let error = recover(
+        &reqwest::Client::new(),
+        &[recorded_recovery_pass()],
+        &retry_config,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("injected refresh binding failure"));
+    let held = crate::download::recover_recorded_sources(
+        &reqwest::Client::new(),
+        &[recorded_recovery_pass()],
+        Arc::new(retry_config),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(!held.complete);
+    assert!(held.stats.failed > 0);
+    assert_eq!(std::fs::read(&derived.path).unwrap(), media);
+    assert_eq!(std::fs::read(&preserved).unwrap(), media);
+    assert_eq!(
+        std::fs::read(super::sidecar(&preserved)).unwrap(),
+        old_sidecar
+    );
+    let held_operations = db
+        .primary_layout_operations("PrimarySync".into())
+        .await
+        .unwrap();
+    assert_eq!(held_operations.len(), 1);
+    assert!(held_operations[0].refresh_metadata);
+    assert_eq!(held_operations[0].phase, "publishing");
+    assert!(held_operations[0].members[0].installed.is_some());
+    assert!(held_operations[0].members[0].preserved.is_some());
+    assert!(
+        db.primary_layout_binding(op.family.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    db.acquire_lock("clear refresh binding failure")
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_refresh_binding")
+        .unwrap();
+    drop(db);
+    let mut previous = None;
+    for _ in 0..2 {
+        let db = Arc::new(SqliteStateDb::open(&state).await.unwrap());
+        let config = DownloadConfig {
+            directory: dir.path().join("new-root").into(),
+            state_db: Some(db.clone()),
+            ..DownloadConfig::test_default()
+        };
+        assert!(!config.refresh_metadata);
+        let result = crate::download::recover_recorded_sources(
+            &reqwest::Client::new(),
+            &[recorded_recovery_pass()],
+            Arc::new(config),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(result.complete);
+        assert_eq!(result.stats.failed, 0);
+        assert_eq!(std::fs::read(&derived.path).unwrap(), media);
+        assert_eq!(std::fs::read(&preserved).unwrap(), media);
+        let new_sidecar = std::fs::read(super::sidecar(&derived.path)).unwrap();
+        assert!(
+            std::str::from_utf8(&new_sidecar)
+                .unwrap()
+                .contains("Rating>5")
+        );
+        assert_eq!(
+            std::fs::read(super::sidecar(&preserved)).unwrap(),
+            old_sidecar
+        );
+        let manifest = db.get_manifest_assets().await.unwrap();
+        let preserved_files: Vec<_> = manifest
+            .iter()
+            .flat_map(|row| &row.preserved_files)
+            .collect();
+        assert_eq!(preserved_files.len(), 1);
+        let receipt = preserved_files[0];
+        assert_eq!(receipt.operation, op.operation);
+        assert_eq!(receipt.family, op.family);
+        assert_eq!(receipt.previous_generation, op.generation);
+        assert_eq!(receipt.phase, "committed");
+        assert_eq!(receipt.native_path.to_path(), preserved);
+        assert_eq!(receipt.provider_checksum, "synthetic-provider-checksum");
+        assert_eq!(receipt.local_checksum, super::digest(media));
+        assert_eq!(
+            receipt.source_checksum.as_deref(),
+            Some(super::digest(media).as_str())
+        );
+        assert_eq!(
+            receipt.sidecar_checksum.as_deref(),
+            Some(super::digest(old_sidecar).as_str())
+        );
+        assert_eq!(receipt.size_bytes, media.len() as u64);
+        let binding = db
+            .primary_layout_binding(op.family.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.generation, op.generation + 1);
+        assert_eq!(binding.child, op.child);
+        assert!(
+            db.get_pending_metadata_rewrites(100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let snapshot = durable_state(&db);
+        if let Some(previous) = &previous {
+            assert_eq!(&snapshot, previous);
+        }
+        previous = Some(snapshot);
+        assert!(!dir.path().join("new-root").exists());
+    }
+}
+
+#[tokio::test]
+async fn v027_recorded_refresh_intent_survives_failed_commit_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state.sqlite");
+    let root = dir.path().join("old-root");
+    std::fs::create_dir(&root).unwrap();
+    let db = Arc::new(SqliteStateDb::open(&state).await.unwrap());
+    let op = prepared_layout_with_refresh(&db, &root, "refresh.JPG", "PrimarySync", true).await;
+    assert!(op.refresh_metadata);
+    let stage = op.members[0].stage.as_ref().unwrap().to_path();
+    let destination = op.members[0].destination.as_ref().unwrap().to_path();
+    db.acquire_lock("inject recorded refresh commit failure").unwrap().execute_batch(
+        "CREATE TRIGGER fail_recorded_refresh_commit BEFORE INSERT ON primary_layout_bindings BEGIN SELECT RAISE(FAIL,'injected recorded refresh commit failure'); END"
+    ).unwrap();
+    drop(db);
+    let db = Arc::new(SqliteStateDb::open(&state).await.unwrap());
+    let config = DownloadConfig {
+        directory: dir.path().join("new-root").into(),
+        state_db: Some(db.clone()),
+        ..DownloadConfig::test_default()
+    };
+    assert!(!config.refresh_metadata);
+    let held = crate::download::recover_recorded_sources(
+        &reqwest::Client::new(),
+        &[recorded_recovery_pass()],
+        Arc::new(config),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(!held.complete);
+    assert!(held.stats.failed > 0);
+    let pending = db
+        .primary_layout_operations("PrimarySync".into())
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(
+        pending[0].refresh_metadata,
+        "recorded refresh intent must survive the failed commit"
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), PREPARED);
+    db.acquire_lock("clear recorded refresh failure")
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_recorded_refresh_commit")
+        .unwrap();
+    drop(db);
+    let mut settled = None;
+    for _ in 0..2 {
+        let db = Arc::new(SqliteStateDb::open(&state).await.unwrap());
+        let config = DownloadConfig {
+            directory: dir.path().join("new-root").into(),
+            state_db: Some(db.clone()),
+            ..DownloadConfig::test_default()
+        };
+        assert!(!config.refresh_metadata);
+        let result = crate::download::recover_recorded_sources(
+            &reqwest::Client::new(),
+            &[recorded_recovery_pass()],
+            Arc::new(config),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(result.complete);
+        assert_eq!(result.stats.failed, 0);
+        assert_eq!(std::fs::read(&destination).unwrap(), PREPARED);
+        assert!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let snapshot = durable_state(&db);
+        if let Some(previous) = &settled {
+            assert_eq!(&snapshot, previous);
+        }
+        settled = Some(snapshot);
+        assert!(!dir.path().join("new-root").exists());
+    }
+    assert!(!stage.exists());
 }
 
 #[tokio::test]
@@ -556,7 +907,9 @@ async fn v027_planned_journal_requires_every_recorded_preparation() {
         let root = dir.path().join("old-root");
         std::fs::create_dir(&root).unwrap();
         let db = Arc::new(SqliteStateDb::open(&state).await.unwrap());
-        let mut op = prepared_layout(&db, &root, "planned.JPG").await;
+        let mut op =
+            prepared_layout_with_refresh(&db, &root, "planned.JPG", "PrimarySync", true).await;
+        assert!(op.refresh_metadata);
         let destination = op.members[0].destination.as_ref().unwrap().to_path();
         let stage = op.members[0].stage.as_ref().unwrap().to_path();
         // Reproduce the durable prefix before prepare saves its final phase:

@@ -691,7 +691,7 @@ async fn primary_layout_heic_jpeg_extension_changes_retire_only_preserved_owned_
 }
 
 #[tokio::test]
-async fn primary_layout_migrates_suffix_and_disables_without_redownload() {
+async fn naming_switch_preserves_existing_paths_without_redownload() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
@@ -704,13 +704,13 @@ async fn primary_layout_migrates_suffix_and_disables_without_redownload() {
     let (migrated, _) = cycle(root.path(), edited.clone(), true, EditedNaming::Primary).await;
     assert_eq!(migrated.failed_count, 0, "{:?}", migrated.stats);
     assert!(migrated.db_sync_token_advance_safe);
-    assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
-    assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
-    assert!(!media.join("IMG_0501_edited.JPG").exists());
+    assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+    assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_ONE);
+    assert!(!media.join("IMG_0501_original.JPG").exists());
     assert_eq!(
         server.received_requests().await.unwrap().len(),
         downloads,
-        "migration fetched verified local media"
+        "naming change fetched existing media"
     );
     let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
         .await
@@ -728,7 +728,7 @@ async fn primary_layout_migrates_suffix_and_disables_without_redownload() {
     assert!(disabled.db_sync_token_advance_safe);
     assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
     assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_ONE);
-    assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+    assert!(!media.join("IMG_0501_original.JPG").exists());
     assert_eq!(server.received_requests().await.unwrap().len(), downloads);
 }
 
@@ -809,89 +809,121 @@ async fn contract_source_checkpoint_requires_durable_recovery_primary_layout_aft
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
-    let (initial, _) = cycle(
-        root.path(),
-        records(&server, None),
-        false,
-        EditedNaming::Primary,
+    let current = records(&server, None);
+    let (initial, _) = cycle(root.path(), current.clone(), true, EditedNaming::Primary).await;
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    let original = media.join("IMG_0501.JPG");
+    assert_bytes(&original, ORIGINAL);
+    let requests = server.received_requests().await.unwrap().len();
+    let db = Arc::new(
+        state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap(),
+    );
+    let checkpoint = db.get_metadata("sync_token:PrimarySync").await.unwrap();
+    assert!(
+        checkpoint.is_some(),
+        "precondition: initial checkpoint is durable"
+    );
+    let operation = download::prepared_layout_with_refresh(
+        &db,
+        &media,
+        "recorded-recovery.JPG",
+        "PrimarySync",
+        true,
     )
     .await;
-    assert_eq!(initial.failed_count, 0);
-    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-    conn.execute_batch("CREATE TRIGGER fail_layout_commit BEFORE INSERT ON primary_layout_bindings BEGIN SELECT RAISE(FAIL,'injected layout commit failure'); END").unwrap();
-    drop(conn);
-    let edited = records(&server, Some(("edit-one", EDIT_ONE)));
-    let (failed, _) = cycle(root.path(), edited.clone(), false, EditedNaming::Primary).await;
-    assert!(!failed.db_sync_token_advance_safe);
-    assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
-    assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
-    assert_eq!(
-        db_count(
-            root.path(),
-            "SELECT COUNT(*) FROM primary_layout_operations WHERE phase='publishing'"
-        ),
-        1
+    let destination = operation.members[0].destination.as_ref().unwrap().to_path();
+    // The recorded journal alone must wake the selected zone on a quiet watch.
+    assert!(
+        db.get_metadata(&format!(
+            "{}PrimarySync",
+            crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
+        ))
+        .await
+        .unwrap()
+        .is_none()
     );
-    // A real interrupted publication must wake its selected zone even when
-    // the provider is quiet and no retained-checkpoint marker can mask it.
-    {
+    assert!(
+        !db.has_metadata_capture_work(&["PrimarySync"], state::METADATA_CAPTURE_REVISION)
+            .await
+            .unwrap()
+    );
+    assert!(
+        db.get_metadata(&state::unresolved_identity_key("PrimarySync"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(db.get_pending().await.unwrap().is_empty());
+    use crate::state::ReportStateStore as _;
+    assert!(!db.has_download_retry_work("PrimarySync").await.unwrap());
+    let selected = crate::sync_loop::test_support::make_run_cycle_library_state(
+        "PrimarySync",
+        "sync_token",
+        "zone_token",
+    );
+    let mut precheck = crate::sync_loop::precheck::WatchPrecheck::SkipAll;
+    crate::sync_loop::precheck::include_pending_local_work(&mut precheck, db.as_ref(), &[selected])
+        .await;
+    assert!(precheck.should_sync_zone("PrimarySync"));
+    assert!(!precheck.should_sync_zone("SharedSync-unselected"));
+    assert!(precheck.db_sync_token_after_success().is_none());
+    db.acquire_lock("inject recorded layout commit failure").unwrap().execute_batch(
+        "CREATE TRIGGER fail_layout_commit BEFORE INSERT ON primary_layout_bindings BEGIN SELECT RAISE(FAIL,'injected layout commit failure'); END"
+    ).unwrap();
+    drop(db);
+    let held = try_cycle_options(
+        root.path(),
+        current.clone(),
+        true,
+        EditedNaming::Primary,
+        CycleOptions::default(),
+    )
+    .await;
+    assert!(held.is_err(), "recorded commit failure must surface");
+    assert_bytes(&original, ORIGINAL);
+    assert_bytes(&destination, b"prepared current rendition");
+    let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+        checkpoint,
+        "recorded work must hold the source checkpoint"
+    );
+    let pending = db
+        .primary_layout_operations("PrimarySync".into())
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(
+        pending[0].refresh_metadata,
+        "recorded intent must remain durable"
+    );
+    db.acquire_lock("clear recorded layout commit failure")
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_layout_commit")
+        .unwrap();
+    drop(db);
+    for _ in 0..2 {
+        let (recovered, _) = cycle(root.path(), current.clone(), true, EditedNaming::Primary).await;
+        assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
+        assert!(recovered.db_sync_token_advance_safe);
+        assert_eq!(recovered.stats.downloaded, 0);
+        assert_bytes(&original, ORIGINAL);
+        assert_bytes(&destination, b"prepared current rendition");
         let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
             .await
             .unwrap();
         assert!(
-            db.get_metadata(&format!(
-                "{}PrimarySync",
-                crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
-            ))
-            .await
-            .unwrap()
-            .is_none()
-        );
-        assert!(
-            !db.has_metadata_capture_work(&["PrimarySync"], state::METADATA_CAPTURE_REVISION)
+            db.primary_layout_operations("PrimarySync".into())
                 .await
                 .unwrap()
+                .is_empty()
         );
-        assert!(
-            db.get_metadata(&state::unresolved_identity_key("PrimarySync"))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        let selected = crate::sync_loop::test_support::make_run_cycle_library_state(
-            "PrimarySync",
-            "sync_token",
-            "zone_token",
-        );
-        let mut precheck = crate::sync_loop::precheck::WatchPrecheck::SkipAll;
-        crate::sync_loop::precheck::include_pending_local_work(&mut precheck, &db, &[selected])
-            .await;
-        assert!(precheck.should_sync_zone("PrimarySync"));
-        assert!(!precheck.should_sync_zone("SharedSync-unselected"));
-        assert!(precheck.db_sync_token_after_success().is_none());
     }
-    let requests = server.received_requests().await.unwrap().len();
-    rusqlite::Connection::open(root.path().join("state.db"))
-        .unwrap()
-        .execute_batch("DROP TRIGGER fail_layout_commit")
-        .unwrap();
-    let (recovered, _) = cycle(root.path(), edited, true, EditedNaming::Primary).await;
-    assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
-    assert!(recovered.db_sync_token_advance_safe);
-    assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
-    assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
-    assert_eq!(
-        server.received_requests().await.unwrap().len(),
-        requests,
-        "recovery downloaded already published bytes"
-    );
-    assert_eq!(
-        db_count(
-            root.path(),
-            "SELECT COUNT(*) FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled')"
-        ),
-        0
-    );
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
 }
 
 #[tokio::test]
@@ -2977,6 +3009,182 @@ async fn review501_explicit_metadata_refresh_uses_preserving_layout_owner() {
         }
         assert_eq!(server.received_requests().await.unwrap().len(), requests);
     }
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn review501_explicit_metadata_refresh_keeps_existing_naming_paths() {
+    let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, EDIT_TWO).await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let options = |refresh_metadata| CycleOptions {
+        refresh_metadata,
+        sidecar: true,
+        private: true,
+        ..CycleOptions::default()
+    };
+    let initial_records =
+        records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT)));
+    let (initial, _) = cycle_options(
+        root.path(),
+        initial_records.clone(),
+        true,
+        EditedNaming::Suffix,
+        options(false),
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    let original = media.join("IMG_0501.JPG");
+    let edited = media.join("IMG_0501_edited.JPG");
+    assert_bytes(&original, VALID_ORIGINAL);
+    assert_bytes(&edited, VALID_EDIT);
+    let original_mtime = std::fs::metadata(&original).unwrap().modified().unwrap();
+    let edited_mtime = std::fs::metadata(&edited).unwrap().modified().unwrap();
+    let sidecar = media.join("IMG_0501_edited.JPG.xmp");
+    let previous_xmp = std::fs::read(&sidecar).unwrap();
+    let requests = server.received_requests().await.unwrap().len();
+    let (renamed, _) = cycle_options(
+        root.path(),
+        initial_records.clone(),
+        true,
+        EditedNaming::Primary,
+        options(false),
+    )
+    .await;
+    assert_eq!(renamed.failed_count, 0, "{:?}", renamed.stats);
+    assert!(renamed.db_sync_token_advance_safe);
+    assert_eq!(renamed.stats.downloaded, 0);
+    assert_bytes(&original, VALID_ORIGINAL);
+    assert_bytes(&edited, VALID_EDIT);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), previous_xmp);
+    assert!(!media.join("IMG_0501_original.JPG").exists());
+    let mut changed = initial_records;
+    changed[1]["fields"]["isFavorite"] = json!({"value":1});
+    let (refreshed, _) = cycle_options(
+        root.path(),
+        changed.clone(),
+        true,
+        EditedNaming::Primary,
+        options(true),
+    )
+    .await;
+    assert_eq!(refreshed.failed_count, 0, "{:?}", refreshed.stats);
+    assert!(refreshed.db_sync_token_advance_safe);
+    assert_eq!(refreshed.stats.downloaded, 0);
+    assert_bytes(&original, VALID_ORIGINAL);
+    assert_bytes(&edited, VALID_EDIT);
+    assert_eq!(
+        std::fs::metadata(&original).unwrap().modified().unwrap(),
+        original_mtime
+    );
+    assert_eq!(
+        std::fs::metadata(&edited).unwrap().modified().unwrap(),
+        edited_mtime
+    );
+    let fresh_xmp = std::fs::read(&sidecar).unwrap();
+    assert_ne!(
+        fresh_xmp, previous_xmp,
+        "explicit refresh must update metadata"
+    );
+    assert!(
+        std::str::from_utf8(&fresh_xmp)
+            .unwrap()
+            .contains("Rating>5")
+    );
+    let parsed: xmp_toolkit::XmpMeta = std::str::from_utf8(&fresh_xmp).unwrap().parse().unwrap();
+    let old: xmp_toolkit::XmpMeta = std::str::from_utf8(&previous_xmp).unwrap().parse().unwrap();
+    for (namespace, key) in [
+        (xmp_toolkit::xmp_ns::XMP, "CreateDate"),
+        (xmp_toolkit::xmp_ns::EXIF, "DateTimeOriginal"),
+    ] {
+        assert_eq!(
+            parsed.property(namespace, key).unwrap().value,
+            old.property(namespace, key).unwrap().value
+        );
+    }
+    let expected_date = chrono::DateTime::from_timestamp_millis(
+        crate::sync_loop::test_support::RUN_CYCLE_ASSET_DATE_MS,
+    )
+    .unwrap()
+    .with_timezone(&chrono::Local)
+    .format("%Y-%m-%dT%H:%M:%S")
+    .to_string();
+    for (namespace, key) in [
+        (xmp_toolkit::xmp_ns::XMP, "CreateDate"),
+        (xmp_toolkit::xmp_ns::EXIF, "DateTimeOriginal"),
+    ] {
+        assert_eq!(
+            parsed.property(namespace, key).unwrap().value,
+            expected_date
+        );
+    }
+    let keywords: Vec<_> = (1..)
+        .map_while(|index| parsed.array_item(xmp_toolkit::xmp_ns::DC, "subject", index))
+        .map(|item| item.value)
+        .collect();
+    assert!(keywords.iter().any(|value| value == "TestAlbum"));
+    assert!(!keywords.iter().any(|value| value == "Unfiled"));
+    assert!(!media.join("IMG_0501_original.JPG").exists());
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    for (version, expected) in [("original", &original), ("adjusted", &edited)] {
+        let recorded: String = conn.query_row(
+            "SELECT local_path FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size=?1 AND status='downloaded'",
+            [version], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(std::path::Path::new(&recorded), expected);
+    }
+    drop(conn);
+    let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+        .await
+        .unwrap();
+    assert!(
+        db.get_pending_metadata_rewrites(100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    drop(db);
+    let catalogue = || {
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let mut statement = conn.prepare(
+            "SELECT version_size, local_path, metadata_hash FROM assets WHERE library='PrimarySync' AND id='asset-501' ORDER BY version_size"
+        ).unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<(String, String, Option<String>)>>>()
+            .unwrap()
+    };
+    let refreshed_catalogue = catalogue();
+    for _ in 0..2 {
+        let (quiet, lookups) = cycle_options(
+            root.path(),
+            changed.clone(),
+            true,
+            EditedNaming::Primary,
+            options(false),
+        )
+        .await;
+        assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+        assert!(quiet.db_sync_token_advance_safe);
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_eq!(lookups, 0);
+        assert_eq!(catalogue(), refreshed_catalogue);
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert!(
+            db.get_pending_metadata_rewrites(100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(db);
+        assert_bytes(&original, VALID_ORIGINAL);
+        assert_bytes(&edited, VALID_EDIT);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), fresh_xmp);
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
 }
 
 #[tokio::test]
