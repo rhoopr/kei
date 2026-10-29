@@ -833,77 +833,190 @@ async fn current_unverified_primary_candidate_is_held_across_reopen() {
     assert_eq!(server.received_requests().await.unwrap().len(), 0);
 }
 
-// Unresolved: retain runner checkpoint veto and independent original/edit bytes
-// until a recorded edited-family operation replaces this retired setup.
 #[tokio::test]
-async fn unresolved_recorded_edited_family_local_modification_holds_runner_checkpoint() {
+async fn recorded_edited_family_local_modification_holds_runner_checkpoint_then_recovers() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
-    std::fs::create_dir(&media).unwrap();
-    std::fs::write(media.join("IMG_0501.JPG"), b"foreign primary bytes").unwrap();
-    let (first, _) = cycle(
-        root.path(),
-        records(&server, Some(("edit-one", EDIT_ONE))),
-        false,
-        EditedNaming::Primary,
+    let current = records(&server, Some(("edit-one", EDIT_ONE)));
+    let (initial, _) = cycle(root.path(), current.clone(), true, EditedNaming::Suffix).await;
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    assert!(initial.db_sync_token_advance_safe);
+    let original = media.join("IMG_0501.JPG");
+    let edited = media.join("IMG_0501_edited.JPG");
+    assert_bytes(&original, ORIGINAL);
+    assert_bytes(&edited, EDIT_ONE);
+    let requests = server.received_requests().await.unwrap().len();
+    let provider = Session {
+        records: current.clone(),
+        quiet: true,
+        lookups: Arc::new(AtomicUsize::new(0)),
+        current: None,
+        lookup_change: None,
+        indexing: None,
+    };
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: make_full_album_with_boxed_session("PrimarySync", Box::new(provider)),
+        exclude_ids: Arc::default(),
+    };
+    let db = Arc::new(
+        state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap(),
+    );
+    let checkpoint = db.get_metadata("sync_token:PrimarySync").await.unwrap();
+    assert!(checkpoint.is_some());
+    let store: Arc<dyn download::DownloadStore> = db.clone();
+    let base = make_run_cycle_download_config_builder(&media, store);
+    let mut config = base(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from("PrimarySync"),
     )
-    .await;
-    assert_eq!(first.failed_count, 0);
-    assert!(first.db_sync_token_advance_safe);
-    assert_bytes(&media.join("IMG_0501.JPG"), b"foreign primary bytes");
-    let names: Vec<_> = std::fs::read_dir(&media)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "JPG"))
+    .as_ref()
+    .clone();
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    config.edited_naming = EditedNaming::Suffix;
+    config.refresh_metadata = true;
+    // This explicit refresh is planned and journaled while both recorded files
+    // are intact. Subsequent ordinary cycles must replay the saved intent.
+    let operation = download::seed_unprepared_refresh(&config, &pass).await;
+    assert!(operation.refresh_metadata);
+    let old: Vec<_> = operation
+        .members
+        .iter()
+        .filter_map(|member| member.old.as_ref())
         .collect();
-    let current = names
+    assert_eq!(old.len(), 2);
+    assert!(old.iter().any(|file| file.path.to_path() == original));
+    assert!(old.iter().any(|file| file.path.to_path() == edited));
+    let receipts: Vec<_> = old
         .iter()
-        .find(|path| {
-            path.file_name()
+        .map(|file| serde_json::to_value(file).unwrap())
+        .collect();
+    drop(config);
+    drop(base);
+    drop(db);
+    std::fs::write(&edited, b"user changed owned bytes").unwrap();
+    for _ in 0..2 {
+        let result = try_cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Suffix,
+            CycleOptions::default(),
+        )
+        .await;
+        let error = result.expect_err("local modification must stop recorded recovery");
+        assert!(
+            format!("{error:#}").contains("Owned layout file changed locally"),
+            "unexpected recovery failure: {error:#}"
+        );
+        assert_bytes(&edited, b"user changed owned bytes");
+        assert_bytes(&original, ORIGINAL);
+        let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+            checkpoint
+        );
+        let pending = db
+            .primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].operation, operation.operation);
+        assert!(pending[0].refresh_metadata);
+        assert_eq!(pending[0].phase, operation.phase);
+        assert!(
+            pending[0]
+                .members
+                .iter()
+                .all(|member| member.prepared.is_none())
+        );
+        assert!(
+            pending[0]
+                .members
+                .iter()
+                .filter_map(|member| member.stage.as_ref())
+                .all(|stage| !stage.to_path().exists())
+        );
+        let held: Vec<_> = pending[0]
+            .members
+            .iter()
+            .filter_map(|member| member.old.as_ref())
+            .map(|file| serde_json::to_value(file).unwrap())
+            .collect();
+        assert_eq!(held, receipts);
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    }
+    std::fs::write(&edited, EDIT_ONE).unwrap();
+    let mut completed_receipts = None;
+    for recovery_cycle in 0..2 {
+        let (result, lookups) =
+            cycle(root.path(), current.clone(), true, EditedNaming::Suffix).await;
+        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+        assert!(result.db_sync_token_advance_safe);
+        assert_eq!(result.stats.downloaded, 0);
+        if recovery_cycle > 0 {
+            assert_eq!(
+                lookups, 0,
+                "quiet reopen must not repeat source confirmation"
+            );
+        }
+        assert_bytes(&original, ORIGINAL);
+        assert_bytes(&edited, EDIT_ONE);
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
                 .unwrap()
-                .to_string_lossy()
-                .starts_with("IMG_0501-")
-                && !path
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .ends_with("_original.JPG")
-        })
-        .unwrap();
-    let archive = names
-        .iter()
-        .find(|path| {
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .ends_with("_original.JPG")
-        })
-        .unwrap();
-    assert_bytes(current, EDIT_ONE);
-    assert_bytes(archive, ORIGINAL);
-    let (second, _) = cycle(
-        root.path(),
-        records(&server, Some(("edit-two", EDIT_TWO))),
-        false,
-        EditedNaming::Primary,
-    )
-    .await;
-    assert_eq!(second.failed_count, 0);
-    assert_bytes(current, EDIT_TWO);
-    assert_bytes(archive, ORIGINAL);
-    std::fs::write(current, b"user changed owned bytes").unwrap();
-    let (conflict, _) = cycle(
-        root.path(),
-        records(&server, Some(("edit-one", EDIT_ONE))),
-        false,
-        EditedNaming::Primary,
-    )
-    .await;
-    assert!(!conflict.db_sync_token_advance_safe);
-    assert_bytes(current, b"user changed owned bytes");
-    assert_bytes(archive, ORIGINAL);
-    assert_bytes(&media.join("IMG_0501.JPG"), b"foreign primary bytes");
+                .is_empty()
+        );
+        let manifest = db.get_manifest_assets().await.unwrap();
+        let preserved: Vec<_> = manifest
+            .iter()
+            .flat_map(|row| &row.preserved_files)
+            .collect();
+        assert_eq!(preserved.len(), 2);
+        for (version, bytes) in [("original", ORIGINAL), ("adjusted", EDIT_ONE)] {
+            let old_file = old.iter().find(|file| file.version == version).unwrap();
+            let expected = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+            let receipt = preserved
+                .iter()
+                .find(|receipt| receipt.local_checksum == expected)
+                .unwrap();
+            assert_eq!(receipt.operation, operation.operation);
+            assert_eq!(receipt.family, operation.family);
+            assert_eq!(receipt.phase, "committed");
+            assert_eq!(receipt.previous_generation, operation.generation);
+            assert_eq!(receipt.provider_checksum, old_file.provider_checksum);
+            assert_eq!(receipt.source_checksum, old_file.source_checksum);
+            assert_eq!(receipt.size_bytes, bytes.len() as u64);
+            assert_eq!(
+                receipt.local_checksum,
+                data_encoding::HEXLOWER.encode(&Sha256::digest(bytes))
+            );
+            assert_eq!(std::fs::read(receipt.native_path.to_path()).unwrap(), bytes);
+        }
+        let snapshot: Vec<_> = preserved.into_iter().cloned().collect();
+        if let Some(previous) = &completed_receipts {
+            assert_eq!(
+                &snapshot, previous,
+                "quiet reopen must retain the same receipts"
+            );
+        }
+        completed_receipts = Some(snapshot);
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    }
 }
 
 #[tokio::test]
