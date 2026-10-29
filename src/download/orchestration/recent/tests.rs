@@ -540,11 +540,14 @@ async fn private_recent_equal_dates_preserve_provider_ties_and_recover_after_cap
         crate::cli::RecentScope::PerFilter,
     ] {
         let server = crate::start_wiremock_or_skip!();
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
-            .mount(&server)
-            .await;
-        let mut source = (*inventory(&server.uri())).clone();
+        for name in ["alpha", "beta", "gamma", "delta", "epsilon"] {
+            Mock::given(method("GET"))
+                .and(wiremock::matchers::path(format!("/{name}.jpg")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(distinct_media(name)))
+                .mount(&server)
+                .await;
+        }
+        let mut source = (*distinct_inventory(&server.uri())).clone();
         source[1][1]["fields"]["assetDate"] = source[0][1]["fields"]["assetDate"].clone();
         source.swap(0, 1);
         let source = Arc::new(source);
@@ -630,29 +633,62 @@ async fn private_recent_equal_dates_preserve_provider_ties_and_recover_after_cap
                     _ => 0,
                 }
             );
+            assert_eq!(
+                result.sync_token.as_deref(),
+                Some("delta-successor"),
+                "only the changes successor may become the source cursor"
+            );
+            assert!(!result.checkpoint.sync_token_blocked);
             if cycle == 0 {
-                assert!(result.sync_token.is_none());
+                assert!(result.checkpoint.selection_window_complete);
                 assert_eq!(
                     db.get_metadata("sync_token:PrimarySync")
                         .await
                         .unwrap()
                         .as_deref(),
-                    Some("saved-tie-cursor")
+                    Some("saved-tie-cursor"),
+                    "the bounded receipt cannot itself commit a cursor"
                 );
-            } else {
-                let successor = result
-                    .sync_token
-                    .expect("uncapped complete coverage retains existing checkpoint bridge");
-                db.commit_checkpoint_transition(crate::state::CheckpointTransition {
-                    expected_metadata: Vec::new(),
-                    legacy_preservation_proofs: Vec::new(),
-                    legacy_config_hash: None,
-                    sparse_identity_proofs: Vec::new(),
-                    metadata_updates: vec![("sync_token:PrimarySync".into(), successor)],
-                    metadata_deletes: Vec::new(),
-                })
-                .await
-                .unwrap();
+            }
+            if cycle == 1 {
+                assert!(
+                    !queries.lock().unwrap().is_empty(),
+                    "removing the cap must reselect the full tied inventory"
+                );
+            }
+            db.commit_checkpoint_transition(crate::state::CheckpointTransition {
+                expected_metadata: Vec::new(),
+                legacy_preservation_proofs: Vec::new(),
+                legacy_config_hash: None,
+                sparse_identity_proofs: Vec::new(),
+                metadata_updates: vec![(
+                    "sync_token:PrimarySync".into(),
+                    result.sync_token.clone().unwrap(),
+                )],
+                metadata_deletes: Vec::new(),
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("delta-successor")
+            );
+            for relative in &expected {
+                let output = relative.strip_prefix("media/").unwrap_or(relative);
+                let name = std::path::Path::new(output)
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_ascii_lowercase();
+                assert_eq!(
+                    std::fs::read(config.directory.join(output)).unwrap(),
+                    distinct_media(&name),
+                    "each tied provider resource must keep its own bytes"
+                );
             }
             if cycle >= 2 {
                 assert!(queries.lock().unwrap().is_empty());
@@ -1101,11 +1137,14 @@ async fn private_filter_expansion_reopens_retained_coverage_and_converges_withou
 async fn recent_recovery_receipt_task_fault_and_cancellation_preserve_then_reopen() {
     for fault in ["receipt", "task", "cancel"] {
         let server = crate::start_wiremock_or_skip!();
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
-            .mount(&server)
-            .await;
-        let inventory = inventory(&server.uri());
+        for name in ["alpha", "beta", "gamma", "delta", "epsilon"] {
+            Mock::given(method("GET"))
+                .and(wiremock::matchers::path(format!("/{name}.jpg")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(distinct_media(name)))
+                .mount(&server)
+                .await;
+        }
+        let inventory = distinct_inventory(&server.uri());
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("owned.db");
         let mut config = test_config();
@@ -1256,8 +1295,48 @@ async fn recent_recovery_receipt_task_fault_and_cancellation_preserve_then_reope
                 })
                 .await
                 .unwrap();
+                let expected = [
+                    "A/alpha.JPG",
+                    "A/delta.JPG",
+                    "B/alpha.JPG",
+                    "B/beta.JPG",
+                    "B/epsilon.JPG",
+                    "media/changed.JPG",
+                    "media/gamma.JPG",
+                ];
+                assert_eq!(
+                    paths(&db),
+                    expected,
+                    "every selected resource and the retained publication must remain accounted"
+                );
+                for relative in expected
+                    .into_iter()
+                    .filter(|path| *path != "media/changed.JPG")
+                {
+                    let output = relative.strip_prefix("media/").unwrap_or(relative);
+                    let name = std::path::Path::new(output)
+                        .file_stem()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_ascii_lowercase();
+                    assert_eq!(
+                        std::fs::read(config.directory.join(output)).unwrap(),
+                        distinct_media(&name),
+                        "selected resources cannot borrow another resource's bytes"
+                    );
+                }
+                assert_eq!(
+                    server.received_requests().await.unwrap().len(),
+                    6,
+                    "recovery downloads each selected resource once and quiet reopen downloads none"
+                );
                 if cycle == 1 {
                     assert_eq!(result.stats.downloaded, 6);
+                    assert!(
+                        !queries.lock().unwrap().is_empty(),
+                        "a fault must leave selection recovery due"
+                    );
                 } else {
                     assert_eq!(result.stats.downloaded, 0);
                     assert!(queries.lock().unwrap().is_empty());
