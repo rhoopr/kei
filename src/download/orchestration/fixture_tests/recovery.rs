@@ -1,3 +1,4 @@
+use sha1::{Digest, Sha1};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -8,6 +9,13 @@ use crate::download::paths::DirCache;
 
 use super::support::Harness;
 use super::{cycle, fixture, pass};
+
+fn provider_v1(bytes: &[u8]) -> String {
+    let mut hash = Sha1::new();
+    hash.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+    hash.update(bytes);
+    data_encoding::BASE64.encode(&[vec![1], hash.finalize().to_vec()].concat())
+}
 
 #[tokio::test]
 async fn bundled_import_media_filter_roundtrip() {
@@ -30,6 +38,8 @@ async fn bundled_import_media_filter_roundtrip() {
         let mut records = h
             .asset("photo", "Photo.jpg", "public.jpeg", "media/pattern.jpg", 0)
             .await;
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            serde_json::json!(provider_v1(&fixture("media/pattern.jpg")));
         records.extend(
             h.asset(
                 "video",
@@ -65,6 +75,13 @@ async fn bundled_import_media_filter_roundtrip() {
         assert_eq!(stats.total, 2);
         assert_eq!(stats.matched, 1);
         assert_eq!(stats.filtered, 1);
+        let imported = h.db().get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].download_checksum, None);
+        assert_eq!(
+            imported[0].local_checksum.as_deref(),
+            Some(super::sha256(&fixture("media/pattern.jpg")).as_str())
+        );
         h.reopen().await;
         for _ in 0..2 {
             let result = cycle(&h.config, records.clone()).await;
@@ -85,6 +102,76 @@ async fn bundled_import_media_filter_roundtrip() {
                 fixture("media/pattern.jpg")
             );
             assert_eq!(std::fs::read(&video).unwrap(), fixture("media/pattern.mov"));
+        }
+        h.server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn bundled_import_unproven_or_wrong_bytes_remain_pending_across_reopen() {
+    for wrong_bytes in [false, true] {
+        let mut h = Harness::new().await;
+        let source = fixture("media/pattern.jpg");
+        let mut records = h
+            .asset("photo", "Photo.jpg", "public.jpeg", "media/pattern.jpg", 0)
+            .await;
+        if wrong_bytes {
+            records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+                serde_json::json!(provider_v1(&source));
+        }
+        let path = h.config.directory.join("Photo.JPG");
+        std::fs::create_dir_all(&h.config.directory).unwrap();
+        let mut local = source.clone();
+        if wrong_bytes {
+            *local.last_mut().unwrap() ^= 1;
+        }
+        std::fs::write(&path, &local).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let album = pass(records.clone()).album;
+        let (stream, panic_rx) = album.photo_stream(None, None, 1);
+        let stats = import_assets(
+            stream,
+            panic_rx,
+            h.db(),
+            &h.config,
+            "PrimarySync",
+            &mut DirCache::new(),
+            ImportRunOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.matched, 1);
+        let rows = h.db().get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].download_checksum, None);
+        h.reopen().await;
+        for _ in 0..2 {
+            let result = cycle(&h.config, records.clone()).await;
+            assert!(
+                matches!(result.outcome, DownloadOutcome::PartialFailure { .. }),
+                "{result:?}"
+            );
+            assert_eq!(result.stats.skipped.uncertain, 1);
+            assert_eq!(result.stats.downloaded, 0);
+            assert_eq!(std::fs::read(&path).unwrap(), local);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                modified
+            );
+            assert_eq!(
+                super::support::files(&h.config.directory),
+                vec![path.clone()]
+            );
+            h.reopen().await;
+            let pending = h.db().get_pending().await.unwrap();
+            let failed = h.db().get_failed().await.unwrap();
+            assert!(
+                pending
+                    .iter()
+                    .chain(failed.iter())
+                    .any(|row| row.id.as_ref() == "asset-photo"),
+                "missing durable retry evidence"
+            );
         }
         h.server.verify().await;
     }
