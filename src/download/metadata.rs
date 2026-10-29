@@ -64,7 +64,7 @@ pub(super) use probe::HeifNativeCaptureTime;
 pub(crate) use probe::{ExifProbe, probe_exif};
 #[cfg(feature = "xmp")]
 pub(in crate::download) use sidecar::create_layout_sidecar;
-#[cfg(all(test, feature = "xmp"))]
+#[cfg(all(test, feature = "xmp", target_os = "linux"))]
 pub(crate) use sidecar::write_sidecar;
 #[cfg(feature = "xmp")]
 pub(crate) use sidecar::write_sidecar_in_namespace;
