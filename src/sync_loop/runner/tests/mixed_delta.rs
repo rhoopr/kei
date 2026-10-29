@@ -385,6 +385,7 @@ enum InventoryFault {
     Cancellation,
     BridgeQuery,
     BridgeCancellation,
+    BlankSuccessor,
     AnchorRead,
     AnchorWrite,
     StateWrite,
@@ -395,9 +396,12 @@ struct InventorySession {
     inner: crate::test_helpers::DynamicRecentPhotosSession,
     zone: &'static str,
     smart: bool,
+    hidden: bool,
     fault: Option<InventoryFault>,
     download_url: Option<String>,
     changes: Arc<AtomicUsize>,
+    expected_cursor: Arc<str>,
+    observed_cursors: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     cancel: CancellationToken,
 }
 
@@ -415,14 +419,21 @@ impl PhotosSession for InventorySession {
             let request: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(request["zones"].as_array().unwrap().len(), 1);
             assert_eq!(request["zones"][0]["zoneID"]["zoneName"], self.zone);
-            assert!(matches!(
-                request["zones"][0]["syncToken"].as_str(),
-                Some("inventory-query-eof" | "validated-delta-successor" | "retained-valid-cursor")
-            ));
-            self.changes.fetch_add(1, Ordering::SeqCst);
+            let cursor = request["zones"][0]["syncToken"].as_str();
+            self.observed_cursors
+                .lock()
+                .unwrap()
+                .push(cursor.map(str::to_owned));
+            let previous = self.changes.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                cursor == Some(self.expected_cursor.as_ref())
+                    || (previous > 0 && cursor == Some("validated-delta-successor")),
+                "source replay must start at the persisted boundary, got {cursor:?}, expected {}",
+                self.expected_cursor
+            );
             return Ok(json!({"zones": [{
                 "zoneID": {"zoneName": self.zone, "ownerRecordName": "_defaultOwner"},
-                "syncToken": "validated-delta-successor",
+                "syncToken": if self.fault == Some(InventoryFault::BlankSuccessor) { "" } else { "validated-delta-successor" },
                 "moreComing": false,
                 "records": []
             }]}));
@@ -453,15 +464,22 @@ impl PhotosSession for InventorySession {
             use sha2::Digest;
             let media = include_bytes!("../../../../tests/data/media/pattern.jpg");
             for record in records {
+                // Model the actual Hidden-pass metadata in the real-download fixture.
+                if self.hidden && record["recordType"] == "CPLAsset" {
+                    record["fields"]["isHidden"] = json!({"value": 1});
+                }
+                let id = record["recordName"].as_str().unwrap_or_default().to_owned();
+                let mut distinct = media.to_vec();
+                distinct.extend_from_slice(id.as_bytes());
                 if record["recordType"] == "CPLMaster"
                     && let Some(resource) =
                         record["fields"]["resOriginalRes"]["value"].as_object_mut()
                 {
-                    resource.insert("downloadURL".into(), json!(download_url));
-                    resource.insert("size".into(), json!(media.len()));
+                    resource.insert("downloadURL".into(), json!(format!("{download_url}/{id}")));
+                    resource.insert("size".into(), json!(distinct.len()));
                     resource.insert(
                         "fileChecksum".into(),
-                        json!(data_encoding::BASE64.encode(&sha2::Sha256::digest(media))),
+                        json!(data_encoding::BASE64.encode(&sha2::Sha256::digest(&distinct))),
                     );
                 }
             }
@@ -650,6 +668,13 @@ async fn inventory_cycle(
     };
     let cancel = CancellationToken::new();
     let changes = Arc::new(AtomicUsize::new(0));
+    let observed_cursors = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let expected_cursor: Arc<str> = db
+        .get_metadata(&format!("sync_token:{}", step.zone))
+        .await
+        .unwrap()
+        .unwrap_or_else(|| "fixture-zone-history-boundary".to_string())
+        .into();
     let passes = step
         .passes
         .iter()
@@ -664,9 +689,12 @@ async fn inventory_cycle(
                     .with_filename_prefix(if name.is_empty() { "unfiled" } else { name }),
                 zone: step.zone,
                 smart: kind == PassKind::SmartFolder,
+                hidden: kind == PassKind::SmartFolder && name == "Hidden",
                 fault: step.fault,
                 download_url: step.download_url.clone(),
                 changes: changes.clone(),
+                expected_cursor: expected_cursor.clone(),
+                observed_cursors: observed_cursors.clone(),
                 cancel: cancel.clone(),
             };
             let album = if kind == PassKind::SmartFolder {
@@ -714,6 +742,14 @@ async fn inventory_cycle(
     ))
     .await
     .unwrap();
+    let cursors = observed_cursors.lock().unwrap().clone();
+    if let Some(first) = cursors.first() {
+        assert_eq!(
+            first.as_deref(),
+            Some(expected_cursor.as_ref()),
+            "first source replay must use the persisted boundary"
+        );
+    }
     crate::sync_loop::reporting::record_cycle_run(Some(db.as_ref()), &result, chrono::Utc::now())
         .await;
     let report_path = root.join("inventory-report.json");
@@ -800,8 +836,11 @@ async fn comparable_inventory_full_then_mixed_refresh_does_not_replace_anchor() 
     let mut step = InventoryStep::mixed(90, 10);
     let first = inventory_cycle(root.path(), &step).await;
     assert_eq!(first.failed_count, 0);
-    assert_eq!(first.stats.assets_seen, 100);
-    assert_eq!(first.stats.api_total_at_start, Some(100));
+    // The bridge repeats Hidden's ten items; the anchor still describes the
+    // initial complete 100-item inventory, not accumulated activity.
+    assert_eq!(first.stats.assets_seen, 110);
+    assert_eq!(first.stats.api_total_at_start, Some(110));
+    assert!(first.stats.api_total_at_start_partial);
     assert_inventory_ledger(root.path(), &first).await;
     let before = inventory_anchors(root.path()).await;
     assert_eq!(anchor_total(&before), 100);
@@ -964,10 +1003,18 @@ async fn comparable_inventory_four_percent_decline_does_not_warn() {
 #[tokio::test]
 async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
     use crate::config::CreatedDateFilter;
-    for case in 0..13 {
+    for case in 0..14 {
         let root = inventory_root();
         inventory_cycle(root.path(), &InventoryStep::mixed(90, 10)).await;
         let before = inventory_anchors(root.path()).await;
+        if case >= 11 {
+            let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+                .await
+                .unwrap();
+            db.set_metadata("sync_token:PrimarySync", "veto-prior-cursor")
+                .await
+                .unwrap();
+        }
         let mut step = InventoryStep::mixed(9, 1);
         match case {
             0 => step.fault = Some(InventoryFault::MissingCount),
@@ -993,10 +1040,14 @@ async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
                 step.drift = true;
                 step.fault = Some(InventoryFault::BridgeQuery);
             }
-            _ => {
-                assert_eq!(case, 12, "unexpected inventory veto case");
+            12 => {
                 step.drift = true;
                 step.fault = Some(InventoryFault::BridgeCancellation);
+            }
+            _ => {
+                assert_eq!(case, 13, "unexpected inventory veto case");
+                step.drift = true;
+                step.fault = Some(InventoryFault::BlankSuccessor);
             }
         }
         let result = inventory_cycle(root.path(), &step).await;
@@ -1005,6 +1056,23 @@ async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
             "case {case}: {result:?}"
         );
         assert_eq!(inventory_anchors(root.path()).await, before, "case {case}");
+        if case >= 11 {
+            assert!(
+                !result.db_sync_token_advance_safe,
+                "case {case}: {result:?}"
+            );
+            let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+                .await
+                .unwrap();
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("veto-prior-cursor"),
+                "case {case}"
+            );
+        }
         assert_inventory_ledger(root.path(), &result).await;
         let recovered = inventory_cycle(root.path(), &InventoryStep::mixed(90, 10)).await;
         assert_eq!(recovered.failed_count, 0, "case {case}: {recovered:?}");
@@ -1029,14 +1097,24 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
     let body = include_bytes!("../../../../tests/data/media/pattern.jpg").as_slice();
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(body))
+        .respond_with(|request: &wiremock::Request| {
+            let mut bytes = body.to_vec();
+            bytes.extend_from_slice(request.url.path().rsplit('/').next().unwrap().as_bytes());
+            wiremock::ResponseTemplate::new(200).set_body_bytes(bytes)
+        })
         .mount(&server)
         .await;
     let mut paths = Vec::with_capacity(100);
     for (prefix, count) in [("unfiled", 90), ("Hidden", 10)] {
         for index in 0..count {
             let path = media.join(format!("{prefix}-{index:04}.JPG"));
-            paths.push(path);
+            let mut expected = body.to_vec();
+            let id = format!(
+                "{id_prefix}-master-{index:04}",
+                id_prefix = if prefix == "unfiled" { "" } else { prefix }
+            );
+            expected.extend_from_slice(id.as_bytes());
+            paths.push((path, expected));
         }
     }
     let mut step = InventoryStep::mixed(90, 10);
@@ -1045,10 +1123,13 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
     let first = inventory_cycle(root.path(), &step).await;
     assert_eq!(first.failed_count, 0, "{first:?}");
     assert_eq!(first.stats.state_write_failures, 0);
-    assert_eq!(first.stats.assets_seen, 100);
+    // The bridge repeats Hidden's ten items without redownloading them.
+    assert_eq!(first.stats.assets_seen, 110);
+    assert_eq!(first.stats.api_total_at_start, Some(110));
+    assert!(first.stats.api_total_at_start_partial);
     assert_eq!(first.stats.downloaded, 100);
-    for path in &paths {
-        assert_eq!(std::fs::read(path).unwrap(), body);
+    for (path, expected) in &paths {
+        assert_eq!(&std::fs::read(path).unwrap(), expected);
     }
     let before = inventory_anchors(root.path()).await;
     assert_eq!(anchor_total(&before), 100);
@@ -1072,7 +1153,7 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
         );
     }
 
-    std::fs::remove_file(&paths[0]).unwrap();
+    std::fs::remove_file(&paths[0].0).unwrap();
     step.full = true;
     step.passes[0].2 = 85;
     step.fault = Some(InventoryFault::StateWrite);
@@ -1084,7 +1165,8 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
     assert_eq!(failed.stats.enumeration_errors, 0);
     assert!(!failed.stats.enumeration_incomplete);
     assert!(!failed.stats.interrupted);
-    assert_eq!(failed.stats.state_write_failures, 1);
+    // The injected store rejects every selected upsert, not just the missing file.
+    assert_eq!(failed.stats.state_write_failures, 95);
     assert!(!failed.db_sync_token_advance_safe);
     assert_eq!(failed.stats.downloaded, 0);
     assert_eq!(failed.stats.bytes_downloaded, 0);
@@ -1106,14 +1188,14 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
         let summary = db.get_summary().await.unwrap();
         assert_eq!(summary.pending + summary.failed, 0);
     }
-    assert!(!paths[0].exists());
-    for path in &paths[1..] {
-        assert_eq!(std::fs::read(path).unwrap(), body);
+    assert!(!paths[0].0.exists());
+    for (path, expected) in &paths[1..] {
+        assert_eq!(&std::fs::read(path).unwrap(), expected);
     }
 
     // Restore the landed file and remove only the injected failure. The same
-    // resolved scope now admits the real 5% decline and its query checkpoint.
-    std::fs::write(&paths[0], body).unwrap();
+    // resolved scope now admits the real 5% decline and its bridged source checkpoint.
+    std::fs::write(&paths[0].0, &paths[0].1).unwrap();
     step.fault = None;
     let recovered = inventory_cycle(root.path(), &step).await;
     assert_eq!(recovered.failed_count, 0);
@@ -1133,7 +1215,7 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("inventory-query-eof")
+            Some("validated-delta-successor")
         );
     }
 
@@ -1145,8 +1227,8 @@ async fn comparable_inventory_state_write_failure_holds_anchor_and_checkpoint_th
     assert_eq!(steady.stats.downloaded, 0);
     assert_eq!(anchor_total(&inventory_anchors(root.path()).await), 95);
     assert_inventory_ledger(root.path(), &steady).await;
-    for path in &paths {
-        assert_eq!(std::fs::read(path).unwrap(), body);
+    for (path, expected) in &paths {
+        assert_eq!(&std::fs::read(path).unwrap(), expected);
     }
     assert_eq!(std::fs::read_dir(&media).unwrap().count(), paths.len());
     assert_eq!(server.received_requests().await.unwrap().len(), 100);

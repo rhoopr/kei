@@ -1905,6 +1905,7 @@ pub(crate) async fn run_cycle(
             && !indexing_reconciliation
             && library_completed_without_errors
             && !sync_result.checkpoint.enumeration_incomplete
+            && !sync_result.checkpoint.sync_token_blocked
             && sync_result.checkpoint.state_write_failures == 0
             && !cycle_has_stale_plan
             && !is_retry_failed
