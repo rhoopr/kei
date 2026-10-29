@@ -1742,15 +1742,16 @@ async fn issue1044_confirmed_delta_deletion_survives_unrelated_sparse_hold_after
             continue;
         }
         assert!(result.stats.identity_incomplete, "{result:?}");
-        let requested = lookups.lock().unwrap();
-        assert!(
-            requested
-                .iter()
-                .any(|names| names.iter().any(|name| name == "deleted-master")
-                    && names.iter().any(|name| name == "asset-deleted-master")),
-            "{requested:?}"
-        );
-        drop(requested);
+        {
+            let requested = lookups.lock().unwrap();
+            assert!(
+                requested
+                    .iter()
+                    .any(|names| names.iter().any(|name| name == "deleted-master")
+                        && names.iter().any(|name| name == "asset-deleted-master")),
+                "{requested:?}"
+            );
+        }
         assert!(
             !db.sparse_identities("PrimarySync")
                 .await

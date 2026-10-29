@@ -533,10 +533,10 @@ impl PhotoAlbum {
             let mut by_name: FxHashMap<&str, &Value> = FxHashMap::default();
             let mut duplicates = FxHashSet::default();
             for record in response_records {
-                if let Some(name) = record.get("recordName").and_then(Value::as_str) {
-                    if by_name.insert(name, record).is_some() {
-                        duplicates.insert(name);
-                    }
+                if let Some(name) = record.get("recordName").and_then(Value::as_str)
+                    && by_name.insert(name, record).is_some()
+                {
+                    duplicates.insert(name);
                 }
             }
 
