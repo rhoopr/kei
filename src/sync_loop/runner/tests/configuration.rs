@@ -1180,12 +1180,9 @@ enum ExternalReconciliationEntry {
 
 #[cfg(unix)]
 async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
-    use crate::state::{DownloadContextStateStore, ReconciliationStateStore};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, UNIX_EPOCH};
     #[derive(Clone, Debug)]
     struct ReconciliationSession {
-        records: serde_json::Value,
         source_calls: Arc<AtomicUsize>,
         lookup_calls: Arc<AtomicUsize>,
     }
@@ -1199,7 +1196,6 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
         ) -> anyhow::Result<serde_json::Value> {
             if url.contains("/records/lookup?") {
                 self.lookup_calls.fetch_add(1, Ordering::SeqCst);
-                return Ok(self.records.clone());
             }
             self.source_calls.fetch_add(1, Ordering::SeqCst);
             if url.contains("/changes/zone?") {
@@ -1217,47 +1213,38 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
         }
     }
     let config = make_run_cycle_config();
-    let old_dir = tempfile::tempdir().unwrap();
-    let new_dir = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
-    let db_path = old_dir.path().join("state.db");
+    let dir = tempfile::tempdir().unwrap();
+    let old_root = dir.path().join("old");
+    let new_root = dir.path().join("new");
+    let planned_root = new_root.join("planned");
+    let moved_root = new_root.join("moved");
+    std::fs::create_dir_all(&old_root).unwrap();
+    std::fs::create_dir_all(&planned_root).unwrap();
+    let old_path = old_root.join("old.jpg");
+    let external = dir.path().join("external.jpg");
+    let unrelated = new_root.join("unrelated.xmp");
+    std::fs::write(&unrelated, b"unrelated user metadata").unwrap();
+    std::fs::write(&old_path, b"preserved historical file").unwrap();
+    std::fs::write(&external, b"foreign external file").unwrap();
+    let db_path = dir.path().join("state.db");
     let db = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
-    let old_path = old_dir.path().join("photo.jpg");
-    let external = outside.path().join("photo.jpg");
-    std::fs::write(&old_path, vec![0u8; 1024]).unwrap();
-    std::fs::write(&external, vec![0u8; 1024]).unwrap();
-    let original_bytes = std::fs::read(&old_path).unwrap();
-    let old_time = UNIX_EPOCH + Duration::from_secs(12345);
-    std::fs::File::options()
-        .write(true)
-        .open(&old_path)
-        .unwrap()
-        .set_times(std::fs::FileTimes::new().set_modified(old_time))
-        .unwrap();
-    let unrelated = new_dir.path().join("unrelated.xmp");
-    std::fs::write(&unrelated, b"external user metadata").unwrap();
-    let checksum = download::file::compute_sha256(&old_path).await.unwrap();
-    let provider_checksum = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-    let record = crate::test_helpers::TestAssetRecord::new("BLOCKED")
-        .filename("photo.jpg")
-        .created_at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap())
-        .size(1024)
-        .checksum(provider_checksum)
+    let historical = crate::test_helpers::TestAssetRecord::new("HISTORICAL")
+        .filename("old.jpg")
+        .size(25)
+        .checksum("historical-provider")
         .build();
-    db.upsert_seen(&record).await.unwrap();
+    db.upsert_seen(&historical).await.unwrap();
+    let historical_checksum = download::file::compute_sha256(&old_path).await.unwrap();
     db.mark_downloaded(
         "PrimarySync",
-        "BLOCKED",
+        "HISTORICAL",
         "original",
         &old_path,
-        &checksum,
+        &historical_checksum,
         None,
     )
     .await
     .unwrap();
-    db.upsert_asset_master_mapping("PrimarySync", "asset-BLOCKED", "BLOCKED")
-        .await
-        .unwrap();
     db.set_metadata(
         ENUM_CONFIG_HASH_KEY,
         &download::compute_config_hash(&config),
@@ -1267,67 +1254,37 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
     db.set_metadata("sync_token:PrimarySync", "zone-before")
         .await
         .unwrap();
-    let old_builder = make_run_cycle_download_config_builder(old_dir.path(), db.clone());
-    let new_builder = make_run_cycle_download_config_builder(new_dir.path(), db.clone());
-    let old_config = old_builder(
-        download::SyncMode::Full,
-        Arc::new(rustc_hash::FxHashSet::default()),
-        Arc::new(download::AssetGroupings::default()),
-        Arc::from("PrimarySync"),
-    );
-    let new_config = new_builder(
-        download::SyncMode::Full,
-        Arc::new(rustc_hash::FxHashSet::default()),
-        Arc::new(download::AssetGroupings::default()),
-        Arc::from("PrimarySync"),
-    );
-    let old_hash = download::hash_download_config(&old_config);
-    let new_hash = download::hash_download_config(&new_config);
-    db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, &old_hash)
+    db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "prior-path-config")
         .await
         .unwrap();
-    let records = full_album_page_with_download(
+    // A real planned and prepared layout is the authorization for recovery;
+    // path configuration drift alone cannot create one.
+    let op = download::prepared_layout_with_refresh(
+        &db,
+        &planned_root,
+        "photo.jpg",
         "PrimarySync",
-        "BLOCKED",
-        "unused",
-        "https://p01.icloud-content.com/photo.jpg",
-        1024,
-        provider_checksum,
-    );
-    let asset = crate::icloud::photos::PhotoAsset::new(
-        records["records"][0].clone(),
-        records["records"][1].clone(),
-    );
-    let expected = download::filter::expected_paths_for(&asset, new_config.as_ref())
-        .remove(0)
-        .path;
-    std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
-    let conflicting_bytes = vec![7u8; 1024];
+        false,
+    )
+    .await;
+    let expected = op.members[0].destination.as_ref().unwrap().to_path();
+    let stage = op.members[0].stage.as_ref().unwrap().to_path();
+    let staged_bytes = std::fs::read(&stage).unwrap();
     match entry {
         ExternalReconciliationEntry::Symlink => {
-            std::os::unix::fs::symlink(&external, &expected).unwrap();
+            std::os::unix::fs::symlink(&external, &expected).unwrap()
         }
-        ExternalReconciliationEntry::Hardlink => {
-            std::fs::hard_link(&old_path, &expected).unwrap();
-        }
+        ExternalReconciliationEntry::Hardlink => std::fs::hard_link(&old_path, &expected).unwrap(),
         ExternalReconciliationEntry::SameSizeReplacement
         | ExternalReconciliationEntry::MovedDirectory => {
-            std::fs::write(&expected, &conflicting_bytes).unwrap();
+            std::fs::write(&expected, vec![7u8; staged_bytes.len()]).unwrap()
         }
     }
-    let capture_time =
-        UNIX_EPOCH + Duration::from_secs(asset.created_local().timestamp().unsigned_abs());
-    drop(old_config);
-    drop(new_config);
-    drop(old_builder);
-    drop(new_builder);
-    drop(db);
     let source_calls = Arc::new(AtomicUsize::new(0));
     let lookup_calls = Arc::new(AtomicUsize::new(0));
     let album = make_full_album_with_boxed_session(
         "PrimarySync",
         Box::new(ReconciliationSession {
-            records,
             source_calls: Arc::clone(&source_calls),
             lookup_calls: Arc::clone(&lookup_calls),
         }),
@@ -1335,137 +1292,74 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
     let lib =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
     let (_session_dir, session) = make_shared_session_for_run_cycle().await;
-    let moved = new_dir.path().join("externally-moved");
-    let moved_photo = moved.join(expected.file_name().unwrap());
-    let mut reserved = None;
+    drop(db);
+    let mut completed_binding = None;
+    let mut completed_mtime = None;
     for cycle in 0..4 {
-        // Release every production SQLite handle before each restart.
         let db = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
-        let new_builder = make_run_cycle_download_config_builder(new_dir.path(), db.clone());
-        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+        let builder = make_run_cycle_download_config_builder(&new_root, db.clone());
+        let expected_hash = download::hash_download_config(&builder(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from("PrimarySync"),
+        ));
         let lookups_before = lookup_calls.load(Ordering::SeqCst);
         let result = run_cycle(
             &[&lib],
             &config,
             Some(db.as_ref()),
             false,
-            &new_builder,
+            &builder,
             download::DownloadControls::download_hidden(),
             &session,
             &CancellationToken::new(),
         )
         .await
         .unwrap();
-        assert_eq!(
-            result.failed_count,
-            usize::from(cycle < 2),
-            "{entry:?}, cycle {cycle}: {result:?}"
-        );
-        assert_eq!(
-            result.db_sync_token_advance_safe,
-            cycle >= 2,
-            "{entry:?}, cycle {cycle}"
-        );
         if cycle < 2 {
-            assert_eq!(source_calls.load(Ordering::SeqCst), 0);
-            let diagnostic = match entry {
-                ExternalReconciliationEntry::Symlink => {
-                    "Path reconciliation rejected an unsafe destination"
-                }
-                ExternalReconciliationEntry::Hardlink => {
-                    "Could not restore reconciled capture mtime"
-                }
-                ExternalReconciliationEntry::SameSizeReplacement
-                | ExternalReconciliationEntry::MovedDirectory => {
-                    "Path reconciliation found conflicting destination bytes"
-                }
-            };
             assert!(
-                capture.contains_event(|event| event.message() == Some(diagnostic)),
-                "missing {diagnostic}: {:?}",
-                capture.events()
+                result.failed_count > 0,
+                "{entry:?} cycle {cycle}: {result:?}"
             );
-        }
-        drop(new_builder);
-        drop(db);
-        let reopened = state::SqliteStateDb::open(&db_path).await.unwrap();
-        let rows = reopened.get_downloaded_page(0, 10).await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id.as_ref(), "BLOCKED");
-        assert_eq!(rows[0].library.as_ref(), "PrimarySync");
-        assert_eq!(rows[0].version_size, state::VersionSizeKey::Original);
-        assert_eq!(
-            rows[0].created_at.timestamp_millis(),
-            record.created_at.timestamp_millis()
-        );
-        assert_eq!(
-            rows[0].local_path.as_deref(),
-            Some(if cycle < 2 {
-                old_path.as_path()
-            } else {
-                expected.as_path()
-            })
-        );
-        assert_eq!(rows[0].local_checksum.as_deref(), Some(checksum.as_str()));
-        assert_eq!(
-            reopened
-                .get_metadata("sync_token:PrimarySync")
+            assert!(!result.db_sync_token_advance_safe);
+            assert_eq!(source_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("zone-before")
+            );
+            let pending = db
+                .primary_layout_operations("PrimarySync".into())
                 .await
-                .unwrap()
-                .as_deref(),
-            Some(if cycle < 2 {
-                "zone-before"
-            } else {
-                "zone-after"
-            })
-        );
-        assert_eq!(
-            reopened
-                .get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(if cycle < 2 {
-                old_hash.as_str()
-            } else {
-                new_hash.as_str()
-            })
-        );
-        assert_eq!(
-            reopened
-                .get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
-                .await
-                .unwrap()
-                .as_deref(),
-            if cycle < 2 {
-                Some(new_hash.as_str())
-            } else {
-                None
-            }
-        );
-        let reservations = reopened.get_reconciliation_reservations().await.unwrap();
-        assert_eq!(
-            reservations.len(),
-            usize::from(cycle >= 2 || !matches!(entry, ExternalReconciliationEntry::Symlink))
-        );
-        if cycle == 0 || (cycle == 2 && matches!(entry, ExternalReconciliationEntry::Symlink)) {
-            reserved = Some(reservations.clone());
-        } else {
-            assert_eq!(reservations, *reserved.as_ref().unwrap());
-        }
-        assert_eq!(
-            std::fs::read(&unrelated).unwrap(),
-            b"external user metadata"
-        );
-        assert_eq!(
-            std::fs::metadata(&old_path).unwrap().modified().unwrap(),
-            if cycle < 2 {
-                old_time
-            } else {
-                UNIX_EPOCH + Duration::from_secs(23456)
-            }
-        );
-        if cycle < 2 {
+                .unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].operation, op.operation);
+            assert_eq!(pending[0].source_library, "PrimarySync");
+            assert_eq!(
+                pending[0].members[0]
+                    .destination
+                    .as_ref()
+                    .unwrap()
+                    .to_path(),
+                expected
+            );
+            assert_eq!(
+                db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(expected_hash.as_str())
+            );
+            assert_eq!(
+                db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("prior-path-config")
+            );
             match entry {
                 ExternalReconciliationEntry::Symlink => {
                     assert_eq!(std::fs::read_link(&expected).unwrap(), external)
@@ -1476,74 +1370,269 @@ async fn external_reconciliation_lifecycle(entry: ExternalReconciliationEntry) {
                         std::fs::metadata(&expected).unwrap().ino(),
                         std::fs::metadata(&old_path).unwrap().ino()
                     );
-                    assert_eq!(std::fs::metadata(&old_path).unwrap().nlink(), 2);
                 }
                 ExternalReconciliationEntry::SameSizeReplacement
-                | ExternalReconciliationEntry::MovedDirectory => {
-                    assert_eq!(std::fs::read(&expected).unwrap(), conflicting_bytes);
-                }
+                | ExternalReconciliationEntry::MovedDirectory => assert_eq!(
+                    std::fs::read(&expected).unwrap(),
+                    vec![7u8; staged_bytes.len()]
+                ),
             }
+            let retained_stage =
+                if cycle == 1 && matches!(entry, ExternalReconciliationEntry::MovedDirectory) {
+                    moved_root.join(stage.strip_prefix(&planned_root).unwrap())
+                } else {
+                    stage.clone()
+                };
+            assert_eq!(std::fs::read(retained_stage).unwrap(), staged_bytes);
         } else {
-            assert_eq!(std::fs::read(&expected).unwrap(), original_bytes);
             assert_eq!(
-                std::fs::metadata(&expected).unwrap().modified().unwrap(),
-                capture_time
+                result.failed_count, 0,
+                "{entry:?} cycle {cycle}: {result:?}"
             );
-            let receipts = reopened.get_downloaded_path_records().await.unwrap();
-            assert_eq!(receipts.len(), 2);
-            for path in [&old_path, &expected] {
-                let receipt = receipts
+            assert!(result.db_sync_token_advance_safe);
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("zone-after")
+            );
+            assert_eq!(
+                db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(expected_hash.as_str())
+            );
+            assert_eq!(
+                db.get_metadata(PENDING_DOWNLOAD_CONFIG_HASH_KEY)
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert!(
+                db.primary_layout_operations("PrimarySync".into())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(std::fs::read(&expected).unwrap(), staged_bytes);
+            let binding = db
+                .primary_layout_binding(op.family.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(binding.family, op.family);
+            assert_eq!(binding.source_library, op.source_library);
+            assert_eq!(binding.child, op.child);
+            assert_eq!(binding.generation, op.generation + 1);
+            assert!(
+                binding
+                    .files
                     .iter()
-                    .find(|receipt| receipt.local_path.as_ref() == Some(path))
-                    .unwrap();
-                assert_eq!(receipt.id, "BLOCKED");
-                assert_eq!(receipt.library, "PrimarySync");
-                assert_eq!(receipt.local_checksum.as_deref(), Some(checksum.as_str()));
-            }
+                    .any(|file| file.path.to_path() == expected)
+            );
+            let evidence = serde_json::to_vec(&binding).unwrap();
+            let mtime = std::fs::metadata(&expected).unwrap().modified().unwrap();
             if cycle == 3 {
                 assert_eq!(result.stats.downloaded, 0);
-                assert_eq!(
-                    lookup_calls.load(Ordering::SeqCst),
-                    lookups_before,
-                    "quiet cycle must not hydrate or reconcile again"
-                );
-                assert!(!capture.contains_event(|event| event.message()
-                    == Some("Path reconciliation found conflicting destination bytes")));
-                assert_eq!(
-                    std::fs::read_dir(expected.parent().unwrap())
-                        .unwrap()
-                        .count(),
-                    1
-                );
+                assert_eq!(lookup_calls.load(Ordering::SeqCst), lookups_before);
+                assert_eq!(completed_binding.as_ref(), Some(&evidence));
+                assert_eq!(completed_mtime, Some(mtime));
+            } else {
+                completed_binding = Some(evidence);
+                completed_mtime = Some(mtime);
             }
         }
-        if matches!(entry, ExternalReconciliationEntry::MovedDirectory) && cycle >= 1 {
-            assert_eq!(std::fs::read(&moved_photo).unwrap(), conflicting_bytes);
+        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+        let historical_row = rows
+            .iter()
+            .find(|row| row.id.as_ref() == "HISTORICAL")
+            .unwrap();
+        assert_eq!(
+            historical_row.local_path.as_deref(),
+            Some(old_path.as_path())
+        );
+        assert_eq!(
+            historical_row.local_checksum.as_deref(),
+            Some(historical_checksum.as_str())
+        );
+        assert_eq!(
+            std::fs::read(&old_path).unwrap(),
+            b"preserved historical file"
+        );
+        assert_eq!(std::fs::read(&external).unwrap(), b"foreign external file");
+        assert_eq!(
+            std::fs::read(&unrelated).unwrap(),
+            b"unrelated user metadata"
+        );
+        if cycle == 1 && matches!(entry, ExternalReconciliationEntry::MovedDirectory) {
+            assert_eq!(
+                std::fs::read(moved_root.join(expected.file_name().unwrap())).unwrap(),
+                vec![7u8; staged_bytes.len()]
+            );
         }
-        drop(reopened);
+        drop(builder);
+        drop(db);
         if cycle == 0 && matches!(entry, ExternalReconciliationEntry::MovedDirectory) {
-            std::fs::rename(expected.parent().unwrap(), &moved).unwrap();
-            std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
-            std::fs::write(&expected, &conflicting_bytes).unwrap();
+            std::fs::rename(&planned_root, &moved_root).unwrap();
+            std::fs::create_dir(&planned_root).unwrap();
+            std::fs::write(&expected, vec![7u8; staged_bytes.len()]).unwrap();
         }
         if cycle == 1 {
             std::fs::remove_file(&expected).unwrap();
-            // A same-byte atomic replacement and externally altered timestamp
-            // are valid source evidence on restart; no old inode is reused.
-            let replacement = old_dir.path().join("external-replacement.jpg");
-            std::fs::write(&replacement, &original_bytes).unwrap();
-            std::fs::File::options()
-                .write(true)
-                .open(&replacement)
-                .unwrap()
-                .set_times(
-                    std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(23456)),
-                )
-                .unwrap();
-            std::fs::rename(&replacement, &old_path).unwrap();
+            if matches!(entry, ExternalReconciliationEntry::MovedDirectory) {
+                std::fs::remove_dir(&planned_root).unwrap();
+                std::fs::rename(&moved_root, &planned_root).unwrap();
+                std::fs::remove_file(&expected).unwrap();
+            }
         }
-        assert_eq!(std::fs::read(&external).unwrap(), vec![0u8; 1024]);
-        assert_eq!(std::fs::read(&old_path).unwrap(), vec![0u8; 1024]);
+    }
+}
+
+#[tokio::test]
+async fn root_drift_without_recorded_operation_does_not_backfill_historical_file() {
+    #[derive(Clone, Debug)]
+    struct HistoricalSession {
+        records: serde_json::Value,
+    }
+    #[async_trait::async_trait]
+    impl crate::icloud::photos::PhotosSession for HistoricalSession {
+        async fn post(
+            &self,
+            url: &str,
+            _body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<serde_json::Value> {
+            if url.contains("/records/lookup?") {
+                return Ok(self.records.clone());
+            }
+            if url.contains("/changes/zone?") {
+                return Ok(
+                    serde_json::json!({"zones": [{"zoneID": {"zoneName":"PrimarySync", "ownerRecordName":"_defaultOwner"}, "syncToken":"zone-after", "moreComing":false, "records":[]}]}),
+                );
+            }
+            if url.contains("/internal/records/query/batch") {
+                return Ok(album_count_response(0));
+            }
+            Ok(serde_json::json!({"records": [], "syncToken": "zone-after"}))
+        }
+        fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+    let config = make_run_cycle_config();
+    let old = tempfile::tempdir().unwrap();
+    let new = tempfile::tempdir().unwrap();
+    let db_path = old.path().join("state.db");
+    let source = old.path().join("old.jpg");
+    let foreign = new
+        .path()
+        .join(crate::sync_loop::test_support::run_cycle_expected_date_dir())
+        .join("old.jpg");
+    std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"historical media").unwrap();
+    std::fs::write(&foreign, b"foreign occupant").unwrap();
+    let db = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
+    let record = crate::test_helpers::TestAssetRecord::new("HISTORICAL")
+        .filename("old.jpg")
+        .size(16)
+        .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        .build();
+    db.upsert_seen(&record).await.unwrap();
+    let checksum = download::file::compute_sha256(&source).await.unwrap();
+    db.mark_downloaded(
+        "PrimarySync",
+        "HISTORICAL",
+        "original",
+        &source,
+        &checksum,
+        None,
+    )
+    .await
+    .unwrap();
+    db.upsert_asset_master_mapping("PrimarySync", "asset-HISTORICAL", "HISTORICAL")
+        .await
+        .unwrap();
+    db.set_metadata(
+        ENUM_CONFIG_HASH_KEY,
+        &download::compute_config_hash(&config),
+    )
+    .await
+    .unwrap();
+    db.set_metadata(download::DOWNLOAD_CONFIG_HASH_KEY, "prior-path-config")
+        .await
+        .unwrap();
+    db.set_metadata("sync_token:PrimarySync", "zone-before")
+        .await
+        .unwrap();
+    drop(db);
+    let lib = make_run_cycle_library_state_with_album(
+        "PrimarySync",
+        "sync_token:PrimarySync",
+        make_full_album_with_boxed_session(
+            "PrimarySync",
+            Box::new(HistoricalSession {
+                records: {
+                    let mut records = full_album_page_with_download(
+                        "PrimarySync",
+                        "HISTORICAL",
+                        "unused",
+                        "https://p01.icloud-content.com/old.jpg",
+                        16,
+                        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                    );
+                    records["records"][0]["fields"]["filenameEnc"]["value"] =
+                        serde_json::json!("b2xkLmpwZw==");
+                    records
+                },
+            }),
+        ),
+    );
+    let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+    for _ in 0..2 {
+        let db = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
+        let builder = make_run_cycle_download_config_builder(new.path(), db.clone());
+        let result = run_cycle(
+            &[&lib],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, 0);
+        assert!(result.db_sync_token_advance_safe, "{result:?}");
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("zone-after")
+        );
+        assert!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].local_path.as_deref(), Some(source.as_path()));
+        assert_eq!(rows[0].local_checksum.as_deref(), Some(checksum.as_str()));
+        assert_eq!(std::fs::read(&source).unwrap(), b"historical media");
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign occupant");
+        assert_eq!(
+            std::fs::read_dir(foreign.parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
     }
 }
 
