@@ -173,7 +173,7 @@ suites execute these same tests; the gate also validates the scenario filters.
 |----------|-----------------------------|
 | Missing, null, out-of-range, and valid epoch capture dates; one child or a matching visible/hidden sibling | `hidden_invalid_capture_date` selects both metadata capture and pending recovery |
 | Conflicting or missing historical dates/owners and failed retry persistence | `run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint`, `bounded_full_sync_hydrates_live_legacy_pending_master` |
-| Deferred work, changed authoritative evidence, bounded recovery, and no repeated completed work | `run_cycle_metadata_capture_retry_preserves_durable_checkpoint_until_repaired`, `ambiguous_capture_repair_keeps_identity_and_checkpoint_without_full_backfill` |
+| Historical retries persist without authorizing automatic repair; current ambiguity remains bounded | `run_cycle_historical_capture_retry_survives_reopen_without_automatic_repair`, `ambiguous_capture_repair_keeps_identity_and_checkpoint_without_full_backfill` |
 | Schema-28 preservation with one or multiple current children | `run_cycle_single_survivor_preserved`, `run_cycle_ambiguous_children_preserved_independently` |
 | Changed rendition evidence and stale retry attempts | `metadata_capture_retry_changed_evidence_is_due_and_old_attempt_cannot_delay_it` |
 | Other-library success cannot clear unresolved work; streaming and collecting paths retain failed work | `unresolved_identity_survives_restart_and_other_zone_success_then_recovers`, `sparse_retry_omitted_source_preserves_failed_work_then_recovers_media` |

@@ -548,10 +548,6 @@ pub(super) struct FailingMetadataSetDb {
     pub(super) fail_upsert_seen: bool,
     pub(super) fail_source_delete: bool,
     pub(super) fail_refresh_downloaded_metadata: bool,
-    /// Stands in for a concurrent pass: refreshes the row to this snapshot
-    /// and marks it for rewrite in the window between the downloader
-    /// writing the file and the finaliser deciding the marker's fate.
-    pub(super) refresh_on_mark_downloaded: Option<state::AssetMetadata>,
     /// Counts drains: `run_pending` starts each one with an offset-zero
     /// page fetch.
     pub(super) drains: Arc<std::sync::atomic::AtomicUsize>,
@@ -573,45 +569,6 @@ impl std::fmt::Debug for FailingMetadataSetDb {
 }
 
 impl FailingMetadataSetDb {
-    async fn prepare_downloaded_write(
-        &self,
-        library: &str,
-        id: &str,
-        version_size: &str,
-    ) -> Result<(), state::error::StateError> {
-        if let Some(newer) = &self.refresh_on_mark_downloaded {
-            let record = self
-                .inner
-                .get_downloaded_page(0, u32::MAX)
-                .await?
-                .into_iter()
-                .find(|row| {
-                    row.library.as_ref() == library
-                        && row.id.as_ref() == id
-                        && row.version_size.as_str() == version_size
-                })
-                .expect("refresh target");
-            self.inner
-                .refresh_downloaded_asset_metadata(
-                    library,
-                    id,
-                    (
-                        &state::MetadataCapture {
-                            shared: Arc::new(newer.clone()),
-                            renditions: Arc::from([]),
-                        },
-                        record.created_at,
-                        record.added_at,
-                    ),
-                    true,
-                    false,
-                    state::METADATA_CAPTURE_REVISION,
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
     pub(super) fn new(
         inner: Arc<dyn download::DownloadStore>,
         failure: MetadataSetFailure,
@@ -629,7 +586,6 @@ impl FailingMetadataSetDb {
             fail_upsert_seen: false,
             fail_source_delete: false,
             fail_refresh_downloaded_metadata: false,
-            refresh_on_mark_downloaded: None,
             drains: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_metadata_checksum_write: false,
             completed_candidate_mutation: None,
@@ -679,15 +635,6 @@ impl FailingMetadataSetDb {
 
     pub(super) fn with_download_dir_replaced_on_upsert(mut self, path: std::path::PathBuf) -> Self {
         self.replace_download_dir_on_upsert = Some(path);
-        self
-    }
-
-    #[cfg(feature = "xmp")]
-    pub(super) fn with_refresh_on_mark_downloaded(
-        mut self,
-        metadata: state::AssetMetadata,
-    ) -> Self {
-        self.refresh_on_mark_downloaded = Some(metadata);
         self
     }
 
@@ -788,6 +735,29 @@ impl state::DownloadStateStore for FailingMetadataSetDb {
         result
     }
 
+    async fn mark_verified_download_with_metadata(
+        &self,
+        library: &str,
+        id: &str,
+        version_size: &str,
+        local_path: &std::path::Path,
+        local_checksum: &str,
+        download_checksum: Option<&str>,
+        metadata: (bool, u8),
+    ) -> Result<(), state::error::StateError> {
+        self.inner
+            .mark_verified_download_with_metadata(
+                library,
+                id,
+                version_size,
+                local_path,
+                local_checksum,
+                download_checksum,
+                metadata,
+            )
+            .await
+    }
+
     async fn mark_verified_download(
         &self,
         library: &str,
@@ -798,8 +768,6 @@ impl state::DownloadStateStore for FailingMetadataSetDb {
         download_checksum: Option<&str>,
         mark_capture_repair: bool,
     ) -> Result<(), state::error::StateError> {
-        self.prepare_downloaded_write(library, id, version_size)
-            .await?;
         self.inner
             .mark_verified_download(
                 library,
@@ -822,8 +790,6 @@ impl state::DownloadStateStore for FailingMetadataSetDb {
         local_checksum: &str,
         download_checksum: Option<&str>,
     ) -> Result<(), state::error::StateError> {
-        self.prepare_downloaded_write(library, id, version_size)
-            .await?;
         self.inner
             .mark_downloaded(
                 library,
@@ -1064,6 +1030,25 @@ impl state::DownloadContextStateStore for FailingMetadataSetDb {
 
 #[async_trait::async_trait]
 impl state::TempFileOwnershipStore for FailingMetadataSetDb {
+    async fn prepare_temp_publication(
+        &self,
+        part: &std::path::Path,
+        proof: &state::db::PreparedPublication,
+    ) -> Result<(), state::error::StateError> {
+        self.inner.prepare_temp_publication(part, proof).await
+    }
+
+    async fn get_prepared_publications(
+        &self,
+        library: &str,
+        id: &str,
+        version: state::VersionSizeKey,
+    ) -> Result<Vec<state::db::PreparedPublication>, state::error::StateError> {
+        self.inner
+            .get_prepared_publications(library, id, version)
+            .await
+    }
+
     async fn claim_temp_file(
         &self,
         path: &std::path::Path,

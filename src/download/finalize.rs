@@ -55,7 +55,7 @@ pub(super) enum DownloadedFinalization {
 }
 
 #[cfg(test)]
-pub(in crate::download) mod finalization_probe;
+pub(crate) mod finalization_probe;
 
 /// Persist success state for a task that has already landed safely on disk.
 /// A failed metadata write records a retry marker; retiring markers is left to
@@ -121,6 +121,8 @@ where
             error: Box::new(error),
         };
     }
+    #[cfg(all(test, feature = "xmp"))]
+    finalization_probe::observe_before(&task.download_path).await;
     match db
         .mark_verified_download_with_metadata(
             library,

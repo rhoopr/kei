@@ -3086,6 +3086,25 @@ async fn explicit_refresh_reuse_is_writable_and_completion_is_bound_to_recorded_
         .unwrap()
     );
     assert!(db.guard_primary_writer(&path).await.is_ok());
+    // Reopen with no new operator request. The recorded generation must
+    // retain its explicit intent and unresolved metadata for this exact path.
+    drop(db);
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), RAW);
+    let retained = db
+        .pending_selection_metadata(owner(), root.id.clone(), 10)
+        .await
+        .unwrap();
+    assert!(
+        retained
+            .iter()
+            .any(|work| work.asset.local_path.as_deref() == Some(path.as_path()))
+    );
+
     // A later retry whose generation still records the explicit refresh remains
     // writable even when the caller would otherwise install the marker.
     assert!(
