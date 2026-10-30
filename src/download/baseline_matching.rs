@@ -551,7 +551,15 @@ async fn historical_candidate(
 ) -> Option<bool> {
     let old_receipts: Vec<_> = historical
         .iter()
-        .filter(|receipt| receipt.native_path.to_path() == path)
+        .filter(|receipt| {
+            let native = receipt.native_path.to_path();
+            native == path
+                || (receipt.version_size != task.version_size.as_str()
+                    && crate::fs_util::confined_path_key(&native)
+                        .ok()
+                        .zip(crate::fs_util::confined_path_key(path).ok())
+                        .is_some_and(|(a, b)| a == b))
+        })
         .collect();
     if old_receipts.is_empty() {
         return None;
@@ -559,7 +567,9 @@ async fn historical_candidate(
     let destination = crate::fs_util::confined_path_key(&task.download_path);
     let candidate = crate::fs_util::confined_path_key(path);
     Some(match retain_pending_file(root, path).await {
-        Ok(None) => false,
+        Ok(None) => old_receipts
+            .iter()
+            .any(|receipt| receipt.version_size != task.version_size.as_str()),
         Ok(Some(file))
             if matches!((destination, candidate), (Ok(destination), Ok(candidate)) if destination != candidate)
                 && old_receipts.iter().all(|receipt| {

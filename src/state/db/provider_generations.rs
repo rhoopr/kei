@@ -20,6 +20,8 @@ use super::rows::encode_asset_date;
 use super::{SqliteStateDb, account};
 use crate::state::{AssetRecord, error::StateError};
 
+mod adjusted_redirect;
+pub(crate) use adjusted_redirect::AdjustedRedirect;
 pub(crate) mod coverage;
 pub(crate) mod observation;
 mod pending_path_cache;

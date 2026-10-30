@@ -754,9 +754,7 @@ impl SelectionRun {
             }
             Err(_) => return Ok((self.clone(), asset)),
         };
-        if current.asset.id() == asset.id()
-            || filter::is_asset_filtered(&current.asset, config).is_some()
-        {
+        if filter::is_asset_filtered(&current.asset, config).is_some() {
             return Ok((self.clone(), asset));
         }
         if let Some(witness) = asset.selector_membership() {
@@ -766,6 +764,31 @@ impl SelectionRun {
                 .insert("selector_membership".into(), witness.clone());
             current.body = serde_json::to_vec(&body)?;
             current.asset = current.asset.with_selector_membership(witness.clone());
+        }
+        if current.asset.id() == asset.id() {
+            if let Some(root) = self
+                .try_redirect_adjusted(decision, &current.asset, current.body, config)
+                .await?
+            {
+                let run = Arc::new(Self {
+                    capture: self.capture.clone(),
+                    root,
+                    albums: self.albums.clone(),
+                    held: self.held.clone(),
+                    session_expired: self.session_expired.clone(),
+                    source_runs: BTreeMap::new(),
+                    fresh_confirmation: true,
+                    retained_retry: self.retained_retry,
+                    retry_sources: self.retry_sources.clone(),
+                });
+                return Ok((
+                    run,
+                    current
+                        .asset
+                        .with_state_record_name(Arc::from(decision.state_id.clone())),
+                ));
+            }
+            return Ok((self.clone(), asset));
         }
         let mut replacement = decision.clone();
         replacement.decision.master = Some(current.asset.id().to_owned());
@@ -883,6 +906,217 @@ impl SelectionRun {
                 .asset
                 .with_state_record_name(Arc::from(decision.state_id.clone())),
         ))
+    }
+
+    /// Recover only a proven original occupying an admitted adjusted path.
+    /// The transaction rechecks every saved owner and the retained file.
+    async fn try_redirect_adjusted(
+        &self,
+        decision: &ActiveDecision,
+        asset: &PhotoAsset,
+        fresh: Vec<u8>,
+        config: &DownloadConfig,
+    ) -> Result<Option<ActiveGeneration>> {
+        let Some(old) = decision
+            .decision
+            .destinations
+            .iter()
+            .find(|d| d.version_size == "adjusted")
+        else {
+            return Ok(None);
+        };
+        let Some(derived) = filter::derive_expected_paths(asset, config)
+            .into_iter()
+            .find(|d| d.version_size == crate::state::VersionSizeKey::Adjusted)
+        else {
+            return Ok(None);
+        };
+        let path = old.path.to_path();
+        if crate::fs_util::confined_path_key(&path)?
+            != crate::fs_util::confined_path_key(&derived.path)?
+        {
+            return Ok(None);
+        }
+        let Ok(Some(file)) =
+            crate::download::file::retain_pending_file(&config.directory, &path).await
+        else {
+            // The normal matcher owns the uncertainty and retry for a missing,
+            // changed or unsafe retained source.
+            return Ok(None);
+        };
+        let original_key = filter::provider_version_for_selected(
+            asset,
+            config,
+            crate::state::VersionSizeKey::Original,
+        );
+        let Some((_, original)) = asset
+            .versions()
+            .iter()
+            .find(|(key, _)| crate::state::VersionSizeKey::from(*key) == original_key)
+        else {
+            return Ok(None);
+        };
+        let library = asset.source_zone().context("Missing retry source")?;
+        let binding = self
+            .capture
+            .db
+            .bind_publication(
+                self.capture.owner.clone(),
+                crate::state::db::PublicationBinding {
+                    account_key: String::new(),
+                    provider_key: String::new(),
+                    scope: self.root.spec.scope.clone(),
+                    library: library.to_owned(),
+                    child: decision.decision.child.clone(),
+                    master: asset.id().to_owned(),
+                    state_id: decision.state_id.clone(),
+                    origin_pass: decision.decision.pass_key.clone(),
+                },
+            )
+            .await?;
+        let proof = self
+            .capture
+            .db
+            .bound_cross_rendition_original(
+                binding,
+                crate::state::VersionSizeKey::Adjusted,
+                crate::state::db::CrossRenditionOriginal {
+                    path: old.path.clone(),
+                    provider_checksum: original.checksum.to_string(),
+                    provider_size: original.size,
+                    local_checksum: Some(data_encoding::HEXLOWER.encode(&file.fingerprint.sha256)),
+                },
+            )
+            .await?;
+        let Some(proof) = proof else {
+            return Ok(None);
+        };
+        let snapshots = self
+            .capture
+            .db
+            .adjusted_redirect_snapshots(self.capture.owner.clone(), old.path.clone())
+            .await?;
+        if snapshots.is_empty() {
+            return Ok(None);
+        }
+        let mut fresh_witnesses = Vec::new();
+        let mut checked_passes = std::collections::HashSet::new();
+        for (root, snapshot) in &snapshots {
+            if root.spec.zone != self.root.spec.zone
+                || root.spec.metadata_flags != self.root.spec.metadata_flags
+                || root.spec.metadata_enabled != self.root.spec.metadata_enabled
+                || !(root.spec.profile == self.root.spec.profile
+                    || crate::state::db::provider_generations::retained_profiles_compatible(
+                        &root.spec.profile,
+                        &self.root.spec.profile,
+                    ))
+            {
+                continue;
+            }
+            let key = &snapshot.decision.pass_key;
+            if checked_passes.contains(key) {
+                continue;
+            }
+            let Some(body) = snapshot.decision.confirmation.as_deref() else {
+                return Err(SelectionReferenceUnavailable.into());
+            };
+            let Some(master) = snapshot.decision.master.as_deref() else {
+                return Err(SelectionReferenceUnavailable.into());
+            };
+            let retained =
+                current_asset(body, &snapshot.decision.child, master, &self.root.spec.zone)?;
+            if !same_selected_facts(&retained, asset) {
+                continue;
+            }
+            checked_passes.insert(key.clone());
+            let Some(witness) = retained.selector_membership() else {
+                continue;
+            };
+            let Some(album) = self.albums.get(key) else {
+                return Err(SelectionReferenceUnavailable.into());
+            };
+            if let Err(error) = album
+                .confirm_selector_membership(witness, &snapshot.decision.child)
+                .await
+            {
+                if crate::icloud::photos::session::is_session_error(&error) {
+                    return Err(error);
+                }
+                return Err(SelectionReferenceUnavailable.into());
+            }
+            fresh_witnesses.push((key.clone(), witness.clone()));
+        }
+        let Some(store) = config.state_db.as_ref() else {
+            return Ok(None);
+        };
+        let concrete = Arc::clone(&self.capture.db) as Arc<dyn super::models::DownloadStore>;
+        anyhow::ensure!(
+            Arc::ptr_eq(store, &concrete),
+            "Retry source database context mismatch"
+        );
+        let mut planner = TaskPlanner::for_download(Some(store.as_ref())).await?;
+        let mut task = filter::DownloadTask {
+            require_created_entry: true,
+            url: derived.url,
+            download_path: path,
+            replacement_fingerprint: None,
+            publication_binding: None,
+            pending_cross_parent_root: None,
+            checksum: derived.checksum,
+            asset_id: decision.state_id.clone().into(),
+            asset_record_name: asset.asset_record_name_arc(),
+            library: Arc::from(library),
+            metadata: filter::build_selected_payload(asset, config, derived.version_size),
+            size: derived.size,
+            created_local: asset.created_local(),
+            version_size: derived.version_size,
+            media_type: filter::determine_media_type(derived.version_size, asset),
+        };
+        planner
+            .choose_independent_sibling(store.as_ref(), &mut task)
+            .await?;
+        let destination = task.download_path;
+        let root = config.directory.to_path_buf();
+        let root = self
+            .capture
+            .db
+            .redirect_incomplete_adjusted(
+                self.capture.owner.clone(),
+                crate::state::db::provider_generations::AdjustedRedirect {
+                    expected: snapshots
+                        .into_iter()
+                        .map(|(root, decision)| (root.id, decision))
+                        .collect(),
+                    fresh_confirmation: fresh,
+                    fresh_witnesses,
+                    preferred_pass: decision.decision.pass_key.clone(),
+                    reference_generation: self.root.id.clone(),
+                    original_provider_version: original_key,
+                    original: proof,
+                    destination: SelectionPath::from_path(&std::path::absolute(&destination)?),
+                },
+                MAX_GENERATION_BYTES,
+                Box::new(move || {
+                    file.validate_blocking()
+                        .map_err(|_error| crate::state::error::StateError::ProviderWorkConflict)?;
+                    let target = crate::fs_util::ConfinedPath::open(
+                        &root,
+                        &destination,
+                        crate::fs_util::ConfinedParents::Existing,
+                    )
+                    .map_err(|_error| crate::state::error::StateError::ProviderWorkConflict)?;
+                    if target
+                        .open_optional_regular()
+                        .map_err(|_error| crate::state::error::StateError::ProviderWorkConflict)?
+                        .is_some()
+                    {
+                        return Err(crate::state::error::StateError::ProviderWorkConflict);
+                    }
+                    Ok(())
+                }),
+            )
+            .await?;
+        Ok(Some(root))
     }
 
     /// Capture only failed tasks' original selected provenance. This transient
@@ -1300,6 +1534,22 @@ impl SelectionRun {
                 asset.asset_record_name().to_owned(),
             )
             .await?;
+        let mut redirected = std::collections::HashSet::new();
+        if reason.is_empty()
+            && previous.as_ref().is_none_or(|value| {
+                (value.decision.confirmation.is_none() || value.is_deferred_observation())
+                    && value.decision.outcome != SelectionOutcome::Selected
+            })
+        {
+            for task in &mut plan.tasks {
+                if planner
+                    .choose_cross_rendition_sibling(asset, config, task)
+                    .await?
+                {
+                    redirected.insert(task.version_size);
+                }
+            }
+        }
         // Choose verified historical reuse before freezing the physical
         // destination. This is a read-only candidate; the producer rechecks
         // its receipt and retained file inside the final adoption transaction.
@@ -1403,7 +1653,14 @@ impl SelectionRun {
                         break;
                     }
                 }
-                let path = if planner.managed_layout_session().is_some() {
+                let path = if redirected.contains(&derived.version_size) {
+                    plan.tasks
+                        .iter()
+                        .find(|task| task.version_size == derived.version_size)
+                        .context("Redirected selection lost its rendition")?
+                        .download_path
+                        .clone()
+                } else if planner.managed_layout_session().is_some() {
                     plan.tasks
                         .iter()
                         .find(|task| task.version_size == derived.version_size)

@@ -9,7 +9,9 @@ use super::{OwnedTempFile, SqliteStateDb, TempFileOwnershipStore};
 use crate::state::error::StateError;
 
 mod prepared;
-pub(crate) use prepared::{PreparedPublication, PublicationBinding};
+pub(crate) use prepared::{
+    CrossRenditionOccupant, CrossRenditionOriginal, PreparedPublication, PublicationBinding,
+};
 pub(super) use prepared::{
     record_bound_receipt, retire_handed_off_publication, retire_prepared_receipt,
 };

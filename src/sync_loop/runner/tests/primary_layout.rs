@@ -71,6 +71,7 @@ struct Session {
     lookup_change: Option<(usize, Vec<Value>)>,
     indexing: Option<IndexingOptions>,
     baseline_successor: Option<&'static str>,
+    cycle_token: Option<&'static str>,
     trace: Option<RequestTrace>,
 }
 #[async_trait::async_trait]
@@ -109,7 +110,7 @@ impl PhotosSession for Session {
                 );
             }
             return Ok(
-                json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":if request["zones"][0]["syncToken"] == "fixture-zone-history-boundary" {self.baseline_successor.unwrap_or("cycle-token")} else {"cycle-token"},"moreComing":false,"records":if self.quiet || request["zones"][0]["syncToken"] == "fixture-zone-history-boundary" {vec![]} else {self.records.clone()}}]}),
+                json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":if request["zones"][0]["syncToken"] == "fixture-zone-history-boundary" {self.baseline_successor.unwrap_or(self.cycle_token.unwrap_or("cycle-token"))} else {self.cycle_token.unwrap_or("cycle-token")},"moreComing":false,"records":if self.quiet || request["zones"][0]["syncToken"] == "fixture-zone-history-boundary" {vec![]} else {self.records.clone()}}]}),
             );
         }
         if url.contains("/records/lookup?") {
@@ -136,12 +137,11 @@ impl PhotosSession for Session {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|wanted| {
+                .filter_map(|wanted| {
                     current
                         .iter()
                         .find(|record| record["recordName"] == wanted["recordName"])
-                        .unwrap()
-                        .clone()
+                        .cloned()
                 })
                 .collect();
             return Ok(json!({"records":records}));
@@ -215,6 +215,7 @@ async fn cycle_resolution(
 struct CycleOptions {
     indexing: Option<IndexingOptions>,
     baseline_successor: Option<&'static str>,
+    cycle_token: Option<&'static str>,
     trace: Option<RequestTrace>,
     refresh_metadata: bool,
     embed_rating: bool,
@@ -239,6 +240,7 @@ impl Default for CycleOptions {
         Self {
             indexing: None,
             baseline_successor: None,
+            cycle_token: None,
             trace: None,
             refresh_metadata: false,
             embed_rating: false,
@@ -289,6 +291,7 @@ async fn try_cycle_options(
         lookup_change: options.lookup_change.clone(),
         indexing: options.indexing.clone(),
         baseline_successor: options.baseline_successor,
+        cycle_token: options.cycle_token,
         trace: options.trace.clone(),
     };
     let owner = state::db::account::AccountOwner::authenticated(
@@ -552,6 +555,7 @@ async fn portable_prepolicy_fixture(
         lookup_change: None,
         indexing: None,
         baseline_successor: None,
+        cycle_token: None,
         trace: None,
     };
     let mut album = crate::icloud::photos::PhotoAlbum::new(
@@ -977,6 +981,7 @@ async fn portable_prepolicy_recovery_gate_rejects_root_and_store_drift() {
             lookup_change: None,
             indexing: None,
             baseline_successor: None,
+            cycle_token: None,
             trace: None,
         };
         let mut album = crate::icloud::photos::PhotoAlbum::new(
@@ -1808,6 +1813,7 @@ async fn recorded_edited_family_recovery_scenario() {
         lookup_change: None,
         indexing: None,
         baseline_successor: None,
+        cycle_token: None,
         trace: None,
     };
     let pass = AlbumPass {
@@ -2095,6 +2101,627 @@ async fn contract_source_checkpoint_requires_durable_recovery_primary_layout_aft
         );
     }
     assert_eq!(server.received_requests().await.unwrap().len(), requests);
+}
+
+#[tokio::test]
+async fn scoped_original_adjusted_only_publishes_distinct_sibling() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let options = |resolution| CycleOptions {
+        private: true,
+        resolution,
+        ..CycleOptions::default()
+    };
+    let (first, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::Original),
+    )
+    .await;
+    assert_eq!(first.failed_count, 0, "{:?}", first.stats);
+    let original = media.join("IMG_0501.JPG");
+    assert_bytes(&original, ORIGINAL);
+    let edited = records(&server, Some(("edit-one", EDIT_ONE)));
+    let (result, _) = cycle_options(
+        root.path(),
+        edited.clone(),
+        false,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::None),
+    )
+    .await;
+    assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+    assert_bytes(&original, ORIGINAL);
+    let entries: Vec<_> = std::fs::read_dir(&media)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    let sibling = entries
+        .iter()
+        .find(|path| *path != &original && std::fs::read(path).unwrap() == EDIT_ONE)
+        .expect("adjusted sibling must contain edit")
+        .clone();
+    assert_ne!(sibling, original);
+    {
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let conn = db
+            .acquire_lock("scoped original and adjusted receipts")
+            .unwrap();
+        let receipts: Vec<(String, String)> = conn.prepare("SELECT version_size,native_path FROM download_receipts WHERE child='asset-501' AND source_checksum IS NOT NULL ORDER BY version_size")
+            .unwrap().query_map([], |r| Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(receipts.len(), 2, "{receipts:?}");
+        assert_eq!(receipts[0].0, "adjusted");
+        assert_eq!(receipts[1].0, "original");
+        assert_ne!(receipts[0].1, receipts[1].1);
+        let reserved: String = conn.query_row(
+            "SELECT destination_path FROM reconciliation_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(std::path::Path::new(&reserved), sibling);
+    }
+    let requests = server.received_requests().await.unwrap().len();
+    for _ in 0..2 {
+        let (quiet, _) = cycle_options(
+            root.path(),
+            edited.clone(),
+            true,
+            EditedNaming::Primary,
+            options(crate::types::PhotoResolution::None),
+        )
+        .await;
+        assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_bytes(&original, ORIGINAL);
+        assert_bytes(&sibling, EDIT_ONE);
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+}
+
+#[tokio::test]
+async fn scoped_bad_admitted_adjusted_recovers_after_reopen() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let original = media.join("IMG_0501.JPG");
+    let options = |resolution, cycle_token| CycleOptions {
+        private: true,
+        resolution,
+        cycle_token: Some(cycle_token),
+        ..CycleOptions::default()
+    };
+    let (first, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::Original, "original-token"),
+    )
+    .await;
+    assert_eq!(first.failed_count, 0);
+    {
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let conn = db.acquire_lock("initial checkpoint").unwrap();
+        let token: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(token, "original-token");
+    }
+    assert_bytes(&original, ORIGINAL);
+    std::fs::write(&original, b"changed original").unwrap();
+    let mut edited = records(&server, Some(("edit-one", EDIT_ONE)));
+    let mut healthy = records(&server, None);
+    for record in &mut healthy {
+        record["recordName"] = json!(record["recordName"].as_str().unwrap().replace("501", "502"));
+        if let Some(reference) = record["fields"].get_mut("masterRef") {
+            reference["value"]["recordName"] = json!("502");
+        }
+    }
+    healthy[0]["fields"]["filenameEnc"]["value"] = json!("IMG_0502.JPG");
+    healthy[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/edit-two",server.uri()),"size":EDIT_TWO.len(),"fileChecksum":provider_hash(EDIT_TWO)});
+    healthy[1]["fields"]["resJPEGFullRes"] = json!({"value":{"downloadURL":format!("{}/edit-two",server.uri()),"size":EDIT_TWO.len(),"fileChecksum":provider_hash(EDIT_TWO)}});
+    healthy[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+    healthy[1]["fields"]["adjustmentRenderType"] = json!({"value":1});
+    edited.extend(healthy);
+    let (held, _) = cycle_options(
+        root.path(),
+        edited.clone(),
+        false,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::None, "debt-token"),
+    )
+    .await;
+    assert!(held.failed_count > 0, "{:?}", held.stats);
+    assert!(held.db_sync_token_advance_safe);
+    assert_bytes(&media.join("IMG_0502.JPG"), EDIT_TWO);
+    let (held_again, _) = cycle_options(
+        root.path(),
+        edited.clone(),
+        false,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::None, "debt-token-2"),
+    )
+    .await;
+    assert!(held_again.db_sync_token_advance_safe);
+    assert_bytes(&media.join("IMG_0502.JPG"), EDIT_TWO);
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    {
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        let conn = db.acquire_lock("recorded bad destination").unwrap();
+        let count:i64=conn.query_row("SELECT count(*) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.child='asset-501' AND d.version_size='adjusted' AND d.admitted=1 AND d.verified_media=0 AND g.sealed=1",[],|r|r.get(0)).unwrap();
+        assert!(
+            count >= 2,
+            "must start from two sealed admitted generations: {count}"
+        );
+        let token: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(token, "debt-token-2");
+    }
+    std::fs::write(&original, ORIGINAL).unwrap();
+    {
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        db.make_selection_retry_due(owner.clone(), "asset-501".into())
+            .await
+            .unwrap();
+    }
+    let (recovered, _) = cycle_options(
+        root.path(),
+        edited.clone(),
+        true,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::None, "recovered-token"),
+    )
+    .await;
+    assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
+    assert_bytes(&original, ORIGINAL);
+    let sibling = std::fs::read_dir(&media)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p != &original && std::fs::read(p).is_ok_and(|b| b == EDIT_ONE))
+        .expect("edited sibling");
+    {
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        let conn = db.acquire_lock("recovered adjusted ownership").unwrap();
+        let incomplete: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND admitted=1 AND verified_media=0", [], |r|r.get(0)).unwrap();
+        assert_eq!(incomplete, 0);
+        let receipts: i64 = conn.query_row("SELECT count(*) FROM download_receipts WHERE child='asset-501' AND version_size IN ('original','adjusted') AND source_checksum IS NOT NULL", [], |r|r.get(0)).unwrap();
+        assert_eq!(receipts, 2);
+    }
+    for _ in 0..2 {
+        let (quiet, _) = cycle_options(
+            root.path(),
+            edited.clone(),
+            true,
+            EditedNaming::Primary,
+            options(crate::types::PhotoResolution::None, "recovered-token"),
+        )
+        .await;
+        assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_bytes(&original, ORIGINAL);
+        assert_bytes(&sibling, EDIT_ONE);
+    }
+}
+
+#[tokio::test]
+async fn scoped_distinct_admitted_edits_publish_current_and_preserve_old_debt() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let original = media.join("IMG_0501.JPG");
+    let options = |resolution, token| CycleOptions {
+        private: true,
+        resolution,
+        cycle_token: Some(token),
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::Original, "initial-token"),
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0);
+    assert_bytes(&original, ORIGINAL);
+    let original_receipt: String = {
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let conn = db.acquire_lock("original source-backed receipt").unwrap();
+        conn.query_row("SELECT json_array(id,scope,child,master,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-501' AND version_size='original' AND source_checksum IS NOT NULL",[],|r|r.get(0)).unwrap()
+    };
+    std::fs::write(&original, b"changed original").unwrap();
+    let first = records(&server, Some(("edit-one", EDIT_ONE)));
+    let (old, _) = cycle_options(
+        root.path(),
+        first,
+        false,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::None, "old-edit-token"),
+    )
+    .await;
+    assert!(old.failed_count > 0);
+    assert!(old.db_sync_token_advance_safe);
+    let current = records(&server, Some(("edit-two", EDIT_TWO)));
+    let (new, _) = cycle_options(
+        root.path(),
+        current.clone(),
+        false,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::None, "current-edit-token"),
+    )
+    .await;
+    assert!(new.failed_count > 0);
+    assert!(new.db_sync_token_advance_safe);
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(&original, ORIGINAL).unwrap();
+    let original_mtime = std::fs::metadata(&original).unwrap().modified().unwrap();
+    let old_snapshot: Vec<String> = {
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        db.make_selection_retry_due(owner.clone(), "asset-501".into())
+            .await
+            .unwrap();
+        let conn = db.acquire_lock("capture distinct historical debt").unwrap();
+        let rows:Vec<String>=conn.prepare("SELECT json_array(d.generation,d.path,d.checksum,d.verified_media,d.verified_metadata,g.sealed,g.seal_hash,p.admission,p.reason,p.attempts,p.next_retry_at,p.manifest_hash) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation JOIN provider_active_decisions p ON p.generation=d.generation AND p.pass_key=d.pass_key AND p.child=d.child WHERE d.child='asset-501' AND d.version_size='adjusted' AND d.checksum=?1 ORDER BY d.generation").unwrap().query_map([provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert!(!rows.is_empty(), "old edit must be admitted debt");
+        let current_count:i64=conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND checksum=?1 AND admitted=1 AND verified_media=0",[provider_hash(EDIT_TWO)],|r|r.get(0)).unwrap();
+        assert!(
+            current_count > 0,
+            "current edit must have an admitted bad destination"
+        );
+        let token: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(token, "current-edit-token");
+        rows
+    };
+    let (recovered, _) = cycle_options(
+        root.path(),
+        current.clone(),
+        true,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::None, "recovered-token"),
+    )
+    .await;
+    assert_eq!(recovered.stats.downloaded, 1, "{:?}", recovered.stats);
+    assert!(recovered.db_sync_token_advance_safe);
+    assert_bytes(&original, ORIGINAL);
+    let sibling = std::fs::read_dir(&media)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p != &original && std::fs::read(p).is_ok_and(|b| b == EDIT_TWO))
+        .expect("current edit sibling");
+    let old_immutable: Vec<String> = {
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        let conn = db
+            .acquire_lock("verify historical debt survives current publication")
+            .unwrap();
+        let rows:Vec<String>=conn.prepare("SELECT json_array(d.generation,d.path,d.checksum,d.verified_media,d.verified_metadata,g.sealed,g.seal_hash,p.admission,p.reason,p.attempts,p.next_retry_at,p.manifest_hash) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation JOIN provider_active_decisions p ON p.generation=d.generation AND p.pass_key=d.pass_key AND p.child=d.child WHERE d.child='asset-501' AND d.version_size='adjusted' AND d.checksum=?1 ORDER BY d.generation").unwrap().query_map([provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(
+            rows, old_snapshot,
+            "historical debt and seal must not be rewritten"
+        );
+        let fabricated:i64=conn.query_row("SELECT count(*) FROM download_receipts WHERE child='asset-501' AND version_size='adjusted' AND provider_checksum=?1",[provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap();
+        assert_eq!(fabricated, 0);
+        let completed:i64=conn.query_row("SELECT count(*) FROM download_receipts WHERE child='asset-501' AND version_size='adjusted' AND provider_checksum=?1 AND source_checksum IS NOT NULL",[provider_hash(EDIT_TWO)],|r|r.get(0)).unwrap();
+        assert_eq!(completed, 1);
+        let retained:String=conn.query_row("SELECT json_array(id,scope,child,master,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-501' AND version_size='original' AND source_checksum IS NOT NULL",[],|r|r.get(0)).unwrap();
+        assert_eq!(retained, original_receipt);
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().modified().unwrap(),
+            original_mtime
+        );
+        let token: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(token, "recovered-token");
+        let immutable:Vec<String>=conn.prepare("SELECT json_array(d.generation,d.path,d.checksum,d.verified_media,d.verified_metadata,g.sealed,g.seal_hash,p.admission,p.manifest_hash) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation JOIN provider_active_decisions p ON p.generation=d.generation AND p.pass_key=d.pass_key AND p.child=d.child WHERE d.child='asset-501' AND d.version_size='adjusted' AND d.checksum=?1 ORDER BY d.generation").unwrap().query_map([provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        immutable
+    };
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.url.path() == "/edit-one")
+            .count(),
+        0
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.url.path() == "/edit-two")
+            .count(),
+        1
+    );
+    drop(requests);
+    for _ in 0..2 {
+        let (quiet, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            options(crate::types::PhotoResolution::None, "recovered-token"),
+        )
+        .await;
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_bytes(&original, ORIGINAL);
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().modified().unwrap(),
+            original_mtime
+        );
+        assert_bytes(&sibling, EDIT_TWO);
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        let conn = db.acquire_lock("reopened historical debt").unwrap();
+        let old_pending:i64=conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND checksum=?1 AND admitted=1 AND verified_media=0",[provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap();
+        assert!(old_pending > 0);
+        let immutable:Vec<String>=conn.prepare("SELECT json_array(d.generation,d.path,d.checksum,d.verified_media,d.verified_metadata,g.sealed,g.seal_hash,p.admission,p.manifest_hash) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation JOIN provider_active_decisions p ON p.generation=d.generation AND p.pass_key=d.pass_key AND p.child=d.child WHERE d.child='asset-501' AND d.version_size='adjusted' AND d.checksum=?1 ORDER BY d.generation").unwrap().query_map([provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(immutable, old_immutable);
+    }
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/edit-two")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn scoped_missing_original_keeps_admitted_adjusted_pending() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("media/IMG_0501.JPG");
+    let options = |resolution| CycleOptions {
+        private: true,
+        resolution,
+        ..CycleOptions::default()
+    };
+    let (first, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::Original),
+    )
+    .await;
+    assert_eq!(first.failed_count, 0);
+    std::fs::write(&original, b"changed original").unwrap();
+    let edited = records(&server, Some(("edit-one", EDIT_ONE)));
+    let (held, _) = cycle_options(
+        root.path(),
+        edited.clone(),
+        false,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::None),
+    )
+    .await;
+    assert!(held.failed_count > 0);
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_file(&original).unwrap();
+    {
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        db.make_selection_retry_due(owner.clone(), "asset-501".into())
+            .await
+            .unwrap();
+    }
+    let requests = server.received_requests().await.unwrap().len();
+    let (_held, _) = cycle_options(
+        root.path(),
+        edited.clone(),
+        true,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::None),
+    )
+    .await;
+    assert!(!original.exists());
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    {
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        let conn = db
+            .acquire_lock("missing original retains adjusted debt")
+            .unwrap();
+        let pending:i64=conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND admitted=1 AND verified_media=0",[],|r|r.get(0)).unwrap();
+        assert!(pending > 0);
+    }
+    std::fs::write(&original, ORIGINAL).unwrap();
+    {
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        db.make_selection_retry_due(owner, "asset-501".into())
+            .await
+            .unwrap();
+    }
+    let (recovered, _) = cycle_options(
+        root.path(),
+        edited,
+        true,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::None),
+    )
+    .await;
+    assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
+    assert_bytes(&original, ORIGINAL);
+    assert!(
+        std::fs::read_dir(root.path().join("media"))
+            .unwrap()
+            .any(|entry| {
+                let path = entry.unwrap().path();
+                path != original && std::fs::read(path).is_ok_and(|bytes| bytes == EDIT_ONE)
+            })
+    );
+}
+
+#[tokio::test]
+async fn scoped_unaccounted_source_holds_distinct_checkpoint() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let options = |token| CycleOptions {
+        private: true,
+        cycle_token: Some(token),
+        ..CycleOptions::default()
+    };
+    let (first, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        options("source-start"),
+    )
+    .await;
+    assert_eq!(first.failed_count, 0);
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    {
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        let conn = db.acquire_lock("baseline checkpoint").unwrap();
+        let token: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(token, "source-start");
+    }
+    let mut sparse = crate::test_helpers::sparse_shared_asset_record();
+    sparse["recordName"] = json!("unresolved-child");
+    sparse["fields"]
+        .as_object_mut()
+        .unwrap()
+        .remove("masterRef");
+    let (held, _) = cycle_options(
+        root.path(),
+        vec![sparse],
+        false,
+        EditedNaming::Primary,
+        options("unaccounted-successor"),
+    )
+    .await;
+    assert!(!held.db_sync_token_advance_safe, "{held:?}");
+    let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+        .await
+        .unwrap();
+    let conn = db.acquire_lock("unaccounted checkpoint held").unwrap();
+    let token: String = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(token, "source-start");
+    assert_bytes(&root.path().join("media/IMG_0501.JPG"), ORIGINAL);
+}
+
+#[tokio::test]
+async fn scoped_adjusted_only_holds_changed_or_foreign_original() {
+    for changed in [true, false] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("media");
+        let options = |resolution| CycleOptions {
+            private: true,
+            resolution,
+            ..CycleOptions::default()
+        };
+        if changed {
+            let (first, _) = cycle_options(
+                root.path(),
+                records(&server, None),
+                false,
+                EditedNaming::Primary,
+                options(crate::types::PhotoResolution::Original),
+            )
+            .await;
+            assert_eq!(first.failed_count, 0);
+        } else {
+            std::fs::create_dir_all(&media).unwrap();
+        }
+        let original = media.join("IMG_0501.JPG");
+        let foreign = b"foreign or locally changed original";
+        std::fs::write(&original, foreign).unwrap();
+        let requests = server.received_requests().await.unwrap().len();
+        let (held, _) = cycle_options(
+            root.path(),
+            records(&server, Some(("edit-one", EDIT_ONE))),
+            false,
+            EditedNaming::Primary,
+            options(crate::types::PhotoResolution::None),
+        )
+        .await;
+        assert!(held.failed_count > 0, "{changed}: {:?}", held.stats);
+        assert_bytes(&original, foreign);
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        assert!(!std::fs::read_dir(&media).unwrap().any(|entry| {
+            std::fs::read(entry.unwrap().path()).is_ok_and(|bytes| bytes == EDIT_ONE)
+        }));
+    }
 }
 
 #[tokio::test]
@@ -2902,6 +3529,7 @@ async fn primary_layout_read_only_conflict_discloses_and_keeps_local_changes() {
         lookup_change: None,
         indexing: None,
         baseline_successor: None,
+        cycle_token: None,
         trace: None,
     };
     let pass = AlbumPass {
@@ -4456,6 +5084,7 @@ async fn interrupted_unprepared_embedded_refresh_remains_held() {
         lookup_change: None,
         indexing: None,
         baseline_successor: None,
+        cycle_token: None,
         trace: None,
     };
     let pass = AlbumPass {
@@ -4563,6 +5192,7 @@ async fn interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync() {
             lookup_change: None,
             indexing: None,
             baseline_successor: None,
+            cycle_token: None,
             trace: None,
         };
         let pass = AlbumPass {
@@ -4798,6 +5428,7 @@ async fn interrupted_embedded_scratch_reopens_without_adopting_or_removing_unkno
         lookup_change: None,
         indexing: None,
         baseline_successor: None,
+        cycle_token: None,
         trace: None,
     };
     let pass = AlbumPass {
@@ -5044,6 +5675,7 @@ async fn interrupted_unprepared_refresh_retries_on_ordinary_sync() {
         lookup_change: None,
         indexing: None,
         baseline_successor: None,
+        cycle_token: None,
         trace: None,
     };
     let pass = AlbumPass {
@@ -5177,6 +5809,7 @@ async fn interrupted_unprepared_refresh_rejects_drift_and_occupied_paths() {
             lookup_change: None,
             indexing: None,
             baseline_successor: None,
+            cycle_token: None,
             trace: None,
         };
         let pass = AlbumPass {

@@ -426,7 +426,21 @@ A bound completed receipt for an older resource can classify its unchanged
 native occupant when the account, source, child, master, rendition and pass
 match. It cannot prove the selected resource. The selected resource still uses
 a distinct reserved destination and the ordinary verified publication path;
-changed or unsafe historical occupants remain uncertain.
+changed or unsafe historical occupants remain uncertain. Before initial adjusted
+selection, an exact source-backed original receipt and matching confined local
+fingerprint can classify the occupied requested name. The planner reserves a
+separate identity-suffixed destination and rechecks the original during matching.
+Local-trust receipts do not supply this authority. Due replay can redirect an
+already admitted incomplete adjusted destination only after fresh scoped source
+confirmation, fresh membership for each affected selecting pass, and a complete
+owner census. One transaction validates each saved
+decision and seal, transfers only incomplete paths whose saved provider facts
+match the fresh confirmation, recomputes their proofs, and preserves retry
+evidence and completed sibling files. Older distinct provider generations stay
+pending at their recorded paths; the newer publication does not complete them.
+A retained original handle and an empty confined sibling are rechecked before
+commit. Prepared publications and frozen metadata defer this transition until the
+existing recovery or metadata owner settles them.
 
 The selected resource's fileChecksum can independently verify raw local bytes
 for the explicitly supported MMCS v1 variant: strict Base64 of byte 0x01 followed

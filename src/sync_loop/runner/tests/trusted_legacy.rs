@@ -1695,6 +1695,54 @@ async fn trusted_legacy_due_compaction_revalidates_in_successor_generation() {
     };
     let path: crate::state::db::provider_selection::SelectionPath =
         serde_json::from_str(&path).unwrap();
+    // This is a genuine compacted local-trust completion. Even with the same
+    // current resource facts and file hash it is not source-backed authority
+    // for moving a distinct adjusted rendition to a sibling.
+    let (
+        trusted_scope,
+        trusted_pass,
+        trusted_child,
+        trusted_master,
+        trusted_checksum,
+        trusted_size,
+        trusted_path,
+        trusted_local,
+    ): (String, String, String, String, String, i64, String, String) = {
+        let conn = rusqlite::Connection::open(&f.database).unwrap();
+        conn.query_row("SELECT scope,origin_pass,child,master,provider_checksum,provider_size,native_path,local_checksum FROM download_receipts WHERE source_checksum IS NULL AND version_size='original' LIMIT 1", [], |r|
+            Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).unwrap()
+    };
+    let binding = db
+        .bind_publication(
+            owner.clone(),
+            crate::state::db::PublicationBinding {
+                account_key: String::new(),
+                provider_key: String::new(),
+                scope: trusted_scope,
+                library: ZONE.into(),
+                child: trusted_child.clone(),
+                master: trusted_master,
+                state_id: trusted_child,
+                origin_pass: trusted_pass,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        db.bound_cross_rendition_original(
+            binding,
+            crate::state::VersionSizeKey::Adjusted,
+            crate::state::db::CrossRenditionOriginal {
+                path: serde_json::from_str(&trusted_path).unwrap(),
+                provider_checksum: trusted_checksum,
+                provider_size: u64::try_from(trusted_size).unwrap(),
+                local_checksum: Some(trusted_local),
+            }
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
     let candidate = db
         .accepted_trusted_legacy_file(ZONE.into(), child.clone(), version.clone())
         .await

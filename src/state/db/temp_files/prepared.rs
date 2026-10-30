@@ -64,7 +64,67 @@ impl PublicationBinding {
     }
 }
 
+/// Exact current original resource and retained-file fingerprint supplied by the
+/// caller. The fingerprint must come from a confined, no-follow file read.
+pub(crate) struct CrossRenditionOriginal {
+    pub(crate) path: SelectionPath,
+    pub(crate) provider_checksum: String,
+    pub(crate) provider_size: u64,
+    pub(crate) local_checksum: Option<String>,
+}
+
+/// Evidence of an original occupant, not evidence of the adjusted rendition.
+/// Callers must revalidate the receipt and retained file at the eventual commit.
+pub(crate) struct CrossRenditionOccupant {
+    pub(crate) receipt: super::super::download_receipts::DownloadReceipt,
+}
+
 impl SqliteStateDb {
+    /// Read-only proof for the original occupying an adjusted destination. This
+    /// does not reserve a path, authorize adoption, or validate a later commit.
+    pub(crate) async fn bound_cross_rendition_original(
+        &self,
+        binding: PublicationBinding,
+        requested_version: VersionSizeKey,
+        original: CrossRenditionOriginal,
+    ) -> Result<Option<CrossRenditionOccupant>, StateError> {
+        self.with_conn("read cross-rendition original receipt", move |conn| {
+            binding.validate(conn)?;
+            if requested_version != VersionSizeKey::Adjusted {
+                return Ok(None);
+            }
+            let Some(fingerprint) = original.local_checksum.as_deref() else {
+                return Ok(None);
+            };
+            let mut occupants = super::super::download_receipts::historical(
+                conn,
+                &binding.scope,
+                &binding.child,
+                &binding.master,
+                "original",
+            )?
+            .into_iter()
+            .filter(|receipt| receipt.native_path == original.path);
+            let Some(receipt) = occupants.next() else {
+                return Ok(None);
+            };
+            if occupants.next().is_some()
+                || receipt.account_key != binding.account_key
+                || receipt.provider_key != binding.provider_key
+                || receipt.library != binding.library
+                || receipt.state_id != binding.state_id
+                || !receipt.fulfills_pass(&binding.origin_pass)
+                || receipt.provider_checksum != original.provider_checksum
+                || receipt.provider_size != original.provider_size
+                || receipt.local_checksum != fingerprint
+            {
+                return Ok(None);
+            }
+            Ok(Some(CrossRenditionOccupant { receipt }))
+        })
+        .await
+    }
+
     pub(crate) async fn bound_download_receipts(
         &self,
         binding: PublicationBinding,
@@ -934,6 +994,172 @@ mod binding_tests {
                     .get(0))
                 .unwrap(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_rendition_original_requires_exact_source_receipt_and_fingerprint() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let db = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        let mut proof = fixture(&db, root.path(), true).await;
+        std::fs::write(proof.destination.to_path(), b"original bytes").unwrap();
+        proof.local_checksum = format!("{:x}", Sha256::digest(b"original bytes"));
+        db.prepare_temp_publication(&proof.temporary.to_path(), &proof)
+            .await
+            .unwrap();
+        finish(&db, &proof).await.unwrap();
+        drop(db);
+        let db = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        let binding = proof.binding.clone().unwrap();
+        let original = || super::CrossRenditionOriginal {
+            path: proof.destination.clone(),
+            provider_checksum: proof.provider_checksum.clone(),
+            provider_size: proof.provider_size,
+            local_checksum: Some(format!(
+                "{:x}",
+                Sha256::digest(std::fs::read(proof.destination.to_path()).unwrap())
+            )),
+        };
+        let find = |binding, version, original| {
+            db.bound_cross_rendition_original(binding, version, original)
+        };
+        assert!(
+            find(binding.clone(), VersionSizeKey::Adjusted, original())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            find(binding.clone(), VersionSizeKey::Original, original())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for field in ["child", "master", "state", "pass", "library"] {
+            let mut other = binding.clone();
+            match field {
+                "child" => other.child.push_str("-other"),
+                "master" => other.master.push_str("-other"),
+                "state" => other.state_id.push_str("-other"),
+                "pass" => other.origin_pass.push_str("-other"),
+                _ => other.library.push_str("-other"),
+            }
+            let result = find(other, VersionSizeKey::Adjusted, original()).await;
+            assert!(result.is_err() || result.unwrap().is_none(), "{field}");
+        }
+        let mut foreign = binding.clone();
+        foreign.account_key.push_str("-other");
+        assert!(
+            find(foreign, VersionSizeKey::Adjusted, original())
+                .await
+                .is_err()
+        );
+        let mut wrong = original();
+        wrong.provider_checksum.push_str("-other");
+        assert!(
+            find(binding.clone(), VersionSizeKey::Adjusted, wrong)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut wrong = original();
+        wrong.provider_size += 1;
+        assert!(
+            find(binding.clone(), VersionSizeKey::Adjusted, wrong)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut wrong = original();
+        wrong.path = SelectionPath::from_path(&root.path().join("other.JPG"));
+        assert!(
+            find(binding.clone(), VersionSizeKey::Adjusted, wrong)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut missing = original();
+        missing.local_checksum = None;
+        assert!(
+            find(binding.clone(), VersionSizeKey::Adjusted, missing)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(proof.destination.to_path(), b"changed bytes").unwrap();
+        assert!(
+            find(binding.clone(), VersionSizeKey::Adjusted, original())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(proof.destination.to_path(), b"original bytes").unwrap();
+        assert!(
+            find(binding.clone(), VersionSizeKey::Adjusted, original())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // A valid receipt for a different occupant rendition is not an original receipt.
+        {
+            let mut adjusted = find(binding.clone(), VersionSizeKey::Adjusted, original())
+                .await
+                .unwrap()
+                .unwrap()
+                .receipt;
+            let conn = db
+                .acquire_lock("replace original with adjusted receipt")
+                .unwrap();
+            adjusted.version_size = "adjusted".into();
+            adjusted.save(&conn).unwrap();
+            conn.execute(
+                "DELETE FROM download_receipts WHERE version_size='original'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            find(binding.clone(), VersionSizeKey::Adjusted, original())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Restore the source-backed original so the next control changes only trust type.
+        {
+            let conn = db.acquire_lock("restore original receipt").unwrap();
+            let id: String = conn
+                .query_row(
+                    "SELECT id FROM download_receipts WHERE version_size='adjusted'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let mut receipt = crate::state::db::download_receipts::load(&conn, &id)
+                .unwrap()
+                .unwrap();
+            receipt.version_size = "original".into();
+            receipt.save(&conn).unwrap();
+            conn.execute(
+                "DELETE FROM download_receipts WHERE version_size='adjusted'",
+                [],
+            )
+            .unwrap();
+        }
+        // A local-trust-shaped row is excluded before its proof can confer source authority.
+        db.acquire_lock("replace source proof with local-trust row").unwrap().execute(
+            "UPDATE download_receipts SET source_checksum=NULL, trust_receipt='local', selected_metadata_hash='metadata', generation_id='generation'", [],
+        ).unwrap();
+        assert!(
+            find(binding, VersionSizeKey::Adjusted, original())
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

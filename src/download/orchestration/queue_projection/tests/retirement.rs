@@ -3373,3 +3373,334 @@ async fn db_healthy_root(db: &Arc<SqliteStateDb>) -> ActiveGeneration {
         .await
         .unwrap()
 }
+
+#[tokio::test]
+async fn adjusted_redirect_transaction_is_fenced_and_atomic() {
+    use crate::state::VersionSizeKey;
+    use crate::state::db::CrossRenditionOccupant;
+    use crate::state::db::provider_generations::AdjustedRedirect;
+    for mode in 0..19 {
+        REFERENCE_RAW.scope(mode == 13, async {
+        let budget = if mode == 14 { BUDGET * 128 } else { BUDGET };
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("state.db");
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&database, &owner())
+                .await
+                .unwrap(),
+        );
+        let original_root = db
+            .begin_selection_generation(owner(), spec(), budget)
+            .await
+            .unwrap();
+        let (original, tasks, rows) = admission(
+            &db,
+            &original_root.id,
+            &dir.path().join("media"),
+            0,
+            mode == 12,
+            budget,
+        )
+        .await;
+        publish(&db, &tasks[0]).await;
+        if mode == 12 {
+            publish(&db, &tasks[1]).await;
+        }
+        db.seal_selection_generation(owner(), original_root.id.clone(), true, None)
+            .await
+            .unwrap();
+        let receipt = {
+            let conn = db
+                .acquire_lock("create completed source-backed receipt")
+                .unwrap();
+            SqliteStateDb::merge_test_completed_origin(
+                &conn,
+                &original_root.id,
+                "pass",
+                &original.decision.child,
+                "pass",
+            )
+            .unwrap()
+        };
+        let mut body: Value =
+            serde_json::from_slice(original.decision.confirmation.as_ref().unwrap()).unwrap();
+        body["records"][0]["fields"]["resJPEGFullRes"] = json!({"value":{"downloadURL":"https://p01.icloud-content.com/edit.jpg","size":RAW.len(),"fileChecksum":super::OLD}});
+        body["records"][0]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+        body["records"][1]["fields"]["adjustmentRenderType"] = json!({"value":1});
+        let body = serde_json::to_vec(&body).unwrap();
+        let asset = crate::icloud::photos::current_asset(
+            &body,
+            &original.decision.child,
+            original.decision.master.as_deref().unwrap(),
+            &spec().zone,
+        )
+        .unwrap();
+        let metadata = asset.metadata_arc(VersionSizeKey::Adjusted);
+        let mut row = rows[0].clone();
+        row.version_size = VersionSizeKey::Adjusted;
+        row.checksum = super::OLD.into();
+        row.metadata = metadata.clone();
+        let mut selected_rows = vec![row.clone()];
+        if mode == 12 {
+            selected_rows.push(rows[1].clone());
+        }
+        let mut adjusted = original.clone();
+        adjusted.decision.confirmation = Some(body.clone());
+        adjusted.decision.destinations[0].version_size = "adjusted".into();
+        adjusted.decision.destinations[0].checksum = super::OLD.into();
+        adjusted.decision.destinations[0].metadata_hash = metadata.metadata_hash.clone().unwrap();
+        if mode == 12 {
+            let companion_metadata = asset.metadata_arc(tasks[1].version_size);
+            selected_rows[1].metadata = companion_metadata.clone();
+            adjusted.decision.destinations[1].metadata_hash =
+                companion_metadata.metadata_hash.clone().unwrap();
+        }
+        let count = if mode == 14 { 65 } else if mode == 1 || mode == 4 || mode == 6 || mode == 15 || mode == 16 || mode == 17 || mode == 18 { 2 } else { 1 };
+        let mut historical = adjusted.clone();
+        let mut historical_rows = selected_rows.clone();
+        if mode == 15 || mode == 17 {
+            let mut old_body:Value=serde_json::from_slice(&body).unwrap();
+            if mode == 15 { old_body["records"][0]["fields"]["resJPEGFullRes"]["value"]["fileChecksum"]=json!(CURRENT); }
+            else { old_body["records"][1]["fields"]["captionEnc"]=json!({"value":"older metadata","type":"STRING"}); }
+            let old_body=serde_json::to_vec(&old_body).unwrap();
+            let old_asset=crate::icloud::photos::current_asset(&old_body,&original.decision.child,original.decision.master.as_deref().unwrap(),&spec().zone).unwrap();
+            let old_metadata=old_asset.metadata_arc(VersionSizeKey::Adjusted);
+            historical.decision.confirmation=Some(old_body);
+            historical.decision.destinations[0].checksum=if mode == 15 { CURRENT } else { super::OLD }.into();
+            historical.decision.destinations[0].metadata_hash=old_metadata.metadata_hash.clone().unwrap();
+            historical_rows[0].checksum=if mode == 15 { CURRENT } else { super::OLD }.into();
+            historical_rows[0].metadata=old_metadata;
+        }
+        let mut expected = Vec::new();
+        for index in 0..count {
+            let (selected, selected_records) = if (mode == 15 || mode == 17) && index == 0 { (&historical,&historical_rows) } else { (&adjusted,&selected_rows) };
+            let mut generation_spec=spec();
+            if mode == 18 && index == 0 { generation_spec.profile["fixture_path_policy"]=json!("other"); }
+            let root = db
+                .begin_selection_generation(owner(), generation_spec, budget)
+                .await
+                .unwrap();
+            assert!(
+                db.project_selection_decision(
+                    owner(),
+                    root.id.clone(),
+                    selected.clone(),
+                    selected_records.clone(),
+                    budget
+                )
+                .await
+                .unwrap_or_else(|error| panic!("mode {mode}: {error:?}"))
+                .admitted
+            );
+            db.seal_selection_generation(owner(), root.id.clone(), true, None)
+                .await
+                .unwrap();
+            if mode != 16 || index == 1 {
+                db.defer_selection_confirmation(
+                    owner(), root.id.clone(), "pass".into(), adjusted.decision.child.clone(),
+                ).await.unwrap();
+            }
+            expected.push((root.id, selected.clone()));
+        }
+        if mode == 15 || mode == 17 {
+            let old_path=tasks[0].download_path.to_str().unwrap();
+            let old_key=crate::fs_util::confined_path_key(&tasks[0].download_path).unwrap();
+            db.acquire_lock("reserve historical adjusted destination").unwrap().execute("INSERT INTO reconciliation_paths(library,id,version_size,requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size) VALUES('PrimarySync',?1,'adjusted',?2,?2,?3,?4,?5)",rusqlite::params![adjusted.state_id,old_key,old_path,if mode == 15 { CURRENT } else { super::OLD },RAW.len() as i64]).unwrap();
+        }
+        if mode == 12 {
+            publish(&db, &tasks[1]).await;
+        }
+        if mode == 3 {
+            let sha = data_encoding::HEXLOWER.encode(&Sha256::digest(RAW));
+            db.mark_verified_download(
+                "PrimarySync",
+                &adjusted.state_id,
+                "adjusted",
+                &tasks[0].download_path,
+                &sha,
+                Some(&sha),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        if mode == 11 {
+            use crate::state::TempFileOwnershipStore;
+            let part = dir.path().join("prepared.part");
+            db.claim_temp_file(&part).await.unwrap();
+            let journal = crate::state::db::PreparedPublication {
+                binding: None,
+                library: "PrimarySync".into(),
+                id: adjusted.state_id.clone(),
+                version: "adjusted".into(),
+                provider_checksum: super::OLD.into(),
+                provider_size: RAW.len() as u64,
+                temporary: SelectionPath::from_path(&part),
+                destination: SelectionPath::from_path(&tasks[0].download_path),
+                local_checksum: "a".repeat(64),
+                source_checksum: "b".repeat(64),
+            };
+            db.prepare_temp_publication(&part, &journal).await.unwrap();
+        }
+        if mode == 4 {
+            let mut ids: Vec<_> = expected.iter().map(|(id, _)| id.clone()).collect();
+            ids.sort();
+            let trigger = format!(
+                "CREATE TRIGGER redirect_fault BEFORE UPDATE OF path ON provider_active_destinations WHEN OLD.generation='{}' BEGIN SELECT RAISE(ABORT,'redirect fault'); END;",
+                ids[1]
+            );
+            db.acquire_lock("inject second-generation redirect fault")
+                .unwrap()
+                .execute_batch(&trigger)
+                .unwrap();
+        }
+        let original_expected = expected.clone();
+        let retries: Vec<(i64, i64, String)> = {
+            let conn = db.acquire_lock("capture retry evidence").unwrap();
+            original_expected.iter().map(|(id,_)| conn.query_row("SELECT attempts,next_retry_at,reason FROM provider_active_decisions WHERE generation=?1", [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap()).collect()
+        };
+        if mode == 6 {
+            expected.pop();
+        }
+        if mode == 2 {
+            expected[0].1.decision.reason = "stale".into();
+        }
+        let sibling = tasks[0].download_path.with_file_name("safe-sibling.jpg");
+        if mode == 7 {
+            let key = crate::fs_util::confined_path_key(&sibling).unwrap();
+            db.acquire_lock("conflicting sibling reservation").unwrap().execute("INSERT INTO reconciliation_paths(library,id,version_size,requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size) VALUES('PrimarySync','foreign','adjusted',?1,?1,?2,'foreign',1)",rusqlite::params![key,sibling.to_string_lossy()]).unwrap();
+        }
+        let fresh = if mode == 8 {
+            let mut changed: Value = serde_json::from_slice(&body).unwrap();
+            changed["records"][0]["fields"]["resOriginalRes"]["value"]["size"] =
+                json!(RAW.len() + 1);
+            serde_json::to_vec(&changed).unwrap()
+        } else {
+            body
+        };
+        let retained =
+            crate::download::file::retain_pending_file(dir.path(), &tasks[0].download_path)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&retained.fingerprint.sha256),
+            receipt.local_checksum
+        );
+        if mode == 9 {
+            std::fs::write(&sibling, b"foreign sibling").unwrap();
+        }
+        if mode == 10 {
+            std::fs::write(&tasks[0].download_path, b"changed after retain").unwrap();
+        }
+        let checked_sibling = sibling.clone();
+        let receipt_id = receipt.id().unwrap();
+        let receipt_checksum = receipt.local_checksum.clone();
+        let historical_generation=expected[0].0.clone();
+        let reference_generation = if mode == 18 { expected[1].0.clone() } else { expected[0].0.clone() };
+        let request = AdjustedRedirect {
+            expected,
+            fresh_confirmation: fresh,
+            fresh_witnesses: Vec::new(),
+            preferred_pass: "pass".into(),
+            reference_generation,
+            original_provider_version: if mode == 13 { VersionSizeKey::Alternative } else { VersionSizeKey::Original },
+            original: CrossRenditionOccupant { receipt },
+            destination: SelectionPath::from_path(&sibling),
+        };
+        let outcome = db
+            .redirect_incomplete_adjusted(
+                owner(),
+                request,
+                budget,
+                Box::new(move || {
+                    if mode == 5 {
+                        return Err(crate::state::error::StateError::ProviderWorkConflict);
+                    }
+                    if std::fs::symlink_metadata(&checked_sibling).is_ok() {
+                        return Err(crate::state::error::StateError::ProviderWorkConflict);
+                    }
+                    retained
+                        .validate_blocking()
+                        .map_err(|_error| crate::state::error::StateError::ProviderWorkConflict)
+                }),
+            )
+            .await;
+        let succeeds = mode < 2 || mode == 12 || mode == 13 || mode == 14 || mode == 15 || mode == 16 || mode == 18;
+        assert_eq!(outcome.is_ok(), succeeds, "mode {mode}: {outcome:?}");
+        if mode == 16 { assert_eq!(outcome.as_ref().unwrap().id, original_expected[0].0); }
+        if mode == 4 {
+            db.acquire_lock("remove redirect fault")
+                .unwrap()
+                .execute_batch("DROP TRIGGER redirect_fault")
+                .unwrap();
+        }
+        drop(db);
+        let reopened = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        let verify_ids: Vec<_> = original_expected.iter().map(|(id,old)| (id.clone(),(mode != 15 || old.decision.destinations[0].checksum == super::OLD) && (mode != 18 || id != &historical_generation))).collect();
+        {
+            let conn = reopened.acquire_lock("reopened redirect state").unwrap();
+            let original_receipt: String = conn.query_row("SELECT local_checksum FROM download_receipts WHERE id=?1 AND source_checksum IS NOT NULL", [&receipt_id], |r| r.get(0)).unwrap();
+            assert_eq!(original_receipt, receipt_checksum);
+            let reservation: i64 = conn.query_row("SELECT count(*) FROM reconciliation_paths WHERE library='PrimarySync' AND id=?1 AND version_size='adjusted' AND destination_path_key=?2", rusqlite::params![adjusted.state_id, crate::fs_util::confined_path_key(&sibling).unwrap()], |r| r.get(0)).unwrap();
+            assert_eq!(
+                reservation,
+                i64::from(succeeds),
+                "destination ownership mode {mode}"
+            );
+            for ((id, old), retry) in original_expected.into_iter().zip(retries) {
+                let after: (i64,i64,String) = conn.query_row("SELECT attempts,next_retry_at,reason FROM provider_active_decisions WHERE generation=?1", [&id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                assert_eq!(after, retry, "retry evidence mode {mode}");
+                let path: String = conn.query_row("SELECT path FROM provider_active_destinations WHERE generation=?1 AND version_size='adjusted'", [&id], |r|r.get(0)).unwrap();
+                let expected_path = if succeeds && (mode != 15 || old.decision.destinations[0].checksum == super::OLD) && (mode != 18 || id != historical_generation) {
+                    SelectionPath::from_path(&sibling)
+                } else {
+                    old.decision.destinations[0].path.clone()
+                };
+                assert_eq!(path, expected_path.key().unwrap(), "mode {mode}");
+            }
+        }
+        if succeeds {
+            for (id, redirected) in verify_ids {
+                let loaded = reopened
+                    .selection_decision(owner(), id, "pass".into(), adjusted.decision.child.clone())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    loaded.decision.destinations[0].path,
+                    if redirected { SelectionPath::from_path(&sibling) } else { SelectionPath::from_path(&tasks[0].download_path) }
+                );
+            }
+        }
+        if mode == 15 {
+            let conn=reopened.acquire_lock("historical reservation remains").unwrap();
+            let path:String=conn.query_row("SELECT destination_path FROM reconciliation_paths WHERE library='PrimarySync' AND id=?1 AND version_size='adjusted' AND provider_checksum=?2",rusqlite::params![adjusted.state_id,CURRENT],|r|r.get(0)).unwrap();
+            assert_eq!(std::path::Path::new(&path),tasks[0].download_path);
+        }
+        if mode == 12 {
+            assert_eq!(std::fs::read(&tasks[1].download_path).unwrap(), RAW);
+            let conn = reopened
+                .acquire_lock("completed sibling stays complete")
+                .unwrap();
+            let completed:i64=conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE version_size='live_original' AND verified_media=1",[],|r|r.get(0)).unwrap();
+            assert!(completed > 0);
+        }
+        if mode == 10 {
+            assert_eq!(
+                std::fs::read(&tasks[0].download_path).unwrap(),
+                b"changed after retain"
+            );
+        } else {
+            assert_eq!(std::fs::read(&tasks[0].download_path).unwrap(), RAW);
+        }
+        if mode == 9 {
+            assert_eq!(std::fs::read(&sibling).unwrap(), b"foreign sibling");
+        } else {
+            assert!(!sibling.exists());
+        }
+        }).await;
+    }
+}

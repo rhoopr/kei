@@ -806,7 +806,7 @@ impl TaskPlanner {
                 }
             }
         }
-        let historical = if let (Some(binding), Some(album)) =
+        let mut historical = if let (Some(binding), Some(album)) =
             (&task.publication_binding, &config.primary_layout_source)
         {
             let capture = match album.publication_scope(&task.library) {
@@ -844,6 +844,31 @@ impl TaskPlanner {
             .iter()
             .find(|path| path.version_size == task.version_size)
             .map_or(task.download_path.as_path(), |path| path.path.as_path());
+        match self
+            .cross_rendition_original(asset, config, task, requested)
+            .await
+        {
+            Ok(Some(receipt)) => historical.push(receipt),
+            Ok(None) => match self
+                .missing_cross_rendition_original(asset, config, task, requested)
+                .await
+            {
+                Ok(Some(receipt)) => historical.push(receipt),
+                Ok(None) => {}
+                Err(_) => {
+                    return super::baseline_matching::uncertain(
+                        "scoped_receipt_or_reservation_validation_failed",
+                        Some(requested),
+                    );
+                }
+            },
+            Err(_) => {
+                return super::baseline_matching::uncertain(
+                    "scoped_receipt_or_reservation_validation_failed",
+                    Some(requested),
+                );
+            }
+        }
         let selected_copy_scope =
             if let (Some(run), Some(key)) = (&config.selection_run, &config.primary_layout_pass) {
                 match run
@@ -906,6 +931,199 @@ impl TaskPlanner {
         matched
     }
 
+    /// A source-backed original can occupy the requested adjusted name without
+    /// supplying evidence for the adjusted bytes. Recheck the confined file on
+    /// every use; a missing or changed occupant is never positive proof.
+    async fn cross_rendition_original(
+        &self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        task: &DownloadTask,
+        requested: &Path,
+    ) -> Result<Option<crate::state::db::download_receipts::DownloadReceipt>> {
+        if task.version_size != VersionSizeKey::Adjusted || self.ownership_incomplete {
+            return Ok(None);
+        }
+        let key = PathPlanningMode::Reconciliation.key(requested)?;
+        if self
+            .reconciliation
+            .path_owners
+            .get(&key)
+            .is_some_and(|owners| {
+                owners.iter().any(|owner| {
+                    owner.library != task.library
+                        || owner.asset_id.as_ref() != task.asset_id.as_ref()
+                        || !matches!(
+                            owner.version_size,
+                            VersionSizeKey::Original | VersionSizeKey::Adjusted
+                        )
+                })
+            })
+        {
+            return Ok(None);
+        }
+        let (Some(binding), Some(album)) =
+            (&task.publication_binding, &config.primary_layout_source)
+        else {
+            return Ok(None);
+        };
+        let Some((capture, scope, _)) = album.publication_scope(&task.library)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(scope == binding.scope, "Publication scope changed");
+        let original_key =
+            super::filter::provider_version_for_selected(asset, config, VersionSizeKey::Original);
+        let Some((_, original)) = asset
+            .versions()
+            .iter()
+            .find(|(key, _)| VersionSizeKey::from(*key) == original_key)
+        else {
+            return Ok(None);
+        };
+        let Ok(fingerprint) =
+            super::file::fingerprint_downloaded_path(&config.directory, requested).await
+        else {
+            return Ok(None);
+        };
+        let proof = capture
+            .db
+            .bound_cross_rendition_original(
+                binding.as_ref().clone(),
+                task.version_size,
+                crate::state::db::CrossRenditionOriginal {
+                    path: crate::state::db::provider_selection::SelectionPath::from_path(
+                        &std::path::absolute(requested)?,
+                    ),
+                    provider_checksum: original.checksum.to_string(),
+                    provider_size: original.size,
+                    local_checksum: Some(data_encoding::HEXLOWER.encode(&fingerprint.sha256)),
+                },
+            )
+            .await?;
+        Ok(proof.map(|proof| proof.receipt))
+    }
+
+    /// A missing source-backed original is negative evidence only: it holds
+    /// the selected path until the retained file can be revalidated.
+    async fn missing_cross_rendition_original(
+        &self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        task: &DownloadTask,
+        requested: &Path,
+    ) -> Result<Option<crate::state::db::download_receipts::DownloadReceipt>> {
+        if task.version_size != VersionSizeKey::Adjusted
+            || !matches!(
+                super::file::inspect_pending_candidate(&config.directory, requested).await,
+                Ok(false)
+            )
+        {
+            return Ok(None);
+        }
+        let (Some(binding), Some(album)) =
+            (&task.publication_binding, &config.primary_layout_source)
+        else {
+            return Ok(None);
+        };
+        let Some((capture, scope, _)) = album.publication_scope(&task.library)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(scope == binding.scope, "Publication scope changed");
+        let key =
+            super::filter::provider_version_for_selected(asset, config, VersionSizeKey::Original);
+        let current = asset
+            .versions()
+            .iter()
+            .find(|(version, _)| VersionSizeKey::from(*version) == key)
+            .map(|(_, original)| (original.checksum.to_string(), original.size));
+        let (checksum, size) = current.clone().unwrap_or_default();
+        let mut receipts = capture
+            .db
+            .bound_historical_downloads(
+                binding.as_ref().clone(),
+                "original".into(),
+                checksum.clone(),
+                size,
+            )
+            .await?;
+        if current.is_some() {
+            receipts.extend(
+                capture
+                    .db
+                    .bound_download_receipts(
+                        binding.as_ref().clone(),
+                        "original".into(),
+                        checksum,
+                        size,
+                    )
+                    .await?,
+            );
+        }
+        let requested_key = crate::fs_util::confined_path_key(requested)?;
+        for receipt in receipts {
+            if crate::fs_util::confined_path_key(&receipt.native_path.to_path())? == requested_key {
+                return Ok(Some(receipt));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Choose and reserve a sibling only for a newly selected obligation.
+    pub(super) async fn choose_cross_rendition_sibling(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        task: &mut DownloadTask,
+    ) -> Result<bool> {
+        if self.managed_plan {
+            return Ok(false);
+        }
+        let derived = super::filter::derive_expected_paths(asset, config);
+        let Some(requested) = derived
+            .iter()
+            .find(|path| path.version_size == task.version_size)
+        else {
+            return Ok(false);
+        };
+        if self.path_mode.key(&requested.path)? != self.path_mode.key(&task.download_path)?
+            || self
+                .cross_rendition_original(asset, config, task, &requested.path)
+                .await?
+                .is_none()
+        {
+            return Ok(false);
+        }
+        let Some(db) = config.state_db.as_deref() else {
+            return Ok(false);
+        };
+        self.choose_independent_sibling(db, task).await?;
+        self.reconciliation
+            .reservations
+            .push(ReconciliationReservation {
+                library: Arc::clone(&task.library),
+                asset_id: task.asset_id.as_ref().into(),
+                version_size: task.version_size,
+                requested_path_key: ReconciliationPathKey(
+                    PathPlanningMode::Reconciliation
+                        .key(&requested.path)?
+                        .as_ref()
+                        .to_owned(),
+                ),
+                destination_path_key: ReconciliationPathKey(
+                    PathPlanningMode::Reconciliation
+                        .key(&task.download_path)?
+                        .as_ref()
+                        .to_owned(),
+                ),
+                destination_path: crate::fs_util::absolute_confined_path(&task.download_path)?,
+                content: Some(ReconciliationContent {
+                    checksum: task.checksum.clone(),
+                    size: task.size,
+                }),
+            });
+        Ok(true)
+    }
+
     /// Ordinary downloads must never publish to a protected legacy identity,
     /// even when the directory cache cannot see the protected file under the
     /// target spelling. Choose the existing identity suffix instead of asking
@@ -932,6 +1150,14 @@ impl TaskPlanner {
         if super::legacy_preservation::current_path_is_independent(db, &task.download_path).await? {
             return Ok(());
         }
+        self.choose_independent_sibling(db, task).await
+    }
+
+    pub(super) async fn choose_independent_sibling(
+        &mut self,
+        db: &dyn DownloadStore,
+        task: &mut DownloadTask,
+    ) -> Result<()> {
         let protected_key = self.path_mode.key(&task.download_path)?;
         if self.claimed_paths.get(protected_key.as_ref()) == Some(&task.size) {
             self.claimed_paths.remove(protected_key.as_ref());
@@ -940,6 +1166,7 @@ impl TaskPlanner {
             .download_path
             .parent()
             .context("protected download target has no parent")?;
+        self.dir_cache.ensure_dir_async(parent).await;
         let filename = task
             .download_path
             .file_name()
