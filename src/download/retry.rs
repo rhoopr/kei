@@ -333,6 +333,11 @@ impl PendingRetryPlanning<'_> {
                         .task_planner
                         .match_existing(asset, pass_config, task)
                         .await;
+                    #[cfg(test)]
+                    crate::download::planner::distinct_timing_test_hook::observe_retry(
+                        &task.download_path,
+                        &decision,
+                    );
                     match decision {
                         decision @ (crate::download::baseline_matching::BaselineMatch::Present { .. }
                             | crate::download::baseline_matching::BaselineMatch::ProviderPresent { .. }

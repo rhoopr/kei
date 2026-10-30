@@ -87,6 +87,200 @@ pub(super) struct TaskPlanner {
 }
 
 #[cfg(test)]
+pub(crate) mod distinct_timing_test_hook {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    struct Probe {
+        positive: bool,
+        published: Notify,
+        first_release: Notify,
+        receipt: Notify,
+        matched: Notify,
+        match_release: Notify,
+        decision: Mutex<Option<String>>,
+        explanation: Mutex<Option<crate::state::db::match_diagnostics::MatchExplanation>>,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+    type Map = Mutex<HashMap<PathBuf, Arc<Probe>>>;
+    fn firsts() -> &'static Map {
+        static MAP: OnceLock<Map> = OnceLock::new();
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+    fn seconds() -> &'static Map {
+        static MAP: OnceLock<Map> = OnceLock::new();
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+    fn retries() -> &'static Map {
+        static MAP: OnceLock<Map> = OnceLock::new();
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+    async fn wait(signal: &Notify) {
+        tokio::time::timeout(Duration::from_secs(30), signal.notified())
+            .await
+            .expect("synthetic timing barrier timed out");
+    }
+    pub(crate) struct Control {
+        first: PathBuf,
+        second: PathBuf,
+        probe: Arc<Probe>,
+    }
+    impl Control {
+        pub(crate) fn install(
+            first: PathBuf,
+            second: PathBuf,
+            events: Arc<Mutex<Vec<String>>>,
+        ) -> Self {
+            Self::create(first, second, false, events)
+        }
+        pub(crate) fn install_positive(first: PathBuf, second: PathBuf) -> Self {
+            Self::create(first, second, true, Arc::new(Mutex::new(Vec::new())))
+        }
+        fn create(
+            first: PathBuf,
+            second: PathBuf,
+            positive: bool,
+            events: Arc<Mutex<Vec<String>>>,
+        ) -> Self {
+            let probe = Arc::new(Probe {
+                positive,
+                published: Notify::new(),
+                first_release: Notify::new(),
+                receipt: Notify::new(),
+                matched: Notify::new(),
+                match_release: Notify::new(),
+                decision: Mutex::new(None),
+                explanation: Mutex::new(None),
+                events,
+            });
+            assert!(
+                firsts()
+                    .lock()
+                    .unwrap()
+                    .insert(first.clone(), probe.clone())
+                    .is_none()
+            );
+            assert!(
+                seconds()
+                    .lock()
+                    .unwrap()
+                    .insert(second.clone(), probe.clone())
+                    .is_none()
+            );
+            if !positive {
+                assert!(
+                    retries()
+                        .lock()
+                        .unwrap()
+                        .insert(second.clone(), probe.clone())
+                        .is_none()
+                );
+            }
+            Self {
+                first,
+                second,
+                probe,
+            }
+        }
+        pub(crate) async fn matched(
+            &self,
+        ) -> (
+            String,
+            crate::state::db::match_diagnostics::MatchExplanation,
+        ) {
+            wait(&self.probe.matched).await;
+            (
+                self.probe.decision.lock().unwrap().clone().unwrap(),
+                self.probe
+                    .explanation
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("uncertain decision explanation"),
+            )
+        }
+        pub(crate) fn release(&self) {
+            self.probe.first_release.notify_one();
+            self.probe.match_release.notify_one();
+            self.probe.receipt.notify_one();
+            self.probe.published.notify_one();
+        }
+    }
+    impl Drop for Control {
+        fn drop(&mut self) {
+            self.release();
+            firsts().lock().unwrap().remove(&self.first);
+            seconds().lock().unwrap().remove(&self.second);
+            retries().lock().unwrap().remove(&self.second);
+        }
+    }
+    pub(crate) async fn first_before_receipt(path: &Path) {
+        let probe = firsts().lock().unwrap().get(path).cloned();
+        if let Some(probe) = probe
+            && !probe.positive
+        {
+            firsts().lock().unwrap().remove(path);
+            probe.published.notify_one();
+            wait(&probe.first_release).await;
+        }
+    }
+    pub(crate) fn first_after_receipt(path: &Path) {
+        let probe = firsts().lock().unwrap().remove(path);
+        if let Some(probe) = probe
+            && probe.positive
+        {
+            probe.receipt.notify_one();
+        }
+    }
+    pub(crate) async fn before_match(path: &Path) {
+        let probe = seconds().lock().unwrap().get(path).cloned();
+        if let Some(probe) = probe {
+            if probe.positive {
+                wait(&probe.receipt).await;
+            } else {
+                wait(&probe.published).await;
+            }
+        }
+    }
+    pub(in crate::download) async fn after_match(
+        path: &Path,
+        decision: &crate::download::baseline_matching::BaselineMatch,
+    ) {
+        let probe = seconds().lock().unwrap().remove(path);
+        if let Some(probe) = probe {
+            if !probe.positive {
+                *probe.decision.lock().unwrap() = Some(format!("{decision:?}"));
+                if let crate::download::baseline_matching::BaselineMatch::Uncertain(explanation) =
+                    decision
+                {
+                    *probe.explanation.lock().unwrap() = Some(explanation.clone());
+                }
+                probe.matched.notify_one();
+                wait(&probe.match_release).await;
+            }
+        } else {
+            observe_retry(path, decision);
+        }
+    }
+    pub(in crate::download) fn observe_retry(
+        path: &Path,
+        decision: &crate::download::baseline_matching::BaselineMatch,
+    ) {
+        let probe = retries().lock().unwrap().get(path).cloned();
+        if let Some(probe) = probe {
+            probe
+                .events
+                .lock()
+                .unwrap()
+                .push(format!("decision:{decision:?}"));
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod distinct_occupant_test_hook {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};

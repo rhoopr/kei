@@ -838,8 +838,19 @@ where
                     });
                     let mut existing_matches = Vec::with_capacity(plan.tasks.len());
                     for task in &plan.tasks {
-                        existing_matches
-                            .push(task_planner.match_existing(&asset, config, task).await);
+                        #[cfg(test)]
+                        crate::download::planner::distinct_timing_test_hook::before_match(
+                            &task.download_path,
+                        )
+                        .await;
+                        let decision = task_planner.match_existing(&asset, config, task).await;
+                        #[cfg(test)]
+                        crate::download::planner::distinct_timing_test_hook::after_match(
+                            &task.download_path,
+                            &decision,
+                        )
+                        .await;
+                        existing_matches.push(decision);
                     }
                     let missing_tasks: Vec<_> = plan
                         .tasks

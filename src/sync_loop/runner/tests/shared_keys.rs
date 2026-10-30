@@ -839,6 +839,7 @@ async fn existing_exact_selected_shared_child_is_not_redownloaded() {
 
 #[tokio::test]
 async fn distinct_provider_resources_with_colliding_names_publish_independent_files() {
+    Box::pin(super::distinct_resource_proof::observe_before_receipt_timing(false)).await;
     use crate::commands::{AlbumPass, PassKind};
     use crate::sync_loop::test_support::make_run_cycle_library_state_with_passes;
 
@@ -888,6 +889,17 @@ async fn distinct_provider_resources_with_colliding_names_publish_independent_fi
     let database = directory.join("state.db");
     let media = directory.join("media");
     std::fs::create_dir(&media).unwrap();
+    let first_path = media
+        .join(run_cycle_expected_date_dir())
+        .join("collision.JPG");
+    let second_path = media
+        .join(run_cycle_expected_date_dir())
+        .join(format!("collision-{}.JPG", second.len()));
+    let _positive_timing =
+        crate::download::planner::distinct_timing_test_hook::Control::install_positive(
+            first_path,
+            second_path,
+        );
     let sentinel = media.join("independent.bin");
     std::fs::write(&sentinel, b"unrelated preserved bytes").unwrap();
     let sentinel_mtime = std::fs::metadata(&sentinel).unwrap().modified().unwrap();

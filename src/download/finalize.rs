@@ -121,6 +121,9 @@ where
             error: Box::new(error),
         };
     }
+    #[cfg(test)]
+    crate::download::planner::distinct_timing_test_hook::first_before_receipt(&task.download_path)
+        .await;
     #[cfg(all(test, feature = "xmp"))]
     finalization_probe::observe_before(&task.download_path).await;
     match db
@@ -136,6 +139,10 @@ where
         .await
     {
         Ok(()) => {
+            #[cfg(test)]
+            crate::download::planner::distinct_timing_test_hook::first_after_receipt(
+                &task.download_path,
+            );
             update_metadata_marker(
                 db,
                 library,
