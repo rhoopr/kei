@@ -42,6 +42,10 @@ struct IndexingSession {
 impl PhotosSession for IndexingSession {
     async fn post(&self, url: &str, body: String, _: &[(&str, &str)]) -> anyhow::Result<Value> {
         let request: Value = serde_json::from_str(&body)?;
+        if url.ends_with("/zones/list") {
+            assert_eq!(request, json!({}));
+            return Ok(crate::sync_loop::test_support::baseline_zone_response(ZONE));
+        }
         if request["query"]["recordType"] == "CheckIndexingState" {
             return Ok(
                 json!({"records":[{"fields":{"state":{"value":*self.readiness.lock().unwrap()}}}]}),
@@ -117,17 +121,22 @@ impl PhotosSession for IndexingSession {
     }
 }
 
+fn photo_bytes(id: &str) -> Vec<u8> {
+    [BYTES, id.as_bytes()].concat()
+}
+
 fn provider(readiness: &'static str, ids: &[&str], base: &str) -> IndexingSession {
-    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(BYTES));
     let records = ids
         .iter()
         .flat_map(|id| {
+            let bytes = photo_bytes(id);
+            let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes));
             let mut page = full_album_page_with_download(
                 ZONE,
                 id,
                 "query-candidate",
                 &format!("{base}/{id}.jpg"),
-                BYTES.len() as u64,
+                bytes.len() as u64,
                 &checksum,
             );
             page["records"][0]["fields"]["filenameEnc"]["value"] = json!(format!("{id}.jpg"));
@@ -177,7 +186,7 @@ async fn indexing_restart_recovers_omitted_assets_and_reuses_downloaded_files() 
     for id in ["existing", "provisional", "omitted"] {
         Mock::given(method("GET"))
             .and(path(format!("/{id}.jpg")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(BYTES))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(photo_bytes(id)))
             .expect(1)
             .mount(&server)
             .await;
@@ -230,7 +239,7 @@ async fn indexing_restart_recovers_omitted_assets_and_reuses_downloaded_files() 
         for row in &rows {
             assert_eq!(
                 std::fs::read(row.local_path.as_ref().unwrap()).unwrap(),
-                BYTES
+                photo_bytes(row.id.strip_prefix("asset-").unwrap())
             );
         }
         if step == 0 {
@@ -238,15 +247,11 @@ async fn indexing_restart_recovers_omitted_assets_and_reuses_downloaded_files() 
         }
         assert_eq!(
             std::fs::read(existing_path.as_ref().unwrap()).unwrap(),
-            BYTES
+            photo_bytes("existing")
         );
         assert_eq!(
             inner.get_metadata(CURSOR).await.unwrap().as_deref(),
-            Some(if step < 4 {
-                "query-candidate"
-            } else {
-                "trusted-after"
-            })
+            Some("trusted-after")
         );
         assert_eq!(
             inner.get_metadata(&hold).await.unwrap().is_some(),
@@ -284,7 +289,7 @@ async fn indexing_restart_recovers_omitted_assets_and_reuses_downloaded_files() 
                 "steady state uses incremental sync"
             );
             assert_eq!(result.stats.downloaded, 0);
-            assert_eq!(*provider.changes.lock().unwrap(), ["query-candidate"]);
+            assert_eq!(*provider.changes.lock().unwrap(), ["trusted-after"]);
             assert!(
                 inner
                     .get_metadata(&crate::sync_cycle::indexing_replay_key(ZONE))
@@ -687,7 +692,7 @@ async fn indexing_retry_only_keeps_hold_until_normal_inventory_recovers_omitted_
     for id in ["known", "omitted", "late"] {
         Mock::given(method("GET"))
             .and(path(format!("/{id}.jpg")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(BYTES))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(photo_bytes(id)))
             .expect(1)
             .mount(&server)
             .await;
@@ -761,8 +766,9 @@ async fn indexing_retry_only_keeps_hold_until_normal_inventory_recovers_omitted_
             inner.get_metadata(&hold).await.unwrap().is_some(),
             round == 0
         );
+        let rows = inner.get_downloaded_page(0, 10).await.unwrap();
         assert_eq!(
-            inner.get_downloaded_page(0, 10).await.unwrap().len(),
+            rows.len(),
             if round == 0 {
                 1
             } else if round == 3 {
@@ -771,6 +777,13 @@ async fn indexing_retry_only_keeps_hold_until_normal_inventory_recovers_omitted_
                 2
             }
         );
+        for row in rows {
+            let id = row.id.strip_prefix("asset-").unwrap();
+            assert_eq!(
+                std::fs::read(row.local_path.unwrap()).unwrap(),
+                photo_bytes(id)
+            );
+        }
         assert_eq!(
             inner
                 .get_metadata(&crate::sync_cycle::indexing_replay_key(ZONE))
@@ -798,7 +811,7 @@ async fn indexing_running_plan_cannot_qualify_after_late_finished_probe() {
     let server = wiremock::MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/omitted.jpg"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(BYTES))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(photo_bytes("omitted")))
         .expect(1)
         .mount(&server)
         .await;
@@ -936,11 +949,33 @@ async fn indexing_qualified_replay_keeps_expired_trusted_cursor_and_recovery_deb
         db.get_metadata(&replay).await.unwrap().as_deref(),
         Some("1")
     );
+    drop(build);
+    drop(store);
+    drop(db);
+    let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_metadata(CURSOR).await.unwrap().as_deref(),
+        Some("trusted-before")
+    );
+    assert_eq!(
+        db.get_metadata(&replay).await.unwrap().as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        *provider.changes.lock().unwrap(),
+        ["trusted-before", "trusted-before"]
+    );
     assert!(
-        db.get_metadata("retained_checkpoint_hold:PrimarySync")
-            .await
-            .unwrap()
-            .is_some(),
+        db.get_metadata(&format!(
+            "{}{}",
+            crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX,
+            ZONE
+        ))
+        .await
+        .unwrap()
+        .is_some(),
         "qualified inventory cannot waive the retained-history gate when replay rejects its cursor"
     );
 }
@@ -1025,7 +1060,7 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
         for id in ["provisional", "omitted"] {
             Mock::given(method("GET"))
                 .and(path(format!("/{id}.jpg")))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(BYTES))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(photo_bytes(id)))
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -1118,7 +1153,10 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
             let rows = db.get_downloaded_page(0, 10).await.unwrap();
             assert_eq!(rows.len(), if step == 0 { 1 } else { 2 }, "step {step}");
             for row in rows {
-                assert_eq!(std::fs::read(row.local_path.unwrap()).unwrap(), BYTES);
+                assert_eq!(
+                    std::fs::read(row.local_path.unwrap()).unwrap(),
+                    photo_bytes(row.id.strip_prefix("asset-").unwrap())
+                );
             }
             assert_eq!(
                 db.get_metadata(CURSOR).await.unwrap().as_deref(),
@@ -1157,10 +1195,7 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
                 } else {
                     "trusted-before"
                 };
-                // Main's missing-successor fallback performs the initial
-                // replay and one retained-cursor bridge after its inventory.
-                let calls = if step == 2 { 2 } else { 1 };
-                assert_eq!(*source.changes.lock().unwrap(), vec![cursor; calls]);
+                assert_eq!(*source.changes.lock().unwrap(), [cursor]);
             }
             assert_eq!(result.stats.downloaded, usize::from(step < 2));
             let events = diagnostics();
