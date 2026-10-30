@@ -209,7 +209,19 @@ impl BaselineMatcher {
         .await
     }
 
-    /// Pass-specific copies cannot reuse another directory's receipt as coverage.
+    pub(in crate::download) fn candidate_paths(
+        &self,
+        task: &DownloadTask,
+    ) -> Vec<std::path::PathBuf> {
+        self.receipts
+            .get(&(task.version_size, task.checksum.to_string(), task.size))
+            .into_iter()
+            .flatten()
+            .map(|receipt| receipt.local_path.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(in crate::download) async fn match_task_in_scope(
         &self,
         root: &Path,
@@ -220,6 +232,33 @@ impl BaselineMatcher {
         discovered: &BaselineCandidates,
         historical: &[crate::state::db::download_receipts::DownloadReceipt],
     ) -> BaselineMatch {
+        self.match_task_with_distinct(
+            root,
+            task,
+            requested_path,
+            require_requested_parent,
+            selected,
+            discovered,
+            (historical, &std::collections::HashSet::new()),
+        )
+        .await
+    }
+
+    /// Pass-specific copies cannot reuse another directory's receipt as coverage.
+    pub(in crate::download) async fn match_task_with_distinct(
+        &self,
+        root: &Path,
+        task: &DownloadTask,
+        requested_path: &Path,
+        require_requested_parent: bool,
+        selected: &SelectedCopyScope,
+        discovered: &BaselineCandidates,
+        evidence: (
+            &[crate::state::db::download_receipts::DownloadReceipt],
+            &std::collections::HashSet<std::path::PathBuf>,
+        ),
+    ) -> BaselineMatch {
+        let (historical, distinct) = evidence;
         if task.checksum.trim().is_empty() {
             return uncertain("provider_signature_missing", None);
         }
@@ -285,6 +324,9 @@ impl BaselineMatcher {
             .filter(is_identity)
             .chain(candidates.iter().filter(|receipt| !is_identity(receipt)));
         for receipt in ordered.filter(|receipt| !belongs_to_other_copy(receipt)) {
+            if distinct.contains(&receipt.local_path) {
+                continue;
+            }
             if let Some(changed) =
                 historical_candidate(root, task, &receipt.local_path, historical).await
             {
@@ -449,7 +491,7 @@ impl BaselineMatcher {
             .into_iter()
             .chain(discovered.paths.iter().map(std::path::PathBuf::as_path))
         {
-            if !visited.insert(path.to_path_buf()) {
+            if !visited.insert(path.to_path_buf()) || distinct.contains(path) {
                 continue;
             }
             if other_selected_copies.iter().any(|(native, compatible)| {
@@ -1383,6 +1425,91 @@ mod tests {
 mod selected_destination_tests {
     use super::tests::{receipt, task};
     use super::{BaselineCandidates, BaselineMatch, BaselineMatcher, SelectedCopyScope};
+
+    #[tokio::test]
+    async fn distinct_occupant_does_not_clear_other_candidate_uncertainty() {
+        let root = tempfile::tempdir().unwrap();
+        let occupant = root.path().join("requested.JPG");
+        let extra = root.path().join("unexplained.JPG");
+        std::fs::write(&occupant, b"first").unwrap();
+        let mut target = task(root.path());
+        target.download_path = root.path().join("reserved.JPG");
+        let matcher = BaselineMatcher::new(Vec::new());
+        let selected = SelectedCopyScope {
+            admitted: true,
+            other: vec![],
+        };
+        let distinct = std::collections::HashSet::from([occupant.clone()]);
+        let mut discovered = BaselineCandidates {
+            paths: vec![],
+            complete: true,
+        };
+        assert!(matches!(
+            matcher
+                .match_task_with_distinct(
+                    root.path(),
+                    &target,
+                    &occupant,
+                    false,
+                    &selected,
+                    &discovered,
+                    (&[], &distinct)
+                )
+                .await,
+            BaselineMatch::Missing
+        ));
+        std::fs::write(&extra, b"other").unwrap();
+        discovered.paths.push(extra.clone());
+        assert!(matches!(
+            matcher
+                .match_task_with_distinct(
+                    root.path(),
+                    &target,
+                    &occupant,
+                    false,
+                    &selected,
+                    &discovered,
+                    (&[], &distinct)
+                )
+                .await,
+            BaselineMatch::Uncertain(_)
+        ));
+        discovered.paths.clear();
+        discovered.complete = false;
+        assert!(matches!(
+            matcher
+                .match_task_with_distinct(
+                    root.path(),
+                    &target,
+                    &occupant,
+                    false,
+                    &selected,
+                    &discovered,
+                    (&[], &distinct)
+                )
+                .await,
+            BaselineMatch::Uncertain(_)
+        ));
+        discovered.complete = true;
+        std::fs::write(&target.download_path, b"occupied").unwrap();
+        assert!(matches!(
+            matcher
+                .match_task_with_distinct(
+                    root.path(),
+                    &target,
+                    &occupant,
+                    false,
+                    &selected,
+                    &discovered,
+                    (&[], &distinct)
+                )
+                .await,
+            BaselineMatch::Uncertain(_)
+        ));
+        assert_eq!(std::fs::read(occupant).unwrap(), b"first");
+        assert_eq!(std::fs::read(extra).unwrap(), b"other");
+        assert_eq!(std::fs::read(&target.download_path).unwrap(), b"occupied");
+    }
 
     #[tokio::test]
     async fn admitted_missing_album_copy_is_distinct_but_occupied_copy_stays_uncertain() {

@@ -426,7 +426,13 @@ A bound completed receipt for an older resource can classify its unchanged
 native occupant when the account, source, child, master, rendition and pass
 match. It cannot prove the selected resource. The selected resource still uses
 a distinct reserved destination and the ordinary verified publication path;
-changed or unsafe historical occupants remain uncertain. Before initial adjusted
+changed or unsafe historical occupants remain uncertain. A different child's raw
+source-backed receipt can classify only its own unchanged occupied candidate when
+its exact scoped native path and fulfilled pass validate. This exception requires
+the selected resource's separately admitted destination to be confined and absent;
+the receipt and occupant bytes are freshly checked, and other candidate uncertainty
+remains. It never grants reuse or replacement authority over the occupant.
+Before initial adjusted
 selection, an exact source-backed original receipt and matching confined local
 fingerprint can classify the occupied requested name. The planner reserves a
 separate identity-suffixed destination and rechecks the original during matching.

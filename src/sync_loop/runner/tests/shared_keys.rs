@@ -836,3 +836,283 @@ async fn existing_exact_selected_shared_child_is_not_redownloaded() {
     assert_eq!(keys(&conn), before_keys);
     assert_eq!(baseline_six_fields(&conn), before_six);
 }
+
+#[tokio::test]
+async fn distinct_provider_resources_with_colliding_names_publish_independent_files() {
+    use crate::commands::{AlbumPass, PassKind};
+    use crate::sync_loop::test_support::make_run_cycle_library_state_with_passes;
+
+    let server = wiremock::MockServer::start().await;
+    let first = include_bytes!("../../../../tests/data/media/pattern.jpg").as_slice();
+    let second = include_bytes!("../../../../tests/data/media/metadata.jpg").as_slice();
+    let hashes = [
+        "1f7b7dd82b9a019b98add756d74e4cfdfb952bb8a1a010869c80de0fd8e5c215",
+        "37fc601b7ed94c703635d331cac5705d610ccbb01321935f20577458a141f6b1",
+    ];
+    let payloads = [first, second];
+    // Independently calculated MMCS v1 fileChecksum values for these exact bytes.
+    let checksums = [
+        "ATLF2mUdMsryhdyIJgwrpiBlt1z2".to_string(),
+        "AV/Hz7fW6Rc+X19s6b+avvkD/0Sf".to_string(),
+    ];
+    for (bytes, expected) in payloads.iter().zip(&checksums) {
+        let mut signature = sha1::Sha1::new();
+        signature.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+        signature.update(bytes);
+        let actual = base64::engine::general_purpose::STANDARD
+            .encode([vec![1], signature.finalize().to_vec()].concat());
+        assert_eq!(&actual, expected);
+    }
+    assert_ne!(first, second);
+    for (index, endpoint) in ["/distinct-first.jpg", "/distinct-second.jpg"]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(hex_sha256(payloads[index]), hashes[index]);
+        Mock::given(method("GET"))
+            .and(path(*endpoint))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(payloads[index])
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let directory = tempfile::tempdir_in(std::env::temp_dir()).unwrap().keep();
+    eprintln!(
+        "distinct-resource synthetic evidence: {}",
+        directory.display()
+    );
+    let database = directory.join("state.db");
+    let media = directory.join("media");
+    std::fs::create_dir(&media).unwrap();
+    let sentinel = media.join("independent.bin");
+    std::fs::write(&sentinel, b"unrelated preserved bytes").unwrap();
+    let sentinel_mtime = std::fs::metadata(&sentinel).unwrap().modified().unwrap();
+    let mut records = page_records(
+        SHARED,
+        "distinct-master-a",
+        "asset-distinct-a",
+        "collision.jpg",
+        &format!("{}/distinct-first.jpg", server.uri()),
+        first,
+        &checksums[0],
+    );
+    records.extend(page_records(
+        SHARED,
+        "distinct-master-b",
+        "asset-distinct-b",
+        "collision.jpg",
+        &format!("{}/distinct-second.jpg", server.uri()),
+        second,
+        &checksums[1],
+    ));
+    let owner = crate::state::db::account::AccountOwner::authenticated(
+        "distinct@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-distinct"}})).unwrap(),
+    )
+    .unwrap();
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    let mut prior = None;
+    for cycle in 0..3 {
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&database, &owner)
+                .await
+                .unwrap(),
+        );
+        let provider = Provider {
+            zone: SHARED.to_string(),
+            records: records.clone(),
+        };
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/shared".into(),
+            Arc::new(std::collections::HashMap::new()),
+            Box::new(provider),
+            Arc::new(json!({"zoneName":SHARED,"ownerRecordName":"_defaultOwner"})),
+            "shared".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            owner.clone(),
+            "com",
+        ));
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: library.all(),
+            exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+        }];
+        let mut selected = make_run_cycle_library_state_with_passes(SHARED, SHARED_TOKEN, passes);
+        selected.library = library;
+        let builder = make_run_cycle_download_config_builder(&media, db.clone());
+        let result = crate::sync_cycle::run_cycle(
+            &[&selected],
+            &make_run_cycle_config(),
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
+        assert_eq!(
+            result.stats.skipped.uncertain, 0,
+            "cycle {cycle}: {result:?}"
+        );
+        assert_eq!(
+            result.stats.downloaded,
+            if cycle == 0 { 2 } else { 0 },
+            "cycle {cycle}: {result:?}"
+        );
+        let conn = db.acquire_lock("distinct resources proof").unwrap();
+        let owner_keys = owner.authenticated_keys().unwrap();
+        let receipt_owners: Vec<(String, String)> = conn
+            .prepare("SELECT account_key,provider_key FROM download_receipts ORDER BY child")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            receipt_owners,
+            vec![(owner_keys.0.to_string(), owner_keys.1.to_string()); 2]
+        );
+        let rows = query(
+            &conn,
+            "SELECT id,version_size,status,checksum,created_at,added_at,local_path FROM assets ORDER BY id,version_size",
+        );
+        assert_eq!(rows.len(), 2, "exact current asset count");
+        assert_eq!(
+            mappings(&conn),
+            vec![
+                (
+                    SHARED.into(),
+                    "asset-distinct-a".into(),
+                    "distinct-master-a".into()
+                ),
+                (
+                    SHARED.into(),
+                    "asset-distinct-b".into(),
+                    "distinct-master-b".into()
+                )
+            ]
+        );
+        let mut files = vec![sentinel.clone()];
+        let mut snapshot = Vec::new();
+        for (i, (id, master)) in [
+            ("asset-distinct-a", "distinct-master-a"),
+            ("asset-distinct-b", "distinct-master-b"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let row = &rows[i];
+            assert_eq!(
+                &row[..6],
+                &[
+                    rusqlite::types::Value::Text((*id).into()),
+                    rusqlite::types::Value::Text("original".into()),
+                    rusqlite::types::Value::Text("downloaded".into()),
+                    rusqlite::types::Value::Text(checksums[i].clone()),
+                    rusqlite::types::Value::Integer(1_700_000_000),
+                    rusqlite::types::Value::Integer(1_700_000_000)
+                ]
+            );
+            let file = match &row[6] {
+                rusqlite::types::Value::Text(s) => PathBuf::from(s),
+                value => panic!("invalid path: {value:?}"),
+            };
+            let expected_name = if i == 0 {
+                "collision.JPG".to_string()
+            } else {
+                format!("collision-{}.JPG", second.len())
+            };
+            assert_eq!(
+                file,
+                media
+                    .join(run_cycle_expected_date_dir())
+                    .join(expected_name)
+            );
+            let bytes = std::fs::read(&file).unwrap();
+            assert_eq!(bytes, payloads[i]);
+            assert_eq!(hex_sha256(&bytes), hashes[i]);
+            let path_text = file.to_string_lossy().into_owned();
+            let paths: Vec<(String, String, String, String)> = conn.prepare("SELECT local_path,provider_checksum,local_checksum,source_checksum FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size='original'").unwrap().query_map(rusqlite::params![SHARED, id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().collect::<Result<_,_>>().unwrap();
+            assert_eq!(
+                paths,
+                vec![(
+                    path_text,
+                    checksums[i].clone(),
+                    hashes[i].into(),
+                    hashes[i].into()
+                )]
+            );
+            type ReceiptRow = (
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                String,
+                String,
+                String,
+            );
+            let receipts: Vec<ReceiptRow> = conn.prepare("SELECT scope,child,master,state_id,provider_checksum,provider_size,native_path,source_checksum,local_checksum FROM download_receipts WHERE library=?1 AND child=?2 AND version_size='original'").unwrap().query_map(rusqlite::params![SHARED,id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).unwrap().collect::<Result<_,_>>().unwrap();
+            assert_eq!(receipts.len(), 1, "exact receipt for {id}");
+            let receipt = &receipts[0];
+            let scope: Value = serde_json::from_str(&receipt.0).unwrap();
+            assert_eq!(scope["zone"]["zoneName"], SHARED);
+            assert_eq!(scope["database"], "shared");
+            assert_eq!(
+                (
+                    &receipt.1, &receipt.2, &receipt.3, &receipt.4, receipt.5, &receipt.7,
+                    &receipt.8
+                ),
+                (
+                    &id.to_string(),
+                    &master.to_string(),
+                    &id.to_string(),
+                    &checksums[i],
+                    payloads[i].len() as i64,
+                    &hashes[i].to_string(),
+                    &hashes[i].to_string()
+                )
+            );
+            let native: Value = serde_json::from_str(&receipt.6).unwrap();
+            assert_eq!(native["path"], file.to_string_lossy().as_ref());
+            files.push(file.clone());
+            snapshot.push((
+                file.clone(),
+                bytes,
+                std::fs::metadata(file).unwrap().modified().unwrap(),
+            ));
+        }
+        assert_ne!(snapshot[0].0, snapshot[1].0);
+        assert_eq!(query(&conn, "SELECT id FROM download_receipts").len(), 2);
+        assert_eq!(query(&conn, "SELECT id FROM asset_metadata_paths").len(), 2);
+        files.sort();
+        assert_eq!(media_files(&media), files, "exact file set");
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"unrelated preserved bytes"
+        );
+        assert_eq!(
+            std::fs::metadata(&sentinel).unwrap().modified().unwrap(),
+            sentinel_mtime
+        );
+        if let Some(previous) = &prior {
+            assert_eq!(&snapshot, previous, "reopened files changed");
+        }
+        prior = Some(snapshot);
+    }
+    server.verify().await;
+}

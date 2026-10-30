@@ -25,6 +25,7 @@ mod indexing;
 
 mod trusted_legacy;
 
+mod distinct_resource_proof;
 mod shared_keys;
 
 mod sparse_recovery;

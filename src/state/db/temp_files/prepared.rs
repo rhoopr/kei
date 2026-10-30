@@ -125,6 +125,42 @@ impl SqliteStateDb {
         .await
     }
 
+    /// Read a single source-backed receipt for a different child at this exact
+    /// native path. This classifies an occupant only; it never authorizes reuse.
+    pub(crate) async fn bound_distinct_occupant(
+        &self,
+        binding: PublicationBinding,
+        path: SelectionPath,
+        version: String,
+        checksum: String,
+        size: u64,
+    ) -> Result<Option<super::super::download_receipts::DownloadReceipt>, StateError> {
+        self.with_conn("read distinct occupant receipt", move |conn| {
+            binding.validate(conn)?;
+            let ids: Vec<(String, bool)> = conn.prepare(
+                "SELECT id, source_checksum IS NOT NULL FROM download_receipts                  WHERE scope=?1 AND library=?2 AND native_path=?3 ORDER BY id"
+            )?.query_map(params![binding.scope, binding.library, path.key()?], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?.collect::<Result<_, _>>()?;
+            let [(id, true)] = ids.as_slice() else { return Ok(None); };
+            let receipt = super::super::download_receipts::load(conn, id)?.ok_or_else(invalid)?;
+            if receipt.account_key != binding.account_key
+                || receipt.provider_key != binding.provider_key
+                || receipt.scope != binding.scope
+                || receipt.library != binding.library
+                || receipt.native_path != path
+                || receipt.child == binding.child
+                || receipt.version_size != version
+                || !receipt.fulfills_pass(&binding.origin_pass)
+                || (receipt.provider_checksum == checksum && receipt.provider_size == size)
+                || receipt.source_checksum != receipt.local_checksum
+            {
+                return Ok(None);
+            }
+            Ok(Some(receipt))
+        }).await
+    }
+
     pub(crate) async fn bound_download_receipts(
         &self,
         binding: PublicationBinding,
@@ -1160,6 +1196,171 @@ mod binding_tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_occupant_requires_exact_authenticated_path_and_source_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_owned(&root.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        let mut proof = fixture(&db, root.path(), true).await;
+        proof.source_checksum = proof.local_checksum.clone();
+        let mut selected = proof.binding.clone().unwrap();
+        selected.child = "other-child".into();
+        selected.master = "other-master".into();
+        selected.state_id = "other-child".into();
+        let find = |binding: PublicationBinding,
+                    path: SelectionPath,
+                    version: &str,
+                    checksum: &str,
+                    size| {
+            db.bound_distinct_occupant(binding, path, version.into(), checksum.into(), size)
+        };
+        let path = proof.destination.clone();
+        assert!(
+            find(selected.clone(), path.clone(), "original", "different", 5)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        db.prepare_temp_publication(&proof.temporary.to_path(), &proof)
+            .await
+            .unwrap();
+        finish(&db, &proof).await.unwrap();
+        assert!(
+            find(selected.clone(), path.clone(), "original", "different", 5)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            find(
+                selected.clone(),
+                SelectionPath::from_path(&root.path().join("other")),
+                "original",
+                "different",
+                5
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            find(selected.clone(), path.clone(), "adjusted", "different", 5)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            find(
+                selected.clone(),
+                path.clone(),
+                "original",
+                "opaque-generation",
+                4
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let mut wrong_pass = selected.clone();
+        wrong_pass.origin_pass.push_str("-other");
+        assert!(
+            find(wrong_pass, path.clone(), "original", "different", 5)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut wrong_owner = selected.clone();
+        wrong_owner.account_key.push_str("-other");
+        assert!(
+            find(wrong_owner, path.clone(), "original", "different", 5)
+                .await
+                .is_err()
+        );
+        let mut wrong_scope = selected.clone();
+        wrong_scope.scope = wrong_scope.scope.replace("_defaultOwner", "other-owner");
+        let wrong_scope_result = find(wrong_scope, path.clone(), "original", "different", 5).await;
+        assert!(wrong_scope_result.is_err() || wrong_scope_result.unwrap().is_none());
+        {
+            let conn = db.acquire_lock("add ambiguous receipt").unwrap();
+            let id: String = conn
+                .query_row("SELECT id FROM download_receipts", [], |row| row.get(0))
+                .unwrap();
+            let mut other = crate::state::db::download_receipts::load(&conn, &id)
+                .unwrap()
+                .unwrap();
+            other.child = "another-child".into();
+            other.master = "another-master".into();
+            other.state_id = "another-child".into();
+            other.save(&conn).unwrap();
+        }
+        assert!(
+            find(selected.clone(), path.clone(), "original", "different", 5)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        db.acquire_lock("remove ambiguous test receipt")
+            .unwrap()
+            .execute(
+                "DELETE FROM download_receipts WHERE child='another-child'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            find(selected.clone(), path.clone(), "original", "different", 5)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        db.acquire_lock("corrupt distinct proof")
+            .unwrap()
+            .execute("UPDATE download_receipts SET proof_hash='corrupt'", [])
+            .unwrap();
+        assert!(
+            find(selected, path, "original", "different", 5)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_occupant_rejects_edited_and_local_trust_receipts() {
+        let root = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_owned(&root.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        let proof = fixture(&db, root.path(), true).await;
+        let mut selected = proof.binding.clone().unwrap();
+        selected.child = "other-child".into();
+        selected.master = "other-master".into();
+        selected.state_id = "other-child".into();
+        db.prepare_temp_publication(&proof.temporary.to_path(), &proof)
+            .await
+            .unwrap();
+        finish(&db, &proof).await.unwrap();
+        let find = || {
+            db.bound_distinct_occupant(
+                selected.clone(),
+                proof.destination.clone(),
+                "original".into(),
+                "different".into(),
+                5,
+            )
+        };
+        assert!(
+            find().await.unwrap().is_none(),
+            "edited local bytes lack raw source proof"
+        );
+        db.acquire_lock("replace source proof with local trust").unwrap().execute(
+            "UPDATE download_receipts SET source_checksum=NULL, trust_receipt='local', selected_metadata_hash='metadata', generation_id='generation'", [],
+        ).unwrap();
+        assert!(
+            find().await.unwrap().is_none(),
+            "local trust is not source proof"
         );
     }
 

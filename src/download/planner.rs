@@ -86,6 +86,71 @@ pub(super) struct TaskPlanner {
     ownership_incomplete: bool,
 }
 
+#[cfg(test)]
+pub(crate) mod distinct_occupant_test_hook {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    type Before = Box<dyn FnOnce() + Send>;
+    type After = Box<dyn FnOnce(bool, bool) + Send>;
+    struct Probe {
+        before: Option<Before>,
+        after: After,
+    }
+    fn callbacks() -> &'static Mutex<std::collections::HashMap<PathBuf, Probe>> {
+        static CALLBACKS: OnceLock<Mutex<std::collections::HashMap<PathBuf, Probe>>> =
+            OnceLock::new();
+        CALLBACKS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+    }
+    pub(crate) fn install(path: PathBuf, before: Before, after: After) {
+        assert!(
+            callbacks()
+                .lock()
+                .unwrap()
+                .insert(
+                    path,
+                    Probe {
+                        before: Some(before),
+                        after
+                    }
+                )
+                .is_none()
+        );
+    }
+    pub(super) fn run(path: &Path) {
+        let callback = callbacks()
+            .lock()
+            .unwrap()
+            .get_mut(path)
+            .and_then(|probe| probe.before.take());
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+    pub(super) fn finish(path: &Path, failed: bool, exact: bool) {
+        if let Some(probe) = callbacks().lock().unwrap().remove(path) {
+            (probe.after)(failed, exact);
+        }
+    }
+    pub(crate) fn discard(path: &Path) {
+        callbacks().lock().unwrap().remove(path);
+    }
+}
+
+async fn distinct_occupant_bytes_match(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> bool {
+    let Ok(Some(file)) = super::file::retain_pending_file(root, path).await else {
+        return false;
+    };
+    file.fingerprint.size == expected_size
+        && data_encoding::HEXLOWER.encode(&file.fingerprint.sha256) == expected_sha256
+        && file.validate().await.is_ok()
+}
+
 impl TaskPlanner {
     pub(super) fn new() -> Self {
         Self {
@@ -912,9 +977,83 @@ impl TaskPlanner {
                 Default::default()
             };
         let discovered = self.discover_baseline_family(asset, requested).await;
+        // A separately admitted absent destination may ignore an independently
+        // authenticated occupant, but only for the particular path proved here.
+        let mut distinct = std::collections::HashSet::new();
+        if selected_copy_scope.admitted
+            && task.replacement_fingerprint.is_none()
+            && task.pending_cross_parent_root.is_none()
+            && matches!(
+                super::file::inspect_pending_candidate(&config.directory, &task.download_path)
+                    .await,
+                Ok(false)
+            )
+            && let (Some(binding), Some(run), Some(pass), Some(album)) = (
+                &task.publication_binding,
+                &config.selection_run,
+                &config.primary_layout_pass,
+                &config.primary_layout_source,
+            )
+            && binding.scope == run.root.spec.scope
+            && binding.origin_pass == *pass
+            && binding.child == task.asset_record_name.as_ref()
+            && binding.master == asset.id()
+            && binding.state_id == task.asset_id.as_ref()
+            && binding.library == task.library.as_ref()
+            && let Ok(Some((capture, scope, _))) = album.publication_scope(&task.library)
+            && scope == binding.scope
+            && Arc::ptr_eq(&capture.db, &run.capture.db)
+        {
+            let paths = [requested.to_path_buf(), task.download_path.clone()]
+                .into_iter()
+                .chain(discovered.paths.iter().cloned())
+                .chain(self.baseline_matcher.candidate_paths(task));
+            for path in paths {
+                let keys = crate::fs_util::confined_path_key(&path)
+                    .ok()
+                    .zip(crate::fs_util::confined_path_key(&task.download_path).ok());
+                if !matches!(keys, Some((a, b)) if a != b) {
+                    continue;
+                }
+                let native = crate::state::db::provider_selection::SelectionPath::from_path(&path);
+                let read = || {
+                    capture.db.bound_distinct_occupant(
+                        binding.as_ref().clone(),
+                        native.clone(),
+                        task.version_size.as_str().into(),
+                        task.checksum.to_string(),
+                        task.size,
+                    )
+                };
+                let Ok(Some(receipt)) = read().await else {
+                    continue;
+                };
+                if distinct_occupant_bytes_match(
+                    &config.directory,
+                    &path,
+                    receipt.provider_size,
+                    &receipt.local_checksum,
+                )
+                .await
+                {
+                    #[cfg(test)]
+                    distinct_occupant_test_hook::run(&path);
+                    let reread = read().await;
+                    #[cfg(test)]
+                    distinct_occupant_test_hook::finish(
+                        &path,
+                        reread.is_err(),
+                        matches!(&reread, Ok(Some(current)) if current == &receipt),
+                    );
+                    if matches!(reread, Ok(Some(current)) if current == receipt) {
+                        distinct.insert(path);
+                    }
+                }
+            }
+        }
         let matched = self
             .baseline_matcher
-            .match_task_in_scope(
+            .match_task_with_distinct(
                 &config.directory,
                 task,
                 requested,
@@ -922,7 +1061,7 @@ impl TaskPlanner {
                     && config.primary_layout_pass_kind != Some(crate::commands::PassKind::Unfiled),
                 &selected_copy_scope,
                 &discovered,
-                &historical,
+                (&historical, &distinct),
             )
             .await;
         if matches!(matched, super::baseline_matching::BaselineMatch::Missing)

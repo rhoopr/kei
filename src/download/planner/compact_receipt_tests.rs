@@ -211,3 +211,37 @@ async fn v027_compact_only_changed_template_modified_file_is_uncertain() {
     );
     assert!(!task.download_path.exists());
 }
+
+#[tokio::test]
+async fn distinct_occupant_confined_bytes_require_unchanged_file() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("occupant.jpg");
+    let digest = format!("{:x}", Sha256::digest(b"first"));
+    assert!(!super::distinct_occupant_bytes_match(root.path(), &path, 5, &digest).await);
+    std::fs::write(&path, b"first").unwrap();
+    assert!(super::distinct_occupant_bytes_match(root.path(), &path, 5, &digest).await);
+    assert!(!super::distinct_occupant_bytes_match(root.path(), &path, 4, &digest).await);
+    std::fs::write(&path, b"other").unwrap();
+    assert!(!super::distinct_occupant_bytes_match(root.path(), &path, 5, &digest).await);
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(&path).unwrap();
+        let target = root.path().join("target.jpg");
+        std::fs::write(&target, b"first").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(!super::distinct_occupant_bytes_match(root.path(), &path, 5, &digest).await);
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("occupant.jpg"), b"first").unwrap();
+        let parent_link = root.path().join("linked-parent");
+        std::os::unix::fs::symlink(outside.path(), &parent_link).unwrap();
+        assert!(
+            !super::distinct_occupant_bytes_match(
+                root.path(),
+                &parent_link.join("occupant.jpg"),
+                5,
+                &digest,
+            )
+            .await
+        );
+    }
+}
