@@ -11,11 +11,10 @@ use crate::sync_cycle::{
 use crate::sync_loop::test_support::{
     FailingMetadataSetDb, MetadataSetFailure, RunCycleDownloadConfigOptions, album_count_response,
     full_album_page_with_download, make_empty_full_album, make_full_album_with_boxed_session,
-    make_incremental_album, make_named_empty_full_album,
-    make_recording_run_cycle_download_config_builder, make_run_cycle_config,
-    make_run_cycle_download_config_builder, make_run_cycle_download_config_builder_with_options,
-    make_run_cycle_library_state_with_album, make_run_cycle_library_state_with_passes,
-    make_shared_session_for_run_cycle, make_state_db,
+    make_named_empty_full_album, make_recording_run_cycle_download_config_builder,
+    make_run_cycle_config, make_run_cycle_download_config_builder,
+    make_run_cycle_download_config_builder_with_options, make_run_cycle_library_state_with_album,
+    make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle, make_state_db,
 };
 use crate::{config, download, state};
 
@@ -1997,10 +1996,12 @@ async fn run_cycle_download_config_hash_drift_keeps_source_incremental() {
         .expect("seed zone token");
 
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    let bridge = ConfigBridgeSession::new("PrimarySync", "inventory", "zone-tok-new");
+    let calls = Arc::clone(&bridge.calls);
     let lib_state = make_run_cycle_library_state_with_album(
         "PrimarySync",
         &format!("{SYNC_TOKEN_PREFIX}PrimarySync"),
-        make_incremental_album("zone-tok-new"),
+        make_full_album_with_boxed_session("PrimarySync", Box::new(bridge)),
     );
     let states = vec![&lib_state];
     let observed_modes = Arc::new(std::sync::Mutex::new(Vec::<download::SyncMode>::new()));
@@ -2030,15 +2031,16 @@ async fn run_cycle_download_config_hash_drift_keeps_source_incremental() {
     .expect("run cycle");
 
     assert_eq!(result.failed_count, 0);
-    assert_eq!(result.stats.full_enumeration_reason, None);
+    assert_eq!(
+        result.stats.full_enumeration_reason,
+        Some(download::FullEnumerationReason::DownloadConfigHashDrift)
+    );
     let observed_modes = observed_modes.lock().expect("recorded modes lock").clone();
     assert!(
-        matches!(
-            observed_modes.last(),
-            Some(download::SyncMode::Incremental { zone_sync_token })
-                if zone_sync_token == "zone-tok-prev"
-        ),
-        "path-only drift must preserve incremental source tracking: {observed_modes:?}"
+        observed_modes
+            .iter()
+            .any(|mode| matches!(mode, download::SyncMode::Full)),
+        "path drift requires current selection observation: {observed_modes:?}"
     );
     assert_eq!(
         db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
@@ -2046,7 +2048,7 @@ async fn run_cycle_download_config_hash_drift_keeps_source_incremental() {
             .expect("read zone token")
             .as_deref(),
         Some("zone-tok-new"),
-        "the incremental source pass should refresh the selected zone token after success"
+        "the bridge must refresh the selected zone token after success"
     );
     assert_eq!(
         db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
@@ -2061,6 +2063,51 @@ async fn run_cycle_download_config_hash_drift_keeps_source_incremental() {
             .await
             .expect("read pending download hash"),
         None
+    );
+    let first_calls = calls.lock().unwrap().clone();
+    assert!(first_calls.iter().any(|(kind, _)| *kind == "query"));
+    assert!(
+        first_calls
+            .iter()
+            .any(|(kind, cursor)| *kind == "changes" && cursor == "zone-tok-prev")
+    );
+    let steady = run_cycle(
+        &states,
+        &config,
+        Some(db.as_ref()),
+        false,
+        &build_download_config,
+        download::DownloadControls::download_hidden(),
+        &shared_session,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("run steady cycle");
+    assert_eq!(steady.failed_count, 0);
+    assert_eq!(steady.stats.full_enumeration_reason, None);
+    assert_eq!(steady.stats.downloaded, 0);
+    let later_calls = calls.lock().unwrap().clone();
+    assert_eq!(
+        later_calls
+            .iter()
+            .filter(|(kind, _)| *kind == "query")
+            .count(),
+        first_calls
+            .iter()
+            .filter(|(kind, _)| *kind == "query")
+            .count()
+    );
+    assert!(
+        later_calls[first_calls.len()..]
+            .iter()
+            .any(|(kind, cursor)| *kind == "changes" && cursor == "zone-tok-new")
+    );
+    assert_eq!(
+        db.get_metadata(download::DOWNLOAD_CONFIG_HASH_KEY)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(new_hash.as_str())
     );
 }
 
@@ -2251,8 +2298,11 @@ async fn run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_ste
             records: Arc::new(records),
         }),
     );
-    let lib_state =
-        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+    let lib_state = make_run_cycle_library_state_with_album(
+        "PrimarySync",
+        &format!("{SYNC_TOKEN_PREFIX}PrimarySync"),
+        album,
+    );
     let db = make_state_db();
     let download_dir = tempfile::tempdir().expect("download tempdir");
     let old_lower_bound = config::CreatedDateFilter::CaptureDate(
@@ -2308,6 +2358,7 @@ async fn run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_ste
         .expect("April downloaded row");
     let april_path = april_record.local_path.expect("April local path");
     assert_eq!(tokio::fs::read(&april_path).await.unwrap(), april_body);
+    let april_mtime = std::fs::metadata(&april_path).unwrap().modified().unwrap();
     assert_eq!(
         db.get_metadata(ENUM_CONFIG_HASH_KEY)
             .await
@@ -2393,6 +2444,10 @@ async fn run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_ste
             .all(|entry| second_snapshot.get(entry.0) == Some(entry.1))
     );
     assert_eq!(tokio::fs::read(&april_path).await.unwrap(), april_body);
+    assert_eq!(
+        std::fs::metadata(&april_path).unwrap().modified().unwrap(),
+        april_mtime
+    );
     let downloaded = db
         .get_downloaded_page(0, 10)
         .await
@@ -2453,6 +2508,10 @@ async fn run_cycle_date_bound_expansion_preserves_existing_media_and_reaches_ste
     .expect("run steady-state date-bound cycle");
     assert_eq!(third_result.stats.downloaded, 0);
     assert_eq!(snapshot_files(download_dir.path()), second_snapshot);
+    assert_eq!(
+        std::fs::metadata(&april_path).unwrap().modified().unwrap(),
+        april_mtime
+    );
     assert_ne!(
         third_result.stats.full_enumeration_reason,
         Some(download::FullEnumerationReason::DownloadConfigHashDrift)
@@ -3014,10 +3073,13 @@ async fn download_config_legacy_hash_migrates_without_reconciliation() {
 #[tokio::test]
 async fn unresolved_identity_inventory_requires_a_delta_bridge() {
     use crate::state::{SparseAttemptOutcome, SparseEvidence, SparseSourceId};
-    for (prior_token, sparse) in [None, Some("retained-before")]
-        .into_iter()
-        .flat_map(|token| [false, true].map(|sparse| (token, sparse)))
-    {
+    for (prior_token, sparse, marker_present) in [
+        (None, false, true),
+        (None, true, true),
+        (Some("retained-before"), false, true),
+        (Some("retained-before"), true, true),
+        (Some("retained-before"), false, false),
+    ] {
         let inner = make_state_db();
         let marker = state::unresolved_identity_key("PrimarySync");
         if sparse {
@@ -3042,8 +3104,10 @@ async fn unresolved_identity_inventory_requires_a_delta_bridge() {
                 .await
                 .unwrap();
         }
-        let blocked = prior_token.is_none() || sparse;
-        inner.set_metadata(&marker, "1").await.unwrap();
+        let blocked = marker_present;
+        if marker_present {
+            inner.set_metadata(&marker, "1").await.unwrap();
+        }
         inner
             .set_metadata(crate::sync_cycle::ENUM_CONFIG_HASH_KEY, "old-config")
             .await
@@ -3092,10 +3156,10 @@ async fn unresolved_identity_inventory_requires_a_delta_bridge() {
                     .await
                     .unwrap()
                     .as_deref(),
-                if sparse {
+                if blocked {
                     prior_token
                 } else {
-                    prior_token.map(|_| "bridged-after")
+                    Some("bridged-after")
                 }
             );
             assert_eq!(result.stats.downloaded, 0);
