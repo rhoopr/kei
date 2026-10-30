@@ -8132,3 +8132,190 @@ async fn v027_prepared_operation_upgrade_normal_runner_and_quiet_reopen() {
 }
 
 mod observation_commits;
+
+#[tokio::test]
+async fn collecting_scoped_paired_change_preserves_child_and_receipts_after_reopen() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let original = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
+    let mut changed = original.to_vec();
+    changed.extend_from_slice(b"changed");
+    for (name, bytes) in [
+        ("original", original.as_slice()),
+        ("changed", changed.as_slice()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("{album}");
+    let resource = |name: &str, bytes: &[u8]| json!({"downloadURL":format!("{}/{name}",server.uri()),"size":bytes.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(bytes))});
+    {
+        let mut current = f.session.records.lock().unwrap();
+        current[0]["fields"]["filenameEnc"] = json!({"value":"paired.jpg","type":"STRING"});
+        current[0]["fields"]["resOriginalFileType"] = json!({"value":"public.jpeg"});
+        current[0]["fields"]["itemType"] = json!({"value":"public.jpeg"});
+        current[0]["fields"]["resOriginalRes"]["value"] = resource("original", original);
+    }
+    crate::download::orchestration::test_support::seed_complete_album_snapshot(
+        f.db.as_ref(),
+        "A",
+        "A",
+        &[("asset-m", "m")],
+    )
+    .await;
+    let pass = destination_pass(&f, "A");
+    let expected_pass = crate::download::orchestration::generation::pass_key(&pass);
+    let expected_owner = owner();
+    let (account_key, provider_key) = expected_owner.authenticated_keys().unwrap();
+    let (_, scope, _) = pass
+        .album
+        .publication_scope("PrimarySync")
+        .unwrap()
+        .unwrap();
+    let first = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        std::slice::from_ref(&pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.stats.downloaded, 1, "{first:?}");
+    let original_path = f.config.directory.join("A/paired.JPG");
+    assert_eq!(std::fs::read(&original_path).unwrap(), original);
+    let receipt: (String, String, String) = f.db.acquire_lock("first child receipt").unwrap().query_row(
+        "SELECT child,source_checksum,local_checksum FROM download_receipts WHERE child='asset-m'", [],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+    ).unwrap();
+    assert_eq!(receipt.1, format!("{:x}", Sha256::digest(original)));
+    assert_eq!(receipt.2, format!("{:x}", Sha256::digest(original)));
+    drop(pass);
+    {
+        let mut current = f.session.records.lock().unwrap();
+        current[0]["fields"]["resOriginalRes"]["value"] = resource("changed", &changed);
+        *f.session.changes_records.lock().unwrap() = vec![current[1].clone()];
+    }
+    f = reopen_destination_fixture(f).await;
+    let pass = destination_pass(&f, "A");
+    let lookups_before = f.session.calls.load(Ordering::SeqCst);
+    let result =
+        crate::download::orchestration::incremental::download_photos_incremental_collecting_inner(
+            &reqwest::Client::new(),
+            std::slice::from_ref(&pass),
+            &Arc::new(f.config.clone()),
+            "old-cursor",
+            controls(),
+            CancellationToken::new(),
+            tokio::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(result.outcome, crate::download::DownloadOutcome::Success),
+        "{result:?}"
+    );
+    assert_eq!(result.stats.downloaded, 1, "{result:?}");
+    assert_eq!(result.sync_token.as_deref(), Some("quiet-zone-cursor"));
+    assert!(f.session.calls.load(Ordering::SeqCst) > lookups_before);
+    assert_eq!(std::fs::read(&original_path).unwrap(), original);
+    let rows = f.db.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id.as_ref(), "asset-m");
+    let changed_path = rows[0].local_path.as_ref().unwrap();
+    assert_ne!(changed_path, &original_path);
+    assert_eq!(std::fs::read(changed_path).unwrap(), changed);
+    drop(pass);
+    f = reopen_destination_fixture(f).await;
+    assert_eq!(std::fs::read(&original_path).unwrap(), original);
+    let rows = f.db.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows[0].id.as_ref(), "asset-m");
+    assert_eq!(
+        std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+        changed
+    );
+    {
+        let conn = f.db.acquire_lock("reopened paired scope").unwrap();
+        let mapping: String = conn.query_row("SELECT master_record_name FROM asset_master_mappings WHERE library='PrimarySync' AND asset_record_name='asset-m'", [], |r| r.get(0)).unwrap();
+        assert_eq!(mapping, "m");
+        let old: (String,String) = conn.query_row("SELECT source_checksum,local_checksum FROM download_receipts WHERE child='asset-m' AND source_checksum=?1", [&receipt.1], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!((&old.0, &old.1), (&receipt.1, &receipt.2));
+        let changed_hash = format!("{:x}", Sha256::digest(&changed));
+        let paths = [
+            (&original_path, &receipt.1),
+            (rows[0].local_path.as_ref().unwrap(), &changed_hash),
+        ];
+        for (path, hash) in paths {
+            let native = serde_json::to_string(&SelectionPath::from_path(path)).unwrap();
+            let count: i64 = conn.query_row(
+            "SELECT count(*) FROM download_receipts WHERE scope=?1 AND library='PrimarySync' AND child='asset-m' AND master='m' AND state_id='asset-m' AND native_path=?2 AND source_checksum=?3 AND local_checksum=?3 AND account_key=?4 AND provider_key=?5 AND origin_pass=?6",
+            rusqlite::params![scope, native, hash, account_key, provider_key, expected_pass], |r| r.get(0),
+        ).unwrap();
+            assert_eq!(count, 1);
+        }
+    }
+    let other_owner = AccountOwner::authenticated(
+        "other@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"other-provider"}})).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &other_owner).await,
+        Err(crate::state::error::StateError::AccountOwnerMismatch)
+    ));
+
+    // A child announcing a new master is not a complete pair. An omitted
+    // lookup must leave the old mapping and replayable cursor intact.
+    let mut unpaired = f.session.records.lock().unwrap()[1].clone();
+    unpaired["fields"]["masterRef"]["value"]["recordName"] = json!("unconfirmed-master");
+    *f.session.changes_records.lock().unwrap() = vec![unpaired];
+    *f.session.corrupt.lock().unwrap() = Some("missing");
+    let pass = destination_pass(&f, "A");
+    let lookups_before = f.session.calls.load(Ordering::SeqCst);
+    let refused =
+        crate::download::orchestration::incremental::download_photos_incremental_collecting_inner(
+            &reqwest::Client::new(),
+            std::slice::from_ref(&pass),
+            &Arc::new(f.config.clone()),
+            "old-cursor",
+            controls(),
+            CancellationToken::new(),
+            tokio::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert!(f.session.calls.load(Ordering::SeqCst) > lookups_before);
+    assert!(refused.checkpoint.identity_incomplete, "{refused:?}");
+    assert!(refused.checkpoint.sync_token_blocked, "{refused:?}");
+    assert_eq!(refused.stats.downloaded, 0);
+    drop(pass);
+    f = reopen_destination_fixture(f).await;
+    {
+        let conn = f.db.acquire_lock("unconfirmed pair after reopen").unwrap();
+        let mapping: String = conn.query_row("SELECT master_record_name FROM asset_master_mappings WHERE library='PrimarySync' AND asset_record_name='asset-m'", [], |r| r.get(0)).unwrap();
+        assert_eq!(mapping, "m");
+        let owners: i64 = conn.query_row("SELECT count(*) FROM asset_master_mappings WHERE master_record_name='unconfirmed-master'", [], |r| r.get(0)).unwrap();
+        assert_eq!(owners, 0);
+    }
+    assert_eq!(
+        f.db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("old-cursor")
+    );
+    assert_eq!(std::fs::read(&original_path).unwrap(), original);
+    assert_eq!(
+        std::fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+        changed
+    );
+}

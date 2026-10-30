@@ -2393,7 +2393,7 @@ async fn incremental_collecting_paired_asset_preserves_child_state_identity() {
                 .set_body_bytes(changed_body.clone())
                 .insert_header("content-type", "image/jpeg"),
         )
-        .expect(1)
+        .expect(0)
         .mount(&server)
         .await;
 
@@ -2480,21 +2480,30 @@ async fn incremental_collecting_paired_asset_preserves_child_state_identity() {
     .await
     .expect("collecting incremental sync should keep the child identity");
 
-    assert!(matches!(incremental.outcome, DownloadOutcome::Success));
-    assert_eq!(incremental.stats.downloaded, 1);
-    assert_eq!(incremental.stats.failed, 0);
-    assert_eq!(incremental.sync_token.as_deref(), Some("zone-token-next"));
+    assert!(
+        matches!(
+            incremental.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 2 }
+        ),
+        "{incremental:?}"
+    );
+    assert_eq!(incremental.stats.downloaded, 0);
+    assert_eq!(incremental.stats.skipped.uncertain, 1);
+    assert_eq!(incremental.stats.state_write_failures, 1);
+    assert!(incremental.sync_token.is_none());
     let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
     assert_eq!(downloaded.len(), 1);
     assert_eq!(downloaded[0].id.as_ref(), "asset-COLLECTING_IDENTITY");
-    assert_ne!(
+    assert_eq!(
         downloaded[0].local_path.as_deref(),
         Some(original_path.as_path())
     );
-    assert!(
-        original_path.exists(),
-        "the prior provider bytes must remain on disk"
+    assert_eq!(
+        tokio::fs::read(&original_path).await.unwrap(),
+        original_body
     );
+    // Without a scoped receipt the occupied original cannot establish that a
+    // different resource is safe to publish at a second path.
 }
 
 #[tokio::test]
