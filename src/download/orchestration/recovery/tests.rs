@@ -17,7 +17,6 @@ use crate::download::retry::{
 };
 use crate::download::{file, filter};
 use crate::icloud::photos::{PhotoAsset, PhotosSession};
-use crate::retry::RetryConfig;
 use crate::state::VersionSizeKey;
 use crate::test_helpers::{
     MockPhotosFlow, TestAssetRecord, mock_photo_records_for_zone_with_filename,
@@ -442,109 +441,198 @@ async fn name_id7_targeted_retry_adopts_intact_recorded_path_without_planned_tas
     }
 }
 
+fn scoped_retry_album(records: Vec<Value>) -> crate::icloud::photos::PhotoAlbum {
+    crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: "https://example.invalid".into(),
+            name: "".into(),
+            list_type: "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
+            obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(PendingLookupSession {
+            records: Arc::new(records),
+        }),
+    )
+}
+
 #[tokio::test]
 async fn targeted_retry_adopts_smaller_metadata_rewritten_recorded_file() {
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let dir = TempDir::new().expect("temp dir");
-    let mut config = test_config();
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
+    use crate::icloud::photos::inbox::ShadowCapture;
+    use sha1::{Digest, Sha1};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
 
-    let mut records = incremental_photo_records_with_url(
-        "METADATA_REWRITTEN_RETRY",
-        "rewritten.jpg",
-        "https://p01.icloud-content.com/rewritten.jpg",
-        8,
-    );
-    records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
-        json!("ck_metadata_rewritten_retry");
-    let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
-    let recorded_path = filter::expected_paths_for(&asset, &config)
-        .into_iter()
-        .next()
-        .expect("asset should derive a path")
-        .path;
-    tokio::fs::create_dir_all(recorded_path.parent().expect("recorded path parent"))
+    let server = crate::start_wiremock_or_skip!();
+    let mut body = include_bytes!("../../../../tests/data/media/pattern.jpg").to_vec();
+    #[cfg(not(feature = "xmp"))]
+    {
+        let mut stale = little_exif::metadata::Metadata::new();
+        stale.set_tag(little_exif::exif_tag::ExifTag::SubSecTimeOriginal(
+            "1".repeat(12000),
+        ));
+        stale
+            .write_to_vec(&mut body, little_exif::filetype::FileExtension::JPEG)
+            .unwrap();
+    }
+    #[cfg(feature = "xmp")]
+    {
+        let mut packet = b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description/></rdf:RDF></x:xmpmeta>".to_vec();
+        packet.extend_from_slice(&[b' '; 12000]);
+        let length = u16::try_from(packet.len() + 2).unwrap().to_be_bytes();
+        let mut app = vec![0xff, 0xe1, length[0], length[1]];
+        app.extend_from_slice(&packet);
+        body.splice(2..2, app);
+    }
+    let mut hash = Sha1::new();
+    hash.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+    hash.update(&body);
+    let signature = data_encoding::BASE64.encode(&[vec![1], hash.finalize().to_vec()].concat());
+    Mock::given(method("GET"))
+        .and(path("/rewritten.jpg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(body.clone())
+                .insert_header("content-type", "image/jpeg"),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    for bound in [true, false] {
+        let dir = TempDir::new().unwrap();
+        let database = dir.path().join("state.db");
+        let owner = crate::state::db::account::AccountOwner::authenticated(
+            "retry@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"retry-fixture"}})).unwrap(),
+        )
+        .unwrap();
+        let db = Arc::new(SqliteStateDb::open_owned(&database, &owner).await.unwrap());
+        let mut records = incremental_photo_records_with_url(
+            "METADATA_REWRITTEN_RETRY",
+            "rewritten.jpg",
+            &format!("{}/rewritten.jpg", server.uri()),
+            body.len() as u64,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(signature);
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let mut album = scoped_retry_album(records.clone());
+        album.set_shadow_capture(
+            ShadowCapture::new(db.clone(), owner.clone(), "com"),
+            Arc::from("private"),
+        );
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album,
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path().join("media"));
+        config.state_db = Some(db.clone());
+        config.metadata.set_exif_datetime = true;
+        let initial = Arc::new(config.with_pass(&pass));
+        let result = stream_and_download_from_stream(
+            &Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
+            &initial,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
         .await
-        .expect("create recorded path parent");
-    tokio::fs::write(&recorded_path, b"shorter")
-        .await
-        .expect("seed metadata-rewritten file");
-    let local_checksum = file::compute_sha256(&recorded_path)
-        .await
-        .expect("hash metadata-rewritten file");
-
-    let record = TestAssetRecord::new(asset.state_id())
-        .filename("rewritten.jpg")
-        .checksum("ck_metadata_rewritten_retry")
-        .size(8)
-        .added_at(Utc.timestamp_opt(1_700_000_000, 0).unwrap())
-        .build();
-    db.upsert_seen(&record).await.expect("seed state row");
-    db.mark_downloaded(
-        "PrimarySync",
-        asset.state_id(),
-        VersionSizeKey::Original.as_str(),
-        &recorded_path,
-        &local_checksum,
-        Some("download-checksum-before-metadata"),
-    )
-    .await
-    .expect("seed metadata-rewritten state");
-    db.mark_failed(
-        "PrimarySync",
-        asset.state_id(),
-        VersionSizeKey::Original.as_str(),
-        "prior false truncation",
-    )
-    .await
-    .expect("mark row failed");
-    db.prepare_for_retry(
-        Some("PrimarySync"),
-        crate::state::RetryErrorRetention::Clear,
-    )
-    .await
-    .expect("prepare row for retry");
-    db.upsert_asset_master_mapping("PrimarySync", asset.asset_record_name(), asset.state_id())
-        .await
-        .expect("seed asset/master mapping");
-
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session(
+        .unwrap();
+        assert_eq!(result.downloaded, 1, "{result:?}");
+        let downloaded = db.get_downloaded_page(0, 10).await.unwrap();
+        let state_id = downloaded[0].id.to_string();
+        let recorded_path = downloaded[0].local_path.clone().unwrap();
+        let output = std::fs::read(&recorded_path).unwrap();
+        assert_ne!(output, body);
+        assert!(
+            output.len() < body.len(),
+            "metadata output {} source {}",
+            output.len(),
+            body.len()
+        );
+        let local = file::compute_sha256(&recorded_path).await.unwrap();
+        let source = downloaded[0].download_checksum.clone().unwrap();
+        assert_ne!(source, local);
+        assert_eq!(
+            source,
+            data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(&body))
+        );
+        if !bound {
+            db.acquire_lock("remove operation binding")
+                .unwrap()
+                .execute("DELETE FROM download_receipts", [])
+                .unwrap();
+        }
+        db.mark_failed(
             "PrimarySync",
-            "",
-            Box::new(PendingLookupSession {
-                records: Arc::new(records),
-            }),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-    let plan = build_pending_retry_download_tasks(
-        &passes,
-        &config,
-        DownloadRunMode::Download,
-        CancellationToken::new(),
-    )
-    .await
-    .expect("adopt metadata-rewritten retry");
-
-    assert!(plan.tasks.is_empty());
-    assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), b"shorter");
-    let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
-    assert_eq!(downloaded.len(), 1);
-    assert_eq!(
-        downloaded[0].local_path.as_deref(),
-        Some(recorded_path.as_path())
-    );
-    assert_eq!(
-        downloaded[0].local_checksum.as_deref(),
-        Some(local_checksum.as_str())
-    );
-    assert_eq!(
-        downloaded[0].download_checksum.as_deref(),
-        Some("download-checksum-before-metadata")
-    );
+            &state_id,
+            "original",
+            "synthetic interruption",
+        )
+        .await
+        .unwrap();
+        db.prepare_for_retry(
+            Some("PrimarySync"),
+            crate::state::RetryErrorRetention::Clear,
+        )
+        .await
+        .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", asset.asset_record_name(), asset.id())
+            .await
+            .unwrap();
+        drop(initial);
+        drop(config);
+        drop(pass);
+        drop(db);
+        for _ in 0..2 {
+            let db = Arc::new(SqliteStateDb::open_owned(&database, &owner).await.unwrap());
+            let mut album = scoped_retry_album(records.clone());
+            album.set_shadow_capture(
+                ShadowCapture::new(db.clone(), owner.clone(), "com"),
+                Arc::from("private"),
+            );
+            let pass = AlbumPass {
+                kind: PassKind::Unfiled,
+                album,
+                exclude_ids: Arc::new(FxHashSet::default()),
+            };
+            let mut config = test_config();
+            config.directory = Arc::from(dir.path().join("media"));
+            config.state_db = Some(db.clone());
+            config.metadata.set_exif_datetime = true;
+            let plan = build_pending_retry_download_tasks(
+                &[pass],
+                &config,
+                DownloadRunMode::Download,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(plan.tasks.is_empty());
+            assert_eq!(std::fs::read(&recorded_path).unwrap(), output);
+            let summary = db.get_summary().await.unwrap();
+            assert_eq!(summary.downloaded, u64::from(bound));
+            assert_eq!(summary.pending, u64::from(!bound));
+            if bound {
+                let rows = db.get_downloaded_page(0, 10).await.unwrap();
+                assert_eq!(rows[0].local_checksum.as_deref(), Some(local.as_str()));
+                assert_eq!(rows[0].download_checksum.as_deref(), Some(source.as_str()));
+            } else {
+                assert_eq!(plan.unmatched_targets.len(), 1);
+            }
+        }
+    }
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -1086,150 +1174,413 @@ async fn changed_resource_repair(scenario: &str) {
 
 #[tokio::test]
 async fn same_size_provider_change_retry_does_not_adopt_stale_recorded_path() {
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
+    use crate::icloud::photos::inbox::ShadowCapture;
+    use sha1::{Digest, Sha1};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
 
-    let failed_server = crate::start_wiremock_or_skip!();
-    Mock::given(method("GET"))
-        .and(path("/changed.jpg"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(1)
-        .mount(&failed_server)
-        .await;
+    fn signature(bytes: &[u8]) -> String {
+        let mut hash = Sha1::new();
+        hash.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+        hash.update(bytes);
+        data_encoding::BASE64.encode(&[vec![1], hash.finalize().to_vec()].concat())
+    }
 
-    let new_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
-    let new_checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&new_body));
-    let failed_url = format!("{}/changed.jpg", failed_server.uri());
-    let mut changed_records = incremental_photo_records_with_url(
-        "SAME_SIZE_CHANGED",
-        "changed.jpg",
-        &failed_url,
-        new_body.len() as u64,
-    );
-    changed_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(new_checksum);
-    let changed_asset = PhotoAsset::new(changed_records[0].clone(), changed_records[1].clone());
-
-    let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
-    let dir = TempDir::new().expect("temp dir");
-    let mut config = test_config();
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-    config.sync_mode = SyncMode::Incremental {
-        zone_sync_token: "zone-token-prev".to_string(),
-    };
-    config.retry = RetryConfig {
-        max_retries: 0,
-        base_delay_secs: 0,
-        max_delay_secs: 0,
-    };
-    let config = Arc::new(config);
-
-    let recorded_path = filter::expected_paths_for(&changed_asset, config.as_ref())
-        .into_iter()
-        .next()
-        .expect("asset should derive a path")
-        .path;
-    tokio::fs::create_dir_all(recorded_path.parent().expect("recorded parent"))
-        .await
-        .expect("create recorded directory");
-    let old_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x45];
-    tokio::fs::write(&recorded_path, &old_body)
-        .await
-        .expect("seed old provider version");
-    let old_local_checksum = file::compute_sha256(&recorded_path)
-        .await
-        .expect("hash old provider version");
-    let old_record = TestAssetRecord::new("SAME_SIZE_CHANGED")
-        .filename("changed.jpg")
-        .checksum("old-provider-checksum")
-        .size(old_body.len() as u64)
-        .build();
-    db.upsert_seen(&old_record)
-        .await
-        .expect("seed old state row");
-    db.mark_downloaded(
-        "PrimarySync",
-        "SAME_SIZE_CHANGED",
-        VersionSizeKey::Original.as_str(),
-        &recorded_path,
-        &old_local_checksum,
-        None,
-    )
-    .await
-    .expect("record old provider version");
-
-    let first = stream_and_download_from_stream(
-        &Client::new(),
-        stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(changed_asset)]),
-        &config,
-        DownloadControls::download_hidden(),
-        1,
-        CancellationToken::new(),
-        StreamRuntime::new(None, None),
-    )
-    .await
-    .expect("changed provider version should reach the download pipeline");
-    assert_eq!(first.downloaded, 0);
-    assert_eq!(first.failed.len(), 1);
-    assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), old_body);
-    let failed = db.get_failed().await.expect("failed row");
-    assert!(failed[0].downloaded_at.is_none());
-
-    let success_server = crate::start_wiremock_or_skip!();
-    Mock::given(method("GET"))
-        .and(path("/changed.jpg"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(new_body.clone())
-                .insert_header("content-type", "image/jpeg"),
+    for scenario in [
+        "foreign",
+        "changed",
+        "reservation_failure",
+        "provider_drift",
+        "conflict",
+        "ambiguous",
+        "config_drift",
+        "normal",
+    ] {
+        let (trace, _guard) = crate::test_helpers::TracingCapture::install();
+        let server = crate::start_wiremock_or_skip!();
+        let old_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x45];
+        let new_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let old_checksum = signature(&old_body);
+        let new_checksum = signature(&new_body);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path("/old.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(old_body.clone())
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let observed = calls.clone();
+        let response = new_body.clone();
+        Mock::given(method("GET"))
+            .and(path("/changed.jpg"))
+            .respond_with(move |_: &wiremock::Request| {
+                if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(500)
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(response.clone())
+                        .insert_header("content-type", "image/jpeg")
+                }
+            })
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let database = dir.path().join("state.db");
+        let owner = crate::state::db::account::AccountOwner::authenticated(
+            "recovery@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"recovery-fixture"}})).unwrap(),
         )
-        .expect(1)
-        .mount(&success_server)
-        .await;
-    changed_records[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
-        json!(format!("{}/changed.jpg", success_server.uri()));
-    let retry_passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session(
-            "PrimarySync",
-            "",
-            Box::new(PendingLookupSession {
-                records: Arc::new(changed_records),
-            }),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
+        .unwrap();
+        let db = Arc::new(SqliteStateDb::open_owned(&database, &owner).await.unwrap());
+        let mut old_records = incremental_photo_records_with_url(
+            "SAME_SIZE_CHANGED",
+            "changed.jpg",
+            &format!("{}/old.jpg", server.uri()),
+            old_body.len() as u64,
+        );
+        old_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(old_checksum);
+        let old_asset = PhotoAsset::new(old_records[0].clone(), old_records[1].clone());
+        let mut changed_records = incremental_photo_records_with_url(
+            "SAME_SIZE_CHANGED",
+            "changed.jpg",
+            &format!("{}/changed.jpg", server.uri()),
+            new_body.len() as u64,
+        );
+        changed_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(new_checksum);
+        let changed_asset = PhotoAsset::new(changed_records[0].clone(), changed_records[1].clone());
+        let mut album = scoped_retry_album(changed_records.clone());
+        album.set_shadow_capture(
+            ShadowCapture::new(db.clone(), owner.clone(), "com"),
+            Arc::from("private"),
+        );
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album,
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path().join("media"));
+        config.state_db = Some(db.clone());
+        config.retry.max_retries = 0;
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".into(),
+        };
+        let initial = Arc::new(config.with_pass(&pass));
+        let first = stream_and_download_from_stream(
+            &Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(old_asset.clone())]),
+            &initial,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.downloaded, 1, "{first:?}; {:?}", trace.events());
+        let old_path = db.get_downloaded_page(0, 10).await.unwrap()[0]
+            .local_path
+            .clone()
+            .unwrap();
+        assert_eq!(std::fs::read(&old_path).unwrap(), old_body);
+        if scenario == "changed" {
+            std::fs::write(&old_path, b"foreign!").unwrap();
+        }
+        if scenario == "foreign" {
+            db.acquire_lock("foreign receipt")
+                .unwrap()
+                .execute("UPDATE download_receipts SET child='foreign-child'", [])
+                .unwrap();
+        }
+        if scenario == "reservation_failure" {
+            db.acquire_lock("inject reservation failure").unwrap().execute_batch(
+                "CREATE TRIGGER fail_choice BEFORE INSERT ON reconciliation_paths BEGIN SELECT RAISE(ABORT,'synthetic reservation failure'); END;"
+            ).unwrap();
+            let refused = stream_and_download_from_stream(
+                &Client::new(),
+                stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(changed_asset.clone())]),
+                &initial,
+                DownloadControls::download_hidden(),
+                1,
+                CancellationToken::new(),
+                StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(refused.state_write_failures, 1);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(std::fs::read(&old_path).unwrap(), old_body);
+            assert_eq!(db.get_downloaded_page(0, 10).await.unwrap().len(), 1);
+            assert_eq!(db.get_summary().await.unwrap().pending, 0);
+            db.acquire_lock("remove reservation failure")
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_choice")
+                .unwrap();
+        }
+        let first = stream_and_download_from_stream(
+            &Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(changed_asset)]),
+            &initial,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        if matches!(scenario, "foreign" | "changed") {
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(first.downloaded, 0);
+            assert!(first.skip_summary.uncertain > 0, "{first:?}");
+            assert_eq!(
+                std::fs::read(&old_path).unwrap(),
+                if scenario == "changed" {
+                    b"foreign!".as_slice()
+                } else {
+                    old_body.as_slice()
+                }
+            );
+            continue;
+        }
+        assert_eq!(first.downloaded, 0);
+        assert_eq!(first.failed.len(), 1, "{first:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&old_path).unwrap(), old_body);
+        let reserved: String = db
+            .acquire_lock("inspect saved destination")
+            .unwrap()
+            .query_row(
+                "SELECT destination_path FROM reconciliation_paths WHERE provider_checksum=?1",
+                [&new_checksum],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(std::path::Path::new(&reserved), old_path);
+        drop(initial);
+        drop(config);
+        drop(pass);
+        drop(db);
 
-    let retry = download_photos_with_sync(
-        &Client::new(),
-        &retry_passes,
-        config,
-        DownloadControls::download_hidden(),
-        CancellationToken::new(),
-    )
-    .await
-    .expect("targeted retry should download the changed provider version");
-
-    assert!(matches!(retry.outcome, DownloadOutcome::Success));
-    assert_eq!(retry.stats.downloaded, 1);
-    assert_eq!(tokio::fs::read(&recorded_path).await.unwrap(), old_body);
-    let downloaded = db.get_downloaded_page(0, 10).await.expect("downloaded row");
-    assert_eq!(downloaded.len(), 2);
-    let changed_path = downloaded
-        .iter()
-        .find(|record| record.id.as_ref() == "asset-SAME_SIZE_CHANGED")
-        .expect("changed child has a downloaded row")
-        .local_path
-        .as_ref()
-        .expect("changed provider version has a local path");
-    assert_ne!(changed_path, &recorded_path);
-    assert_eq!(tokio::fs::read(changed_path).await.unwrap(), new_body);
-    let summary = db.get_summary().await.expect("summary");
-    assert_eq!(summary.downloaded, 2);
-    assert_eq!(summary.pending, 0);
-    assert_eq!(summary.failed, 0);
+        let db = Arc::new(SqliteStateDb::open_owned(&database, &owner).await.unwrap());
+        let mut drifted_records = changed_records.clone();
+        drifted_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(signature(b"different-source"));
+        let mut drifted_album = scoped_retry_album(drifted_records);
+        drifted_album.set_shadow_capture(
+            ShadowCapture::new(db.clone(), owner.clone(), "com"),
+            Arc::from("private"),
+        );
+        let drifted_pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: drifted_album,
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut album = scoped_retry_album(changed_records);
+        album.set_shadow_capture(
+            ShadowCapture::new(db.clone(), owner.clone(), "com"),
+            Arc::from("private"),
+        );
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album,
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path().join("media"));
+        config.state_db = Some(db.clone());
+        config.retry.max_retries = 0;
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".into(),
+        };
+        if scenario == "conflict" {
+            db.acquire_lock("inject foreign destination")
+                .unwrap()
+                .execute(
+                    "UPDATE reconciliation_paths SET id='foreign-child' WHERE provider_checksum=?1",
+                    [&new_checksum],
+                )
+                .unwrap();
+            let conflict = download_photos_with_sync(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await;
+            assert!(conflict.as_ref().map_or(true, |value| !matches!(
+                value.outcome,
+                DownloadOutcome::Success
+            )));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(std::fs::read(&old_path).unwrap(), old_body);
+            assert!(
+                db.get_summary().await.unwrap().pending + db.get_summary().await.unwrap().failed
+                    > 0
+            );
+            db.acquire_lock("restore recorded owner").unwrap().execute(
+                "UPDATE reconciliation_paths SET id='asset-SAME_SIZE_CHANGED' WHERE provider_checksum=?1",
+                [&new_checksum],
+            ).unwrap();
+        }
+        if scenario == "ambiguous" {
+            use crate::state::db::{
+                ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
+                ReconciliationStateStore,
+            };
+            let other = dir.path().join("media/other/changed.jpg");
+            db.reserve_reconciliation_paths(&[ReconciliationReservation {
+                library: "PrimarySync".into(),
+                asset_id: "asset-SAME_SIZE_CHANGED".into(),
+                version_size: VersionSizeKey::Original,
+                requested_path_key: ReconciliationPathKey(
+                    crate::fs_util::confined_path_key(
+                        &dir.path().join("media/other-request/changed.jpg"),
+                    )
+                    .unwrap(),
+                ),
+                destination_path_key: ReconciliationPathKey(
+                    crate::fs_util::confined_path_key(&other).unwrap(),
+                ),
+                destination_path: other,
+                content: Some(ReconciliationContent {
+                    checksum: new_checksum.clone().into_boxed_str(),
+                    size: new_body.len() as u64,
+                }),
+            }])
+            .await
+            .unwrap();
+            config.folder_structure = "future-template".into();
+            let ambiguous = download_photos_with_sync(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await;
+            assert!(ambiguous.as_ref().map_or(true, |value| !matches!(
+                value.outcome,
+                DownloadOutcome::Success
+            )));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(std::fs::read(&old_path).unwrap(), old_body);
+            assert!(
+                db.get_summary().await.unwrap().pending + db.get_summary().await.unwrap().failed
+                    > 0
+            );
+            db.acquire_lock("remove conflicting test destination").unwrap().execute(
+                "DELETE FROM reconciliation_paths WHERE provider_checksum=?1 AND destination_path<>?2",
+                rusqlite::params![new_checksum, reserved],
+            ).unwrap();
+        }
+        if scenario == "config_drift" {
+            config.folder_structure = "future-template".into();
+        }
+        if scenario == "provider_drift" {
+            let drift = download_photos_with_sync(
+                &Client::new(),
+                std::slice::from_ref(&drifted_pass),
+                Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                !matches!(drift.outcome, DownloadOutcome::Success),
+                "{drift:?}"
+            );
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(std::fs::read(&old_path).unwrap(), old_body);
+            assert!(
+                db.get_summary().await.unwrap().pending + db.get_summary().await.unwrap().failed
+                    > 0
+            );
+        }
+        for cycle in 0..2 {
+            let retry = download_photos_with_sync(
+                &Client::new(),
+                std::slice::from_ref(&pass),
+                Arc::new(config.clone()),
+                DownloadControls::download_hidden(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(retry.outcome, DownloadOutcome::Success),
+                "scenario={scenario}; {retry:?}; calls={}; events={:?}",
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                trace.events()
+            );
+            assert_eq!(retry.stats.downloaded, usize::from(cycle == 0));
+            assert_eq!(std::fs::read(&old_path).unwrap(), old_body);
+            let rows = db.get_downloaded_page(0, 10).await.unwrap();
+            let new_path = rows
+                .iter()
+                .find(|r| r.checksum.as_ref() == new_checksum)
+                .unwrap()
+                .local_path
+                .as_ref()
+                .unwrap();
+            assert_ne!(new_path, &old_path);
+            assert_eq!(new_path, std::path::Path::new(&reserved));
+            assert_eq!(std::fs::read(new_path).unwrap(), new_body);
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        if scenario == "config_drift" {
+            let fresh_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x47];
+            Mock::given(method("GET"))
+                .and(path("/fresh.jpg"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(fresh_body.clone())
+                        .insert_header("content-type", "image/jpeg"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut fresh_records = incremental_photo_records_with_url(
+                "FRESH_AFTER_DRIFT",
+                "fresh.jpg",
+                &format!("{}/fresh.jpg", server.uri()),
+                fresh_body.len() as u64,
+            );
+            fresh_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+                json!(signature(&fresh_body));
+            let fresh = PhotoAsset::new(fresh_records[0].clone(), fresh_records[1].clone());
+            let result = stream_and_download_from_stream(
+                &Client::new(),
+                stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(fresh)]),
+                &Arc::new(config.with_pass(&pass)),
+                DownloadControls::download_hidden(),
+                1,
+                CancellationToken::new(),
+                StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.downloaded, 1, "{result:?}");
+            let rows = db.get_downloaded_page(0, 10).await.unwrap();
+            let fresh_path = rows
+                .iter()
+                .find(|row| row.id.as_ref() == "asset-FRESH_AFTER_DRIFT")
+                .unwrap()
+                .local_path
+                .as_ref()
+                .unwrap();
+            assert!(fresh_path.starts_with(dir.path().join("media/future-template")));
+            assert_eq!(std::fs::read(fresh_path).unwrap(), fresh_body);
+        }
+        server.verify().await;
+    }
 }
 
 #[tokio::test]

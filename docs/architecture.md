@@ -1727,7 +1727,10 @@ are saved; recovered renditions and failed recovery writes stay out of transfer
 and reservation dispatch. A healthy rendition about to receive a fresh choice
 uses the same current-file proof so that a later failure can still recover it.
 Existing durable choices keep their replay policy; saved different destinations
-still retain debt.
+still retain debt. When a naming-template change leaves no exact requested-path
+choice, targeted retry may replay a unique saved destination for the same owner
+and provider generation. Multiple destinations remain pending, and replay
+remains confined to the current root.
 The file is hashed beneath the current root without following links. A retained
 file and namespace, plus the process's
 destination guard, remain live through immediate conditional state finalization.

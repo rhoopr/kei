@@ -461,8 +461,77 @@ impl TaskPlanner {
             .await?;
         if matches!(self.path_mode, PathPlanningMode::Download) && !self.managed_plan {
             self.relocate_protected_tasks(&mut plan, config).await?;
+            self.reserve_changed_publication_choices(asset, config, &plan)
+                .await?;
         }
         Ok(plan)
+    }
+
+    // Only nominate choices backed by scoped prior publications. The caller
+    // persists them after matching returns Missing, before dispatch.
+    async fn reserve_changed_publication_choices(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        plan: &AssetTaskPlan,
+    ) -> Result<()> {
+        let Some(album) = &config.primary_layout_source else {
+            return Ok(());
+        };
+        let derived = super::filter::derive_expected_paths(asset, config);
+        for task in &plan.tasks {
+            let Some(binding) = task.publication_binding.as_deref() else {
+                continue;
+            };
+            let Some(requested) = derived
+                .iter()
+                .find(|path| path.version_size == task.version_size)
+            else {
+                continue;
+            };
+            let requested_key = PathPlanningMode::Reconciliation.key(&requested.path)?;
+            let destination_key = PathPlanningMode::Reconciliation.key(&task.download_path)?;
+            if requested_key == destination_key {
+                continue;
+            }
+            let Some((capture, scope, _)) = album.publication_scope(&task.library)? else {
+                continue;
+            };
+            anyhow::ensure!(scope == binding.scope, "Publication scope changed");
+            let historical = capture
+                .db
+                .bound_historical_downloads(
+                    binding.clone(),
+                    task.version_size.as_str().into(),
+                    task.checksum.to_string(),
+                    task.size,
+                )
+                .await?;
+            if !historical.iter().any(|receipt| {
+                PathPlanningMode::Reconciliation
+                    .key(&receipt.native_path.to_path())
+                    .is_ok_and(|key| key == requested_key)
+            }) {
+                continue;
+            }
+            self.reconciliation
+                .reservations
+                .push(ReconciliationReservation {
+                    library: Arc::clone(&task.library),
+                    asset_id: task.asset_id.as_ref().into(),
+                    version_size: task.version_size,
+                    requested_path_key: ReconciliationPathKey(requested_key.as_ref().to_owned()),
+                    destination_path_key: ReconciliationPathKey(
+                        destination_key.as_ref().to_owned(),
+                    ),
+                    destination_path: crate::fs_util::absolute_confined_path(&task.download_path)?,
+                    content: Some(ReconciliationContent {
+                        checksum: task.checksum.clone(),
+                        size: task.size,
+                    }),
+                });
+        }
+        Ok(())
     }
 
     async fn bind_publication_tasks(
@@ -1169,7 +1238,7 @@ impl TaskPlanner {
             reservation.destination_path =
                 crate::fs_util::absolute_confined_path(&reservation.destination_path)?;
             reservation.destination_path_key = ReconciliationPathKey(
-                self.path_mode
+                PathPlanningMode::Reconciliation
                     .key(&reservation.destination_path)?
                     .as_ref()
                     .to_owned(),
@@ -1285,7 +1354,22 @@ impl TaskPlanner {
                         size: task.size,
                     };
                     let slot = (owner.clone(), content.clone(), requested_key.clone());
-                    if let Some(destination) = self.reconciliation.destinations.get(&slot) {
+                    let mut destination = self.reconciliation.destinations.get(&slot).cloned();
+                    if destination.is_none() && matches!(replay, ReservedReplay::PendingRetry) {
+                        // A template change must not redirect already recorded work.
+                        // Replay only a unique choice for this exact owner and generation.
+                        let mut choices = self.reconciliation.destinations.iter()
+                            .filter(|((saved_owner, saved_content, _), _)| saved_owner == &owner && saved_content == &content)
+                            .map(|(_, path)| path.clone());
+                        if let Some(first) = choices.next() {
+                            anyhow::ensure!(
+                                choices.all(|path| path == first),
+                                "pending retry has multiple recorded destinations"
+                            );
+                            destination = Some(first);
+                        }
+                    }
+                    if let Some(destination) = destination.as_ref() {
                         let planned_key =
                             PathPlanningMode::Reconciliation.key(&task.download_path)?;
                         self.claimed_paths.remove(&planned_key);

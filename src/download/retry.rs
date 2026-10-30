@@ -400,10 +400,11 @@ impl PendingRetryPlanning<'_> {
                             } else {
                                 false
                             };
-                            // A previously admitted sibling is already current work. Resume
-                            // its exact reservation after failure, without interpreting the
-                            // old candidate or requiring its consumed repair marker again.
-                            let reserved_copy = pass_config.repair_truncated
+                            // A saved absent sibling can resume after an ordinary failure
+                            // only when the current matcher found no uncertainty. Explicit
+                            // repair retains its existing consumed-marker recovery path.
+                            let reserved_copy = (pass_config.repair_truncated
+                                || matches!(decision, crate::download::baseline_matching::BaselineMatch::Missing))
                                 && self.task_planner.has_durable_destination(task)
                                 && evidence.local_path_under(&pass_config.directory)
                                     .is_some_and(|old|old != task.download_path)
