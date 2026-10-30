@@ -263,14 +263,31 @@ async fn run_case(mode: &'static str, replacement: bool, reply: Value) -> (Value
         )
         .await
         .unwrap();
+    if mode == "tracking_limit" {
+        assert_eq!(
+            inventory
+                .latest
+                .values()
+                .filter(|(record, _, _)| record.deleted == Some(true))
+                .count(),
+            64
+        );
+    }
     let (record, _, observation) = inventory
         .latest
         .values()
         .filter(|(record, _, _)| {
-            record.record_type == "CPLAsset" && record.fields.pointer("/masterRef/value").is_none()
+            record.record_type == "CPLAsset"
+                && record.deleted != Some(true)
+                && record.fields.pointer("/masterRef/value").is_none()
         })
         .min_by_key(|(record, _, _)| &record.record_name)
         .unwrap();
+    if mode == "tracking_limit" {
+        assert_eq!(record.record_name, "private-child");
+    } else if mode == "long_identity" {
+        assert_eq!(record.record_name, "x".repeat(513));
+    }
     let lookup = album
         .lookup_missing_reference(&record.record_name, &masters(), &cancel)
         .await;
@@ -363,9 +380,11 @@ async fn missing_reference_regression_observations_cover_tracking_and_identity_l
         let (fields, calls) = run_case(mode, false, json!({"records":[]})).await;
         assert_eq!(calls, 1);
         assert_eq!(fields["record_history"], "first_seen");
+        assert_eq!(fields["prior_reference"], "not_observed");
         assert_eq!(fields["sparse_marker"], "true");
         assert_eq!(fields["linkage"], "partial_fields");
         assert_eq!(fields["lookup_outcome"], "omitted");
+        assert_eq!(fields["lookup_family"], "not_established");
     }
 }
 
