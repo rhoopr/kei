@@ -173,8 +173,9 @@ impl SqliteStateDb {
             }
             for proof in &transition.legacy_preservation_proofs {
                 let binds_cursor = transition.metadata_updates.iter().any(|(key, value)| {
-                    super::legacy_preservation::checkpoint_library(key)
-                        == Some(proof.library.as_str())
+                    !crate::sync_cycle::is_current_zone_checkpoint(key)
+                        && super::legacy_preservation::checkpoint_library(key)
+                            == Some(proof.library.as_str())
                         && value == &proof.next_cursor
                 });
                 if !binds_cursor {

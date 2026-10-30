@@ -309,7 +309,7 @@ async fn retained_checkpoint_metadata_fence_rolls_back_stale_plans() {
         db.set_metadata("pending_enum_config_hash", "new-config")
             .await
             .unwrap();
-        db.set_metadata("retained_checkpoint_hold:zone", "durable-hold")
+        db.set_metadata("retained_checkpoint_hold:v27:zone", "durable-hold")
             .await
             .unwrap();
         let result = db
@@ -324,7 +324,7 @@ async fn retained_checkpoint_metadata_fence_rolls_back_stale_plans() {
                 ],
                 metadata_deletes: vec![
                     "pending_enum_config_hash".into(),
-                    "retained_checkpoint_hold:zone".into(),
+                    "retained_checkpoint_hold:v27:zone".into(),
                 ],
             })
             .await;
@@ -335,7 +335,7 @@ async fn retained_checkpoint_metadata_fence_rolls_back_stale_plans() {
         ("sync_token:zone", "concurrent-cursor"),
         ("enum_config_hash", "old-config"),
         ("pending_enum_config_hash", "new-config"),
-        ("retained_checkpoint_hold:zone", "durable-hold"),
+        ("retained_checkpoint_hold:v27:zone", "durable-hold"),
     ] {
         assert_eq!(
             db.get_metadata(key).await.unwrap().as_deref(),
@@ -349,6 +349,36 @@ async fn retained_checkpoint_metadata_fence_rolls_back_stale_plans() {
             .provider_checkpoint_status
             .as_deref(),
         Some("preserved")
+    );
+    db.commit_checkpoint_transition(CheckpointTransition {
+        expected_metadata: vec![("sync_token:zone".into(), Some("concurrent-cursor".into()))],
+        legacy_preservation_proofs: Vec::new(),
+        legacy_config_hash: None,
+        sparse_identity_proofs: Vec::new(),
+        metadata_updates: vec![("sync_token:zone".into(), "new-cursor".into())],
+        metadata_deletes: vec!["retained_checkpoint_hold:v27:zone".into()],
+    })
+    .await
+    .unwrap();
+    drop(db);
+    let db = SqliteStateDb::open(&path).await.unwrap();
+    assert_eq!(
+        db.get_metadata("sync_token:zone").await.unwrap().as_deref(),
+        Some("new-cursor")
+    );
+    assert!(
+        db.get_metadata("retained_checkpoint_hold:v27:zone")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        db.get_summary()
+            .await
+            .unwrap()
+            .provider_checkpoint_status
+            .as_deref(),
+        Some("current")
     );
 }
 

@@ -633,7 +633,7 @@ pub(super) fn activate(conn: &Connection, proof: &LegacyActivationProof) -> Resu
     let prior: Option<String> = conn
         .query_row(
             "SELECT value FROM metadata WHERE key=?1",
-            [crate::sync_cycle::sync_token_key(&proof.library)],
+            [format!("sync_token:{}", proof.library)],
             |r| r.get(0),
         )
         .optional()?;
@@ -1801,6 +1801,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let (db, snapshot, files) = seed(&path).await;
+        let original_mtime = std::fs::metadata(&files[0].path)
+            .unwrap()
+            .modified()
+            .unwrap();
         assert!(
             db.prepare_legacy_preservation(&snapshot, &files)
                 .await
@@ -1830,6 +1834,21 @@ mod tests {
             snapshot.evidence
         );
         let activation = proof(&db, &snapshot).await;
+        // A current-epoch cursor cannot activate historical coverage, even if
+        // its cursor and proof otherwise match the historical transition.
+        db.set_metadata(&crate::sync_cycle::sync_token_key("PrimarySync"), "before")
+            .await
+            .unwrap();
+        let mut current = transition(vec![activation.clone()]);
+        current.metadata_updates = vec![(
+            crate::sync_cycle::sync_token_key("PrimarySync"),
+            "after".into(),
+        )];
+        assert!(db.commit_checkpoint_transition(current).await.is_err());
+        assert_eq!(
+            db.legacy_preservations("PrimarySync").await.unwrap()[0].active_generation,
+            None
+        );
         db.commit_checkpoint_transition(transition(vec![activation.clone()]))
             .await
             .unwrap();
@@ -1853,6 +1872,20 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join("original.jpg")).unwrap(),
             b"legacy bytes"
+        );
+        assert_eq!(
+            std::fs::metadata(&files[0].path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            original_mtime
+        );
+        assert_eq!(
+            db.get_metadata(&crate::sync_cycle::sync_token_key("PrimarySync"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("before")
         );
         assert!(
             db.commit_checkpoint_transition(transition(vec![activation]))
