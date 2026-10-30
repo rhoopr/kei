@@ -8,7 +8,6 @@ use reqwest::Client;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-use crate::download::filter::derive_expected_paths;
 use crate::download::pipeline::outcome::build_download_outcome;
 use crate::download::pipeline::streaming::{
     StreamRuntime, stream_and_download_from_stream, stream_and_download_from_stream_with_context,
@@ -204,25 +203,10 @@ async fn print_and_dry_run_preserve_downloaded_child_identity() {
         printed.printed_filenames
     );
 
-    let asset = make_asset();
-    let base_path = derive_expected_paths(&asset, config.as_ref())
-        .into_iter()
-        .next()
-        .expect("asset has an expected path")
-        .path;
-    let base_filename = base_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("expected path has a filename");
-    let expected_dry_run_path =
-        base_path.with_file_name(crate::download::paths::insert_asset_identity_suffix(
-            base_filename,
-            asset.asset_record_name(),
-        ));
     let (capture, _guard) = crate::test_helpers::TracingCapture::install();
     let dry_run = stream_and_download_from_stream(
         &reqwest::Client::new(),
-        stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
+        stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(make_asset())]),
         &config,
         DownloadControls::dry_run_hidden(),
         1,
@@ -230,15 +214,18 @@ async fn print_and_dry_run_preserve_downloaded_child_identity() {
         StreamRuntime::new(None, None),
     )
     .await
-    .expect("dry-run sync should plan the child identity");
-    assert_eq!(dry_run.downloaded, 1);
-    let dry_run_path = capture
-        .events()
-        .into_iter()
-        .find(|event| event.message() == Some("[DRY RUN] Would download"))
-        .and_then(|event| event.field("path").map(ToOwned::to_owned))
-        .expect("dry-run path event");
-    assert_eq!(dry_run_path, expected_dry_run_path.display().to_string());
+    .expect("dry-run sync should inspect the child identity");
+    assert_eq!(dry_run.downloaded, 0);
+    assert!(
+        !capture
+            .events()
+            .iter()
+            .any(|event| event.message() == Some("[DRY RUN] Would download"))
+    );
+    assert_eq!(
+        fs::read(rows[0].local_path.as_ref().unwrap()).unwrap(),
+        body
+    );
 }
 
 #[tokio::test]
