@@ -8,8 +8,8 @@ use crate::download::planner::TaskPlanner;
 use crate::download::retry::build_pending_retry_download_tasks;
 use crate::download::{DownloadConfig, DownloadRunMode, file};
 use crate::icloud::photos::{PhotoAsset, PhotosSession};
+use crate::state::{DownloadStateStore, ReconciliationStateStore, SqliteStateDb, VersionSizeKey};
 use crate::state::{ReconciliationContent, ReconciliationPathKey, ReconciliationReservation};
-use crate::state::{ReconciliationStateStore, SqliteStateDb, VersionSizeKey};
 use crate::test_helpers::TestAssetRecord;
 use crate::types::AssetVersionSize;
 use base64::Engine as _;
@@ -378,7 +378,7 @@ async fn issue_770_recovery_recorded_choice_replays_across_sqlite_reopen() {
     assert_eq!(first.tasks[0].download_path, old_path);
     assert!(matches!(
         first.tasks[0].publication(),
-        file::FinalPublication::NoReplace
+        file::FinalPublication::CreateOnly
     ));
     let db = config.state_db.take().unwrap();
     let before = db.get_reconciliation_reservations().await.unwrap();
@@ -652,7 +652,7 @@ impl RecoveryFixture {
         assert_eq!(rows[0].local_checksum.as_deref(), Some(local.as_str()));
         let expected_download_checksum = match proof {
             PublicationProof::Download => Some(local.as_str()),
-            PublicationProof::Adoption => None,
+            PublicationProof::Adoption => Some(local.as_str()),
         };
         assert_eq!(
             rows[0].download_checksum.as_deref(),
@@ -918,13 +918,14 @@ async fn issue_770_recovery_adopts_only_durable_exact_hash_proof_in_every_pass_o
             let checksum = file::compute_sha256(&fixture.destination).await.unwrap();
             fixture
                 .db
-                .mark_downloaded(
+                .mark_verified_download(
                     "PrimarySync",
                     "PENDING",
                     "original",
                     &fixture.destination,
                     &checksum,
-                    None,
+                    Some(&checksum),
+                    false,
                 )
                 .await
                 .unwrap();
@@ -983,13 +984,14 @@ async fn issue_770_recovery_failed_adoption_write_rechecks_proof_after_restart()
     let checksum = file::compute_sha256(&fixture.destination).await.unwrap();
     fixture
         .db
-        .mark_downloaded(
+        .mark_verified_download(
             "PrimarySync",
             "PENDING",
             "original",
             &fixture.destination,
             &checksum,
-            None,
+            Some(&checksum),
+            false,
         )
         .await
         .unwrap();
@@ -1183,37 +1185,47 @@ async fn issue_770_recovery_durable_metadata_hash_preserves_size_and_download_pr
             CancellationToken::new(),
         )
         .await;
+    // A generic legacy source/local mismatch does not prove a metadata rewrite.
+    // Keep the pending evidence and bytes across reopens until a bound receipt exists.
     assert!(
-        matches!(adopted.outcome, DownloadOutcome::Success),
+        matches!(adopted.outcome, DownloadOutcome::PartialFailure { .. }),
         "{adopted:?}"
     );
     assert_eq!(adopted.stats.downloaded, 0);
-    assert!(fixture.db.get_pending().await.unwrap().is_empty());
-    assert!(fixture.db.get_failed().await.unwrap().is_empty());
-    let rows = fixture.db.get_downloaded_page(0, 10).await.unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].size_bytes, provider_size as u64);
-    assert_eq!(rows[0].local_checksum.as_deref(), Some(local_hash.as_str()));
+    assert!(
+        fixture
+            .db
+            .get_downloaded_page(0, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let pending = fixture.db.get_pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].size_bytes, provider_size as u64);
     assert_eq!(
-        rows[0].download_checksum.as_deref(),
+        pending[0].local_checksum.as_deref(),
+        Some(local_hash.as_str())
+    );
+    assert_eq!(
+        pending[0].download_checksum.as_deref(),
         Some(source_hash.as_str())
     );
     assert_eq!(std::fs::read(&fixture.destination).unwrap(), fixture.bytes);
     fixture.assert_preserved().await;
-    let receipts = fixture.receipt_snapshot().await;
     fixture.reopen().await;
-    assert_eq!(
-        fixture
-            .run(
-                &[PassKind::Unfiled, PassKind::SmartFolder],
-                CancellationToken::new()
-            )
-            .await
-            .stats
-            .downloaded,
-        0
+    let reopened = fixture
+        .run(
+            &[PassKind::Unfiled, PassKind::SmartFolder],
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(reopened.outcome, DownloadOutcome::PartialFailure { .. }),
+        "{reopened:?}"
     );
-    assert_eq!(fixture.receipt_snapshot().await, receipts);
+    assert_eq!(std::fs::read(&fixture.destination).unwrap(), fixture.bytes);
+    assert_eq!(fixture.db.get_pending().await.unwrap().len(), 1);
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
@@ -2139,11 +2151,239 @@ async fn issue_770_recovery_collecting_incremental_retains_unreceipted_reserved_
             CancellationToken::new(), std::time::Duration::from_secs(3600),
         ).await.unwrap();
         assert_eq!(result.stats.downloaded, 0);
-        assert!(result.stats.enumeration_errors > 0);
+        assert_eq!(result.stats.enumeration_errors, 0);
+        assert_eq!(result.stats.skipped.uncertain, 1);
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert_eq!(
+            result.sync_token.as_deref(),
+            Some("synthetic-created-successor")
+        );
         assert_eq!(std::fs::read(&fixture.destination).unwrap(), fixture.bytes);
         assert!(server.received_requests().await.unwrap().is_empty());
         fixture.assert_preserved().await;
     }
+}
+
+#[tokio::test]
+async fn issue_770_recovery_collecting_mixed_work_publishes_healthy_and_retries_uncertain() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct CountLookup {
+        inner: RecoveryLookupSession,
+        lookups: Arc<AtomicUsize>,
+        lookup_bodies: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for CountLookup {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            if url.contains("/records/lookup?") {
+                self.lookups.fetch_add(1, Ordering::SeqCst);
+                self.lookup_bodies
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&body)?);
+            }
+            self.inner.post(url, body, headers).await
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    let server = crate::start_wiremock_or_skip!();
+    let mut fixture = RecoveryFixture::new(&server).await;
+    std::fs::create_dir_all(fixture.destination.parent().unwrap()).unwrap();
+    std::fs::write(&fixture.destination, &fixture.bytes).unwrap();
+    fixture.config.folder_structure = "old-album".into();
+    fixture.db.acquire_lock("seed prior retry attempts").unwrap().execute(
+        "UPDATE assets SET download_attempts=3, last_error='prior synthetic failure' WHERE library='PrimarySync' AND id='PENDING' AND version_size='original'", [],
+    ).unwrap();
+    let before = fixture.db.get_pending().await.unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].download_attempts, 3);
+    let healthy = incremental_photo_records_with_url(
+        "HEALTHY",
+        "healthy.jpg",
+        &format!("{}/healthy.jpg", server.uri()),
+        fixture.bytes.len() as u64,
+    );
+    let mut records = fixture.records.clone();
+    records.extend(healthy);
+    Mock::given(method("GET"))
+        .and(path("/healthy.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(fixture.bytes.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut pass = issue_770_pass(PassKind::Unfiled, &records);
+    pass.album = album_with_session(
+        "PrimarySync",
+        "",
+        Box::new(
+            crate::test_helpers::MockPhotosFlow::new()
+                .changes_zone_page(records, "mixed-successor", false)
+                .build(),
+        ),
+    );
+    let result =
+        crate::download::orchestration::incremental::download_photos_incremental_collecting_inner(
+            &Client::new(),
+            &[pass],
+            &Arc::new(fixture.config.clone()),
+            "mixed-predecessor",
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.stats.downloaded, 1, "{result:?}");
+    assert_eq!(result.stats.skipped.uncertain, 1);
+    assert!(
+        matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ),
+        "{result:?}"
+    );
+    assert_eq!(result.sync_token.as_deref(), Some("mixed-successor"));
+    let rows = fixture.db.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id.as_ref(), "asset-HEALTHY");
+    let healthy_path = rows[0].local_path.as_ref().unwrap().clone();
+    assert_eq!(
+        healthy_path,
+        fixture.root.path().join("old-album/healthy_YXNzZXQ.JPG")
+    );
+    let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(&fixture.bytes));
+    assert_eq!(rows[0].local_checksum.as_deref(), Some(digest.as_str()));
+    assert_eq!(rows[0].download_checksum.as_deref(), Some(digest.as_str()));
+    assert_eq!(std::fs::read(&healthy_path).unwrap(), fixture.bytes);
+    assert_eq!(std::fs::read(&fixture.destination).unwrap(), fixture.bytes);
+    let pending = fixture.db.get_pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id.as_ref(), "PENDING");
+    assert_eq!(pending[0].download_attempts, 3);
+    let diagnostics = crate::state::db::match_diagnostics::MatchDiagnostics::decode(
+        pending[0].last_error.as_deref().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        diagnostics.last_transfer_error.as_deref(),
+        Some("prior synthetic failure")
+    );
+    assert!(
+        diagnostics
+            .attempts
+            .iter()
+            .any(|attempt| attempt.child == "asset-PENDING")
+    );
+    let ledger = fixture.db.get_reconciliation_reservations().await.unwrap();
+    assert!(fixture.ledger.iter().all(|entry| ledger.contains(entry)));
+    for (key, value) in [
+        ("sync_token:PrimarySync", "checkpoint-before"),
+        ("config_hash", "active-before"),
+        ("pending_download_config_hash", "staged-after"),
+    ] {
+        assert_eq!(
+            fixture.db.get_metadata(key).await.unwrap().as_deref(),
+            Some(value)
+        );
+    }
+    fixture.reopen().await;
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let lookup_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut retry_pass = issue_770_pass(PassKind::Unfiled, &fixture.records);
+    retry_pass.album = album_with_session(
+        "PrimarySync",
+        "",
+        Box::new(CountLookup {
+            inner: RecoveryLookupSession {
+                records: Arc::new(fixture.records.clone()),
+                enumerate: false,
+            },
+            lookups: lookups.clone(),
+            lookup_bodies: lookup_bodies.clone(),
+        }),
+    );
+    let retry = download_photos_with_sync(
+        &Client::new(),
+        &[retry_pass],
+        Arc::new(fixture.config.clone()),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        lookups.load(Ordering::SeqCst) > 0,
+        "pending work must be retried after healthy progress"
+    );
+    assert!(
+        lookup_bodies.lock().unwrap().iter().any(|body| {
+            body["records"].as_array().is_some_and(|records| {
+                records
+                    .iter()
+                    .any(|record| record["recordName"] == "PENDING")
+            })
+        }),
+        "targeted lookup must request the pending master"
+    );
+    assert!(
+        matches!(retry.outcome, DownloadOutcome::PartialFailure { .. }),
+        "{retry:?}"
+    );
+    assert_eq!(retry.stats.downloaded, 0);
+    fixture.reopen().await;
+    let pending = fixture.db.get_pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id.as_ref(), "PENDING");
+    // The ordinary full-sync retry owner starts a new per-sync attempt budget.
+    assert_eq!(pending[0].download_attempts, 0);
+    let diagnostics = crate::state::db::match_diagnostics::MatchDiagnostics::decode(
+        pending[0].last_error.as_deref().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        diagnostics.last_transfer_error.as_deref(),
+        Some("prior synthetic failure")
+    );
+    assert!(
+        diagnostics
+            .attempts
+            .iter()
+            .any(|attempt| attempt.child == "asset-PENDING")
+    );
+    let rows = fixture.db.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id.as_ref(), "asset-HEALTHY");
+    assert_eq!(rows[0].local_path.as_ref(), Some(&healthy_path));
+    assert_eq!(rows[0].local_checksum.as_deref(), Some(digest.as_str()));
+    assert_eq!(rows[0].download_checksum.as_deref(), Some(digest.as_str()));
+    assert_eq!(std::fs::read(&healthy_path).unwrap(), fixture.bytes);
+    assert_eq!(std::fs::read(&fixture.destination).unwrap(), fixture.bytes);
+    let ledger = fixture.db.get_reconciliation_reservations().await.unwrap();
+    assert!(fixture.ledger.iter().all(|entry| ledger.contains(entry)));
+    for (key, value) in [
+        ("sync_token:PrimarySync", "checkpoint-before"),
+        ("config_hash", "active-before"),
+        ("pending_download_config_hash", "staged-after"),
+    ] {
+        assert_eq!(
+            fixture.db.get_metadata(key).await.unwrap().as_deref(),
+            Some(value)
+        );
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[path = "reservation_integrity.rs"]

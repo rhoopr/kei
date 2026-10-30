@@ -1388,7 +1388,10 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         }
         tracing::info!("All incremental assets already downloaded or filtered");
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
-        let failed_count = enumeration_errors
+        let failed_count = stats
+            .skipped
+            .uncertain
+            .saturating_add(enumeration_errors)
             .saturating_add(delta_summary.state_transition_failures)
             .saturating_add(planning_state_write_failures)
             .saturating_add(rewrite_failures);
@@ -1644,7 +1647,8 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         ));
     }
 
-    let outcome = if failed > 0
+    let outcome = if stats.skipped.uncertain > 0
+        || failed > 0
         || pass_result.exif_failures > 0
         || pass_result.state_write_failures > 0
         || delta_summary.state_transition_failures > 0
@@ -1652,7 +1656,8 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         || enumeration_errors > 0
     {
         DownloadOutcome::PartialFailure {
-            failed_count: failed
+            failed_count: stats.skipped.uncertain
+                + failed
                 + pass_result.exif_failures
                 + pass_result.state_write_failures
                 + delta_summary.state_transition_failures
