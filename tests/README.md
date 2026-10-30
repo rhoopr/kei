@@ -821,16 +821,16 @@ qualification. Retry-only known failures cannot hide unqueued omitted assets;
 a RUNNING album-plan transition must rebuild the omitted album after FINISHED.
 File-backed replay debt also bypasses an otherwise quiet watch pre-check.
 
-`primary_layout::indexing` additionally starts with real managed files or an
-interrupted journal, reopens SQLite between phases, and proves RUNNING remains
-blocked under primary and recorded-layout suffix modes. FINISHED inventory is
-read-only with exact media/sidecar/journal/catalogue oracles; durable full
-materialization recovers previously unqueued assets with an empty change feed.
-Inventory faults cover regression, cancellation, bounds, stale planning, invalid
-identity, missing token and atomic transition failure. Publication faults retain
-full debt/cursor through failed transfers, checkpoint writes, cancellation,
-bounds and regression. Pending-only journals remain managed under suffix;
-local edits, foreign collisions and sidecars retain the normal protection owners.
+`primary_layout::indexing` uses real files and a recorded authorized journal
+operation, reopening SQLite between cycles. RUNNING holds the source cursor
+while ordinary work and recorded recovery retain their own safety gates. FINISHED
+full inventory qualifies replay of the exact old cursor. Faults cover regression,
+cancellation, bounds, stale planning, invalid identity, missing token, failed
+transfer and checkpoint transition failure. The tests retain local modifications,
+foreign collisions and pending match evidence, then exercise recovery and a quiet
+reopen. Previously recorded materialization debt survives a failed transfer until
+full recovery and retained-cursor replay. A modified sidecar is preserved when no
+rewrite was requested.
 
 
 ## Running

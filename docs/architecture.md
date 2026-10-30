@@ -942,7 +942,8 @@ checkpoints remain unchanged. Cross-zone album sources also contribute readiness
 While indexing, the download dispatcher uses full queries without incremental
 replay, retained-work admission, metadata repair, retry retirement, or album
 snapshot completion. Ordinary media still uses the existing verified publication
-and durable finalization path. Managed primary layouts wait for `FINISHED`.
+and durable finalization path. Current naming is prospective; recorded authorized
+layout operations recover through their journal independently of new layout planning.
 Watch cycles with a hold bypass the database no-change shortcut and rebuild
 collection and album plans so omitted albums can reappear after indexing.
 
@@ -969,24 +970,18 @@ metadata, stale scope, missing proof, state-write failure, and readiness
 regression cannot qualify an inventory or advance its cursor. Provisional
 inventory cannot replace a comparable inventory anchor.
 
-Managed primary configuration, recorded bindings and pending operations retain
-the RUNNING guard, including a later suffix configuration. Once FINISHED, the
-held phase uses the same full-enumeration owner and token/EOF evidence, but
-only consumes validated provider identities. It does not invoke local task
-planning, journal recovery, publication, metadata drains, retry retirement or
-snapshot pruning. A fresh FINISHED plan, unbounded selected scope, valid token
-and final FINISHED observations from every source qualify that inventory.
-The fenced transition additionally writes
-`indexing_materialization_required:<zone>`. Presence, including unknown payloads,
-forces a fresh full managed materialization through the existing journal and
-publication owners before retained-cursor replay. It bypasses quiet watch
-shortcuts and refreshes plans across restarts. An empty change feed therefore
-cannot omit assets that inventory-only qualification never queued.
+Indexing reconciliation uses ordinary source matching and publication, including
+for libraries with recorded primary layouts. It does not plan new historical
+layout convergence. Previously authorized operations retain their recorded
+recovery path, including after a naming change. A completed FINISHED inventory
+writes replay debt without creating new materialization debt.
 
-Managed materialization debt survives retry-only/bounded runs, failed transfers,
-metadata failure, interruption, regression and checkpoint-write failure. When an
-old cursor exists, both full publication and its incremental bridge must qualify
-before one checkpoint transaction removes materialization and replay debt.
+Existing `indexing_materialization_required:<zone>` debt remains recognized
+across reopen. It forces full processing and survives retry-only or bounded runs,
+failed transfers, metadata failure, interruption, regression and checkpoint-write
+failure. When an old cursor exists, full publication and its incremental bridge
+must qualify before one checkpoint transaction removes materialization and replay
+debt.
 Existing local-byte, collision, sidecar, ownership and interrupted-journal guards
 still control every managed write. Readiness probes are observations, not an
 atomic snapshot guarantee from Apple.
