@@ -2289,7 +2289,7 @@ async fn contract_source_checkpoint_requires_durable_recovery_and_temp_file_dele
 }
 
 #[tokio::test]
-async fn primary_layout_private_generations_remain_complete_across_edits() {
+async fn primary_layout_private_edit_retains_occupied_original_and_processes_new_work() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
@@ -2297,54 +2297,189 @@ async fn primary_layout_private_generations_remain_complete_across_edits() {
         private: true,
         ..CycleOptions::default()
     };
-    for (edit, bytes) in [
-        (None, ORIGINAL),
-        (Some(("edit-one", EDIT_ONE)), EDIT_ONE),
-        (Some(("edit-two", EDIT_TWO)), EDIT_TWO),
-        (None, ORIGINAL),
-    ] {
-        let (result, _) = cycle_options(
-            root.path(),
-            records(&server, edit),
-            false,
-            EditedNaming::Primary,
-            options(),
-        )
-        .await;
-        assert_eq!(result.failed_count, 0, "{:?}", result.stats);
-        assert!(result.db_sync_token_advance_safe, "{:?}", result.stats);
-        assert_bytes(&media.join("IMG_0501.JPG"), bytes);
+    let (initial, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0);
+    assert!(initial.db_sync_token_advance_safe);
+    assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+    let mut current = records(&server, Some(("edit-one", EDIT_ONE)));
+    let mut new = records(&server, None);
+    for record in &mut new {
+        record["recordName"] = json!(record["recordName"].as_str().unwrap().replace("501", "502"));
+        if let Some(reference) = record["fields"].get_mut("masterRef") {
+            reference["value"]["recordName"] = json!("502");
+        }
+    }
+    new[0]["fields"]["filenameEnc"]["value"] = json!("NEW_0502.JPG");
+    new[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/edit-two",server.uri()),"size":EDIT_TWO.len(),"fileChecksum":provider_hash(EDIT_TWO)});
+    current.extend(new);
+    let mut quiet_snapshot = None;
+    for (round, (edit, quiet, uncertain, downloads, generations, debt)) in [
+        (Some(("edit-one", EDIT_ONE)), false, 1, 1, 1, 1),
+        (Some(("edit-two", EDIT_TWO)), false, 2, 0, 2, 2),
+        (None, false, 1, 0, 3, 2),
+        (None, true, 0, 0, 3, 2),
+        (None, true, 0, 0, 3, 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut page = records(&server, edit);
+        page.extend(current[2..].to_vec());
+        let (result, lookups) =
+            cycle_options(root.path(), page, quiet, EditedNaming::Primary, options()).await;
+        assert_eq!(
+            result.stats.skipped.uncertain, uncertain,
+            "round {round}: {result:?}"
+        );
+        assert_eq!(
+            result.stats.downloaded, downloads,
+            "round {round}: {result:?}"
+        );
+        assert!(
+            result.db_sync_token_advance_safe,
+            "round {round}: {result:?}"
+        );
+        if quiet {
+            assert_eq!(result.failed_count, 0);
+            assert_eq!(lookups, 0);
+        }
+        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
+        assert_bytes(&media.join("NEW_0502.JPG"), EDIT_TWO);
+        assert!(!media.join("IMG_0501_original.JPG").exists());
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cycle-token")
+        );
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1, "round {round}: {pending:?}");
+        assert_eq!(pending[0].id.as_ref(), "asset-501");
+        assert_eq!(pending[0].version_size.as_str(), "adjusted");
+        assert!(
+            pending[0]
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("unsupported_provider_proof_without_valid_receipt"))
+        );
+        drop(db);
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let receipt: (String, String, String, String) = conn.query_row("SELECT local_checksum, source_checksum, provider_checksum, local_path FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+        assert_eq!(receipt.0, format!("{:x}", Sha256::digest(ORIGINAL)));
+        assert_eq!(receipt.0, receipt.1);
+        assert_eq!(receipt.2, provider_hash(ORIGINAL));
+        assert_eq!(std::path::Path::new(&receipt.3), media.join("IMG_0501.JPG"));
+        let current_receipt: (String, String, String) = conn.query_row("SELECT local_checksum, source_checksum, provider_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-502' AND version_size='original'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(current_receipt.0, format!("{:x}", Sha256::digest(EDIT_TWO)));
+        assert_eq!(current_receipt.0, current_receipt.1);
+        assert_eq!(current_receipt.2, provider_hash(EDIT_TWO));
+        let pending_checksum: String = conn.query_row("SELECT checksum FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted' AND status='pending' AND local_path IS NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            pending_checksum,
+            provider_hash(if round == 0 { EDIT_ONE } else { EDIT_TWO })
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'"
+            ),
+            0
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations"
+            ),
+            0
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM assets WHERE library='PrimarySync' AND id='asset-502' AND version_size='original' AND status='downloaded'"
+            ),
+            1
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM provider_active_generations WHERE sealed=1 AND checkpoint_ready=1"
+            ),
+            generations
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM provider_active_generations WHERE sealed=0 OR checkpoint_ready=0"
+            ),
+            0
+        );
         assert_eq!(
             db_count(
                 root.path(),
                 "SELECT COUNT(*) FROM provider_active_destinations WHERE admitted=1 AND (verified_media=0 OR verified_metadata=0)"
             ),
-            0
+            debt
         );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND admitted=1 AND verified_media=0 AND verified_metadata=0"
+            ),
+            debt
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='original' AND admitted=1 AND verified_media=1 AND verified_metadata=1"
+            ),
+            generations
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM provider_active_destinations WHERE child='asset-502' AND version_size='original' AND admitted=1 AND verified_media=1 AND verified_metadata=1"
+            ),
+            1
+        );
+        for bytes in [EDIT_ONE, EDIT_TWO].into_iter().take(debt as usize) {
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND checksum=?1 AND verified_media=0 AND verified_metadata=0", [provider_hash(bytes)], |r| r.get(0)).unwrap();
+            assert_eq!(count, 1);
+        }
+        if quiet {
+            let snapshot: Vec<String> = ["SELECT json_array(id,sealed,checkpoint_ready) FROM provider_active_generations ORDER BY id", "SELECT json_array(generation,child,version_size,checksum,verified_media,verified_metadata) FROM provider_active_destinations ORDER BY generation,child,version_size", "SELECT json_array(id,version_size,status,checksum,last_error) FROM assets ORDER BY id,version_size"].into_iter().flat_map(|sql| conn.prepare(sql).unwrap().query_map([], |r| r.get::<_,String>(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap()).collect();
+            if let Some(previous) = &quiet_snapshot {
+                assert_eq!(&snapshot, previous);
+            }
+            quiet_snapshot = Some(snapshot);
+        }
     }
-    assert!(
-        db_count(
-            root.path(),
-            "SELECT COUNT(*) FROM provider_active_generations"
-        ) > 0,
-        "fixture never activated private selection"
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.url.path() == "/original")
+            .count(),
+        1
     );
-    let downloads = server.received_requests().await.unwrap().len();
-    for _ in 0..2 {
-        let (quiet, lookups) = cycle_options(
-            root.path(),
-            records(&server, None),
-            true,
-            EditedNaming::Primary,
-            options(),
-        )
-        .await;
-        assert_eq!(quiet.failed_count, 0);
-        assert!(quiet.db_sync_token_advance_safe);
-        assert_eq!(quiet.stats.downloaded, 0);
-        assert_eq!(lookups, 0);
-        assert_eq!(server.received_requests().await.unwrap().len(), downloads);
-    }
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.url.path() == "/edit-two")
+            .count(),
+        1
+    );
 }
 
 #[cfg(feature = "xmp")]
