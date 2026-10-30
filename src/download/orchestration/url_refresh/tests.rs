@@ -20,14 +20,13 @@ use crate::commands::{AlbumPass, PassKind};
 use crate::download::filter::DownloadTask;
 use crate::icloud::photos::PhotosSession;
 use crate::state::{SqliteStateDb, VersionSizeKey};
-use crate::test_helpers::MockPhotosFlow;
 
 use super::super::dispatch::download_photos_with_sync;
 use super::super::incremental::download_photos_incremental_collecting_inner;
 use super::super::models::{DownloadControls, DownloadOutcome, SyncMode};
 use super::super::test_support::{
     album_with_session, album_with_session_and_container, changes_zone_response,
-    incremental_photo_records_with_url, mock_album, relation_delta_record, retry_test_task,
+    incremental_photo_records_with_url, relation_delta_record, retry_test_task,
     seed_complete_album_snapshot, test_config,
 };
 use super::RetryTaskKey;
@@ -56,12 +55,14 @@ fn cleanup_retry_key_preserves_identity_rendition_library_and_destination() {
 #[derive(Clone, Debug)]
 struct SharedChangesZoneSession {
     responses: Arc<std::sync::Mutex<std::collections::VecDeque<Value>>>,
+    lookup_requests: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl SharedChangesZoneSession {
     fn new(responses: Vec<Value>) -> Self {
         Self {
             responses: Arc::new(std::sync::Mutex::new(responses.into())),
+            lookup_requests: Arc::default(),
         }
     }
 }
@@ -71,9 +72,12 @@ impl PhotosSession for SharedChangesZoneSession {
     async fn post(
         &self,
         url: &str,
-        _body: String,
+        body: String,
         _headers: &[(&str, &str)],
     ) -> anyhow::Result<Value> {
+        if url.contains("/records/lookup?") {
+            self.lookup_requests.lock().expect("poisoned").push(body);
+        }
         let mut responses = self.responses.lock().expect("poisoned");
         if url.contains("/records/lookup?") {
             let current = responses.front().expect("fresh lookup fixture");
@@ -346,11 +350,13 @@ async fn incremental_expired_urls_are_refreshed_and_retried_same_cycle() {
     Mock::given(method("GET"))
         .and(path("/expired-url-1.jpg"))
         .respond_with(ResponseTemplate::new(410))
+        .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/expired-url-2.jpg"))
         .respond_with(ResponseTemplate::new(410))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -363,6 +369,7 @@ async fn incremental_expired_urls_are_refreshed_and_retried_same_cycle() {
                 .set_body_bytes(body.clone())
                 .insert_header("content-type", "image/jpeg"),
         )
+        .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -372,6 +379,7 @@ async fn incremental_expired_urls_are_refreshed_and_retried_same_cycle() {
                 .set_body_bytes(body)
                 .insert_header("content-type", "image/jpeg"),
         )
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -408,13 +416,13 @@ async fn incremental_expired_urls_are_refreshed_and_retried_same_cycle() {
                 "PrimarySync",
                 "Vacation",
                 Some("container-vacation"),
-                Box::new(album_session),
+                Box::new(album_session.clone()),
             ),
             exclude_ids: Arc::new(FxHashSet::default()),
         },
         AlbumPass {
             kind: PassKind::Unfiled,
-            album: mock_album("", MockPhotosFlow::new().build()),
+            album: album_with_session("PrimarySync", "", Box::new(album_session.clone())),
             exclude_ids: Arc::new(FxHashSet::default()),
         },
     ];
@@ -438,6 +446,16 @@ async fn incremental_expired_urls_are_refreshed_and_retried_same_cycle() {
     .await
     .expect("expired incremental URLs should be refreshed and retried");
 
+    {
+        let lookups = album_session.lookup_requests.lock().expect("poisoned");
+        assert!(lookups.len() >= 2, "child and paired lookups: {lookups:?}");
+        for child in ["asset-URL_AGED_ONE", "asset-URL_AGED_TWO"] {
+            assert!(
+                lookups.iter().any(|body| body.contains(child)),
+                "missing child lookup: {child}"
+            );
+        }
+    }
     assert!(matches!(result.outcome, DownloadOutcome::Success));
     assert_eq!(result.stats.downloaded, 2);
     assert_eq!(result.stats.failed, 0);

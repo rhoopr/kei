@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Synthetic cycle control for a changed distinct-occupant receipt.
 use crate::icloud::photos::{PhotoLibrary, PhotosSession};
 use crate::sync_loop::test_support::{
