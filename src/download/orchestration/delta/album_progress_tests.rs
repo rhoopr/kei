@@ -225,6 +225,8 @@ fn targets() -> FxHashSet<String> {
 async fn issue958_sparse_late_pair_and_retry_preserve_results() {
     for (name, late, shared, retry, expected_seconds) in [
         ("master_only_eof", false, false, false, 23),
+        ("late_local_pair", true, false, false, 24),
+        ("late_local_pair_retry", true, false, true, 27),
         ("late_owner_pair", true, true, false, 24),
         ("late_owner_pair_retry", true, true, true, 27),
         ("owner_eof_then_shared_pair", false, true, false, 25),
@@ -237,10 +239,19 @@ async fn issue958_sparse_late_pair_and_retry_preserve_results() {
         }
         let mut missing = targets();
         let (capture, _guard) = crate::test_helpers::TracingCapture::install();
-        let assets = album
+        let result = album
             .hydrate_matching_assets_from_changes(&mut missing)
-            .await
-            .unwrap();
+            .await;
+        if shared {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "Missing authenticated selecting owner"
+            );
+            assert_eq!(missing, targets());
+            assert!(session.trace.lock().unwrap().is_empty());
+            continue;
+        }
+        let assets = result.unwrap();
         assert_eq!(
             session.started.elapsed().as_secs(),
             expected_seconds,
@@ -286,6 +297,48 @@ async fn issue958_sparse_late_pair_and_retry_preserve_results() {
             })
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue958_authenticated_source_link_hydrates_exact_targets() {
+    let session = SparseFixture::new(1, false).authenticated();
+    let album = session
+        .album("PrimarySync")
+        .with_cross_zone_sources(vec![session.album("SharedSync-fixture")]);
+    let mut missing = targets();
+    let assets = album
+        .hydrate_matching_assets_from_changes(&mut missing)
+        .await
+        .unwrap();
+    assert!(missing.is_empty());
+    let ids: FxHashSet<_> = assets
+        .iter()
+        .map(|asset| asset.asset_record_name().to_owned())
+        .collect();
+    assert_eq!(ids, targets());
+    assert!(
+        assets
+            .iter()
+            .all(|asset| asset.source_zone() == Some("SharedSync-fixture"))
+    );
+    let trace = session.trace.lock().unwrap();
+    assert!(trace.iter().all(|event| event["kind"] != "page_start"));
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| event["kind"] == "lookup_start" && event["source"] == "PrimarySync")
+            .count(),
+        2
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(
+                |event| event["kind"] == "lookup_start" && event["source"] == "SharedSync-fixture"
+            )
+            .count(),
+        4
+    );
 }
 
 #[tokio::test(start_paused = true)]

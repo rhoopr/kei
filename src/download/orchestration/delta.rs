@@ -1037,14 +1037,8 @@ async fn hydrate_unpaired_created_asset_deltas_inner(
                 .await;
             match resolution {
                 RecordResolution::AssetPresent { master_record_name } => {
-                    summary
-                        .persist_asset_master_mapping(
-                            state_id.as_str(),
-                            master_record_name.as_str(),
-                            &config.library,
-                            config,
-                        )
-                        .await;
+                    // The child names a candidate, but only the confirmed pair
+                    // below may replace a durable family mapping.
                     pending.extend(indices.into_iter().map(|index| {
                         (
                             index,

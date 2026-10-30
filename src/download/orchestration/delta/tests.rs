@@ -921,6 +921,7 @@ async fn asset_only_delta_recovers_identity_refreshes_metadata_and_advances_toke
         };
         let mut config = test_config();
         config.directory = Arc::from(dir.path());
+        config.refresh_metadata = true;
         config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         let media_path =
             seed_downloaded_metadata_asset(db.as_ref(), &config, &pass, &stored_asset).await;
@@ -943,8 +944,10 @@ async fn asset_only_delta_recovers_identity_refreshes_metadata_and_advances_toke
         assert_eq!(
             session_probe.records_query_count(),
             match identity_source {
-                IdentitySource::ProviderLookup | IdentitySource::StaleState => 2,
-                IdentitySource::Delta | IdentitySource::State => 1,
+                IdentitySource::ProviderLookup
+                | IdentitySource::StaleState
+                | IdentitySource::State => 2,
+                IdentitySource::Delta => 1,
             },
             "{identity_source:?}"
         );
@@ -2729,6 +2732,13 @@ async fn issue958_album_groups_share_one_fallback_per_source() {
         )
         .await;
         let calls = probe.calls.lock().unwrap();
+        if cross_zone {
+            assert!(calls.is_empty());
+            assert_eq!(probe.lookup_calls.load(Ordering::SeqCst), 0);
+            assert!(summary.token_unsafe_reason.is_some());
+            assert!(mapping.is_empty() && complete.is_empty() && downloads.is_empty());
+            continue;
+        }
         if lookup_error.is_some() {
             assert!(calls.is_empty());
             assert_eq!(summary.auth_errors, 1);

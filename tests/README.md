@@ -214,8 +214,9 @@ or power-loss durability.
 
 The `issue958_` hydration regressions use synthetic child/master lookups and
 200-record change pages. They check complete-pair and source-scope rejection,
-100-target lookup batches, cross-zone priority, and one fallback scan per shared
-source chain across two or 25 album groups. An absent target remains unresolved.
+100-target lookup batches, one same-source fallback scan across two or 25 album
+groups, and authenticated cross-zone links to exact targets. Unauthenticated
+cross-zone searches stop before requests; an absent target remains unresolved.
 Cancellation after two masters-only pages reproduces the orphan-buffer warning;
 it does not diagnose a provider fault. File-backed production-cycle tests stop
 during direct relation lookup or a later fallback page, reopen the preserved
