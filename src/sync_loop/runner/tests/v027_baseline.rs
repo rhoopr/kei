@@ -1710,6 +1710,12 @@ mod sidecar_namespace;
 
 #[tokio::test]
 async fn issue1044_confirmed_delta_deletion_survives_unrelated_sparse_hold_after_baseline() {
+    // Force both sides of the second-resolution promotion boundary.
+    confirmed_delta_deletion_with_seen_at(0, "pending").await;
+    confirmed_delta_deletion_with_seen_at(i64::MAX, "failed").await;
+}
+
+async fn confirmed_delta_deletion_with_seen_at(seen_at: i64, expected_status: &str) {
     use crate::state::SparseIdentityStore as _;
 
     #[derive(Clone)]
@@ -1829,6 +1835,13 @@ async fn issue1044_confirmed_delta_deletion_survives_unrelated_sparse_hold_after
                 .filename("pending.jpg")
                 .build();
             db.upsert_seen(&pending).await.unwrap();
+            db.acquire_lock("set deterministic promotion boundary")
+                .unwrap()
+                .execute(
+                    "UPDATE assets SET last_seen_at=?1 WHERE library='PrimarySync' AND id='deleted-master'",
+                    [seen_at],
+                )
+                .unwrap();
             db.upsert_asset_master_mapping("PrimarySync", "asset-deleted-master", "deleted-master")
                 .await
                 .unwrap();
@@ -1967,7 +1980,15 @@ async fn issue1044_confirmed_delta_deletion_survives_unrelated_sparse_hold_after
             "SELECT status,is_deleted,deleted_at FROM assets WHERE library='PrimarySync' AND id='deleted-master' AND version_size='original'",
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
-        assert_eq!(retired, ("failed".into(), 1, Some(1_792_541_032)));
+        assert_eq!(retired, (expected_status.into(), 1, Some(1_792_541_032)));
+        // The second reopened cycle must not retry a confirmed deletion.
+        let deletion_lookups = lookups
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|names| names.iter().any(|name| name == "deleted-master"))
+            .count();
+        assert_eq!(deletion_lookups, 1, "cycle={cycle}");
         let mut stmt = conn.prepare("SELECT version_size,status,is_deleted FROM assets WHERE library='PrimarySync' AND id='live-master' ORDER BY version_size").unwrap();
         let rows = stmt
             .query_map([], |row| {
