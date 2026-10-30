@@ -449,6 +449,7 @@ async fn import_child_identity_survives_sync_fresh_import_reopen_and_unchanged_s
     use base64::Engine as _;
     use serde_json::json;
     use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
 
@@ -464,6 +465,8 @@ async fn import_child_identity_survives_sync_fresh_import_reopen_and_unchanged_s
         ),
     ] {
         let server = crate::start_wiremock_or_skip!();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
         let dir = TempDir::new().unwrap();
         let mut assets = Vec::new();
         let second_child = if prefix_collision {
@@ -516,20 +519,26 @@ async fn import_child_identity_survives_sync_fresh_import_reopen_and_unchanged_s
                 let checksum =
                     base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
                 fields[format!("{key}Res")] = json!({"value": {
-                    "size": body.len(), "downloadURL": format!("{}{route}", server.uri()),
+                    "size": body.len(), "downloadURL": if tag == 1 && suffix == "orig" {
+                        format!("http://{address}{route}")
+                    } else {
+                        format!("{}{route}", server.uri())
+                    },
                     "fileChecksum": checksum,
                 }});
                 fields[format!("{key}FileType")] = json!({"value": file_type});
-                Mock::given(method("GET"))
-                    .and(path(route))
-                    .respond_with(
-                        ResponseTemplate::new(200)
-                            .set_body_bytes(body)
-                            .insert_header("content-type", mime),
-                    )
-                    .expect(1)
-                    .mount(&server)
-                    .await;
+                if tag != 1 || suffix != "orig" {
+                    Mock::given(method("GET"))
+                        .and(path(route))
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .set_body_bytes(body)
+                                .insert_header("content-type", mime),
+                        )
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                }
             }
             let child_fields = json!({
                 "assetDate": {"value": 1736899200000.0},
@@ -556,17 +565,74 @@ async fn import_child_identity_survives_sync_fresh_import_reopen_and_unchanged_s
         config.edited = true;
         config.state_db = Some(original_db.clone());
         config.concurrent_downloads = 1;
-        let first = stream_and_download_from_stream(
-            &Client::new(),
-            stream::iter(assets.clone().into_iter().map(Ok::<_, anyhow::Error>)),
-            &Arc::new(config.clone()),
-            DownloadControls::download_hidden(),
-            2,
-            CancellationToken::new(),
-            StreamRuntime::new(None, None),
-        )
-        .await
-        .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        // The first worker waits for admission of a second-child task. The
+        // producer computes every match for that child before recording it;
+        // its two-slot queue can hold the other first-child tasks meanwhile.
+        let serve_first = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                anyhow::ensure!(request.len() < 4096, "fixture request exceeded bound");
+                let mut byte = [0];
+                anyhow::ensure!(
+                    socket.read(&mut byte).await? == 1,
+                    "incomplete fixture request"
+                );
+                request.push(byte[0]);
+            }
+            anyhow::ensure!(
+                request.starts_with(b"GET /alpha-child-orig "),
+                "unexpected fixture request"
+            );
+            started_tx
+                .send(())
+                .map_err(|_value| anyhow::anyhow!("gate observer dropped"))?;
+            release_rx.await?;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nContent-Type: image/jpeg\r\nConnection: close\r\n\r\n\xff\xd8\xff\xe0\x00\x10\x01\x00").await?;
+            socket.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
+        });
+        let admit_second = async {
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                started_rx.await?;
+                loop {
+                    if original_db
+                        .get_pending()
+                        .await?
+                        .iter()
+                        .any(|row| row.id.as_ref() == second_child)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await;
+            // Release even on timeout or DB error so the transfer can finish.
+            let _ = release_tx.send(());
+            observed
+        };
+        let client = Client::new();
+        let first_config = Arc::new(config.clone());
+        let first_run = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            stream_and_download_from_stream(
+                &client,
+                stream::iter(assets.clone().into_iter().map(Ok::<_, anyhow::Error>)),
+                &first_config,
+                DownloadControls::download_hidden(),
+                2,
+                CancellationToken::new(),
+                StreamRuntime::new(None, None),
+            ),
+        );
+        let (first, admitted, served) = tokio::join!(first_run, admit_second, serve_first);
+        admitted.unwrap().unwrap();
+        served.unwrap().unwrap();
+        let first = first.unwrap().unwrap();
         assert_eq!(first.downloaded, 6, "{policy:?}/{raw_policy:?}: {first:?}");
         assert!(first.failed.is_empty());
         let mut before = original_db.get_downloaded_page(0, 100).await.unwrap();
@@ -822,8 +888,77 @@ async fn import_child_identity_survives_sync_fresh_import_reopen_and_unchanged_s
         assert_eq!(unchanged.state_write_failures, 0);
         assert_eq!(unchanged.enumeration_errors, 0);
         assert_eq!(fs::read_dir(dir.path().join("photos")).unwrap().count(), 6);
-        assert!(reopened.get_pending().await.unwrap().is_empty());
-        assert_eq!(reopened.get_downloaded_page(0, 100).await.unwrap().len(), 6);
+        let mut pending = reopened.get_pending().await.unwrap();
+        pending.sort_by(|a, b| {
+            (&a.id, a.version_size.as_str()).cmp(&(&b.id, b.version_size.as_str()))
+        });
+        assert_eq!(pending.len(), 6);
+        for (row, imported) in pending.iter().zip(&after) {
+            assert_eq!(
+                (
+                    &row.id,
+                    row.version_size,
+                    &row.local_path,
+                    &row.checksum,
+                    &row.local_checksum,
+                    &row.metadata.metadata_hash
+                ),
+                (
+                    &imported.id,
+                    imported.version_size,
+                    &imported.local_path,
+                    &imported.checksum,
+                    &imported.local_checksum,
+                    &imported.metadata.metadata_hash
+                )
+            );
+            assert!(row.last_error.as_deref().is_some_and(|error| {
+                error.contains("no_valid_receipt_or_supported_provider_proof")
+            }));
+        }
+        assert!(
+            reopened
+                .get_downloaded_page(0, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(reopened);
+        let reopened = SqliteStateDb::open(&import_path).await.unwrap();
+        let mut again = reopened.get_pending().await.unwrap();
+        again.sort_by(|a, b| {
+            (&a.id, a.version_size.as_str()).cmp(&(&b.id, b.version_size.as_str()))
+        });
+        assert_eq!(again.len(), 6);
+        for (row, old) in again.iter().zip(&pending) {
+            assert_eq!(
+                (
+                    &row.id,
+                    row.version_size,
+                    &row.local_path,
+                    &row.checksum,
+                    &row.local_checksum,
+                    &row.metadata.metadata_hash,
+                    &row.last_error
+                ),
+                (
+                    &old.id,
+                    old.version_size,
+                    &old.local_path,
+                    &old.checksum,
+                    &old.local_checksum,
+                    &old.metadata.metadata_hash,
+                    &old.last_error
+                )
+            );
+        }
+        assert!(
+            reopened
+                .get_downloaded_page(0, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         for (row, content) in after.iter().zip(bytes) {
             assert_eq!(fs::read(row.local_path.as_ref().unwrap()).unwrap(), content);
         }
