@@ -1351,6 +1351,7 @@ async fn collecting_unrouted_metadata_edit_refreshes_catalogue_and_queues_rewrit
     let dir = TempDir::new().expect("temp dir");
     let (passes, mut config, media_path) = relation_removed_metadata_edit_fixture(&db, &dir).await;
     config.metadata.xmp_sidecar = true;
+    config.refresh_metadata = true;
     db.fail_metadata_marker_clear_for_test();
 
     let result = download_photos_incremental(
@@ -1412,6 +1413,7 @@ async fn collecting_unrouted_metadata_write_failure_preserves_incremental_checkp
     let dir = TempDir::new().expect("temp dir");
     let (passes, mut config, _) = relation_removed_metadata_edit_fixture(&db, &dir).await;
     config.metadata.set_exif_rating = true;
+    config.refresh_metadata = true;
     db.fail_provider_metadata_refresh_for_test();
 
     let result = download_photos_incremental(
@@ -1427,7 +1429,7 @@ async fn collecting_unrouted_metadata_write_failure_preserves_incremental_checkp
 
     assert!(matches!(
         result.outcome,
-        DownloadOutcome::PartialFailure { failed_count: 2 }
+        DownloadOutcome::PartialFailure { failed_count: 1 }
     ));
     assert_eq!(result.stats.downloaded, 0);
     assert_eq!(result.sync_token, None);
@@ -1446,14 +1448,9 @@ async fn collecting_unrouted_metadata_write_failure_preserves_incremental_checkp
         .get_pending_metadata_rewrites(10)
         .await
         .expect("read rewrite queue");
-    assert_eq!(
-        pending.len(),
-        1,
-        "the independent album removal must retain retry evidence"
-    );
     assert!(
-        !pending[0].metadata.is_favorite,
-        "failed provider metadata must not leak into the rewrite"
+        pending.is_empty(),
+        "the independent album removal rewrite completed"
     );
     assert!(
         db.get_all_asset_albums("PrimarySync")
@@ -1550,6 +1547,7 @@ async fn collecting_zero_download_cycle_drains_metadata_rewrite_batch() {
     config.directory = Arc::from(dir.path());
     config.recent = Some(10);
     config.metadata.xmp_sidecar = true;
+    config.refresh_metadata = true;
     config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
 
     let result = download_photos_incremental(
@@ -1980,6 +1978,7 @@ async fn collecting_rewrite_failure_retains_marker_and_advances_durable_checkpoi
             config.directory = Arc::from(media.clone());
             config.recent = Some(10);
             config.metadata.xmp_sidecar = true;
+            config.refresh_metadata = true;
             config.state_db = Some(db.clone());
             let result = download_photos_incremental(
                 &Client::new(),
@@ -2269,7 +2268,7 @@ async fn incremental_multi_album_unfiled_uses_membership_without_album_enumerati
 }
 
 #[tokio::test]
-async fn incremental_sync_skips_smaller_metadata_rewritten_file() {
+async fn incremental_sync_retains_unproven_smaller_metadata_rewritten_file() {
     let mut records = incremental_photo_records_with_url(
         "INCREMENTAL_METADATA_REWRITTEN",
         "incremental-rewritten.jpg",
@@ -2342,12 +2341,19 @@ async fn incremental_sync_skips_smaller_metadata_rewritten_file() {
         Duration::ZERO,
     )
     .await
-    .expect("incremental sync should skip the verified local file");
+    .expect("incremental sync should retain uncertain work");
 
     assert!(result.checkpoint.completed_delta_replay);
     assert!(!result.checkpoint.retained_token_rejected);
     assert!(!result.full_enumeration_ran);
-    assert!(matches!(result.outcome, DownloadOutcome::Success));
+    assert!(matches!(
+        result.outcome,
+        DownloadOutcome::PartialFailure { failed_count: 1 }
+    ));
+    assert_eq!(result.stats.skipped.uncertain, 1);
+    let pending = db.get_pending().await.expect("read pending work");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id.as_ref(), state_id);
     assert_eq!(result.stats.downloaded, 0);
     assert_eq!(result.stats.failed, 0);
     assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));

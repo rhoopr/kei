@@ -25,6 +25,7 @@ struct CurrentSession {
     calls: Arc<AtomicUsize>,
     rank_calls: Arc<AtomicUsize>,
     changes_cursors: Arc<Mutex<Vec<Option<String>>>>,
+    changes_records: Arc<Mutex<Vec<Value>>>,
     corrupt: Arc<Mutex<Option<&'static str>>>,
     discovery: bool,
     zone_name: Arc<str>,
@@ -65,7 +66,7 @@ impl PhotosSession for CurrentSession {
                 .unwrap()
                 .push(request["zones"][0]["syncToken"].as_str().map(str::to_owned));
             return Ok(
-                json!({"zones":[{"zoneID":{"zoneName":self.zone_name.as_ref(),"ownerRecordName":"_defaultOwner"},"records":[],"syncToken":"quiet-zone-cursor","moreComing":false}]}),
+                json!({"zones":[{"zoneID":{"zoneName":self.zone_name.as_ref(),"ownerRecordName":"_defaultOwner"},"records":self.changes_records.lock().unwrap().clone(),"syncToken":"quiet-zone-cursor","moreComing":false}]}),
             );
         }
         if url.contains("/internal/records/query/batch?") {
@@ -203,6 +204,7 @@ impl Fixture {
             calls: Arc::new(AtomicUsize::new(0)),
             rank_calls: Arc::new(AtomicUsize::new(0)),
             changes_cursors: Arc::new(Mutex::new(Vec::new())),
+            changes_records: Arc::new(Mutex::new(Vec::new())),
             corrupt: Arc::new(Mutex::new(None)),
             discovery: false,
             zone_name: Arc::from("PrimarySync"),
@@ -2941,6 +2943,185 @@ fn destination_pass_with(
         album,
         exclude_ids: Arc::new(FxHashSet::default()),
     }
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn collecting_reuses_scoped_smaller_metadata_publication_after_reopen() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let source_dir = tempfile::tempdir().unwrap();
+    // The provider source has a long title; the real embedded writer replaces
+    // it with the shorter current provider title before publication.
+    let source_path = source_dir.path().join("provider.jpg");
+    std::fs::write(
+        &source_path,
+        include_bytes!("../../../../tests/data/media/pattern.jpg"),
+    )
+    .unwrap();
+    crate::download::metadata::apply_metadata(
+        &source_path,
+        &crate::download::metadata::MetadataWrite {
+            title: Some("long source title ".repeat(2048)),
+            ..Default::default()
+        },
+        ".part",
+    )
+    .unwrap();
+    let source = std::fs::read(&source_path).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/smaller-metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(source.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = Arc::from("{album}");
+    f.config.metadata.embed_xmp = true;
+    {
+        let mut current = f.session.records.lock().unwrap();
+        current[0]["fields"]["filenameEnc"] = json!({"value": "changed.JPG", "type": "STRING"});
+        current[0]["fields"]["resOriginalFileType"] = json!({"value": "public.jpeg"});
+        current[0]["fields"]["itemType"] = json!({"value": "public.jpeg"});
+        current[0]["fields"]["resOriginalRes"]["value"] = json!({
+            "downloadURL": format!("{}/smaller-metadata", server.uri()),
+            "size": source.len(),
+            "fileChecksum": data_encoding::BASE64.encode(&Sha256::digest(&source)),
+        });
+    }
+    let pass = destination_pass(&f, "A");
+    crate::download::orchestration::test_support::seed_complete_album_snapshot(
+        f.db.as_ref(),
+        "A",
+        "A",
+        &[("asset-m", "m")],
+    )
+    .await;
+    let initial = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        std::slice::from_ref(&pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(initial.stats.downloaded, 1, "{initial:?}");
+    let media = f.config.directory.join("A/changed.JPG");
+    let output = std::fs::read(&media).unwrap();
+    assert!(
+        output.len() < source.len(),
+        "source {}, output {}",
+        source.len(),
+        output.len()
+    );
+    let source_hash = format!("{:x}", Sha256::digest(&source));
+    let output_hash = format!("{:x}", Sha256::digest(&output));
+    assert_ne!(source_hash, output_hash);
+    let receipt: (String, String) = f
+        .db
+        .acquire_lock("verify publication proof")
+        .unwrap()
+        .query_row(
+            "SELECT source_checksum,local_checksum FROM download_receipts WHERE child='asset-m'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(receipt, (source_hash, output_hash));
+    let encoded_path = serde_json::to_string(&SelectionPath::from_path(&media)).unwrap();
+    let exact: i64 = f.db.acquire_lock("exact scoped publication").unwrap().query_row(
+        "SELECT count(*) FROM download_receipts WHERE child='asset-m' AND native_path=?1 AND source_checksum=?2 AND local_checksum=?3",
+        rusqlite::params![encoded_path, receipt.0, receipt.1], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(exact, 1);
+    drop(pass);
+    *f.session.changes_records.lock().unwrap() = f.session.records.lock().unwrap().clone();
+    f = reopen_destination_fixture(f).await;
+    let pass = destination_pass(&f, "A");
+    let result =
+        crate::download::orchestration::incremental::download_photos_incremental_collecting_inner(
+            &reqwest::Client::new(),
+            std::slice::from_ref(&pass),
+            &Arc::new(f.config.clone()),
+            "old-cursor",
+            controls(),
+            CancellationToken::new(),
+            tokio::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(result.outcome, crate::download::DownloadOutcome::Success),
+        "{result:?}"
+    );
+    assert_eq!(result.stats.downloaded, 0);
+    assert_eq!(result.stats.skipped.by_state, 1, "{result:?}");
+    assert_eq!(result.stats.skipped.uncertain, 0);
+    assert_eq!(result.sync_token.as_deref(), Some("quiet-zone-cursor"));
+    assert_eq!(std::fs::read(&media).unwrap(), output);
+    assert!(f.db.get_pending().await.unwrap().is_empty());
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let after: (String, String) = f
+        .db
+        .acquire_lock("receipt after collecting reuse")
+        .unwrap()
+        .query_row(
+            "SELECT source_checksum,local_checksum FROM download_receipts WHERE child='asset-m'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after, receipt);
+
+    // Changed bytes cannot inherit the completed publication's authority.
+    drop(pass);
+    let mut changed = output.clone();
+    changed[0] ^= 1;
+    std::fs::write(&media, &changed).unwrap();
+    f = reopen_destination_fixture(f).await;
+    let pass = destination_pass(&f, "A");
+    let refused =
+        crate::download::orchestration::incremental::download_photos_incremental_collecting_inner(
+            &reqwest::Client::new(),
+            std::slice::from_ref(&pass),
+            &Arc::new(f.config.clone()),
+            "quiet-zone-cursor",
+            controls(),
+            CancellationToken::new(),
+            tokio::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            refused.outcome,
+            crate::download::DownloadOutcome::PartialFailure { failed_count: 1 }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(refused.stats.skipped.uncertain, 1);
+    assert_eq!(refused.stats.downloaded, 0);
+    assert_eq!(refused.sync_token.as_deref(), Some("quiet-zone-cursor"));
+    assert_eq!(std::fs::read(&media).unwrap(), changed);
+    let pending = f.db.get_pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id.as_ref(), "asset-m");
+    let still: (String, String) = f
+        .db
+        .acquire_lock("receipt after changed-byte refusal")
+        .unwrap()
+        .query_row(
+            "SELECT source_checksum,local_checksum FROM download_receipts WHERE child='asset-m'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(still, receipt);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
