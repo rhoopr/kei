@@ -657,6 +657,7 @@ impl PendingRetryPlanning<'_> {
                             task.version_size,
                         ),
                         pass_index,
+                        recorded_pass: None,
                     },
                 );
             }

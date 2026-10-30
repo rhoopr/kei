@@ -710,6 +710,7 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
             master_record_name: "MASTER".into(),
             provider_version: VersionSizeKey::Original,
             pass_index: 0,
+            recorded_pass: None,
         },
     );
     let plan = build_incremental_expired_url_retry_tasks(
@@ -1050,4 +1051,90 @@ async fn incremental_refresh_preserves_frozen_raw_jpeg_provider_renditions() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn recorded_retry_refresh_uses_original_pass_not_current_index() {
+    use super::{RetryTaskKey, UrlRetrySource, build_incremental_expired_url_retry_tasks};
+    let original_requests = Arc::new(Mutex::new(Vec::new()));
+    let current_requests = Arc::new(Mutex::new(Vec::new()));
+    let records = incremental_photo_records_with_url(
+        "MASTER",
+        "old.jpg",
+        "https://p01.icloud-content.com/old",
+        8,
+    );
+    let original = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: album_with_session(
+            "PrimarySync",
+            "",
+            Box::new(BoundedSession {
+                delta: Arc::new(Vec::new()),
+                fresh: Arc::new(records),
+                requests: original_requests.clone(),
+            }),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let current = AlbumPass {
+        kind: PassKind::SmartFolder,
+        album: album_with_session(
+            "PrimarySync",
+            "Favorites",
+            Box::new(BoundedSession {
+                delta: Arc::new(Vec::new()),
+                fresh: Arc::new(Vec::new()),
+                requests: current_requests.clone(),
+            }),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let mut task = retry_test_task("child-state", VersionSizeKey::Original, "unused");
+    task.asset_record_name = "asset-MASTER".into();
+    task.size = 8;
+    let key = crate::download::orchestration::generation::pass_key(&original);
+    let mut sources = rustc_hash::FxHashMap::default();
+    sources.insert(
+        RetryTaskKey::from(&task),
+        UrlRetrySource {
+            asset_record_name: task.asset_record_name.clone(),
+            master_record_name: "MASTER".into(),
+            provider_version: VersionSizeKey::Original,
+            pass_index: 0,
+            recorded_pass: Some((key, original)),
+        },
+    );
+    let plan = build_incremental_expired_url_retry_tasks(
+        &[current],
+        &sources,
+        &[task.clone()],
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(
+        plan.tasks.len(),
+        1,
+        "old lookups={}, current lookups={}, unrefreshed={}",
+        original_requests.lock().unwrap().len(),
+        current_requests.lock().unwrap().len(),
+        plan.unrefreshed.len()
+    );
+    assert_eq!(plan.tasks[0].download_path, task.download_path);
+    assert_eq!(plan.tasks[0].checksum, task.checksum);
+    assert!(current_requests.lock().unwrap().is_empty());
+    assert_eq!(original_requests.lock().unwrap().len(), 2);
+    sources
+        .get_mut(&RetryTaskKey::from(&task))
+        .unwrap()
+        .recorded_pass
+        .as_mut()
+        .unwrap()
+        .0 = "wrong-key".into();
+    let refused =
+        build_incremental_expired_url_retry_tasks(&[], &sources, &[task], CancellationToken::new())
+            .await;
+    assert!(refused.tasks.is_empty());
+    assert_eq!(refused.unrefreshed.len(), 1);
+    assert_eq!(original_requests.lock().unwrap().len(), 2);
 }

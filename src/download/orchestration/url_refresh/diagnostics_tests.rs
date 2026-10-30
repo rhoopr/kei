@@ -483,6 +483,7 @@ async fn exact_refresh_diagnostics_scope_and_resource_matrix() {
                         UrlRetrySource {
                             asset_record_name: Arc::from(child),
                             pass_index: 0,
+                            recorded_pass: None,
                             master_record_name: Arc::from(master),
                             provider_version: rendition,
                         },

@@ -5212,7 +5212,7 @@ async fn private_historical_replay_windows_round_robin_and_persist_past_64_after
                 .unwrap();
             assert_eq!(selected.id, expected_root.id, "round-robin wave {wave}");
             let decisions =
-                f.db.retained_selection_decisions(owner(), selected.id)
+                f.db.retained_selection_decisions(owner(), selected.id, false)
                     .await
                     .unwrap();
             let expected: Vec<_> = if wave == 0 { 0..64 } else { 64..72 }
@@ -5248,7 +5248,7 @@ async fn private_historical_replay_windows_round_robin_and_persist_past_64_after
     }
     f = reopen_destination_fixture(f).await;
     let tail =
-        f.db.retained_selection_decisions(owner(), roots[0].id.clone())
+        f.db.retained_selection_decisions(owner(), roots[0].id.clone(), false)
             .await
             .unwrap();
     assert_eq!(
@@ -5529,7 +5529,7 @@ async fn private_quota_valid_large_source_declaration_keeps_same_root_healthy_ta
     for _ in 0..2 {
         f = reopen_destination_fixture(f).await;
         let scheduled =
-            f.db.retained_selection_decisions(owner(), root.id.clone())
+            f.db.retained_selection_decisions(owner(), root.id.clone(), false)
                 .await
                 .unwrap();
         assert_eq!(
@@ -5862,6 +5862,12 @@ async fn explicit_native_refresh_failure_reopens_under_normal_sync_without_rewri
 
 #[tokio::test]
 async fn private_smart_selector_preserves_existing_dispatch_and_retained_debt_gate() {
+    crate::download::orchestration::generation::TEST_GENERATION_FORMAT
+        .scope(1, legacy_smart_selector_retained_debt_gate())
+        .await;
+}
+
+async fn legacy_smart_selector_retained_debt_gate() {
     let (mut f, root, _, _) = Box::pin(active_pending_fixture()).await;
     f.pass.kind = PassKind::SmartFolder;
     f.config.media = crate::config::MediaSelection {
@@ -9013,4 +9019,99 @@ async fn scoped_album_removal_explicit_refresh_preserves_owned_media() {
 #[tokio::test]
 async fn scoped_album_removal_explicit_embedded_refresh_preserves_capture_mtime() {
     Box::pin(scoped_membership_refresh_fixture(true)).await;
+}
+
+#[tokio::test]
+async fn legacy_recorded_policy_requires_exact_production_fingerprint_and_scope() {
+    use crate::download::orchestration::generation::{context_for_format, legacy_recorded_passes};
+    use crate::state::db::provider_generations::ActiveGeneration;
+    let f = Fixture::new().await;
+    let globals = crate::config::GlobalArgs {
+        username: Some("synthetic@example.invalid".into()),
+        domain: None,
+        data_dir: Some(f.dir.path().to_string_lossy().into_owned()),
+    };
+    let app = crate::config::Config::build(
+        &globals,
+        &crate::cli::PasswordArgs::default(),
+        crate::cli::SyncArgs::default(),
+        None,
+    )
+    .unwrap();
+    let hashes = [
+        crate::download::compute_config_hash_for_unfiled(&app, false),
+        crate::download::compute_config_hash_for_unfiled(&app, true),
+    ];
+    assert_ne!(hashes[0], hashes[1]);
+    let mut old = f.config.clone();
+    old.enum_config_hash = Some(hashes[1].clone().into());
+    old.legacy_enum_hashes = Some([hashes[0].clone().into(), hashes[1].clone().into()]);
+    let old_context = context_for_format(std::slice::from_ref(&f.pass), &old, controls(), 1)
+        .await
+        .unwrap()
+        .unwrap();
+    let root = ActiveGeneration {
+        id: "synthetic".into(),
+        spec: old_context.spec(&old, "synthetic".into()),
+        sealed: true,
+        checkpoint_ready: true,
+        checkpoint_veto: None,
+    };
+    let mut current = old.clone();
+    current.enum_config_hash = Some(hashes[0].clone().into());
+    let context = context_for_format(std::slice::from_ref(&f.pass), &current, controls(), 2)
+        .await
+        .unwrap()
+        .unwrap();
+    let replay = |root: &ActiveGeneration, config: &super::DownloadConfig| {
+        legacy_recorded_passes(root, &context, std::slice::from_ref(&f.pass), config).unwrap()
+    };
+    assert_eq!(replay(&root, &current).unwrap().len(), 1);
+    let mut changed = current.clone();
+    changed.folder_structure = "changed-template".into();
+    assert!(replay(&root, &changed).is_none());
+    let mut changed = current.clone();
+    changed.raw_policy = crate::types::RawPolicy::PreferRaw;
+    assert!(replay(&root, &changed).is_none());
+    let mut changed = current.clone();
+    changed.media.videos = false;
+    assert!(replay(&root, &changed).is_none());
+    let mut changed = current.clone();
+    changed.filename_exclude = Arc::from(vec![glob::Pattern::new("*.jpg").unwrap()]);
+    assert!(replay(&root, &changed).is_none());
+    let mut changed = current.clone();
+    changed.skip_created_before = Some(crate::config::CreatedDateFilter::Instant(
+        chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+    ));
+    assert!(replay(&root, &changed).is_none());
+    let mut changed = current.clone();
+    changed.metadata.set_exif_datetime = true;
+    assert!(replay(&root, &changed).is_none());
+    let mut changed = current.clone();
+    changed.repair_truncated = !changed.repair_truncated;
+    assert!(replay(&root, &changed).is_none());
+    let mut changed = current.clone();
+    changed.max_download_attempts += 1;
+    assert!(replay(&root, &changed).is_none());
+    let mut changed = current.clone();
+    changed.recent = Some(1);
+    assert!(replay(&root, &changed).is_none());
+    let other = Fixture::new().await;
+    assert!(
+        legacy_recorded_passes(&root, &context, std::slice::from_ref(&other.pass), &current)
+            .unwrap()
+            .is_none()
+    );
+    let mut wrong_scope = root.clone();
+    wrong_scope.spec.scope.push_str("-other");
+    assert!(replay(&wrong_scope, &current).is_none());
+    let mut wrong_zone = root.clone();
+    wrong_zone.spec.zone["zoneName"] = json!("other");
+    assert!(replay(&wrong_zone, &current).is_none());
+    let mut wrong_key = root.clone();
+    wrong_key.spec.profile["passes"][0]["key"] = json!("bad");
+    assert!(replay(&wrong_key, &current).is_none());
+    let mut no_enum_evidence = current.clone();
+    no_enum_evidence.legacy_enum_hashes = None;
+    assert!(replay(&root, &no_enum_evidence).is_none());
 }

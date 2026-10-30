@@ -569,6 +569,10 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             max_download_attempts: config.retry.max_download_attempts,
             sync_mode,
             enum_config_hash: Some(Arc::clone(&enum_config_hash)),
+            legacy_enum_hashes: Some([
+                download::compute_config_hash_for_unfiled(&config, false).into(),
+                download::compute_config_hash_for_unfiled(&config, true).into(),
+            ]),
             album_name: None,
             exclude_asset_ids,
             asset_groupings,

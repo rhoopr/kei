@@ -794,22 +794,34 @@ where
                     // A newly saved destination must not preclude recovery of
                     // the proven current publication. Consume each recovery
                     // once and reserve only the remaining transfer tasks.
-                    let recovered = match recover_pending_current_publications(
-                        producer_state_db.as_deref(),
-                        config,
-                        &asset,
-                        &download_ctx,
-                        &mut task_planner,
-                        &plan.tasks,
-                        &producer_shutdown,
-                    )
-                    .await
+                    // A legacy recorded obligation owns its frozen path. Generic
+                    // pending adoption can nominate a different matching file;
+                    // exact recorded reuse is already checked by projection.
+                    let recovered = if config
+                        .selection_run
+                        .as_ref()
+                        .is_some_and(|run| run.is_changed_legacy_retry(config))
                     {
-                        Ok(recovered) => recovered,
-                        Err(error) => {
-                            enum_errors_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::error!(%error, "Current publication recovery refused unsafe local evidence");
-                            continue 'assets;
+                        Default::default()
+                    } else {
+                        match recover_pending_current_publications(
+                            producer_state_db.as_deref(),
+                            config,
+                            &asset,
+                            &download_ctx,
+                            &mut task_planner,
+                            &plan.tasks,
+                            &producer_shutdown,
+                        )
+                        .await
+                        {
+                            Ok(recovered) => recovered,
+                            Err(error) => {
+                                enum_errors_producer
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::error!(%error, "Current publication recovery refused unsafe local evidence");
+                                continue 'assets;
+                            }
                         }
                     };
                     state_write_failures_producer.fetch_add(

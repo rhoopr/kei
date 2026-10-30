@@ -827,6 +827,14 @@ impl TaskPlanner {
             {
                 Ok(receipts) => {
                     for receipt in receipts {
+                        if config
+                            .selection_run
+                            .as_ref()
+                            .is_some_and(|run| run.is_changed_legacy_retry(config))
+                            && receipt.native_path.to_path() != task.download_path
+                        {
+                            continue;
+                        }
                         if self.has_durable_destination(task)
                             && task.download_path != receipt.native_path.to_path()
                         {
@@ -976,6 +984,47 @@ impl TaskPlanner {
             } else {
                 Default::default()
             };
+        // Changed legacy selection may only settle its admitted frozen copy.
+        // A same-checksum file for another child is not authority to move it.
+        if config
+            .selection_run
+            .as_ref()
+            .is_some_and(|run| run.is_changed_legacy_retry(config))
+        {
+            if !selected_copy_scope.admitted {
+                return super::baseline_matching::uncertain(
+                    "recorded_destination_not_admitted",
+                    Some(&task.download_path),
+                );
+            }
+            return match super::file::retain_pending_file(&config.directory, &task.download_path)
+                .await
+            {
+                Ok(None) => {
+                    let Some(db) = config.state_db.as_deref() else {
+                        return super::baseline_matching::uncertain(
+                            "recorded_source_database_missing",
+                            Some(&task.download_path),
+                        );
+                    };
+                    match db.guard_primary_writer(&task.download_path).await {
+                        Ok(()) => super::baseline_matching::BaselineMatch::Missing,
+                        Err(_) => super::baseline_matching::uncertain(
+                            "scoped_receipt_or_reservation_validation_failed",
+                            Some(&task.download_path),
+                        ),
+                    }
+                }
+                Ok(Some(_)) => super::baseline_matching::uncertain(
+                    "recorded_destination_occupied_without_receipt",
+                    Some(&task.download_path),
+                ),
+                Err(_) => super::baseline_matching::uncertain(
+                    "candidate_unreadable_unsafe_or_changed",
+                    Some(&task.download_path),
+                ),
+            };
+        }
         let discovered = self.discover_baseline_family(asset, requested).await;
         // A separately admitted absent destination may ignore an independently
         // authenticated occupant, but only for the particular path proved here.

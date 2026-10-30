@@ -866,6 +866,16 @@ replaying a newer inventory cannot seal an interrupted old window. Configuration
 or source changes create a distinct generation or require existing validated
 reseed. They cannot acknowledge omitted eligibility or old unresolved debt.
 
+After selection changes, a due admitted format-1 media destination can be
+retried at its frozen path when the original complete configuration fingerprint
+matches current non-selection policy. The selector-only Unfiled hash encoding
+is reconstructed from current policy; an absent or unknown hash is not proof.
+The provider owner reconstructs only validated private passes from the current
+authenticated source, and fresh confirmation must match the saved facts. A
+changed legacy retry does not adopt another path or an unreceipted occupied
+path. Failed URL refresh remains bound to the recorded pass and source.
+Incompatible roots rotate fairly without consuming a transfer attempt.
+
 Destination media completion requires an actual confined file fingerprint and
 independently verified selected source checksum. A versioned local-trust
 alternative can settle an explicitly accepted legacy file after a fresh scoped

@@ -1347,6 +1347,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                         task.version_size,
                     ),
                     pass_index: *pass_index,
+                    recorded_pass: None,
                 },
             );
         }

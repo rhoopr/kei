@@ -28,6 +28,7 @@ pub(in crate::download) struct RetryTaskKey {
 pub(in crate::download) struct UrlRetrySource {
     pub(in crate::download) asset_record_name: Arc<str>,
     pub(in crate::download) pass_index: usize,
+    pub(in crate::download) recorded_pass: Option<(String, crate::commands::AlbumPass)>,
     pub(in crate::download) master_record_name: Arc<str>,
     pub(in crate::download) provider_version: VersionSizeKey,
 }
@@ -78,6 +79,29 @@ impl CleanupRetryPlan {
     }
 }
 
+fn same_retry_owner(
+    expected: &crate::icloud::photos::PhotoAlbum,
+    actual: &crate::icloud::photos::PhotoAlbum,
+    library: &str,
+) -> bool {
+    if expected.selection_scope() != actual.selection_scope() {
+        return false;
+    }
+    match (
+        expected.publication_scope(library),
+        actual.publication_scope(library),
+    ) {
+        (Ok(None), Ok(None)) => true,
+        (Ok(Some((a, scope_a, zone_a))), Ok(Some((b, scope_b, zone_b)))) => {
+            a.owner == b.owner
+                && Arc::ptr_eq(&a.db, &b.db)
+                && scope_a == scope_b
+                && zone_a == zone_b
+        }
+        _ => false,
+    }
+}
+
 /// Refresh only the URL on already-selected tasks. Their original destination,
 /// rendition, metadata and publication authorization retain the first pass's
 /// selection evidence, including deferred unfiled exclusions.
@@ -95,11 +119,20 @@ async fn refresh_failed_download_urls(
                 .get(&RetryTaskKey::from(task))
                 .is_some_and(|source| {
                     source.asset_record_name == task.asset_record_name
-                        && passes.get(source.pass_index).is_some_and(|pass| {
-                            pass.album
-                                .task_source(task.library.as_ref())
-                                .is_ok_and(|source| source.is_some())
-                        })
+                        && source
+                            .recorded_pass
+                            .as_ref()
+                            .is_none_or(|(key, pass)| super::generation::pass_key(pass) == *key)
+                        && source
+                            .recorded_pass
+                            .as_ref()
+                            .map(|(_, pass)| &pass.album)
+                            .or_else(|| passes.get(source.pass_index).map(|pass| &pass.album))
+                            .is_some_and(|album| {
+                                album
+                                    .task_source(task.library.as_ref())
+                                    .is_ok_and(|source| source.is_some())
+                            })
                 })
         })
     };
@@ -125,16 +158,20 @@ async fn refresh_failed_download_urls(
         "Starting targeted download URL refresh"
     );
     let mut refreshed_zones = FxHashSet::default();
+    let mut refreshed_albums: Vec<crate::icloud::photos::PhotoAlbum> = Vec::new();
     let mut source_albums = Vec::new();
     for pass in passes {
         source_albums.push(pass.album.clone());
     }
     if let Some(sources) = retry_sources {
         for task in failed_tasks {
-            if let Some(pass) = sources
-                .get(&RetryTaskKey::from(task))
-                .and_then(|source| passes.get(source.pass_index))
-                && let Ok(Some(album)) = pass.album.task_source(task.library.as_ref())
+            if let Some(source) = sources.get(&RetryTaskKey::from(task))
+                && let Some(owner) = source
+                    .recorded_pass
+                    .as_ref()
+                    .map(|(_, pass)| &pass.album)
+                    .or_else(|| passes.get(source.pass_index).map(|pass| &pass.album))
+                && let Ok(Some(album)) = owner.task_source(task.library.as_ref())
             {
                 source_albums.push(album);
             }
@@ -145,17 +182,52 @@ async fn refresh_failed_download_urls(
             break;
         }
         let zone = album.zone_name();
-        if !refreshed_zones.insert(zone) {
+        if retry_sources.is_none() && !refreshed_zones.insert(zone.to_owned()) {
+            continue;
+        }
+        if retry_sources.is_some()
+            && refreshed_albums
+                .iter()
+                .any(|previous| same_retry_owner(previous, album, zone))
+        {
             continue;
         }
         let requests: Vec<_> = failed_tasks
             .iter()
-            .filter(|task| task.library.as_ref() == zone && source_matches(task))
+            .filter(|task| {
+                task.library.as_ref() == zone
+                    && source_matches(task)
+                    && retry_sources.is_none_or(|sources| {
+                        sources
+                            .get(&RetryTaskKey::from(*task))
+                            .and_then(|source| {
+                                source
+                                    .recorded_pass
+                                    .as_ref()
+                                    .map(|(_, pass)| &pass.album)
+                                    .or_else(|| {
+                                        passes.get(source.pass_index).map(|pass| &pass.album)
+                                    })
+                            })
+                            .and_then(|owner| {
+                                owner.task_source(task.library.as_ref()).ok().flatten()
+                            })
+                            .is_some_and(|owner| {
+                                same_retry_owner(&owner, album, task.library.as_ref())
+                            })
+                    })
+            })
             .map(|task| task.asset_record_name.as_ref())
             .collect::<FxHashSet<_>>()
             .into_iter()
             .map(|name| RecordLookupRequest::asset_only(ProviderRecordId::new(name)))
             .collect();
+        if requests.is_empty() {
+            continue;
+        }
+        if retry_sources.is_some() {
+            refreshed_albums.push(album.clone());
+        }
         planned_unique_child_requests += requests.len();
         let resolutions = tokio::select! {
             biased;
@@ -251,6 +323,25 @@ async fn refresh_failed_download_urls(
             for task in failed_tasks.iter().filter(|task| {
                 task.library.as_ref() == zone
                     && source_matches(task)
+                    && retry_sources.is_none_or(|sources| {
+                        sources
+                            .get(&RetryTaskKey::from(*task))
+                            .and_then(|source| {
+                                source
+                                    .recorded_pass
+                                    .as_ref()
+                                    .map(|(_, pass)| &pass.album)
+                                    .or_else(|| {
+                                        passes.get(source.pass_index).map(|pass| &pass.album)
+                                    })
+                            })
+                            .and_then(|owner| {
+                                owner.task_source(task.library.as_ref()).ok().flatten()
+                            })
+                            .is_some_and(|owner| {
+                                same_retry_owner(&owner, album, task.library.as_ref())
+                            })
+                    })
                     && task.asset_record_name.as_ref() == asset.asset_record_name()
             }) {
                 if retry_sources.is_some_and(|sources| {

@@ -37,7 +37,7 @@ const DEFERRED_REASON: &str = "selection_generation_deferred";
 
 #[cfg(test)]
 tokio::task_local! {
-    pub(super) static TEST_GENERATION_FORMAT: u8;
+    pub(crate) static TEST_GENERATION_FORMAT: u8;
 }
 
 fn generation_format() -> u8 {
@@ -259,13 +259,37 @@ pub(crate) async fn has_current_observation(
         .await?)
 }
 
-async fn context_for_format(
+pub(super) async fn context_for_format(
     passes: &[AlbumPass],
     config: &DownloadConfig,
     controls: DownloadControls,
     format: u8,
 ) -> Result<Option<SelectionContext>> {
     context_for_source(passes, config, controls, format, None).await
+}
+
+fn selection_policy(
+    config: &DownloadConfig,
+    scope: &str,
+    zone: &Value,
+    binding: Option<&Value>,
+    paths: String,
+    enum_hash: Option<&str>,
+    anchored_root: &SelectionPath,
+) -> Value {
+    let mut policy = json!({"format":1,"scope":scope,"zone":zone,
+        "paths":paths,"anchored_root":anchored_root,
+        "before":config.skip_created_before.map(crate::config::CreatedDateFilter::fingerprint),
+        "after":config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
+        "enum_hash":enum_hash,"metadata_flags":crate::download::pipeline::MetadataFlags::from(config).bits(),
+        "capture_revision":crate::state::METADATA_CAPTURE_REVISION,
+        "capture_repair":format!("{:?}",config.capture_timestamp_repair),
+        "repair_truncated":config.repair_truncated,"attempt_limit":config.max_download_attempts,
+    });
+    if let (Some(binding), Some(object)) = (binding, policy.as_object_mut()) {
+        object.insert("selector_binding".into(), binding.clone());
+    }
+    policy
 }
 
 async fn context_for_source(
@@ -368,17 +392,15 @@ async fn context_for_source(
     }
     let anchored_root = SelectionPath::from_path(&std::path::absolute(&config.directory)?);
     let policy = |paths: String| {
-        let mut policy = json!({"format":1,"scope":scope,"zone":zone,
-            "paths":paths,"anchored_root":anchored_root,
-            "before":config.skip_created_before.map(crate::config::CreatedDateFilter::fingerprint),"after":config.skip_created_after.map(crate::config::CreatedDateFilter::fingerprint),
-            "enum_hash":config.enum_config_hash.as_deref(),"metadata_flags":crate::download::pipeline::MetadataFlags::from(config).bits(),
-            "capture_revision":crate::state::METADATA_CAPTURE_REVISION,"capture_repair":format!("{:?}",config.capture_timestamp_repair),
-            "repair_truncated":config.repair_truncated,"attempt_limit":config.max_download_attempts,
-        });
-        if let (Some(binding), Some(object)) = (&selector_binding, policy.as_object_mut()) {
-            object.insert("selector_binding".into(), binding.clone());
-        }
-        policy
+        selection_policy(
+            config,
+            &scope,
+            &zone,
+            selector_binding.as_ref(),
+            paths,
+            config.enum_config_hash.as_deref(),
+            &anchored_root,
+        )
     };
     if format == 2 {
         // Folder templates cannot revoke already admitted destinations. Keep
@@ -467,7 +489,7 @@ pub(crate) struct SelectionRun {
 }
 
 impl SelectionContext {
-    fn spec(&self, config: &DownloadConfig, basis: String) -> GenerationSpec {
+    pub(super) fn spec(&self, config: &DownloadConfig, basis: String) -> GenerationSpec {
         GenerationSpec {
             format: self.format,
             scope: self.scope.clone(),
@@ -666,6 +688,15 @@ fn classify_selection_reference_deferral(error: &anyhow::Error) -> bool {
 }
 
 impl SelectionRun {
+    pub(in crate::download) fn is_changed_legacy_retry(&self, config: &DownloadConfig) -> bool {
+        self.retained_retry
+            && self.root.spec.format == 1
+            && config
+                .selection_context
+                .as_ref()
+                .is_some_and(|context| context.config_hash != self.root.spec.config_hash)
+    }
+
     pub(in crate::download) fn for_asset(
         self: &Arc<Self>,
         asset: &PhotoAsset,
@@ -1166,15 +1197,25 @@ impl SelectionRun {
                 {
                     continue;
                 }
-                if run.root.spec.format == 2
+                if (run.root.spec.format == 2 || run.retained_retry)
                     && deferred.insert((key.clone(), task.asset_record_name.to_string()))
+                    && run
+                        .capture
+                        .db
+                        .selection_attempt_due(
+                            run.capture.owner.clone(),
+                            run.root.id.clone(),
+                            key.clone(),
+                            task.asset_record_name.to_string(),
+                        )
+                        .await?
                 {
                     self.capture
                         .db
                         .defer_selection_confirmation(
                             run.capture.owner.clone(),
                             run.root.id.clone(),
-                            key,
+                            key.clone(),
                             task.asset_record_name.to_string(),
                         )
                         .await?;
@@ -1197,6 +1238,7 @@ impl SelectionRun {
                             task.version_size,
                         ),
                         pass_index,
+                        recorded_pass: run.retained_retry.then(|| (key.clone(), pass.clone())),
                     },
                 ));
                 break;
@@ -2449,6 +2491,148 @@ async fn metadata_tail(
     Ok(priority.failed.saturating_add(result.failed))
 }
 
+pub(super) fn legacy_recorded_passes(
+    root: &ActiveGeneration,
+    context: &SelectionContext,
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+) -> Result<Option<Vec<AlbumPass>>> {
+    let profile = &root.spec.profile;
+    if root.spec.format != 1
+        || root.spec.scope != context.scope
+        || root.spec.zone != context.zone
+        || root.spec.metadata_flags != crate::download::pipeline::MetadataFlags::from(config).bits()
+        || root.spec.metadata_enabled
+            != crate::download::pipeline::MetadataFlags::from(config).has_any_write()
+        || profile.get("format") != Some(&json!(1))
+        || profile.get("coverage") != Some(&json!("observed_selection_window"))
+        || profile.get("recent") != Some(&json!(config.recent))
+        || profile.get("recent_scope") != Some(&json!(format!("{:?}", config.recent_scope)))
+        || profile.as_object().is_none_or(|o| o.len() != 6)
+    {
+        return Ok(None);
+    }
+    let Some(global_excludes) = profile.get("excludes").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    if global_excludes.iter().any(|v| v.as_str().is_none()) {
+        return Ok(None);
+    }
+    let Some(saved) = profile.get("passes").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    if saved.is_empty() {
+        return Ok(None);
+    }
+    let anchored_root = SelectionPath::from_path(&std::path::absolute(&config.directory)?);
+    let mut hashes: Vec<Option<&str>> = Vec::new();
+    if config.enum_config_hash.is_none() {
+        hashes.push(None);
+    } else if let Some(candidates) = &config.legacy_enum_hashes {
+        hashes.extend(candidates.iter().map(|hash| Some(hash.as_ref())));
+    }
+    let mut matches = false;
+    for enum_hash in hashes {
+        let mut policy = selection_policy(
+            config,
+            &root.spec.scope,
+            &root.spec.zone,
+            None,
+            hash_download_config(config),
+            enum_hash,
+            &anchored_root,
+        );
+        policy
+            .as_object_mut()
+            .context("Invalid selection policy")?
+            .insert("profile".into(), profile.clone());
+        matches |= digest(&serde_json::to_vec(&policy)?) == root.spec.config_hash;
+    }
+    if !matches {
+        return Ok(None);
+    }
+    let zone = root
+        .spec
+        .zone
+        .get("zoneName")
+        .and_then(Value::as_str)
+        .context("Missing retained zone")?;
+    let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in saved {
+        let Some(object) = item.as_object() else {
+            return Ok(None);
+        };
+        if object.len() != 4 {
+            return Ok(None);
+        }
+        let (Some(key), Some(kind), Some(scope), Some(excludes)) = (
+            item.get("key").and_then(Value::as_str),
+            item.get("kind").and_then(Value::as_str),
+            item.get("scope"),
+            item.get("excludes").and_then(Value::as_array),
+        ) else {
+            return Ok(None);
+        };
+        let kind = match kind {
+            "Unfiled" if scope.get("container_id") == Some(&Value::Null) => PassKind::Unfiled,
+            "Album"
+                if scope
+                    .get("container_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty()) =>
+            {
+                PassKind::Album
+            }
+            _ => return Ok(None),
+        };
+        let mut exclude_ids = rustc_hash::FxHashSet::default();
+        for value in excludes {
+            let Some(value) = value.as_str() else {
+                return Ok(None);
+            };
+            if !exclude_ids.insert(value.to_owned()) {
+                return Ok(None);
+            }
+        }
+        let mut reconstructed = None;
+        for pass in passes {
+            let Some(owner) = pass.album.task_source(zone)? else {
+                continue;
+            };
+            let Some((capture, source_scope, source_zone)) = owner.owned_private_scope()? else {
+                continue;
+            };
+            if capture.owner != context.capture.owner
+                || !Arc::ptr_eq(&capture.db, &context.capture.db)
+                || source_scope != root.spec.scope
+                || source_zone != root.spec.zone
+            {
+                continue;
+            }
+            if let Some(album) =
+                owner.recorded_private_selection(scope, &root.spec.scope, &root.spec.zone)?
+            {
+                reconstructed = Some(album);
+                break;
+            }
+        }
+        let Some(album) = reconstructed else {
+            return Ok(None);
+        };
+        let pass = AlbumPass {
+            kind,
+            album,
+            exclude_ids: Arc::new(exclude_ids),
+        };
+        if pass_key(&pass) != key || !seen.insert(key.to_owned()) {
+            return Ok(None);
+        }
+        result.push(pass);
+    }
+    Ok(Some(result))
+}
+
 async fn recover_retained(
     client: &Client,
     passes: &[AlbumPass],
@@ -2478,31 +2662,55 @@ async fn recover_retained(
             ..crate::download::pipeline::StreamingResult::default()
         });
     };
-    anyhow::ensure!(
-        (root.spec.profile == current.spec.profile
-            || (root.spec.format == 2
-                && current.spec.format == 2
-                && crate::state::db::provider_generations::retained_profiles_compatible(
-                    &root.spec.profile,
-                    &current.spec.profile
-                )))
-            && root.spec.zone == current.spec.zone
-            && root.spec.metadata_flags == current.spec.metadata_flags,
-        "Retained selection configuration disagrees"
-    );
-    let metadata = context
-        .capture
-        .db
-        .pending_selection_metadata(
-            context.capture.owner.clone(),
-            root.id.clone(),
-            metadata_writer_limits().0,
-        )
-        .await?;
+    let legacy = root.spec.format == 1 && root.spec.config_hash != context.config_hash;
+    let recovered_passes = if legacy {
+        match legacy_recorded_passes(&root, context, passes, config)? {
+            Some(passes) => passes,
+            None => {
+                context
+                    .capture
+                    .db
+                    .rotate_retained_selection_root(context.capture.owner.clone(), root.id.clone())
+                    .await?;
+                return Ok(crate::download::pipeline::StreamingResult {
+                    enumeration_complete: true,
+                    ..Default::default()
+                });
+            }
+        }
+    } else {
+        anyhow::ensure!(
+            (root.spec.profile == current.spec.profile
+                || (root.spec.format == 2
+                    && current.spec.format == 2
+                    && crate::state::db::provider_generations::retained_profiles_compatible(
+                        &root.spec.profile,
+                        &current.spec.profile
+                    )))
+                && root.spec.zone == current.spec.zone
+                && root.spec.metadata_flags == current.spec.metadata_flags,
+            "Retained selection configuration disagrees"
+        );
+        passes.to_vec()
+    };
+    let passes = recovered_passes.as_slice();
+    let metadata = if legacy {
+        Vec::new()
+    } else {
+        context
+            .capture
+            .db
+            .pending_selection_metadata(
+                context.capture.owner.clone(),
+                root.id.clone(),
+                metadata_writer_limits().0,
+            )
+            .await?
+    };
     let decisions = context
         .capture
         .db
-        .retained_selection_decisions(context.capture.owner.clone(), root.id.clone())
+        .retained_selection_decisions(context.capture.owner.clone(), root.id.clone(), legacy)
         .await?;
     let run = context.replay_run(root.clone(), passes, true, true);
     for decision in &decisions {
@@ -2535,6 +2743,12 @@ async fn recover_retained(
             break;
         }
         let key = pass_key(pass);
+        let mut pass_config = config.with_pass(pass);
+        if legacy {
+            let mut exclusions = (*pass.exclude_ids).clone();
+            exclusions.extend(config.exclude_asset_ids.iter().cloned());
+            pass_config.exclude_asset_ids = Arc::new(exclusions);
+        }
         let mut groups: BTreeMap<String, (Arc<SelectionRun>, Vec<Result<PhotoAsset>>)> =
             BTreeMap::new();
         for decision in decisions
@@ -2569,7 +2783,7 @@ async fn recover_retained(
             if let Some(asset) = asset {
                 let asset = asset.with_state_record_name(Arc::from(decision.state_id.clone()));
                 let (owner, asset) = run
-                    .prepare_replay_or_retain(decision, asset, &config.with_pass(pass))
+                    .prepare_replay_or_retain(decision, asset, &pass_config)
                     .await?;
                 groups
                     .entry(owner.root.id.clone())
@@ -2582,7 +2796,7 @@ async fn recover_retained(
             }
         }
         for (_, (run, assets)) in groups {
-            let mut effective = config.with_pass(pass);
+            let mut effective = pass_config.clone();
             effective.selection_run = Some(run.clone());
             effective.selection_pass = Some(key.clone());
             let result = crate::download::pipeline::stream_and_download_from_stream(
@@ -2610,8 +2824,10 @@ async fn recover_retained(
             super::models::merge_streaming_result(&mut combined, result);
         }
     }
-    combined.exif_failures +=
-        metadata_tail(config, &cancel, context, &root.id, Some(metadata)).await?;
+    if !legacy {
+        combined.exif_failures +=
+            metadata_tail(config, &cancel, context, &root.id, Some(metadata)).await?;
+    }
     context
         .capture
         .db

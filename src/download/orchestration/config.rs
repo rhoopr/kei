@@ -466,6 +466,13 @@ fn hash_download_config_with_date_bounds(
 /// incremental router can prove those cases from per-library tokens, trusted
 /// album snapshots, and targeted smart-folder refreshes.
 pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
+    compute_config_hash_for_unfiled(config, config.filters.selection.unfiled)
+}
+
+pub(crate) fn compute_config_hash_for_unfiled(
+    config: &crate::config::Config,
+    unfiled: bool,
+) -> String {
     use sha2::{Digest, Sha256};
 
     let live_resolution = config.photos.live_resolution.to_asset_version_size();
@@ -510,7 +517,7 @@ pub(crate) fn compute_config_hash(config: &crate::config::Config) -> String {
     // alone: switching it on can make old, never-enumerated unfiled assets
     // newly eligible. Keep the full fallback for that unknown drift class.
     hasher.update(b"unfiled:");
-    hasher.update([u8::from(config.filters.selection.unfiled)]);
+    hasher.update([u8::from(unfiled)]);
     finalize_hash(hasher)
 }
 
@@ -596,6 +603,7 @@ pub(crate) struct DownloadConfig {
     /// Hash of enumeration-affecting config. Full album snapshots persist this
     /// so later routing can prove a trusted snapshot still matches the plan.
     pub(crate) enum_config_hash: Option<Arc<str>>,
+    pub(crate) legacy_enum_hashes: Option<[Arc<str>; 2]>,
     /// Album name for `{album}` token in folder_structure. Set per-album when
     /// processing albums individually.
     pub(crate) album_name: Option<Arc<str>>,
@@ -844,6 +852,7 @@ impl DownloadConfig {
             max_download_attempts: 10,
             sync_mode: SyncMode::Full,
             enum_config_hash: None,
+            legacy_enum_hashes: None,
             album_name: None,
             exclude_asset_ids: std::sync::Arc::new(FxHashSet::default()),
             asset_groupings: Arc::new(AssetGroupings::default()),

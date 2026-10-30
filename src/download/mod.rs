@@ -30,8 +30,8 @@ mod orchestration;
 
 pub(crate) use orchestration::config::{
     DOWNLOAD_CONFIG_HASH_KEY, DownloadConfig, InventoryScope, compute_config_hash,
-    hash_download_config, hash_legacy_download_config, inventory_scope,
-    sync_coverage_fingerprint_json,
+    compute_config_hash_for_unfiled, hash_download_config, hash_legacy_download_config,
+    inventory_scope, sync_coverage_fingerprint_json,
 };
 pub(crate) use orchestration::context::{ClaimedLegacyMasterStates, DownloadContext};
 use orchestration::context::{RecordedLocalFile, preload_download_context};
@@ -79,3 +79,6 @@ pub(crate) use orchestration::primary_layout::tests::{
     probe_recorded_recovery_gate, seed_partly_published_compat, seed_prepared_edited_compat,
     seed_unprepared_refresh,
 };
+
+#[cfg(test)]
+pub(crate) use orchestration::generation::TEST_GENERATION_FORMAT;

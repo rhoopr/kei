@@ -126,6 +126,72 @@ impl PhotoAlbum {
         Ok(source.cloned())
     }
 
+    /// Reconstruct a supported private query using only this authenticated owner.
+    pub(crate) fn recorded_private_selection(
+        &self,
+        recorded: &Value,
+        scope: &str,
+        zone: &Value,
+    ) -> Result<Option<Self>> {
+        let Some((_, actual_scope, actual_zone)) = self.owned_private_scope()? else {
+            return Ok(None);
+        };
+        if actual_scope != scope || &actual_zone != zone {
+            return Ok(None);
+        }
+        let Some(fields) = recorded.as_object() else {
+            return Ok(None);
+        };
+        let keys = [
+            "zone",
+            "name",
+            "list_type",
+            "obj_type",
+            "query_filter",
+            "container_id",
+            "cross_zone_sources",
+        ];
+        if fields.len() != keys.len()
+            || keys.iter().any(|key| !fields.contains_key(*key))
+            || fields.get("zone") != Some(zone)
+            || fields
+                .get("cross_zone_sources")
+                .and_then(Value::as_array)
+                .is_none_or(|items| !items.is_empty())
+        {
+            return Ok(None);
+        }
+        let (Some(name), Some(list), Some(object)) = (
+            fields.get("name").and_then(Value::as_str),
+            fields.get("list_type").and_then(Value::as_str),
+            fields.get("obj_type").and_then(Value::as_str),
+        ) else {
+            return Ok(None);
+        };
+        let container = match fields.get("container_id") {
+            Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(std::sync::Arc::from(value.as_str())),
+            _ => return Ok(None),
+        };
+        let filter = match fields.get("query_filter") {
+            Some(Value::Null) => None,
+            Some(value) => Some(std::sync::Arc::new(value.clone())),
+            None => return Ok(None),
+        };
+        let mut result = self.clone();
+        result.name = std::sync::Arc::from(name);
+        result.list_type = std::sync::Arc::from(list);
+        result.obj_type = std::sync::Arc::from(object);
+        result.container_id = container;
+        result.query_filter = filter;
+        result.cross_zone_sources.clear();
+        result.rank_capture = None;
+        if result.selection_scope() != *recorded || result.private_selection_scope()?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(result))
+    }
+
     /// Resolve only authenticated sources already attached by album selection.
     /// Duplicate labels with distinct database/owner identities are ambiguous.
     pub(crate) fn publication_scope(
