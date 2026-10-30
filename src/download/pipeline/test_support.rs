@@ -48,6 +48,7 @@ pub(super) struct FailingDownloadStore {
     pub(super) downloaded_state_loads: AtomicUsize,
     pub(super) track_failed_calls: bool,
     pub(super) fail_complete_sync_run: bool,
+    pub(super) publication_db: Option<Arc<crate::state::SqliteStateDb>>,
 }
 
 impl FailingDownloadStore {
@@ -60,6 +61,7 @@ impl FailingDownloadStore {
             downloaded_state_loads: AtomicUsize::new(0),
             track_failed_calls: false,
             fail_complete_sync_run: false,
+            publication_db: None,
         }
     }
 
@@ -156,9 +158,18 @@ impl DownloadStateStore for FailingDownloadStore {
         }
     }
 
-    async fn mark_failed(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), StateError> {
+    async fn mark_failed(
+        &self,
+        library: &str,
+        id: &str,
+        version: &str,
+        error: &str,
+    ) -> Result<(), StateError> {
         if self.track_failed_calls {
             self.failed_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(db) = &self.publication_db {
+                return db.mark_failed(library, id, version, error).await;
+            }
             Ok(())
         } else {
             unimplemented!()
@@ -298,8 +309,25 @@ impl crate::state::DownloadContextStateStore for FailingDownloadStore {
 
 #[async_trait::async_trait]
 impl TempFileOwnershipStore for FailingDownloadStore {
-    async fn claim_temp_file(&self, _: &Path) -> Result<(), StateError> {
-        Ok(())
+    async fn prepare_temp_publication(
+        &self,
+        part: &Path,
+        proof: &crate::state::db::PreparedPublication,
+    ) -> Result<(), StateError> {
+        match &self.publication_db {
+            Some(db) => db.prepare_temp_publication(part, proof).await,
+            None => Err(StateError::Invariant {
+                operation: "prepare_temp_publication",
+                detail: "store cannot retain prepared publication evidence".into(),
+            }),
+        }
+    }
+
+    async fn claim_temp_file(&self, path: &Path) -> Result<(), StateError> {
+        match &self.publication_db {
+            Some(db) => db.claim_temp_file(path).await,
+            None => Ok(()),
+        }
     }
 
     async fn get_owned_temp_files_before(
@@ -309,8 +337,11 @@ impl TempFileOwnershipStore for FailingDownloadStore {
         Ok(Vec::new())
     }
 
-    async fn retire_temp_files(&self, _: &[PathBuf]) -> Result<u64, StateError> {
-        Ok(0)
+    async fn retire_temp_files(&self, paths: &[PathBuf]) -> Result<u64, StateError> {
+        match &self.publication_db {
+            Some(db) => db.retire_temp_files(paths).await,
+            None => Ok(0),
+        }
     }
 }
 

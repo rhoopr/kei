@@ -283,6 +283,7 @@ async fn download_pass_invalid_unknown_media_marks_failed_not_downloaded() {
 
 #[tokio::test(start_paused = true)]
 async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
+    use crate::state::TempFileOwnershipStore;
     use base64::Engine as _;
     use wiremock::matchers::method;
     use wiremock::{Mock, ResponseTemplate};
@@ -299,8 +300,15 @@ async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
         .await;
 
     let dir = TempDir::new().unwrap();
+    let database_path = dir.path().join("state.db");
+    let durable = Arc::new(
+        crate::state::SqliteStateDb::open(&database_path)
+            .await
+            .unwrap(),
+    );
     let mut store = FailingDownloadStore::new(usize::MAX / 2);
     store.track_failed_calls = true;
+    store.publication_db = Some(Arc::clone(&durable));
     let db = Arc::new(store);
     let state_db: Arc<dyn DownloadStore> = db.clone();
     let client = Client::new();
@@ -331,6 +339,23 @@ async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
         })
         .collect();
 
+    for task in &tasks {
+        durable
+            .upsert_seen(&crate::state::AssetRecord::new_pending(
+                Arc::clone(&task.library),
+                task.asset_id.to_string(),
+                task.version_size,
+                task.checksum.to_string(),
+                format!("{}.jpg", task.asset_id),
+                chrono::Utc::now(),
+                None,
+                task.size,
+                task.media_type,
+            ))
+            .await
+            .unwrap();
+    }
+
     let result = run_download_pass(
         PassConfig {
             prior_auth_errors: 0,
@@ -352,6 +377,7 @@ async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
     )
     .await;
 
+    assert_eq!(result.downloaded, STATE_DB_UNWRITABLE_THRESHOLD);
     assert_eq!(result.state_write_failures, STATE_DB_UNWRITABLE_THRESHOLD);
     assert_eq!(
         result.failed.len(),
@@ -371,6 +397,59 @@ async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
             "state write failures must not remove an already-published file: {}",
             landed.display()
         );
+        assert_eq!(std::fs::read(&landed).unwrap(), jpeg_body);
+        let proofs = durable
+            .get_prepared_publications(
+                "PrimarySync",
+                &format!("CIRCUIT_{i}"),
+                VersionSizeKey::Original,
+            )
+            .await
+            .unwrap();
+        assert_eq!(proofs.len(), 1, "landed bytes retain prepared evidence");
+        assert_eq!(proofs[0].destination.to_path(), landed);
+    }
+    for i in STATE_DB_UNWRITABLE_THRESHOLD..STATE_DB_UNWRITABLE_THRESHOLD + 3 {
+        assert!(!dir.path().join(format!("photo_{i}.jpg")).exists());
+    }
+    let failed = durable.get_failed().await.unwrap();
+    assert_eq!(failed.len(), 3, "queued failures must be recorded durably");
+    assert_eq!(
+        durable.get_pending().await.unwrap().len(),
+        STATE_DB_UNWRITABLE_THRESHOLD
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        STATE_DB_UNWRITABLE_THRESHOLD
+    );
+    let outcome = crate::download::DownloadOutcome::PartialFailure {
+        failed_count: result.state_write_failures + result.failed.len(),
+    };
+    assert!(!crate::sync_cycle::should_store_sync_token(&outcome, false));
+
+    drop(db);
+    drop(durable);
+    let reopened = crate::state::SqliteStateDb::open(&database_path)
+        .await
+        .unwrap();
+    assert_eq!(reopened.get_failed().await.unwrap().len(), 3);
+    assert_eq!(
+        reopened.get_pending().await.unwrap().len(),
+        STATE_DB_UNWRITABLE_THRESHOLD
+    );
+    for i in 0..STATE_DB_UNWRITABLE_THRESHOLD {
+        let landed = dir.path().join(format!("photo_{i}.jpg"));
+        assert_eq!(std::fs::read(&landed).unwrap(), jpeg_body);
+        let proofs = reopened
+            .get_prepared_publications(
+                "PrimarySync",
+                &format!("CIRCUIT_{i}"),
+                VersionSizeKey::Original,
+            )
+            .await
+            .unwrap();
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].destination.to_path(), landed);
     }
 }
 

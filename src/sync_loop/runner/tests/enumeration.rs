@@ -117,6 +117,49 @@ async fn run_one_photo_full_cycle_with_controls(
     .await
 }
 
+// Record history replay separately from the rank query token.
+#[derive(Clone)]
+struct RecentZoneHistory {
+    inner: crate::test_helpers::DynamicRecentPhotosSession,
+    zone: &'static str,
+    successor: &'static str,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for RecentZoneHistory {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        if url.contains("/changes/zone?") {
+            let request: serde_json::Value = serde_json::from_str(&body)?;
+            let zones = request["zones"].as_array().expect("zone request");
+            assert_eq!(zones.len(), 1);
+            assert_eq!(zones[0]["zoneID"]["zoneName"], self.zone);
+            let token = zones[0]["syncToken"].as_str().expect("history cursor");
+            self.requests.lock().unwrap().push(token.to_owned());
+            anyhow::ensure!(
+                token == "fixture-zone-history-boundary" || token == self.successor,
+                "unexpected history cursor"
+            );
+            return Ok(serde_json::json!({"zones": [{
+                "zoneID": {"zoneName": self.zone},
+                "records": [],
+                "syncToken": self.successor,
+                "moreComing": false
+            }]}));
+        }
+        crate::icloud::photos::PhotosSession::post(&self.inner, url, body, headers).await
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
 #[tokio::test]
 async fn run_cycle_recent_exact_multiple_libraries_advance_each_zone() {
     let mut config = make_run_cycle_config();
@@ -128,20 +171,40 @@ async fn run_cycle_recent_exact_multiple_libraries_advance_each_zone() {
     let primary_session = crate::test_helpers::DynamicRecentPhotosSession::new(20)
         .with_filename_prefix("primary-recent")
         .with_zone("PrimarySync")
-        .with_token("zone-tok-primary");
+        .with_token("rank-tok-primary");
     let shared_session_photos = crate::test_helpers::DynamicRecentPhotosSession::new(20)
         .with_filename_prefix("shared-recent")
         .with_zone("SharedSync-TEST")
-        .with_token("zone-tok-shared");
+        .with_token("rank-tok-shared");
+    let primary_inventory = primary_session.clone();
+    let shared_inventory = shared_session_photos.clone();
+    let primary_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let shared_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let primary_state = make_run_cycle_library_state_with_album(
         "PrimarySync",
         "sync_token:PrimarySync",
-        make_full_album_with_boxed_session("PrimarySync", Box::new(primary_session)),
+        make_full_album_with_boxed_session(
+            "PrimarySync",
+            Box::new(RecentZoneHistory {
+                inner: primary_session,
+                zone: "PrimarySync",
+                successor: "history-tok-primary",
+                requests: Arc::clone(&primary_requests),
+            }),
+        ),
     );
     let shared_state = make_run_cycle_library_state_with_album(
         "SharedSync-TEST",
         "sync_token:SharedSync-TEST",
-        make_full_album_with_boxed_session("SharedSync-TEST", Box::new(shared_session_photos)),
+        make_full_album_with_boxed_session(
+            "SharedSync-TEST",
+            Box::new(RecentZoneHistory {
+                inner: shared_session_photos,
+                zone: "SharedSync-TEST",
+                successor: "history-tok-shared",
+                requests: Arc::clone(&shared_requests),
+            }),
+        ),
     );
     let states = vec![&primary_state, &shared_state];
     let build_download_config = make_run_cycle_download_config_builder_with_options(
@@ -168,18 +231,90 @@ async fn run_cycle_recent_exact_multiple_libraries_advance_each_zone() {
     .expect("run recent multi-library cycle");
 
     assert_eq!(result.failed_count, 0);
-    assert_eq!(result.stats.assets_seen, 40);
+    // The legacy fixture has no prior recent-selection receipt: the bridge
+    // must repeat the bounded inventory before its successor can be saved.
+    assert_eq!(result.stats.assets_seen, 80);
     assert_eq!(
         db.get_metadata("sync_token:PrimarySync")
             .await
             .expect("read primary token"),
-        Some("zone-tok-primary".to_owned())
+        Some("history-tok-primary".to_owned())
     );
     assert_eq!(
         db.get_metadata("sync_token:SharedSync-TEST")
             .await
             .expect("read shared token"),
-        Some("zone-tok-shared".to_owned())
+        Some("history-tok-shared".to_owned())
+    );
+    assert!(!result.stats.sync_token_blocked);
+    assert!(result.can_advance_database_checkpoint());
+    assert_eq!(primary_inventory.emitted_ids().len(), 40);
+    assert_eq!(shared_inventory.emitted_ids().len(), 40);
+    for inventory in [&primary_inventory, &shared_inventory] {
+        let ids = inventory.emitted_ids();
+        assert_eq!(&ids[..20], &ids[20..]);
+        assert_eq!(
+            ids[..20]
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            20
+        );
+        assert!(inventory.results_limits().iter().all(|limit| *limit <= 40));
+        // Each two-item page is followed by five bounded empty-tail probes.
+        let expected_offsets: Vec<_> = (0..30).step_by(2).cycle().take(30).collect();
+        assert_eq!(inventory.offsets(), expected_offsets);
+    }
+    assert_eq!(
+        *primary_requests.lock().unwrap(),
+        ["fixture-zone-history-boundary"]
+    );
+    assert_eq!(
+        *shared_requests.lock().unwrap(),
+        ["fixture-zone-history-boundary"]
+    );
+    let primary_offsets = primary_inventory.offsets();
+    let shared_offsets = shared_inventory.offsets();
+
+    let quiet = run_cycle(
+        &states,
+        &config,
+        Some(db.as_ref()),
+        false,
+        &build_download_config,
+        download::DownloadControls::download_hidden(),
+        &shared_session,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("run quiet recent multi-library cycle");
+    assert_eq!(quiet.failed_count, 0);
+    assert_eq!(quiet.stats.assets_seen, 0);
+    assert!(quiet.stats.full_enumeration_reason.is_none(), "{quiet:?}");
+    assert!(quiet.can_advance_database_checkpoint(), "{quiet:?}");
+    assert_eq!(primary_inventory.offsets(), primary_offsets);
+    assert_eq!(shared_inventory.offsets(), shared_offsets);
+    assert_eq!(
+        *primary_requests.lock().unwrap(),
+        ["fixture-zone-history-boundary", "history-tok-primary"]
+    );
+    assert_eq!(
+        *shared_requests.lock().unwrap(),
+        ["fixture-zone-history-boundary", "history-tok-shared"]
+    );
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("history-tok-primary")
+    );
+    assert_eq!(
+        db.get_metadata("sync_token:SharedSync-TEST")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("history-tok-shared")
     );
 }
 
