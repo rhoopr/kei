@@ -983,3 +983,254 @@ impl PhotosSession for FairPaged {
         Box::new(self.clone())
     }
 }
+
+#[derive(Clone)]
+struct PagedAdmissionSession {
+    base: HealthySession,
+    phase: usize,
+    first: Arc<Vec<Value>>,
+    second: Arc<Vec<Value>>,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for PagedAdmissionSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        if self.phase > 0 && url.contains("/changes/zone?") {
+            let request: Value = serde_json::from_str(&body)?;
+            assert_eq!(request["zones"][0]["zoneID"], healthy_zone());
+            let cursor = request["zones"][0]["syncToken"].as_str().unwrap();
+            self.requests.lock().unwrap().push(cursor.to_owned());
+            let (records, next, more) = match (self.phase, cursor) {
+                (1 | 2, "healthy-cycle-1") => (self.first.as_ref().clone(), "page-one", true),
+                (1 | 2, "page-one") => (self.second.as_ref().clone(), "after-both", false),
+                (3, "after-both") => (vec![], "after-both", false),
+                _ => panic!("unexpected cursor {cursor} in phase {}", self.phase),
+            };
+            return Ok(
+                json!({"zones":[{"zoneID":healthy_zone(),"records":records,"syncToken":next,"moreComing":more}]}),
+            );
+        }
+        self.base.post(url, body, headers).await
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn run_cycle_ledger_transaction_preserves_cursor_debt_and_media_across_restart() {
+    let (trace, _guard) = crate::test_helpers::TracingCapture::install();
+    let server = crate::start_wiremock_or_skip!();
+    for name in ["initial", "first", "second"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .mount(&server)
+            .await;
+    }
+    let debt_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    Mock::given(method("GET"))
+        .and(path("/debt"))
+        .respond_with({
+            let available = debt_available.clone();
+            move |_: &wiremock::Request| {
+                if available.load(Ordering::SeqCst) {
+                    ResponseTemplate::new(200).set_body_bytes(MEDIA)
+                } else {
+                    ResponseTemplate::new(503)
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir(&root).unwrap();
+    let database = dir.path().join("state.db");
+    let make_pair = |name: &str, tag| {
+        let mut records = pair(
+            name,
+            &format!("{name}.JPG"),
+            &format!("{}/{name}", server.uri()),
+            tag,
+        );
+        records[1]["fields"]["masterRef"]["value"]["zoneID"] = healthy_zone();
+        records
+    };
+    let initial = make_pair("initial", 70);
+    let debt = make_pair("debt", 71);
+    let first = Arc::new(make_pair("first", 72));
+    let second = Arc::new(make_pair("second", 73));
+    let mut all = initial.clone();
+    all.extend(debt.clone());
+    all.extend(first.as_ref().clone());
+    all.extend(second.as_ref().clone());
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let mut initial_bytes = None;
+    let mut prior_work = None;
+    for phase in 0..4 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&database, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        if phase == 0 {
+            db.set_metadata("sync_token:PrimarySync-v027-healthy", "legacy-cursor")
+                .await
+                .unwrap();
+        }
+        if phase == 1 {
+            db.acquire_lock("inject current admission failure").unwrap().execute_batch(
+                "CREATE TRIGGER cycle_admission_fault BEFORE INSERT ON provider_active_destinations WHEN NEW.child='asset-second' BEGIN SELECT RAISE(ABORT,'synthetic cycle admission fault'); END;"
+            ).unwrap();
+        } else if phase == 2 {
+            db.acquire_lock("remove admission fault after reopen")
+                .unwrap()
+                .execute_batch("DROP TRIGGER cycle_admission_fault")
+                .unwrap();
+        }
+        if phase == 3 {
+            debt_available.store(true, Ordering::SeqCst);
+            db.make_selection_retry_due(baseline_owner(), "asset-debt".into())
+                .await
+                .unwrap();
+        }
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let base = HealthySession {
+            cycle: 0,
+            records: Arc::new(if phase == 0 {
+                [initial.clone(), debt.clone()].concat()
+            } else {
+                all.clone()
+            }),
+            delta: Arc::new(vec![]),
+            inventory: Arc::new(AtomicUsize::new(0)),
+            changes: Arc::new(AtomicUsize::new(0)),
+            boundaries: Arc::new(AtomicUsize::new(0)),
+        };
+        let provider = PagedAdmissionSession {
+            base,
+            phase,
+            first: first.clone(),
+            second: second.clone(),
+            requests: requests.clone(),
+        };
+        let library = selected(db.clone(), healthy_zone(), Box::new(provider)).await;
+        let base_builder = make_run_cycle_download_config_builder(&root, db.clone());
+        let builder = |mode, exclude, groups, name| {
+            let mut config = (*base_builder(mode, exclude, groups, name)).clone();
+            configure(&mut config);
+            Arc::new(config)
+        };
+        let result = run_cycle(
+            &[&library],
+            &make_run_cycle_config(),
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await;
+        let token = db.get_metadata(&sync_token_key(HEALTHY)).await.unwrap();
+        if phase == 0 {
+            assert!(result.is_ok(), "baseline: {result:?}");
+            assert_eq!(token.as_deref(), Some("healthy-cycle-1"));
+            initial_bytes = Some(std::fs::read(root.join("initial.JPG")).unwrap());
+        } else if phase == 1 {
+            assert!(
+                format!("{result:?} {:?}", trace.events())
+                    .contains("synthetic cycle admission fault"),
+                "admission fault must fire: {result:?}"
+            );
+            if let Ok(outcome) = &result {
+                assert!(!outcome.can_advance_database_checkpoint(), "{outcome:?}");
+            }
+            assert_eq!(*requests.lock().unwrap(), ["healthy-cycle-1", "page-one"]);
+            assert_eq!(token.as_deref(), Some("healthy-cycle-1"));
+            assert_eq!(
+                std::fs::read(root.join("first.JPG")).unwrap(),
+                MEDIA,
+                "first page remains accounted"
+            );
+            assert!(!root.join("second.JPG").exists());
+            let conn = db.acquire_lock("failed admission rolled back").unwrap();
+            assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE child='asset-first' AND verified_media=1", [], |r| r.get(0)).unwrap(), 1, "first page admitted and verified");
+            for table in ["provider_active_decisions", "provider_active_destinations"] {
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        &format!("SELECT count(*) FROM {table} WHERE child='asset-second'"),
+                        [],
+                        |r| r.get(0)
+                    )
+                    .unwrap(),
+                    0,
+                    "{table}"
+                );
+            }
+        } else {
+            assert!(result.is_ok(), "phase {phase}: {result:?}");
+            assert_eq!(token.as_deref(), Some("after-both"));
+            assert_eq!(
+                *requests.lock().unwrap(),
+                if phase == 2 {
+                    vec!["healthy-cycle-1", "page-one"]
+                } else {
+                    vec!["after-both"]
+                }
+            );
+            assert_eq!(std::fs::read(root.join("first.JPG")).unwrap(), MEDIA);
+            assert_eq!(std::fs::read(root.join("second.JPG")).unwrap(), MEDIA);
+        }
+        assert_eq!(
+            std::fs::read(root.join("initial.JPG")).unwrap(),
+            *initial_bytes.as_ref().unwrap()
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync-v027-healthy")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("legacy-cursor")
+        );
+        let conn = db
+            .acquire_lock("prior work and current accounting")
+            .unwrap();
+        if phase < 3 {
+            let snapshot: (String, String, String, String) = conn.query_row(
+                "SELECT d.path,d.checksum,d.master,m.master_record_name FROM provider_active_destinations d JOIN asset_master_mappings m ON m.library=d.library AND m.asset_record_name='asset-initial' WHERE d.child='asset-debt' AND d.verified_media=0",
+                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+            if let Some(prior) = &prior_work {
+                assert_eq!(
+                    &snapshot, prior,
+                    "debt destination and historical mapping survive phase {phase}"
+                );
+            } else {
+                prior_work = Some(snapshot);
+            }
+        } else {
+            assert_eq!(
+                std::fs::read(root.join("debt.JPG")).unwrap(),
+                MEDIA,
+                "quiet retry recovers the original debt"
+            );
+        }
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE child='asset-debt' AND verified_media=0", [], |r| r.get(0)).unwrap(), i64::from(phase < 3), "phase {phase}");
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM assets WHERE id='asset-initial' AND status='downloaded'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+}

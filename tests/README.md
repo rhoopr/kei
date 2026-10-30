@@ -561,12 +561,11 @@ Removing only the injected fault permits recovery and two quiet repeats. The
 capacity case charges a real previously captured page; it does not simulate a
 physical disk-full condition.
 
-`run_cycle_shadow_transaction_preserves_cursor_debt_and_media_across_restart`
-seeds historical media, mapping, downloaded state and pending debt. Four
-production cycles across reopen cover capture failure, captured observations
-with unresolved checkpoint evidence, recovery under the existing gate and a
-quiet repeat. Media remains intact and no cycle publishes another file. The
-actual CLI startup control captures an unknown source through normal library
+`run_cycle_ledger_transaction_preserves_cursor_debt_and_media_across_restart`
+exercises two incremental pages and an injected current-ledger admission failure,
+then reopens and retries without the fault. It checks the scoped checkpoint,
+transaction rollback, existing media and retry debt, recovery and a quiet retry.
+The actual CLI startup control captures an unknown source through normal library
 resolution without manually attaching an album. The schema-28 migration fault
 control retains source cursors, debt and an unknown BLOB in a conflicting table
 with matching columns but no durable key. It rolls back partial DDL, then retries
