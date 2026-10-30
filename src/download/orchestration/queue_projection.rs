@@ -246,4 +246,4 @@ pub(super) async fn admit_retained_work(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

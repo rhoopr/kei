@@ -8574,3 +8574,443 @@ async fn streaming_scoped_paired_change_preserves_child_and_receipts_after_reope
         changed
     );
 }
+
+// Stable selected albums return their own current inventories.
+#[cfg(feature = "xmp")]
+#[derive(Clone)]
+struct MembershipInventory {
+    current: CurrentSession,
+    phase: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "xmp")]
+impl MembershipInventory {
+    fn present(&self, name: &str) -> bool {
+        match (self.phase.load(Ordering::SeqCst), name) {
+            (0, "Trip") | (1, "Trip" | "Family") | (2, "Family") => true,
+            (0..=2, "Trip" | "Family") => false,
+            _ => panic!("unexpected membership phase or album"),
+        }
+    }
+}
+
+#[cfg(feature = "xmp")]
+#[async_trait::async_trait]
+impl PhotosSession for MembershipInventory {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        if url.contains("/internal/records/query/batch?") {
+            let batch = request["batch"].as_array().unwrap().iter().map(|entry| {
+                let kind = entry["query"]["filterBy"]["fieldValue"]["value"][0].as_str().unwrap();
+                let name = kind.rsplit_once(':').unwrap().1;
+                json!({"records":[{"fields":{"itemCount":{"value":u64::from(self.present(name))}}}]})
+            }).collect::<Vec<_>>();
+            return Ok(json!({"batch":batch}));
+        }
+        if url.contains("/records/query?") {
+            let filters = request["query"]["filterBy"].as_array().unwrap();
+            let value = |name: &str| {
+                filters.iter().find(|f| f["fieldName"] == name).unwrap()["fieldValue"]["value"]
+                    .clone()
+            };
+            let name = value("parentId");
+            let offset = value("startRank").as_u64().unwrap();
+            let records = if offset == 0 && self.present(name.as_str().unwrap()) {
+                self.current.records.lock().unwrap().clone()
+            } else {
+                Vec::new()
+            };
+            return Ok(json!({"records":records,"syncToken":"membership-inventory"}));
+        }
+        self.current.post(url, body, headers).await
+    }
+    async fn post_changes_body(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&self.post(url, body, headers).await?)?)
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(feature = "xmp")]
+fn membership_pass(f: &Fixture, session: &MembershipInventory, name: &str) -> AlbumPass {
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: Arc::from("https://example.invalid"),
+            name: Arc::from(name),
+            list_type: Arc::from("CPLContainerRelationLiveByAssetDate"),
+            obj_type: Arc::from(format!("CPLContainerRelationNotDeletedByAssetDate:{name}")),
+            query_filter: Some(Arc::new(
+                json!([{"fieldName":"parentId","comparator":"EQUALS","fieldValue":{"type":"STRING","value":name}}]),
+            )),
+            page_size: 2,
+            zone_id: Arc::new(
+                json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner","zoneType":"REGULAR_CUSTOM_ZONE"}),
+            ),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: Some(Arc::from(name)),
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(session.clone()),
+    );
+    album.set_shadow_capture(f.capture.clone(), Arc::from("private"));
+    AlbumPass {
+        kind: PassKind::Album,
+        album,
+        exclude_ids: Arc::new(FxHashSet::default()),
+    }
+}
+
+#[cfg(feature = "xmp")]
+pub(in crate::download::orchestration) async fn scoped_membership_refresh_fixture(embed: bool) {
+    use crate::state::MetadataRewriteStore;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use xmp_toolkit::{OpenFileOptions, XmpFile, XmpMeta, xmp_ns};
+
+    let server = MockServer::start().await;
+    let source = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    Mock::given(method("GET"))
+        .and(path("/membership.jpg"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(source.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    // Both passes select the same eligible physical family throughout.
+    f.config.folder_structure_albums = Arc::from("");
+    f.config.metadata.xmp_sidecar = true;
+    f.config.metadata.embed_xmp = embed;
+    f.config.metadata.set_exif_datetime = embed;
+    {
+        let mut records = f.session.records.lock().unwrap();
+        records[0]["fields"]["filenameEnc"] = json!({"value":"membership.JPG","type":"STRING"});
+        records[0]["fields"]["resOriginalFileType"] = json!({"value":"public.jpeg"});
+        records[0]["fields"]["itemType"] = json!({"value":"public.jpeg"});
+        records[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/membership.jpg",server.uri()),"size":source.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(source))});
+    }
+    let phase = Arc::new(AtomicUsize::new(0));
+    let session = MembershipInventory {
+        current: f.session.clone(),
+        phase: phase.clone(),
+    };
+    macro_rules! passes {
+        () => {
+            [
+                membership_pass(&f, &session, "Trip"),
+                membership_pass(&f, &session, "Family"),
+            ]
+        };
+    }
+    let initial = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes!(),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(initial.outcome, crate::download::DownloadOutcome::Success),
+        "{initial:?}"
+    );
+    assert_eq!(initial.stats.downloaded, 1);
+    let row = f.db.get_downloaded_page(0, 10).await.unwrap().remove(0);
+    let media = row.local_path.unwrap();
+    let sidecar = media.with_file_name(format!(
+        "{}.xmp",
+        media.file_name().unwrap().to_str().unwrap()
+    ));
+    let subjects = |bytes: &[u8]| {
+        let xmp: XmpMeta = std::str::from_utf8(bytes).unwrap().parse().unwrap();
+        let mut result: Vec<_> = xmp
+            .property_array(xmp_ns::DC, "subject")
+            .map(|v| v.value)
+            .collect();
+        result.sort();
+        result
+    };
+    let original = std::fs::read(&media).unwrap();
+    let initial_xmp = std::fs::read(&sidecar).unwrap();
+    assert_eq!(subjects(&initial_xmp), ["Trip"]);
+    let original_mtime = std::fs::metadata(&media).unwrap().modified().unwrap();
+    if embed {
+        assert_ne!(original, source);
+        assert_eq!(
+            original_mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            1_700_000_000
+        );
+    }
+    let receipt: (String, String) = f
+        .db
+        .acquire_lock("initial genuine receipt")
+        .unwrap()
+        .query_row(
+            "SELECT source_checksum,local_checksum FROM download_receipts WHERE child='asset-m'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(receipt.0, format!("{:x}", Sha256::digest(source)));
+    assert_eq!(receipt.1, format!("{:x}", Sha256::digest(&original)));
+    let exact: i64 = f.db.acquire_lock("initial scoped native proof").unwrap().query_row(
+        "SELECT count(*) FROM download_receipts WHERE library='PrimarySync' AND child='asset-m' AND master='m' AND native_path=?1 AND source_checksum=?2 AND local_checksum=?3 AND account_key<>'' AND provider_key<>'' AND scope<>''",
+        rusqlite::params![serde_json::to_string(&SelectionPath::from_path(&media)).unwrap(), receipt.0, receipt.1], |r| r.get(0)).unwrap();
+    assert_eq!(exact, 1);
+    assert!(f.db.guard_primary_writer(&media).await.is_ok());
+    f = reopen_destination_fixture(f).await;
+    f.config.sync_mode = crate::download::SyncMode::Full;
+    assert!(f.db.guard_primary_writer(&media).await.is_ok());
+
+    // Ordinary Family admission must preserve bytes and create exact path debt.
+    phase.store(1, Ordering::SeqCst);
+    let initial_sidecar_mtime = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
+    let ordinary = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes!(),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(ordinary.outcome, crate::download::DownloadOutcome::Success),
+        "{ordinary:?}"
+    );
+    assert_eq!(ordinary.stats.downloaded, 0);
+    assert_eq!(std::fs::read(&media).unwrap(), original);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), initial_xmp);
+    assert_eq!(
+        std::fs::metadata(&media).unwrap().modified().unwrap(),
+        original_mtime
+    );
+    assert_eq!(
+        std::fs::metadata(&sidecar).unwrap().modified().unwrap(),
+        initial_sidecar_mtime
+    );
+    let pending = f.db.get_pending_metadata_rewrites(10).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].library.as_ref(), "PrimarySync");
+    assert_eq!(pending[0].id.as_ref(), "asset-m");
+    assert_eq!(pending[0].local_path.as_ref(), Some(&media));
+    assert!(
+        f.db.guard_primary_writer(&media).await.is_ok(),
+        "ordinary admission installed read-only protection"
+    );
+    let trip_key = crate::download::orchestration::generation::pass_key(&membership_pass(
+        &f, &session, "Trip",
+    ));
+    let family_key = crate::download::orchestration::generation::pass_key(&membership_pass(
+        &f, &session, "Family",
+    ));
+    let added_exact: i64 = f.db.acquire_lock("Family admitted at the same native path").unwrap().query_row(
+        "SELECT count(*) FROM provider_active_destinations WHERE library='PrimarySync' AND child='asset-m' AND admitted=1 AND verified_media=1 AND path=?1 AND pass_key=?2",
+        rusqlite::params![SelectionPath::from_path(&media).key().unwrap(), family_key], |r| r.get(0)).unwrap();
+    assert!(added_exact >= 1);
+    let fulfilled: String = f.db.acquire_lock("receipt fulfills both passes").unwrap().query_row(
+        "SELECT origin_pass FROM download_receipts WHERE library='PrimarySync' AND child='asset-m' AND native_path=?1",
+        [serde_json::to_string(&SelectionPath::from_path(&media)).unwrap()], |r| r.get(0)).unwrap();
+    let fulfilled: Vec<String> = serde_json::from_str(&fulfilled).unwrap();
+    assert!(fulfilled.contains(&trip_key));
+    assert!(fulfilled.contains(&family_key));
+    f.config.refresh_metadata = true;
+    let added = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes!(),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(added.outcome, crate::download::DownloadOutcome::Success),
+        "{added:?}"
+    );
+    assert_eq!(added.stats.downloaded, 0);
+    assert_eq!(
+        subjects(&std::fs::read(&sidecar).unwrap()),
+        ["Family", "Trip"]
+    );
+    assert_eq!(
+        f.db.get_downloaded_page(0, 10).await.unwrap()[0]
+            .local_path
+            .as_ref(),
+        Some(&media)
+    );
+    assert!(
+        f.db.get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(f.db.guard_primary_writer(&media).await.is_ok());
+
+    // Retain Trip in inventory during the delta, so a snapshot cannot remove it.
+    *f.session.changes_records.lock().unwrap() = vec![
+        crate::download::orchestration::test_support::relation_delete_record("Trip", "asset-m"),
+    ];
+    f.config.refresh_metadata = false;
+    let before_delta_xmp = std::fs::read(&sidecar).unwrap();
+    let before_delta_media = std::fs::read(&media).unwrap();
+    let before_delta_mtime = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
+    let cursors_before = f.session.changes_cursors.lock().unwrap().len();
+    let removed = crate::download::orchestration::incremental::download_photos_incremental(
+        &reqwest::Client::new(),
+        &passes!(),
+        &Arc::new(f.config.clone()),
+        "membership-delete-cursor",
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(removed.outcome, crate::download::DownloadOutcome::Success),
+        "{removed:?}"
+    );
+    assert_eq!(removed.stats.downloaded, 0);
+    assert_eq!(
+        f.session.changes_cursors.lock().unwrap()[cursors_before..],
+        [Some("membership-delete-cursor".to_string())]
+    );
+    let tombstone: i64 = f.db.acquire_lock("delta relation tombstone").unwrap().query_row("SELECT is_deleted FROM asset_album_memberships WHERE library='PrimarySync' AND container_id='Trip' AND asset_record_name='asset-m'", [], |r| r.get(0)).unwrap();
+    assert_eq!(tombstone, 1);
+    assert_eq!(
+        f.db.get_all_asset_albums("PrimarySync").await.unwrap(),
+        vec![("asset-m".to_string(), "Family".to_string())]
+    );
+    assert_eq!(std::fs::read(&sidecar).unwrap(), before_delta_xmp);
+    assert_eq!(std::fs::read(&media).unwrap(), before_delta_media);
+    assert_eq!(
+        std::fs::metadata(&sidecar).unwrap().modified().unwrap(),
+        before_delta_mtime
+    );
+    let pending = f.db.get_pending_metadata_rewrites(10).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].library.as_ref(), "PrimarySync");
+    assert_eq!(pending[0].id.as_ref(), "asset-m");
+    assert_eq!(pending[0].local_path.as_ref(), Some(&media));
+    phase.store(2, Ordering::SeqCst);
+    f.config.refresh_metadata = true;
+    let refreshed = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes!(),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(refreshed.outcome, crate::download::DownloadOutcome::Success),
+        "{refreshed:?}"
+    );
+    assert_eq!(refreshed.stats.downloaded, 0);
+    let final_xmp = std::fs::read(&sidecar).unwrap();
+    assert_eq!(subjects(&final_xmp), ["Family"]);
+    let final_media = std::fs::read(&media).unwrap();
+    assert_eq!(
+        std::fs::metadata(&media).unwrap().modified().unwrap(),
+        original_mtime
+    );
+    if embed {
+        assert_ne!(final_media, original);
+        let mut file = XmpFile::new().unwrap();
+        file.open_file(&media, OpenFileOptions::default().for_read())
+            .unwrap();
+        let xmp = file.xmp().unwrap();
+        let mut groups: Vec<_> = xmp
+            .property_array(xmp_ns::DC, "subject")
+            .map(|v| v.value)
+            .collect();
+        groups.sort();
+        assert_eq!(groups, ["Family"]);
+    } else {
+        assert_eq!(final_media, source);
+    }
+    let after = f.db.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].local_path.as_ref(), Some(&media));
+    assert_eq!(
+        after[0].local_checksum.as_deref(),
+        Some(format!("{:x}", Sha256::digest(&final_media)).as_str())
+    );
+    let final_exact: i64 = f.db.acquire_lock("final scoped native proof").unwrap().query_row(
+        "SELECT count(*) FROM download_receipts WHERE library='PrimarySync' AND child='asset-m' AND master='m' AND native_path=?1 AND source_checksum=?2 AND local_checksum=?3",
+        rusqlite::params![serde_json::to_string(&SelectionPath::from_path(&media)).unwrap(), receipt.0, format!("{:x}", Sha256::digest(&final_media))], |r| r.get(0)).unwrap();
+    assert_eq!(final_exact, 1);
+    let final_passes: String = f.db.acquire_lock("final receipt pass obligations").unwrap().query_row("SELECT origin_pass FROM download_receipts WHERE library='PrimarySync' AND child='asset-m' AND native_path=?1", [serde_json::to_string(&SelectionPath::from_path(&media)).unwrap()], |r| r.get(0)).unwrap();
+    let final_passes: Vec<String> = serde_json::from_str(&final_passes).unwrap();
+    assert!(final_passes.contains(&trip_key));
+    assert!(final_passes.contains(&family_key));
+    assert!(
+        f.db.get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    f.config.refresh_metadata = false;
+    let final_sidecar_mtime = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
+    let quiet = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes!(),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(quiet.outcome, crate::download::DownloadOutcome::Success),
+        "{quiet:?}"
+    );
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(std::fs::read(&media).unwrap(), final_media);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), final_xmp);
+    assert_eq!(
+        std::fs::metadata(&sidecar).unwrap().modified().unwrap(),
+        final_sidecar_mtime
+    );
+    assert_eq!(
+        std::fs::metadata(&media).unwrap().modified().unwrap(),
+        original_mtime
+    );
+    assert!(
+        f.db.get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn scoped_album_removal_explicit_refresh_preserves_owned_media() {
+    Box::pin(scoped_membership_refresh_fixture(false)).await;
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn scoped_album_removal_explicit_embedded_refresh_preserves_capture_mtime() {
+    Box::pin(scoped_membership_refresh_fixture(true)).await;
+}

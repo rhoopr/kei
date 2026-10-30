@@ -611,6 +611,7 @@ async fn album_membership_rewrites_every_finalized_path_after_restart() {
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn album_membership_first_xmp_and_tracked_path_removal() {
+    use crate::state::MetadataRewriteStore;
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
@@ -682,6 +683,16 @@ async fn album_membership_first_xmp_and_tracked_path_removal() {
         names
     };
     let first_xmp = tokio::fs::read_to_string(&sidecar_path).await.unwrap();
+    let first_media_mtime = tokio::fs::metadata(media_path)
+        .await
+        .unwrap()
+        .modified()
+        .unwrap();
+    let first_sidecar_mtime = tokio::fs::metadata(&sidecar_path)
+        .await
+        .unwrap()
+        .modified()
+        .unwrap();
     assert_eq!(
         subjects(&first_xmp),
         ["Trip"],
@@ -712,25 +723,66 @@ async fn album_membership_first_xmp_and_tracked_path_removal() {
     .unwrap();
     assert_eq!(second.downloaded, 0);
     assert_eq!(second.exif_failures, 0);
+    // Generic baseline adoption is read-only: even an explicit drain retains debt.
     assert_eq!(
-        subjects(&tokio::fs::read_to_string(&sidecar_path).await.unwrap()),
-        ["Family", "Trip"]
+        tokio::fs::read_to_string(&sidecar_path).await.unwrap(),
+        first_xmp
     );
-    assert!(
-        db.get_pending_metadata_rewrites(10)
+    assert_eq!(tokio::fs::read(media_path).await.unwrap(), body);
+    assert_eq!(
+        tokio::fs::metadata(media_path)
             .await
             .unwrap()
-            .is_empty()
+            .modified()
+            .unwrap(),
+        first_media_mtime
     );
-
+    assert_eq!(
+        tokio::fs::metadata(&sidecar_path)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap(),
+        first_sidecar_mtime
+    );
+    let pending = db.get_pending_metadata_rewrites(10).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].library.as_ref(), "PrimarySync");
+    assert_eq!(pending[0].id.as_ref(), "asset-FIRST_ALBUM");
+    assert_eq!(pending[0].local_path.as_ref(), Some(media_path));
+    assert!(db.guard_primary_writer(media_path).await.is_err());
+    assert_eq!(
+        drain_pending_metadata_rewrites(
+            db.as_ref(),
+            &config.metadata,
+            CaptureTimestampRepair::Preserve,
+            &["PrimarySync"],
+            config.temp_suffix.clone(),
+            &CancellationToken::new(),
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(&sidecar_path).await.unwrap(),
+        first_xmp
+    );
+    assert_eq!(tokio::fs::read(media_path).await.unwrap(), body);
+    let pending = db.get_pending_metadata_rewrites(10).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].local_path.as_ref(), Some(media_path));
+    let rows = db.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].local_path, row.local_path);
     config.album_name = None;
     config.recent = Some(10);
+    let change_calls = Arc::new(AtomicUsize::new(0));
     let pass = AlbumPass {
         kind: PassKind::Unfiled,
         album: changes_album(
             "",
             changes_zone_session(
-                Arc::new(AtomicUsize::new(0)),
+                change_calls.clone(),
                 vec![relation_delete_record("trip", "asset-FIRST_ALBUM")],
             ),
         ),
@@ -753,20 +805,71 @@ async fn album_membership_first_xmp_and_tracked_path_removal() {
         );
         assert_eq!(removed.stats.downloaded, 0);
         assert_eq!(
-            subjects(&tokio::fs::read_to_string(&sidecar_path).await.unwrap()),
-            ["Family"]
+            db.get_all_asset_albums("PrimarySync").await.unwrap(),
+            vec![("asset-FIRST_ALBUM".to_string(), "Family".to_string())]
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&sidecar_path).await.unwrap(),
+            first_xmp
         );
         assert_eq!(tokio::fs::read(media_path).await.unwrap(), body);
-        assert!(
-            db.get_pending_metadata_rewrites(10)
+        assert_eq!(
+            tokio::fs::metadata(media_path)
                 .await
                 .unwrap()
-                .is_empty()
+                .modified()
+                .unwrap(),
+            first_media_mtime
         );
-        let rows = db.get_downloaded_page(0, 10).await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].local_path, row.local_path);
+        assert_eq!(
+            tokio::fs::metadata(&sidecar_path)
+                .await
+                .unwrap()
+                .modified()
+                .unwrap(),
+            first_sidecar_mtime
+        );
+        let pending = db.get_pending_metadata_rewrites(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id.as_ref(), "asset-FIRST_ALBUM");
+        assert_eq!(pending[0].local_path.as_ref(), Some(media_path));
+        assert!(db.guard_primary_writer(media_path).await.is_err());
     }
+    assert_eq!(change_calls.load(Ordering::SeqCst), 2);
+    let reopened = SqliteStateDb::open(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.get_all_asset_albums("PrimarySync").await.unwrap(),
+        vec![("asset-FIRST_ALBUM".to_string(), "Family".to_string())]
+    );
+    let pending = reopened.get_pending_metadata_rewrites(10).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id.as_ref(), "asset-FIRST_ALBUM");
+    assert_eq!(pending[0].local_path.as_ref(), Some(media_path));
+    assert!(reopened.guard_primary_writer(media_path).await.is_err());
+    assert_eq!(
+        tokio::fs::read_to_string(&sidecar_path).await.unwrap(),
+        first_xmp
+    );
+    assert_eq!(tokio::fs::read(media_path).await.unwrap(), body);
+    assert_eq!(
+        tokio::fs::metadata(media_path)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap(),
+        first_media_mtime
+    );
+    assert_eq!(
+        tokio::fs::metadata(&sidecar_path)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap(),
+        first_sidecar_mtime
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -3122,124 +3225,12 @@ async fn recent_overflow_uses_current_inventory_and_preserves_checkpoint() {
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn first_album_sync_keeps_capture_mtime_after_embedded_metadata_rewrite() {
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
-    use std::time::UNIX_EPOCH;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, ResponseTemplate};
-
-    const CAPTURE_SECS: u64 = 1_700_000_000;
-    let server = crate::start_wiremock_or_skip!();
-    let body = vec![
-        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
-        0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
-    ];
-    Mock::given(method("GET"))
-        .and(path("/plain.jpg"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let mut records = incremental_photo_records_with_url(
-        "PLAIN",
-        "plain.jpg",
-        &format!("{}/plain.jpg", server.uri()),
-        body.len() as u64,
-    );
-    records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
-        json!(base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body)));
-    let pass = || AlbumPass {
-        kind: PassKind::Album,
-        album: mock_album_with_container(
-            "Trip",
-            "trip",
-            MockPhotosFlow::new()
-                .album_count(1)
-                .query_page(records.clone(), Some("token-full"))
-                .build(),
+    Box::pin(
+        crate::download::orchestration::queue_projection::tests::scoped_membership_refresh_fixture(
+            true,
         ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("state.db");
-    let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
-    let media_dir = dir.path().join("media");
-    let mut config = test_config();
-    config.directory = Arc::from(media_dir);
-    config.metadata.xmp_sidecar = true;
-    config.metadata.embed_xmp = true;
-    config.metadata.set_exif_datetime = true;
-    config.state_db = Some(db.clone());
-
-    assert!(db.get_downloaded_page(0, 10).await.unwrap().is_empty());
-    let first = download_photos_with_sync(
-        &Client::new(),
-        &[pass()],
-        Arc::new(config.clone()),
-        DownloadControls::download_hidden(),
-        CancellationToken::new(),
     )
-    .await
-    .unwrap();
-    assert!(
-        matches!(first.outcome, DownloadOutcome::Success),
-        "{first:?}"
-    );
-    assert_eq!(first.stats.downloaded, 1);
-    let row = db.get_downloaded_page(0, 10).await.unwrap().remove(0);
-    let media = row.local_path.unwrap();
-    let first_bytes = tokio::fs::read(&media).await.unwrap();
-    let first_mtime = tokio::fs::metadata(&media)
-        .await
-        .unwrap()
-        .modified()
-        .unwrap();
-    assert_ne!(first_bytes, body);
-    assert_eq!(
-        first_mtime.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-        CAPTURE_SECS
-    );
-    assert!(
-        db.get_pending_metadata_rewrites(10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-
-    config.state_db = None;
-    drop(db);
-    let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
-    config.state_db = Some(db.clone());
-    let steady = download_photos_with_sync(
-        &Client::new(),
-        &[pass()],
-        Arc::new(config),
-        DownloadControls::download_hidden(),
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert!(
-        matches!(steady.outcome, DownloadOutcome::Success),
-        "{steady:?}"
-    );
-    assert_eq!(steady.stats.downloaded, 0);
-    assert_eq!(tokio::fs::read(&media).await.unwrap(), first_bytes);
-    assert_eq!(
-        tokio::fs::metadata(&media)
-            .await
-            .unwrap()
-            .modified()
-            .unwrap(),
-        first_mtime
-    );
-    assert_eq!(db.get_downloaded_page(0, 10).await.unwrap().len(), 1);
-    assert!(
-        db.get_pending_metadata_rewrites(10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    .await;
 }
 
 #[tokio::test]
