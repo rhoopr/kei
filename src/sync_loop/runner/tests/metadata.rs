@@ -505,6 +505,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
         evidence: EvidenceCase,
         records: Vec<serde_json::Value>,
         valid: Vec<serde_json::Value>,
+        recovered: Vec<serde_json::Value>,
     }
     #[async_trait::async_trait]
     impl crate::icloud::photos::PhotosSession for IdentitySession {
@@ -515,47 +516,72 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<serde_json::Value> {
             let request: serde_json::Value = serde_json::from_str(&body)?;
+            if request["query"]["recordType"] == "CheckIndexingState" {
+                return Ok(
+                    serde_json::json!({"records":[{"recordName":"index","fields":{"state":{"value":"FINISHED"}}}]}),
+                );
+            }
             if let Some(page) = sparse_fixture_inventory(url, &request, &self.valid) {
                 return Ok(page);
             }
             if url.contains("/records/lookup?") {
-                self.lookups
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let body: serde_json::Value = serde_json::from_str(&body).unwrap();
-                assert_eq!(body["zoneID"]["zoneName"], "PrimarySync");
                 assert_eq!(
-                    body["records"],
-                    serde_json::json!([{"recordName":"unresolved-child"}])
+                    body["zoneID"],
+                    serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})
                 );
-                let records = if self.unresolved && self.evidence != EvidenceCase::Ordinary {
-                    let mut record = crate::test_helpers::sparse_shared_asset_record();
-                    record["recordName"] = serde_json::json!("unresolved-child");
-                    match self.evidence {
-                        EvidenceCase::Malformed => {
-                            record["fields"]["linkedShareZoneOwner"]["value"] =
-                                serde_json::json!(null)
+                let requested = body["records"].as_array().unwrap();
+                let is_source = requested
+                    .iter()
+                    .any(|item| item["recordName"] == "unresolved-child");
+                if is_source {
+                    self.lookups
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let records = if self.unresolved && is_source {
+                    if self.evidence == EvidenceCase::Ordinary {
+                        Vec::new()
+                    } else {
+                        let mut record = crate::test_helpers::sparse_shared_asset_record();
+                        record["recordName"] = serde_json::json!("unresolved-child");
+                        match self.evidence {
+                            EvidenceCase::Malformed => {
+                                record["fields"]["linkedShareZoneOwner"]["value"] =
+                                    serde_json::json!(null)
+                            }
+                            EvidenceCase::Changed => {
+                                record["fields"]["linkedShareRecordName"]["value"] =
+                                    serde_json::json!("different-private-child");
+                                record["fields"]["linkedShareZoneName"]["value"] =
+                                    serde_json::json!("SharedSync-different-private-zone");
+                                record["fields"]["linkedShareZoneOwner"]["value"]["recordName"] =
+                                    serde_json::json!("different-private-owner");
+                            }
+                            _ => {}
                         }
-                        EvidenceCase::Changed => {
-                            record["fields"]["linkedShareRecordName"]["value"] =
-                                serde_json::json!("different-private-child");
-                            record["fields"]["linkedShareZoneName"]["value"] =
-                                serde_json::json!("SharedSync-different-private-zone");
-                            record["fields"]["linkedShareZoneOwner"]["value"]["recordName"] =
-                                serde_json::json!("different-private-owner");
-                        }
-                        _ => {}
+                        vec![record]
                     }
-                    vec![record]
-                } else if self.unresolved {
-                    Vec::new()
                 } else {
-                    vec![
-                        serde_json::json!({"recordName":"unresolved-child","serverErrorCode":"UNKNOWN_ITEM"}),
-                    ]
+                    self.valid
+                        .iter()
+                        .chain(self.recovered.iter())
+                        .filter(|record| {
+                            requested
+                                .iter()
+                                .any(|item| item["recordName"] == record["recordName"])
+                        })
+                        .cloned()
+                        .collect()
                 };
                 return Ok(serde_json::json!({"records":records}));
             }
             if url.contains("/changes/zone?") {
+                if request["zones"][0]["syncToken"] == "zone-after" {
+                    return Ok(
+                        serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"zone-after","moreComing":false,"records":[]}]}),
+                    );
+                }
+                assert_eq!(request["zones"][0]["syncToken"], "zone-before");
                 let mut child = if self.evidence != EvidenceCase::Ordinary {
                     crate::test_helpers::sparse_shared_asset_record()
                 } else {
@@ -573,7 +599,16 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                     child["deleted"] = serde_json::json!(true);
                 }
                 let mut records = self.valid.clone();
-                records.push(child);
+                if self.unresolved
+                    || matches!(
+                        self.evidence,
+                        EvidenceCase::DeletedDelta | EvidenceCase::HardDeletedDelta
+                    )
+                {
+                    records.push(child);
+                } else {
+                    records.extend(self.recovered.clone());
+                }
                 return Ok(serde_json::json!({"zones": [{
                     "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
                     "syncToken": "zone-after", "moreComing": false, "records": records
@@ -639,11 +674,34 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             .as_array()
             .unwrap()
             .clone();
+        let mut recovered = full_album_page_with_download(
+            "PrimarySync",
+            "recovered",
+            "zone-after",
+            &format!("{}/valid.jpg", server.uri()),
+            bytes.len() as u64,
+            &checksum,
+        )["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        recovered[1]["recordName"] = serde_json::json!("unresolved-child");
+        let owner = crate::state::db::account::AccountOwner::authenticated(
+            "identity@example.invalid",
+            "com",
+            &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"synthetic-identity"}}))
+                .unwrap(),
+        )
+        .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("state.db");
         let media = dir.path().join("media");
         {
-            let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            let inner = Arc::new(
+                state::SqliteStateDb::open_owned(&database, &owner)
+                    .await
+                    .unwrap(),
+            );
             let db = inner.clone() as Arc<dyn download::DownloadStore>;
             seed_run_cycle_metadata_drift_asset(&db, &media).await;
             let run = inner.start_sync_run().await.unwrap();
@@ -696,7 +754,11 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             let phase = cycle.saturating_sub(usize::from(marker_failure));
             let fail_marker = marker_failure && cycle == 0;
             let fail_deletion = deletion_delta && phase == 3;
-            let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            let inner = Arc::new(
+                state::SqliteStateDb::open_owned(&database, &owner)
+                    .await
+                    .unwrap(),
+            );
             if phase == 3 {
                 // Simulate the retry deadline without sleeping or changing production time.
                 rusqlite::Connection::open(&database).unwrap().execute(
@@ -720,23 +782,44 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             } else {
                 inner.clone()
             };
-            let primary = make_run_cycle_library_state_with_album(
-                "PrimarySync",
-                "sync_token:PrimarySync",
-                make_full_album_with_boxed_session(
-                    "PrimarySync",
-                    Box::new(IdentitySession {
-                        unresolved: phase < 3,
-                        lookups: lookups.clone(),
-                        evidence,
-                        records: run_cycle_favourited_asset_page()["records"]
-                            .as_array()
-                            .unwrap()
-                            .clone(),
-                        valid: valid.clone(),
-                    }),
+            let mut primary_library = crate::icloud::photos::PhotoLibrary::new(
+                "https://synthetic.example/database/1/photos/production/private".into(),
+                Arc::new(std::collections::HashMap::new()),
+                Box::new(IdentitySession {
+                    unresolved: phase < 3,
+                    lookups: lookups.clone(),
+                    evidence,
+                    records: run_cycle_favourited_asset_page()["records"]
+                        .as_array()
+                        .unwrap()
+                        .clone(),
+                    valid: valid.clone(),
+                    recovered: recovered.clone(),
+                }),
+                Arc::new(
+                    serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
                 ),
+                "private".into(),
+                crate::retry::RetryConfig::default(),
+            )
+            .await
+            .unwrap();
+            // Fault wrappers are not the concrete capture database. The next
+            // normal cycle restores scoped capture and replays the held source.
+            if !fail_marker && !fail_deletion {
+                primary_library.shadow_capture =
+                    Some(crate::icloud::photos::inbox::ShadowCapture::new(
+                        inner.clone(),
+                        owner.clone(),
+                        "com",
+                    ));
+            }
+            let mut primary = make_run_cycle_library_state_with_album(
+                "PrimarySync",
+                &crate::sync_cycle::sync_token_key("PrimarySync"),
+                primary_library.all(),
             );
+            primary.library = primary_library;
             #[derive(Clone)]
             struct QuietShared;
             #[async_trait::async_trait]
@@ -747,11 +830,20 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                     body: String,
                     _: &[(&str, &str)],
                 ) -> anyhow::Result<serde_json::Value> {
-                    let request = serde_json::from_str(&body)?;
+                    let request: serde_json::Value = serde_json::from_str(&body)?;
+                    if request["query"]["recordType"] == "CheckIndexingState" {
+                        return Ok(
+                            serde_json::json!({"records":[{"recordName":"index","fields":{"state":{"value":"FINISHED"}}}]}),
+                        );
+                    }
                     if let Some(page) = sparse_fixture_inventory(url, &request, &[]) {
                         return Ok(page);
                     }
                     assert!(url.contains("/changes/zone?"));
+                    assert_eq!(
+                        request["zones"][0]["zoneID"],
+                        serde_json::json!({"zoneName":"SharedSync-test","ownerRecordName":"_defaultOwner"})
+                    );
                     Ok(
                         serde_json::json!({"zones":[{"zoneID":{"zoneName":"SharedSync-test","ownerRecordName":"_defaultOwner"},"records":[],"syncToken":"shared-after","moreComing":false}]}),
                     )
@@ -760,11 +852,28 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                     Box::new(self.clone())
                 }
             }
-            let shared = make_run_cycle_library_state_with_album(
+            let mut shared_library = crate::icloud::photos::PhotoLibrary::new(
+                "https://synthetic.example/database/1/photos/production/private".into(),
+                Arc::new(std::collections::HashMap::new()), Box::new(QuietShared),
+                Arc::new(serde_json::json!({"zoneName":"SharedSync-test","ownerRecordName":"_defaultOwner"})),
+                "private".into(), crate::retry::RetryConfig::default(),
+            ).await.unwrap();
+            // Fault wrappers are not the concrete capture database. The next
+            // normal cycle restores scoped capture and replays the held source.
+            if !fail_marker && !fail_deletion {
+                shared_library.shadow_capture =
+                    Some(crate::icloud::photos::inbox::ShadowCapture::new(
+                        inner.clone(),
+                        owner.clone(),
+                        "com",
+                    ));
+            }
+            let mut shared = make_run_cycle_library_state_with_album(
                 "SharedSync-test",
-                "sync_token:SharedSync-test",
-                make_full_album_with_boxed_session("SharedSync-test", Box::new(QuietShared)),
+                &crate::sync_cycle::sync_token_key("SharedSync-test"),
+                shared_library.all(),
             );
+            shared.library = shared_library;
             let libraries = if phase == 1 {
                 vec![&shared]
             } else {
@@ -790,12 +899,12 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             )
             .await
             .unwrap();
+            let selected_identity_incomplete = phase != 1 && phase < recovery_phase;
             assert_eq!(
-                result.stats.identity_incomplete,
-                phase < recovery_phase,
+                result.stats.identity_incomplete, selected_identity_incomplete,
                 "recent={recent:?} evidence={evidence:?} cycle={cycle}"
             );
-            assert_eq!(result.failed_count > 0, phase < recovery_phase);
+            assert_eq!(result.failed_count > 0, selected_identity_incomplete);
             let deferred = phase == 2
                 && matches!(
                     evidence,
@@ -806,21 +915,18 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                 );
             assert_eq!(
                 lookups.load(std::sync::atomic::Ordering::Relaxed),
-                usize::from(phase != 1 && !deferred && !(phase >= 3 && deletion_delta)),
+                if phase == 3 && !deletion_delta {
+                    if recent.is_some() { 2 } else { 4 }
+                } else {
+                    usize::from(phase != 1 && !deferred && phase < 3)
+                },
                 "recent={recent:?} evidence={evidence:?} cycle={cycle} phase={phase}"
             );
             let retained = inner.sparse_identities("PrimarySync").await.unwrap();
-            let stable_link = matches!(
-                evidence,
-                EvidenceCase::Sparse
-                    | EvidenceCase::DeletedDelta
-                    | EvidenceCase::HardDeletedDelta
-                    | EvidenceCase::Changed
-                    | EvidenceCase::MarkerWriteFailure
-            );
             assert_eq!(
                 retained.len(),
-                usize::from(phase < recovery_phase && !fail_marker && stable_link)
+                usize::from(phase < recovery_phase && !fail_marker),
+                "recent={recent:?} evidence={evidence:?} cycle={cycle}"
             );
             if deferred {
                 assert!(retained[0].next_retry.is_some());
@@ -831,7 +937,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                     result.failed_count,
                     result.session_expired
                 ),
-                if phase < recovery_phase {
+                if selected_identity_incomplete {
                     crate::cycle_reporter::CycleStatus::Failed
                 } else {
                     crate::cycle_reporter::CycleStatus::Success
@@ -841,13 +947,26 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                 result.stats.state_write_failures > 0,
                 fail_marker || fail_deletion
             );
-            assert!(
+            assert_eq!(
                 inner
                     .get_master_record_name_for_asset("PrimarySync", "unresolved-child")
                     .await
                     .unwrap()
-                    .is_none()
+                    .as_deref(),
+                (phase >= recovery_phase && !deletion_delta).then_some("recovered"),
+                "recent={recent:?} evidence={evidence:?} cycle={cycle}"
             );
+            for child in ["private-linked-child", "different-private-child"] {
+                assert_eq!(
+                    inner
+                        .get_master_record_name_for_asset("PrimarySync", child)
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("master-PrimarySync"),
+                    "recent={recent:?} evidence={evidence:?} cycle={cycle}"
+                );
+            }
             let marker_expected = phase < recovery_phase && !fail_marker;
             assert_eq!(
                 inner
@@ -870,7 +989,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             );
             assert_eq!(
                 inner
-                    .get_metadata("sync_token:PrimarySync")
+                    .get_metadata(&crate::sync_cycle::sync_token_key("PrimarySync"))
                     .await
                     .unwrap()
                     .as_deref(),
@@ -882,7 +1001,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             );
             assert_eq!(
                 inner
-                    .get_metadata("sync_token:SharedSync-test")
+                    .get_metadata(&crate::sync_cycle::sync_token_key("SharedSync-test"))
                     .await
                     .unwrap()
                     .as_deref(),
