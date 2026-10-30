@@ -1542,9 +1542,36 @@ impl SelectionRun {
             })
         {
             for task in &mut plan.tasks {
-                if planner
-                    .choose_cross_rendition_sibling(asset, config, task)
-                    .await?
+                if planner.managed_layout_session().is_some() {
+                    continue;
+                }
+                let matched = planner.match_existing(asset, config, task).await;
+                if let crate::download::baseline_matching::BaselineMatch::RecordedPresent {
+                    receipt,
+                    ..
+                } = matched
+                {
+                    let path = receipt.native_path.to_path();
+                    if !planner.conflicts_with_durable_destination(task, &path)
+                        && planner.retry_path_allowed(
+                            &task.library,
+                            &task.asset_id,
+                            task.version_size,
+                            &task.checksum,
+                            task.size,
+                            &path,
+                        )
+                    {
+                        planner.release_unpublished_task_claim(task);
+                        task.download_path = path;
+                    }
+                    continue;
+                }
+                if !planner.has_durable_destination(task)
+                    && !planner.conflicts_with_durable_destination(task, &task.download_path)
+                    && planner
+                        .choose_cross_rendition_sibling(asset, config, task)
+                        .await?
                 {
                     redirected.insert(task.version_size);
                 }
@@ -1568,6 +1595,7 @@ impl SelectionRun {
                     ..
                 } = planner.match_existing(asset, config, task).await
                     && task.download_path != receipt.local_path
+                    && !planner.conflicts_with_durable_destination(task, &receipt.local_path)
                 {
                     planner.release_unpublished_task_claim(task);
                     task.download_path = receipt.local_path;
@@ -1620,7 +1648,14 @@ impl SelectionRun {
                             candidate.clone(),
                         )
                         .await?;
-                    if (fulfilled
+                    if !planner.conflicts_with_durable_choice(
+                        asset.source_zone().unwrap_or(&config.library),
+                        asset.state_id(),
+                        derived.version_size,
+                        &derived.checksum,
+                        derived.size,
+                        &path,
+                    ) && (fulfilled
                         || filter::stored_path_matches_download_family(
                             asset.state_id(),
                             derived,

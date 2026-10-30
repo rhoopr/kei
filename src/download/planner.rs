@@ -335,6 +335,14 @@ impl TaskPlanner {
                 continue;
             }
             if record.checksum != derived.checksum.as_ref()
+                || self.conflicts_with_durable_choice(
+                    &owner.library,
+                    &owner.asset_id,
+                    version_size,
+                    &derived.checksum,
+                    derived.size,
+                    path,
+                )
                 || !super::filter::stored_path_matches_download_family(
                     asset.state_id(),
                     derived,
@@ -1360,6 +1368,61 @@ impl TaskPlanner {
                     })
                 })
             })
+    }
+
+    /// A saved choice for this generation cannot be displaced by an older receipt.
+    pub(super) fn conflicts_with_durable_destination(
+        &self,
+        task: &DownloadTask,
+        candidate: &Path,
+    ) -> bool {
+        self.conflicts_with_durable_choice(
+            &task.library,
+            &task.asset_id,
+            task.version_size,
+            &task.checksum,
+            task.size,
+            candidate,
+        )
+    }
+
+    pub(super) fn conflicts_with_durable_choice(
+        &self,
+        library: &str,
+        asset_id: &str,
+        version: VersionSizeKey,
+        checksum: &str,
+        size: u64,
+        candidate: &Path,
+    ) -> bool {
+        let Ok(candidate_key) = PathPlanningMode::Reconciliation.key(candidate) else {
+            return true;
+        };
+        self.reconciliation.durable_destinations.iter().any(|key| {
+            *key != candidate_key
+                && self
+                    .reconciliation
+                    .path_owners
+                    .get(key)
+                    .is_some_and(|owners| {
+                        owners.iter().any(|owner| {
+                            owner.library.as_ref() == library
+                                && owner.asset_id.as_ref() == asset_id
+                                && owner.version_size == version
+                        })
+                    })
+                && self
+                    .reconciliation
+                    .path_contents
+                    .get(key)
+                    .is_none_or(|contents| {
+                        contents.iter().any(|content| {
+                            content.as_ref().is_none_or(|content| {
+                                content.checksum.as_ref() == checksum && content.size == size
+                            })
+                        })
+                    })
+        })
     }
 
     /// A committed choice wins over an older recorded source path on restart.

@@ -2183,6 +2183,103 @@ async fn scoped_original_adjusted_only_publishes_distinct_sibling() {
 }
 
 #[tokio::test]
+async fn scoped_completed_edit_keeps_old_path_after_naming_change() {
+    for scenario in ["completed", "changed", "reservation"] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("media");
+        let options = |token| CycleOptions {
+            private: true,
+            cycle_token: Some(token),
+            ..CycleOptions::default()
+        };
+        let page = records(&server, Some(("edit-one", EDIT_ONE)));
+        let (initial, _) = cycle_options(
+            root.path(),
+            page.clone(),
+            false,
+            EditedNaming::Suffix,
+            options("initial-token"),
+        )
+        .await;
+        assert_eq!(initial.failed_count, 0, "{scenario}: {:?}", initial.stats);
+        let original = media.join("IMG_0501.JPG");
+        let edit = media.join("IMG_0501_edited.JPG");
+        assert_bytes(&original, ORIGINAL);
+        assert_bytes(&edit, EDIT_ONE);
+        let original_mtime = std::fs::metadata(&original).unwrap().modified().unwrap();
+        let edit_mtime = std::fs::metadata(&edit).unwrap().modified().unwrap();
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let receipts: Vec<String> = conn.prepare("SELECT json_array(version_size,native_path,provider_checksum,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-501' ORDER BY version_size").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(receipts.len(), 2);
+        let reserved = media.join("saved-adjusted.JPG");
+        if scenario == "reservation" {
+            let requested = crate::fs_util::confined_path_key(&original).unwrap();
+            let destination = crate::fs_util::confined_path_key(&reserved).unwrap();
+            conn.execute("INSERT INTO reconciliation_paths(library,id,version_size,requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size) VALUES('PrimarySync','asset-501','adjusted',?1,?2,?3,?4,?5)", rusqlite::params![requested,destination,reserved.to_str().unwrap(),provider_hash(EDIT_ONE),EDIT_ONE.len() as i64]).unwrap();
+        }
+        drop(conn);
+        if scenario == "changed" {
+            std::fs::write(&edit, b"changed local edit").unwrap();
+        }
+        let requests = server.received_requests().await.unwrap().len();
+        for round in 0..2 {
+            let (result, _) = cycle_options(
+                root.path(),
+                page.clone(),
+                round != 0,
+                EditedNaming::Primary,
+                options("changed-token"),
+            )
+            .await;
+            assert_bytes(&original, ORIGINAL);
+            assert_eq!(
+                std::fs::metadata(&original).unwrap().modified().unwrap(),
+                original_mtime
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+            if scenario == "completed" {
+                assert_eq!(result.failed_count, 0, "round {round}: {:?}", result.stats);
+                assert!(result.db_sync_token_advance_safe);
+                assert_eq!(result.stats.downloaded, 0);
+                assert_bytes(&edit, EDIT_ONE);
+                assert_eq!(
+                    std::fs::metadata(&edit).unwrap().modified().unwrap(),
+                    edit_mtime
+                );
+                let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+                let token: String = conn
+                    .query_row(
+                        "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(token, "changed-token");
+                let after: Vec<String> = conn.prepare("SELECT json_array(version_size,native_path,provider_checksum,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-501' ORDER BY version_size").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+                assert_eq!(after, receipts);
+                let debt: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-501' AND admitted=1 AND (verified_media=0 OR verified_metadata=0)", [], |r| r.get(0)).unwrap();
+                assert_eq!(debt, 0);
+            } else if scenario == "changed" {
+                assert!(
+                    result.failed_count > 0 || !result.db_sync_token_advance_safe,
+                    "{result:?}"
+                );
+                assert_bytes(&edit, b"changed local edit");
+            } else {
+                assert_bytes(&edit, EDIT_ONE);
+                let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+                let destination: String = conn.query_row("SELECT destination_path FROM reconciliation_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted' AND provider_checksum=?1", [provider_hash(EDIT_ONE)], |r| r.get(0)).unwrap();
+                assert_eq!(std::path::Path::new(&destination), reserved);
+                let debt: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND checksum=?1 AND verified_media=0", [provider_hash(EDIT_ONE)], |r| r.get(0)).unwrap();
+                assert!(debt > 0, "{result:?}");
+            }
+            assert!(!reserved.exists());
+        }
+    }
+}
+
+#[tokio::test]
 async fn scoped_bad_admitted_adjusted_recovers_after_reopen() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
@@ -2729,47 +2826,89 @@ async fn primary_layout_retains_original_when_only_adjusted_selected() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
-    let (initial, _) = cycle(
+    let options = |resolution, token| CycleOptions {
+        private: true,
+        resolution,
+        cycle_token: Some(token),
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
         root.path(),
         records(&server, None),
         false,
         EditedNaming::Primary,
+        options(crate::types::PhotoResolution::Original, "original-token"),
     )
     .await;
     assert_eq!(initial.failed_count, 0);
+    let original = media.join("IMG_0501.JPG");
+    assert_bytes(&original, ORIGINAL);
+    let mtime = std::fs::metadata(&original).unwrap().modified().unwrap();
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let receipt: String = conn.query_row("SELECT json_array(id,scope,child,master,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-501' AND version_size='original' AND source_checksum IS NOT NULL", [], |r| r.get(0)).unwrap();
+    drop(conn);
     let edited = records(&server, Some(("edit-one", EDIT_ONE)));
-    let (result, _) = cycle_resolution(
+    let (result, _) = cycle_options(
         root.path(),
         edited.clone(),
         false,
         EditedNaming::Primary,
-        crate::types::PhotoResolution::None,
+        options(crate::types::PhotoResolution::None, "edit-token"),
     )
     .await;
     assert_eq!(result.failed_count, 0, "{:?}", result.stats);
     assert!(result.db_sync_token_advance_safe);
-    assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
-    assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
-    let requests = server.received_requests().await.unwrap();
+    assert_eq!(result.stats.downloaded, 1);
+    let sibling = std::fs::read_dir(&media)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p != &original && std::fs::read(p).is_ok_and(|b| b == EDIT_ONE))
+        .unwrap();
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let retained: String = conn.query_row("SELECT json_array(id,scope,child,master,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-501' AND version_size='original' AND source_checksum IS NOT NULL", [], |r| r.get(0)).unwrap();
+    assert_eq!(retained, receipt);
+    let (path, source, local): (String,String,String) = conn.query_row("SELECT native_path,source_checksum,local_checksum FROM download_receipts WHERE child='asset-501' AND version_size='adjusted' AND provider_checksum=?1", [provider_hash(EDIT_ONE)], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
     assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.url.path() == "/original")
-            .count(),
-        1,
-        "unselected original was fetched"
+        std::path::Path::new(
+            serde_json::from_str::<Value>(&path).unwrap()["path"]
+                .as_str()
+                .unwrap()
+        ),
+        sibling
     );
-    let (quiet, lookups) = cycle_resolution(
-        root.path(),
-        edited,
-        true,
-        EditedNaming::Primary,
-        crate::types::PhotoResolution::None,
-    )
-    .await;
-    assert_eq!(quiet.failed_count, 0);
-    assert!(quiet.db_sync_token_advance_safe);
-    assert_eq!(lookups, 0);
+    assert_eq!(source, format!("{:x}", Sha256::digest(EDIT_ONE)));
+    assert_eq!(source, local);
+    let token: String = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(token, "edit-token");
+    drop(conn);
+    let requests = server.received_requests().await.unwrap().len();
+    for _ in 0..2 {
+        let (quiet, lookups) = cycle_options(
+            root.path(),
+            edited.clone(),
+            true,
+            EditedNaming::Primary,
+            options(crate::types::PhotoResolution::None, "edit-token"),
+        )
+        .await;
+        assert_eq!(quiet.failed_count, 0);
+        assert!(quiet.db_sync_token_advance_safe);
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_eq!(lookups, 0);
+        assert_bytes(&original, ORIGINAL);
+        assert_bytes(&sibling, EDIT_ONE);
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().modified().unwrap(),
+            mtime
+        );
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
 }
 
 #[cfg(target_os = "linux")]
@@ -2920,8 +3059,10 @@ async fn primary_layout_private_edit_retains_occupied_original_and_processes_new
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
-    let options = || CycleOptions {
+    let original = media.join("IMG_0501.JPG");
+    let options = |token| CycleOptions {
         private: true,
+        cycle_token: Some(token),
         ..CycleOptions::default()
     };
     let (initial, _) = cycle_options(
@@ -2929,184 +3070,143 @@ async fn primary_layout_private_edit_retains_occupied_original_and_processes_new
         records(&server, None),
         false,
         EditedNaming::Primary,
-        options(),
+        options("original-token"),
     )
     .await;
     assert_eq!(initial.failed_count, 0);
     assert!(initial.db_sync_token_advance_safe);
-    assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
-    let mut current = records(&server, Some(("edit-one", EDIT_ONE)));
-    let mut new = records(&server, None);
-    for record in &mut new {
+    assert_bytes(&original, ORIGINAL);
+    let mtime = std::fs::metadata(&original).unwrap().modified().unwrap();
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let receipt: String = conn.query_row("SELECT json_array(id,scope,child,master,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-501' AND version_size='original' AND source_checksum IS NOT NULL", [], |r| r.get(0)).unwrap();
+    drop(conn);
+    let mut healthy = records(&server, None);
+    for record in &mut healthy {
         record["recordName"] = json!(record["recordName"].as_str().unwrap().replace("501", "502"));
         if let Some(reference) = record["fields"].get_mut("masterRef") {
             reference["value"]["recordName"] = json!("502");
         }
     }
-    new[0]["fields"]["filenameEnc"]["value"] = json!("NEW_0502.JPG");
-    new[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/edit-two",server.uri()),"size":EDIT_TWO.len(),"fileChecksum":provider_hash(EDIT_TWO)});
-    current.extend(new);
-    let mut quiet_snapshot = None;
-    for (round, (edit, quiet, uncertain, downloads, generations, debt)) in [
-        (Some(("edit-one", EDIT_ONE)), false, 1, 1, 1, 1),
-        (Some(("edit-two", EDIT_TWO)), false, 2, 0, 2, 2),
-        (None, false, 1, 0, 3, 2),
-        (None, true, 0, 0, 3, 2),
-        (None, true, 0, 0, 3, 2),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    healthy[0]["fields"]["filenameEnc"]["value"] = json!("NEW_0502.JPG");
+    healthy[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/edit-two",server.uri()),"size":EDIT_TWO.len(),"fileChecksum":provider_hash(EDIT_TWO)});
+    let mut paths = Vec::new();
+    for (round, edit, token) in [
+        (0, Some(("edit-one", EDIT_ONE)), "first-token"),
+        (1, Some(("edit-two", EDIT_TWO)), "second-token"),
+        (2, None, "revert-token"),
+    ] {
         let mut page = records(&server, edit);
-        page.extend(current[2..].to_vec());
-        let (result, lookups) =
-            cycle_options(root.path(), page, quiet, EditedNaming::Primary, options()).await;
-        assert_eq!(
-            result.stats.skipped.uncertain, uncertain,
-            "round {round}: {result:?}"
-        );
-        assert_eq!(
-            result.stats.downloaded, downloads,
-            "round {round}: {result:?}"
-        );
-        assert!(
-            result.db_sync_token_advance_safe,
-            "round {round}: {result:?}"
-        );
-        if quiet {
-            assert_eq!(result.failed_count, 0);
-            assert_eq!(lookups, 0);
-        }
-        assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
-        assert_bytes(&media.join("NEW_0502.JPG"), EDIT_TWO);
-        assert!(!media.join("IMG_0501_original.JPG").exists());
-        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
-            .await
-            .unwrap();
-        assert_eq!(
-            db.get_metadata("sync_token:PrimarySync")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("cycle-token")
-        );
-        let pending = db.get_pending().await.unwrap();
-        assert_eq!(pending.len(), 1, "round {round}: {pending:?}");
-        assert_eq!(pending[0].id.as_ref(), "asset-501");
-        assert_eq!(pending[0].version_size.as_str(), "adjusted");
-        assert!(
-            pending[0]
-                .last_error
-                .as_deref()
-                .is_some_and(|e| e.contains("unsupported_provider_proof_without_valid_receipt"))
-        );
-        drop(db);
+        page.extend(healthy.clone());
+        let (result, _) = cycle_options(
+            root.path(),
+            page,
+            false,
+            EditedNaming::Primary,
+            options(token),
+        )
+        .await;
+        assert_eq!(result.failed_count, 0, "round {round}: {:?}", result.stats);
+        assert_eq!(result.stats.downloaded, [2, 1, 0][round]);
+        assert_eq!(result.stats.skipped.uncertain, 0);
         let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-        let receipt: (String, String, String, String) = conn.query_row("SELECT local_checksum, source_checksum, provider_checksum, local_path FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
-        assert_eq!(receipt.0, format!("{:x}", Sha256::digest(ORIGINAL)));
-        assert_eq!(receipt.0, receipt.1);
-        assert_eq!(receipt.2, provider_hash(ORIGINAL));
-        assert_eq!(std::path::Path::new(&receipt.3), media.join("IMG_0501.JPG"));
-        let current_receipt: (String, String, String) = conn.query_row("SELECT local_checksum, source_checksum, provider_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-502' AND version_size='original'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
-        assert_eq!(current_receipt.0, format!("{:x}", Sha256::digest(EDIT_TWO)));
-        assert_eq!(current_receipt.0, current_receipt.1);
-        assert_eq!(current_receipt.2, provider_hash(EDIT_TWO));
-        let pending_checksum: String = conn.query_row("SELECT checksum FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted' AND status='pending' AND local_path IS NULL", [], |r| r.get(0)).unwrap();
-        assert_eq!(
-            pending_checksum,
-            provider_hash(if round == 0 { EDIT_ONE } else { EDIT_TWO })
-        );
-        assert_eq!(
-            db_count(
-                root.path(),
-                "SELECT COUNT(*) FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'"
-            ),
-            0
-        );
-        assert_eq!(
-            db_count(
-                root.path(),
-                "SELECT COUNT(*) FROM primary_layout_operations"
-            ),
-            0
-        );
-        assert_eq!(
-            db_count(
-                root.path(),
-                "SELECT COUNT(*) FROM assets WHERE library='PrimarySync' AND id='asset-502' AND version_size='original' AND status='downloaded'"
-            ),
-            1
-        );
-        assert_eq!(
-            db_count(
-                root.path(),
-                "SELECT COUNT(*) FROM provider_active_generations WHERE sealed=1 AND checkpoint_ready=1"
-            ),
-            generations
-        );
-        assert_eq!(
-            db_count(
-                root.path(),
-                "SELECT COUNT(*) FROM provider_active_generations WHERE sealed=0 OR checkpoint_ready=0"
-            ),
-            0
-        );
-        assert_eq!(
-            db_count(
-                root.path(),
-                "SELECT COUNT(*) FROM provider_active_destinations WHERE admitted=1 AND (verified_media=0 OR verified_metadata=0)"
-            ),
-            debt
-        );
-        assert_eq!(
-            db_count(
-                root.path(),
-                "SELECT COUNT(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND admitted=1 AND verified_media=0 AND verified_metadata=0"
-            ),
-            debt
-        );
-        assert_eq!(
-            db_count(
-                root.path(),
-                "SELECT COUNT(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='original' AND admitted=1 AND verified_media=1 AND verified_metadata=1"
-            ),
-            generations
-        );
-        assert_eq!(
-            db_count(
-                root.path(),
-                "SELECT COUNT(*) FROM provider_active_destinations WHERE child='asset-502' AND version_size='original' AND admitted=1 AND verified_media=1 AND verified_metadata=1"
-            ),
-            1
-        );
-        for bytes in [EDIT_ONE, EDIT_TWO].into_iter().take(debt as usize) {
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND checksum=?1 AND verified_media=0 AND verified_metadata=0", [provider_hash(bytes)], |r| r.get(0)).unwrap();
-            assert_eq!(count, 1);
+        let generations: (i64, i64) = conn.query_row("SELECT count(*), COALESCE(sum(sealed=1 AND checkpoint_ready=1),0) FROM provider_active_generations", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(generations, (1, 1));
+        let destinations: (i64, i64) = conn.query_row("SELECT count(*), COALESCE(sum(verified_media=0 OR verified_metadata=0),0) FROM provider_active_destinations WHERE admitted=1", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(destinations, ([3, 3, 2][round], 0));
+        for (index, bytes) in [EDIT_ONE, EDIT_TWO].into_iter().enumerate() {
+            let count: i64 = conn.query_row("SELECT count(*) FROM download_receipts WHERE child='asset-501' AND version_size='adjusted' AND provider_checksum=?1 AND source_checksum IS NOT NULL", [provider_hash(bytes)], |r| r.get(0)).unwrap();
+            assert_eq!(count, i64::from(index <= round));
         }
-        if quiet {
-            let snapshot: Vec<String> = ["SELECT json_array(id,sealed,checkpoint_ready) FROM provider_active_generations ORDER BY id", "SELECT json_array(generation,child,version_size,checksum,verified_media,verified_metadata) FROM provider_active_destinations ORDER BY generation,child,version_size", "SELECT json_array(id,version_size,status,checksum,last_error) FROM assets ORDER BY id,version_size"].into_iter().flat_map(|sql| conn.prepare(sql).unwrap().query_map([], |r| r.get::<_,String>(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap()).collect();
-            if let Some(previous) = &quiet_snapshot {
-                assert_eq!(&snapshot, previous);
-            }
-            quiet_snapshot = Some(snapshot);
+        let token_saved: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(token_saved, token);
+        let retained: String = conn.query_row("SELECT json_array(id,scope,child,master,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-501' AND version_size='original' AND source_checksum IS NOT NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(retained, receipt);
+        drop(conn);
+        assert!(result.db_sync_token_advance_safe);
+        assert_bytes(&original, ORIGINAL);
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().modified().unwrap(),
+            mtime
+        );
+        assert_bytes(&media.join("NEW_0502.JPG"), EDIT_TWO);
+        if let Some((_, bytes)) = edit {
+            let path = std::fs::read_dir(&media)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| {
+                    p != &original
+                        && p != &media.join("NEW_0502.JPG")
+                        && std::fs::read(p).is_ok_and(|b| b == bytes)
+                });
+            paths.push(path.expect("each edit has its own sibling"));
         }
     }
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|r| r.url.path() == "/original")
-            .count(),
-        1
-    );
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|r| r.url.path() == "/edit-two")
-            .count(),
-        1
-    );
+    assert_eq!(paths.len(), 2);
+    assert_ne!(paths[0], paths[1]);
+    assert_bytes(&paths[0], EDIT_ONE);
+    assert_bytes(&paths[1], EDIT_TWO);
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let receipts: Vec<String> = conn.prepare("SELECT json_array(provider_checksum,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-501' AND version_size='adjusted' ORDER BY provider_checksum").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(receipts.len(), 2);
+    for (path, bytes) in paths.iter().zip([EDIT_ONE, EDIT_TWO]) {
+        let (native, source, local): (String, String, String) = conn.query_row("SELECT native_path,source_checksum,local_checksum FROM download_receipts WHERE child='asset-501' AND version_size='adjusted' AND provider_checksum=?1", [provider_hash(bytes)], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(
+            std::path::Path::new(
+                serde_json::from_str::<Value>(&native).unwrap()["path"]
+                    .as_str()
+                    .unwrap()
+            ),
+            path
+        );
+        assert_eq!(source, format!("{:x}", Sha256::digest(bytes)));
+        assert_eq!(local, source);
+    }
+    drop(conn);
+    let requests = server.received_requests().await.unwrap().len();
+    for _ in 0..2 {
+        let mut page = records(&server, None);
+        page.extend(healthy.clone());
+        let (quiet, lookups) = cycle_options(
+            root.path(),
+            page,
+            true,
+            EditedNaming::Primary,
+            options("revert-token"),
+        )
+        .await;
+        assert_eq!(quiet.failed_count, 0);
+        assert!(quiet.db_sync_token_advance_safe);
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_eq!(lookups, 0);
+        assert_bytes(&original, ORIGINAL);
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().modified().unwrap(),
+            mtime
+        );
+        assert_bytes(&paths[0], EDIT_ONE);
+        assert_bytes(&paths[1], EDIT_TWO);
+        assert_bytes(&media.join("NEW_0502.JPG"), EDIT_TWO);
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let retained: Vec<String> = conn.prepare("SELECT json_array(provider_checksum,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-501' AND version_size='adjusted' ORDER BY provider_checksum").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(retained, receipts);
+        let debt: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND (verified_media=0 OR verified_metadata=0)", [], |r| r.get(0)).unwrap();
+        assert_eq!(debt, 0);
+        let token: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(token, "revert-token");
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
 }
 
 #[cfg(feature = "xmp")]
@@ -4461,59 +4561,116 @@ async fn review501_changed_unselected_legacy_original_holds_migration() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let media = root.path().join("media");
-    let (initial, _) = cycle(
+    let original = media.join("IMG_0501.JPG");
+    let options = |resolution, token| CycleOptions {
+        private: true,
+        resolution,
+        cycle_token: Some(token),
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
         root.path(),
         records(&server, None),
         false,
         EditedNaming::Suffix,
+        options(crate::types::PhotoResolution::Original, "original-token"),
     )
     .await;
     assert_eq!(initial.failed_count, 0);
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let receipt: String = conn.query_row("SELECT json_array(id,scope,child,master,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-501' AND version_size='original' AND source_checksum IS NOT NULL", [], |r| r.get(0)).unwrap();
+    drop(conn);
     let modified = b"locally modified original bytes";
-    std::fs::write(media.join("IMG_0501.JPG"), modified).unwrap();
+    std::fs::write(&original, modified).unwrap();
     let requests = server.received_requests().await.unwrap().len();
     let edited = records(&server, Some(("edit-one", EDIT_ONE)));
-    let (held, _) = cycle_resolution(
+    let (held, _) = cycle_options(
         root.path(),
         edited.clone(),
         false,
         EditedNaming::Primary,
-        crate::types::PhotoResolution::None,
+        options(crate::types::PhotoResolution::None, "held-token"),
     )
     .await;
     assert!(held.failed_count > 0);
-    assert!(!held.db_sync_token_advance_safe);
-    assert_bytes(&media.join("IMG_0501.JPG"), modified);
-    assert!(!media.join("IMG_0501_original.JPG").exists());
+    assert!(held.db_sync_token_advance_safe);
+    assert_bytes(&original, modified);
     assert_eq!(server.received_requests().await.unwrap().len(), requests);
-    // Restore only this synthetic fixture's exact owned bytes, then recover.
-    std::fs::write(media.join("IMG_0501.JPG"), ORIGINAL).unwrap();
-    let (recovered, _) = cycle_resolution(
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let debt: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND checksum=?1 AND admitted=1 AND verified_media=0", [provider_hash(EDIT_ONE)], |r| r.get(0)).unwrap();
+    assert_eq!(debt, 2);
+    let token: String = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(token, "held-token");
+    drop(conn);
+    std::fs::write(&original, ORIGINAL).unwrap();
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+        .await
+        .unwrap();
+    db.make_selection_retry_due(owner, "asset-501".into())
+        .await
+        .unwrap();
+    drop(db);
+    let (recovered, _) = cycle_options(
         root.path(),
         edited.clone(),
         true,
         EditedNaming::Primary,
-        crate::types::PhotoResolution::None,
+        options(crate::types::PhotoResolution::None, "recovered-token"),
     )
     .await;
     assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
     assert!(recovered.db_sync_token_advance_safe);
-    assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
-    assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+    assert_eq!(recovered.stats.downloaded, 1);
+    let sibling = std::fs::read_dir(&media)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p != &original && std::fs::read(p).is_ok_and(|b| b == EDIT_ONE))
+        .unwrap();
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let retained: String = conn.query_row("SELECT json_array(id,scope,child,master,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-501' AND version_size='original' AND source_checksum IS NOT NULL", [], |r| r.get(0)).unwrap();
+    assert_eq!(retained, receipt);
+    let done: i64 = conn.query_row("SELECT count(*) FROM download_receipts WHERE child='asset-501' AND version_size='adjusted' AND provider_checksum=?1 AND source_checksum IS NOT NULL", [provider_hash(EDIT_ONE)], |r| r.get(0)).unwrap();
+    assert_eq!(done, 1);
+    let debt: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND checksum=?1 AND admitted=1 AND verified_media=0", [provider_hash(EDIT_ONE)], |r| r.get(0)).unwrap();
+    assert_eq!(debt, 0);
+    let token: String = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(token, "recovered-token");
+    drop(conn);
+    let requests = server.received_requests().await.unwrap().len();
     for _ in 0..2 {
-        let (quiet, lookups) = cycle_resolution(
+        let (quiet, _) = cycle_options(
             root.path(),
             edited.clone(),
             true,
             EditedNaming::Primary,
-            crate::types::PhotoResolution::None,
+            options(crate::types::PhotoResolution::None, "recovered-token"),
         )
         .await;
         assert_eq!(quiet.failed_count, 0);
         assert!(quiet.db_sync_token_advance_safe);
         assert_eq!(quiet.stats.downloaded, 0);
-        assert_eq!(lookups, 0);
+        assert_bytes(&original, ORIGINAL);
+        assert_bytes(&sibling, EDIT_ONE);
     }
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
 }
 
 #[tokio::test]

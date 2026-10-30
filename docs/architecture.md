@@ -438,6 +438,9 @@ decision and seal, transfers only incomplete paths whose saved provider facts
 match the fresh confirmation, recomputes their proofs, and preserves retry
 evidence and completed sibling files. Older distinct provider generations stay
 pending at their recorded paths; the newer publication does not complete them.
+Before choosing a new adjusted sibling, a fresh selection checks an applicable
+completed scoped receipt and its confined file. A saved different destination
+for the same provider generation retains its own pending obligation.
 A retained original handle and an empty confined sibling are rechecked before
 commit. Prepared publications and frozen metadata defer this transition until the
 existing recovery or metadata owner settles them.
