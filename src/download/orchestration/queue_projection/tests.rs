@@ -4077,6 +4077,21 @@ async fn private_metadata_recovery_fixture_with_signature(
         .try_with(|enabled| *enabled)
         .unwrap_or(false)
     {
+        // The explicit earlier request already wrote these bytes before the
+        // injected receipt failure. Normal sync must finish only its scoped
+        // recorded work, without requesting another refresh.
+        assert!(!f.config.refresh_metadata);
+        assert!(trace.events().iter().any(|event| {
+            event
+                .fields
+                .values()
+                .any(|value| value.contains("synthetic metadata finalization failure"))
+        }));
+        let written = std::fs::read(&media_paths[0]).unwrap();
+        assert_ne!(written, media);
+        let scoped_debt: i64 = f.db.acquire_lock("recorded scoped writer before normal retry").unwrap().query_row(
+            "SELECT count(*) FROM provider_active_destinations WHERE library='PrimarySync' AND child='asset-m' AND admitted=1 AND verified_media=1 AND verified_metadata=0 AND prepared_hash IS NOT NULL", [], |row| row.get(0)).unwrap();
+        assert_eq!(scoped_debt, 1);
         let token_key = crate::sync_cycle::sync_token_key("PrimarySync");
         f.db.set_metadata("sync_token:PrimarySync", "old-cursor")
             .await
@@ -4091,6 +4106,9 @@ async fn private_metadata_recovery_fixture_with_signature(
         .await;
         assert_eq!(first.failed_count, 0, "{first:?}");
         assert!(first.db_sync_token_advance_safe, "{first:?}");
+        assert_eq!(std::fs::read(&media_paths[0]).unwrap(), written);
+        assert_eq!(f.db.acquire_lock("scoped writer settled by normal retry").unwrap().query_row::<i64, _, _>(
+            "SELECT count(*) FROM provider_active_destinations WHERE library='PrimarySync' AND child='asset-m' AND admitted=1 AND verified_media=1 AND verified_metadata=0", [], |row| row.get(0)).unwrap(), 0);
         assert_eq!(
             f.db.get_metadata("sync_token:PrimarySync")
                 .await
@@ -4124,6 +4142,7 @@ async fn private_metadata_recovery_fixture_with_signature(
             crate::sync_loop::run_prepared_fixture_cycle(reopened, next_passes, config).await;
         assert_eq!(next.failed_count, 0, "{next:?}");
         assert_eq!(next.stats.downloaded, 0);
+        assert_eq!(std::fs::read(&media_paths[0]).unwrap(), written);
         assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), ranks);
     }
     let mut refreshed_sibling = None;

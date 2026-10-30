@@ -1083,365 +1083,147 @@ async fn run_cycle_single_pass_metadata_refresh_advances_checkpoint_after_durabl
     );
 }
 
-#[tokio::test]
-async fn run_cycle_hidden_legacy_capture_repair_survives_restart() {
-    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
-    use serde_json::{Value, json};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+#[derive(Clone, Debug)]
+struct HiddenHistoricalQuietSession {
+    calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for HiddenHistoricalQuietSession {
+    async fn post(
+        &self,
+        url: &str,
+        _body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        if url.contains("/internal/records/query/batch") {
+            self.calls.lock().unwrap().push("count");
+            return Ok(album_count_response(0));
+        }
+        if url.contains("/records/query?") {
+            self.calls.lock().unwrap().push("query");
+            return Ok(serde_json::json!({"records": [], "syncToken": "zone-tok-new"}));
+        }
+        if !url.contains("/changes/zone?") {
+            self.calls.lock().unwrap().push("unexpected hydration");
+            anyhow::bail!("historical Hidden state must not cause provider hydration");
+        }
+        self.calls.lock().unwrap().push("delta");
+        Ok(serde_json::json!({"zones": [{
+            "zoneID": {"zoneName": "SharedSync-HIDDEN", "ownerRecordName": "_defaultOwner"},
+            "syncToken": "zone-tok-new", "moreComing": false, "records": []
+        }]}))
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+// Snapshot the exact scoped catalogue, mappings, owner, capture receipt and
+// retry evidence, independently of the candidate-selection algorithm.
+fn hidden_historical_snapshot(path: &std::path::Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    [
+        "SELECT json_group_array(json_array(library,id,version_size,status,local_path,checksum,local_checksum,download_checksum,created_at,added_at,metadata_hash,is_hidden,is_favorite)) FROM (SELECT * FROM assets ORDER BY library,id,version_size)",
+        "SELECT json_group_array(json_array(library,asset_record_name,master_record_name,updated_at)) FROM (SELECT * FROM asset_master_mappings ORDER BY library,asset_record_name,master_record_name)",
+        "SELECT json_group_array(json_array(library,master_record_name,asset_record_name,claimed_at)) FROM (SELECT * FROM legacy_master_state_owners ORDER BY library,master_record_name,asset_record_name)",
+        "SELECT json_group_array(json_array(library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size)) FROM (SELECT * FROM asset_metadata_paths ORDER BY library,id,version_size,local_path)",
+        "SELECT json_group_array(json_array(library,asset_id,revision,updated_at)) FROM (SELECT * FROM asset_metadata_capture_revisions ORDER BY library,asset_id)",
+        "SELECT json_group_array(json_array(library,asset_id,target_revision,evidence,generation,attempts,last_attempt_at,next_retry_at)) FROM (SELECT * FROM metadata_capture_retries ORDER BY library,asset_id)",
+    ].into_iter().map(|sql| conn.query_row(sql, [], |row| row.get(0)).unwrap()).collect()
+}
+
+async fn assert_hidden_historical_state_survives_reopen(ambiguous: bool) {
+    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig};
+    use serde_json::json;
 
     const ZONE: &str = "SharedSync-HIDDEN";
     const MASTER: &str = "master-hidden";
     const CHILD: &str = "asset-master-hidden";
-    const TOKEN_KEY: &str = "sync_token:SharedSync-HIDDEN";
-    #[derive(Clone, Debug)]
-    struct HiddenCaptureSession {
-        records: Arc<Vec<Value>>,
-        repair_requests: Arc<AtomicUsize>,
-    }
-    #[async_trait::async_trait]
-    impl PhotosSession for HiddenCaptureSession {
-        async fn post(
-            &self,
-            url: &str,
-            body: String,
-            _headers: &[(&str, &str)],
-        ) -> anyhow::Result<Value> {
-            let request: Value = serde_json::from_str(&body)?;
-            if url.contains("/records/lookup?") {
-                self.repair_requests.fetch_add(1, Ordering::SeqCst);
-                return Ok(json!({"records": [self.records[0]]}));
-            }
-            if url.contains("/changes/zone?") {
-                let records = if request["zones"][0]["syncToken"].is_string() {
-                    Vec::new()
-                } else {
-                    self.repair_requests.fetch_add(1, Ordering::SeqCst);
-                    self.records.as_ref().clone()
-                };
-                return Ok(json!({"zones": [{
-                    "zoneID": {"zoneName": ZONE, "ownerRecordName": "_defaultOwner"},
-                    "syncToken": "zone-tok-new", "moreComing": false, "records": records
-                }]}));
-            }
-            if url.contains("/internal/records/query/batch") {
-                return Ok(album_count_response(1));
-            }
-            assert!(url.contains("/records/query?"));
-            let offset = request["query"]["filterBy"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|filter| filter["fieldName"] == "startRank")
-                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
-                .unwrap_or(0);
-            let records = if offset == 0 {
-                self.records.as_ref().clone()
-            } else {
-                Vec::new()
-            };
-            Ok(json!({"records": records, "syncToken": "zone-tok-new"}))
-        }
-        fn clone_box(&self) -> Box<dyn PhotosSession> {
-            Box::new(self.clone())
-        }
-    }
-
+    const TOKEN: &str = "sync_token:SharedSync-HIDDEN";
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("state.db");
     let media_dir = dir.path().join("media");
     std::fs::create_dir_all(&media_dir).unwrap();
-    let media_path = media_dir.join("legacy.jpg");
-    let original_bytes = vec![0u8; 1024];
-    std::fs::write(&media_path, &original_bytes).unwrap();
+    let hidden_path = media_dir.join("hidden.jpg");
+    let primary_path = media_dir.join("primary.jpg");
+    let hidden_bytes = vec![7u8; 1024];
+    let primary_bytes = vec![9u8; 1024];
+    std::fs::write(&hidden_path, &hidden_bytes).unwrap();
+    std::fs::write(&primary_path, &primary_bytes).unwrap();
     {
         let db = state::SqliteStateDb::open(&db_path).await.unwrap();
-        let record = crate::test_helpers::TestAssetRecord::new(MASTER)
-            .library(ZONE)
-            .filename("legacy.jpg")
-            .added_at(chrono::DateTime::from_timestamp_millis(RUN_CYCLE_ASSET_DATE_MS).unwrap())
-            .size(1024)
-            .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-            .build();
-        db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded(
-            ZONE,
-            MASTER,
-            "original",
-            &media_path,
-            "local-checksum",
-            None,
-        )
-        .await
-        .unwrap();
-        for child in [CHILD] {
-            db.upsert_asset_master_mapping(ZONE, child, MASTER)
-                .await
-                .unwrap();
-        }
-        db.set_metadata_capture_revision_for_test(ZONE, MASTER, 0);
-        db.set_metadata(TOKEN_KEY, "zone-tok-prev").await.unwrap();
-        assert!(
-            db.get_legacy_master_state_owners()
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-    let mut page = full_album_page_with_download(
-        ZONE,
-        MASTER,
-        "zone-tok-new",
-        "https://p01.icloud-content.com/photo.jpg",
-        1024,
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-    );
-    page["records"][1]["fields"]["addedDate"] =
-        json!({"value": RUN_CYCLE_ASSET_DATE_MS + 123, "type": "TIMESTAMP"});
-    page["records"][1]["fields"]["isHidden"] = json!({"value": 1, "type": "INT64"});
-    page["records"][1]["fields"]["isFavorite"] = json!({"value": 1, "type": "INT64"});
-    let repair_requests = Arc::new(AtomicUsize::new(0));
-    let album = PhotoAlbum::new(
-        PhotoAlbumConfig {
-            params: Arc::new(std::collections::HashMap::new()),
-            service_endpoint: Arc::from("https://example.com"),
-            name: Arc::from("Hidden"),
-            list_type: Arc::from("CPLAssetAndMasterHiddenByAssetDate"),
-            obj_type: Arc::from("CPLAssetHiddenByAssetDate"),
-            query_filter: None,
-            page_size: 100,
-            zone_id: Arc::new(json!({"zoneName": ZONE})),
-            retry_config: retry::RetryConfig::default(),
-            container_id: None,
-            cross_zone_sources: Vec::new(),
-        },
-        Box::new(HiddenCaptureSession {
-            records: Arc::new(page["records"].as_array().unwrap().clone()),
-            repair_requests: Arc::clone(&repair_requests),
-        }),
-    );
-    let lib_state = make_run_cycle_library_state_with_passes(
-        ZONE,
-        TOKEN_KEY,
-        vec![crate::commands::AlbumPass {
-            kind: crate::commands::PassKind::SmartFolder,
-            album,
-            exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
-        }],
-    );
-    let config = make_run_cycle_config();
-    for cycle in 0..2 {
-        let inner = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
-        let db = Arc::clone(&inner) as Arc<dyn download::DownloadStore>;
-        let build_config = make_run_cycle_download_config_builder_with_options(
-            &media_dir,
-            Arc::clone(&db),
-            RunCycleDownloadConfigOptions {
-                media: media_without_photo_downloads(),
-                ..RunCycleDownloadConfigOptions::default()
-            },
-        );
-        let (_session_dir, session) = make_shared_session_for_run_cycle().await;
-        let result = run_cycle(
-            &[&lib_state],
-            &config,
-            Some(db.as_ref()),
-            false,
-            &build_config,
-            download::DownloadControls::download_hidden(),
-            &session,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(result.failed_count, 0);
-        assert_eq!(result.stats.downloaded, 0);
-        assert_eq!(
-            result.stats.metadata_capture_refreshed,
-            usize::from(cycle == 0)
-        );
-        assert_eq!(result.stats.metadata_capture_remaining, 0);
-        assert_eq!(
-            inner.get_metadata(TOKEN_KEY).await.unwrap().as_deref(),
-            Some("zone-tok-new")
-        );
-        let rows = inner.get_downloaded_page(0, 10).await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].metadata.is_hidden && rows[0].metadata.is_favorite);
-        assert_eq!(rows[0].local_path.as_deref(), Some(media_path.as_path()));
-        let owners = inner.get_legacy_master_state_owners().await.unwrap();
-        assert_eq!(owners.len(), 1);
-        assert!(owners.contains(&(ZONE.to_string(), MASTER.to_string(), CHILD.to_string())));
-        let status = inner
-            .get_summary()
-            .await
-            .unwrap()
-            .metadata_capture
-            .into_iter()
-            .find(|status| status.library == ZONE)
-            .unwrap();
-        assert_eq!(status.active_revision, state::METADATA_CAPTURE_REVISION);
-        assert_eq!(status.pending_revision, None);
-        assert_eq!(status.failed_assets, 0);
-        assert_eq!(std::fs::read(&media_path).unwrap(), original_bytes);
-        assert_eq!(std::fs::read_dir(&media_dir).unwrap().count(), 1);
-        assert_eq!(
-            repair_requests.load(Ordering::SeqCst),
-            2,
-            "restart must not repeat metadata lookup or repair scan"
-        );
-    }
-}
-
-#[tokio::test]
-async fn run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint() {
-    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession};
-    use serde_json::{Value, json};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    const ZONE: &str = "SharedSync-HIDDEN";
-    const MASTER: &str = "master-hidden";
-    const CHILD: &str = "asset-master-hidden";
-    const TOKEN_KEY: &str = "sync_token:SharedSync-HIDDEN";
-    #[derive(Clone, Debug)]
-    struct HiddenCaptureSession {
-        records: Arc<Vec<Value>>,
-        repair_requests: Arc<AtomicUsize>,
-    }
-    #[async_trait::async_trait]
-    impl PhotosSession for HiddenCaptureSession {
-        async fn post(
-            &self,
-            url: &str,
-            body: String,
-            _headers: &[(&str, &str)],
-        ) -> anyhow::Result<Value> {
-            let request: Value = serde_json::from_str(&body)?;
-            if url.contains("/records/lookup?") {
-                self.repair_requests.fetch_add(1, Ordering::SeqCst);
-                return Ok(json!({"records": [self.records[0]]}));
-            }
-            if url.contains("/changes/zone?") {
-                let records = if request["zones"][0]["syncToken"].is_string() {
-                    Vec::new()
+        for (library, path) in [(ZONE, &hidden_path), ("PrimarySync", &primary_path)] {
+            let record = crate::test_helpers::TestAssetRecord::new(MASTER)
+                .library(library)
+                .filename(if library == ZONE {
+                    "hidden.jpg"
                 } else {
-                    self.repair_requests.fetch_add(1, Ordering::SeqCst);
-                    self.records.as_ref().clone()
-                };
-                return Ok(json!({"zones": [{
-                    "zoneID": {"zoneName": ZONE, "ownerRecordName": "_defaultOwner"},
-                    "syncToken": "zone-tok-new", "moreComing": false, "records": records
-                }]}));
-            }
-            if url.contains("/internal/records/query/batch") {
-                return Ok(album_count_response(1));
-            }
-            assert!(url.contains("/records/query?"));
-            let offset = request["query"]["filterBy"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|filter| filter["fieldName"] == "startRank")
-                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
-                .unwrap_or(0);
-            let records = if offset == 0 {
-                self.records.as_ref().clone()
-            } else {
-                Vec::new()
-            };
-            Ok(json!({"records": records, "syncToken": "zone-tok-new"}))
-        }
-        fn clone_box(&self) -> Box<dyn PhotosSession> {
-            Box::new(self.clone())
-        }
-    }
-
-    for (legacy_added, fail_retry_write) in [
-        (chrono::DateTime::from_timestamp(1_640_995_200, 0), false),
-        (chrono::DateTime::from_timestamp(1_514_764_800, 0), false),
-        (None, false),
-        (chrono::DateTime::from_timestamp(1_640_995_200, 0), true),
-    ] {
-        let surviving_added = chrono::DateTime::from_timestamp(1_514_764_800, 0).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("state.db");
-        let media_dir = dir.path().join("media");
-        std::fs::create_dir_all(&media_dir).unwrap();
-        let media_path = media_dir.join("legacy.jpg");
-        let original_bytes = vec![0u8; 1024];
-        std::fs::write(&media_path, &original_bytes).unwrap();
-        {
-            let db = state::SqliteStateDb::open(&db_path).await.unwrap();
-            let mut record = crate::test_helpers::TestAssetRecord::new(MASTER)
-                .library(ZONE)
-                .filename("legacy.jpg")
+                    "primary.jpg"
+                })
+                .added_at(chrono::DateTime::from_timestamp_millis(RUN_CYCLE_ASSET_DATE_MS).unwrap())
                 .size(1024)
                 .checksum("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
                 .build();
-            record.added_at = legacy_added;
             db.upsert_seen(&record).await.unwrap();
-            db.mark_downloaded(
-                ZONE,
-                MASTER,
-                "original",
-                &media_path,
-                "local-checksum",
-                None,
-            )
-            .await
-            .unwrap();
-            for child in [CHILD, "historical-sibling"] {
-                db.upsert_asset_master_mapping(ZONE, child, MASTER)
-                    .await
-                    .unwrap();
+            db.mark_downloaded(library, MASTER, "original", path, "local-checksum", None)
+                .await
+                .unwrap();
+            db.upsert_asset_master_mapping(library, CHILD, MASTER)
+                .await
+                .unwrap();
+            db.set_metadata_capture_revision_for_test(library, MASTER, 0);
+            if library == "PrimarySync" || !ambiguous {
+                assert!(
+                    db.claim_legacy_master_state_owner(library, MASTER, CHILD)
+                        .await
+                        .unwrap()
+                );
             }
-            let mut survivor = record.clone();
-            survivor.id = CHILD.into();
-            survivor.added_at = Some(surviving_added);
-            db.upsert_seen(&survivor).await.unwrap();
-            let survivor_path = media_dir.join("survivor.jpg");
-            std::fs::write(&survivor_path, &original_bytes).unwrap();
-            db.mark_downloaded(
-                ZONE,
-                CHILD,
-                "original",
-                &survivor_path,
-                "local-checksum",
-                None,
-            )
-            .await
-            .unwrap();
-            db.set_metadata_capture_revision_for_test(
-                ZONE,
-                CHILD,
-                state::METADATA_CAPTURE_REVISION,
-            );
-            db.set_metadata_capture_revision_for_test(ZONE, MASTER, 0);
-            db.set_metadata(TOKEN_KEY, "zone-tok-prev").await.unwrap();
+        }
+        if ambiguous {
+            db.upsert_asset_master_mapping(ZONE, "historical-sibling", MASTER)
+                .await
+                .unwrap();
+            db.begin_metadata_capture_revision(ZONE, state::METADATA_CAPTURE_REVISION)
+                .await
+                .unwrap();
+            let candidate = db
+                .get_metadata_capture_candidates(ZONE, state::METADATA_CAPTURE_REVISION, 10)
+                .await
+                .unwrap()
+                .remove(0);
             assert!(
-                db.get_legacy_master_state_owners()
+                db.defer_metadata_capture_ambiguity(&candidate, state::METADATA_CAPTURE_REVISION)
                     .await
                     .unwrap()
-                    .is_empty()
             );
         }
-        if fail_retry_write {
-            rusqlite::Connection::open(&db_path).unwrap().execute_batch(
-                "CREATE TRIGGER fail_owner_guard_retry BEFORE INSERT ON metadata_capture_retries BEGIN SELECT RAISE(ABORT, 'injected retry failure'); END;"
-            ).unwrap();
-        }
-        let mut page = full_album_page_with_download(
-            ZONE,
-            MASTER,
-            "zone-tok-new",
-            "https://p01.icloud-content.com/photo.jpg",
-            1024,
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        db.set_metadata(TOKEN, "zone-tok-prev").await.unwrap();
+        db.set_metadata("sync_token:PrimarySync", "primary-before")
+            .await
+            .unwrap();
+    }
+    let before = hidden_historical_snapshot(&db_path);
+    if ambiguous {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let retry: (String, String, i64, i64, i64, i64) = conn.query_row(
+            "SELECT library,asset_id,target_revision,attempts,last_attempt_at,next_retry_at FROM metadata_capture_retries", [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))
+        ).unwrap();
+        assert_eq!(
+            (&*retry.0, &*retry.1, retry.2, retry.3),
+            (ZONE, MASTER, state::METADATA_CAPTURE_REVISION, 1)
         );
-        page["records"][1]["fields"]["addedDate"] =
-            json!({"value": surviving_added.timestamp_millis(), "type": "TIMESTAMP"});
-        page["records"][1]["fields"]["isHidden"] = json!({"value": 1, "type": "INT64"});
-        page["records"][1]["fields"]["isFavorite"] = json!({"value": 1, "type": "INT64"});
-        let repair_requests = Arc::new(AtomicUsize::new(0));
+        assert!(retry.5 > retry.4);
+    }
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let config = make_run_cycle_config();
+    let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+    for _ in 0..2 {
+        let inner = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
+        let db = Arc::clone(&inner) as Arc<dyn download::DownloadStore>;
         let album = PhotoAlbum::new(
             PhotoAlbumConfig {
                 params: Arc::new(std::collections::HashMap::new()),
@@ -1456,99 +1238,83 @@ async fn run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint() {
                 container_id: None,
                 cross_zone_sources: Vec::new(),
             },
-            Box::new(HiddenCaptureSession {
-                records: Arc::new(page["records"].as_array().unwrap().clone()),
-                repair_requests: Arc::clone(&repair_requests),
+            Box::new(HiddenHistoricalQuietSession {
+                calls: Arc::clone(&calls),
             }),
         );
-        let lib_state = make_run_cycle_library_state_with_passes(
+        let lib = make_run_cycle_library_state_with_passes(
             ZONE,
-            TOKEN_KEY,
+            TOKEN,
             vec![crate::commands::AlbumPass {
                 kind: crate::commands::PassKind::SmartFolder,
                 album,
                 exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
             }],
         );
-        let config = make_run_cycle_config();
-        for cycle in 0..3 {
-            let inner = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
-            let db = Arc::clone(&inner) as Arc<dyn download::DownloadStore>;
-            let build_config = make_run_cycle_download_config_builder_with_options(
-                &media_dir,
-                Arc::clone(&db),
-                RunCycleDownloadConfigOptions {
-                    media: media_without_photo_downloads(),
-                    ..RunCycleDownloadConfigOptions::default()
-                },
-            );
-            let (_session_dir, session) = make_shared_session_for_run_cycle().await;
-            let result = run_cycle(
-                &[&lib_state],
-                &config,
-                Some(db.as_ref()),
-                false,
-                &build_config,
-                download::DownloadControls::download_hidden(),
-                &session,
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-            assert!(result.failed_count > 0);
-            assert_eq!(result.stats.downloaded, 0);
-            assert_eq!(result.stats.metadata_capture_refreshed, 0);
-            assert_eq!(result.stats.metadata_capture_remaining, 1);
-            assert_eq!(
-                result.stats.metadata_capture_failures,
-                usize::from(cycle == 0 || (fail_retry_write && cycle == 1))
-            );
-            assert_eq!(
-                inner.get_metadata(TOKEN_KEY).await.unwrap().as_deref(),
-                Some("zone-tok-prev")
-            );
-            let rows = inner.get_downloaded_page(0, 10).await.unwrap();
-            assert_eq!(rows.len(), 2);
-            let legacy = rows.iter().find(|row| row.id.as_ref() == MASTER).unwrap();
-            assert_eq!(legacy.added_at, legacy_added);
-            let rows = [legacy];
-            assert!(!rows[0].metadata.is_hidden && !rows[0].metadata.is_favorite);
-            assert_eq!(rows[0].local_path.as_deref(), Some(media_path.as_path()));
-            let owners = inner.get_legacy_master_state_owners().await.unwrap();
-            assert!(owners.is_empty());
-            let status = inner
-                .get_summary()
+        let build = make_run_cycle_download_config_builder_with_options(
+            &media_dir,
+            Arc::clone(&db),
+            RunCycleDownloadConfigOptions {
+                media: media_without_photo_downloads(),
+                ..RunCycleDownloadConfigOptions::default()
+            },
+        );
+        let result = run_cycle(
+            &[&lib],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build,
+            download::DownloadControls::download_hidden(),
+            &session,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.failed_count, 0, "{result:?}");
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(result.stats.metadata_capture_refreshed, 0);
+        assert_eq!(result.stats.metadata_capture_failures, 0);
+        assert_eq!(
+            inner.get_metadata(TOKEN).await.unwrap().as_deref(),
+            Some("zone-tok-new")
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
                 .await
                 .unwrap()
-                .metadata_capture
-                .into_iter()
-                .find(|status| status.library == ZONE)
-                .unwrap();
-            assert_eq!(status.active_revision, 0);
-            assert_eq!(
-                status.pending_revision,
-                Some(state::METADATA_CAPTURE_REVISION)
-            );
-            assert_eq!(
-                status.failed_assets,
-                if fail_retry_write && cycle > 0 { 2 } else { 1 }
-            );
-            if fail_retry_write && cycle == 0 {
-                assert!(result.stats.state_write_failures > 0);
-                rusqlite::Connection::open(&db_path)
-                    .unwrap()
-                    .execute_batch("DROP TRIGGER fail_owner_guard_retry")
-                    .unwrap();
-            }
-            assert_eq!(std::fs::read(&media_path).unwrap(), original_bytes);
-            assert_eq!(std::fs::read_dir(&media_dir).unwrap().count(), 2);
-            assert_eq!(
-                repair_requests.load(Ordering::SeqCst),
-                if fail_retry_write && cycle > 0 { 4 } else { 2 },
-                "deferred ownership guard must not repeat metadata lookup or repair scan"
-            );
-        }
+                .as_deref(),
+            Some("primary-before")
+        );
+        assert!(
+            inner
+                .get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(build);
+        drop(db);
+        drop(inner);
+        assert_eq!(hidden_historical_snapshot(&db_path), before);
+        assert_eq!(std::fs::read(&hidden_path).unwrap(), hidden_bytes);
+        assert_eq!(std::fs::read(&primary_path).unwrap(), primary_bytes);
+        assert_eq!(std::fs::read_dir(&media_dir).unwrap().count(), 2);
     }
+    let calls = calls.lock().unwrap();
+    assert!(!calls.contains(&"unexpected hydration"));
+    assert!(calls.iter().filter(|call| **call == "query").count() >= 2);
+}
+
+#[tokio::test]
+async fn run_cycle_hidden_legacy_capture_repair_survives_restart() {
+    assert_hidden_historical_state_survives_reopen(false).await;
+}
+
+#[tokio::test]
+async fn run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint() {
+    assert_hidden_historical_state_survives_reopen(true).await;
 }
 
 #[tokio::test]
@@ -3829,6 +3595,9 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                         json!({"value": RUN_CYCLE_ASSET_DATE_MS, "type": "TIMESTAMP"});
                 }
                 let recovered = !with_sibling && (valid_epoch || cycle >= 3);
+                // A valid current sibling permits source progress without
+                // claiming or reinterpreting the ambiguous historical owner.
+                let source_complete = recovered || (with_sibling && cycle >= 2);
                 let inner = Arc::new(state::SqliteStateDb::open(&db_path).await.unwrap());
                 let db = Arc::clone(&inner) as Arc<dyn download::DownloadStore>;
                 let build_config = make_run_cycle_download_config_builder_with_options(
@@ -3840,6 +3609,7 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                     },
                 );
                 let (_session_dir, session) = make_shared_session_for_run_cycle().await;
+                let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
                 let result = run_cycle(
                     &[&lib_state],
                     &config,
@@ -3854,14 +3624,22 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                 .unwrap();
                 assert_eq!(
                     result.failed_count > 0,
-                    !recovered,
+                    !source_complete,
                     "invalid={invalid:?}, sibling={with_sibling}, cycle={cycle}"
                 );
                 assert_eq!(result.stats.downloaded, 0);
-                assert_eq!(
-                    result.stats.metadata_capture_refreshed,
-                    usize::from(!with_sibling && if valid_epoch { cycle == 0 } else { cycle == 3 })
-                );
+                if cycle == 2 && !with_sibling && !valid_epoch {
+                    assert!(trace.contains_event(|event| event.message()
+                        == Some("Failed to refresh downloaded asset metadata")
+                        && event.field("library") == Some(ZONE)
+                        && event.field("asset_id") == Some(MASTER)
+                        && event.field("error").is_some_and(|error| {
+                            error.contains("injected capture refresh failure")
+                        })));
+                    assert!(result.stats.state_write_failures > 0);
+                }
+                // Current-source catalogue refresh is not historical capture repair.
+                assert_eq!(result.stats.metadata_capture_refreshed, 0);
                 assert_eq!(
                     result.stats.metadata_capture_remaining,
                     u64::from(!recovered)
@@ -3872,7 +3650,7 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                 let inner = state::SqliteStateDb::open(&db_path).await.unwrap();
                 assert_eq!(
                     inner.get_metadata(TOKEN_KEY).await.unwrap().as_deref(),
-                    Some(if recovered {
+                    Some(if source_complete {
                         "zone-tok-new"
                     } else {
                         "zone-tok-prev"
@@ -3915,13 +3693,34 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                     ),
                     (1, 0, 0)
                 );
-                assert!(
-                    inner
-                        .get_pending_metadata_rewrites(10)
-                        .await
-                        .unwrap()
-                        .is_empty()
+                // The current Hidden smart-folder membership independently marks
+                // its grouping dirty. No metadata writer is enabled in this fixture.
+                let queued = inner.get_pending_metadata_rewrites(10).await.unwrap();
+                let grouping_seen = !with_sibling && (valid_epoch || cycle >= 2);
+                assert_eq!(
+                    queued.len(),
+                    usize::from(grouping_seen),
+                    "invalid={invalid:?}, sibling={with_sibling}, cycle={cycle}"
                 );
+                if grouping_seen {
+                    assert_eq!(
+                        (
+                            &*queued[0].library,
+                            &*queued[0].id,
+                            queued[0].version_size.as_str()
+                        ),
+                        (ZONE, MASTER, "original")
+                    );
+                    assert_eq!(queued[0].local_path.as_deref(), Some(media_path.as_path()));
+                    let conn = rusqlite::Connection::open(&db_path).unwrap();
+                    let membership: i64 = conn.query_row("SELECT count(*) FROM asset_albums WHERE library=?1 AND asset_id=?2 AND album_name='Hidden' AND source='icloud'", [ZONE, MASTER], |row| row.get(0)).unwrap();
+                    assert_eq!(membership, 1);
+                    let marker: i64 = conn.query_row("SELECT count(*) FROM assets WHERE library=?1 AND id=?2 AND version_size='original' AND status='downloaded' AND metadata_write_failed_at IS NOT NULL", [ZONE, MASTER], |row| row.get(0)).unwrap();
+                    assert_eq!(
+                        marker, 1,
+                        "the recorded grouping marker remains durable when writers are disabled"
+                    );
+                }
                 assert_eq!(rows[0].local_path.as_deref(), Some(media_path.as_path()));
                 assert_eq!(
                     inner.get_legacy_master_state_owners().await.unwrap(),
@@ -3954,10 +3753,13 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
                 // Inspect persisted retry evidence independently of cycle counters.
                 let conn = rusqlite::Connection::open(&db_path).unwrap();
                 let retries: i64 = conn.query_row(
-                    "SELECT count(*) FROM metadata_capture_retries WHERE library=?1 AND asset_id=?2 AND attempts=1 AND next_retry_at>last_attempt_at",
+                    "SELECT count(*) FROM metadata_capture_retries WHERE library=?1 AND asset_id=?2",
                     [ZONE, MASTER], |row| row.get(0),
                 ).unwrap();
-                assert_eq!(retries, i64::from(with_sibling));
+                assert_eq!(
+                    retries, 0,
+                    "stale historical capture does not schedule a retry"
+                );
                 let revision: i64 = conn.query_row(
                     "SELECT revision FROM asset_metadata_capture_revisions WHERE library=?1 AND asset_id=?2",
                     [ZONE, MASTER], |row| row.get(0),

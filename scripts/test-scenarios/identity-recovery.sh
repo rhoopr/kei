@@ -6,11 +6,11 @@ source "$script_dir/lib.sh"
 
 # Consumer matrices: malformed/epoch dates, mixed visibility, restart and recovery.
 run_scenario_test lib hidden_invalid_capture_date
-# Historical ownership and failed durable retry writes.
+# Hidden historical ownership and pending legacy recovery.
 run_scenario_test lib run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint
 run_scenario_test lib bounded_full_sync_hydrates_live_legacy_pending_master
-# Deferral, authoritative changed evidence, completion and unchanged follow-up.
-run_scenario_test lib run_cycle_metadata_capture_retry_preserves_durable_checkpoint_until_repaired
+# Historical retries remain durable without authorizing automatic repair.
+run_scenario_test lib run_cycle_historical_capture_retry_survives_reopen_without_automatic_repair
 # Historical capture ambiguity is preserved without blocking new selected backup.
 run_scenario_test lib v027_historical_pending_identity_survives_baseline_and_quiet_progress
 run_scenario_test lib v027_prepared_layout_recovery_finishes_without_current_pass_or_layout

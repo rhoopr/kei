@@ -172,7 +172,7 @@ suites execute these same tests; the gate also validates the scenario filters.
 | Evidence | Tests selected by the slice |
 |----------|-----------------------------|
 | Missing, null, out-of-range, and valid epoch capture dates; one child or a matching visible/hidden sibling | `hidden_invalid_capture_date` selects both metadata capture and pending recovery |
-| Conflicting or missing historical dates/owners and failed retry persistence | `run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint`, `bounded_full_sync_hydrates_live_legacy_pending_master` |
+| Scoped historical owner and ambiguity evidence survive quiet cycles; pending legacy source recovery remains bounded | `run_cycle_legacy_owner_guard_preserves_dates_and_checkpoint`, `bounded_full_sync_hydrates_live_legacy_pending_master` |
 | Historical retries persist without authorizing automatic repair; current ambiguity remains bounded | `run_cycle_historical_capture_retry_survives_reopen_without_automatic_repair`, `ambiguous_capture_repair_keeps_identity_and_checkpoint_without_full_backfill` |
 | Schema-28 preservation with one or multiple current children | `run_cycle_single_survivor_preserved`, `run_cycle_ambiguous_children_preserved_independently` |
 | Changed rendition evidence and stale retry attempts | `metadata_capture_retry_changed_evidence_is_due_and_old_attempt_cannot_delay_it` |
@@ -191,8 +191,12 @@ The capture matrix changes invalid provider evidence to a valid date, injects a
 SQLite refresh failure, removes the trigger, and requires recovery on the next
 cycle plus an unchanged follow-up. A valid owner claim may survive a failed
 metadata refresh, but the catalogue date, capture receipt, and checkpoint must
-remain unchanged until refresh commits. Malformed mixed-child cases remain unresolved;
-separate existing tests supply authoritative ownership and prove finite recovery.
+remain unchanged until refresh commits. Current valid siblings can advance the
+source checkpoint while their ambiguous historical owner and capture remain
+unchanged. The Hidden smart-folder grouping marker remains durable with writers
+disabled. `v027_prepared_operation_upgrade_normal_runner_and_quiet_reopen` pairs
+this with an explicitly recorded metadata update, a finalization fault, and a
+normal retry after reopen; its existing owner-refusal controls remain separate.
 Fully valid ambiguous families exercise schema-28 preservation in their existing
 regressions. The capture epoch control isolates a single child's valid date.
 No media rewrite is enabled. Pending recovery verifies the exact downloaded
