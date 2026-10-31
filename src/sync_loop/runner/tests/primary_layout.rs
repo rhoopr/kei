@@ -6416,3 +6416,330 @@ async fn review501_suffix_album_collecting_edit_recovers_without_redownload() {
         0
     );
 }
+
+async fn ordinary_template_preserves_recorded_paths(pass_kind: PassKind) {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let page = records(&server, Some(("edit-one", EDIT_ONE)));
+    let options = |folder_structure, cycle_token| CycleOptions {
+        private: true,
+        pass_kind,
+        folder_structure,
+        baseline_successor: Some("initial-token"),
+        cycle_token: Some(cycle_token),
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
+        root.path(),
+        page.clone(),
+        false,
+        EditedNaming::Primary,
+        options("first", "initial-token"),
+    )
+    .await;
+    assert_eq!(
+        initial.failed_count, 0,
+        "{pass_kind:?}: {:?}",
+        initial.stats
+    );
+    assert_eq!(initial.stats.downloaded, 2);
+    assert!(initial.db_sync_token_advance_safe);
+    let first = root.path().join("media/first");
+    let original = first.join("IMG_0501_original.JPG");
+    let edited = first.join("IMG_0501.JPG");
+    assert_bytes(&original, ORIGINAL);
+    assert_bytes(&edited, EDIT_ONE);
+    let times = [
+        std::fs::metadata(&original).unwrap().modified().unwrap(),
+        std::fs::metadata(&edited).unwrap().modified().unwrap(),
+    ];
+    let snapshot = || {
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let receipts: Vec<String> = conn.prepare("SELECT json_array(scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,account_key,provider_key) FROM download_receipts ORDER BY version_size").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        let paths: Vec<String> = conn.prepare("SELECT json_array(library,id,version_size,local_path,provider_checksum,local_checksum,source_checksum,download_checksum,metadata_write_failed_at,capture_repair_metadata_hash) FROM asset_metadata_paths ORDER BY version_size,local_path").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        (receipts, paths)
+    };
+    let (receipts, paths) = snapshot();
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(paths.len(), 2);
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+    let owner_row: (String, String) = rusqlite::Connection::open(root.path().join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT account_key,provider_key FROM account_owner WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(owner_row, (account_key.to_owned(), provider_key.to_owned()));
+    // Fixed pass identities independently bind these fixtures' kinds and provider
+    // query scopes (including album-501 for Album), with no exclusions.
+    let expected_pass = match pass_kind {
+        PassKind::Unfiled => "7de366311251c17f1e952c68059e8b40b6c3a25d8a01646bf24c4dbd61202256",
+        PassKind::Album => "8f22641465c3b441df94dc2d08b5c1029c663a7da888d17799e8eb30e9caf0c2",
+        PassKind::SmartFolder => "bfd1a1429a2d64c388c4d15164469212b7334f0fa06ed59ac35a6e52c9e1113a",
+    };
+    let parsed_paths: Vec<Value> = paths
+        .iter()
+        .map(|r| serde_json::from_str(r).unwrap())
+        .collect();
+    for (row, version, bytes, path) in [
+        (&parsed_paths[0], "adjusted", EDIT_ONE, &edited),
+        (&parsed_paths[1], "original", ORIGINAL, &original),
+    ] {
+        let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+        assert_eq!(
+            (&row[0], &row[1], &row[2]),
+            (&json!("PrimarySync"), &json!("asset-501"), &json!(version))
+        );
+        assert_eq!(row[3], path.to_str().unwrap());
+        assert_eq!(row[4], provider_hash(bytes));
+        assert_eq!(row[5], hash);
+        assert_eq!(row[6], hash);
+        assert_eq!(row[7], hash);
+        assert!(row[8].as_i64().is_some_and(|time| time > 0));
+        assert!(row[9].is_null());
+    }
+    let parsed: Vec<Value> = receipts
+        .iter()
+        .map(|r| serde_json::from_str(r).unwrap())
+        .collect();
+    for (receipt, version, bytes, path) in [
+        (&parsed[0], "adjusted", EDIT_ONE, &edited),
+        (&parsed[1], "original", ORIGINAL, &original),
+    ] {
+        let scope: Value = serde_json::from_str(receipt[0].as_str().unwrap()).unwrap();
+        assert_eq!(
+            scope,
+            json!({"container":"com.apple.photos.cloud", "database":"private", "environment":"production", "format":1, "realm":"com", "zone":{"ownerRecordName":"_defaultOwner", "zoneName":"PrimarySync"}})
+        );
+        assert_eq!(
+            (&receipt[1], &receipt[2], &receipt[3], &receipt[4]),
+            (
+                &json!("PrimarySync"),
+                &json!("asset-501"),
+                &json!("501"),
+                &json!("asset-501")
+            )
+        );
+        assert_eq!(receipt[5], expected_pass);
+        assert_eq!(receipt[6], version);
+        assert_eq!(receipt[7], provider_hash(bytes));
+        assert_eq!(receipt[8], bytes.len());
+        let native: Value = serde_json::from_str(receipt[9].as_str().unwrap()).unwrap();
+        assert_eq!(native["path"], path.to_str().unwrap());
+        let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+        assert_eq!(receipt[10], hash);
+        assert_eq!(receipt[11], hash);
+        assert!(!receipt[12].as_str().unwrap().is_empty());
+        assert_eq!(receipt[13], account_key);
+        assert_eq!(receipt[14], provider_key);
+    }
+    assert_eq!(parsed[0][5], parsed[1][5]);
+    assert_eq!(
+        db_count(root.path(), "SELECT COUNT(*) FROM account_owner"),
+        1
+    );
+    async fn metadata_work(db: &state::SqliteStateDb) -> Vec<(std::path::PathBuf, String, String)> {
+        let mut work: Vec<_> = db
+            .get_pending_metadata_rewrites(100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|asset| {
+                (
+                    asset.local_path.unwrap(),
+                    asset.checksum.into_string(),
+                    asset.local_checksum.unwrap(),
+                )
+            })
+            .collect();
+        work.sort();
+        work
+    }
+    let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+        .await
+        .unwrap();
+    let metadata_before = metadata_work(&db).await;
+    let mut expected_work = vec![
+        (
+            original.clone(),
+            provider_hash(ORIGINAL),
+            data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL)),
+        ),
+        (
+            edited.clone(),
+            provider_hash(EDIT_ONE),
+            data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_ONE)),
+        ),
+    ];
+    expected_work.sort();
+    assert_eq!(metadata_before, expected_work);
+    drop(db);
+    let requests = server.received_requests().await.unwrap().len();
+    assert_eq!(requests, 2);
+    let token = || {
+        rusqlite::Connection::open(root.path().join("state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(token(), "initial-token");
+    for round in 0..3 {
+        let (result, lookups) = cycle_options(
+            root.path(),
+            page.clone(),
+            round > 0,
+            EditedNaming::Primary,
+            options("second", "changed-token"),
+        )
+        .await;
+        assert_eq!(
+            result.failed_count, 0,
+            "{pass_kind:?} round {round}: {:?}",
+            result.stats
+        );
+        assert!(result.db_sync_token_advance_safe);
+        assert_eq!(result.stats.downloaded, 0);
+        assert_eq!(result.stats.skipped.uncertain, 0);
+        if round == 0 {
+            assert_eq!(
+                result.stats.full_enumeration_reason,
+                Some(download::FullEnumerationReason::DownloadConfigHashDrift)
+            );
+            assert!(result.stats.assets_seen > 0);
+            assert!(result.stats.skipped.on_disk > 0);
+        } else {
+            assert_eq!(lookups, 0);
+        }
+        assert_bytes(&original, ORIGINAL);
+        assert_bytes(&edited, EDIT_ONE);
+        assert_eq!(
+            [
+                std::fs::metadata(&original).unwrap().modified().unwrap(),
+                std::fs::metadata(&edited).unwrap().modified().unwrap()
+            ],
+            times
+        );
+        assert!(!root.path().join("media/second/IMG_0501.JPG").exists());
+        assert!(
+            !root
+                .path()
+                .join("media/second/IMG_0501_original.JPG")
+                .exists()
+        );
+        assert!(!root.path().join("media/.kei-history").exists());
+        assert_eq!(snapshot(), (receipts.clone(), paths.clone()));
+        assert_eq!(token(), "changed-token");
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM assets WHERE library='PrimarySync' AND id='asset-501' AND status='downloaded'"
+            ),
+            2
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM assets WHERE library='PrimarySync' AND id='asset-501' AND status='pending'"
+            ),
+            0
+        );
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let decisions: Vec<(String, String, String)> = conn.prepare("SELECT pass_key,outcome,admission FROM provider_active_decisions WHERE child='asset-501'").unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<Result<_, _>>().unwrap();
+        assert!(!decisions.is_empty());
+        assert!(
+            decisions
+                .iter()
+                .all(|(pass, outcome, admission)| pass == expected_pass
+                    && outcome == "selected"
+                    && admission == "admitted"),
+            "{decisions:?}"
+        );
+        let destinations: Vec<String> = conn.prepare("SELECT json_array(pass_key,child,library,asset_id,master,version_size,path,checksum,size_bytes,admitted,verified_media,verified_metadata,source_checksum,local_checksum) FROM provider_active_destinations WHERE child='asset-501' ORDER BY version_size,path").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(destinations.len(), 2, "{destinations:?}");
+        for (row, version, bytes, path) in [
+            (&destinations[0], "adjusted", EDIT_ONE, &edited),
+            (&destinations[1], "original", ORIGINAL, &original),
+        ] {
+            let row: Value = serde_json::from_str(row).unwrap();
+            let native: Value = serde_json::from_str(row[6].as_str().unwrap()).unwrap();
+            let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+            assert_eq!(
+                (&row[0], &row[1], &row[2], &row[3], &row[4], &row[5]),
+                (
+                    &json!(expected_pass),
+                    &json!("asset-501"),
+                    &json!("PrimarySync"),
+                    &json!("asset-501"),
+                    &json!("501"),
+                    &json!(version)
+                )
+            );
+            assert_eq!(native["path"], path.to_str().unwrap());
+            assert_eq!(row[7], provider_hash(bytes));
+            assert_eq!(row[8], bytes.len());
+            assert_eq!(
+                (&row[9], &row[10], &row[11]),
+                (&json!(1), &json!(1), &json!(1))
+            );
+            assert_eq!(row[12], hash);
+            assert_eq!(row[13], hash);
+        }
+        assert_eq!(
+            db_count(root.path(), "SELECT COUNT(*) FROM provider_work_retries"),
+            0
+        );
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM provider_work_receipts WHERE state='deferred'"
+            ),
+            0
+        );
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert!(db.get_pending().await.unwrap().is_empty());
+        assert_eq!(metadata_work(&db).await, metadata_before);
+        for table in [
+            "primary_layout_operations",
+            "primary_layout_bindings",
+            "primary_layout_claims",
+            "primary_layout_preserved",
+            "primary_layout_superseded_paths",
+        ] {
+            assert_eq!(
+                db_count(root.path(), &format!("SELECT COUNT(*) FROM {table}")),
+                0,
+                "{table}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn ordinary_template_preserves_recorded_unfiled_paths() {
+    ordinary_template_preserves_recorded_paths(PassKind::Unfiled).await;
+}
+
+#[tokio::test]
+async fn ordinary_template_preserves_recorded_album_paths() {
+    ordinary_template_preserves_recorded_paths(PassKind::Album).await;
+}
+
+#[tokio::test]
+async fn ordinary_template_preserves_recorded_smart_folder_paths() {
+    ordinary_template_preserves_recorded_paths(PassKind::SmartFolder).await;
+}
