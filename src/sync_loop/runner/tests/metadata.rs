@@ -480,6 +480,10 @@ fn sparse_fixture_inventory(
 }
 
 #[tokio::test]
+#[allow(
+    clippy::print_stderr,
+    reason = "synthetic provider and state measurements are test evidence"
+)]
 async fn unresolved_identity_survives_restart_and_other_zone_success_then_recovers() {
     use crate::state::SparseIdentityStore as _;
     use base64::Engine as _;
@@ -502,6 +506,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
     struct IdentitySession {
         unresolved: bool,
         lookups: Arc<std::sync::atomic::AtomicUsize>,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
         evidence: EvidenceCase,
         records: Vec<serde_json::Value>,
         valid: Vec<serde_json::Value>,
@@ -516,6 +521,18 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<serde_json::Value> {
             let request: serde_json::Value = serde_json::from_str(&body)?;
+            let kind = if url.contains("/changes/zone?") {
+                "delta"
+            } else if url.contains("/records/lookup?") {
+                "lookup"
+            } else if url.contains("/records/query?") {
+                "inventory"
+            } else if url.contains("/internal/records/query/batch?") {
+                "count"
+            } else {
+                "other"
+            };
+            self.requests.lock().unwrap().push(kind.to_owned());
             if request["query"]["recordType"] == "CheckIndexingState" {
                 return Ok(
                     serde_json::json!({"records":[{"recordName":"index","fields":{"state":{"value":"FINISHED"}}}]}),
@@ -750,8 +767,18 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             EvidenceCase::DeletedDelta | EvidenceCase::HardDeletedDelta
         );
         let recovery_phase = 3 + usize::from(deletion_delta);
-        for cycle in 0..(5 + usize::from(marker_failure) + usize::from(deletion_delta)) {
-            let phase = cycle.saturating_sub(usize::from(marker_failure));
+        let extra_quiet = evidence == EvidenceCase::Sparse;
+        let mut quiet_counts = None;
+        let mut quiet_debt = None;
+        let mut quiet_state = None;
+        for cycle in 0..(5
+            + usize::from(marker_failure)
+            + usize::from(deletion_delta)
+            + usize::from(extra_quiet))
+        {
+            let phase = cycle
+                .saturating_sub(usize::from(marker_failure))
+                .saturating_sub(usize::from(extra_quiet && cycle >= 3));
             let fail_marker = marker_failure && cycle == 0;
             let fail_deletion = deletion_delta && phase == 3;
             let inner = Arc::new(
@@ -766,6 +793,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                 ).unwrap();
             }
             let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let db: Arc<dyn download::DownloadStore> = if fail_marker {
                 Arc::new(FailingMetadataSetDb::new(
                     inner.clone(),
@@ -788,6 +816,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                 Box::new(IdentitySession {
                     unresolved: phase < 3,
                     lookups: lookups.clone(),
+                    requests: requests.clone(),
                     evidence,
                     records: run_cycle_favourited_asset_page()["records"]
                         .as_array()
@@ -922,6 +951,74 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                 },
                 "recent={recent:?} evidence={evidence:?} cycle={cycle} phase={phase}"
             );
+            if extra_quiet && phase == 2 {
+                let counts = {
+                    let requests = requests.lock().unwrap();
+                    ["inventory", "count", "delta", "lookup", "other"]
+                        .map(|kind| requests.iter().filter(|item| item.as_str() == kind).count())
+                };
+                let debt = {
+                    let conn = inner
+                        .acquire_lock("snapshot unchanged sparse debt")
+                        .unwrap();
+                    let mut stmt = conn.prepare("SELECT * FROM unresolved_sparse_identities ORDER BY library, source_record_name").unwrap();
+                    let columns = stmt.column_count();
+                    stmt.query_map([], |row| {
+                        (0..columns)
+                            .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+                };
+                assert_eq!(debt.len(), 1);
+                if let Some(prior) = &quiet_counts {
+                    assert_eq!(
+                        &counts, prior,
+                        "unchanged selected follow-ups must have stable request counts"
+                    );
+                } else {
+                    quiet_counts = Some(counts);
+                }
+                if let Some(prior) = &quiet_debt {
+                    assert_eq!(
+                        &debt, prior,
+                        "unchanged follow-ups must preserve exact sparse attribution"
+                    );
+                } else {
+                    quiet_debt = Some(debt);
+                }
+                let state_counts = {
+                    let conn = inner.acquire_lock("measure quiet retained state").unwrap();
+                    [
+                        "assets",
+                        "provider_active_generations",
+                        "provider_active_decisions",
+                        "provider_active_destinations",
+                        "provider_shadow_pages",
+                        "unresolved_sparse_identities",
+                    ]
+                    .map(|table| {
+                        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap()
+                    })
+                };
+                if let Some(prior) = quiet_state {
+                    assert_eq!(
+                        state_counts, prior,
+                        "unchanged selected cycles must not accumulate retained rows"
+                    );
+                } else {
+                    quiet_state = Some(state_counts);
+                }
+                eprintln!(
+                    "SPARSE_QUIET recent={recent:?} cycle={cycle} inventory={} count={} delta={} lookup={} other={} state_rows={state_counts:?}",
+                    counts[0], counts[1], counts[2], counts[3], counts[4]
+                );
+            }
             let retained = inner.sparse_identities("PrimarySync").await.unwrap();
             assert_eq!(
                 retained.len(),
