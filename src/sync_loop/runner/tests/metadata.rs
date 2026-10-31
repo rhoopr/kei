@@ -507,6 +507,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
         unresolved: bool,
         lookups: Arc<std::sync::atomic::AtomicUsize>,
         requests: Arc<std::sync::Mutex<Vec<String>>>,
+        pages: Arc<std::sync::Mutex<Vec<(u64, u64, usize)>>>,
         evidence: EvidenceCase,
         records: Vec<serde_json::Value>,
         valid: Vec<serde_json::Value>,
@@ -521,12 +522,40 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<serde_json::Value> {
             let request: serde_json::Value = serde_json::from_str(&body)?;
-            let kind = if url.contains("/changes/zone?") {
+            let kind = if request["query"]["recordType"] == "CheckIndexingState" {
+                "index"
+            } else if url.contains("/changes/zone?") {
                 "delta"
             } else if url.contains("/records/lookup?") {
-                "lookup"
-            } else if url.contains("/records/query?") {
-                "inventory"
+                let names = request["records"].as_array().unwrap();
+                let has_child = names.iter().any(|item| {
+                    item["recordName"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with("asset-valid-new"))
+                });
+                let has_master = names.iter().any(|item| {
+                    item["recordName"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with("valid-new"))
+                });
+                if names
+                    .iter()
+                    .any(|item| item["recordName"] == "unresolved-child")
+                {
+                    "source_lookup"
+                } else if names.len() == 1 && has_child {
+                    "child_lookup"
+                } else if names.len() == 2 && has_child && has_master {
+                    "pair_lookup"
+                } else {
+                    "other_lookup"
+                }
+            } else if url.contains("/records/query?")
+                && request["query"]["filterBy"]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| item["fieldName"] == "startRank"))
+            {
+                "rank"
             } else if url.contains("/internal/records/query/batch?") {
                 "count"
             } else {
@@ -536,6 +565,32 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             if request["query"]["recordType"] == "CheckIndexingState" {
                 return Ok(
                     serde_json::json!({"records":[{"recordName":"index","fields":{"state":{"value":"FINISHED"}}}]}),
+                );
+            }
+            if kind == "rank" {
+                let rank = request["query"]["filterBy"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|filter| filter["fieldName"] == "startRank")
+                    .unwrap()["fieldValue"]["value"]
+                    .as_u64()
+                    .unwrap();
+                let limit = request["resultsLimit"].as_u64().unwrap();
+                let start = usize::try_from(rank)
+                    .unwrap()
+                    .saturating_mul(2)
+                    .min(self.valid.len());
+                let end = start
+                    .saturating_add(usize::try_from(limit).unwrap())
+                    .min(self.valid.len());
+                let records = &self.valid[start..end];
+                self.pages
+                    .lock()
+                    .unwrap()
+                    .push((rank, limit, records.len()));
+                return Ok(
+                    serde_json::json!({"records": records, "syncToken": "sparse-fixture-rank"}),
                 );
             }
             if let Some(page) = sparse_fixture_inventory(url, &request, &self.valid) {
@@ -655,7 +710,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
         files
     };
 
-    for (recent, evidence) in [Some(10), None].into_iter().flat_map(|recent| {
+    for (recent, evidence, size) in [Some(10), None].into_iter().flat_map(|recent| {
         [
             EvidenceCase::Ordinary,
             EvidenceCase::Sparse,
@@ -665,7 +720,18 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             EvidenceCase::Changed,
             EvidenceCase::MarkerWriteFailure,
         ]
-        .map(|evidence| (recent, evidence))
+        .into_iter()
+        .flat_map(move |evidence| {
+            let sizes: &[usize] = if recent.is_none() && evidence == EvidenceCase::Sparse {
+                &[1, 16]
+            } else {
+                &[1]
+            };
+            sizes
+                .iter()
+                .copied()
+                .map(move |size| (recent, evidence, size))
+        })
     }) {
         let server = crate::start_wiremock_or_skip!();
         // Valid JPEG framing; no optional metadata writer is needed.
@@ -677,20 +743,32 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
         Mock::given(method("GET"))
             .and(path("/valid.jpg"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
-            .expect(1)
+            .expect(u64::try_from(size).unwrap())
             .mount(&server)
             .await;
-        let valid = full_album_page_with_download(
-            "PrimarySync",
-            "valid-new",
-            "zone-after",
-            &format!("{}/valid.jpg", server.uri()),
-            bytes.len() as u64,
-            &checksum,
-        )["records"]
-            .as_array()
-            .unwrap()
-            .clone();
+        let valid: Vec<_> = (0..size)
+            .flat_map(|i| {
+                let id = if size == 1 {
+                    "valid-new".to_owned()
+                } else {
+                    format!("valid-new-{i}")
+                };
+                let mut page = full_album_page_with_download(
+                    "PrimarySync",
+                    &id,
+                    "zone-after",
+                    &format!("{}/valid.jpg", server.uri()),
+                    bytes.len() as u64,
+                    &checksum,
+                );
+                if size > 1 {
+                    page["records"][0]["fields"]["filenameEnc"]["value"] = serde_json::json!(
+                        base64::engine::general_purpose::STANDARD.encode(format!("unique-{i}.jpg"))
+                    );
+                }
+                page["records"].as_array().unwrap().clone()
+            })
+            .collect();
         let mut recovered = full_album_page_with_download(
             "PrimarySync",
             "recovered",
@@ -794,6 +872,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             }
             let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let pages = Arc::new(std::sync::Mutex::new(Vec::new()));
             let db: Arc<dyn download::DownloadStore> = if fail_marker {
                 Arc::new(FailingMetadataSetDb::new(
                     inner.clone(),
@@ -817,6 +896,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                     unresolved: phase < 3,
                     lookups: lookups.clone(),
                     requests: requests.clone(),
+                    pages: pages.clone(),
                     evidence,
                     records: run_cycle_favourited_asset_page()["records"]
                         .as_array()
@@ -954,8 +1034,18 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             if extra_quiet && phase == 2 {
                 let counts = {
                     let requests = requests.lock().unwrap();
-                    ["inventory", "count", "delta", "lookup", "other"]
-                        .map(|kind| requests.iter().filter(|item| item.as_str() == kind).count())
+                    [
+                        "index",
+                        "rank",
+                        "count",
+                        "delta",
+                        "child_lookup",
+                        "pair_lookup",
+                        "source_lookup",
+                        "other_lookup",
+                        "other",
+                    ]
+                    .map(|kind| requests.iter().filter(|item| item.as_str() == kind).count())
                 };
                 let debt = {
                     let conn = inner
@@ -1014,9 +1104,59 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                 } else {
                     quiet_state = Some(state_counts);
                 }
+                let media_gets = server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request.url.path() == "/valid.jpg")
+                    .count();
+                let rank_pages = pages.lock().unwrap().clone();
+                assert_eq!(
+                    counts,
+                    [
+                        3,
+                        if recent.is_some() { 6 } else { 0 },
+                        0,
+                        1,
+                        size,
+                        size,
+                        0,
+                        0,
+                        0
+                    ],
+                    "classify provider requests by actual query and lookup members"
+                );
+                assert_eq!(
+                    media_gets, size,
+                    "no repeated media GET after the first cycle"
+                );
+                if recent.is_some() {
+                    assert_eq!(
+                        rank_pages,
+                        [
+                            (0, 4, 2),
+                            (1, 4, 0),
+                            (3, 4, 0),
+                            (5, 4, 0),
+                            (7, 4, 0),
+                            (9, 4, 0)
+                        ]
+                    );
+                } else {
+                    assert!(rank_pages.is_empty());
+                }
                 eprintln!(
-                    "SPARSE_QUIET recent={recent:?} cycle={cycle} inventory={} count={} delta={} lookup={} other={} state_rows={state_counts:?}",
-                    counts[0], counts[1], counts[2], counts[3], counts[4]
+                    "SPARSE_QUIET_REACHED recent={recent:?} size={size} cycle={cycle} index={} rank={} count={} delta={} child_lookup={} pair_lookup={} source_lookup={} other_lookup={} other={} media_gets_total={media_gets} rank_pages={rank_pages:?} state_rows={state_counts:?}",
+                    counts[0],
+                    counts[1],
+                    counts[2],
+                    counts[3],
+                    counts[4],
+                    counts[5],
+                    counts[6],
+                    counts[7],
+                    counts[8]
                 );
             }
             let retained = inner.sparse_identities("PrimarySync").await.unwrap();
@@ -1118,7 +1258,7 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             }
             assert_eq!(
                 result.stats.downloaded,
-                usize::from(cycle == 0),
+                if cycle == 0 { size } else { 0 },
                 "recent={recent:?} evidence={evidence:?} cycle={cycle}: {:?}",
                 result.stats
             );
