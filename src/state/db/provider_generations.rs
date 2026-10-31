@@ -27,6 +27,7 @@ pub(crate) mod observation;
 mod pending_path_cache;
 mod reference_refresh;
 mod retirement;
+mod root_admission_cache;
 mod selector_binding;
 pub(super) use retirement::advance_completed_receipt;
 
@@ -1212,6 +1213,8 @@ fn load_decision_with_sources(
     child: &str,
     verify_body: bool,
 ) -> Result<ActiveDecision, StateError> {
+    #[cfg(test)]
+    root_admission_cache::note_manifest_load();
     if conn.is_autocommit() {
         let tx = conn.unchecked_transaction()?;
         let manifest = load_decision_with_pages(
@@ -1617,6 +1620,53 @@ fn validate_records(
     Ok(())
 }
 
+/// Reject ambiguous catalogue, legacy and receipt ownership before an
+/// exact old-root receipt can become fresh selection evidence.
+fn guard_root_reuse_ownership(
+    conn: &Connection,
+    receipt: &super::download_receipts::DownloadReceipt,
+    pass: &str,
+) -> Result<(), StateError> {
+    let path = receipt.native_path.to_path();
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(".xmp");
+    if super::legacy_preservation::path_is_protected(conn, &path)?
+        || super::legacy_preservation::path_is_protected(conn, &std::path::PathBuf::from(sidecar))?
+    {
+        return Err(StateError::ProviderWorkConflict);
+    }
+    let same_resource = super::download_receipts::matching(
+        conn,
+        &receipt.scope,
+        &receipt.child,
+        &receipt.master,
+        &receipt.version_size,
+        &receipt.provider_checksum,
+        receipt.provider_size,
+    )?
+    .into_iter()
+    .filter(|candidate| {
+        candidate.library == receipt.library
+            && candidate.state_id == receipt.state_id
+            && candidate.fulfills_pass(pass)
+    })
+    .collect::<Vec<_>>();
+    if same_resource.len() != 1 || same_resource.first() != Some(receipt) {
+        return Err(StateError::ProviderWorkConflict);
+    }
+    root_admission_cache::guard_owners(conn, receipt)?;
+    Ok(())
+}
+
+/// Attempt-scoped, source-backed old-path proof; the held file is validated
+/// inside admission and stays alive until the transaction has committed.
+pub(crate) struct RootAdmissionReuse {
+    pub(crate) binding: super::PublicationBinding,
+    pub(crate) receipt: super::download_receipts::DownloadReceipt,
+    pub(crate) authorization: ReuseAuthorization,
+    pub(crate) validate_file: Box<dyn Fn() -> Result<(), StateError> + Send>,
+}
+
 impl SqliteStateDb {
     pub(crate) async fn selection_attempt_due(
         &self,
@@ -1848,13 +1898,45 @@ impl SqliteStateDb {
         fresh_confirmation: Option<Vec<u8>>,
         capacity: u64,
     ) -> Result<GenerationProjection, StateError> {
+        self.project_selection_decision_with_root_reuse(
+            owner,
+            generation,
+            manifest,
+            records,
+            fresh_confirmation,
+            Vec::new(),
+            capacity,
+        )
+        .await
+    }
+
+    pub(crate) async fn project_selection_decision_with_root_reuse(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        manifest: ActiveDecision,
+        records: Vec<AssetRecord>,
+        fresh_confirmation: Option<Vec<u8>>,
+        root_reuses: Vec<RootAdmissionReuse>,
+        capacity: u64,
+    ) -> Result<GenerationProjection, StateError> {
         self.with_conn_mut("projecting selection destinations",move|conn|{
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;
             let root=load_generation(&tx,&generation)?;
             let changed_basis=root.spec.format == 1 && basis(&tx,&root.spec.scope)?!=root.spec.basis;
             validate_decision(&tx,&root,&manifest,true)?;validate_records(&root,&manifest,&records)?;
             let d=&manifest.decision;let bytes=encode(&manifest)?;let hash=digest(&bytes);
+            if !root_reuses.is_empty() {
+                if root.spec.format != 2 || d.outcome != SelectionOutcome::Selected { return invalid(); }
+                let fresh = fresh_confirmation.as_deref().filter(|body| body.len() <= MAX_CHUNK_BYTES).ok_or(StateError::ProviderWorkConflict)?;
+                selector_binding::validate_membership(&root.spec, pass(&root, &d.pass_key)?, &d.child, fresh)?;
+                let master=d.master.as_deref().ok_or(StateError::ProviderSelectionInvalid)?;
+                let current=crate::icloud::photos::current_asset(fresh,&d.child,master,&root.spec.zone).map_err(|_error| StateError::ProviderSelectionInvalid)?;
+                let selected=crate::icloud::photos::current_asset(d.confirmation.as_deref().ok_or(StateError::ProviderSelectionInvalid)?,&d.child,master,&root.spec.zone).map_err(|_error| StateError::ProviderSelectionInvalid)?;
+                if !crate::icloud::photos::same_selected_facts(&current,&selected) { return Err(StateError::ProviderWorkConflict); }
+            }
             let existing:Option<(Vec<u8>,String)>=tx.query_row("SELECT manifest,admission FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            if existing.is_some() && !root_reuses.is_empty() { return Err(StateError::ProviderWorkConflict); }
             let mut resolving=false;
             let mut reseal_observation=false;
             if let Some((previous,admission))=&existing {
@@ -1925,7 +2007,28 @@ impl SqliteStateDb {
                 if conflict {reason="unfinished_grouping_conflict".to_owned()}
             }
             let admitted=d.outcome==SelectionOutcome::Selected && reason.is_empty();
+            if !admitted && !root_reuses.is_empty() { return Err(StateError::ProviderWorkConflict); }
             let admission=if admitted {"admitted"} else if d.outcome==SelectionOutcome::Excluded {"excluded"} else {"deferred"};
+            if admitted {
+                let mut seen = HashSet::new();
+                for proof in &root_reuses {
+                    let receipt=&proof.receipt;
+                    if !seen.insert(&receipt.version_size)
+                        || receipt.scope != root.spec.scope
+                        || receipt.child != d.child
+                        || d.master.as_deref() != Some(receipt.master.as_str())
+                        || receipt.state_id != manifest.state_id
+                        || !receipt.fulfills_pass(&d.pass_key)
+                        || !d.destinations.iter().any(|dest| dest.version_size == receipt.version_size && dest.path == receipt.native_path && dest.checksum == receipt.provider_checksum && dest.size == receipt.provider_size)
+                    { return Err(StateError::ProviderWorkConflict); }
+                    let record=records.iter().find(|record| record.version_size.as_str()==receipt.version_size).ok_or(StateError::ProviderWorkConflict)?;
+                    guard_root_reuse_ownership(&tx, receipt, &proof.binding.origin_pass)?;
+                    guard_root_pending_resource(&tx, &receipt.library, &receipt.state_id, &receipt.version_size, &receipt.native_path.to_path())?;
+                    if !super::temp_files::reuse_bound_download_tx(&tx, &proof.binding, receipt, record, || (proof.validate_file)(), &proof.authorization, true)? {
+                        return Err(StateError::ProviderWorkConflict);
+                    }
+                }
+            }
             if existing.is_none() || resolving {
                 let charged=decision_charge(&root,&manifest)?;
                 charge(&tx,charged,capacity,root.spec.format)?;
@@ -1965,6 +2068,16 @@ impl SqliteStateDb {
             // Consumption is the final write, and never means verified publication.
             tx.execute("UPDATE provider_active_decisions SET admission=?4,reason=?5,attempts=?6,next_retry_at=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child,admission,reason,if admission=="deferred" {attempts.saturating_add(1).min(32)} else {0},if admission=="deferred" {Utc::now().timestamp()+delay} else {0}])?;
             refresh_admission_hash(&tx,&root,&d.pass_key,&d.child)?;
+            if admitted {
+                for proof in &root_reuses {
+                    let record=records.iter().find(|record| record.version_size.as_str()==proof.receipt.version_size).ok_or(StateError::ProviderWorkConflict)?;
+                    guard_root_reuse_ownership(&tx, &proof.receipt, &proof.binding.origin_pass)?;
+                    guard_root_pending_resource(&tx, &proof.receipt.library, &proof.receipt.state_id, &proof.receipt.version_size, &proof.receipt.native_path.to_path())?;
+                    if !super::temp_files::reuse_bound_download_tx(&tx, &proof.binding, &proof.receipt, record, || (proof.validate_file)(), &proof.authorization, true)? {
+                        return Err(StateError::ProviderWorkConflict);
+                    }
+                }
+            }
             if reseal_observation {reference_refresh::reseal(&tx,&root)?;}
             tx.commit()?;
             #[cfg(all(test, target_os = "linux"))]
@@ -2547,6 +2660,13 @@ fn pending_reservations(
         Some(chosen) => pending_path_cache::candidates(conn, chosen)?,
         None => pending_keys(conn)?,
     };
+    pending_reservations_for_keys(conn, keys)
+}
+
+fn pending_reservations_for_keys(
+    conn: &Connection,
+    keys: Vec<(String, String, String)>,
+) -> Result<Vec<super::ReconciliationReservation>, StateError> {
     let mut reservations = Vec::new();
     for (generation, key, child) in keys {
         let root = load_generation(conn, &generation)?;
@@ -2597,6 +2717,79 @@ fn pending_reservations(
         }
     }
     Ok(reservations)
+}
+
+pub(super) fn root_pending_for_path(
+    conn: &Connection,
+    path: &Path,
+) -> Result<Vec<super::ReconciliationReservation>, StateError> {
+    let keys = root_admission_cache::pending_keys_for_path(conn, path)?;
+    pending_reservations_for_keys(conn, keys)
+}
+
+fn guard_root_pending_resource(
+    conn: &Connection,
+    library: &str,
+    asset: &str,
+    version: &str,
+    path: &Path,
+) -> Result<(), StateError> {
+    let keys = root_admission_cache::pending_keys_for_resource(conn, library, asset, version)?;
+    for reservation in pending_reservations_for_keys(conn, keys)? {
+        if reservation.library.as_ref() == library
+            && reservation.asset_id.as_ref() == asset
+            && reservation.version_size.as_str() == version
+            && reservation.destination_path != path
+        {
+            return Err(StateError::ProviderWorkConflict);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn root_test_pending_path(
+    conn: &Connection,
+    path: &Path,
+) -> Result<Vec<super::ReconciliationReservation>, StateError> {
+    root_pending_for_path(conn, path)
+}
+
+#[cfg(test)]
+pub(crate) fn root_test_pending_resource(
+    conn: &Connection,
+    library: &str,
+    asset: &str,
+    version: &str,
+) -> Result<Vec<super::ReconciliationReservation>, StateError> {
+    let keys = root_admission_cache::pending_keys_for_resource(conn, library, asset, version)?;
+    pending_reservations_for_keys(conn, keys)
+}
+
+#[cfg(test)]
+pub(crate) fn root_test_guard_pending_resource(
+    conn: &Connection,
+    library: &str,
+    asset: &str,
+    version: &str,
+    path: &Path,
+) -> Result<(), StateError> {
+    guard_root_pending_resource(conn, library, asset, version, path)
+}
+
+#[cfg(test)]
+pub(crate) fn root_test_cache_reads(path: &Path) -> usize {
+    root_admission_cache::cache_reads(path)
+}
+
+#[cfg(test)]
+pub(crate) fn root_test_cache_counts() -> [usize; 3] {
+    root_admission_cache::counts()
+}
+
+#[cfg(test)]
+pub(crate) fn root_test_reset_cache_counts() {
+    root_admission_cache::reset_counts();
 }
 
 // Format-2 tasks retain their complete immutable provider facts and native

@@ -79,6 +79,185 @@ pub(crate) struct CrossRenditionOccupant {
     pub(crate) receipt: super::super::download_receipts::DownloadReceipt,
 }
 
+/// Recheck and settle a source-backed exact path inside the caller's transaction.
+/// The caller must keep the retained file alive until its transaction commits.
+pub(in crate::state::db) fn reuse_bound_download_tx<F>(
+    tx: &rusqlite::Transaction<'_>,
+    binding: &PublicationBinding,
+    receipt: &super::super::download_receipts::DownloadReceipt,
+    record: &crate::state::AssetRecord,
+    validate_file: F,
+    authorization: &super::super::provider_generations::ReuseAuthorization,
+    force_readonly: bool,
+) -> Result<bool, StateError>
+where
+    F: FnOnce() -> Result<(), StateError>,
+{
+    binding.validate(tx)?;
+    if receipt.scope != binding.scope
+        || receipt.library != binding.library
+        || receipt.child != binding.child
+        || receipt.master != binding.master
+        || receipt.state_id != binding.state_id
+        || !receipt.fulfills_pass(&binding.origin_pass)
+        || record.library.as_ref() != receipt.library
+        || record.id.as_ref() != receipt.state_id
+        || record.version_size.as_str() != receipt.version_size
+        || record.checksum.as_ref() != receipt.provider_checksum
+        || record.size_bytes != receipt.provider_size
+        || super::super::download_receipts::load(tx, &receipt.id()?)?.as_ref() != Some(receipt)
+    {
+        return Err(invalid());
+    }
+    let current: Option<(String,i64,bool)> = tx.query_row(
+                "SELECT checksum,size_bytes,is_deleted FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
+                params![receipt.library,receipt.state_id,receipt.version_size],
+                |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+    if current.as_ref().is_none_or(|(checksum, size, deleted)| {
+        checksum != &receipt.provider_checksum
+            || u64::try_from(*size).ok() != Some(receipt.provider_size)
+            || *deleted
+    }) {
+        return Err(invalid());
+    }
+    let path = receipt.native_path.to_path();
+    let mapped:Option<String>=tx.query_row(
+                "SELECT master_record_name FROM asset_master_mappings WHERE library=?1 AND asset_record_name=?2",
+                params![receipt.library,receipt.child],|row|row.get(0)).optional()?;
+    if mapped
+        .as_deref()
+        .is_some_and(|master| master != receipt.master)
+    {
+        return Err(invalid());
+    }
+    let chosen = super::super::primary_layout::path_key(&path)?;
+    let collision_key =
+        crate::fs_util::confined_path_key(&path).map_err(|_redacted_error| invalid())?;
+    let foreign:bool=tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM reconciliation_paths WHERE destination_path_key=?1
+                 AND (library<>?2 OR id<>?3 OR version_size<>?4 OR provider_checksum<>?5 OR provider_size<>?6))",
+                params![collision_key,receipt.library,receipt.state_id,receipt.version_size,
+                    receipt.provider_checksum,i64::try_from(receipt.provider_size).map_err(|_redacted_error|invalid())?],
+                |row|row.get(0))?;
+    if foreign {
+        return Err(invalid());
+    }
+    let pending_reservations = if force_readonly {
+        super::super::provider_generations::root_pending_for_path(tx, &path)?
+    } else {
+        super::super::provider_generations::pending_destination_reservations_for_path(tx, &path)?
+    };
+    for reservation in pending_reservations {
+        if super::super::primary_layout::path_key(&reservation.destination_path)? == chosen
+            && (reservation.library.as_ref() != receipt.library
+                || reservation.asset_id.as_ref() != receipt.state_id
+                || reservation.version_size.as_str() != receipt.version_size
+                || reservation.content.as_ref().is_none_or(|content| {
+                    content.checksum.as_ref() != receipt.provider_checksum
+                        || content.size != receipt.provider_size
+                }))
+        {
+            return Err(invalid());
+        }
+    }
+
+    let reservations=tx.prepare("SELECT destination_path,provider_checksum,provider_size FROM reconciliation_paths
+                WHERE library=?1 AND id=?2 AND version_size=?3 AND
+                ((provider_checksum=?4 AND provider_size=?5) OR (provider_checksum='' AND provider_size=-1))")?
+                .query_map(params![receipt.library,receipt.state_id,receipt.version_size,receipt.provider_checksum,
+                    i64::try_from(receipt.provider_size).map_err(|_redacted_error|invalid())?],
+                    |row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?)))?
+                .collect::<Result<Vec<_>,_>>()?;
+    for (reserved, checksum, size) in reservations {
+        if checksum.is_empty()
+            || size < 0
+            || super::super::primary_layout::path_key(Path::new(&reserved))? != chosen
+        {
+            return Err(invalid());
+        }
+    }
+    super::super::primary_layout::guard_slot(
+        tx,
+        &receipt.library,
+        &receipt.state_id,
+        &receipt.version_size,
+        &receipt.provider_checksum,
+        &path,
+    )?;
+    super::super::primary_layout::guard_downloaded_checksum(tx, &path, &receipt.local_checksum)?;
+    validate_file()?;
+    // The compact receipt already owns this exact pass and native destination.
+    // Preserve completed rows and optional metadata; only finish outstanding retry status.
+    let pending: bool = tx.query_row(
+        "SELECT status!='downloaded' FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
+        params![receipt.library, receipt.state_id, receipt.version_size],
+        |row| row.get(0),
+    )?;
+    if pending {
+        super::super::asset_writes::update_status_to_downloaded(
+            tx,
+            &receipt.library,
+            &receipt.state_id,
+            &receipt.version_size,
+            &path,
+            &receipt.local_checksum,
+            Some(&receipt.source_checksum),
+            false,
+            chrono::Utc::now().timestamp(),
+        )?;
+        tx.execute(
+            "DELETE FROM asset_verifications WHERE library=?1 AND id=?2 AND version_size=?3",
+            params![receipt.library, receipt.state_id, receipt.version_size],
+        )?;
+    }
+    let protect_readonly = force_readonly
+        || !super::super::provider_generations::reuse_metadata_is_writable(
+            tx,
+            &receipt.library,
+            &receipt.state_id,
+            &receipt.version_size,
+            &receipt.native_path.key()?,
+            &receipt.provider_checksum,
+            authorization,
+        )?;
+    if protect_readonly {
+        match super::super::primary_layout::persist_readonly_marker(
+            tx,
+            &receipt.library,
+            &receipt.state_id,
+            &receipt.version_size,
+            &path,
+            &receipt.provider_checksum,
+            &receipt.local_checksum,
+            &receipt.source_checksum,
+        )? {
+            super::super::primary_layout::ReadonlyMarker::Marked
+            | super::super::primary_layout::ReadonlyMarker::Unchanged => {}
+            super::super::primary_layout::ReadonlyMarker::Conflict => {
+                return Err(StateError::ProviderWorkConflict);
+            }
+            super::super::primary_layout::ReadonlyMarker::Missing
+            | super::super::primary_layout::ReadonlyMarker::Unsupported => {
+                // The compact receipt is valid, but no exact
+                // compatibility row can carry durable read-only
+                // protection. Do not settle; leave the pending owner
+                // for the caller to re-plan.
+                return Ok(false);
+            }
+        }
+    }
+    super::super::provider_generations::record_readonly_destination(
+        tx,
+        &receipt.library,
+        &receipt.state_id,
+        &receipt.version_size,
+        &path,
+        &receipt.local_checksum,
+        &receipt.source_checksum,
+    )?;
+    Ok(true)
+}
+
 impl SqliteStateDb {
     /// Read-only proof for the original occupying an adjusted destination. This
     /// does not reserve a path, authorize adoption, or validate a later commit.
@@ -228,110 +407,22 @@ impl SqliteStateDb {
         authorization: super::super::provider_generations::ReuseAuthorization,
     ) -> Result<bool, StateError> {
         self.with_conn_mut("reuse bound completed download", move |conn| {
-            let tx=conn.transaction()?;
-            binding.validate(&tx)?;
-            if receipt.scope != binding.scope || receipt.library != binding.library
-                || receipt.child != binding.child || receipt.master != binding.master
-                || receipt.state_id != binding.state_id || !receipt.fulfills_pass(&binding.origin_pass)
-                || record.library.as_ref()!=receipt.library || record.id.as_ref()!=receipt.state_id
-                || record.version_size.as_str()!=receipt.version_size
-                || record.checksum.as_ref()!=receipt.provider_checksum || record.size_bytes!=receipt.provider_size
-                || super::super::download_receipts::load(&tx,&receipt.id()?)?.as_ref()!=Some(&receipt)
-            { return Err(invalid()); }
-            let current: Option<(String,i64,bool)> = tx.query_row(
-                "SELECT checksum,size_bytes,is_deleted FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
-                params![receipt.library,receipt.state_id,receipt.version_size],
-                |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
-            if current.as_ref().is_none_or(|(checksum,size,deleted)|
-                checksum!=&receipt.provider_checksum || u64::try_from(*size).ok()!=Some(receipt.provider_size) || *deleted)
-            { return Err(invalid()); }
-            let path=receipt.native_path.to_path();
-            let mapped:Option<String>=tx.query_row(
-                "SELECT master_record_name FROM asset_master_mappings WHERE library=?1 AND asset_record_name=?2",
-                params![receipt.library,receipt.child],|row|row.get(0)).optional()?;
-            if mapped.as_deref().is_some_and(|master|master!=receipt.master) {return Err(invalid());}
-            let chosen=super::super::primary_layout::path_key(&path)?;
-            let collision_key=crate::fs_util::confined_path_key(&path).map_err(|_redacted_error|invalid())?;
-            let foreign:bool=tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM reconciliation_paths WHERE destination_path_key=?1
-                 AND (library<>?2 OR id<>?3 OR version_size<>?4 OR provider_checksum<>?5 OR provider_size<>?6))",
-                params![collision_key,receipt.library,receipt.state_id,receipt.version_size,
-                    receipt.provider_checksum,i64::try_from(receipt.provider_size).map_err(|_redacted_error|invalid())?],
-                |row|row.get(0))?;
-            if foreign {return Err(invalid());}
-            for reservation in super::super::provider_generations::pending_destination_reservations_for_path(&tx, &path)? {
-                if super::super::primary_layout::path_key(&reservation.destination_path)?==chosen
-                    && (reservation.library.as_ref()!=receipt.library
-                        || reservation.asset_id.as_ref()!=receipt.state_id
-                        || reservation.version_size.as_str()!=receipt.version_size
-                        || reservation.content.as_ref().is_none_or(|content|
-                            content.checksum.as_ref()!=receipt.provider_checksum || content.size!=receipt.provider_size))
-                {return Err(invalid());}
-            }
-
-            let reservations=tx.prepare("SELECT destination_path,provider_checksum,provider_size FROM reconciliation_paths
-                WHERE library=?1 AND id=?2 AND version_size=?3 AND
-                ((provider_checksum=?4 AND provider_size=?5) OR (provider_checksum='' AND provider_size=-1))")?
-                .query_map(params![receipt.library,receipt.state_id,receipt.version_size,receipt.provider_checksum,
-                    i64::try_from(receipt.provider_size).map_err(|_redacted_error|invalid())?],
-                    |row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?)))?
-                .collect::<Result<Vec<_>,_>>()?;
-            for (reserved,checksum,size) in reservations {
-                if checksum.is_empty() || size<0 || super::super::primary_layout::path_key(Path::new(&reserved))?!=chosen {
-                    return Err(invalid());
-                }
-            }
-            super::super::primary_layout::guard_slot(&tx,&receipt.library,&receipt.state_id,
-                &receipt.version_size,&receipt.provider_checksum,&path)?;
-            super::super::primary_layout::guard_downloaded_checksum(&tx,&path,&receipt.local_checksum)?;
-            validate_file()?;
-            // The compact receipt already owns this exact pass and native destination.
-            // Preserve completed rows and optional metadata; only finish outstanding retry status.
-            let pending: bool=tx.query_row("SELECT status!='downloaded' FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
-                params![receipt.library,receipt.state_id,receipt.version_size],|row|row.get(0))?;
-            if pending {
-                super::super::asset_writes::update_status_to_downloaded(&tx,&receipt.library,&receipt.state_id,
-                    &receipt.version_size,&path,&receipt.local_checksum,Some(&receipt.source_checksum),false,
-                    chrono::Utc::now().timestamp())?;
-                tx.execute("DELETE FROM asset_verifications WHERE library=?1 AND id=?2 AND version_size=?3",
-                    params![receipt.library,receipt.state_id,receipt.version_size])?;
-            }
-            let protect_readonly = !super::super::provider_generations::reuse_metadata_is_writable(
+            let tx = conn.transaction()?;
+            let settled = reuse_bound_download_tx(
                 &tx,
-                &receipt.library,
-                &receipt.state_id,
-                &receipt.version_size,
-                &receipt.native_path.key()?,
-                &receipt.provider_checksum,
+                &binding,
+                &receipt,
+                &record,
+                validate_file,
                 &authorization,
+                false,
             )?;
-            if protect_readonly {
-                match super::super::primary_layout::persist_readonly_marker(
-                &tx,&receipt.library,&receipt.state_id,&receipt.version_size,&path,
-                &receipt.provider_checksum,&receipt.local_checksum,&receipt.source_checksum,
-            )? {
-                super::super::primary_layout::ReadonlyMarker::Marked
-                | super::super::primary_layout::ReadonlyMarker::Unchanged => {}
-                super::super::primary_layout::ReadonlyMarker::Conflict => {
-                    return Err(StateError::ProviderWorkConflict)
-                }
-                super::super::primary_layout::ReadonlyMarker::Missing
-                    | super::super::primary_layout::ReadonlyMarker::Unsupported => {
-                        // The compact receipt is valid, but no exact
-                        // compatibility row can carry durable read-only
-                        // protection. Do not settle; leave the pending owner
-                        // for the caller to re-plan.
-                        return Ok(false);
-                    }
-                }
+            if settled {
+                tx.commit()?;
             }
-            super::super::provider_generations::record_readonly_destination(
-                &tx,&receipt.library,&receipt.state_id,&receipt.version_size,&path,
-                &receipt.local_checksum,&receipt.source_checksum,
-            )?;
-            tx.commit()?;
-            Ok(true)
-        }).await
+            Ok(settled)
+        })
+        .await
     }
 
     pub(crate) async fn bind_publication(

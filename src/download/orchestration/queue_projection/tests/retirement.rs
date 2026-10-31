@@ -3723,3 +3723,394 @@ async fn adjusted_redirect_transaction_is_fenced_and_atomic() {
         }).await;
     }
 }
+
+#[tokio::test]
+async fn root_candidate_pending_manifest_refreshes_and_preserves_different_path_work() {
+    use crate::state::db::provider_generations::{
+        root_test_cache_counts, root_test_guard_pending_resource, root_test_pending_path,
+        root_test_pending_resource, root_test_reset_cache_counts,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open_owned(&db_path, &owner()).await.unwrap());
+    let root = db
+        .begin_selection_generation(owner(), spec(), MAX_GENERATION_BYTES)
+        .await
+        .unwrap();
+    let media = dir.path().join("media");
+    let (manifest, tasks, records) =
+        admission(&db, &root.id, &media, 0, false, MAX_GENERATION_BYTES).await;
+    let first = tasks[0].download_path.clone();
+    let record = &records[0];
+    let old_other_path = dir.path().join("old-root/changed.JPG");
+    {
+        let conn = db.acquire_lock("root candidate pending evidence").unwrap();
+        root_test_reset_cache_counts();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(root_test_pending_path(&conn, &first).unwrap().len(), 1);
+        let same = root_test_pending_resource(
+            &conn,
+            &record.library,
+            &manifest.state_id,
+            record.version_size.as_str(),
+        )
+        .unwrap();
+        assert_eq!(same.len(), 1);
+        assert_eq!(same[0].destination_path, first);
+        assert_ne!(same[0].destination_path, old_other_path);
+        assert!(
+            root_test_guard_pending_resource(
+                &conn,
+                &record.library,
+                &manifest.state_id,
+                record.version_size.as_str(),
+                &old_other_path
+            )
+            .is_err()
+        );
+        root_test_guard_pending_resource(
+            &conn,
+            &record.library,
+            &manifest.state_id,
+            record.version_size.as_str(),
+            &first,
+        )
+        .unwrap();
+        let alias = std::path::PathBuf::from(first.to_string_lossy().to_uppercase());
+        assert_eq!(root_test_pending_path(&conn, &alias).unwrap().len(), 1);
+        conn.execute_batch("SAVEPOINT damage_projection").unwrap();
+        conn.execute(
+            "UPDATE provider_active_destinations SET path='{}' WHERE generation=?1",
+            [&root.id],
+        )
+        .unwrap();
+        assert!(root_test_pending_path(&conn, &old_other_path).is_err());
+        conn.execute_batch("ROLLBACK TO damage_projection; RELEASE damage_projection")
+            .unwrap();
+        assert_eq!(root_test_pending_path(&conn, &first).unwrap().len(), 1);
+        conn.execute_batch("SAVEPOINT damage_manifest").unwrap();
+        conn.execute(
+            "UPDATE provider_active_decisions SET manifest_hash='invalid' WHERE generation=?1",
+            [&root.id],
+        )
+        .unwrap();
+        assert!(root_test_pending_path(&conn, &old_other_path).is_err());
+        conn.execute_batch("ROLLBACK TO damage_manifest; RELEASE damage_manifest")
+            .unwrap();
+        assert_eq!(root_test_pending_path(&conn, &first).unwrap().len(), 1);
+        conn.execute_batch("COMMIT").unwrap();
+        assert_eq!(root_test_cache_counts()[0], 1);
+    }
+    let (_, second, _) = admission(&db, &root.id, &media, 1, false, MAX_GENERATION_BYTES).await;
+    {
+        let conn = db.acquire_lock("local pending insertion").unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(
+            root_test_pending_path(&conn, &second[0].download_path)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(root_test_pending_path(&conn, &first).unwrap().len(), 1);
+        conn.execute_batch("COMMIT").unwrap();
+        assert_eq!(root_test_cache_counts()[0], 1);
+    }
+    let other = Arc::new(SqliteStateDb::open_owned(&db_path, &owner()).await.unwrap());
+    let (_, third, _) = admission(&other, &root.id, &media, 2, false, MAX_GENERATION_BYTES).await;
+    {
+        let conn = db.acquire_lock("external pending insertion").unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(
+            root_test_pending_path(&conn, &third[0].download_path)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(root_test_pending_path(&conn, &first).unwrap().len(), 1);
+        conn.execute_batch("COMMIT").unwrap();
+        assert_eq!(root_test_cache_counts()[0], 2);
+    }
+}
+
+#[tokio::test]
+async fn root_candidate_pending_workload_refreshes_only_changed_decisions() {
+    use crate::state::db::provider_generations::{
+        root_test_cache_counts, root_test_pending_path, root_test_reset_cache_counts,
+    };
+    for size in [16, 64] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+                .await
+                .unwrap(),
+        );
+        let root = db
+            .begin_selection_generation(owner(), spec(), MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+        {
+            let conn = db.acquire_lock("prime root workload index").unwrap();
+            root_test_reset_cache_counts();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            assert!(
+                root_test_pending_path(&conn, &dir.path().join("absent"))
+                    .unwrap()
+                    .is_empty()
+            );
+            conn.execute_batch("COMMIT").unwrap();
+        }
+        let mut planner = TaskPlanner::for_download(None).await.unwrap();
+        let started = std::time::Instant::now();
+        for index in 0..size {
+            let (_, tasks, _) = admission_with_planner(
+                &db,
+                &root.id,
+                &dir.path().join("media"),
+                index,
+                (false, false),
+                MAX_GENERATION_BYTES,
+                &mut planner,
+            )
+            .await;
+            let conn = db.acquire_lock("measure root candidate refresh").unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            assert_eq!(
+                root_test_pending_path(&conn, &tasks[0].download_path)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            conn.execute_batch("COMMIT").unwrap();
+        }
+        let [builds, refreshed_owners, manifest_loads] = root_test_cache_counts();
+        assert_eq!(builds, 1);
+        assert!(
+            refreshed_owners <= size * 2,
+            "size={size}, owners={refreshed_owners}"
+        );
+        assert_eq!(manifest_loads, size * 3, "size={size}");
+        let conn = db.acquire_lock("identity query plan").unwrap();
+        let plan: Vec<String> = conn.prepare(
+            "EXPLAIN QUERY PLAN SELECT DISTINCT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND (asset_id=?2 OR child=?2) ORDER BY generation,pass_key,child"
+        ).unwrap().query_map(["PrimarySync", "asset-compact-0"], |row| row.get(3)).unwrap()
+            .collect::<Result<_, _>>().unwrap();
+        eprintln!(
+            "root pending workload: size={size}, builds={builds}, refreshed_owners={refreshed_owners}, manifest_loads={manifest_loads}, elapsed_ms={}, identity_plan={plan:?}",
+            started.elapsed().as_millis()
+        );
+    }
+}
+
+#[tokio::test]
+async fn root_candidate_cold_and_external_rebuild_reject_missing_or_false_complete_projection() {
+    use crate::state::db::provider_generations::{
+        root_test_pending_path, root_test_pending_resource,
+    };
+    for corruption in ["missing", "non-admitted", "false-complete"] {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let db = Arc::new(SqliteStateDb::open_owned(&db_path, &owner()).await.unwrap());
+        let root = db
+            .begin_selection_generation(owner(), spec(), MAX_GENERATION_BYTES)
+            .await
+            .unwrap();
+        let (manifest, tasks, records) = admission(
+            &db,
+            &root.id,
+            &dir.path().join("media"),
+            0,
+            false,
+            MAX_GENERATION_BYTES,
+        )
+        .await;
+        let path = &tasks[0].download_path;
+        let record = &records[0];
+        let corrupt = match corruption {
+            "missing" => "DELETE FROM provider_active_destinations WHERE generation=?1",
+            "non-admitted" => {
+                "UPDATE provider_active_destinations SET admitted=0 WHERE generation=?1"
+            }
+            "false-complete" => {
+                "UPDATE provider_active_destinations SET verified_media=1 WHERE generation=?1"
+            }
+            _ => panic!("unknown corruption"),
+        };
+        let snapshot = |conn: &rusqlite::Connection| -> (Vec<String>, Vec<String>) {
+            let decisions = conn.prepare("SELECT json_array(generation,pass_key,child,manifest_hash,outcome,admission,reason,admission_hash) FROM provider_active_decisions ORDER BY generation,pass_key,child").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+            let destinations = conn.prepare("SELECT json_array(generation,pass_key,child,library,asset_id,version_size,path,checksum,size_bytes,admitted,verified_media,verified_metadata,local_checksum,source_checksum,progress_hash) FROM provider_active_destinations ORDER BY generation,pass_key,child,version_size,path").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+            (decisions, destinations)
+        };
+        let initial;
+        {
+            let conn = db.acquire_lock("cold projection corruption").unwrap();
+            initial = snapshot(&conn);
+            assert!(!initial.1.is_empty());
+            conn.execute_batch("BEGIN IMMEDIATE; SAVEPOINT cold_damage")
+                .unwrap();
+            conn.execute(corrupt, [&root.id]).unwrap();
+            assert!(
+                root_test_pending_path(&conn, path).is_err(),
+                "{corruption}: cold path"
+            );
+            assert!(
+                root_test_pending_resource(
+                    &conn,
+                    &record.library,
+                    &manifest.state_id,
+                    record.version_size.as_str()
+                )
+                .is_err(),
+                "{corruption}: cold resource"
+            );
+            conn.execute_batch("ROLLBACK TO cold_damage; RELEASE cold_damage")
+                .unwrap();
+            assert_eq!(
+                root_test_pending_path(&conn, path).unwrap().len(),
+                1,
+                "{corruption}: rollback"
+            );
+            conn.execute_batch("COMMIT").unwrap();
+            assert_eq!(snapshot(&conn), initial);
+        }
+        let external = rusqlite::Connection::open(&db_path).unwrap();
+        external
+            .execute_batch(
+                "CREATE TEMP TABLE saved_projection AS SELECT * FROM provider_active_destinations;",
+            )
+            .unwrap();
+        external.execute(corrupt, [&root.id]).unwrap();
+        {
+            let conn = db.acquire_lock("external projection corruption").unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            assert!(
+                root_test_pending_path(&conn, path).is_err(),
+                "{corruption}: external path"
+            );
+            assert!(
+                root_test_pending_resource(
+                    &conn,
+                    &record.library,
+                    &manifest.state_id,
+                    record.version_size.as_str()
+                )
+                .is_err(),
+                "{corruption}: external resource"
+            );
+            conn.execute_batch("ROLLBACK").unwrap();
+        }
+        external
+            .execute(
+                "DELETE FROM provider_active_destinations WHERE generation=?1",
+                [&root.id],
+            )
+            .unwrap();
+        external
+            .execute(
+                "INSERT INTO provider_active_destinations SELECT * FROM temp.saved_projection",
+                [],
+            )
+            .unwrap();
+        {
+            let conn = db.acquire_lock("projection restored").unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            assert_eq!(
+                root_test_pending_path(&conn, path).unwrap().len(),
+                1,
+                "{corruption}: restored"
+            );
+            conn.execute_batch("COMMIT").unwrap();
+            assert_eq!(snapshot(&conn), initial);
+        }
+        assert!(!path.exists(), "pending media must remain pending");
+    }
+}
+
+#[tokio::test]
+async fn root_candidate_cold_and_external_rebuild_reject_deleted_sealed_decision() {
+    use crate::state::db::provider_generations::root_test_pending_path;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open_owned(&db_path, &owner()).await.unwrap());
+    let root = db
+        .begin_selection_generation(owner(), spec(), MAX_GENERATION_BYTES)
+        .await
+        .unwrap();
+    let (_, tasks, _) = admission(
+        &db,
+        &root.id,
+        &dir.path().join("media"),
+        0,
+        false,
+        MAX_GENERATION_BYTES,
+    )
+    .await;
+    db.seal_selection_generation(owner(), root.id.clone(), false, Some("unfinished".into()))
+        .await
+        .unwrap();
+    let path = &tasks[0].download_path;
+    {
+        let conn = db.acquire_lock("cold deleted sealed decision").unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE; SAVEPOINT deleted_decision")
+            .unwrap();
+        conn.execute(
+            "DELETE FROM provider_active_destinations WHERE generation=?1",
+            [&root.id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM provider_active_decisions WHERE generation=?1",
+            [&root.id],
+        )
+        .unwrap();
+        assert!(
+            root_test_pending_path(&conn, path).is_err(),
+            "cold deleted decision must violate the seal"
+        );
+        conn.execute_batch("ROLLBACK TO deleted_decision; RELEASE deleted_decision")
+            .unwrap();
+        assert_eq!(root_test_pending_path(&conn, path).unwrap().len(), 1);
+        conn.execute_batch("COMMIT").unwrap();
+    }
+    let external = rusqlite::Connection::open(&db_path).unwrap();
+    external.execute_batch("CREATE TEMP TABLE saved_decision AS SELECT * FROM provider_active_decisions; CREATE TEMP TABLE saved_destination AS SELECT * FROM provider_active_destinations;").unwrap();
+    external
+        .execute(
+            "DELETE FROM provider_active_destinations WHERE generation=?1",
+            [&root.id],
+        )
+        .unwrap();
+    external
+        .execute(
+            "DELETE FROM provider_active_decisions WHERE generation=?1",
+            [&root.id],
+        )
+        .unwrap();
+    {
+        let conn = db.acquire_lock("external deleted sealed decision").unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(
+            root_test_pending_path(&conn, path).is_err(),
+            "external deletion must invalidate the seal"
+        );
+        conn.execute_batch("ROLLBACK").unwrap();
+    }
+    external
+        .execute(
+            "INSERT INTO provider_active_decisions SELECT * FROM temp.saved_decision",
+            [],
+        )
+        .unwrap();
+    external
+        .execute(
+            "INSERT INTO provider_active_destinations SELECT * FROM temp.saved_destination",
+            [],
+        )
+        .unwrap();
+    {
+        let conn = db.acquire_lock("restored sealed decision").unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert_eq!(root_test_pending_path(&conn, path).unwrap().len(), 1);
+        conn.execute_batch("COMMIT").unwrap();
+    }
+    assert!(!path.exists());
+}

@@ -14,6 +14,7 @@ pub(crate) use prepared::{
 };
 pub(super) use prepared::{
     record_bound_receipt, retire_handed_off_publication, retire_prepared_receipt,
+    reuse_bound_download_tx,
 };
 
 #[derive(Debug, Clone)]

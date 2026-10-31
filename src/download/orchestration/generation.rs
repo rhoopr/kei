@@ -1644,6 +1644,133 @@ impl SelectionRun {
                 }
             }
         }
+        // Old-root reuse is limited to a fresh, source-confirmed selection and
+        // one exact bound source receipt. Never search an arbitrary old tree.
+        // A retained file and its no-follow namespace remain live until the
+        // admission transaction validates the receipt and commits.
+        let mut root_reuses = Vec::new();
+        let mut root_guards = Vec::new();
+        if reason.is_empty()
+            && previous.is_none()
+            && fresh.is_some()
+            && self.root.spec.format == 2
+            && !config.refresh_metadata
+        {
+            let current_root = crate::fs_util::absolute_confined_path(&config.directory)?;
+            let mut candidates = Vec::new();
+            for task in &plan.tasks {
+                let Some(binding) = task.publication_binding.as_deref() else {
+                    continue;
+                };
+                let receipts = self
+                    .capture
+                    .db
+                    .bound_download_receipts(
+                        binding.clone(),
+                        task.version_size.as_str().to_owned(),
+                        task.checksum.to_string(),
+                        task.size,
+                    )
+                    .await?;
+                let mut outside = false;
+                for receipt in &receipts {
+                    let native = receipt.native_path.to_path();
+                    let absolute = crate::fs_util::absolute_confined_path(&native)?;
+                    anyhow::ensure!(absolute == native, "Invalid recorded publication path");
+                    outside |= !absolute.starts_with(&current_root);
+                }
+                if !outside {
+                    continue;
+                }
+                anyhow::ensure!(
+                    receipts.len() == 1,
+                    "Ambiguous recorded old-root publication"
+                );
+                let receipt = receipts
+                    .into_iter()
+                    .next()
+                    .context("Missing recorded publication")?;
+                let path = crate::fs_util::absolute_confined_path(&receipt.native_path.to_path())?;
+                anyhow::ensure!(
+                    path == receipt.native_path.to_path() && !path.starts_with(&current_root),
+                    "Invalid recorded old-root path"
+                );
+                anyhow::ensure!(
+                    !redirected.contains(&task.version_size)
+                        && !planner.conflicts_with_durable_destination(task, &path)
+                        && planner.retry_path_allowed(
+                            &task.library,
+                            &task.asset_id,
+                            task.version_size,
+                            &task.checksum,
+                            task.size,
+                            &path
+                        ),
+                    "Recorded old-root path conflicts with durable work"
+                );
+                candidates.push((
+                    crate::fs_util::confined_path_key(&path)?,
+                    path,
+                    task,
+                    binding.clone(),
+                    receipt,
+                ));
+            }
+            // All participants lock in the same canonical order, and duplicate
+            // physical paths cannot recursively acquire the same mutex.
+            candidates.sort_by(|left, right| left.0.cmp(&right.0));
+            anyhow::ensure!(
+                !candidates
+                    .windows(2)
+                    .any(|pair| matches!(pair, [left, right] if left.0 == right.0)),
+                "Ambiguous recorded old-root paths"
+            );
+            for (_, path, task, binding, receipt) in candidates {
+                let guard = crate::download::file::lock_download_destination(&path, cancel).await?;
+                // Anchor at the filesystem root so every component of this
+                // exact, receipt-bound path is traversed without following links.
+                let anchor = path
+                    .ancestors()
+                    .last()
+                    .context("Recorded path has no root")?;
+                let file = crate::download::file::retain_pending_file(anchor, &path)
+                    .await?
+                    .context("Recorded old-root file is unavailable")?;
+                let actual = data_encoding::HEXLOWER.encode(&file.fingerprint.sha256);
+                anyhow::ensure!(
+                    actual == receipt.local_checksum
+                        && (receipt.source_checksum != receipt.local_checksum
+                            || file.fingerprint.size == task.size),
+                    "Recorded old-root file no longer matches its receipt"
+                );
+                #[cfg(test)]
+                crate::test_helpers::primary_source_snapshot_point(&path).await?;
+                let retained = file.clone();
+                let authorization = crate::state::db::provider_generations::ReuseAuthorization {
+                    current_metadata_flags: crate::download::pipeline::MetadataFlags::from(config)
+                        .bits(),
+                    explicit_refresh_authorized: false,
+                    scope: binding.scope.clone(),
+                    pass_key: binding.origin_pass.clone(),
+                    child: binding.child.clone(),
+                    generation: Some(self.root.id.clone()),
+                };
+                root_guards.push(guard);
+                root_reuses.push((
+                    task.version_size,
+                    crate::state::db::provider_generations::RootAdmissionReuse {
+                        binding,
+                        receipt,
+                        authorization,
+                        validate_file: Box::new(move || {
+                            retained.validate_blocking().map_err(|_error| {
+                                crate::state::error::StateError::ProviderSelectionInvalid
+                            })
+                        }),
+                    },
+                ));
+            }
+        }
         let mut destinations = Vec::new();
         let mut records = Vec::new();
         if reason.is_empty() {
@@ -1730,7 +1857,12 @@ impl SelectionRun {
                         break;
                     }
                 }
-                let path = if redirected.contains(&derived.version_size) {
+                let path = if let Some((_, proof)) = root_reuses
+                    .iter()
+                    .find(|(version, _)| *version == derived.version_size)
+                {
+                    proof.receipt.native_path.to_path()
+                } else if redirected.contains(&derived.version_size) {
                     plan.tasks
                         .iter()
                         .find(|task| task.version_size == derived.version_size)
@@ -1848,15 +1980,17 @@ impl SelectionRun {
         let mut projection = self
             .capture
             .db
-            .project_selection_decision_with_proof(
+            .project_selection_decision_with_root_reuse(
                 self.capture.owner.clone(),
                 self.root.id.clone(),
                 manifest.clone(),
                 records,
                 fresh,
+                root_reuses.into_iter().map(|(_, proof)| proof).collect(),
                 MAX_GENERATION_BYTES,
             )
             .await?;
+        drop(root_guards);
         if freshly_confirmed {
             self.capture
                 .db
