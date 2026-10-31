@@ -18,7 +18,7 @@ fn provider_metadata(records: &mut [Value]) {
     fields["captionEnc"] = json!({"value": "Café fixture", "type": "STRING"});
 }
 
-fn bound_receipt(
+pub(super) fn bound_receipt(
     h: &Harness,
     id: &str,
     source: &[u8],

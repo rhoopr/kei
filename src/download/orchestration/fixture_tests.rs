@@ -203,42 +203,24 @@ async fn bundled_heif_prepublication_xmp_preserves_media_and_checksum_roles() {
         "media/pattern.avif",
     ] {
         let source = fixture(name);
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/media"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(source.clone())
-                    .insert_header("content-type", "image/heic"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("state.db");
-        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
-        let mut config = DownloadConfig::test_default();
-        config.directory = Arc::from(dir.path().join("media"));
-        config.folder_structure = String::new();
-        config.sync_mode = SyncMode::Full;
-        config.metadata.embed_xmp = true;
-        config.metadata.set_exif_rating = true;
-        config.state_db = Some(db.clone());
+        let mut h = support::Harness::new_owned().await;
+        h.config.metadata.embed_xmp = true;
+        h.config.metadata.set_exif_rating = true;
         let filename = Path::new(name).file_name().unwrap().to_str().unwrap();
         let uti = if filename.ends_with("avif") {
             "public.avif"
         } else {
             "public.heic"
         };
-        let records = records(filename, uti, &server, &source);
-        let result = cycle(&config, records.clone()).await;
+        let records = h.asset("fixture-master", filename, uti, name, 1).await;
+        let result = h.owned_cycle(records.clone()).await;
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "{name}: {result:?}"
         );
         assert_eq!(result.stats.downloaded, 1);
         assert_eq!(result.stats.exif_failures, 0);
-        let row = db.get_downloaded_page(0, 10).await.unwrap().remove(0);
+        let row = h.db().get_downloaded_page(0, 10).await.unwrap().remove(0);
         let path = row.local_path.unwrap();
         let written = std::fs::read(&path).unwrap();
         assert!(
@@ -264,11 +246,13 @@ async fn bundled_heif_prepublication_xmp_preserves_media_and_checksum_roles() {
             row.local_checksum.as_deref(),
             Some(sha256(&written).as_str())
         );
-        config.state_db = None;
-        drop(db);
-        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
-        config.state_db = Some(db.clone());
-        let result = cycle(&config, records).await;
+        let receipt = metadata::bound_receipt(&h, "fixture-master", &source, &written, &path);
+        h.reopen().await;
+        assert_eq!(
+            metadata::bound_receipt(&h, "fixture-master", &source, &written, &path),
+            receipt
+        );
+        let result = h.owned_cycle(records).await;
         assert!(matches!(result.outcome, DownloadOutcome::Success));
         assert_eq!(result.stats.downloaded, 0);
         assert!(
@@ -276,13 +260,20 @@ async fn bundled_heif_prepublication_xmp_preserves_media_and_checksum_roles() {
             "{name}: steady state rewrote media"
         );
         assert!(
-            db.get_pending_metadata_rewrites(10)
+            h.db()
+                .get_pending_metadata_rewrites(10)
                 .await
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(std::fs::read_dir(&config.directory).unwrap().count(), 1);
-        server.verify().await;
+        assert!(h.db().get_pending().await.unwrap().is_empty());
+        assert!(h.db().get_failed().await.unwrap().is_empty());
+        assert_eq!(
+            metadata::bound_receipt(&h, "fixture-master", &source, &written, &path),
+            receipt
+        );
+        assert_eq!(std::fs::read_dir(&h.config.directory).unwrap().count(), 1);
+        h.server.verify().await;
     }
 }
 
