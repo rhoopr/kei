@@ -4076,50 +4076,375 @@ async fn primary_layout_stale_writers_and_downloaded_receipts_cannot_finalize_cu
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let edited = records(&server, Some(("edit-one", EDIT_ONE)));
-    cycle(root.path(), edited, false, EditedNaming::Primary).await;
-    let db = state::SqliteStateDb::open(&root.path().join("state.db"))
-        .await
-        .unwrap();
+    let (initial, _) = cycle_options(
+        root.path(),
+        edited.clone(),
+        false,
+        EditedNaming::Primary,
+        CycleOptions {
+            private: true,
+            baseline_successor: Some("guard-checkpoint"),
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0);
+    assert!(initial.db_sync_token_advance_safe);
+    let media = root.path().join("media");
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    let source = records(&server, Some(("edit-one", EDIT_ONE)));
+    let provider = Session {
+        reported_count: None,
+        records: source,
+        quiet: true,
+        lookups: Arc::new(AtomicUsize::new(0)),
+        current: None,
+        lookup_change: None,
+        indexing: None,
+        baseline_successor: None,
+        cycle_token: None,
+        trace: None,
+    };
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::default(),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from("TestAlbum"),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(provider),
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner, "com"),
+        Arc::from("private"),
+    );
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::default(),
+    };
+    let expected_scope = json!({
+        "zone": {"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+        "name":"TestAlbum",
+        "list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+        "obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted",
+        "query_filter":null, "container_id":null, "cross_zone_sources":[]
+    });
+    assert_eq!(pass.album.selection_scope(), expected_scope);
+    let expected_pass = format!(
+        "{:x}",
+        Sha256::digest(
+            json!({"kind":"Unfiled","scope":expected_scope,"excludes":[]})
+                .to_string()
+                .as_bytes()
+        )
+    );
+    let store: Arc<dyn download::DownloadStore> = db.clone();
+    let build = make_run_cycle_download_config_builder(&media, store);
+    let mut config = build(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from("PrimarySync"),
+    )
+    .as_ref()
+    .clone();
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    config.edited_naming = EditedNaming::Primary;
+    let mut op = download::seed_prepared_edited_compat(&config, &pass).await;
+
+    assert_eq!(op.phase, "prepared");
+    assert_eq!(op.generation, 0);
+    assert_eq!(op.library, "PrimarySync");
+    assert_eq!(op.child, "asset-501");
+    assert_eq!(
+        db.primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     let current = root.path().join("media/IMG_0501.JPG");
+    assert!(op.members.iter().any(|m| {
+        m.destination
+            .as_ref()
+            .is_some_and(|p| p.to_path() == current)
+    }));
+    assert!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_claims WHERE operation IS NOT NULL"
+        ) > 0
+    );
+    let current_member = op
+        .members
+        .iter()
+        .find(|m| {
+            m.destination
+                .as_ref()
+                .is_some_and(|p| p.to_path() == current)
+        })
+        .unwrap();
+    let current_path_key = current_member.path_key.clone().unwrap();
+    let original_path = root.path().join("media/IMG_0501_original.JPG");
+    let original_path_key = op
+        .members
+        .iter()
+        .find(|m| {
+            m.destination
+                .as_ref()
+                .is_some_and(|p| p.to_path() == original_path)
+        })
+        .unwrap()
+        .path_key
+        .clone()
+        .unwrap();
+    let record = current_member.record.as_ref().unwrap();
+    assert_eq!(record.version_size.as_str(), "adjusted");
+    assert_eq!(record.checksum.as_ref(), provider_hash(EDIT_ONE));
+    assert_eq!(op.source_library, "PrimarySync");
+    assert_eq!(op.pass, expected_pass);
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let claim: (String, String, String, String, String) = conn.query_row(
+        "SELECT operation, library, child, version, provider_checksum FROM primary_layout_claims WHERE path_key=?1",
+        [current_member.path_key.as_deref().unwrap()],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    ).unwrap();
+    assert_eq!(
+        claim,
+        (
+            op.operation.clone(),
+            "PrimarySync".into(),
+            "asset-501".into(),
+            "adjusted".into(),
+            provider_hash(EDIT_ONE)
+        )
+    );
+    // Snapshot complete rows, including encoded operation/member evidence,
+    // all claims, selected-work retry/progress flags and all receipt fields.
+    let tables = [
+        "primary_layout_operations",
+        "primary_layout_members",
+        "primary_layout_claims",
+        "primary_layout_preserved",
+        "primary_layout_bindings",
+        "provider_selection_rank_pages",
+        "provider_selection_rank_records",
+        "provider_active_generations",
+        "provider_active_decisions",
+        "provider_active_sources",
+        "provider_active_destinations",
+        "provider_selection_generations",
+        "provider_selection_sources",
+        "provider_selection_decisions",
+        "provider_selection_destinations",
+        "download_receipts",
+        "asset_metadata_paths",
+        "assets",
+        "metadata",
+    ];
+    let snapshot = || -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        tables
+            .iter()
+            .map(|table| {
+                let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+                let columns = stmt.column_count();
+                let mut rows = stmt
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|i| row.get(i))
+                            .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                rows.sort_by_key(|row| format!("{row:?}"));
+                rows
+            })
+            .collect()
+    };
+    let before = snapshot();
+    for (table, expected) in [
+        ("provider_active_generations", 1),
+        ("provider_active_decisions", 1),
+        ("provider_active_sources", 0),
+        ("provider_active_destinations", 2),
+    ] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, expected, "unexpected selected work in {table}");
+    }
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("guard-checkpoint")
+    );
+    let original = root.path().join("media/IMG_0501_original.JPG");
+    assert_bytes(&current, EDIT_ONE);
+    assert_bytes(&original, ORIGINAL);
+    let current_mtime = std::fs::metadata(&current).unwrap().modified().unwrap();
+    let original_mtime = std::fs::metadata(&original).unwrap().modified().unwrap();
     use crate::state::db::MetadataRewriteStore as _;
     assert!(db.guard_primary_writer(&current).await.is_err());
-    assert!(
-        db.mark_downloaded(
-            "PrimarySync",
-            "asset-501",
-            "original",
-            &current,
-            "forged-local-sha",
-            None
-        )
-        .await
-        .is_err()
+    assert_eq!(snapshot(), before, "writer guard changed durable state");
+    for version in ["original", "adjusted"] {
+        assert!(
+            db.mark_downloaded(
+                "PrimarySync",
+                "asset-501",
+                version,
+                &current,
+                "forged-local-sha",
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            snapshot(),
+            before,
+            "{version} refusal changed durable state"
+        );
+        assert_bytes(&current, EDIT_ONE);
+        assert_bytes(&original, ORIGINAL);
+        assert_eq!(
+            std::fs::metadata(&current).unwrap().modified().unwrap(),
+            current_mtime
+        );
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().modified().unwrap(),
+            original_mtime
+        );
+    }
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("guard-checkpoint")
     );
+    download::finish_prepared_edited_compat(&config, &mut op).await;
     assert!(
-        db.mark_downloaded(
-            "PrimarySync",
-            "asset-501",
-            "adjusted",
-            &current,
-            "forged-local-sha",
-            None
-        )
-        .await
-        .is_err()
+        db.primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap()
+            .is_empty()
     );
     assert_bytes(&current, EDIT_ONE);
-    let manifest = db.get_manifest_assets().await.unwrap();
-    let adjusted = manifest
-        .iter()
-        .find(|row| row.version == "adjusted")
+    assert_bytes(&original, ORIGINAL);
+    let binding = db
+        .primary_layout_binding(op.family.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.generation, 1);
+    assert_eq!(
+        (
+            binding.library.as_str(),
+            binding.source_library.as_str(),
+            binding.child.as_str()
+        ),
+        ("PrimarySync", "PrimarySync", "asset-501")
+    );
+    for (version, path, bytes) in [
+        ("adjusted", &current, EDIT_ONE),
+        ("original", &original, ORIGINAL),
+    ] {
+        let checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+        let file = binding
+            .files
+            .iter()
+            .find(|f| f.version == version && f.path.to_path() == *path)
+            .unwrap();
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),
+            checksum
+        );
+        assert_eq!(file.provider_checksum, provider_hash(bytes));
+        let row: (String, String, String, String) = conn.query_row(
+            "SELECT status, local_path, checksum, local_checksum FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
+            ["PrimarySync", "asset-501", version], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))
+        ).unwrap();
+        assert_eq!(
+            row,
+            (
+                "downloaded".into(),
+                path.to_str().unwrap().into(),
+                provider_hash(bytes),
+                checksum.clone()
+            )
+        );
+        let receipt: (String, String) = conn.query_row(
+            "SELECT provider_checksum, local_checksum FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4",
+            ["PrimarySync", "asset-501", version, path.to_str().unwrap()], |r| Ok((r.get(0)?,r.get(1)?))
+        ).unwrap();
+        assert_eq!(receipt, (provider_hash(bytes), checksum));
+    }
+    let phase: String = conn
+        .query_row(
+            "SELECT phase FROM primary_layout_operations WHERE operation=?1",
+            [&op.operation],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(phase, "committed");
+    let claim_after: (Option<String>, String) = conn
+        .query_row(
+            "SELECT operation, local_checksum FROM primary_layout_claims WHERE path_key=?1",
+            [&current_path_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .unwrap();
     assert_eq!(
-        adjusted.local_checksum.as_deref(),
-        Some(
-            data_encoding::HEXLOWER
-                .encode(&Sha256::digest(EDIT_ONE))
-                .as_str()
+        claim_after,
+        (
+            None,
+            data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_ONE))
         )
+    );
+    let original_claim: (Option<String>, String) = conn
+        .query_row(
+            "SELECT operation, local_checksum FROM primary_layout_claims WHERE path_key=?1",
+            [&original_path_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        original_claim,
+        (
+            None,
+            data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL))
+        )
+    );
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("guard-checkpoint")
     );
 }
 

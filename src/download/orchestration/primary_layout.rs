@@ -2659,6 +2659,21 @@ pub(crate) mod tests {
         op
     }
 
+    pub(crate) async fn finish_prepared_edited_compat(
+        config: &DownloadConfig,
+        op: &mut LayoutOperation,
+    ) {
+        let db = config.state_db.as_deref().unwrap();
+        super::finish(
+            db,
+            op,
+            &CancellationToken::new(),
+            &mut LayoutOutcome::default(),
+        )
+        .await
+        .unwrap();
+    }
+
     /// Stop after the first create-only member has been installed and its
     /// receipt persisted, matching the released publishing-phase boundary.
     pub(crate) async fn seed_partly_published_compat(

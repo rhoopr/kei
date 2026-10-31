@@ -76,8 +76,8 @@ mod live_baseline_test;
 pub(crate) use orchestration::primary_layout::tests::prepared_layout_with_refresh;
 #[cfg(test)]
 pub(crate) use orchestration::primary_layout::tests::{
-    probe_recorded_recovery_gate, seed_partly_published_compat, seed_prepared_edited_compat,
-    seed_unprepared_refresh,
+    finish_prepared_edited_compat, probe_recorded_recovery_gate, seed_partly_published_compat,
+    seed_prepared_edited_compat, seed_unprepared_refresh,
 };
 
 #[cfg(test)]
