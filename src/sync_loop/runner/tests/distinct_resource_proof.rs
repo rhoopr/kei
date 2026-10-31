@@ -122,9 +122,9 @@ fn page_records(
     vec![master_record, child_record]
 }
 
-#[tokio::test]
-async fn distinct_receipt_changed_during_file_check_holds_second_resource() {
+async fn distinct_receipt_recheck_case(change: bool) {
     use crate::commands::{AlbumPass, PassKind};
+    use rusqlite::OptionalExtension as _;
     let server = wiremock::MockServer::start().await;
     let first = include_bytes!("../../../../tests/data/media/pattern.jpg").as_slice();
     let second = include_bytes!("../../../../tests/data/media/metadata.jpg").as_slice();
@@ -141,7 +141,7 @@ async fn distinct_receipt_changed_during_file_check_holds_second_resource() {
     Mock::given(method("GET"))
         .and(path("/second"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(second))
-        .expect(0)
+        .expect(if change { 0 } else { 1 })
         .mount(&server)
         .await;
     let directory = tempfile::tempdir().unwrap();
@@ -154,6 +154,12 @@ async fn distinct_receipt_changed_during_file_check_holds_second_resource() {
     let destination = media
         .join(run_cycle_expected_date_dir())
         .join(format!("collision-{}.JPG", second.len()));
+    let _timing = crate::download::planner::distinct_timing_test_hook::Control::install_positive(
+        occupant.clone(),
+        destination.clone(),
+    );
+    let outcome = Arc::new(Mutex::new(None));
+    let outcome_after = outcome.clone();
     let snapshot = Arc::new(Mutex::new(None));
     let captured = snapshot.clone();
     let occupant_for_hook = occupant.clone();
@@ -163,19 +169,51 @@ async fn distinct_receipt_changed_during_file_check_holds_second_resource() {
     crate::download::planner::distinct_occupant_test_hook::install(
         occupant.clone(),
         Box::new(move || {
-            let before = (
-                std::fs::read(&occupant_for_hook).unwrap(),
-                std::fs::metadata(&occupant_for_hook)
-                    .unwrap()
-                    .modified()
-                    .unwrap(),
-            );
+            let bytes = std::fs::read(&occupant_for_hook).unwrap();
+            let mtime = std::fs::metadata(&occupant_for_hook)
+                .unwrap()
+                .modified()
+                .unwrap();
             let conn = rusqlite::Connection::open(database_for_hook).unwrap();
-            assert_eq!(conn.execute("UPDATE download_receipts SET proof_hash='changed-during-check' WHERE child='asset-distinct-a'", []).unwrap(), 1);
-            *captured.lock().unwrap() = Some(before);
+            let receipt: String = conn.query_row("SELECT json_array(account_key,provider_key,scope,origin_pass,child,master,version_size,native_path,provider_checksum,provider_size,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-distinct-a'", [], |r| r.get(0)).unwrap();
+            let owner: (String, String) = conn
+                .query_row(
+                    "SELECT account_key,provider_key FROM account_owner WHERE singleton=1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            let fields: Value = serde_json::from_str(&receipt).unwrap();
+            assert_eq!(fields[0], owner.0);
+            assert_eq!(fields[1], owner.1);
+            let scope: Value = serde_json::from_str(fields[2].as_str().unwrap()).unwrap();
+            assert_eq!(scope["database"], "shared");
+            assert_eq!(
+                scope["zone"],
+                json!({"zoneName": SHARED, "ownerRecordName": "_defaultOwner"})
+            );
+            assert!(!fields[3].as_str().unwrap().is_empty());
+            assert_eq!(fields[4], "asset-distinct-a");
+            assert_eq!(fields[5], "distinct-master-a");
+            assert_eq!(fields[6], "original");
+            assert_eq!(
+                serde_json::from_str::<Value>(fields[7].as_str().unwrap()).unwrap()["path"],
+                occupant_for_hook.to_str().unwrap()
+            );
+            assert_eq!(fields[8], "ATLF2mUdMsryhdyIJgwrpiBlt1z2");
+            assert_eq!(fields[9], 1000);
+            assert_eq!(
+                fields[10],
+                "1f7b7dd82b9a019b98add756d74e4cfdfb952bb8a1a010869c80de0fd8e5c215"
+            );
+            assert_eq!(fields[11], fields[10]);
+            if change {
+                assert_eq!(conn.execute("UPDATE download_receipts SET proof_hash='changed-during-check' WHERE child='asset-distinct-a'", []).unwrap(), 1);
+            }
+            *captured.lock().unwrap() = Some((bytes, mtime, fields));
         }),
         Box::new(move |failed, exact| {
-            assert!(!exact);
+            *outcome_after.lock().unwrap() = Some((failed, exact));
             observed_recheck.store(failed, std::sync::atomic::Ordering::SeqCst);
         }),
     );
@@ -234,7 +272,7 @@ async fn distinct_receipt_changed_during_file_check_holds_second_resource() {
     let mut selected = make_run_cycle_library_state_with_passes(SHARED, SHARED_TOKEN, passes);
     selected.library = library;
     let (_session_dir, session) = make_shared_session_for_run_cycle().await;
-    let error = crate::sync_cycle::run_cycle(
+    let result = crate::sync_cycle::run_cycle(
         &[&selected],
         &make_run_cycle_config(),
         Some(db.as_ref()),
@@ -244,41 +282,32 @@ async fn distinct_receipt_changed_during_file_check_holds_second_resource() {
         &session,
         &CancellationToken::new(),
     )
-    .await
-    .expect_err("changed receipt must refuse the selected cycle");
-    assert!(
-        matches!(
-            error.downcast_ref::<crate::state::error::StateError>(),
-            Some(crate::state::error::StateError::ProviderSelectionInvalid)
-        ),
-        "{error:?}"
-    );
+    .await;
     let before = snapshot
         .lock()
         .unwrap()
         .clone()
-        .expect("receipt was changed after confined byte validation");
-    assert!(
-        recheck_failed.load(std::sync::atomic::Ordering::SeqCst),
-        "fresh receipt recheck must reject the changed proof"
-    );
+        .expect("confined byte-validation hook was reached");
+    let reread = outcome
+        .lock()
+        .unwrap()
+        .expect("receipt reread hook was reached");
     assert_eq!(before.0, first);
     assert_eq!(std::fs::read(&occupant).unwrap(), before.0);
     assert_eq!(
         std::fs::metadata(&occupant).unwrap().modified().unwrap(),
         before.1
     );
-    assert!(!destination.exists());
     {
-        let conn = db.acquire_lock("changed receipt remains held").unwrap();
-        let proof: String = conn
-            .query_row(
-                "SELECT proof_hash FROM download_receipts WHERE child='asset-distinct-a'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(proof, "changed-during-check");
+        let conn = db.acquire_lock("diagnostic state").unwrap();
+        let receipt: String = conn.query_row("SELECT json_array(account_key,provider_key,scope,origin_pass,child,master,version_size,native_path,provider_checksum,provider_size,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-distinct-a'", [], |r| r.get(0)).unwrap();
+        let after: Value = serde_json::from_str(&receipt).unwrap();
+        for index in 0..12 {
+            assert_eq!(
+                after[index], before.2[index],
+                "receipt field {index} changed"
+            );
+        }
         let second_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM download_receipts WHERE child='asset-distinct-b'",
@@ -286,9 +315,80 @@ async fn distinct_receipt_changed_during_file_check_holds_second_resource() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(second_count, 0);
+        let work: String = conn.query_row("SELECT json_array(g.account_key,g.provider_key,g.scope,d.pass_key,d.child,d.library,d.asset_id,d.master,d.version_size,d.path,d.checksum,d.size_bytes,d.admitted,d.verified_media) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.child='asset-distinct-b'", [], |r| r.get(0)).unwrap();
+        let work: Value = serde_json::from_str(&work).unwrap();
+        assert_eq!(work[0], before.2[0]);
+        assert_eq!(work[1], before.2[1]);
+        assert_eq!(work[2], before.2[2]);
+        assert_eq!(work[3], before.2[3]);
+        assert_eq!(work[4], "asset-distinct-b");
+        assert_eq!(work[5], SHARED);
+        assert_eq!(work[6], "asset-distinct-b");
+        assert_eq!(work[7], "distinct-master-b");
+        assert_eq!(work[8], "original");
+        assert_eq!(
+            serde_json::from_str::<Value>(work[9].as_str().unwrap()).unwrap()["path"],
+            destination.to_str().unwrap()
+        );
+        assert_eq!(work[10], "AV/Hz7fW6Rc+X19s6b+avvkD/0Sf");
+        assert_eq!(work[11], 4381);
+        assert_eq!(work[12], 1);
+        assert_eq!(work[13], i64::from(!change));
+        let checkpoint: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [SHARED_TOKEN],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        if change {
+            let error = result.expect_err("changed receipt must refuse the selected cycle");
+            assert!(
+                matches!(
+                    error.downcast_ref::<crate::state::error::StateError>(),
+                    Some(crate::state::error::StateError::ProviderSelectionInvalid)
+                ),
+                "{error:?}"
+            );
+            assert_eq!(reread, (true, false));
+            assert!(recheck_failed.load(std::sync::atomic::Ordering::SeqCst));
+            let proof: String = conn
+                .query_row(
+                    "SELECT proof_hash FROM download_receipts WHERE child='asset-distinct-a'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(proof, "changed-during-check");
+            assert_eq!(second_count, 0);
+            assert!(!destination.exists());
+            assert!(
+                checkpoint.is_none(),
+                "failed proof must not advance checkpoint"
+            );
+        } else {
+            let success = result.expect("unchanged receipt permits independent resource");
+            assert_eq!(reread, (false, true));
+            assert_eq!(after[12], before.2[12]);
+            assert_eq!(success.failed_count, 0);
+            assert!(success.db_sync_token_advance_safe);
+            assert_eq!(second_count, 1);
+            assert_eq!(std::fs::read(&destination).unwrap(), second);
+            assert_eq!(checkpoint.as_deref(), Some("shared-delta-after"));
+        }
     }
     server.verify().await;
+}
+
+#[tokio::test]
+async fn distinct_receipt_unchanged_during_file_check_accepts_second_resource() {
+    distinct_receipt_recheck_case(false).await;
+}
+
+#[tokio::test]
+async fn distinct_receipt_changed_during_file_check_holds_second_resource() {
+    distinct_receipt_recheck_case(true).await;
 }
 
 pub(super) async fn observe_before_receipt_timing(fail_second: bool) {
