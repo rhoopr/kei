@@ -67,11 +67,18 @@ pub(in crate::download) use sidecar::create_layout_sidecar;
 #[cfg(all(test, feature = "xmp", target_os = "linux"))]
 pub(crate) use sidecar::write_sidecar;
 #[cfg(feature = "xmp")]
-pub(crate) use sidecar::write_sidecar_in_namespace;
+pub(crate) use sidecar::{SidecarFailureBoundary, write_sidecar_reported};
+#[cfg(all(test, feature = "xmp"))]
+pub(crate) use sidecar::{
+    TestPreparationFault, test_corrupt_publication_once, test_fail_before_sidecar_probe_once,
+    test_fail_sidecar_preparation_once, test_sidecar_attempts,
+};
 #[cfg(feature = "__fuzz_internals")]
 pub(crate) use source_gps::fuzz_tiff_source_gps;
 #[cfg(feature = "xmp")]
 pub(crate) use source_gps::read_source_gps;
+#[cfg(all(test, feature = "xmp"))]
+pub(crate) use source_gps::test_fail_source_gps_once;
 #[cfg(feature = "xmp")]
 pub(crate) use values::SourceGpsMetadata;
 #[allow(

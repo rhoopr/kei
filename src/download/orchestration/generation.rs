@@ -2463,7 +2463,7 @@ const METADATA_WRITER_BUDGET: usize = 500;
 #[cfg(test)]
 tokio::task_local! {
     // Scoped to one fixture future, so parallel tests retain production limits.
-    pub(super) static TEST_METADATA_WRITER_BUDGET: usize;
+    pub(in crate::download) static TEST_METADATA_WRITER_BUDGET: usize;
 }
 
 fn metadata_writer_limits() -> (usize, usize) {
@@ -2574,41 +2574,44 @@ async fn metadata_tail(
     } else {
         current
     };
-    let priority = crate::download::metadata_rewrite::run_pending_rows(
+    let mut attempts = crate::download::metadata_rewrite::TailAttempts::default();
+    let priority = Box::pin(crate::download::metadata_rewrite::run_pending_rows_tracked(
         db.as_ref(),
         flags,
         crate::download::metadata_rewrite::CaptureTimestampRepair::Preserve,
         config.temp_suffix.clone(),
         cancel,
         current,
-        Some(&config.directory),
-    )
+        (Some(&config.directory), &mut attempts),
+    ))
     .await;
+    #[cfg(all(test, feature = "xmp"))]
+    crate::download::metadata_rewrite::fire_test_metadata_tail_hook(&config.directory, true);
     if context.format == 2 && !config.refresh_metadata {
         return Ok(priority.failed);
     }
     let remaining = budget.saturating_sub(priority.fetched);
     let original = offset;
-    let mut result = crate::download::metadata_rewrite::run_pending_budget(
+    let mut result = crate::download::metadata_rewrite::run_pending_budget_tracked(
         db.as_ref(),
         flags,
         crate::download::metadata_rewrite::CaptureTimestampRepair::Preserve,
         config.temp_suffix.clone(),
         cancel,
         None,
-        (offset, remaining),
+        (offset, remaining, &mut attempts),
     )
     .await;
     if result.fetched == 0 && offset > 0 && !cancel.is_cancelled() {
         offset = 0;
-        result = crate::download::metadata_rewrite::run_pending_budget(
+        result = crate::download::metadata_rewrite::run_pending_budget_tracked(
             db.as_ref(),
             flags,
             crate::download::metadata_rewrite::CaptureTimestampRepair::Preserve,
             config.temp_suffix.clone(),
             cancel,
             None,
-            (0, remaining),
+            (0, remaining, &mut attempts),
         )
         .await;
     }
@@ -2622,6 +2625,8 @@ async fn metadata_tail(
             .set_selection_metadata_retry_offset(context.capture.owner.clone(), next)
             .await?;
     }
+    #[cfg(all(test, feature = "xmp"))]
+    crate::download::metadata_rewrite::fire_test_metadata_tail_hook(&config.directory, false);
     Ok(priority.failed.saturating_add(result.failed))
 }
 

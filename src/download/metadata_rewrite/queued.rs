@@ -10,7 +10,7 @@ use super::embedded::{
 use super::grouping::load_pending_groupings;
 use super::planning::{CaptureTimestampRepair, MetadataFlags};
 #[cfg(feature = "xmp")]
-use super::sidecar::write_sidecar_metadata;
+use super::sidecar::write_sidecar_metadata_observed;
 use crate::download::filter::MetadataPayload;
 use crate::state::db::{CaptureRepairReceipt, MetadataRewriteCompletion, MetadataRewriteQueue};
 use crate::state::{MembershipStore, MetadataRewriteStore};
@@ -18,6 +18,227 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(all(test, feature = "xmp"))]
+static TEST_SUPPRESSIONS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<PathBuf, std::sync::Weak<std::sync::atomic::AtomicUsize>>,
+    >,
+> = std::sync::OnceLock::new();
+#[cfg(all(test, feature = "xmp"))]
+pub(crate) fn test_metadata_suppressions(
+    path: &std::path::Path,
+) -> Arc<std::sync::atomic::AtomicUsize> {
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    TEST_SUPPRESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(path.to_owned(), Arc::downgrade(&count));
+    count
+}
+#[cfg(all(test, feature = "xmp"))]
+fn record_test_suppression(path: &std::path::Path) {
+    if let Some(count) = TEST_SUPPRESSIONS.get().and_then(|counts| {
+        counts
+            .lock()
+            .unwrap()
+            .get(path)
+            .and_then(std::sync::Weak::upgrade)
+    }) {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// An exact selected request already attempted in this tail. The retained
+/// namespace and file handles fence target replacement and inode reuse.
+#[cfg(feature = "xmp")]
+struct BlockedAttempt {
+    receipt: crate::state::db::SelectionMetadataReceipt,
+    asset: serde_json::Value,
+    source_checksum: Option<String>,
+    media: crate::download::file::ExistingFileFingerprint,
+    media_target: TargetSnapshot,
+    target: TargetSnapshot,
+}
+
+#[derive(Default)]
+pub(in crate::download) struct TailAttempts {
+    #[cfg(feature = "xmp")]
+    blocked: Vec<Arc<BlockedAttempt>>,
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[derive(PartialEq, Eq)]
+struct MetadataStamp {
+    identity: crate::fs_util::FileIdentity,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    changed: (i64, i64),
+    modified: (i64, i64),
+    size: u64,
+}
+
+#[cfg(all(feature = "xmp", unix))]
+fn metadata_stamp(file: &std::fs::File) -> std::io::Result<MetadataStamp> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = file.metadata()?;
+    Ok(MetadataStamp {
+        identity: crate::fs_util::file_identity(file)?,
+        mode: meta.mode(),
+        uid: meta.uid(),
+        gid: meta.gid(),
+        changed: (meta.ctime(), meta.ctime_nsec()),
+        modified: (meta.mtime(), meta.mtime_nsec()),
+        size: meta.len(),
+    })
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[derive(PartialEq, Eq)]
+enum TargetValue {
+    Missing,
+    File(MetadataStamp, [u8; 32]),
+    Directory(MetadataStamp),
+}
+
+#[cfg(all(feature = "xmp", unix))]
+struct TargetSnapshot {
+    target: crate::fs_util::ConfinedPath,
+    parent: std::fs::File,
+    parent_stamp: MetadataStamp,
+    // Keep a present entry alive, preventing identity reuse.
+    _entry: Option<std::fs::File>,
+    value: TargetValue,
+}
+
+#[cfg(all(feature = "xmp", unix))]
+fn target_value(
+    target: &crate::fs_util::ConfinedPath,
+) -> std::io::Result<(TargetValue, Option<std::fs::File>)> {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    target.validate_namespace()?;
+    if !target.entry_exists()? {
+        return Ok((TargetValue::Missing, None));
+    }
+    let metadata = std::fs::symlink_metadata(target.path())?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other("sidecar symlink"));
+    }
+    if metadata.is_dir() {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(target.path())?;
+        let stamp = metadata_stamp(&file)?;
+        target.validate_namespace()?;
+        return Ok((TargetValue::Directory(stamp), Some(file)));
+    }
+    let mut file = target
+        .open_optional_regular()?
+        .ok_or_else(|| std::io::Error::other("sidecar disappeared"))?;
+    let stamp = metadata_stamp(&file)?;
+    let mut hash = sha2::Sha256::new();
+    let mut buf = [0u8; 16384];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(
+            buf.get(..n)
+                .ok_or_else(|| std::io::Error::other("invalid sidecar read length"))?,
+        );
+    }
+    if metadata_stamp(&file)? != stamp {
+        return Err(std::io::Error::other("sidecar changed"));
+    }
+    target.validate_identity(stamp.identity)?;
+    Ok((TargetValue::File(stamp, hash.finalize().into()), Some(file)))
+}
+
+#[cfg(all(feature = "xmp", unix))]
+fn snapshot_path(path: &std::path::Path) -> Option<TargetSnapshot> {
+    let target_path = path.to_path_buf();
+    let target = crate::fs_util::ConfinedPath::open(
+        path.parent()?,
+        &target_path,
+        crate::fs_util::ConfinedParents::Existing,
+    )
+    .ok()?;
+    let parent = std::fs::File::open(path.parent()?).ok()?;
+    let parent_stamp = metadata_stamp(&parent).ok()?;
+    let (value, entry) = target_value(&target).ok()?;
+    if metadata_stamp(&parent).ok()? != parent_stamp {
+        return None;
+    }
+    target.validate_namespace().ok()?;
+    Some(TargetSnapshot {
+        target,
+        parent,
+        parent_stamp,
+        _entry: entry,
+        value,
+    })
+}
+
+#[cfg(all(feature = "xmp", unix))]
+fn blocked_target(path: &std::path::Path) -> Option<TargetSnapshot> {
+    let mut name = path.file_name()?.to_os_string();
+    name.push(".xmp");
+    snapshot_path(&path.with_file_name(name))
+}
+
+#[cfg(all(feature = "xmp", unix))]
+impl TargetSnapshot {
+    fn unchanged(&self) -> bool {
+        self.target.validate_namespace().is_ok()
+            && metadata_stamp(&self.parent).ok().as_ref() == Some(&self.parent_stamp)
+            && target_value(&self.target)
+                .ok()
+                .is_some_and(|(value, _)| value == self.value)
+            && metadata_stamp(&self.parent).ok().as_ref() == Some(&self.parent_stamp)
+            && self.target.validate_namespace().is_ok()
+    }
+}
+
+// Unsupported platforms keep retries rather than relying on incomplete file identity.
+#[cfg(all(feature = "xmp", not(unix)))]
+struct TargetSnapshot;
+#[cfg(all(feature = "xmp", not(unix)))]
+fn blocked_target(_path: &std::path::Path) -> Option<TargetSnapshot> {
+    None
+}
+#[cfg(all(feature = "xmp", not(unix)))]
+fn snapshot_path(_path: &std::path::Path) -> Option<TargetSnapshot> {
+    None
+}
+
+#[cfg(all(feature = "xmp", not(unix)))]
+impl TargetSnapshot {
+    fn unchanged(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(feature = "xmp")]
+impl BlockedAttempt {
+    fn matches(
+        &self,
+        row: &crate::state::db::PendingMetadataRewrite,
+        media: crate::download::file::ExistingFileFingerprint,
+    ) -> bool {
+        row.selection_receipt.as_ref() == Some(&self.receipt)
+            && row.source_checksum == self.source_checksum
+            && serde_json::to_value(&row.asset).ok().as_ref() == Some(&self.asset)
+            && media == self.media
+            && self.media_target.unchanged()
+            && self.target.unchanged()
+    }
+}
 
 /// Maximum assets processed per metadata-rewrite invocation. Bounds worst-case
 /// tail work at sync end; anything beyond this rolls into the next sync.
@@ -93,6 +314,31 @@ pub(in crate::download) async fn run_pending_budget<D>(
 where
     D: MembershipStore + MetadataRewriteStore + crate::state::ReconciliationStateStore + ?Sized,
 {
+    let mut attempts = TailAttempts::default();
+    run_pending_budget_tracked(
+        db,
+        metadata_flags,
+        capture_timestamp_repair,
+        temp_suffix,
+        shutdown_token,
+        library_scope,
+        (page.0, page.1, &mut attempts),
+    )
+    .await
+}
+
+pub(in crate::download) async fn run_pending_budget_tracked<D>(
+    db: &D,
+    metadata_flags: MetadataFlags,
+    capture_timestamp_repair: CaptureTimestampRepair,
+    temp_suffix: Arc<str>,
+    shutdown_token: &CancellationToken,
+    library_scope: Option<&[&str]>,
+    page: (usize, usize, &mut TailAttempts),
+) -> super::RewritePass
+where
+    D: MembershipStore + MetadataRewriteStore + crate::state::ReconciliationStateStore + ?Sized,
+{
     let selected_queue = if matches!(
         capture_timestamp_repair,
         CaptureTimestampRepair::ReplaceWithCaptureLocal
@@ -119,32 +365,35 @@ where
             };
         }
     };
-    run_pending_rows(
+    Box::pin(run_pending_rows_tracked(
         db,
         metadata_flags,
         capture_timestamp_repair,
         temp_suffix,
         shutdown_token,
         pending,
-        None,
-    )
+        (None, page.2),
+    ))
     .await
 }
 
 /// Both selected destinations and ordinary retry pages use the same physical
 /// writer and exact durable finalization owner.
-pub(in crate::download) async fn run_pending_rows<D>(
+pub(in crate::download) async fn run_pending_rows_tracked<D>(
     db: &D,
     metadata_flags: MetadataFlags,
     capture_timestamp_repair: CaptureTimestampRepair,
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
     pending: Vec<crate::state::db::PendingMetadataRewrite>,
-    archive_root: Option<&std::path::Path>,
+    context: (Option<&std::path::Path>, &mut TailAttempts),
 ) -> super::RewritePass
 where
     D: MembershipStore + MetadataRewriteStore + crate::state::ReconciliationStateStore + ?Sized,
 {
+    let (archive_root, attempts) = context;
+    #[cfg(not(feature = "xmp"))]
+    let _ = attempts;
     let selected_queue = if matches!(
         capture_timestamp_repair,
         CaptureTimestampRepair::ReplaceWithCaptureLocal
@@ -271,6 +520,11 @@ where
                     continue;
                 }
             };
+        #[cfg(all(test, feature = "xmp"))]
+        if super::take_test_writer_denial(&path) {
+            deferred += 1;
+            continue;
+        }
         if db.validate_metadata_writer(&pending_rewrite).await.is_err() {
             deferred += 1;
             continue;
@@ -583,7 +837,47 @@ where
 
         #[cfg(feature = "xmp")]
         if metadata_flags.contains(MetadataFlags::XMP_SIDECAR) {
-            outcome.sidecar_failed = !write_sidecar_metadata(
+            let eligible = !metadata_flags.any_embed()
+                && selected_queue == MetadataRewriteQueue::Ordinary
+                && pending_rewrite.capture_repair_receipt.is_none()
+                && pending_rewrite
+                    .selection_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.prepared.is_none());
+            let mut duplicate = false;
+            if eligible && let Some(media) = pre_rewrite_fingerprint {
+                for attempt in &attempts.blocked {
+                    if pending_rewrite.selection_receipt.as_ref() != Some(&attempt.receipt) {
+                        continue;
+                    }
+                    let attempt = Arc::clone(attempt);
+                    let row = pending_rewrite.clone();
+                    if tokio::task::spawn_blocking(move || attempt.matches(&row, media))
+                        .await
+                        .unwrap_or(false)
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+            }
+            if duplicate {
+                #[cfg(test)]
+                record_test_suppression(&path);
+                continue;
+            }
+            let blocked = if eligible {
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || {
+                    Some((snapshot_path(&path)?, blocked_target(&path)?))
+                })
+                .await
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            let result = Box::pin(write_sidecar_metadata_observed(
                 &path,
                 namespace,
                 false,
@@ -591,8 +885,35 @@ where
                 created_local,
                 pending_rewrite.source_checksum.as_deref(),
                 &temp_suffix,
-            )
+            ))
             .await;
+            outcome.sidecar_failed = !result.success;
+            if result.failed_sidecar_attempt.is_some()
+                && let (Some((media_target, target)), Some(media), Some(receipt), Ok(asset)) = (
+                    blocked,
+                    pre_rewrite_fingerprint,
+                    pending_rewrite.selection_receipt.clone(),
+                    serde_json::to_value(&pending_rewrite.asset),
+                )
+            {
+                let attempt = BlockedAttempt {
+                    receipt,
+                    asset,
+                    source_checksum: pending_rewrite.source_checksum.clone(),
+                    media,
+                    media_target,
+                    target,
+                };
+                let attempt = Arc::new(attempt);
+                let check = Arc::clone(&attempt);
+                let row = pending_rewrite.clone();
+                if tokio::task::spawn_blocking(move || check.matches(&row, media))
+                    .await
+                    .unwrap_or(false)
+                {
+                    attempts.blocked.push(attempt);
+                }
+            }
         }
 
         if drifted {

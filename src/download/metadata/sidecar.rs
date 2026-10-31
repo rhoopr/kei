@@ -9,6 +9,114 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use xmp_toolkit::{FromStrOptions, XmpErrorType, XmpMeta};
 
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+struct DestinationProbeFailure(#[from] std::io::Error);
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestPreparationFault {
+    UnchangedValidation,
+    TempCreate,
+    TempWrite,
+    TempSync,
+}
+#[cfg(test)]
+static TEST_PREPARATION_FAILURES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, TestPreparationFault>>,
+> = std::sync::OnceLock::new();
+#[cfg(test)]
+pub(crate) fn test_fail_sidecar_preparation_once(path: &Path, fault: TestPreparationFault) {
+    TEST_PREPARATION_FAILURES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(path.to_owned(), fault);
+}
+#[cfg(test)]
+fn test_preparation_failure(path: &Path, fault: TestPreparationFault) -> Result<()> {
+    if let Some(failures) = TEST_PREPARATION_FAILURES.get() {
+        let mut failures = failures
+            .lock()
+            .map_err(|error| anyhow::anyhow!("test fault lock poisoned: {error}"))?;
+        if failures.get(path) == Some(&fault) {
+            failures.remove(path);
+            anyhow::bail!("synthetic sidecar preparation operation failure");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+static TEST_PROBES: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<PathBuf, std::sync::Weak<std::sync::atomic::AtomicUsize>>,
+    >,
+> = std::sync::OnceLock::new();
+#[cfg(test)]
+static TEST_CORRUPT_PUBLICATIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::OnceLock::new();
+#[cfg(test)]
+pub(crate) fn test_corrupt_publication_once(target: &Path) {
+    TEST_CORRUPT_PUBLICATIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(target.to_owned());
+}
+#[cfg(test)]
+fn test_take_corrupt_publication(target: &Path) -> bool {
+    TEST_CORRUPT_PUBLICATIONS
+        .get()
+        .is_some_and(|paths| paths.lock().unwrap().remove(target))
+}
+
+#[cfg(test)]
+static TEST_PREPROBE_FAILURES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::OnceLock::new();
+#[cfg(test)]
+pub(crate) fn test_sidecar_attempts(path: &Path) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    TEST_PROBES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(path.to_owned(), std::sync::Arc::downgrade(&count));
+    count
+}
+#[cfg(test)]
+pub(crate) fn test_fail_before_sidecar_probe_once(path: &Path) {
+    TEST_PREPROBE_FAILURES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(path.to_owned());
+}
+#[cfg(test)]
+fn test_before_probe(path: &Path) -> Result<()> {
+    if TEST_PREPROBE_FAILURES
+        .get()
+        .is_some_and(|paths| paths.lock().unwrap().remove(path))
+    {
+        anyhow::bail!("synthetic failure before destination probe");
+    }
+    Ok(())
+}
+#[cfg(test)]
+fn record_test_probe(path: &Path) {
+    if let Some(count) = TEST_PROBES.get().and_then(|counts| {
+        counts
+            .lock()
+            .unwrap()
+            .get(path)
+            .and_then(std::sync::Weak::upgrade)
+    }) {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 static SIDECAR_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct ReconciledSidecarSnapshot {
@@ -60,6 +168,7 @@ pub(crate) async fn write_sidecar(
     write_sidecar_in_namespace(media_path, None, false, write, temp_suffix).await
 }
 
+#[cfg(test)]
 pub(crate) async fn write_sidecar_in_namespace(
     media_path: &Path,
     namespace: Option<crate::fs_util::ConfinedPath>,
@@ -67,6 +176,35 @@ pub(crate) async fn write_sidecar_in_namespace(
     write: &MetadataWrite,
     temp_suffix: &str,
 ) -> Result<()> {
+    write_sidecar_reported(
+        media_path,
+        namespace,
+        require_created_entry,
+        write,
+        temp_suffix,
+    )
+    .await
+    .result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SidecarFailureBoundary {
+    Destination,
+}
+
+pub(crate) struct SidecarWriteReport {
+    pub(crate) result: Result<()>,
+    /// Only an actual failed destination-open probe may be remembered.
+    pub(crate) failure_boundary: Option<SidecarFailureBoundary>,
+}
+
+pub(crate) async fn write_sidecar_reported(
+    media_path: &Path,
+    namespace: Option<crate::fs_util::ConfinedPath>,
+    require_created_entry: bool,
+    write: &MetadataWrite,
+    temp_suffix: &str,
+) -> SidecarWriteReport {
     let media_path = media_path.to_path_buf();
     let write = write.clone();
     let temp_suffix = temp_suffix.to_owned();
@@ -79,23 +217,50 @@ pub(crate) async fn write_sidecar_in_namespace(
             &temp_suffix,
         )
     })
-    .await
-    .context("XMP sidecar preparation task panicked")??;
-    let Some(prepared) = prepared else {
-        return Ok(());
+    .await;
+    let prepared = match prepared {
+        Err(error) => {
+            return SidecarWriteReport {
+                result: Err(error).context("XMP sidecar preparation task panicked"),
+                failure_boundary: None,
+            };
+        }
+        Ok(Err(error)) => {
+            let failure_boundary = error
+                .is::<DestinationProbeFailure>()
+                .then_some(SidecarFailureBoundary::Destination);
+            return SidecarWriteReport {
+                result: Err(error),
+                failure_boundary,
+            };
+        }
+        Ok(Ok(None)) => {
+            return SidecarWriteReport {
+                result: Ok(()),
+                failure_boundary: None,
+            };
+        }
+        Ok(Ok(Some(prepared))) => prepared,
     };
     let prepared = match prepared {
         PreparedSidecar::Publish(prepared) => prepared,
         PreparedSidecar::Unchanged(snapshot) => {
-            tokio::task::spawn_blocking(move || snapshot.validate())
+            let result = tokio::task::spawn_blocking(move || snapshot.validate())
                 .await
-                .context("Unchanged XMP sidecar validation task panicked")??;
-            return Ok(());
+                .context("Unchanged XMP sidecar validation task panicked")
+                .and_then(|result| result);
+            return SidecarWriteReport {
+                result,
+                failure_boundary: None,
+            };
         }
     };
-
     // CONTRACT: XMP_SIDECAR_REWRITE_REQUIRES_STABLE_INPUT
-    tokio::task::spawn_blocking(move || {
+    match tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if test_take_corrupt_publication(prepared.target.path()) {
+            std::fs::write(prepared.temp.path(), b"changed prepared sidecar")?;
+        }
         crate::download::file::publish_sidecar_confined(
             &prepared.temp,
             &prepared.target,
@@ -105,7 +270,16 @@ pub(crate) async fn write_sidecar_in_namespace(
         )
     })
     .await
-    .context("Sidecar publication task panicked")?
+    {
+        Err(error) => SidecarWriteReport {
+            result: Err(error).context("Sidecar publication task panicked"),
+            failure_boundary: None,
+        },
+        Ok(result) => SidecarWriteReport {
+            result,
+            failure_boundary: None,
+        },
+    }
 }
 
 /// Build a sidecar from an independently verified source and publish it only
@@ -242,8 +416,13 @@ fn prepare_sidecar_write(
         #[cfg(target_os = "linux")]
         crate::download::file::recover_file_replacement_confined(&target)?;
     }
+    #[cfg(test)]
+    test_before_probe(media_path)?;
+    #[cfg(test)]
+    record_test_probe(media_path);
     let existing = target
-        .open_optional_regular()?
+        .open_optional_regular()
+        .map_err(DestinationProbeFailure)?
         .map(|mut file| {
             if require_created_entry {
                 return Err(std::io::Error::new(
@@ -292,18 +471,26 @@ fn prepare_sidecar_write(
             snapshot.bytes == bytes,
             "Unchanged sidecar changed after preparation"
         );
+        #[cfg(test)]
+        test_preparation_failure(media_path, TestPreparationFault::UnchangedValidation)?;
         snapshot.validate()?;
         return Ok(Some(PreparedSidecar::Unchanged(snapshot)));
     }
 
+    #[cfg(test)]
+    test_preparation_failure(media_path, TestPreparationFault::TempCreate)?;
     let (mut temp, temporary) = create_unique_sidecar_temp(&target, temp_suffix)?;
     let tmp_path = temporary.path();
+    #[cfg(test)]
+    test_preparation_failure(media_path, TestPreparationFault::TempWrite)?;
     std::io::Write::write_all(&mut temp, &bytes).with_context(|| {
         format!(
             "Could not write temporary XMP sidecar {}",
             tmp_path.display()
         )
     })?;
+    #[cfg(test)]
+    test_preparation_failure(media_path, TestPreparationFault::TempSync)?;
     temp.sync_all().with_context(|| {
         format!(
             "Could not sync temporary XMP sidecar {}",
@@ -396,6 +583,85 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sidecar_failure_boundary_identifies_only_the_failed_operation() {
+        use super::{
+            SidecarFailureBoundary, TestPreparationFault, test_corrupt_publication_once,
+            test_fail_before_sidecar_probe_once, test_fail_sidecar_preparation_once,
+            write_sidecar_reported,
+        };
+        for fault in [
+            TestPreparationFault::UnchangedValidation,
+            TestPreparationFault::TempCreate,
+            TestPreparationFault::TempWrite,
+            TestPreparationFault::TempSync,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let media = dir.path().join("photo.jpg");
+            fs::write(&media, b"media").unwrap();
+            let original = MetadataWrite {
+                rating: Some(1),
+                ..MetadataWrite::default()
+            };
+            assert!(
+                write_sidecar_reported(&media, None, false, &original, ".part")
+                    .await
+                    .result
+                    .is_ok()
+            );
+            let sidecar = dir.path().join("photo.jpg.xmp");
+            let before = fs::read(&sidecar).unwrap();
+            test_fail_sidecar_preparation_once(&media, fault);
+            let requested = if fault == TestPreparationFault::UnchangedValidation {
+                original
+            } else {
+                MetadataWrite {
+                    rating: Some(2),
+                    ..MetadataWrite::default()
+                }
+            };
+            let failed = write_sidecar_reported(&media, None, false, &requested, ".part").await;
+            assert!(failed.result.is_err());
+            assert_eq!(failed.failure_boundary, None);
+            assert_eq!(fs::read(&sidecar).unwrap(), before);
+            assert!(
+                write_sidecar_reported(&media, None, false, &requested, ".part")
+                    .await
+                    .result
+                    .is_ok()
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("photo.jpg");
+        fs::write(&media, b"media").unwrap();
+        let write = MetadataWrite {
+            rating: Some(1),
+            ..MetadataWrite::default()
+        };
+        test_fail_before_sidecar_probe_once(&media);
+        let before = write_sidecar_reported(&media, None, false, &write, ".part").await;
+        assert!(before.result.is_err());
+        assert_eq!(before.failure_boundary, None);
+        let target = dir.path().join("photo.jpg.xmp");
+        fs::create_dir(&target).unwrap();
+        let probe = write_sidecar_reported(&media, None, false, &write, ".part").await;
+        assert!(probe.result.is_err());
+        assert_eq!(
+            probe.failure_boundary,
+            Some(SidecarFailureBoundary::Destination)
+        );
+        fs::remove_dir(&target).unwrap();
+        test_corrupt_publication_once(&target);
+        let publication = write_sidecar_reported(&media, None, false, &write, ".part").await;
+        let error = publication
+            .result
+            .expect_err("corrupted temporary must be rejected");
+        assert!(format!("{error:#}").contains("Prepared sidecar changed"));
+        assert_eq!(publication.failure_boundary, None);
+        assert!(!target.exists());
+        assert_eq!(fs::read(&media).unwrap(), b"media");
     }
 
     #[tokio::test]

@@ -3694,3 +3694,37 @@ async fn readonly_marker_keeps_metadata_pending_and_preserves_sidecar_across_reo
             .is_empty()
     );
 }
+
+#[cfg(all(feature = "xmp", unix))]
+#[test]
+fn blocking_target_replacement_is_not_the_same_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let media = dir.path().join("media.jpg");
+    std::fs::write(&media, b"media").unwrap();
+    let sidecar = dir.path().join("media.jpg.xmp");
+    let media_snapshot = super::snapshot_path(&media).unwrap();
+    assert!(media_snapshot.unchanged());
+    std::fs::remove_file(&media).unwrap();
+    std::fs::write(&media, b"media").unwrap();
+    assert!(
+        !media_snapshot.unchanged(),
+        "replacement with the same bytes changes identity"
+    );
+    let missing = super::blocked_target(&media).unwrap();
+    assert!(missing.unchanged());
+    std::fs::create_dir(&sidecar).unwrap();
+    assert!(!missing.unchanged());
+    let target = super::blocked_target(&media).unwrap();
+    assert!(target.unchanged());
+    std::fs::remove_dir(&sidecar).unwrap();
+    std::fs::write(&sidecar, b"new sidecar").unwrap();
+    assert!(!target.unchanged());
+    let file = super::blocked_target(&media).unwrap();
+    assert!(file.unchanged());
+    std::fs::write(&sidecar, b"changed sidecar").unwrap();
+    assert!(!file.unchanged());
+    std::fs::remove_file(&sidecar).unwrap();
+    std::fs::create_dir(&sidecar).unwrap();
+    assert!(!target.unchanged());
+    assert!(!file.unchanged());
+}

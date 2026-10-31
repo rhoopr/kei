@@ -1817,6 +1817,85 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
         "SELECT id FROM provider_active_generations WHERE sealed=0 ORDER BY id",
     );
     assert!(!interrupted_roots.is_empty());
+    // The failure must leave real scoped B work, not just a generic pending row.
+    // Compare its owner and pass to the production-created generation before
+    // restarting the service; no selection authority is inserted by this test.
+    let assert_b_work = |expected_verified: bool| {
+        let conn = Connection::open(&account.path).unwrap();
+        let owner: (String, String) = conn
+            .query_row(
+                "SELECT account_key,provider_key FROM account_owner WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT g.account_key,g.provider_key,g.scope,g.specification,d.pass_key,d.child,d.master,d.version_size,d.compat_path,d.admitted,d.verified_media              FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation              WHERE d.child='asset-private-0' AND replace(d.compat_path,char(92),'/') LIKE '%/B/%'"
+        ).unwrap();
+        let work = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
+                    r.get::<_, i64>(9)?,
+                    r.get::<_, i64>(10)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            !work.is_empty(),
+            "the selected B destination must remain recorded"
+        );
+        for (
+            account_key,
+            provider_key,
+            scope,
+            specification,
+            pass,
+            child,
+            master,
+            version,
+            path,
+            admitted,
+            verified,
+        ) in work
+        {
+            assert_eq!((&account_key, &provider_key), (&owner.0, &owner.1));
+            let scope: Value = serde_json::from_str(&scope).unwrap();
+            assert_eq!(scope["database"], "private");
+            assert_eq!(
+                scope["zone"],
+                json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})
+            );
+            let spec: Value = serde_json::from_slice(&specification).unwrap();
+            assert!(
+                spec["profile"]["passes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["key"] == pass
+                        && entry["kind"] == "Album"
+                        && entry["scope"]["name"] == "B")
+            );
+            assert_eq!(
+                (child.as_str(), master.as_str(), version.as_str()),
+                ("asset-private-0", "private-0", "original")
+            );
+            assert_eq!(Path::new(&path), media_root.join("B/private-0.JPG"));
+            assert_eq!(admitted, 1);
+            assert_eq!(verified, i64::from(expected_verified));
+        }
+    };
+    assert_b_work(false);
     Connection::open(&account.path)
         .unwrap()
         .execute_batch("DROP TRIGGER private_cli_destination_fault;")
@@ -1903,6 +1982,7 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
             photos.lookups.load(Ordering::SeqCst),
         );
         if completed_cycles == 1 {
+            assert_b_work(true);
             let mut expected_paths: Vec<_> = seeded
                 .iter()
                 .map(|(path, _)| vec![rusqlite::types::Value::Text(path.to_str().unwrap().into())])

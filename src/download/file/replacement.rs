@@ -548,6 +548,40 @@ thread_local! {
     static SIDECAR_CLEANUP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(all(test, feature = "xmp"))]
+static TEST_SIDECAR_PUBLICATIONS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            std::path::PathBuf,
+            std::sync::Weak<std::sync::atomic::AtomicUsize>,
+        >,
+    >,
+> = std::sync::OnceLock::new();
+#[cfg(all(test, feature = "xmp"))]
+pub(crate) fn test_sidecar_publications(
+    path: &std::path::Path,
+) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    TEST_SIDECAR_PUBLICATIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(path.to_owned(), std::sync::Arc::downgrade(&count));
+    count
+}
+#[cfg(all(test, feature = "xmp"))]
+fn record_test_sidecar_publication(path: &std::path::Path) {
+    if let Some(count) = TEST_SIDECAR_PUBLICATIONS.get().and_then(|counts| {
+        counts
+            .lock()
+            .unwrap()
+            .get(path)
+            .and_then(std::sync::Weak::upgrade)
+    }) {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Sidecar publication retains the same no-follow parents used for preparation.
 #[cfg(feature = "xmp")]
 pub(in crate::download) fn publish_sidecar_confined(
@@ -557,6 +591,8 @@ pub(in crate::download) fn publish_sidecar_confined(
     replacement: ExistingFileFingerprint,
     identity: crate::fs_util::FileIdentity,
 ) -> anyhow::Result<()> {
+    #[cfg(test)]
+    record_test_sidecar_publication(target.path());
     fn fingerprint(
         path: &crate::fs_util::ConfinedPath,
     ) -> anyhow::Result<Option<(ExistingFileFingerprint, crate::fs_util::FileIdentity)>> {

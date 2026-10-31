@@ -8110,3 +8110,701 @@ async fn root_candidate_completed_decision_census_and_generation_refresh_scale()
         );
     }
 }
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn selected_metadata_fault_attempts_exact_receipt_once_per_tail() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut page = records(&server, None);
+    let opts = || CycleOptions {
+        private: true,
+        sidecar: true,
+        refresh_metadata: true,
+        baseline_successor: Some("initial-token"),
+        cycle_token: Some("cycle-token"),
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
+        root.path(),
+        page.clone(),
+        false,
+        EditedNaming::Primary,
+        opts(),
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0, "{initial:?}");
+    let media = root.path().join("media/IMG_0501.JPG");
+    let sidecar = root.path().join("media/IMG_0501.JPG.xmp");
+    assert_bytes(&media, ORIGINAL);
+    let (healthy, _) = cycle_options(
+        root.path(),
+        page.clone(),
+        false,
+        EditedNaming::Primary,
+        opts(),
+    )
+    .await;
+    assert_eq!(healthy.stats.exif_failures, 0, "{healthy:?}");
+    let token = || {
+        rusqlite::Connection::open(root.path().join("state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    let before_token = token();
+    std::fs::remove_file(&sidecar).unwrap();
+    std::fs::create_dir(&sidecar).unwrap();
+    page[1]["fields"]["isFavorite"] = json!({"value":1,"type":"INT64"});
+    page[1]["recordChangeTag"] = json!("changed-metadata");
+    let attempts = crate::download::metadata_rewrite::test_sidecar_attempts(&media);
+    let mut readonly = opts();
+    readonly.controls = download::DownloadControls::dry_run_hidden();
+    let _ = cycle_options(
+        root.path(),
+        page.clone(),
+        false,
+        EditedNaming::Primary,
+        readonly,
+    )
+    .await;
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        0,
+        "read-only execution must not enter the writer"
+    );
+    let suppressions = crate::download::metadata_rewrite::test_metadata_suppressions(&media);
+    let before_ordinary = Arc::new(AtomicUsize::new(usize::MAX));
+    let after_ordinary = Arc::new(AtomicUsize::new(usize::MAX));
+    let first_skips = Arc::new(AtomicUsize::new(usize::MAX));
+    let seen_priority = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen_tail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe_hook = attempts.clone();
+    let skips_hook = suppressions.clone();
+    let before_hook = before_ordinary.clone();
+    let after_hook = after_ordinary.clone();
+    let first_skips_hook = first_skips.clone();
+    crate::download::metadata_rewrite::test_metadata_tail_hook(
+        &root.path().join("media"),
+        Arc::new(move |after_priority| {
+            if after_priority && !seen_priority.swap(true, Ordering::SeqCst) {
+                before_hook.store(probe_hook.load(Ordering::SeqCst), Ordering::SeqCst);
+            } else if !after_priority && !seen_tail.swap(true, Ordering::SeqCst) {
+                after_hook.store(probe_hook.load(Ordering::SeqCst), Ordering::SeqCst);
+                first_skips_hook.store(skips_hook.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+        }),
+    );
+    let (fault, _) = cycle_options(
+        root.path(),
+        page.clone(),
+        false,
+        EditedNaming::Primary,
+        opts(),
+    )
+    .await;
+    assert_eq!(
+        before_ordinary.load(Ordering::SeqCst),
+        1,
+        "priority must reach the actual sidecar destination probe"
+    );
+    assert_eq!(
+        after_ordinary.load(Ordering::SeqCst),
+        1,
+        "the identical receipt must not probe twice in the same tail"
+    );
+    assert_eq!(
+        first_skips.load(Ordering::SeqCst),
+        1,
+        "ordinary must skip that same attempted receipt"
+    );
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 2,
+        "a distinct later generation must still reach the probe"
+    );
+    assert!(fault.stats.exif_failures >= 2, "{fault:?}");
+    assert_eq!(token(), before_token);
+    assert_bytes(&media, ORIGINAL);
+    assert_eq!(
+        db_count(root.path(), "SELECT count(*) FROM download_receipts"),
+        1
+    );
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_media=1 AND verified_metadata=0"
+        ),
+        2
+    );
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM asset_metadata_paths WHERE metadata_write_failed_at IS NOT NULL"
+        ),
+        1
+    );
+    std::fs::remove_dir(&sidecar).unwrap();
+    let (recovery, _) = cycle_options(
+        root.path(),
+        page.clone(),
+        false,
+        EditedNaming::Primary,
+        opts(),
+    )
+    .await;
+    assert_eq!(recovery.stats.exif_failures, 0, "{recovery:?}");
+    assert!(
+        std::fs::read_to_string(&sidecar)
+            .unwrap()
+            .contains("<xmp:Rating>5</xmp:Rating>")
+    );
+    assert_bytes(&media, ORIGINAL);
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_metadata=0"
+        ),
+        0
+    );
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM asset_metadata_paths WHERE metadata_write_failed_at IS NOT NULL"
+        ),
+        0
+    );
+    let before_later = attempts.load(Ordering::SeqCst);
+    let (later, _) = cycle_options(root.path(), page, true, EditedNaming::Primary, opts()).await;
+    assert_eq!(later.stats.exif_failures, 0, "{later:?}");
+    assert!(
+        attempts.load(Ordering::SeqCst) > before_later,
+        "a later explicit refresh must enter the writer"
+    );
+    assert_bytes(&media, ORIGINAL);
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn selected_metadata_same_tail_refusal_and_identity_changes_do_not_suppress() {
+    for scenario in ["target", "parent", "receipt", "prewrite"] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut page = records(&server, None);
+        let opts = || CycleOptions {
+            private: true,
+            sidecar: true,
+            refresh_metadata: true,
+            baseline_successor: Some("initial-token"),
+            cycle_token: Some("cycle-token"),
+            ..CycleOptions::default()
+        };
+        let (initial, _) = cycle_options(
+            root.path(),
+            page.clone(),
+            false,
+            EditedNaming::Primary,
+            opts(),
+        )
+        .await;
+        assert_eq!(initial.failed_count, 0, "{scenario}: {initial:?}");
+        let media_root = root.path().join("media");
+        let media = media_root.join("IMG_0501.JPG");
+        let sidecar = media_root.join("IMG_0501.JPG.xmp");
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+        page[1]["fields"]["isFavorite"] = json!({"value":1,"type":"INT64"});
+        page[1]["recordChangeTag"] = json!("changed-metadata");
+        let attempts = crate::download::metadata_rewrite::test_sidecar_attempts(&media);
+        let suppressed = crate::download::metadata_rewrite::test_metadata_suppressions(&media);
+        if scenario == "prewrite" {
+            crate::download::metadata_rewrite::test_deny_metadata_writer_once(&media);
+        }
+        let before_ordinary = Arc::new(AtomicUsize::new(usize::MAX));
+        let after_ordinary = Arc::new(AtomicUsize::new(usize::MAX));
+        let first_tail_skips = Arc::new(AtomicUsize::new(usize::MAX));
+        let first_priority = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_tail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attempt_hook = attempts.clone();
+        let before_hook = before_ordinary.clone();
+        let after_hook = after_ordinary.clone();
+        let skips_hook = suppressed.clone();
+        let first_tail_skips_hook = first_tail_skips.clone();
+        let parent = media_root.clone();
+        let new_sidecar = sidecar.clone();
+        let db_path = root.path().join("state.db");
+        let moved = root.path().join("moved-media");
+        let moved_hook = moved.clone();
+        crate::download::metadata_rewrite::test_metadata_tail_hook(
+            &media_root,
+            Arc::new(move |after_priority| {
+                if after_priority && !first_priority.swap(true, Ordering::SeqCst) {
+                    before_hook.store(attempt_hook.load(Ordering::SeqCst), Ordering::SeqCst);
+                    match scenario {
+                        "target" => std::fs::remove_dir(&new_sidecar).unwrap(),
+                        "parent" => {
+                            std::fs::rename(&parent, &moved_hook).unwrap();
+                            std::fs::create_dir(&parent).unwrap();
+                            std::fs::write(parent.join("IMG_0501.JPG"), ORIGINAL).unwrap();
+                        }
+                        "receipt" => {
+                            let conn = rusqlite::Connection::open(&db_path).unwrap();
+                            let changed = conn.execute("UPDATE provider_active_destinations SET admitted=0 WHERE admitted=1 AND verified_metadata=0", []).unwrap();
+                            assert_eq!(changed, 1);
+                        }
+                        "prewrite" => {}
+                        _ => panic!("unexpected scenario: {scenario}"),
+                    }
+                } else if !after_priority && !first_tail.swap(true, Ordering::SeqCst) {
+                    after_hook.store(attempt_hook.load(Ordering::SeqCst), Ordering::SeqCst);
+                    first_tail_skips_hook
+                        .store(skips_hook.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+            }),
+        );
+        let result =
+            try_cycle_options(root.path(), page, false, EditedNaming::Primary, opts()).await;
+        assert_ne!(
+            before_ordinary.load(Ordering::SeqCst),
+            usize::MAX,
+            "{scenario}: priority not reached"
+        );
+        if scenario == "receipt" {
+            let error = result.expect_err("invalidated receipt must fail closed");
+            assert!(
+                error.to_string().contains("selection provenance"),
+                "{error:#}"
+            );
+            assert_eq!(suppressed.load(Ordering::SeqCst), 0);
+            assert_eq!(before_ordinary.load(Ordering::SeqCst), 1);
+            assert_bytes(&media, ORIGINAL);
+            continue;
+        }
+        let (result, _) = result.unwrap();
+        assert_ne!(
+            after_ordinary.load(Ordering::SeqCst),
+            usize::MAX,
+            "{scenario}: ordinary tail not reached"
+        );
+        assert_eq!(
+            first_tail_skips.load(Ordering::SeqCst),
+            0,
+            "{scenario}: changed or unattempted work must not be suppressed in the intervened tail"
+        );
+        match scenario {
+            "target" => {
+                assert_eq!(before_ordinary.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    after_ordinary.load(Ordering::SeqCst),
+                    2,
+                    "same receipt must retry when its target changes"
+                );
+                assert!(
+                    std::fs::read_to_string(&sidecar)
+                        .unwrap()
+                        .contains("<xmp:Rating>5</xmp:Rating>")
+                );
+            }
+            "parent" => {
+                assert_eq!(before_ordinary.load(Ordering::SeqCst), 1);
+                assert_bytes(&media, ORIGINAL);
+                assert_bytes(&moved.join("IMG_0501.JPG"), ORIGINAL);
+                match after_ordinary.load(Ordering::SeqCst) {
+                    1 => assert!(
+                        result.failed_count > 0,
+                        "a parent guard refusal must retain failure: {result:?}"
+                    ),
+                    2 => assert!(
+                        sidecar.is_file(),
+                        "a reached writer must publish into the changed namespace"
+                    ),
+                    count => panic!("unexpected parent-change attempt count: {count}"),
+                }
+            }
+            "prewrite" => {
+                assert_eq!(
+                    before_ordinary.load(Ordering::SeqCst),
+                    0,
+                    "prewrite refusal entered publisher"
+                );
+                assert_eq!(
+                    after_ordinary.load(Ordering::SeqCst),
+                    1,
+                    "ordinary lane must still attempt the receipt"
+                );
+                assert!(sidecar.is_dir());
+            }
+            _ => panic!("unexpected scenario: {scenario}"),
+        }
+    }
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn selected_metadata_suppressed_page_advances_to_distinct_work() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut page = records(&server, None);
+    let mut second = records(&server, None);
+    second[0]["recordName"] = json!("502");
+    second[0]["fields"]["filenameEnc"]["value"] = json!("IMG_0502.JPG");
+    second[1]["recordName"] = json!("asset-502");
+    second[1]["fields"]["masterRef"]["value"]["recordName"] = json!("502");
+    page.extend(second);
+    let opts = || CycleOptions {
+        private: true,
+        sidecar: true,
+        refresh_metadata: true,
+        reported_count: Some(2),
+        baseline_successor: Some("initial-token"),
+        cycle_token: Some("cycle-token"),
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
+        root.path(),
+        page.clone(),
+        false,
+        EditedNaming::Primary,
+        opts(),
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0, "{initial:?}");
+    assert_eq!(initial.stats.downloaded, 2);
+    let media_root = root.path().join("media");
+    let first = media_root.join("IMG_0501.JPG");
+    let second = media_root.join("IMG_0502.JPG");
+    for media in [&first, &second] {
+        assert_bytes(media, ORIGINAL);
+        let mut sidecar = media.as_os_str().to_os_string();
+        sidecar.push(".xmp");
+        let sidecar = std::path::PathBuf::from(sidecar);
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+    }
+    for index in [1, 3] {
+        page[index]["fields"]["isFavorite"] = json!({"value":1,"type":"INT64"});
+        page[index]["recordChangeTag"] = json!("changed-metadata");
+    }
+    let first_attempts = crate::download::metadata_rewrite::test_sidecar_attempts(&first);
+    let second_attempts = crate::download::metadata_rewrite::test_sidecar_attempts(&second);
+    let first_skips = crate::download::metadata_rewrite::test_metadata_suppressions(&first);
+    let second_skips = crate::download::metadata_rewrite::test_metadata_suppressions(&second);
+    let first_tail_writes = Arc::new(AtomicUsize::new(usize::MAX));
+    let first_tail_skips = Arc::new(AtomicUsize::new(usize::MAX));
+    let first_tail_offset = Arc::new(AtomicUsize::new(usize::MAX));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let a = first_attempts.clone();
+    let b = second_attempts.clone();
+    let sa = first_skips.clone();
+    let sb = second_skips.clone();
+    let writes = first_tail_writes.clone();
+    let skips = first_tail_skips.clone();
+    let offset = first_tail_offset.clone();
+    let db_path = root.path().join("state.db");
+    crate::download::metadata_rewrite::test_metadata_tail_hook(
+        &media_root,
+        Arc::new(move |after_priority| {
+            if !after_priority && !done.swap(true, Ordering::SeqCst) {
+                writes.store(
+                    a.load(Ordering::SeqCst) + b.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+                skips.store(
+                    sa.load(Ordering::SeqCst) + sb.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                let value: String = conn.query_row("SELECT value FROM metadata WHERE key='active_selection_metadata_retry_offset'", [], |r| r.get(0)).unwrap();
+                offset.store(value.parse().unwrap(), Ordering::SeqCst);
+            }
+        }),
+    );
+    let (result, _) = crate::download::metadata_rewrite::test_metadata_budget(
+        2,
+        cycle_options(root.path(), page, false, EditedNaming::Primary, opts()),
+    )
+    .await;
+    assert!(result.stats.exif_failures > 0, "{result:?}");
+    assert_eq!(
+        first_tail_writes.load(Ordering::SeqCst),
+        1,
+        "one priority writer reached"
+    );
+    assert_eq!(
+        first_tail_skips.load(Ordering::SeqCst),
+        1,
+        "ordinary page contains the same receipt"
+    );
+    assert_eq!(
+        first_tail_offset.load(Ordering::SeqCst),
+        1,
+        "suppression consumes the fetched page position"
+    );
+    assert!(first_attempts.load(Ordering::SeqCst) > 0);
+    assert!(
+        second_attempts.load(Ordering::SeqCst) > 0,
+        "the other selected destination must progress on the next page"
+    );
+    assert_bytes(&first, ORIGINAL);
+    assert_bytes(&second, ORIGINAL);
+    assert!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_media=1 AND verified_metadata=0"
+        ) >= 2
+    );
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn selected_metadata_preprobe_and_gps_errors_do_not_suppress_ordinary_retry() {
+    for scenario in [
+        "preprobe",
+        "gps",
+        "unchanged",
+        "temp_create",
+        "temp_write",
+        "temp_sync",
+        "publication",
+    ] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut page = records(&server, None);
+        let opts = || CycleOptions {
+            private: true,
+            sidecar: true,
+            refresh_metadata: true,
+            baseline_successor: Some("initial-token"),
+            cycle_token: Some("cycle-token"),
+            ..CycleOptions::default()
+        };
+        let (initial, _) = cycle_options(
+            root.path(),
+            page.clone(),
+            false,
+            EditedNaming::Primary,
+            opts(),
+        )
+        .await;
+        assert_eq!(initial.failed_count, 0, "{scenario}: {initial:?}");
+        let media_root = root.path().join("media");
+        let media = media_root.join("IMG_0501.JPG");
+        let sidecar = media_root.join("IMG_0501.JPG.xmp");
+        let original_sidecar = std::fs::read(&sidecar).unwrap();
+        if scenario == "preprobe" {
+            std::fs::remove_file(&sidecar).unwrap();
+            std::fs::create_dir(&sidecar).unwrap();
+            crate::download::metadata_rewrite::test_fail_before_sidecar_probe_once(&media);
+        } else if scenario == "gps" {
+            crate::download::metadata_rewrite::test_fail_source_gps_once(&media);
+        } else if scenario == "publication" {
+            page[1]["fields"]["isFavorite"] = json!({"value":1,"type":"INT64"});
+            page[1]["recordChangeTag"] = json!("changed-metadata");
+            crate::download::metadata_rewrite::test_corrupt_publication_once(&sidecar);
+        } else {
+            use crate::download::metadata_rewrite::TestPreparationFault;
+            let fault = match scenario {
+                "unchanged" => TestPreparationFault::UnchangedValidation,
+                "temp_create" => TestPreparationFault::TempCreate,
+                "temp_write" => TestPreparationFault::TempWrite,
+                "temp_sync" => TestPreparationFault::TempSync,
+                _ => panic!("unexpected scenario: {scenario}"),
+            };
+            if scenario != "unchanged" {
+                page[1]["fields"]["isFavorite"] = json!({"value":1,"type":"INT64"});
+                page[1]["recordChangeTag"] = json!("changed-metadata");
+            }
+            crate::download::metadata_rewrite::test_fail_sidecar_preparation_once(&media, fault);
+        }
+        let probes = crate::download::metadata_rewrite::test_sidecar_attempts(&media);
+        let successes = crate::download::metadata_rewrite::test_sidecar_successes(&media);
+        let publications = crate::download::metadata_rewrite::test_sidecar_publications(&sidecar);
+        let suppressions = crate::download::metadata_rewrite::test_metadata_suppressions(&media);
+        let before = Arc::new(AtomicUsize::new(usize::MAX));
+        let after = Arc::new(AtomicUsize::new(usize::MAX));
+        let first_debt = Arc::new(AtomicUsize::new(usize::MAX));
+        let priority_successes = Arc::new(AtomicUsize::new(usize::MAX));
+        let priority_publications = Arc::new(AtomicUsize::new(usize::MAX));
+        let tail_publications = Arc::new(AtomicUsize::new(usize::MAX));
+        let last_debt = Arc::new(AtomicUsize::new(usize::MAX));
+        let first_skips = Arc::new(AtomicUsize::new(usize::MAX));
+        let unchanged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_priority = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_tail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let p = probes.clone();
+        let success_hook = successes.clone();
+        let priority_successes_hook = priority_successes.clone();
+        let publication_hook = publications.clone();
+        let priority_publications_hook = priority_publications.clone();
+        let tail_publications_hook = tail_publications.clone();
+        let skip = suppressions.clone();
+        let before_hook = before.clone();
+        let after_hook = after.clone();
+        let debt_before = first_debt.clone();
+        let debt_after = last_debt.clone();
+        let skips = first_skips.clone();
+        let unchanged_hook = unchanged.clone();
+        let sidecar_hook = sidecar.clone();
+        let db_path = root.path().join("state.db");
+        crate::download::metadata_rewrite::test_metadata_tail_hook(
+            &media_root,
+            Arc::new(move |after_priority| {
+                let first = if after_priority {
+                    !seen_priority.swap(true, Ordering::SeqCst)
+                } else {
+                    !seen_tail.swap(true, Ordering::SeqCst)
+                };
+                if !first {
+                    return;
+                }
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                let debt: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_media=1 AND verified_metadata=0", [], |r| r.get(0)).unwrap();
+                if after_priority {
+                    before_hook.store(p.load(Ordering::SeqCst), Ordering::SeqCst);
+                    priority_successes_hook
+                        .store(success_hook.load(Ordering::SeqCst), Ordering::SeqCst);
+                    priority_publications_hook
+                        .store(publication_hook.load(Ordering::SeqCst), Ordering::SeqCst);
+                    debt_before.store(debt as usize, Ordering::SeqCst);
+                    if scenario != "preprobe" {
+                        unchanged_hook.store(
+                            std::fs::read(&sidecar_hook).unwrap() == original_sidecar,
+                            Ordering::SeqCst,
+                        );
+                    }
+                } else {
+                    after_hook.store(p.load(Ordering::SeqCst), Ordering::SeqCst);
+                    tail_publications_hook
+                        .store(publication_hook.load(Ordering::SeqCst), Ordering::SeqCst);
+                    debt_after.store(debt as usize, Ordering::SeqCst);
+                    skips.store(skip.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+            }),
+        );
+        let (result, _) = cycle_options(
+            root.path(),
+            page.clone(),
+            false,
+            EditedNaming::Primary,
+            opts(),
+        )
+        .await;
+        assert_eq!(
+            first_debt.load(Ordering::SeqCst),
+            1,
+            "{scenario}: priority failure must retain selected debt"
+        );
+        assert_eq!(
+            first_skips.load(Ordering::SeqCst),
+            0,
+            "{scenario}: ordinary retry was suppressed"
+        );
+        match scenario {
+            "preprobe" => {
+                assert_eq!(priority_successes.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    before.load(Ordering::SeqCst),
+                    0,
+                    "failure must occur before the destination probe"
+                );
+                assert_eq!(
+                    after.load(Ordering::SeqCst),
+                    1,
+                    "ordinary lane must reach the destination probe"
+                );
+                assert!(last_debt.load(Ordering::SeqCst) > 0);
+                assert!(result.stats.exif_failures > 0);
+                std::fs::remove_dir(&sidecar).unwrap();
+                let (recovered, _) =
+                    cycle_options(root.path(), page, false, EditedNaming::Primary, opts()).await;
+                assert_eq!(recovered.stats.exif_failures, 0, "{recovered:?}");
+                assert!(sidecar.is_file());
+            }
+            "gps" => {
+                assert_eq!(
+                    priority_successes.load(Ordering::SeqCst),
+                    1,
+                    "the sidecar owner must succeed before the independent GPS failure"
+                );
+                assert_eq!(before.load(Ordering::SeqCst), 1);
+                assert!(
+                    unchanged.load(Ordering::SeqCst),
+                    "sidecar succeeded unchanged before the independent GPS failure"
+                );
+                assert_eq!(
+                    after.load(Ordering::SeqCst),
+                    2,
+                    "ordinary lane must retry the independent GPS debt"
+                );
+                assert_eq!(
+                    last_debt.load(Ordering::SeqCst),
+                    0,
+                    "successful ordinary retry must settle the selected receipt"
+                );
+            }
+            "publication" => {
+                assert_eq!(before.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    priority_publications.load(Ordering::SeqCst),
+                    1,
+                    "the publisher must reject the corrupted owned temporary"
+                );
+                assert_eq!(priority_successes.load(Ordering::SeqCst), 0);
+                assert!(
+                    unchanged.load(Ordering::SeqCst),
+                    "the target must remain unchanged after the publisher refusal"
+                );
+                assert_eq!(after.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    tail_publications.load(Ordering::SeqCst),
+                    2,
+                    "ordinary must enter the publisher with a fresh temporary"
+                );
+                assert_eq!(last_debt.load(Ordering::SeqCst), 0);
+                assert!(
+                    std::fs::read_to_string(&sidecar)
+                        .unwrap()
+                        .contains("<xmp:Rating>5</xmp:Rating>")
+                );
+            }
+            "unchanged" | "temp_create" | "temp_write" | "temp_sync" => {
+                assert_eq!(
+                    priority_successes.load(Ordering::SeqCst),
+                    0,
+                    "{scenario}: injected operation did not fail"
+                );
+                assert_eq!(
+                    before.load(Ordering::SeqCst),
+                    1,
+                    "{scenario}: the real destination probe must have succeeded first"
+                );
+                assert!(
+                    unchanged.load(Ordering::SeqCst),
+                    "{scenario}: failed preparation changed the sidecar"
+                );
+                assert_eq!(
+                    after.load(Ordering::SeqCst),
+                    2,
+                    "{scenario}: ordinary must retry after the post-probe failure"
+                );
+                assert_eq!(
+                    last_debt.load(Ordering::SeqCst),
+                    0,
+                    "{scenario}: ordinary retry must settle the receipt"
+                );
+                if scenario != "unchanged" {
+                    assert!(
+                        std::fs::read_to_string(&sidecar)
+                            .unwrap()
+                            .contains("<xmp:Rating>5</xmp:Rating>")
+                    );
+                }
+            }
+            _ => panic!("unexpected scenario: {scenario}"),
+        }
+        assert_bytes(&media, ORIGINAL);
+    }
+}

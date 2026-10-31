@@ -6,7 +6,27 @@ use anyhow::{Context, Result};
 use little_exif::filetype::FileExtension;
 use std::path::Path;
 
+#[cfg(test)]
+static TEST_GPS_FAILURES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+> = std::sync::OnceLock::new();
+#[cfg(test)]
+pub(crate) fn test_fail_source_gps_once(path: &Path) {
+    TEST_GPS_FAILURES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(path.to_owned());
+}
+
 pub(crate) fn read_source_gps(path: &Path) -> Result<SourceGpsMetadata> {
+    #[cfg(test)]
+    if TEST_GPS_FAILURES
+        .get()
+        .is_some_and(|paths| paths.lock().unwrap().remove(path))
+    {
+        anyhow::bail!("synthetic source GPS read failure");
+    }
     let mut source = std::fs::File::open(path)
         .with_context(|| format!("Could not read {} for source GPS metadata", path.display()))?;
     read_source_gps_from_file(&mut source, path)

@@ -180,3 +180,6 @@ pub(super) fn has_replacement_journal_blocking(
 
 #[cfg(feature = "xmp")]
 pub(super) use replacement::publish_sidecar_confined;
+
+#[cfg(all(test, feature = "xmp"))]
+pub(crate) use replacement::test_sidecar_publications;
