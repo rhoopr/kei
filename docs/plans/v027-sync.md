@@ -154,6 +154,32 @@ Initial cargo check passed. Further validation and implementation status must be
 reported separately; preflight tests are not beta qualification.
 
 
+## Issue-linked beta acceptance gates
+
+These are release acceptance requirements, not claims that this checkpoint has
+passed. The 2026-10-31 audit of published `dd47eca26e882cf4a722ee6702f35bfd72932a93`
+is retained at `.scratch/branch-audit-1044/AUDIT.md` in the main qualification
+checkout. The last completed broad suite there is on older `f3c54a`; the dd47
+qualification was running when the audit was written. Isolated crash-safety
+work is unintegrated and does not qualify this branch. A passing focused
+synthetic test proves its exercised boundary, not a reporter archive or beta.
+
+| Requirement | Evidence and remaining pass criterion |
+| --- | --- |
+| [#845](https://github.com/rhoopr/kei/issues/845), [#853](https://github.com/rhoopr/kei/issues/853): reuse historical Primary-to-Shared media without duplicate downloads or path churn | Existing scoped receipt and fresh-root tests are directional. Exercise a representative authenticated mixed-version migration with independent identity and full byte evidence, stable recorded paths, metadata and timestamps, still and motion renditions, multiple passes, preview/execution parity and no redundant media GET across reopen. Unsupported matches remain visible and pending. |
+| [#953](https://github.com/rhoopr/kei/issues/953), [#956](https://github.com/rhoopr/kei/issues/956), [#1044](https://github.com/rhoopr/kei/issues/1044): useful selected progress despite sparse or unselected holds | Prove authenticated account, zone, child/master and selection boundaries, bounded durable retries and independent progress across restart. Missing zone, empty search and unselected work do not establish identity or deletion. |
+| [#1044](https://github.com/rhoopr/kei/issues/1044): missed pre-baseline deletion in the reported Hidden-only selection | Existing unrestricted Unfiled source-revalidation fixture covers two renditions synthetically; its eligibility gate excludes Hidden-only. Exercise the actual selected baseline and service path with a previously held cursor, explicit provider deletion and expungement, both Live Photo renditions, independent work and reopen. Confirm both catalog rows while preserving exact local media, metadata, paths and timestamps. Require an authenticated library scope and exact stored source identity and rendition rows. Historical Hidden-pass membership is not required for confirmed catalog truth, and this lookup does not certify selected coverage or authorize downloads or checkpoints. Inventory absence, NOT_FOUND alone, missing master or zone, and ambiguous sibling ownership are not deletion authority. |
+| [#1024](https://github.com/rhoopr/kei/issues/1024), [#958](https://github.com/rhoopr/kei/issues/958): bounded state and quiet reopened cost | A small-budget synthetic full-legacy-inbox control passed at f3 with new raw captures forbidden; the near-512 MiB control was ignored. Prove representative near-full upgrade, retained due historical hydration, independent library progress and bounded repeated current/replay state and provider/catalog work. Full raw inbox alone is not shown to block current work; legacy owner retirement remains incomplete. |
+| [#957](https://github.com/rhoopr/kei/issues/957), [#955](https://github.com/rhoopr/kei/issues/955), [#958](https://github.com/rhoopr/kei/issues/958): truthful checkpoint, configuration, health and service behavior | On actual normal cycles, fault and restart the checkpoint/config transition, show atomic promotion or a concrete hold reason, then show unchanged reopened incremental operation without avoidable inventory. Distinguish incomplete backup from liveness; cancellation preserves started writes and unfinished work. |
+| [#845](https://github.com/rhoopr/kei/issues/845), [#954](https://github.com/rhoopr/kei/issues/954): normal metadata correctness and availability | Verify first and subsequent embedded and sidecar updates, exact source/local checksum roles, failed and partial writes, retained obligations and successful reopen. Focused fixture repairs and a narrow Unix destination-open retry optimization do not prove all writers. |
+| Product safety and crash recovery | Resolve the published journal cleanup check/unlink race with independently reviewed coordination. Prove real publication, state and cleanup interruption boundaries preserve all bytes and honest unfinished work, while normal metadata updates remain available. Full-suite counts alone do not prove these boundaries. |
+
+The manifest deletion export requested in [#1049](https://github.com/rhoopr/kei/issues/1049)
+is deferred. These gates do not expand general hardlink support or authentication
+scope; their separate work remains separate. Preserve matching pre-upgrade state,
+config and media for rollback. Do not reset state or remove media to manufacture
+completion.
+
 ## Current acceptance matrix
 
 These results refer to the working tree, not a release or the last committed
