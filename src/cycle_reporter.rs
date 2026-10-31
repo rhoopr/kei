@@ -576,6 +576,85 @@ mod tests {
         assert!(health.last_success_at > previous);
     }
 
+    // Source-only characterization: synthetic completed-cycle facts exercise
+    // the real reporter and /healthz handler; they do not start a service or
+    // claim a provider download occurred.
+    #[tokio::test]
+    async fn incomplete_progressing_cycles_reach_current_healthz_threshold() {
+        for identity_hold in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let report_path = dir.path().join("report.json");
+            let notifier = Notifier::new(None);
+            let metrics = MetricsHandle::new(None);
+            let reporter = reporter_with_surfaces(
+                dir.path(),
+                Some(&report_path),
+                &notifier,
+                None,
+                Some(&metrics),
+            );
+            let mut health = HealthStatus::new();
+            health.record_success();
+            let previous = health.last_success_at;
+            let stats = SyncStats {
+                downloaded: 1,
+                identity_incomplete: identity_hold,
+                unattributed_legacy_assets: u64::from(!identity_hold),
+                unattributed_legacy_pending: u64::from(!identity_hold),
+                sync_token_blocked: true,
+                ..SyncStats::default()
+            };
+            for completed in 1..=5 {
+                report_cycle(&reporter, &mut health, &stats, 0, false).await;
+                let report = parse_json(&report_path);
+                assert_eq!(report["status"], "partial_failure");
+                assert_eq!(report["stats"]["downloaded"], 1);
+                assert_eq!(health.consecutive_failures, completed);
+                assert_eq!(health.last_success_at, previous);
+                assert!(health.last_sync_at.is_some());
+                assert_eq!(
+                    crate::metrics::health_status_for_test(&metrics).await,
+                    if completed < 5 { 200 } else { 503 }
+                );
+                assert!(
+                    health
+                        .last_error
+                        .as_deref()
+                        .unwrap()
+                        .contains(if identity_hold {
+                            "unresolved asset identity"
+                        } else {
+                            "legacy current-work certification"
+                        })
+                );
+            }
+            // Returning from every reporter call demonstrates this task is still
+            // executing; it is not a test of an OS process or a separate readiness endpoint.
+            report_cycle(&reporter, &mut health, &SyncStats::default(), 0, false).await;
+            assert_eq!(health.consecutive_failures, 0);
+            assert_eq!(crate::metrics::health_status_for_test(&metrics).await, 200);
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_cycle_healthz_can_be_stale_before_failure_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let notifier = Notifier::new(None);
+        let metrics = MetricsHandle::new(Some(chrono::Duration::minutes(30)));
+        let reporter = reporter_with_surfaces(dir.path(), None, &notifier, None, Some(&metrics));
+        let mut health = HealthStatus::new();
+        health.record_success();
+        health.last_success_at = Some(chrono::Utc::now() - chrono::Duration::hours(2));
+        let stats = SyncStats {
+            downloaded: 1,
+            identity_incomplete: true,
+            ..SyncStats::default()
+        };
+        report_cycle(&reporter, &mut health, &stats, 0, false).await;
+        assert_eq!(health.consecutive_failures, 1);
+        assert_eq!(crate::metrics::health_status_for_test(&metrics).await, 503);
+    }
+
     #[tokio::test]
     async fn pending_legacy_certification_fails_reporting_until_current_proof_completes() {
         let dir = tempfile::tempdir().unwrap();

@@ -710,6 +710,20 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
         files
     };
 
+    let legacy_snapshot = |database: &std::path::Path| {
+        let conn = rusqlite::Connection::open(database).unwrap();
+        [
+            "SELECT * FROM unattributed_legacy WHERE library='PrimarySync' AND asset_id='legacy-family'",
+            "SELECT * FROM unattributed_legacy_paths WHERE library='PrimarySync' AND asset_id='legacy-family' ORDER BY path_key",
+            "SELECT * FROM metadata_capture_retries WHERE library='PrimarySync' AND asset_id='legacy-family'",
+            "SELECT * FROM unattributed_legacy_proofs WHERE library='PrimarySync' AND asset_id='legacy-family'",
+        ].map(|sql| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let columns = stmt.column_count();
+            stmt.query_map([], |row| (0..columns).map(|i| row.get::<_, rusqlite::types::Value>(i)).collect::<Result<Vec<_>, _>>()).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        })
+    };
+
     for (recent, evidence, size) in [Some(10), None].into_iter().flat_map(|recent| {
         [
             EvidenceCase::Ordinary,
@@ -762,9 +776,8 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                     &checksum,
                 );
                 if size > 1 {
-                    page["records"][0]["fields"]["filenameEnc"]["value"] = serde_json::json!(
-                        base64::engine::general_purpose::STANDARD.encode(format!("unique-{i}.jpg"))
-                    );
+                    page["records"][0]["fields"]["filenameEnc"]["value"] =
+                        serde_json::json!(format!("unique-{i}.jpg"));
                 }
                 page["records"].as_array().unwrap().clone()
             })
@@ -825,6 +838,97 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                 )
                 .await
                 .unwrap();
+            if evidence == EvidenceCase::Sparse {
+                // Separate ambiguous historical family, prepared by its owner;
+                // no current source receipt or child ownership is invented.
+                let path = media.join("legacy-family.jpg");
+                let original = b"synthetic historical bytes";
+                std::fs::write(&path, original).unwrap();
+                let provider_checksum =
+                    base64::engine::general_purpose::STANDARD.encode(Sha256::digest(original));
+                let local_hash = download::file::compute_sha256(&path).await.unwrap();
+                let row = crate::test_helpers::TestAssetRecord::new("legacy-family")
+                    .library("PrimarySync")
+                    .filename("legacy-family.jpg")
+                    .size(original.len() as u64)
+                    .checksum(&provider_checksum)
+                    .build();
+                inner.upsert_seen(&row).await.unwrap();
+                inner
+                    .mark_downloaded(
+                        "PrimarySync",
+                        "legacy-family",
+                        "original",
+                        &path,
+                        &local_hash,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                for child in ["legacy-child-a", "legacy-child-b"] {
+                    inner
+                        .upsert_asset_master_mapping("PrimarySync", child, "legacy-family")
+                        .await
+                        .unwrap();
+                }
+                inner.set_metadata_capture_revision_for_test("PrimarySync", "legacy-family", 0);
+                inner
+                    .begin_metadata_capture_revision(
+                        "PrimarySync",
+                        state::METADATA_CAPTURE_REVISION,
+                    )
+                    .await
+                    .unwrap();
+                let candidate = inner
+                    .get_metadata_capture_candidates(
+                        "PrimarySync",
+                        state::METADATA_CAPTURE_REVISION,
+                        10,
+                    )
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|item| item.asset_id == "legacy-family")
+                    .unwrap();
+                assert!(
+                    inner
+                        .defer_metadata_capture_ambiguity(
+                            &candidate,
+                            state::METADATA_CAPTURE_REVISION
+                        )
+                        .await
+                        .unwrap()
+                );
+                let snapshot = inner
+                    .legacy_preparation_snapshots("PrimarySync", 10)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|item| item.asset_id == "legacy-family")
+                    .unwrap();
+                let sidecar = media.join("legacy-family.jpg.xmp");
+                assert!(!sidecar.exists());
+                let files = [
+                    state::LegacyFileEvidence {
+                        root: media.clone(),
+                        path: path.clone(),
+                        sha256: Some(local_hash),
+                        size: Some(original.len() as u64),
+                    },
+                    state::LegacyFileEvidence {
+                        root: media.clone(),
+                        path: sidecar,
+                        sha256: None,
+                        size: None,
+                    },
+                ];
+                assert!(
+                    inner
+                        .prepare_legacy_preservation(&snapshot, &files)
+                        .await
+                        .unwrap()
+                );
+            }
             for zone in ["PrimarySync", "SharedSync-test"] {
                 inner
                     .set_metadata(&crate::sync_cycle::sync_token_key(zone), "zone-before")
@@ -833,7 +937,16 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             }
         }
         let before = snapshot_files(&media);
+        let legacy_before = (evidence == EvidenceCase::Sparse).then(|| legacy_snapshot(&database));
+        if let Some(rows) = &legacy_before {
+            assert_eq!(
+                rows.each_ref().map(Vec::len),
+                [1, 2, 1, 0],
+                "one prepared family and its separate retry must exist without attribution proof"
+            );
+        }
         let mut after_download = None;
+        let mut selected_receipts = None;
         let mut config = make_run_cycle_config();
         config.filters.recent = recent;
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
@@ -1168,13 +1281,19 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             if deferred {
                 assert!(retained[0].next_retry.is_some());
             }
+            let selected_legacy_pending = evidence == EvidenceCase::Sparse && phase != 1;
+            assert_eq!(
+                result.stats.unattributed_legacy_pending,
+                u64::from(selected_legacy_pending),
+                "legacy status is independent of sparse identity recovery"
+            );
             assert_eq!(
                 crate::cycle_reporter::classify_cycle(
                     &result.stats,
                     result.failed_count,
                     result.session_expired
                 ),
-                if selected_identity_incomplete {
+                if selected_identity_incomplete || selected_legacy_pending {
                     crate::cycle_reporter::CycleStatus::Failed
                 } else {
                     crate::cycle_reporter::CycleStatus::Success
@@ -1213,7 +1332,136 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                     .as_deref(),
                 marker_expected.then_some("1")
             );
+            if evidence == EvidenceCase::Sparse && phase <= 2 {
+                let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+                let zone =
+                    serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+                let scope = crate::icloud::photos::inbox::ShadowCapture::new(
+                    inner.clone(),
+                    owner.clone(),
+                    "com",
+                )
+                .scope("private", &zone)
+                .unwrap();
+                let pass = &primary.plan.passes[0];
+                let expected_pass = format!("{:x}", Sha256::digest(serde_json::json!({"kind": format!("{:?}", pass.kind), "scope": pass.album.selection_scope(), "excludes": Vec::<String>::new()}).to_string().as_bytes()));
+                let content_hash = format!("{:x}", Sha256::digest(&bytes));
+                let files = snapshot_files(&media);
+                let one_path = if size == 1 {
+                    let candidates: Vec<_> = files
+                        .iter()
+                        .filter(|(_, content)| *content == &bytes)
+                        .map(|(path, _)| path.clone())
+                        .collect();
+                    assert_eq!(
+                        candidates.len(),
+                        1,
+                        "one-asset case has exactly one independently observed selected file"
+                    );
+                    Some(candidates[0].clone())
+                } else {
+                    None
+                };
+                let conn = inner
+                    .acquire_lock("inspect exact selected receipts")
+                    .unwrap();
+                let mut receipts = Vec::new();
+                let receipt_count: i64 = conn.query_row("SELECT count(*) FROM download_receipts WHERE library='PrimarySync' AND child LIKE 'asset-valid-new%'", [], |row| row.get(0)).unwrap();
+                assert_eq!(receipt_count, i64::try_from(size).unwrap());
+                for i in 0..size {
+                    let master = if size == 1 {
+                        "valid-new".to_owned()
+                    } else {
+                        format!("valid-new-{i}")
+                    };
+                    let child = format!("asset-{master}");
+                    let path = one_path.clone().unwrap_or_else(|| {
+                        media
+                            .join(run_cycle_expected_date_dir())
+                            .join(format!("unique-{i}.JPG"))
+                    });
+                    assert_eq!(
+                        std::fs::read(&path).unwrap(),
+                        bytes,
+                        "selected media path and bytes"
+                    );
+                    let count: i64 = conn.query_row("SELECT count(*) FROM download_receipts WHERE library='PrimarySync' AND child=?1 AND master=?2 AND version_size='original'", rusqlite::params![child, master], |row| row.get(0)).unwrap();
+                    assert_eq!(count, 1, "each selected rendition has exactly one receipt");
+                    let row: String = conn.query_row(
+                        "SELECT json_array(account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,json(native_path),source_checksum,local_checksum) FROM download_receipts WHERE library='PrimarySync' AND child=?1 AND master=?2 AND version_size='original'",
+                        rusqlite::params![child, master], |row| row.get(0)).unwrap();
+                    let actual: serde_json::Value = serde_json::from_str(&row).unwrap();
+                    let expected = serde_json::json!([
+                        account_key,
+                        provider_key,
+                        scope,
+                        "PrimarySync",
+                        child,
+                        master,
+                        child,
+                        expected_pass,
+                        "original",
+                        checksum,
+                        bytes.len(),
+                        crate::state::db::provider_selection::SelectionPath::from_path(&path),
+                        content_hash,
+                        content_hash
+                    ]);
+                    assert_eq!(
+                        actual, expected,
+                        "receipt must bind the selected account, scope, pass, resource and path"
+                    );
+                    receipts.push(actual);
+                }
+                if let Some(prior) = &selected_receipts {
+                    assert_eq!(
+                        &receipts, prior,
+                        "selected receipts remain exact across held cycles"
+                    );
+                } else {
+                    selected_receipts = Some(receipts);
+                }
+                eprintln!(
+                    "SELECTED_RECEIPTS_REACHED recent={recent:?} size={size} cycle={cycle} exact_receipts={size}"
+                );
+            }
             let summary = inner.get_summary().await.unwrap();
+            if let Some(before_legacy) = &legacy_before {
+                assert_eq!(
+                    &legacy_snapshot(&database),
+                    before_legacy,
+                    "prepared legacy evidence and retry survive every reopen and sparse recovery"
+                );
+                let capture = summary
+                    .metadata_capture
+                    .iter()
+                    .find(|item| item.library == "PrimarySync")
+                    .unwrap();
+                assert_eq!(
+                    (
+                        capture.unattributed_legacy_assets,
+                        capture.unattributed_legacy_pending
+                    ),
+                    (1, 1)
+                );
+                let status = crate::commands::backup_status_line(&summary);
+                assert!(
+                    status.contains(
+                        "preserved legacy records have unresolved historical attribution"
+                    ),
+                    "{status}"
+                );
+                assert_eq!(
+                    status.contains("unresolved asset identity"),
+                    marker_expected,
+                    "{status}"
+                );
+                eprintln!(
+                    "MIXED_DEBT_REACHED recent={recent:?} cycle={cycle} sparse_pending={marker_expected} legacy_pending=1 downloaded={} primary_checkpoint_held={}",
+                    result.stats.downloaded,
+                    phase < recovery_phase
+                );
+            }
             assert_eq!(
                 summary.unresolved_identity_zones,
                 u64::from(marker_expected)

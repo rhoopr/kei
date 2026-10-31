@@ -236,6 +236,16 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
         );
     }
     server.verify().await;
+    // Exercise the same authenticated migration boundary with reconstructed
+    // Primary still/motion history and a selected Shared child.
+    for scenario in [None, Some("tail"), Some("foreign")] {
+        super::v027_baseline::PRESERVE_SHARED_CLAIMS
+            .scope(
+                true,
+                super::v027_baseline::released_schema::exercise_released_schema(scenario),
+            )
+            .await;
+    }
 }
 
 /// The schema comes from v0.24.0; all catalogue rows and operations below are

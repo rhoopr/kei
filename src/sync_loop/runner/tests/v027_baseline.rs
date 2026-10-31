@@ -256,7 +256,7 @@ async fn v027_baseline_mixed_receipt_concurrent_delta_then_two_quiet_reopened_cy
 tokio::task_local! {static CURRENT_SIDECAR_FAILURE: bool;}
 tokio::task_local! {static REQUIRE_OBSERVATION_PROOF: bool;}
 tokio::task_local! {static PRESERVE_EXTERNAL_LINKS: bool;}
-tokio::task_local! {static PRESERVE_SHARED_CLAIMS: bool;}
+tokio::task_local! {pub(super) static PRESERVE_SHARED_CLAIMS: bool;}
 tokio::task_local! {static RESTORE_DELETED_RECEIPTS: bool;}
 
 #[tokio::test]
@@ -2311,3 +2311,8 @@ async fn historical_source_revalidation_case(live: bool) {
         }
     }
 }
+
+#[path = "v027_baseline/legacy_scale.rs"]
+mod legacy_scale;
+
+pub(super) mod released_schema;

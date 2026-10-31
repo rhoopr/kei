@@ -611,6 +611,56 @@ async fn v027_deferred_observation_requires_fresh_proof_and_atomic_first_destina
             .is_err(),
         "another authenticated account cannot resolve this obligation"
     );
+    // The same valid synthetic confirmation cannot give a foreign account
+    // authority over this root. The attempted admission above reaches the
+    // owner and must leave the original deferred decision and queue intact.
+    assert_eq!(
+        reopened
+            .selection_decision(owner(), root.id.clone(), key.clone(), "asset-m".into())
+            .await
+            .unwrap(),
+        Some(observed.clone())
+    );
+    assert_eq!(f.count("provider_active_destinations"), 0);
+    assert_eq!(f.queue(), queue);
+    let mut missing_master: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    missing_master["records"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|record| record["recordType"] != "CPLMaster");
+    assert!(
+        reopened
+            .project_selection_decision_with_proof(
+                owner(),
+                root.id.clone(),
+                selected.clone(),
+                pending.clone(),
+                Some(serde_json::to_vec(&missing_master).unwrap()),
+                MAX_GENERATION_BYTES,
+            )
+            .await
+            .is_err(),
+        "omitted master cannot certify a selected resource"
+    );
+    assert_eq!(
+        reopened
+            .selection_decision(owner(), root.id.clone(), key.clone(), "asset-m".into())
+            .await
+            .unwrap(),
+        Some(observed.clone())
+    );
+    assert_eq!(f.count("provider_active_destinations"), 0);
+    assert_eq!(f.queue(), queue);
+    let after_refusal: String = reopened
+        .acquire_lock("foreign and missing-master refusal preserves seal")
+        .unwrap()
+        .query_row(
+            "SELECT seal_hash FROM provider_active_generations WHERE id=?1",
+            [&root.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(after_refusal, seal);
     reopened.acquire_lock("inject destination rollback").unwrap().execute_batch(
         "CREATE TRIGGER observation_destination_fault BEFORE INSERT ON provider_active_destinations BEGIN SELECT RAISE(ABORT,'synthetic first destination'); END;"
     ).unwrap();
