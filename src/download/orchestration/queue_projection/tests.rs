@@ -192,9 +192,11 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::new_in(tempfile::tempdir().unwrap(), "state.db").await
+    }
+    async fn new_in(dir: TempDir, db_name: &str) -> Self {
         let db = Arc::new(
-            SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            SqliteStateDb::open_owned(&dir.path().join(db_name), &owner())
                 .await
                 .unwrap(),
         );
@@ -1355,10 +1357,10 @@ async fn queue_projection_dispatch_fault_holds_cursor_and_does_not_rank_fallback
 
 #[tokio::test]
 async fn queue_projection_bounded_scan_does_not_starve_later_sources() {
-    let f = Fixture::new().await;
+    let mut f = Fixture::new().await;
     let mut original = Vec::new();
     let mut current = Vec::new();
-    for index in 0..66 {
+    for index in 0..67 {
         let name = format!("m-{index}");
         original.extend(records(&name, OLD, "source"));
         if index != 0 {
@@ -1369,23 +1371,185 @@ async fn queue_projection_bounded_scan_does_not_starve_later_sources() {
     f.capture(original, "many").await;
     f.cycle().await.unwrap();
     assert_eq!(f.count("assets"), 0);
-    for index in 0..66 {
+    for index in 0..67 {
         f.seed_retained_retry(&format!("asset-m-{index}"), true)
             .await
             .unwrap();
     }
+    let source = {
+        let conn =
+            f.db.acquire_lock("preexisting historical source identity")
+                .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(DISTINCT ordinal) FROM provider_work_retries",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 67,
+            "all historical sources must be independently due"
+        );
+        conn.query_row::<String, _, _>("SELECT json_array(account_key,provider_key,scope,request_cursor,successor,body_hash) FROM provider_shadow_pages WHERE request_cursor='many'", [], |r| r.get(0)).unwrap()
+    };
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    f.db = db;
+    f.capture = ShadowCapture::new(Arc::clone(&f.db), owner(), "com");
+    f.pass
+        .album
+        .set_shadow_capture(f.capture.clone(), Arc::from("private"));
+    f.config.state_db = Some(Arc::clone(&f.db) as Arc<dyn DownloadStore>);
+    assert!(
+        has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+            .await
+            .unwrap()
+    );
+    let before_calls = f.session.calls.load(Ordering::SeqCst);
     f.cycle().await.unwrap();
-    assert_eq!(f.count("assets"), 63);
+    assert_eq!(f.count("assets"), 63, "one unresolved of first 64");
+    assert_eq!(
+        f.session.calls.load(Ordering::SeqCst) - before_calls,
+        127,
+        "64 lookups: one missing child and 63 complete pairs"
+    );
     f.cycle().await.unwrap();
-    assert_eq!(f.count("assets"), 65);
+    assert_eq!(f.count("assets"), 66, "three remaining sources serviced");
+    let calls = f.session.calls.load(Ordering::SeqCst);
     f.cycle().await.unwrap();
-    assert_eq!(f.count("assets"), 65);
+    assert_eq!(f.count("assets"), 66);
+    assert_eq!(
+        f.session.calls.load(Ordering::SeqCst),
+        calls,
+        "quiet cycle must not repeat current lookup"
+    );
+    {
+        let conn =
+            f.db.acquire_lock("historical source retained after tail")
+                .unwrap();
+        let after: String = conn.query_row("SELECT json_array(account_key,provider_key,scope,request_cursor,successor,body_hash) FROM provider_shadow_pages WHERE request_cursor='many'", [], |r| r.get(0)).unwrap();
+        assert_eq!(after, source);
+        let identities: Vec<String> = conn
+            .prepare("SELECT id FROM assets ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut expected: Vec<String> = (1..67).map(|i| format!("asset-m-{i}")).collect();
+        expected.sort();
+        assert_eq!(identities, expected);
+    }
     assert_eq!(f.db.acquire_lock("early source still unresolved").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_work_receipts r WHERE r.state='deferred' AND r.reason='current_lookup_unresolved' AND NOT EXISTS (SELECT 1 FROM provider_work_receipts done WHERE done.page_id=r.page_id AND done.ordinal=r.ordinal AND done.config_hash=r.config_hash AND done.state='admitted')",[],|r|r.get(0)).unwrap(),1);
     assert_eq!(
         f.count("provider_work_retries"),
         1,
         "only the unresolved early source remains due later"
     );
+    f.preserved().await;
+}
+
+// A preexisting, owner-created filtered tail must stay due across reopen.
+// This owner-level control does not claim service-watch composition.
+#[tokio::test]
+async fn retained_filtered_67_owner_work_keeps_64_plus_3_fairness() {
+    let mut f = Fixture::new().await;
+    f.config.filename_exclude = Arc::from([glob::Pattern::new("changed.jpg").unwrap()]);
+    let mut historical = Vec::new();
+    let mut current = Vec::new();
+    for index in 0..67 {
+        let name = format!("m-{index}");
+        historical.extend(records(&name, OLD, "source"));
+        if index != 0 {
+            current.extend(records(&name, CURRENT, "current"));
+        }
+    }
+    *f.session.records.lock().unwrap() = current;
+    f.capture(historical, "filtered-67").await;
+    for index in 0..67 {
+        f.seed_retained_retry(&format!("asset-m-{index}"), true)
+            .await
+            .unwrap();
+    }
+    let source: Vec<u8> =
+        f.db.acquire_lock("filtered historical source")
+            .unwrap()
+            .query_row(
+                "SELECT body FROM provider_shadow_pages WHERE request_cursor='filtered-67'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert_eq!(
+        f.db.acquire_lock("filtered due identities")
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT count(DISTINCT ordinal) FROM provider_work_retries",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        67
+    );
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    f.db = db;
+    f.capture = ShadowCapture::new(Arc::clone(&f.db), owner(), "com");
+    f.pass
+        .album
+        .set_shadow_capture(f.capture.clone(), Arc::from("private"));
+    f.config.state_db = Some(Arc::clone(&f.db) as Arc<dyn DownloadStore>);
+    assert!(
+        has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+            .await
+            .unwrap()
+    );
+    f.cycle().await.unwrap();
+    let filtered_count = |f: &Fixture| {
+        f.db.acquire_lock("filtered receipt count").unwrap().query_row::<i64,_,_>(
+        "SELECT count(*) FROM provider_work_receipts WHERE state='deferred' AND reason='currently_filtered'", [], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(filtered_count(&f), 63, "one unresolved among the first 64");
+    f.cycle().await.unwrap();
+    assert_eq!(
+        filtered_count(&f),
+        66,
+        "the last three sources must not starve"
+    );
+    assert_eq!(f.count("assets"), 0);
+    assert_eq!(f.count("provider_work_obligations"), 0);
+    let calls = f.session.calls.load(Ordering::SeqCst);
+    assert!(
+        !has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+            .await
+            .unwrap()
+    );
+    f.cycle().await.unwrap();
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), calls);
+    {
+        let conn = f.db.acquire_lock("filtered identities and source").unwrap();
+        let names: Vec<String> = conn.prepare("SELECT c.record_name FROM provider_catalog_records c JOIN provider_work_receipts r ON r.page_id=c.page_id AND r.ordinal=c.ordinal WHERE r.state='deferred' AND r.reason='currently_filtered' ORDER BY c.record_name").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        let mut expected: Vec<String> = (1..67).map(|i| format!("asset-m-{i}")).collect();
+        expected.sort();
+        assert_eq!(names, expected);
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_work_receipts r JOIN provider_catalog_records c ON c.page_id=r.page_id AND c.ordinal=r.ordinal WHERE c.record_name='asset-m-0' AND r.state='deferred' AND r.reason='current_lookup_unresolved'", [], |r| r.get(0)).unwrap(), 1);
+        assert_eq!(
+            conn.query_row::<Vec<u8>, _, _>(
+                "SELECT body FROM provider_shadow_pages WHERE request_cursor='filtered-67'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            source
+        );
+    }
     f.preserved().await;
 }
 
@@ -2307,8 +2471,68 @@ async fn queue_projection_admitted_before_dispatch_reopens_materializes_and_stay
         "bare history is not admission authority"
     );
     assert_eq!(f.count("assets"), 0);
-    assert_eq!(f.project_retained().await.unwrap(), WorkAdmission::Admitted);
-    assert_eq!(f.count("provider_work_receipts"), 1);
+    // Construct a genuinely pre-existing deferred source through the capture
+    // and work owners; the fixture only advances its retry clock to be due.
+    f.defer_retained().await;
+    let source = || {
+        let conn = f.db.acquire_lock("historical source identity").unwrap();
+        conn.query_row::<String, _, _>(
+            "SELECT json_array(p.account_key,p.provider_key,p.scope,p.request_cursor,p.successor,p.body_hash,c.page_id,c.ordinal,c.record_name,r.config_hash,r.state,r.reason,r.source_hash) FROM provider_shadow_pages p JOIN provider_catalog_records c ON c.page_id=p.id JOIN provider_work_receipts r ON r.page_id=c.page_id AND r.ordinal=c.ordinal WHERE c.kind='asset' AND r.state='deferred'",
+            [], |row| row.get(0),
+        ).unwrap()
+    };
+    let historical_source = source();
+    let identity: Value = serde_json::from_str(&historical_source).unwrap();
+    let (_, expected_scope, zone) = f.pass.album.catalog_work_scope().unwrap().unwrap();
+    assert_eq!(identity[2], expected_scope);
+    assert_eq!(identity[3], "old");
+    assert_eq!(identity[4], "old-successor");
+    assert_eq!(identity[8], "asset-m");
+    assert_eq!(
+        identity[9],
+        config_hash(&f.config.with_pass(&f.pass), &zone)
+    );
+    assert_eq!(identity[10], "deferred");
+    assert_eq!(identity[11], "current_lookup_unresolved");
+    assert_eq!(identity[5], identity[12]);
+    assert!(
+        has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+            .await
+            .unwrap()
+    );
+    // Reopen before servicing the prior obligation, as a stopped service would.
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&f.dir.path().join("state.db"), &owner())
+            .await
+            .unwrap(),
+    );
+    f.db = db;
+    f.capture = ShadowCapture::new(Arc::clone(&f.db), owner(), "com");
+    f.pass
+        .album
+        .set_shadow_capture(f.capture.clone(), Arc::from("private"));
+    f.config.state_db = Some(Arc::clone(&f.db) as Arc<dyn DownloadStore>);
+    assert!(
+        has_due_retained_work(std::slice::from_ref(&f.pass), &f.config, controls())
+            .await
+            .unwrap()
+    );
+    f.cycle().await.unwrap();
+    assert_eq!(
+        f.db.acquire_lock("historical admission oracle")
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT count(*) FROM provider_work_receipts WHERE state='admitted'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(f.count("provider_work_retries"), 0);
+    assert_eq!(f.count("provider_work_obligations"), 1);
+    assert_eq!(f.db.acquire_lock("retained historical source").unwrap().query_row::<String,_,_>("SELECT json_array(p.account_key,p.provider_key,p.scope,p.request_cursor,p.successor,p.body_hash,c.page_id,c.ordinal,c.record_name,r.config_hash,r.state,r.reason,r.source_hash) FROM provider_shadow_pages p JOIN provider_catalog_records c ON c.page_id=p.id JOIN provider_work_receipts r ON r.page_id=c.page_id AND r.ordinal=c.ordinal WHERE c.kind='asset' AND r.state='deferred'", [], |r| r.get(0)).unwrap(), historical_source);
+    assert_eq!(f.count("provider_work_receipts"), 2);
     assert_eq!(
         f.db.acquire_lock("pre-dispatch interruption oracle")
             .unwrap()
@@ -9114,4 +9338,652 @@ async fn legacy_recorded_policy_requires_exact_production_fingerprint_and_scope(
     let mut no_enum_evidence = current.clone();
     no_enum_evidence.legacy_enum_hashes = None;
     assert!(replay(&root, &no_enum_evidence).is_none());
+}
+
+// The worker runs in its own libtest process: service signal handlers and
+// environment never affect the surrounding test runner.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "launched only by historical_service_watch_drains_retained_tail"]
+async fn historical_service_watch_worker() {
+    if std::env::var("KEI_HISTORICAL_SERVICE_WORKER").as_deref() != Ok("1") {
+        return;
+    }
+    // This process is isolated from the parent libtest runner. The real
+    // watch loop emits its wait event only after a cycle and reporting finish.
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .finish(),
+    )
+    .unwrap();
+    let parent = std::path::PathBuf::from(std::env::var_os("KEI_HISTORICAL_TEST_ROOT").unwrap());
+    let server = std::env::var("KEI_HISTORICAL_TEST_SERVER").unwrap();
+    let username = "queue-stage@example.invalid";
+    let ns = crate::account::namespace(username, "com");
+    let dir = tempfile::tempdir_in(&parent).unwrap();
+    let mut f = Fixture::new_in(dir, &format!("{ns}.db")).await;
+    let root = f.dir.path().to_owned();
+    let password = root.join("empty-password");
+    std::fs::write(&password, "").unwrap();
+    let quoted = |s: &str| toml::Value::String(s.to_owned()).to_string();
+    let config_path = root.join("service.toml");
+    std::fs::write(&config_path, format!(
+        "[auth]\nusername={}\npassword_file={}\n[download]\ndirectory={}\n[filters]\nfilename_exclude=[\"changed.jpg\"]\n[watch]\ninterval=60\n[server]\nport=0\n[ui]\nfriendly=false\nprogress_bar=false\n",
+        quoted(username), quoted(password.to_str().unwrap()), quoted(f.config.directory.to_str().unwrap())
+    )).unwrap();
+    std::fs::write(
+        root.join(format!("{ns}.session")),
+        br#"{"session_token":"synthetic-session"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(format!("{ns}.cache")),
+        serde_json::to_vec(&json!({
+            "validated_at":chrono::Utc::now().timestamp(),"account_data":{
+                "dsInfo":{"dsid":"queue-provider"},
+                "webservices":{"ckdatabasews":{"url":server}}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let globals = crate::config::GlobalArgs {
+        username: Some(username.to_owned()),
+        domain: None,
+        data_dir: Some(root.to_string_lossy().into_owned()),
+    };
+    let toml = crate::config::load_toml_config(&config_path, true).unwrap();
+    let sync = crate::cli::SyncArgs::default();
+    let pw = crate::cli::PasswordArgs::default();
+    let cfg = crate::config::Config::build_inner(
+        &globals,
+        &pw,
+        sync.clone(),
+        toml.as_ref(),
+        crate::personality::Mode::Off,
+        Some(false),
+    )
+    .unwrap();
+    // Mirror the production runner's resolved hash inputs; the work owner
+    // computes the fingerprint rather than editing or inventing authority.
+    f.config.directory = Arc::from(cfg.download.directory.as_path());
+    f.config.folder_structure = cfg.download.folder_structure.clone();
+    f.config.folder_structure_albums = Arc::from(cfg.download.folder_structure_albums.as_str());
+    f.config.folder_structure_smart_folders =
+        Arc::from(cfg.download.folder_structure_smart_folders.as_str());
+    f.config.resolution = cfg.photos.resolution;
+    f.config.media = cfg.filters.media;
+    f.config.skip_created_before = cfg.filters.skip_created_before;
+    f.config.skip_created_after = cfg.filters.skip_created_after;
+    f.config.metadata = cfg.metadata;
+    f.config.live_photo_mode = cfg.photos.live_photo_mode;
+    f.config.live_resolution = cfg.photos.live_resolution.to_asset_version_size();
+    f.config.live_photo_mov_filename_policy = cfg.photos.live_photo_mov_filename_policy;
+    f.config.edited = cfg.photos.edited;
+    f.config.edited_naming = cfg.photos.edited_naming;
+    f.config.alternative = cfg.photos.alternative;
+    f.config.raw_policy = cfg.photos.raw_policy;
+    f.config.file_match_policy = cfg.photos.file_match_policy;
+    f.config.force_resolution = cfg.photos.force_resolution;
+    f.config.keep_unicode_in_filenames = cfg.photos.keep_unicode_in_filenames;
+    f.config.filename_exclude = Arc::from(cfg.download.filename_exclude.clone());
+    f.config.recent = cfg.filters.recent;
+    f.config.recent_scope = cfg.filters.recent_scope;
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: Arc::from("https://example.invalid"),
+            name: Arc::from(""),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(f.session.clone()),
+    );
+    album.set_shadow_capture(f.capture.clone(), Arc::from("private"));
+    f.pass.album = album;
+    let mut historical = Vec::new();
+    for index in 0..67 {
+        historical.extend(records(&format!("m-{index}"), OLD, "source"));
+    }
+    historical
+        .push(json!({"recordName":"future-source","recordType":"FutureRecord","opaque":[1,2,3]}));
+    historical.push(json!({"recordName":"explicit-tomb","deleted":true,"opaque":[4,5]}));
+    f.capture(historical, "filtered-67").await;
+    for index in 0..67 {
+        f.seed_retained_retry(&format!("asset-m-{index}"), true)
+            .await
+            .unwrap();
+    }
+    let independent = crate::test_helpers::TestAssetRecord::new("independent-retry")
+        .library("OldUnknownScope")
+        .checksum("independent-checksum")
+        .build();
+    f.db.upsert_seen(&independent).await.unwrap();
+    // This is preexisting independent work, not work dispatched by this sync.
+    // Wait for the real second-resolution clock boundary rather than editing
+    // the asset's stored authority or relying on scheduling luck.
+    let independent_seen: i64 = f.db.acquire_lock("independent work timestamp").unwrap()
+        .query_row("SELECT last_seen_at FROM assets WHERE library='OldUnknownScope' AND id='independent-retry'", [], |r| r.get(0)).unwrap();
+    while chrono::Utc::now().timestamp() <= independent_seen {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let source: Vec<u8> =
+        f.db.acquire_lock("source snapshot")
+            .unwrap()
+            .query_row(
+                "SELECT body FROM provider_shadow_pages WHERE request_cursor='filtered-67'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+    std::fs::write(parent.join("source.bin"), source).unwrap();
+    // Retain the directory for the parent to reopen after this process exits.
+    let Fixture {
+        dir,
+        db,
+        capture,
+        session: _,
+        pass,
+        config,
+    } = f;
+    drop(config);
+    drop(pass);
+    drop(capture);
+    drop(db);
+    let kept = dir.keep();
+    assert_eq!(kept, root);
+    let reopened = SqliteStateDb::open_owned(&root.join(format!("{ns}.db")), &owner())
+        .await
+        .unwrap();
+    drop(reopened);
+    std::fs::write(parent.join("runtime-path"), root.to_str().unwrap()).unwrap();
+    crate::service::run::run(
+        &globals,
+        crate::sync_loop::SyncArgs {
+            is_one_shot: false,
+            service_mode: true,
+            pw,
+            sync,
+            toml_config: toml,
+            config_explicitly_set: true,
+            config_path,
+            redact_password: Arc::new(Mutex::new(None)),
+            personality_mode: crate::personality::Mode::Off,
+            friendly_request: Some(false),
+            input_mode: crate::InputMode::NoInput,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct HistoricalWatchProvider {
+    checks: Arc<AtomicUsize>,
+    lookups: Arc<AtomicUsize>,
+}
+#[cfg(unix)]
+impl wiremock::Respond for HistoricalWatchProvider {
+    fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let path = request.url.path();
+        let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        let response = if path.ends_with("/zones/list") {
+            json!({"zones":if path.contains("/private/") {vec![json!({"zoneID":zone,"syncToken":"scoped-baseline-cursor"})]} else {vec![]}})
+        } else if body.pointer("/query/recordType").and_then(Value::as_str)
+            == Some("CheckIndexingState")
+        {
+            json!({"records":[{"fields":{"state":{"value":"FINISHED"}}}]})
+        } else if path.ends_with("/changes/database") {
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            json!({"syncToken":"quiet-database-cursor","moreComing":false,"zones":[]})
+        } else if path.ends_with("/changes/zone") {
+            json!({"zones":[{"zoneID":zone,"syncToken":"old-cursor","moreComing":false,"records":[]}]})
+        } else if path.ends_with("/records/lookup") {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            let mut response = Vec::new();
+            for item in body["records"].as_array().unwrap() {
+                let name = item["recordName"].as_str().unwrap();
+                let master = name.strip_prefix("asset-").unwrap_or(name);
+                if master != "m-0" && master.starts_with("m-") {
+                    for mut record in records(master, CURRENT, "current") {
+                        if record["recordName"] == name {
+                            record["zoneID"] = zone.clone();
+                            if record["recordType"] == "CPLAsset" {
+                                record["fields"]["masterRef"]["value"]["zoneID"] = zone.clone();
+                            }
+                            response.push(record);
+                        }
+                    }
+                } else {
+                    response.push(
+                        json!({"recordName":name,"zoneID":zone,"serverErrorCode":"UNKNOWN_ITEM"}),
+                    );
+                }
+            }
+            json!({"records":response})
+        } else if path.ends_with("/internal/records/query/batch") {
+            json!({"batch":[{"records":[{"fields":{"itemCount":{"value":0}}}]}]})
+        } else if path.ends_with("/records/query") {
+            json!({"records":[]})
+        } else {
+            panic!("unexpected historical watch request: {path}")
+        };
+        wiremock::ResponseTemplate::new(200).set_body_json(response)
+    }
+}
+
+#[cfg(unix)]
+fn historical_watch_state_snapshot(
+    path: &std::path::Path,
+) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    [
+        "SELECT * FROM account_owner",
+        "SELECT key,value FROM metadata WHERE key LIKE 'sync_token:%' OR key LIKE 'pending_sync_token:%' ORDER BY key",
+        "SELECT library,id,version_size,status,filename,local_path,last_error,checksum,local_checksum,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size FROM assets ORDER BY library,id,version_size",
+        "SELECT * FROM asset_metadata_paths ORDER BY library,id,version_size,local_path",
+        "SELECT * FROM asset_metadata_capture_revisions ORDER BY library,asset_id",
+        "SELECT * FROM provider_shadow_pages ORDER BY id",
+        "SELECT * FROM provider_shadow_records ORDER BY page_id,ordinal",
+        "SELECT * FROM provider_shadow_receipts ORDER BY scope",
+        "SELECT * FROM provider_work_receipts ORDER BY page_id,ordinal,config_hash,confirmation_hash",
+        "SELECT * FROM provider_catalog_debt ORDER BY page_id,ordinal,reason",
+        "SELECT r.* FROM provider_work_retries r JOIN provider_catalog_records c ON c.page_id=r.page_id AND c.ordinal=r.ordinal WHERE c.record_name<>'asset-m-0' ORDER BY r.page_id,r.ordinal,r.config_hash",
+    ].iter().map(|sql| {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let n = stmt.column_count();
+        stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect()).unwrap().collect::<Result<Vec<_>,_>>().unwrap()
+    }).collect()
+}
+
+#[cfg(unix)]
+fn historical_watch_media_snapshot(
+    root: &std::path::Path,
+) -> Vec<(std::path::PathBuf, bool, Vec<u8>, std::time::SystemTime)> {
+    fn visit(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<(std::path::PathBuf, bool, Vec<u8>, std::time::SystemTime)>,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            assert!(
+                !metadata.file_type().is_symlink(),
+                "unexpected media symlink"
+            );
+            let is_dir = metadata.is_dir();
+            assert!(is_dir || metadata.is_file(), "unexpected media entry");
+            let bytes = if is_dir {
+                Vec::new()
+            } else {
+                std::fs::read(&path).unwrap()
+            };
+            out.push((
+                path.strip_prefix(root).unwrap().to_owned(),
+                is_dir,
+                bytes,
+                metadata.modified().unwrap(),
+            ));
+            if is_dir {
+                visit(root, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(root, root, &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn historical_service_watch_drains_retained_tail() {
+    use std::time::{Duration, Instant};
+    struct OwnedChild(std::process::Child, bool);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if !self.1 {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let parent = tempfile::tempdir().unwrap();
+    let server = wiremock::MockServer::start().await;
+    let photos = HistoricalWatchProvider {
+        checks: Arc::new(AtomicUsize::new(0)),
+        lookups: Arc::new(AtomicUsize::new(0)),
+    };
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(photos.clone())
+        .mount(&server)
+        .await;
+    let log = parent.path().join("worker.log");
+    let log_file = std::fs::File::create(&log).unwrap();
+    let mut child = OwnedChild(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", parent.path())
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("KEI_HISTORICAL_SERVICE_WORKER", "1")
+            .env("KEI_HISTORICAL_TEST_ROOT", parent.path())
+            .env("KEI_HISTORICAL_TEST_SERVER", server.uri())
+            .args([
+                "--exact",
+                "download::orchestration::queue_projection::tests::historical_service_watch_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdout(log_file.try_clone().unwrap())
+            .stderr(log_file)
+            .spawn()
+            .unwrap(),
+        false,
+    );
+    let started = Instant::now();
+    let marker = parent.path().join("runtime-path");
+    while !marker.exists() && started.elapsed() < Duration::from_secs(30) {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "worker exited: {}",
+            std::fs::read_to_string(&log).unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        marker.exists(),
+        "worker did not create fixture: {}",
+        std::fs::read_to_string(&log).unwrap()
+    );
+    let root = std::path::PathBuf::from(std::fs::read_to_string(marker).unwrap());
+    let ns = crate::account::namespace("queue-stage@example.invalid", "com");
+    let db_path = root.join(format!("{ns}.db"));
+    let count_filtered = || {
+        rusqlite::Connection::open(&db_path).unwrap().query_row::<i64,_,_>(
+        "SELECT count(*) FROM provider_work_receipts WHERE state='deferred' AND reason='currently_filtered'", [], |r| r.get(0)).unwrap()
+    };
+    let completed_watches = || {
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .matches("Waiting before next cycle")
+            .count()
+    };
+    let mut first_wave = false;
+    let mut second_wave_lookups = None;
+    while completed_watches() < 3 && started.elapsed() < Duration::from_secs(210) {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "worker exited: {}",
+            std::fs::read_to_string(&log).unwrap()
+        );
+        let completed = completed_watches();
+        let filtered = count_filtered();
+        if completed == 1 && filtered == 63 {
+            first_wave = true;
+        }
+        if completed >= 2 && filtered == 66 && second_wave_lookups.is_none() {
+            second_wave_lookups = Some(photos.lookups.load(Ordering::SeqCst));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let diagnostics = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        completed_watches() >= 3,
+        "three watch iterations must finish: {diagnostics}"
+    );
+    assert!(photos.checks.load(Ordering::SeqCst) >= 3, "{diagnostics}");
+    assert!(
+        first_wave,
+        "first 64 attempts were not observed: {diagnostics}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(119),
+        "watch ran faster than its real cadence"
+    );
+    assert_eq!(
+        second_wave_lookups,
+        Some(photos.lookups.load(Ordering::SeqCst)),
+        "quiet cycle repeated lookup"
+    );
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &child.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = child.0.wait().unwrap();
+    child.1 = true;
+    assert!(
+        status.success(),
+        "worker did not exit gracefully: {diagnostics}"
+    );
+    {
+        let db = SqliteStateDb::open_owned(&db_path, &owner()).await.unwrap();
+        let conn = db.acquire_lock("reopened watch evidence").unwrap();
+        let (scope, owner_match): (String, bool) = conn.query_row("SELECT p.scope,p.account_key=a.account_key AND p.provider_key=a.provider_key FROM provider_shadow_pages p CROSS JOIN account_owner a WHERE p.request_cursor='filtered-67' AND a.singleton=1", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert!(owner_match);
+        assert_eq!(
+            serde_json::from_str::<Value>(&scope).unwrap(),
+            json!({"format":1,"realm":"com","container":"com.apple.photos.cloud","environment":"production","database":"private","zone":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}})
+        );
+        assert!(
+            conn.query_row::<i64, _, _>("SELECT count(*) FROM provider_catalog_debt", [], |r| r
+                .get(0))
+                .unwrap()
+                >= 3
+        );
+
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM assets WHERE library='OldUnknownScope' AND id='independent-retry' AND status='pending' AND checksum='independent-checksum'", [], |r| r.get(0)).unwrap(), 1);
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM assets WHERE library='PrimarySync' AND id LIKE 'asset-m-%'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            "old-cursor"
+        );
+
+        let names: Vec<String> = conn.prepare("SELECT c.record_name FROM provider_catalog_records c JOIN provider_work_receipts r ON r.page_id=c.page_id AND r.ordinal=c.ordinal WHERE r.state='deferred' AND r.reason='currently_filtered' ORDER BY c.record_name").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        let mut expected: Vec<String> = (1..67).map(|i| format!("asset-m-{i}")).collect();
+        expected.sort();
+        assert_eq!(names, expected);
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_work_receipts r JOIN provider_catalog_records c ON c.page_id=r.page_id AND c.ordinal=r.ordinal WHERE c.record_name='asset-m-0' AND r.state='deferred' AND r.reason='current_lookup_unresolved'", [], |r| r.get(0)).unwrap(), 1);
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM provider_work_obligations",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row::<Vec<u8>, _, _>(
+                "SELECT body FROM provider_shadow_pages WHERE request_cursor='filtered-67'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            std::fs::read(parent.path().join("source.bin")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(root.join("media/existing.jpg")).unwrap(),
+            b"existing-media"
+        );
+        assert_eq!(
+            std::fs::read(root.join("media/existing.xmp")).unwrap(),
+            b"retained-sidecar"
+        );
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT value FROM metadata WHERE key='pending_sync_token:sparse:OtherZone'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            "retained-debt"
+        );
+        assert_eq!(
+            conn.query_row::<Vec<u8>, _, _>("SELECT payload FROM unknown_future", [], |r| r.get(0))
+                .unwrap(),
+            [0, 255, 7]
+        );
+    }
+    let unresolved_retry = || {
+        rusqlite::Connection::open(&db_path).unwrap().query_row::<(i64,i64,i64),_,_>(
+        "SELECT r.attempts,r.last_attempt_at,r.next_retry_at FROM provider_work_retries r JOIN provider_catalog_records c ON c.page_id=r.page_id AND c.ordinal=r.ordinal WHERE c.record_name='asset-m-0'", [],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap()
+    };
+    let retry = unresolved_retry();
+    assert_eq!((retry.0, retry.2 - retry.1), (2, 7200));
+    let calls = photos.lookups.load(Ordering::SeqCst);
+    let stable_state = historical_watch_state_snapshot(&db_path);
+    let stable_media = historical_watch_media_snapshot(&root.join("media"));
+    for restart in 0..3 {
+        // The first two are quiet reopens. The last explicitly makes only the
+        // unresolved retry due, preserving the original backoff control.
+        if restart == 2 {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            assert_eq!(conn.execute("UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1 WHERE (page_id,ordinal) IN (SELECT page_id,ordinal FROM provider_catalog_records WHERE record_name='asset-m-0')", []).unwrap(), 1);
+        }
+        let log_file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        let mut restart_child = OwnedChild(std::process::Command::new(std::env::current_exe().unwrap())
+            .env_clear().env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", parent.path()).env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("NO_PROXY", "127.0.0.1,localhost").env("KEI_HISTORICAL_RESTART_WORKER", "1")
+            .env("KEI_HISTORICAL_RUNTIME_ROOT", &root)
+            .args(["--exact", "download::orchestration::queue_projection::tests::historical_service_restart_worker", "--ignored", "--nocapture"])
+            .stdout(log_file.try_clone().unwrap()).stderr(log_file).spawn().unwrap(), false);
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let status = loop {
+            if let Some(status) = restart_child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "restart stalled: {}",
+                std::fs::read_to_string(&log).unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        restart_child.1 = true;
+        assert!(
+            status.success(),
+            "restart failed: {}",
+            std::fs::read_to_string(&log).unwrap()
+        );
+        assert_eq!(
+            photos.lookups.load(Ordering::SeqCst),
+            calls + usize::from(restart == 2)
+        );
+        let reopened = SqliteStateDb::open_owned(&db_path, &owner()).await.unwrap();
+        let conn = reopened.acquire_lock("restart evidence").unwrap();
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM provider_work_receipts WHERE state='deferred' AND reason='currently_filtered'", [], |r| r.get(0)).unwrap(),66);
+        assert_eq!(conn.query_row::<i64,_,_>("SELECT count(*) FROM assets WHERE library='OldUnknownScope' AND id='independent-retry' AND status='pending' AND checksum='independent-checksum'", [], |r| r.get(0)).unwrap(),1);
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            "old-cursor"
+        );
+        assert_eq!(
+            conn.query_row::<Vec<u8>, _, _>(
+                "SELECT body FROM provider_shadow_pages WHERE request_cursor='filtered-67'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            std::fs::read(parent.path().join("source.bin")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(root.join("media/existing.jpg")).unwrap(),
+            b"existing-media"
+        );
+        assert_eq!(
+            std::fs::read(root.join("media/existing.xmp")).unwrap(),
+            b"retained-sidecar"
+        );
+        drop(conn);
+        drop(reopened);
+        assert_eq!(
+            historical_watch_state_snapshot(&db_path),
+            stable_state,
+            "complete retained and general state changed on restart {restart}"
+        );
+        assert_eq!(
+            historical_watch_media_snapshot(&root.join("media")),
+            stable_media,
+            "media tree changed on restart {restart}"
+        );
+        let after = unresolved_retry();
+        if restart < 2 {
+            assert_eq!(after, retry);
+        } else {
+            assert_eq!((after.0, after.2 - after.1), (3, 14400));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "launched only by historical_service_watch_drains_retained_tail"]
+async fn historical_service_restart_worker() {
+    if std::env::var("KEI_HISTORICAL_RESTART_WORKER").as_deref() != Ok("1") {
+        return;
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("KEI_HISTORICAL_RUNTIME_ROOT").unwrap());
+    let config_path = root.join("service.toml");
+    let globals = crate::config::GlobalArgs {
+        username: Some("queue-stage@example.invalid".to_owned()),
+        domain: None,
+        data_dir: Some(root.to_string_lossy().into_owned()),
+    };
+    let toml = crate::config::load_toml_config(&config_path, true).unwrap();
+    crate::sync_loop::run_sync(
+        &globals,
+        crate::sync_loop::SyncArgs {
+            is_one_shot: true,
+            service_mode: false,
+            pw: crate::cli::PasswordArgs::default(),
+            sync: crate::cli::SyncArgs::default(),
+            toml_config: toml,
+            config_explicitly_set: true,
+            config_path,
+            redact_password: Arc::new(Mutex::new(None)),
+            personality_mode: crate::personality::Mode::Off,
+            friendly_request: Some(false),
+            input_mode: crate::InputMode::NoInput,
+        },
+    )
+    .await
+    .unwrap();
 }

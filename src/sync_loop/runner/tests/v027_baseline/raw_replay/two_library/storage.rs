@@ -166,6 +166,15 @@ async fn stock(database: &Path, root: &Path, padding: usize) -> u64 {
         .unwrap(),
         WorkAdmission::Deferred
     );
+    if ASSESS_DUE_HYDRATION
+        .try_with(|enabled| *enabled)
+        .unwrap_or(false)
+    {
+        let conn = db
+            .acquire_lock("make the genuine historical retry due")
+            .unwrap();
+        assert_eq!(conn.execute("UPDATE provider_work_retries SET last_attempt_at=0,next_retry_at=1 WHERE page_id=1 AND ordinal=1 AND attempts=1", []).unwrap(), 1);
+    }
     // Use the released asset schema; current upsert intentionally requires
     // schema37 writer guards and must not run against this stock database.
     let file = root.join("original.JPG");
@@ -233,6 +242,59 @@ async fn v027_large_stock_inbox_preserves_current_progress() {
     .await;
 }
 
+tokio::task_local! { static ASSESS_DUE_HYDRATION: bool; }
+
+#[tokio::test]
+#[ignore = "near-512 MiB historical hydration composition; run explicitly on disposable storage"]
+async fn v027_near_full_due_hydration_preserves_independent_current_progress() {
+    ASSESS_DUE_HYDRATION
+        .scope(
+            true,
+            storage_contract_with_stock(
+                Fault::None,
+                crate::icloud::photos::inbox::MAX_CHANGES_PAGE_BYTES - 8192,
+                Some(512 * 1024 * 1024),
+            ),
+        )
+        .await;
+}
+
+#[derive(Clone)]
+struct CountHistoricalLookups {
+    inner: HealthySession,
+    count: Arc<AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl PhotosSession for CountHistoricalLookups {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        if url.contains("/records/lookup?") {
+            let request: Value = serde_json::from_str(&body)?;
+            if request["records"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|record| {
+                    matches!(
+                        record["recordName"].as_str(),
+                        Some("asset-old-0" | "master-old-0")
+                    )
+                })
+            {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        self.inner.post(url, body, headers).await
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
 #[tokio::test]
 async fn v027_full_distinct_stock_admission_rollback_reopens_without_lost_work() {
     storage_contract(Fault::Admission).await;
@@ -274,6 +336,10 @@ async fn storage_contract_with_stock(fault: Fault, padding: usize, capacity: Opt
     let fairness = ASSESS_FAIRNESS
         .try_with(|enabled| *enabled)
         .unwrap_or(false);
+    let due_hydration = ASSESS_DUE_HYDRATION
+        .try_with(|enabled| *enabled)
+        .unwrap_or(false);
+    let mut retained_retry_after_first = None;
     let refresh_fault = ASSESS_REFRESH_FAULT.try_with(|point| *point).unwrap_or(0);
     let partial = ASSESS_PARTIAL.try_with(|enabled| *enabled).unwrap_or(false);
     let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
@@ -445,7 +511,16 @@ async fn storage_contract_with_stock(fault: Fault, padding: usize, capacity: Opt
             changes: Arc::new(AtomicUsize::new(0)),
             boundaries: Arc::new(AtomicUsize::new(0)),
         };
-        let mut healthy = selected(db.clone(), healthy_zone(), Box::new(session.clone())).await;
+        let historical_lookups = Arc::new(AtomicUsize::new(0));
+        let current_session: Box<dyn PhotosSession> = if due_hydration {
+            Box::new(CountHistoricalLookups {
+                inner: session.clone(),
+                count: historical_lookups.clone(),
+            })
+        } else {
+            Box::new(session.clone())
+        };
+        let mut healthy = selected(db.clone(), healthy_zone(), current_session).await;
         if fairness {
             let mut album = crate::icloud::photos::PhotoAlbum::new(
                 crate::icloud::photos::PhotoAlbumConfig {
@@ -632,6 +707,33 @@ async fn storage_contract_with_stock(fault: Fault, padding: usize, capacity: Opt
             continue;
         }
         let result = result.unwrap();
+        if due_hydration {
+            let retry: (i64,i64,i64) = db.acquire_lock("due historical retry across reopen").unwrap().query_row(
+                "SELECT attempts,last_attempt_at,next_retry_at FROM provider_work_retries WHERE page_id=1 AND ordinal=1", [],
+                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            if cycle == 0 {
+                assert_eq!(
+                    historical_lookups.load(Ordering::SeqCst),
+                    1,
+                    "the genuine due hydration lookup must run"
+                );
+                assert_eq!((retry.0, retry.2 - retry.1), (2, 7200));
+                retained_retry_after_first = Some(retry);
+            } else {
+                assert_eq!(
+                    historical_lookups.load(Ordering::SeqCst),
+                    0,
+                    "a backed-off historical retry must stay quiet"
+                );
+                assert_eq!(Some(retry), retained_retry_after_first);
+            }
+            println!(
+                "DUE_HYDRATION cycle={cycle} historical_lookups={} retry={retry:?} checkpoint_advance={} stats={:?}",
+                historical_lookups.load(Ordering::SeqCst),
+                result.can_advance_database_checkpoint(),
+                result.stats
+            );
+        }
         if check_health {
             if cycle == 3 {
                 health = crate::health::HealthStatus::new();

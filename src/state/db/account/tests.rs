@@ -420,3 +420,154 @@ async fn unresolved_legacy_symlink_is_not_permission_for_new_state() {
         Err(StateError::LegacyAccountMigrationRequired)
     ));
 }
+
+/// Opens only a fixture actually produced by the v0.25.2 test writer. The
+/// bound database must use owned upgrade; legacy adoption must reject it.
+#[tokio::test]
+#[ignore = "explicit released-writer fixture; requires v0.25.2 writer output"]
+async fn v0252_owned_writer_current_reader() {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("KEI_WRITER_FIXTURE_DIR").expect("fixture directory is required"),
+    );
+    let path = root.join("state.db");
+    let media = root.join("retained.jpg");
+    let bytes = b"synthetic released-writer retained media";
+    assert_eq!(std::fs::read(&media).unwrap(), bytes);
+    let mtime = std::fs::metadata(&media).unwrap().modified().unwrap();
+    let expected_owner = owner("writer@example.invalid", "com", "synthetic-writer-provider");
+    let before_bytes = std::fs::read(&path).unwrap();
+    let old =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    assert_eq!(
+        old.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+            .unwrap(),
+        35
+    );
+    let saved: (String, String) = old.query_row("SELECT status,local_path FROM assets WHERE library='PrimarySync' AND id='historical-master' AND version_size='original'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(
+        saved,
+        ("downloaded".to_owned(), media.to_str().unwrap().to_owned())
+    );
+    assert_eq!(old.query_row("SELECT status FROM assets WHERE library='PrimarySync' AND id='unfinished-child' AND version_size='original'", [], |r| r.get::<_, String>(0)).unwrap(), "pending");
+    assert_eq!(old.query_row("SELECT master_record_name FROM asset_master_mappings WHERE library='PrimarySync' AND asset_record_name='historical-child'", [], |r| r.get::<_, String>(0)).unwrap(), "historical-master");
+    let tables = ["assets", "asset_metadata_paths", "asset_master_mappings"];
+    let columns: Vec<_> = tables
+        .iter()
+        .map(|table| {
+            let mut stmt = old
+                .prepare(&format!(
+                    "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+                ))
+                .unwrap();
+            let names = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            ((*table).to_owned(), names)
+        })
+        .collect();
+    fn rows(
+        conn: &rusqlite::Connection,
+        columns: &[(String, Vec<String>)],
+    ) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        columns
+            .iter()
+            .map(|(table, names)| {
+                let sql = format!(
+                    "SELECT {} FROM {table} ORDER BY 1,2,3",
+                    names
+                        .iter()
+                        .map(|n| format!("\"{n}\""))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                let mut stmt = conn.prepare(&sql).unwrap();
+                stmt.query_map([], |r| {
+                    (0..names.len())
+                        .map(|i| r.get(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+            })
+            .collect()
+    }
+    let before_rows = rows(&old, &columns);
+    drop(old);
+    assert!(matches!(
+        adopt_legacy(
+            &path,
+            &root.join("must-not-adopt.db"),
+            &expected_owner,
+            "writer@example.invalid",
+            "com"
+        )
+        .await,
+        Err(StateError::AccountOwnerMismatch)
+    ));
+    assert!(!root.join("must-not-adopt.db").exists());
+    assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+    assert!(matches!(
+        SqliteStateDb::open_owned(
+            &path,
+            &owner("writer@example.invalid", "com", "wrong-provider")
+        )
+        .await,
+        Err(StateError::AccountOwnerMismatch)
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+    for _ in 0..2 {
+        let db = SqliteStateDb::open_owned(&path, &expected_owner)
+            .await
+            .unwrap();
+        assert_eq!(db.get_pending().await.unwrap().len(), 1);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("released-token")
+        );
+        drop(db);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                .unwrap(),
+            crate::state::schema::SCHEMA_VERSION
+        );
+        assert_eq!(rows(&conn, &columns), before_rows);
+        assert_eq!(std::fs::read(&media).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&media).unwrap().modified().unwrap(),
+            mtime
+        );
+    }
+    let snapshots: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".kei-pre-v027-")
+        })
+        .collect();
+    assert_eq!(snapshots.len(), 1);
+    let snapshot = rusqlite::Connection::open_with_flags(
+        snapshots[0].path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+            .unwrap(),
+        35
+    );
+    assert_eq!(rows(&snapshot, &columns), before_rows);
+    eprintln!(
+        "V0252_READER_REACHED legacy_refused=1 wrong_owner_refused=1 preserved_snapshot=1 pending=1 reopens=2"
+    );
+}
