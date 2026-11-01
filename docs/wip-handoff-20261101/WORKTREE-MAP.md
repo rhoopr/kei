@@ -1,0 +1,12 @@
+# Worktree and evidence map
+
+- Published destination: `/home/robhooper/dev/kei-v027-sync`, branch `simplify/v027-baseline-incremental`, snapshot HEAD `9a0b5eb58c0a3735ba7bafa28cafc2de27bc9586`. User's separate `/home/robhooper/dev/kei` is not the destination and must be left alone.
+- Published sparse integration: `/home/robhooper/dev/kei-sparse-bridge-integration-ff3d`; `.scratch/sparse-bridge-integration-ff3d-resume/RESULTS.md` and binaries/statuses. Prior source `.scratch/provider-progress-5105/STATUS.md`; old diagnostic/failed snapshots remain evidence.
+- Retry WIP: `/home/robhooper/dev/kei-retry-rebase-9a`, `/home/robhooper/dev/kei-resume-compose-983`. Consult their current owner handoffs and source hashes. Do not assume schema 43 integrated.
+- Embedded and crash WIP: `/home/robhooper/dev/kei-embedded-rating-owner-v19` and earlier v16-v18; packets `.scratch/embedded-rating-owner-v19/`, `.scratch/embedded-rating-owner-v18/`, `.scratch/embedded-rating-owner-v16/COORDINATION-CHECKPOINT.md`; `.scratch/identity-schema44-coordination/STATUS.md`. Do not infer final writer capability, identity proof or schema 44 from partial controls.
+- Visible archive WIP `/home/robhooper/dev/kei-visible-archive-final`, packet `.scratch/visible-archive-final/`; confined-owner WIP `/home/robhooper/dev/kei-confined-owner-route`, packet `.scratch/owner-exchange-primitive/`; sibling diagnostic `/home/robhooper/dev/kei-sibling-diag2-9a`. Inspect current process/log status and owner handoffs first.
+- Prior failed #845 observation remains `.scratch/next-reviewed-packet/VALIDATION-RESULTS.md` and `.scratch/issue845-integrated-observation/RESULTS.md`, synthetic DB/media `/home/robhooper/tmp/kei-845-observation-retained/issue845-mO9kk7`. The later empty-quiet/repeated split is `.scratch/followon-quiet-split/RESULTS.md`.
+- Old broad failure inventory `.scratch/five-bars/qual-dd47eca-20261031/HANDOFF.md`, `.scratch/qualification-failures-983/per-test.tsv`; old counts are not current-head outcomes.
+- User-approved storage cleanup manifest `.scratch/approved-reclamation-20261101/deletion-manifest.tsv`; preserve remaining outputs. A full read-only registered worktree list at snapshot is `WORKTREES-ALL.txt`. This list includes user or stale worktrees and does not imply permission to edit/delete any of them.
+
+All `.scratch` paths above are under `/home/robhooper/dev/kei-v027-sync` unless an absolute path is given. Snapshots may age while in-flight owners finish. Check current status and use exact source/binary hashes from each packet before drawing conclusions.
