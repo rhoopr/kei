@@ -201,10 +201,17 @@ fn stream_incremental_assets_for_single_unfiled_pass(
         };
         delta.summary.inventory_rank_changed |= observed.load(std::sync::atomic::Ordering::Relaxed);
         delta.record_completion(if missing_successor { None } else { token });
+        // A paired source can be streamed without appearing in the unpaired
+        // list. Reuse provisional proof only when the provider delta has no
+        // rank-affecting observations at all.
+        let mut hydration_config = Box::new(config.as_ref().clone());
+        if delta.summary.inventory_rank_changed {
+            hydration_config.prior_sparse_bridge_proofs = Arc::from([]);
+        }
         hydrate_unpaired_created_asset_deltas(
             &mut unpaired_asset_events,
             Some(&pass),
-            &config,
+            &hydration_config,
             &mut delta.summary,
             run_mode,
             &shutdown_token,
@@ -644,10 +651,15 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     for event in &change_events {
         delta.persist_asset_mapping(event, config).await;
     }
+    // Keep the same conservative observation guard in the collecting path.
+    let mut hydration_config = Box::new(config.as_ref().clone());
+    if delta.summary.inventory_rank_changed {
+        hydration_config.prior_sparse_bridge_proofs = Arc::from([]);
+    }
     hydrate_unpaired_created_asset_deltas(
         &mut change_events,
         delta_pass,
-        config,
+        &hydration_config,
         &mut delta.summary,
         controls.run_mode,
         &shutdown_token,

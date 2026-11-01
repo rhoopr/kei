@@ -231,6 +231,14 @@ impl SparseTargetState {
     }
 }
 impl SparseIdentityProof {
+    /// Provisional bridge evidence matches only the exact retained generation.
+    /// Final settlement still revalidates the target and files in the checkpoint transaction.
+    pub(crate) fn matches_identity(&self, identity: &SparseIdentity) -> bool {
+        self.library == identity.library
+            && self.source == identity.source
+            && self.generation == identity.generation
+    }
+
     pub(crate) fn with_target(mut self, target: SparseTargetState) -> Self {
         self.target = Some(target);
         self
@@ -727,10 +735,17 @@ fn clear_selected(
             }
         }
         if let Some(target) = &proof.target {
-            target
+            let validation = target
                 .validate_files
                 .as_ref()
-                .ok_or_else(|| invariant("sparse target file proof missing"))?()?;
+                .ok_or_else(|| invariant("sparse target file proof missing"))?(
+            );
+            #[cfg(test)]
+            if validation.is_err() {
+                crate::test_helpers::SPARSE_TARGET_VALIDATION_FAILURES
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            validation?;
         }
         resolved.push(identity.source);
     }
@@ -1035,6 +1050,7 @@ mod tests {
             .await
             .unwrap();
         let initial_proof = row.proof();
+        assert!(initial_proof.matches_identity(&row));
         for hours in [1, 2, 4, 8, 16, 24, 24] {
             row = db
                 .record_sparse_attempt(
@@ -1049,6 +1065,10 @@ mod tests {
             assert_eq!(row.lookup.as_ref(), Some(&original));
         }
         assert_ne!(row.proof(), initial_proof);
+        assert!(
+            !initial_proof.matches_identity(&row),
+            "a changed retry generation cannot reuse provisional proof"
+        );
         drop(db);
         let db = SqliteStateDb::open(&path).await.unwrap();
         let replay = db

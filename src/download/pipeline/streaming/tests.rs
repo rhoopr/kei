@@ -72,6 +72,7 @@ async fn test_producer_panic_propagates_as_error() {
         sparse_targets: Arc::from([]),
         complete_path_selection: false,
         selection_context: None,
+        prior_sparse_bridge_proofs: Arc::from([]),
         prior_inventory_proof: None,
         selection_run: None,
         selection_pass: None,

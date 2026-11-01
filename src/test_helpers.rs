@@ -102,6 +102,11 @@ pub(crate) fn skip_if_loopback_bind_blocked(test_name: &str) -> bool {
     }
 }
 
+// Test-only reach marker; exact isolated tests read the delta around one run.
+#[cfg(test)]
+pub(crate) static SPARSE_TARGET_VALIDATION_FAILURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 pub(crate) async fn start_wiremock_or_skip(test_name: &str) -> Option<wiremock::MockServer> {
     if skip_if_loopback_bind_blocked(test_name) {

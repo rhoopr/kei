@@ -1704,6 +1704,8 @@ pub(crate) async fn run_cycle(
                             Arc::clone(&download_config.sparse_targets);
                         Arc::make_mut(&mut bridge_config).prior_inventory_proof =
                             sync_result.checkpoint.observation.clone().map(Box::new);
+                        Arc::make_mut(&mut bridge_config).prior_sparse_bridge_proofs =
+                            Arc::from(sync_result.checkpoint.sparse_identity_proofs.clone());
                         let bridge_result = download::download_photos_with_sync(
                             &download_client,
                             &lib_state.plan.passes,

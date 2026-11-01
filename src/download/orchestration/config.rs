@@ -535,6 +535,8 @@ pub(crate) struct DownloadConfig {
     /// Transient proof from this operation's completed full inventory.
     /// Never serialized, hashed, or persisted; an absent proof keeps the
     /// ordinary inventory path.
+    /// Uncommitted proof from an earlier bridge of this same baseline.
+    pub(crate) prior_sparse_bridge_proofs: Arc<[crate::state::SparseIdentityProof]>,
     pub(crate) prior_inventory_proof:
         Option<Box<crate::state::db::provider_generations::observation::ObservationProof>>,
     pub(crate) selection_run: Option<Arc<super::generation::SelectionRun>>,
@@ -843,6 +845,7 @@ impl DownloadConfig {
             sparse_targets: Arc::from([]),
             complete_path_selection: false,
             selection_context: None,
+            prior_sparse_bridge_proofs: Arc::from([]),
             prior_inventory_proof: None,
             selection_run: None,
             selection_pass: None,

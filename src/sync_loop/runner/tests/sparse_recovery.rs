@@ -18,6 +18,12 @@ struct Session {
     source: bool,
     quiet: bool,
     unrelated: bool,
+    late: bool,
+    same_source: bool,
+    paired_sent: Arc<AtomicUsize>,
+    tamper_root: Option<std::path::PathBuf>,
+    tampered: Arc<AtomicUsize>,
+    tampered_path: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     records: Vec<Value>,
     target_calls: Arc<AtomicUsize>,
     source_calls: Arc<std::sync::Mutex<Vec<Option<String>>>>,
@@ -89,12 +95,53 @@ impl PhotosSession for Session {
                 .unwrap()
                 .push(request["zones"][0]["syncToken"].as_str().map(str::to_owned));
         }
-        let records = if self.source && !self.quiet {
-            let mut records = vec![sparse()];
-            if self.unrelated {
-                records.push(unrelated_sparse());
+        if self.source
+            && request["zones"][0]["syncToken"] == "source-after"
+            && let Some(root) = &self.tamper_root
+            && self.tampered.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            let mut directories = vec![root.clone()];
+            let mut found = Vec::new();
+            while let Some(directory) = directories.pop() {
+                for entry in std::fs::read_dir(directory)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() {
+                        directories.push(entry.path());
+                    } else if std::fs::read(entry.path())?
+                        == [
+                            0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0, 1, 0, 0, 1,
+                            0, 1, 0, 0, 0xff, 0xd9,
+                        ]
+                    {
+                        found.push(entry.path());
+                    }
+                }
             }
-            records
+            assert_eq!(
+                found.len(),
+                1,
+                "the completed target must exist before tampering"
+            );
+            std::fs::write(&found[0], b"synthetic changed target")?;
+            *self.tampered_path.lock().unwrap() = Some(found[0].clone());
+        }
+        let records = if self.source && !self.quiet {
+            if request["zones"][0]["syncToken"] == "source-after" {
+                if self.late {
+                    vec![unrelated_sparse()]
+                } else if self.same_source {
+                    self.paired_sent.fetch_add(1, Ordering::SeqCst);
+                    self.records.clone()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                let mut records = vec![sparse()];
+                if self.unrelated {
+                    records.push(unrelated_sparse());
+                }
+                records
+            }
         } else {
             Vec::new()
         };
@@ -128,6 +175,7 @@ fn album(zone: &str, owner: &str, session: Session) -> PhotoAlbum {
 }
 
 #[tokio::test]
+#[allow(clippy::print_stderr, reason = "synthetic bridge regression markers")]
 async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
@@ -135,15 +183,19 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
         Mock, ResponseTemplate,
         matchers::{method, path},
     };
-    for (selected, owner_matches, pending, unrelated) in [
-        (true, true, false, false),
-        (false, true, false, false),
-        (true, false, false, false),
-        (true, true, true, false),
-        (true, true, false, true),
-        (true, true, true, true),
+    for (selected, owner_matches, pending, unrelated, baseline, late, same_source, tamper) in [
+        (true, true, false, false, true, false, false, false),
+        (true, true, false, false, true, true, false, false),
+        (true, true, false, false, true, false, true, false),
+        (true, true, false, false, true, false, false, true),
+        (true, true, false, false, false, false, false, false),
+        (false, true, false, false, false, false, false, false),
+        (true, false, false, false, false, false, false, false),
+        (true, true, true, false, false, false, false, false),
+        (true, true, false, true, false, false, false, false),
+        (true, true, true, true, false, false, false, false),
     ] {
-        let complete = selected && owner_matches && !unrelated;
+        let complete = selected && owner_matches && !unrelated && !late && !same_source && !tamper;
         // A held source obligation beside eligible target work still reopens so
         // the next cycle can prove that the completed transfer is not repeated.
         let cycles = if complete || (pending && unrelated) {
@@ -178,6 +230,19 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
             .as_array()
             .unwrap()
             .clone();
+        let mut changed_source = full_album_page_with_download(
+            "PrimarySync",
+            "changed-master",
+            "source-after",
+            &format!("{}/target.jpg", server.uri()),
+            bytes.len() as u64,
+            &checksum,
+        )["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        changed_source[0]["fields"]["filenameEnc"] = json!({"value":"changed.jpg","type":"STRING"});
+        changed_source[1]["recordName"] = json!("source-child");
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("state.db");
         let media = directory.path().join("media");
@@ -185,6 +250,9 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
         let config = make_run_cycle_config();
         let enum_hash = download::compute_config_hash(&config);
         let calls = Arc::new(AtomicUsize::new(0));
+        let paired_sent = Arc::new(AtomicUsize::new(0));
+        let tampered = Arc::new(AtomicUsize::new(0));
+        let tampered_path = Arc::new(std::sync::Mutex::new(None));
         let source_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut previous_calls = None;
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
@@ -220,6 +288,9 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                     .await
                     .unwrap();
                 for zone in ["PrimarySync", "SharedSync-test"] {
+                    if baseline && zone == "PrimarySync" {
+                        continue;
+                    }
                     inner
                         .set_metadata(&crate::sync_cycle::sync_token_key(zone), "before")
                         .await
@@ -228,7 +299,7 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
             }
             let primary = make_run_cycle_library_state_with_album(
                 "PrimarySync",
-                "sync_token:PrimarySync",
+                &crate::sync_cycle::sync_token_key("PrimarySync"),
                 album(
                     "PrimarySync",
                     "_defaultOwner",
@@ -236,7 +307,13 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                         source: true,
                         quiet: cycle > 0,
                         unrelated,
-                        records: Vec::new(),
+                        late,
+                        same_source,
+                        paired_sent: paired_sent.clone(),
+                        tamper_root: tamper.then(|| media.clone()),
+                        tampered: tampered.clone(),
+                        tampered_path: tampered_path.clone(),
+                        records: changed_source.clone(),
                         target_calls: calls.clone(),
                         source_calls: source_calls.clone(),
                     },
@@ -244,7 +321,7 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
             );
             let shared = make_run_cycle_library_state_with_album(
                 "SharedSync-test",
-                "sync_token:SharedSync-test",
+                &crate::sync_cycle::sync_token_key("SharedSync-test"),
                 album(
                     "SharedSync-test",
                     if owner_matches {
@@ -256,6 +333,12 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                         source: false,
                         quiet: true,
                         unrelated: false,
+                        late: false,
+                        same_source: false,
+                        paired_sent: paired_sent.clone(),
+                        tamper_root: None,
+                        tampered: tampered.clone(),
+                        tampered_path: tampered_path.clone(),
                         records: records.clone(),
                         target_calls: calls.clone(),
                         source_calls: source_calls.clone(),
@@ -267,6 +350,8 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
             } else {
                 vec![&primary]
             };
+            let validation_failures_before =
+                crate::test_helpers::SPARSE_TARGET_VALIDATION_FAILURES.load(Ordering::SeqCst);
             let result = crate::sync_cycle::run_cycle(
                 &libraries,
                 &config,
@@ -279,6 +364,64 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
             )
             .await
             .unwrap();
+            if baseline && cycle == 0 {
+                let calls = source_calls.lock().unwrap();
+                assert!(
+                    calls
+                        .iter()
+                        .any(|cursor| cursor.as_deref() == Some("fixture-zone-history-boundary"))
+                );
+                assert!(
+                    calls
+                        .iter()
+                        .any(|cursor| cursor.as_deref() == Some("source-after")),
+                    "the second bridge must actually run"
+                );
+            }
+            if tamper {
+                assert_eq!(
+                    tampered.load(Ordering::SeqCst),
+                    1,
+                    "target must be changed after the first bridge"
+                );
+                assert!(
+                    crate::test_helpers::SPARSE_TARGET_VALIDATION_FAILURES.load(Ordering::SeqCst)
+                        > validation_failures_before,
+                    "the final checkpoint target-file validator must actually reject the changed file"
+                );
+                let changed = tampered_path.lock().unwrap().clone().unwrap();
+                assert_eq!(std::fs::read(changed).unwrap(), b"synthetic changed target");
+                assert!(
+                    inner
+                        .get_metadata(&crate::sync_cycle::sync_token_key("PrimarySync"))
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "changed target must not certify a source checkpoint"
+                );
+                assert_eq!(
+                    inner.sparse_identities("PrimarySync").await.unwrap().len(),
+                    1,
+                    "changed target retains the sparse obligation"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                eprintln!("SPARSE_TARGET_MUTATION_REACHED checkpoint_held=1 debt=1");
+                continue;
+            }
+            if same_source {
+                assert!(
+                    paired_sent.load(Ordering::SeqCst) > 0,
+                    "same-source paired change must reach the second provider bridge"
+                );
+                assert!(
+                    result.stats.identity_incomplete,
+                    "an intervening paired source cannot reuse the old proof"
+                );
+            }
+            eprintln!(
+                "SPARSE_BRIDGE_REACHED selected={selected} owner_matches={owner_matches} pending={pending} unrelated={unrelated} baseline={baseline} late={late} same_source={same_source} cycle={cycle} identity_incomplete={} downloads={}",
+                result.stats.identity_incomplete, result.stats.downloaded
+            );
             assert!(
                 inner
                     .get_all_asset_albums("SharedSync-test")
@@ -296,7 +439,7 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                 assert_eq!(result.stats.downloaded, usize::from(cycle == 0));
                 assert_eq!(
                     inner
-                        .get_metadata("sync_token:PrimarySync")
+                        .get_metadata(&crate::sync_cycle::sync_token_key("PrimarySync"))
                         .await
                         .unwrap()
                         .as_deref(),
@@ -334,19 +477,19 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                 assert_eq!(
                     result.stats.downloaded,
                     usize::from(selected && owner_matches && cycle == 0),
-                    "eligible target work progresses once, then reopens quietly"
+                    "eligible target work progresses while changed source remains held"
                 );
                 assert_eq!(
                     inner
-                        .get_metadata("sync_token:PrimarySync")
+                        .get_metadata(&crate::sync_cycle::sync_token_key("PrimarySync"))
                         .await
                         .unwrap()
                         .as_deref(),
-                    Some("before")
+                    if baseline { None } else { Some("before") }
                 );
                 assert_eq!(
                     inner.sparse_identities("PrimarySync").await.unwrap().len(),
-                    if unrelated { 2 } else { 1 }
+                    if unrelated || late { 2 } else { 1 }
                 );
                 if pending {
                     assert_eq!(

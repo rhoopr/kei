@@ -98,6 +98,17 @@ impl SparseRetryContext {
                     }
                 }
             }
+            // Earlier provisional bridge proof covers only this exact generation.
+            // A newly observed source still follows the normal admission path;
+            // the final checkpoint transaction revalidates proof and target.
+            if !seen.contains(row.source.as_str())
+                && config
+                    .prior_sparse_bridge_proofs
+                    .iter()
+                    .any(|proof| proof.matches_identity(&row))
+            {
+                continue;
+            }
             if !seen.contains(row.source.as_str()) {
                 events.push(ChangeEvent {
                     record_name: row.source.as_str().into(),
