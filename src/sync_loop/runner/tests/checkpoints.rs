@@ -1871,24 +1871,42 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
 
     for collecting in [false, true] {
         let server = wiremock::MockServer::start().await;
-        let bytes = include_bytes!("../../../../tests/data/media/pattern.jpg");
-        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes));
-        for (name, transfers) in [("earlier", 1), ("debt", 1), ("rejected", 0)] {
+        let earlier_bytes = include_bytes!("../../../../tests/data/media/pattern.jpg").to_vec();
+        assert!(earlier_bytes.ends_with(&[0xff, 0xd9]));
+        let mut debt_bytes = earlier_bytes.clone();
+        let end = debt_bytes.len() - 2;
+        // A valid JPEG comment segment distinguishes the two provider resources.
+        debt_bytes.splice(end..end, [0xff, 0xfe, 0x00, 0x04, b'd', b'1']);
+        let earlier_checksum =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&earlier_bytes));
+        let checksum =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&debt_bytes));
+        assert_ne!(earlier_checksum, checksum);
+        for (name, content, transfers) in [
+            ("earlier", &earlier_bytes, 1),
+            ("debt", &debt_bytes, 1),
+            ("rejected", &earlier_bytes, 0),
+        ] {
             Mock::given(method("GET"))
                 .and(path(format!("/{name}.jpg")))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
                 .expect(transfers)
                 .mount(&server)
                 .await;
         }
         let records = |name: &str| {
+            let (content, provider_checksum) = if name == "debt" {
+                (&debt_bytes, &checksum)
+            } else {
+                (&earlier_bytes, &earlier_checksum)
+            };
             let mut page = full_album_page_with_download(
                 "PrimarySync",
                 &format!("master-{name}"),
                 "unused",
                 &format!("{}/{name}.jpg", server.uri()),
-                bytes.len() as u64,
-                &checksum,
+                content.len() as u64,
+                provider_checksum,
             );
             page["records"][0]["fields"]["filenameEnc"]["value"] = serde_json::json!(
                 base64::engine::general_purpose::STANDARD.encode(format!("{name}.jpg"))
@@ -1934,7 +1952,7 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
             db.upsert_seen(
                 &crate::test_helpers::TestAssetRecord::new("asset-master-debt")
                     .filename("debt.jpg")
-                    .size(bytes.len() as u64)
+                    .size(debt_bytes.len() as u64)
                     .checksum(&checksum)
                     .build(),
             )
@@ -2017,15 +2035,20 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
             assert_eq!(history.created_at, history_snapshot.created_at);
             assert_eq!(tokio::fs::read(&historical).await.unwrap(), history_bytes);
             for row in rows.iter().filter(|row| row.id.as_ref() != "asset-HISTORY") {
+                let expected = match row.id.as_ref() {
+                    "asset-master-earlier" => &earlier_bytes,
+                    "asset-master-debt" => &debt_bytes,
+                    other => panic!("unexpected downloaded identity: {other}"),
+                };
                 assert_eq!(
                     tokio::fs::read(row.local_path.as_ref().unwrap())
                         .await
                         .unwrap(),
-                    bytes
+                    *expected
                 );
                 assert_eq!(
                     row.local_checksum.as_deref(),
-                    Some(format!("{:x}", Sha256::digest(bytes)).as_str())
+                    Some(format!("{:x}", Sha256::digest(expected)).as_str())
                 );
             }
             assert!(
@@ -2150,6 +2173,7 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
             }
         }
         server.verify().await;
+        eprintln!("CHECKPOINT_REPLAY_REACHED collecting={collecting}");
     }
 }
 
