@@ -20,6 +20,26 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(all(test, feature = "xmp"))]
+static TEST_AFTER_ACTIVITY_STOPS: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(all(test, feature = "xmp"))]
+fn test_arm_after_activity_stop(path: &std::path::Path) {
+    TEST_AFTER_ACTIVITY_STOPS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(path.to_owned());
+}
+
+#[cfg(all(test, feature = "xmp"))]
+fn test_take_after_activity_stop(path: &std::path::Path) -> bool {
+    TEST_AFTER_ACTIVITY_STOPS
+        .get()
+        .is_some_and(|paths| paths.lock().unwrap().remove(path))
+}
+
+#[cfg(all(test, feature = "xmp"))]
 static TEST_SUPPRESSIONS: std::sync::OnceLock<
     std::sync::Mutex<
         std::collections::HashMap<PathBuf, std::sync::Weak<std::sync::atomic::AtomicUsize>>,
@@ -526,6 +546,27 @@ where
             continue;
         }
         if db.validate_metadata_writer(&pending_rewrite).await.is_err() {
+            deferred += 1;
+            continue;
+        }
+        let activity_root =
+            archive_root.unwrap_or_else(|| path.ancestors().last().unwrap_or(path.as_path()));
+        if db
+            .validate_metadata_activity_conflicts(
+                &pending_rewrite,
+                selected_queue,
+                metadata_flags.bits(),
+                activity_root,
+            )
+            .await
+            .is_err()
+        {
+            tracing::warn!(target: "kei::download::metadata_rewrite", "Metadata activity could not rule out conflicting unfinished work; retaining the rewrite");
+            deferred += 1;
+            continue;
+        }
+        #[cfg(all(test, feature = "xmp"))]
+        if test_take_after_activity_stop(&path) {
             deferred += 1;
             continue;
         }

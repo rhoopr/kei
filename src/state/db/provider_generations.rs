@@ -3355,6 +3355,7 @@ pub(super) fn metadata_receipt(
     asset.download_checksum = Some(source.clone());
     asset.status = crate::state::AssetStatus::Downloaded;
     Ok(super::PendingMetadataRewrite {
+        activity_admission: None,
         asset,
         capture_repair_receipt: None,
         source_checksum: Some(source),

@@ -389,9 +389,52 @@ fn row_to_pending_metadata_rewrite(
     Ok(PendingMetadataRewrite {
         asset: row_to_asset_record(row)?,
         selection_receipt: None,
+        activity_admission: None,
         capture_repair_receipt,
         source_checksum: row.get(ASSET_COLUMN_COUNT + 3)?,
     })
+}
+
+pub(super) fn validate_activity_selected_work(
+    conn: &Connection,
+    pending: &PendingMetadataRewrite,
+) -> Result<(), StateError> {
+    let Some(receipt) = &pending.selection_receipt else {
+        return Ok(());
+    };
+    let path = super::provider_selection::SelectionPath::from_path(
+        pending
+            .asset
+            .local_path
+            .as_deref()
+            .ok_or(StateError::ProviderSelectionInvalid)?,
+    )
+    .key()?;
+    let current = super::provider_generations::metadata_receipt(
+        conn,
+        &receipt.generation,
+        &receipt.pass_key,
+        &receipt.child,
+        pending.asset.version_size.as_str(),
+        &path,
+    )?;
+    if current.selection_receipt != pending.selection_receipt
+        || current.source_checksum != pending.source_checksum
+        || current.asset.local_path != pending.asset.local_path
+    {
+        return Err(StateError::ProviderWorkConflict);
+    }
+    let mut actual = current.asset;
+    let mut expected = pending.asset.clone();
+    actual.local_path = None;
+    expected.local_path = None;
+    if serde_json::to_value(actual).map_err(|_invalid| StateError::ProviderSelectionInvalid)?
+        != serde_json::to_value(expected)
+            .map_err(|_invalid| StateError::ProviderSelectionInvalid)?
+    {
+        return Err(StateError::ProviderWorkConflict);
+    }
+    Ok(())
 }
 
 impl SqliteStateDb {
@@ -1437,6 +1480,12 @@ impl SqliteStateDb {
 
 #[async_trait]
 impl MetadataRewriteStore for SqliteStateDb {
+    fn metadata_activity_owner(
+        &self,
+    ) -> Option<&dyn super::metadata_activity::MetadataActivityOwner> {
+        Some(self)
+    }
+
     async fn validate_metadata_writer(
         &self,
         pending: &PendingMetadataRewrite,

@@ -1412,6 +1412,12 @@ impl state::MembershipStore for FailingMetadataSetDb {
 
 #[async_trait::async_trait]
 impl state::MetadataRewriteStore for FailingMetadataSetDb {
+    fn metadata_activity_owner(
+        &self,
+    ) -> Option<&dyn crate::state::db::metadata_activity::MetadataActivityOwner> {
+        self.inner.metadata_activity_owner()
+    }
+
     async fn protected_legacy_paths(
         &self,
     ) -> Result<Vec<std::path::PathBuf>, crate::state::error::StateError> {

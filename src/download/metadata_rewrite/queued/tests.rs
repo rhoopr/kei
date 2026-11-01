@@ -26,6 +26,252 @@ use tokio_util::sync::CancellationToken;
 use xmp_toolkit::{XmpMeta, xmp_ns};
 
 #[cfg(feature = "xmp")]
+#[tokio::test]
+async fn activity_preflight_rejects_competitors_and_accepts_only_live_admission() {
+    use crate::state::SqliteStateDb;
+    use crate::state::db::account::AccountOwner;
+    use crate::state::db::metadata_activity::MetadataActivityOwner;
+    use crate::test_helpers::TestAssetRecord;
+
+    async fn observe(
+        db: &SqliteStateDb,
+        flags: MetadataFlags,
+        pending: crate::state::db::PendingMetadataRewrite,
+        root: &std::path::Path,
+        media: &std::path::Path,
+    ) -> bool {
+        let mut attempts = super::TailAttempts::default();
+        super::test_arm_after_activity_stop(media);
+        let result = super::run_pending_rows_tracked(
+            db,
+            flags,
+            CaptureTimestampRepair::Preserve,
+            Arc::from(".part"),
+            &CancellationToken::new(),
+            vec![pending],
+            (Some(root), &mut attempts),
+        )
+        .await;
+        assert_eq!(result.fetched, 1);
+        !super::test_take_after_activity_stop(media)
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.db");
+    let owner = AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"synthetic-provider"}}))
+            .unwrap(),
+    )
+    .unwrap();
+    let db = SqliteStateDb::open_owned(&db_path, &owner).await.unwrap();
+    let media = dir.path().join("photo.jpg");
+    let original = minimal_jpeg_bytes();
+    std::fs::write(&media, &original).unwrap();
+    let checksum = crate::download::file::compute_sha256(&media).await.unwrap();
+    let record = TestAssetRecord::new("activity-test")
+        .checksum("provider-checksum")
+        .build();
+    db.upsert_seen(&record).await.unwrap();
+    db.mark_downloaded(
+        "PrimarySync",
+        "activity-test",
+        "original",
+        &media,
+        &checksum,
+        None,
+    )
+    .await
+    .unwrap();
+    db.record_metadata_write_failure("PrimarySync", "activity-test", "original")
+        .await
+        .unwrap();
+    let pending = db
+        .get_pending_metadata_rewrites_page_for_queue(
+            MetadataRewriteQueue::Ordinary,
+            Some(&["PrimarySync"]),
+            0,
+            10,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let flags = MetadataFlags::RATING | MetadataFlags::EMBED_XMP;
+    assert!(observe(&db, flags, pending.clone(), dir.path(), &media).await);
+    assert!(
+        db.admit_activity(
+            &pending,
+            MetadataRewriteQueue::Ordinary,
+            (flags | MetadataFlags::XMP_SIDECAR).bits()
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        db.admit_activity(
+            &pending,
+            MetadataRewriteQueue::Ordinary,
+            MetadataFlags::XMP_SIDECAR.bits()
+        )
+        .await
+        .is_err()
+    );
+    let admission = Arc::new(
+        db.admit_activity(&pending, MetadataRewriteQueue::Ordinary, flags.bits())
+            .await
+            .unwrap(),
+    );
+    assert!(!observe(&db, flags, pending.clone(), dir.path(), &media).await);
+    let mut own = pending.clone();
+    own.activity_admission = Some(Arc::clone(&admission));
+    assert!(observe(&db, flags, own.clone(), dir.path(), &media).await);
+    // Sidecar-only work is independent if its target is absent. A hard link
+    // to the active media is a real same-file conflict.
+    assert!(
+        observe(
+            &db,
+            MetadataFlags::XMP_SIDECAR,
+            pending.clone(),
+            dir.path(),
+            &media
+        )
+        .await
+    );
+    #[cfg(unix)]
+    {
+        let mut name = media.as_os_str().to_os_string();
+        name.push(".xmp");
+        std::fs::hard_link(&media, std::path::PathBuf::from(name)).unwrap();
+        assert!(
+            !observe(
+                &db,
+                MetadataFlags::XMP_SIDECAR,
+                pending.clone(),
+                dir.path(),
+                &media
+            )
+            .await
+        );
+    }
+    let other = db
+        .admit_activity(&pending, MetadataRewriteQueue::Ordinary, flags.bits())
+        .await
+        .unwrap();
+    assert!(!observe(&db, flags, own.clone(), dir.path(), &media).await);
+    drop(other);
+    drop(db);
+    let reopened = SqliteStateDb::open_owned(&db_path, &owner).await.unwrap();
+    assert!(!observe(&reopened, flags, own, dir.path(), &media).await);
+    assert_eq!(
+        reopened
+            .get_pending_metadata_rewrites_page_for_queue(
+                MetadataRewriteQueue::Ordinary,
+                Some(&["PrimarySync"]),
+                0,
+                10
+            )
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // A separate owner database isolates the unknown-prepared case from the
+    // competing activity above. Neither record is adopted or retired.
+    let db2 = SqliteStateDb::open_owned(&dir.path().join("prepared.db"), &owner)
+        .await
+        .unwrap();
+    db2.upsert_seen(&record).await.unwrap();
+    db2.mark_downloaded(
+        "PrimarySync",
+        "activity-test",
+        "original",
+        &media,
+        &checksum,
+        None,
+    )
+    .await
+    .unwrap();
+    db2.record_metadata_write_failure("PrimarySync", "activity-test", "original")
+        .await
+        .unwrap();
+    let pending2 = db2
+        .get_pending_metadata_rewrites_page_for_queue(
+            MetadataRewriteQueue::Ordinary,
+            Some(&["PrimarySync"]),
+            0,
+            10,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let admission2 = Arc::new(
+        db2.admit_activity(&pending2, MetadataRewriteQueue::Ordinary, flags.bits())
+            .await
+            .unwrap(),
+    );
+    let stage = dir.path().join("prepared.stage");
+    std::fs::write(&stage, b"synthetic prepared").unwrap();
+    db2.bind_prepared(&admission2, &pending2, flags.bits(), dir.path(), &stage)
+        .await
+        .unwrap();
+    assert!(!observe(&db2, flags, pending2.clone(), dir.path(), &media).await);
+    let mut own2 = pending2;
+    own2.activity_admission = Some(admission2);
+    assert!(!observe(&db2, flags, own2, dir.path(), &media).await);
+    assert_eq!(std::fs::read(&media).unwrap(), original);
+    assert_eq!(std::fs::read(&stage).unwrap(), b"synthetic prepared");
+    assert_eq!(
+        db2.get_pending_metadata_rewrites_page_for_queue(
+            MetadataRewriteQueue::Ordinary,
+            Some(&["PrimarySync"]),
+            0,
+            10
+        )
+        .await
+        .unwrap()
+        .len(),
+        1
+    );
+    let before:(Vec<u8>,Vec<u8>)=db2.acquire_lock("prepared evidence before reopen").unwrap().query_row(
+        "SELECT a.binding,p.binding FROM metadata_activity_prerequisite a JOIN metadata_activity_prepared_prerequisite p USING(operation_id)",[],|row|Ok((row.get(0)?,row.get(1)?)),
+    ).unwrap();
+    drop(db2);
+    let reopened2 = SqliteStateDb::open_owned(&dir.path().join("prepared.db"), &owner)
+        .await
+        .unwrap();
+    let after:(Vec<u8>,Vec<u8>)=reopened2.acquire_lock("prepared evidence after reopen").unwrap().query_row(
+        "SELECT a.binding,p.binding FROM metadata_activity_prerequisite a JOIN metadata_activity_prepared_prerequisite p USING(operation_id)",[],|row|Ok((row.get(0)?,row.get(1)?)),
+    ).unwrap();
+    assert_eq!(after, before);
+    let reopened_pending = reopened2
+        .get_pending_metadata_rewrites_page_for_queue(
+            MetadataRewriteQueue::Ordinary,
+            Some(&["PrimarySync"]),
+            0,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopened_pending.len(), 1);
+    assert!(
+        !observe(
+            &reopened2,
+            flags,
+            reopened_pending.into_iter().next().unwrap(),
+            dir.path(),
+            &media
+        )
+        .await
+    );
+    assert_eq!(std::fs::read(&media).unwrap(), original);
+    assert_eq!(std::fs::read(&stage).unwrap(), b"synthetic prepared");
+}
+
+#[cfg(feature = "xmp")]
 async fn stored_checksums(db: &crate::state::SqliteStateDb) -> (Option<String>, Option<String>) {
     let row = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
     (row.local_checksum, row.download_checksum)

@@ -26,6 +26,7 @@ mod legacy_preservation;
 pub(crate) mod match_diagnostics;
 mod membership;
 mod metadata;
+pub(crate) mod metadata_activity;
 mod metadata_capture_retry;
 mod pending_publication;
 pub(crate) mod provider_catalog;
@@ -92,6 +93,7 @@ pub struct SqliteStateDb {
     conn: Arc<Mutex<Connection>>,
     /// Path to the database file (for error messages).
     path: PathBuf,
+    owner: Option<account::AccountOwner>,
     #[cfg(test)]
     legacy_owner_claim_failures: std::sync::atomic::AtomicUsize,
 }
@@ -114,6 +116,7 @@ impl SqliteStateDb {
         Self {
             conn: Arc::new(Mutex::new(conn)),
             path: path.to_owned(),
+            owner: Some(owner.clone()),
             legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -132,6 +135,7 @@ impl SqliteStateDb {
                 })?;
         }
         let cloned_path = path.clone();
+        let retained_owner = owner.clone();
         let owner = owner.clone();
         let conn = tokio::task::spawn_blocking(move || {
             let conn = account::open(&cloned_path, &owner)?;
@@ -145,6 +149,7 @@ impl SqliteStateDb {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
+            owner: Some(retained_owner),
             #[cfg(test)]
             legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -156,6 +161,7 @@ impl SqliteStateDb {
     ) -> Result<Self, StateError> {
         let path = path.to_path_buf();
         let cloned_path = path.clone();
+        let retained_owner = owner.clone();
         let owner = owner.clone();
         let conn = tokio::task::spawn_blocking(move || {
             let conn = account::open_read_only(&cloned_path)?;
@@ -179,6 +185,7 @@ impl SqliteStateDb {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
+            owner: Some(retained_owner),
             #[cfg(test)]
             legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -231,6 +238,7 @@ impl SqliteStateDb {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
+            owner: None,
             #[cfg(test)]
             legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -277,6 +285,7 @@ impl SqliteStateDb {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
+            owner: None,
             #[cfg(test)]
             legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -293,6 +302,7 @@ impl SqliteStateDb {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path: PathBuf::from(":memory:"),
+            owner: None,
             legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         })
     }

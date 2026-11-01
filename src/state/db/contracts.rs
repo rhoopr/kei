@@ -141,6 +141,8 @@ pub(crate) struct SelectionMetadataReceipt {
 pub struct PendingMetadataRewrite {
     pub asset: AssetRecord,
     pub(crate) selection_receipt: Option<SelectionMetadataReceipt>,
+    /// In-memory owner-issued continuation; never reconstructed from a listed row.
+    pub(crate) activity_admission: Option<Arc<super::metadata_activity::ActivityAdmission>>,
     pub capture_repair_receipt: Option<CaptureRepairReceipt>,
     /// SHA-256 captured from a verified download before embedding, for this
     /// exact path and provider rendition. Never inferred from local checksums.
@@ -1109,6 +1111,39 @@ pub enum SourceMetadataRecovery {
 /// Metadata rewrite markers and hashes.
 #[async_trait]
 pub trait MetadataRewriteStore: Send + Sync {
+    /// Returns the optional owner for non-activating metadata activity evidence.
+    fn metadata_activity_owner(
+        &self,
+    ) -> Option<&dyn super::metadata_activity::MetadataActivityOwner> {
+        None
+    }
+
+    /// Reject unfinished authenticated activity on the relevant target. This is
+    /// a preflight, not authority to publish or a filesystem race fence.
+    async fn validate_metadata_activity_conflicts(
+        &self,
+        pending: &PendingMetadataRewrite,
+        queue: MetadataRewriteQueue,
+        flags: u8,
+        root: &Path,
+    ) -> Result<(), StateError> {
+        match self.metadata_activity_owner() {
+            Some(owner) => {
+                owner
+                    .validate_conflicts(
+                        pending,
+                        queue,
+                        flags,
+                        root,
+                        pending.activity_admission.as_deref(),
+                    )
+                    .await
+            }
+            None if pending.activity_admission.is_some() => Err(StateError::ProviderWorkConflict),
+            None => Ok(()),
+        }
+    }
+
     /// Called under the destination lock before any selected metadata write.
     async fn validate_metadata_writer(
         &self,
