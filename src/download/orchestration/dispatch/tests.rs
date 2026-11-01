@@ -833,6 +833,24 @@ async fn smart_only_delta_successor_retains_missing_query_token_hold() {
 }
 
 #[test]
+fn invalid_incremental_pass_index_never_falls_back_to_inventory() {
+    let error = anyhow::Error::new(super::super::incremental::InvalidIncrementalPassIndex)
+        .context("incremental routing");
+    assert_eq!(
+        super::classify_incremental_error(&error),
+        super::IncrementalErrorClass::CaptureRefused
+    );
+    assert_eq!(
+        super::classify_selection_incremental_error(&error),
+        super::IncrementalErrorClass::CaptureRefused
+    );
+    assert_eq!(
+        super::classify_incremental_error(&anyhow::anyhow!("other decode failure")),
+        super::IncrementalErrorClass::StaticFallback
+    );
+}
+
+#[test]
 fn unaccounted_current_record_cannot_fall_back_to_inventory() {
     let error = anyhow::Error::new(crate::icloud::photos::error::UnaccountedChangeError);
     assert_eq!(
@@ -843,4 +861,232 @@ fn unaccounted_current_record_cannot_fall_back_to_inventory() {
         super::classify_selection_incremental_error(&error),
         super::IncrementalErrorClass::CaptureRefused
     );
+}
+
+// Synthetic provider adapter: records and session authority are deliberately
+// local to this fixture, with separate inventory and lookup call counts.
+#[derive(Clone)]
+struct InvalidRouteSession {
+    owner: crate::state::db::account::AccountOwner,
+    records: Arc<Vec<Value>>,
+    changes: Arc<AtomicUsize>,
+    inventory: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for InvalidRouteSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        if url.contains("/changes/zone?") {
+            self.changes.fetch_add(1, Ordering::SeqCst);
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"records":self.records.as_ref(),"syncToken":"synthetic-next","moreComing":false}]}),
+            );
+        }
+        if url.contains("/records/query?") || url.contains("/internal/records/query/batch") {
+            self.inventory.fetch_add(1, Ordering::SeqCst);
+            return Ok(json!({"records":[],"syncToken":"synthetic-query"}));
+        }
+        if url.contains("/records/lookup?") {
+            let request: Value = serde_json::from_str(&body)?;
+            let names = request["records"].as_array().cloned().unwrap_or_default();
+            let records: Vec<_> = self
+                .records
+                .iter()
+                .filter(|record| {
+                    names
+                        .iter()
+                        .any(|name| name["recordName"] == record["recordName"])
+                })
+                .cloned()
+                .collect();
+            return Ok(json!({"records": records}));
+        }
+        anyhow::bail!("unexpected synthetic provider endpoint")
+    }
+
+    async fn current_source_authority(
+        &self,
+    ) -> Option<crate::icloud::photos::session::SourceAuthority> {
+        crate::icloud::photos::session::SourceAuthority::synthetic(
+            &self.owner,
+            "https://synthetic.example",
+        )
+    }
+
+    async fn post_changes_with_evidence(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+        invocation: crate::icloud::photos::session::InvocationToken,
+    ) -> anyhow::Result<crate::icloud::photos::session::ChangesResponse> {
+        let response = self.post(url, body.clone(), headers).await?;
+        crate::icloud::photos::session::ChangesResponse::synthetic(
+            &self.owner,
+            "https://synthetic.example",
+            url,
+            &body,
+            headers,
+            &serde_json::to_vec(&response)?,
+            invocation,
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+async fn invalid_route_refuses_actual_collecting_dispatch(selected: bool) {
+    use super::super::incremental::{InvalidIncrementalPassIndex, invalid_route_test_hook};
+    use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig};
+
+    let server = crate::test_helpers::start_wiremock_or_skip("invalid selected route")
+        .await
+        .expect("synthetic loopback server");
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("media");
+    std::fs::create_dir(&root).unwrap();
+    let owner = crate::state::db::account::AccountOwner::authenticated(
+        "routing-fixture@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-routing-owner"}})).unwrap(),
+    )
+    .unwrap();
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    let checkpoint_key = "sync_token:v27:PrimarySync";
+    db.set_metadata(checkpoint_key, "synthetic-before")
+        .await
+        .unwrap();
+    let mut records = incremental_photo_records("MASTER_ROUTE");
+    for record in &mut records {
+        record["zoneID"] = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        if record["recordType"] == "CPLMaster" {
+            record["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+                json!(format!("{}/unexpected", server.uri()));
+        } else {
+            record["fields"]["masterRef"]["value"]["zoneID"] =
+                json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        }
+    }
+    // This album event is intentionally applied before the invalid route is
+    // encountered; the refusal does not roll back preceding durable effects.
+    records.push(json!({"recordName":"album-before-refusal","recordType":"CPLAlbum","recordChangeTag":"synthetic-album-tag","zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"fields":{"albumName":{"value":"Synthetic Before"}}}));
+    let changes = Arc::new(AtomicUsize::new(0));
+    let inventory = Arc::new(AtomicUsize::new(0));
+    let session = InvalidRouteSession {
+        owner: owner.clone(),
+        records: Arc::new(records),
+        changes: changes.clone(),
+        inventory: inventory.clone(),
+    };
+    let mut album = PhotoAlbum::new(
+        PhotoAlbumConfig {
+            params: Arc::default(),
+            service_endpoint:
+                "https://synthetic.example/database/1/com.apple.photos.cloud/production/private"
+                    .into(),
+            name: "Unfiled".into(),
+            list_type: "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted".into(),
+            obj_type: "CPLAssetByAssetDateWithoutHiddenOrDeleted".into(),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(session),
+    );
+    if selected {
+        album.set_shadow_capture(
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner, "com"),
+            "private".into(),
+        );
+    }
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::default(),
+    };
+    // Two ordinary unfiled passes force the collecting path; a selected
+    // context already selects it with one pass.
+    let passes = if selected {
+        vec![pass]
+    } else {
+        vec![pass.clone(), pass]
+    };
+    let mut config = incremental_test_config(&dir);
+    config.directory = Arc::from(root.as_path());
+    config.state_db = Some(db.clone());
+    config.library = Arc::from("PrimarySync");
+    config.sync_mode = SyncMode::Incremental {
+        zone_sync_token: "synthetic-before".into(),
+    };
+    let result = invalid_route_test_hook::scope(
+        invalid_route_test_hook::Stage::Event,
+        download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        ),
+    )
+    .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("invalid route must refuse rather than fall back"),
+    };
+    assert!(
+        error
+            .downcast_ref::<InvalidIncrementalPassIndex>()
+            .is_some(),
+        "actual route hook was reached: {error:#}"
+    );
+    assert_eq!(changes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        inventory.load(Ordering::SeqCst),
+        0,
+        "no records/query or count fallback"
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "no media GET after invalid route"
+    );
+    assert_eq!(
+        db.get_metadata(checkpoint_key).await.unwrap().as_deref(),
+        Some("synthetic-before")
+    );
+    let conn = db.acquire_lock("synthetic prior album effect").unwrap();
+    let persisted: String = conn.query_row(
+        "SELECT album_name FROM album_containers WHERE library='PrimarySync' AND container_id='album-before-refusal'",
+        [], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(
+        persisted, "Synthetic Before",
+        "earlier album event remains durable"
+    );
+    eprintln!(
+        "INVALID_ROUTE_REFUSAL_REACHED selected={selected} fallback=0 media_get=0 prior_album_effect=1 checkpoint=unchanged"
+    );
+}
+
+#[tokio::test]
+async fn selected_invalid_incremental_route_refuses_without_inventory_fallback() {
+    invalid_route_refuses_actual_collecting_dispatch(true).await;
+}
+
+#[tokio::test]
+async fn ordinary_invalid_incremental_route_refuses_without_inventory_fallback() {
+    invalid_route_refuses_actual_collecting_dispatch(false).await;
 }

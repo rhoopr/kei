@@ -867,3 +867,158 @@ async fn initial_album_confirmation_retry(legacy: bool) {
         }
     }
 }
+
+#[tokio::test]
+async fn selected_relation_invalid_route_preserves_outer_checkpoint_and_prior_effects() {
+    use crate::download::invalid_route_test_hook::{Stage, scope};
+
+    let server = crate::start_wiremock_or_skip!();
+    for id in ["album-a", "album-b", "unfiled"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let records = Arc::new(
+        ["album-a", "album-b", "unfiled"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                pair(
+                    id,
+                    &format!("{id}.JPG"),
+                    &format!("{}/{id}", server.uri()),
+                    30 + u8::try_from(index).unwrap(),
+                )
+            })
+            .collect(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("media");
+    std::fs::create_dir(&root).unwrap();
+    let database = dir.path().join("synthetic-state.db");
+    let token_key = sync_token_key(ZONE);
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let mut prior_files = Vec::new();
+    let mut prior_checkpoint = None;
+    for cycle in 0..2 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&database, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        let session = Session {
+            cycle,
+            unavailable_membership: false,
+            incomplete_inventory: false,
+            incomplete_hits: Arc::new(AtomicUsize::new(0)),
+            records: Arc::clone(&records),
+            rank_queries: Arc::new(AtomicUsize::new(0)),
+            lookup_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/private".into(),
+            Arc::default(),
+            Box::new(session.clone()),
+            Arc::new(zone()),
+            "private".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        let capture =
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), baseline_owner(), "com");
+        library.shadow_capture = Some(capture.clone());
+        let passes = vec![
+            selected_album("A", &session, &capture),
+            selected_album("B", &session, &capture),
+            AlbumPass {
+                kind: PassKind::Unfiled,
+                album: library.all(),
+                exclude_ids: Arc::default(),
+            },
+        ];
+        let mut selected = make_run_cycle_library_state_with_passes(ZONE, &token_key, passes);
+        selected.library = library;
+        let base = make_run_cycle_download_config_builder(&root, db.clone());
+        let builder = |mode, exclude, groups, zone| {
+            let mut config = (*base(mode, exclude, groups, zone)).clone();
+            config.folder_structure = "unfiled".into();
+            config.folder_structure_albums = "albums/{album}".into();
+            #[cfg(feature = "xmp")]
+            {
+                config.metadata.xmp_sidecar = false;
+            }
+            Arc::new(config)
+        };
+        let states = [&selected];
+        let config = make_run_cycle_config();
+        let cancel = CancellationToken::new();
+        let operation = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &cancel,
+        );
+        if cycle == 0 {
+            let result = operation.await.unwrap();
+            assert_eq!(result.failed_count, 0);
+            assert_eq!(result.stats.downloaded, 3);
+            prior_checkpoint = db.get_metadata(&token_key).await.unwrap();
+            assert_eq!(prior_checkpoint.as_deref(), Some("album-after-1"));
+            for relative in [
+                "albums/A/album-a.JPG",
+                "albums/B/album-b.JPG",
+                "unfiled/unfiled.JPG",
+            ] {
+                let path = root.join(relative);
+                prior_files.push((
+                    path.clone(),
+                    std::fs::read(&path).unwrap(),
+                    std::fs::metadata(path).unwrap().modified().unwrap(),
+                ));
+            }
+        } else {
+            let result = Box::pin(scope(Stage::Relation, operation)).await;
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("relation route must refuse"),
+            };
+            assert!(
+                format!("{error:#}").contains("incremental routing returned an invalid pass index"),
+                "actual relation hook must be reached"
+            );
+            assert_eq!(db.get_metadata(&token_key).await.unwrap(), prior_checkpoint);
+            assert_eq!(
+                session.rank_queries.load(Ordering::SeqCst),
+                0,
+                "no fallback rank inventory"
+            );
+            let memberships = db
+                .get_live_selected_album_memberships_for_asset(ZONE, "asset-album-a", &["A", "B"])
+                .await
+                .unwrap();
+            assert_eq!(memberships.len(), 1);
+            assert_eq!(
+                memberships[0].container_id.as_str(),
+                "B",
+                "relation deltas committed before refusal"
+            );
+            for (path, bytes, mtime) in &prior_files {
+                assert_eq!(&std::fs::read(path).unwrap(), bytes);
+                assert_eq!(&std::fs::metadata(path).unwrap().modified().unwrap(), mtime);
+            }
+            assert!(!root.join("albums/B/album-a.JPG").exists());
+            eprintln!(
+                "INVALID_RELATION_ROUTE_OUTER_REACHED checkpoint=unchanged fallback_rank=0 prior_relation_effect=1 original_files=stable"
+            );
+        }
+    }
+    server.verify().await;
+}

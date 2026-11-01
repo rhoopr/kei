@@ -39,6 +39,7 @@ pub(crate) use legacy_preservation::{LegacyActivationProof, LegacyFileEvidence};
 pub(crate) mod primary_layout;
 mod reconciliation;
 mod reports;
+pub(crate) mod retry_clock;
 pub(crate) mod source_revalidation;
 mod sparse_identity;
 pub(crate) mod support;
@@ -107,6 +108,10 @@ impl std::fmt::Debug for SqliteStateDb {
 }
 
 impl SqliteStateDb {
+    pub(crate) fn retry_clock_now(&self) -> i64 {
+        retry_clock::now_for_path(&self.path)
+    }
+
     /// Construct actual released state for upgrade tests, never downgrade it.
     #[cfg(test)]
     pub(crate) fn create_stock_v36_for_test(path: &Path, owner: &account::AccountOwner) -> Self {

@@ -7,7 +7,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 42;
+pub(crate) const SCHEMA_VERSION: i32 = 43;
 
 fn migrate_active_selection(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(r"CREATE TABLE IF NOT EXISTS provider_active_generations (
@@ -1488,6 +1488,12 @@ pub(crate) fn migrate_to_version(
         }
         40 => conn.execute_batch(super::db::source_revalidation::DDL)?,
         42 => conn.execute_batch(super::db::metadata_activity::DDL)?,
+        43 => {
+            conn.execute_batch(super::db::provider_generations::transfer_wait::DDL)?;
+            conn.execute_batch(super::db::provider_generations::compact_attestation::DDL)?;
+            conn.execute_batch(super::db::provider_generations::immutable_epochs::DDL)?;
+            conn.execute_batch(super::db::provider_generations::refreshed_transfer::DDL)?;
+        }
         41 => {
             if !column_exists(conn, "download_receipts", "trust_receipt")? {
                 conn.execute_batch(super::db::download_receipts::LOCAL_TRUST_MIGRATION)?;
@@ -2100,8 +2106,9 @@ mod tests {
         assert_eq!(checkpoint, "retained");
         conn.execute_batch("DROP VIEW metadata_activity_prepared_prerequisite;")
             .unwrap();
-        migrate(&conn).unwrap();
-        migrate(&conn).unwrap();
+        conn.execute_batch("SAVEPOINT migration").unwrap();
+        migrate_to_version(&conn, 41, 42).unwrap();
+        conn.execute_batch("RELEASE migration").unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), 42);
         let count:i64=conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('metadata_activity_prerequisite','metadata_activity_prepared_prerequisite')",[],|row|row.get(0)).unwrap();
         assert_eq!(count, 2);
@@ -2116,6 +2123,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(checkpoint, "retained");
+        // Only after reopening the real crash version 42 do the retry tables
+        // migrate together in the following version.
+        migrate(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 43);
+    }
+
+    #[test]
+    fn composed_v42_to_v43_rolls_back_and_reopens_all_retry_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("composed-schema.db");
+        let conn = Connection::open(&path).unwrap();
+        while get_schema_version(&conn).unwrap() < 42 {
+            let current = get_schema_version(&conn).unwrap();
+            migrate_to_version(&conn, current, current + 1).unwrap();
+        }
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 42);
+        let crash_tables: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('metadata_activity_prerequisite','metadata_activity_prepared_prerequisite')",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(crash_tables, 2);
+        conn.execute_batch("CREATE VIEW provider_refreshed_transfer AS SELECT 1 AS marker;")
+            .unwrap();
+        assert!(migrate(&conn).is_err());
+        assert_eq!(get_schema_version(&conn).unwrap(), 42);
+        let partial: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('provider_transfer_dispatch','provider_compact_root_policy','provider_410_failure_epochs','provider_refreshed_transfer')",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(partial, 0, "the entire retry migration must roll back");
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 42);
+        conn.execute_batch("DROP VIEW provider_refreshed_transfer;")
+            .unwrap();
+        migrate(&conn).unwrap();
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), 43);
+        for name in [
+            "metadata_activity_prerequisite",
+            "metadata_activity_prepared_prerequisite",
+            "provider_transfer_dispatch",
+            "provider_transfer_failures",
+            "provider_transfer_waits",
+            "provider_compact_root_policy",
+            "provider_compact_observations",
+            "provider_410_failure_epochs",
+            "provider_410_shared_waits",
+            "provider_refreshed_transfer",
+            "provider_refreshed_waits",
+            "provider_refreshed_success_receipts",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing composed table {name}");
+        }
     }
 
     #[test]

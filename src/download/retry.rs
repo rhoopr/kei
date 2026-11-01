@@ -127,7 +127,7 @@ impl PendingRetryEvidence {
 
 #[derive(Debug)]
 enum LegacyCandidateSelection {
-    Selected(PhotoAsset),
+    Selected(Box<PhotoAsset>),
     InvalidCaptureDate,
     Missing,
     EvidenceMismatch { candidates: usize },
@@ -188,7 +188,7 @@ fn select_legacy_candidate(
                 candidates: candidate_count,
             };
         }
-        return LegacyCandidateSelection::Selected(selected);
+        return LegacyCandidateSelection::Selected(Box::new(selected));
     }
     LegacyCandidateSelection::Ambiguous {
         matches: 2 + matching.count(),
@@ -1265,6 +1265,7 @@ pub(super) async fn build_pending_retry_download_tasks(
                 persisted_owner,
             ) {
                 LegacyCandidateSelection::Selected(asset) => {
+                    let asset = *asset;
                     if persisted_owner.is_none()
                         && !claim_legacy_owner_for_retry(
                             db.as_ref(),

@@ -201,3 +201,22 @@ async fn dry_run_zero_downloads_with_enumeration_errors_returns_partial_failure(
     );
     assert_eq!(stats.enumeration_errors, 2);
 }
+
+#[tokio::test]
+async fn retained_wait_reports_pending_without_a_transfer_failure() {
+    use crate::download::DownloadOutcome;
+    let mut streaming = StreamingResult {
+        enumeration_complete: true,
+        ..StreamingResult::default()
+    };
+    streaming.skip_summary.uncertain = 1;
+    let (outcome, stats) =
+        build_zero_download_outcome(streaming, DownloadControls::download_hidden()).await;
+    assert!(matches!(
+        outcome,
+        DownloadOutcome::PartialFailure { failed_count: 1 }
+    ));
+    assert_eq!(stats.skipped.uncertain, 1);
+    assert_eq!(stats.failed, 0);
+    assert!(!stats.sync_token_blocked);
+}

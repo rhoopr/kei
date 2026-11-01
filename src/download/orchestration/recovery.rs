@@ -115,6 +115,9 @@ async fn run_targeted_recovery_pass(
     }
 
     let pass_config = PassConfig {
+        retry_owners: None,
+        refresh_requests: None,
+        selection_run: config.selection_run.clone(),
         prior_auth_errors: 0,
         url_obtained_at: Default::default(),
         client: download_client,
@@ -159,6 +162,9 @@ async fn run_targeted_recovery_pass(
                 "Retrying tasks after targeted pending URL refresh"
             );
             let retry_pass_config = PassConfig {
+                retry_owners: None,
+                refresh_requests: None,
+                selection_run: config.selection_run.clone(),
                 prior_auth_errors: pass_result.auth_errors,
                 url_obtained_at: retry_plan.url_obtained_at,
                 client: download_client,
@@ -217,8 +223,12 @@ async fn run_targeted_recovery_pass(
         recap: pass_result.recap.clone(),
         ..SyncStats::default()
     };
-    let failed_count =
-        failed + remaining_unmatched + pass_result.exif_failures + pass_result.state_write_failures;
+    stats.skipped.uncertain += pass_result.shared_waiting.len();
+    let failed_count = failed
+        + remaining_unmatched
+        + pass_result.exif_failures
+        + pass_result.state_write_failures
+        + pass_result.shared_waiting.len();
     let outcome = if pass_result.auth_errors >= AUTH_ERROR_THRESHOLD || provider_auth_errors > 0 {
         DownloadOutcome::SessionExpired {
             auth_error_count: pass_result.auth_errors + provider_auth_errors,

@@ -228,7 +228,7 @@ pub(super) fn spawn_stream_download_producer<S>(
     client: reqwest::Client,
     combined: S,
     download_ctx: Arc<DownloadContext>,
-    task_tx: mpsc::Sender<DownloadTask>,
+    task_tx: mpsc::Sender<super::retry_owners::QueuedTask>,
     initial_free_at_start: Option<u64>,
     shared: StreamPipelineShared,
 ) -> StreamProducer
@@ -369,6 +369,7 @@ where
 
                     assets_seen_producer.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let mut selected_plan = None;
+                    let mut selected_owner = None;
                     if let Some(owner_run) = &config.selection_run {
                         let run = match owner_run.for_asset(&asset) {
                             Ok(run) => run,
@@ -512,7 +513,7 @@ where
                         match run
                             .project(
                                 key,
-                                &asset,
+                                (&asset, &observed_asset),
                                 body,
                                 &mut plan,
                                 &mut task_planner,
@@ -521,7 +522,10 @@ where
                             )
                             .await
                         {
-                            Ok(true) => selected_plan = Some(plan),
+                            Ok(true) => {
+                                selected_plan = Some(plan);
+                                selected_owner = Some((Arc::clone(&run), key.to_owned()));
+                            }
                             Ok(false) => {
                                 producer_pb.inc(1);
                                 continue;
@@ -1008,7 +1012,13 @@ where
                                     }
                                     disposition = disposition.max(AssetDisposition::Forwarded);
                                     let size = task.size;
-                                    if task_tx.send(task).await.is_err() {
+                                    let origin = match &selected_owner {
+                                        Some((run, pass)) if task.publication_binding.as_deref()
+                                            .is_some_and(|binding| &binding.origin_pass == pass) =>
+                                            super::retry_owners::ProducerOrigin::Selected { run: Arc::clone(run), pass: pass.clone() },
+                                        _ => super::retry_owners::ProducerOrigin::Unknown,
+                                    };
+                                    if task_tx.send(super::retry_owners::QueuedTask { task, origin }).await.is_err() {
                                         return skips;
                                     }
                                     if forecast_check(size) {

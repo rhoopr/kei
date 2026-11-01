@@ -1425,18 +1425,41 @@ async fn issue845_partial_movie_case(repeated_observation: bool) {
             })).collect()
         };
         if cycle == 1 {
-            let changes = request_trace
-                .iter()
-                .filter(|request| {
-                    request["endpoint"] == "changes"
-                        && request["zone"] == SOURCE
-                        && request["cursor"] == "current-0"
-                })
-                .count();
-            assert_eq!(
-                changes, 1,
-                "the intended Shared changes page must be requested"
-            );
+            eprintln!("ISSUE845_CYCLE1_REQUEST_TRACE {request_trace:?}");
+            if repeated_observation {
+                let changes = request_trace
+                    .iter()
+                    .filter(|request| {
+                        request["endpoint"] == "changes"
+                            && request["zone"] == SOURCE
+                            && request["cursor"] == "current-0"
+                    })
+                    .count();
+                assert_eq!(
+                    changes, 1,
+                    "the intended Shared changes page must be requested"
+                );
+            } else {
+                let full_queries = request_trace
+                    .iter()
+                    .filter(|request| {
+                        request["endpoint"] == "query"
+                            && request["zone"] == SOURCE
+                            && request["query_type"]
+                                == "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"
+                    })
+                    .count();
+                assert!(
+                    full_queries > 0,
+                    "the Shared full-date pass must be requested"
+                );
+                assert!(
+                    !request_trace
+                        .iter()
+                        .any(|request| request["endpoint"] == "changes"),
+                    "this reopen follows the observed full-date path without a changes request"
+                );
+            }
         }
         eprintln!(
             "ISSUE845_DIAG_COLUMNS owner_destinations=[generation,account,provider,scope,config_hash,basis,metadata_enabled,specification,specification_hash,sealed,checkpoint_ready,checkpoint_veto,seal_hash,seal_header_hash,created_at,replay_after,last_replayed_at,generation_charged_bytes,pass,child,manifest,manifest_hash,outcome,admission,reason,admission_hash,attempts,next_retry_at,decision_charged_bytes,compacted_hash,library,asset_id,master,version,path,compat_path,checksum,size,created_at,added_at,metadata_hash,admitted,verified_media,verified_metadata,local_checksum,source_checksum,grouping_hash,intent_hash,progress_hash,prepared_checksum,prepared_size,prepared_hash]"
@@ -1623,10 +1646,23 @@ async fn issue845_partial_movie_case(repeated_observation: bool) {
                 }
             }
         }
+        {
+            let (attestations, epochs, waits): (i64, i64, i64) = conn.query_row(
+                "SELECT (SELECT count(*) FROM provider_compact_observations WHERE generation=?1 AND pass_key=?2 AND child='asset-shared'), (SELECT count(*) FROM provider_410_failure_epochs WHERE generation=?1 AND pass_key=?2 AND child='asset-shared'), (SELECT count(*) FROM provider_refreshed_waits WHERE generation=?1 AND pass_key=?2 AND child='asset-shared')",
+                rusqlite::params![retry[0].as_str().unwrap(), expected_pass],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).unwrap();
+            assert_eq!(
+                (attestations, epochs, waits),
+                (0, 0, 0),
+                "a Value-only response cannot authorize a compact movie wait"
+            );
+            assert!(deadline > after_time, "unproven selection remains held");
+        }
         saved_retry = Some(retry);
         drop(conn);
         let requests = movie_gets.load(Ordering::SeqCst) - before_requests;
-        let expected_requests = if cycle == 1 { 0 } else { 2 };
+        let expected_requests = if cycle == 1 { 0 } else { 1 };
         assert_eq!(
             requests, expected_requests,
             "per-cycle 410 requests on cycle {cycle}"
@@ -1638,3 +1674,5 @@ async fn issue845_partial_movie_case(repeated_observation: bool) {
     }
     server.verify().await;
 }
+
+mod issue845_wait;

@@ -145,6 +145,7 @@ async fn run<C: DownloadClient>(
             rate_limit_counter: None,
             bandwidth_limiter: None,
             shutdown_token: token,
+            selection_wait: None,
             mode: crate::personality::Mode::Off,
         },
     )
@@ -528,6 +529,9 @@ async fn twins_finish_both_passes_with_independent_metadata_and_reopened_state()
         if explicit {
             let result = run_download_pass(
                 PassConfig {
+                    retry_owners: None,
+                    refresh_requests: None,
+                    selection_run: None,
                     prior_auth_errors: 0,
                     url_obtained_at: Default::default(),
                     client: &client,
@@ -809,7 +813,7 @@ async fn streaming_auth_abort_drains_peer_claim_and_lease() {
         ))
         .await
         .unwrap();
-        tx.send(task).await.unwrap();
+        tx.send(task.into()).await.unwrap();
     }
     drop(tx);
     let shutdown = CancellationToken::new();
@@ -946,7 +950,7 @@ async fn auth_abort_waits_for_detached_metadata_publication_before_unlock() {
         .await
         .unwrap();
         if index == 0 {
-            tx.send(task).await.unwrap();
+            tx.send(task.into()).await.unwrap();
         } else {
             auth_tasks.push(task);
         }
@@ -993,7 +997,7 @@ async fn auth_abort_waits_for_detached_metadata_publication_before_unlock() {
     );
     // Introduce auth failures only after detached publication owns the destination.
     for task in auth_tasks {
-        tx.send(task).await.unwrap();
+        tx.send(task.into()).await.unwrap();
     }
     drop(tx);
     tokio::time::timeout(std::time::Duration::from_secs(5), shutdown.cancelled())
@@ -1050,4 +1054,41 @@ async fn auth_abort_waits_for_detached_metadata_publication_before_unlock() {
             .await
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn selected_completion_guard_survives_waiter_abort() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("selected-guard.jpg");
+    let shutdown = CancellationToken::new();
+    let guard = crate::download::file::lock_download_destination(&path, &shutdown)
+        .await
+        .unwrap();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let owner_entered = Arc::clone(&entered);
+    let owner_release = Arc::clone(&release);
+    let waiter = tokio::spawn(super::hold_guard_through(guard, async move {
+        owner_entered.notify_one();
+        owner_release.notified().await;
+    }));
+    entered.notified().await;
+    waiter.abort();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            crate::download::file::lock_download_destination(&path, &shutdown),
+        )
+        .await
+        .is_err()
+    );
+    release.notify_one();
+    let next_guard = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::download::file::lock_download_destination(&path, &shutdown),
+    )
+    .await
+    .expect("owner must release the destination")
+    .unwrap();
+    drop(next_guard);
 }

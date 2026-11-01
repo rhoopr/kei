@@ -35,6 +35,7 @@ pub(in crate::download) struct StreamingResult {
     pub(in crate::download) downloaded: usize,
     pub(in crate::download) exif_failures: usize,
     pub(in crate::download) failed: Vec<DownloadTask>,
+    pub(in crate::download) retry_owners: super::retry_owners::RetryOwners,
     pub(in crate::download) auth_errors: usize,
     /// CloudKit session failures require recovery even without failed CDN transfers.
     pub(in crate::download) provider_auth_errors: usize,
@@ -83,7 +84,7 @@ pub(super) async fn finalize_streaming_download(
     let pb = shared.pb;
     let pipeline_shutdown = shared.pipeline_shutdown;
 
-    let (producer_panicked, producer_skips) = match handle.await {
+    let (producer_panicked, mut producer_skips) = match handle.await {
         Ok(skips) => (false, skips),
         Err(e) if e.is_panic() => {
             tracing::error!(target: "kei::download::pipeline", error = ?e, "Asset producer task panicked");
@@ -253,7 +254,10 @@ pub(super) async fn finalize_streaming_download(
             .enumeration_complete
             .load(std::sync::atomic::Ordering::Relaxed);
 
+    producer_skips.uncertain += consumer.shared_waits;
+    let retry_owners = consumer.retry_owners;
     Ok(StreamingResult {
+        retry_owners,
         downloaded: consumer.downloaded,
         exif_failures: consumer.exif_failures,
         failed: consumer.failed,
@@ -375,6 +379,7 @@ pub(in crate::download) async fn build_download_result(
             "concurrency": config.concurrent_downloads,
         }),
     );
+    let retry_owners = streaming_result.retry_owners;
     let failed_tasks = streaming_result.failed;
     let skip_breakdown: crate::download::SkipBreakdown = streaming_result.skip_summary.into();
 
@@ -575,23 +580,78 @@ pub(in crate::download) async fn build_download_result(
     // Failed tasks already retain exact provider identities and destinations.
     // Refresh those identities even for ordinary transfer failures; a failed
     // download is not evidence that the completed inventory must be repeated.
-    let retry_plan = if let Some(context) = &config.selection_context {
-        if let Some(run) = &config.selection_run {
-            run.remember_retry_sources(&failed_tasks, passes, config)
-                .await?;
+    let mut selected_retry_tasks = Vec::new();
+    let mut unselected_retry_tasks = Vec::new();
+    let guarded_retry = config.selection_context.is_some() || retry_owners.saw_selection();
+    if guarded_retry {
+        for task in &failed_tasks {
+            match retry_owners.get(task) {
+                Some(super::retry_owners::ResolvedOwner::Selected(_, _))
+                    if config.selection_context.is_some() =>
+                {
+                    selected_retry_tasks.push(task.clone())
+                }
+                Some(super::retry_owners::ResolvedOwner::Ordinary) => {
+                    unselected_retry_tasks.push(task.clone());
+                }
+                _ => checkpoint.identity_incomplete = true,
+            }
+        }
+    } else {
+        unselected_retry_tasks.clone_from(&failed_tasks);
+    }
+    let mut retry_plan = if let Some(context) = &config.selection_context {
+        let mut proven = Vec::new();
+        for task in &selected_retry_tasks {
+            let Some(super::retry_owners::ResolvedOwner::Selected(run, _)) = retry_owners.get(task)
+            else {
+                checkpoint.identity_incomplete = true;
+                continue;
+            };
+            match run
+                .remember_retry_sources(std::slice::from_ref(task), passes, config)
+                .await
+            {
+                Ok(true) => proven.push(task.clone()),
+                Ok(false) => {
+                    run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                    checkpoint.identity_incomplete = true;
+                }
+                Err(error)
+                    if crate::download::orchestration::generation::retry_source_item_error(
+                        &error,
+                    ) =>
+                {
+                    run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                    checkpoint.identity_incomplete = true;
+                }
+                Err(error) => return Err(error),
+            }
         }
         let sources = context.exact_retry_sources()?;
-        crate::download::orchestration::url_refresh::build_incremental_expired_url_retry_tasks(
+        crate::download::orchestration::url_refresh::build_selected_cleanup_request_plan(
             passes,
             &sources,
-            &failed_tasks,
+            &proven,
             shutdown_token.clone(),
         )
         .await
     } else {
-        crate::download::build_retry_download_tasks(passes, &failed_tasks, shutdown_token.clone())
-            .await?
+        crate::download::orchestration::url_refresh::CleanupRetryPlan::default()
     };
+    if !unselected_retry_tasks.is_empty() {
+        let other = crate::download::build_retry_download_tasks(
+            passes,
+            &unselected_retry_tasks,
+            shutdown_token.clone(),
+        )
+        .await?;
+        retry_plan.tasks.extend(other.tasks);
+        retry_plan.unrefreshed.extend(other.unrefreshed);
+        retry_plan.url_obtained_at.extend(other.url_obtained_at);
+        retry_plan.provider_auth_errors += other.provider_auth_errors;
+        retry_plan.rate_limit_observations += other.rate_limit_observations;
+    }
     tracing::debug!(target: "kei::download::pipeline",
         count = retry_plan.tasks.len(),
         "  Re-fetched failed tasks with fresh URLs"
@@ -599,6 +659,12 @@ pub(in crate::download) async fn build_download_result(
 
     let phase2_rate_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pass_config = PassConfig {
+        retry_owners: guarded_retry.then(|| Arc::new(retry_owners)),
+        refresh_requests: config
+            .selection_context
+            .is_some()
+            .then_some(retry_plan.refresh_requests),
+        selection_run: config.selection_run.clone(),
         prior_auth_errors: auth_errors,
         url_obtained_at: retry_plan.url_obtained_at,
         client: download_client,
@@ -752,7 +818,7 @@ fn finish_download_result(
     let outcome = if stats.skipped.uncertain > 0 {
         tracing::warn!(
             pending = stats.skipped.uncertain,
-            "Existing files still need reliable content evidence; pending work retained"
+            "Some selected work remains pending; retry evidence retained"
         );
         match outcome {
             DownloadOutcome::Success => DownloadOutcome::PartialFailure {

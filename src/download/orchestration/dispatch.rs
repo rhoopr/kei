@@ -46,8 +46,11 @@ enum IncrementalErrorClass {
 /// fall back so malformed token responses do not strand the user.
 fn classify_incremental_error(error: &anyhow::Error) -> IncrementalErrorClass {
     if error
-        .downcast_ref::<crate::icloud::photos::error::UnaccountedChangeError>()
+        .downcast_ref::<super::incremental::InvalidIncrementalPassIndex>()
         .is_some()
+        || error
+            .downcast_ref::<crate::icloud::photos::error::UnaccountedChangeError>()
+            .is_some()
         || error
             .downcast_ref::<crate::icloud::photos::error::MissingChangesSuccessor>()
             .is_some()
@@ -505,6 +508,8 @@ async fn download_photos_with_sync_inner(
             .await
         }
         SyncMode::Incremental { zone_sync_token } if config.selection_context.is_some() => {
+            #[cfg(test)]
+            super::incremental::invalid_route_test_hook::record_dispatch(true, false);
             match download_photos_incremental(
                 download_client,
                 passes,
@@ -519,6 +524,8 @@ async fn download_photos_with_sync_inner(
                 Err(error) => match classify_selection_incremental_error(&error) {
                     class @ (IncrementalErrorClass::TokenFallback
                     | IncrementalErrorClass::StaticFallback) => {
+                        #[cfg(test)]
+                        super::incremental::invalid_route_test_hook::record_dispatch(true, true);
                         Box::pin(super::generation::inventory(
                             download_client,
                             passes,
@@ -588,6 +595,8 @@ async fn download_photos_with_sync_inner(
                     .await
                 }
                 IncrementalRoutingDecision::Safe => {
+                    #[cfg(test)]
+                    super::incremental::invalid_route_test_hook::record_dispatch(false, false);
                     let token = zone_sync_token.clone();
                     let has_smart_folder_pass = passes
                         .iter()
@@ -621,6 +630,10 @@ async fn download_photos_with_sync_inner(
                         Err(e) => match classify_incremental_error(&e) {
                             class @ (IncrementalErrorClass::TokenFallback
                             | IncrementalErrorClass::StaticFallback) => {
+                                #[cfg(test)]
+                                super::incremental::invalid_route_test_hook::record_dispatch(
+                                    false, true,
+                                );
                                 let reason = FullEnumerationReason::OtherStaticReason;
                                 tracing::warn!(
                                     error = %e,

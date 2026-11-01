@@ -47,6 +47,83 @@ use super::url_refresh::{
     refresh_stale_incremental_tasks_before_download,
 };
 
+/// A route must identify a pass in the current pass set.
+/// Refuse this cycle instead of allowing an unsafe fallback inventory.
+#[derive(Debug, thiserror::Error)]
+#[error("incremental routing returned an invalid pass index")]
+pub(super) struct InvalidIncrementalPassIndex;
+
+#[cfg(test)]
+pub(crate) mod invalid_route_test_hook {
+    use std::cell::Cell;
+    use std::future::Future;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Stage {
+        Event,
+        Relation,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct DispatchCounts {
+        pub(crate) selected: usize,
+        pub(crate) ordinary: usize,
+        pub(crate) selected_fallback: usize,
+        pub(crate) ordinary_fallback: usize,
+    }
+
+    tokio::task_local! {
+        static STAGE: Cell<Option<Stage>>;
+        static DISPATCH_COUNTS: Cell<DispatchCounts>;
+    }
+
+    pub(crate) async fn scope<F: Future>(stage: Stage, future: F) -> F::Output {
+        STAGE.scope(Cell::new(Some(stage)), future).await
+    }
+
+    pub(crate) async fn scope_counted<F: Future>(
+        stage: Stage,
+        future: F,
+    ) -> (F::Output, DispatchCounts) {
+        DISPATCH_COUNTS
+            .scope(Cell::new(DispatchCounts::default()), async move {
+                let result = STAGE.scope(Cell::new(Some(stage)), future).await;
+                (result, DISPATCH_COUNTS.with(Cell::get))
+            })
+            .await
+    }
+
+    pub(in crate::download::orchestration) fn record_dispatch(selected: bool, fallback: bool) {
+        let _ = DISPATCH_COUNTS.try_with(|cell| {
+            let mut counts = cell.get();
+            match (selected, fallback) {
+                (true, false) => counts.selected += 1,
+                (false, false) => counts.ordinary += 1,
+                (true, true) => counts.selected_fallback += 1,
+                (false, true) => counts.ordinary_fallback += 1,
+            }
+            cell.set(counts);
+        });
+    }
+
+    pub(super) fn append_once(mut indices: Vec<usize>, stage: Stage, invalid: usize) -> Vec<usize> {
+        let inject = STAGE
+            .try_with(|cell| {
+                if cell.get() == Some(stage) {
+                    cell.set(None);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if inject {
+            indices.push(invalid);
+        }
+        indices
+    }
+}
+
 fn single_unfiled_streaming_pass<'a>(
     passes: &'a [crate::commands::AlbumPass],
     config: &DownloadConfig,
@@ -545,7 +622,27 @@ async fn run_collecting_metadata_rewrite_batch(
     .failed
 }
 
-pub(super) async fn download_photos_incremental_collecting_inner(
+pub(super) fn download_photos_incremental_collecting_inner<'a>(
+    download_client: &'a Client,
+    passes: &'a [crate::commands::AlbumPass],
+    config: &'a Arc<DownloadConfig>,
+    zone_sync_token: &'a str,
+    controls: DownloadControls,
+    shutdown_token: CancellationToken,
+    preflight_url_refresh_after: Duration,
+) -> impl std::future::Future<Output = Result<SyncResult>> + 'a {
+    Box::pin(download_photos_incremental_collecting_unboxed(
+        download_client,
+        passes,
+        config,
+        zone_sync_token,
+        controls,
+        shutdown_token,
+        preflight_url_refresh_after,
+    ))
+}
+
+async fn download_photos_incremental_collecting_unboxed(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
     config: &Arc<DownloadConfig>,
@@ -591,9 +688,29 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     // cycle with work.
     if let Some(pass) = delta_pass {
         let phase_started = Instant::now();
-        let (mut change_stream, token_rx, observed) = pass
-            .album
-            .changes_stream_observed(zone_sync_token, collection_independent_rank(passes));
+        let stage = if config.selection_context.is_some() {
+            pass.album
+                .authenticated_zone_scope()
+                .await
+                .and_then(|context| {
+                    crate::icloud::photos::source_causality::ZoneStage::new(
+                        context,
+                        passes.iter().map(super::generation::pass_key).collect(),
+                    )
+                })
+        } else {
+            None
+        };
+        let (mut change_stream, token_rx, observed) = if let Some(stage) = stage {
+            pass.album.changes_stream_observed_with_stage(
+                zone_sync_token,
+                collection_independent_rank(passes),
+                stage,
+            )
+        } else {
+            pass.album
+                .changes_stream_observed(zone_sync_token, collection_independent_rank(passes))
+        };
 
         let mut missing_successor = false;
         loop {
@@ -785,8 +902,24 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             .await
         {
             Ok(pass_indices) => {
+                #[cfg(test)]
+                let pass_indices = invalid_route_test_hook::append_once(
+                    pass_indices,
+                    invalid_route_test_hook::Stage::Event,
+                    passes.len(),
+                );
                 for pass_index in pass_indices {
-                    downloadable_assets.push((asset.clone(), pass_index));
+                    let pass = passes.get(pass_index).ok_or(InvalidIncrementalPassIndex)?;
+                    let selected = if !routing.has_selected_albums()
+                        && pass.kind == crate::commands::PassKind::Unfiled
+                    {
+                        asset
+                            .clone()
+                            .with_direct_zone_route(&super::generation::pass_key(pass))
+                    } else {
+                        asset.clone()
+                    };
+                    downloadable_assets.push((selected, pass_index));
                 }
             }
             Err(e) => {
@@ -817,11 +950,27 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             .await
             {
                 Ok(indices) => {
+                    #[cfg(test)]
+                    let indices = invalid_route_test_hook::append_once(
+                        indices,
+                        invalid_route_test_hook::Stage::Relation,
+                        passes.len(),
+                    );
                     for index in indices {
+                        let pass = passes.get(index).ok_or(InvalidIncrementalPassIndex)?;
                         if !downloadable_assets.iter().any(|(prior, pass)| {
                             *pass == index && prior.asset_record_name() == asset.asset_record_name()
                         }) {
-                            downloadable_assets.push((asset.clone(), index));
+                            let selected = if !routing.has_selected_albums()
+                                && pass.kind == crate::commands::PassKind::Unfiled
+                            {
+                                asset
+                                    .clone()
+                                    .with_direct_zone_route(&super::generation::pass_key(pass))
+                            } else {
+                                asset.clone()
+                            };
+                            downloadable_assets.push((selected, index));
                         }
                     }
                 }
@@ -1519,6 +1668,9 @@ pub(super) async fn download_photos_incremental_collecting_inner(
 
     // Run the download pass on the collected tasks
     let pass_config = PassConfig {
+        retry_owners: None,
+        refresh_requests: None,
+        selection_run: config.selection_run.clone(),
         prior_auth_errors: 0,
         url_obtained_at,
         client: download_client,
@@ -1566,6 +1718,9 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 "Retrying tasks after targeted incremental URL refresh"
             );
             let retry_pass_config = PassConfig {
+                retry_owners: None,
+                refresh_requests: None,
+                selection_run: config.selection_run.clone(),
                 prior_auth_errors: pass_result.auth_errors,
                 url_obtained_at: retry_plan.url_obtained_at,
                 client: download_client,
@@ -1607,6 +1762,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         }
     }
 
+    skip_breakdown.uncertain += pass_result.shared_waiting.len();
     let mut stats = SyncStats {
         assets_seen: 0, // incremental doesn't have total library count
         downloaded: succeeded,

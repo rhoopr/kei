@@ -762,6 +762,16 @@ impl Session {
         self.principal.as_deref()
     }
 
+    // Existing authenticated session model; does not freeze shared cookies.
+    pub(crate) fn account_namespace(&self) -> &str {
+        &self.sanitized_username
+    }
+    pub(crate) fn photos_service_root(&self) -> Option<&str> {
+        self.session_data
+            .get("ckdatabasews_url")
+            .map(String::as_str)
+    }
+
     pub(crate) fn cookiejar_path(&self) -> PathBuf {
         self.cookie_dir.join(&self.sanitized_username)
     }

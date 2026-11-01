@@ -1,5 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 /// Deserializes a JSON string, treating `null` as an empty string.
 /// Used for fields like `recordType` that Apple sends as `null` for hard-deleted records.
@@ -56,8 +57,16 @@ pub(crate) struct BatchQueryResponse {
     pub batch: Vec<QueryResponse>,
 }
 
-/// A `CloudKit` record. Fields are kept as dynamic JSON because Apple's schema
-/// varies by record type and changes without notice.
+/// Redacted raw value retained only for a proven staged source record.
+#[derive(Clone)]
+pub(crate) struct RecordObservation(Arc<Value>, Option<super::source_causality::SourceOrdinal>);
+impl std::fmt::Debug for RecordObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted provider record>")
+    }
+}
+
+/// A `CloudKit` record. Generic deserialization retains no source evidence.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Record {
@@ -69,6 +78,59 @@ pub(crate) struct Record {
     pub fields: Value,
     #[serde(default)]
     pub deleted: Option<bool>,
+    #[serde(skip)]
+    pub(crate) observation: Option<RecordObservation>,
+}
+
+impl Record {
+    /// Return the original parsed value only while the decoded record still
+    /// matches it. A modified or manually constructed record is not evidence.
+    pub(crate) fn observed_value(&self) -> Option<&Value> {
+        let raw = self.observation.as_ref()?.0.as_ref();
+        let object = raw.as_object()?;
+        let name = match object.get("recordName") {
+            None => "",
+            Some(value) => value.as_str()?,
+        };
+        let kind = match object.get("recordType") {
+            None | Some(Value::Null) => "",
+            Some(value) => value.as_str()?,
+        };
+        let deleted = match object.get("deleted") {
+            None | Some(Value::Null) => None,
+            Some(Value::Bool(value)) => Some(*value),
+            Some(_) => return None,
+        };
+        let fields_match = object
+            .get("fields")
+            .map_or(self.fields.is_null(), |fields| fields == &self.fields);
+        (name == self.record_name
+            && kind == self.record_type
+            && fields_match
+            && deleted == self.deleted)
+            .then_some(raw)
+    }
+
+    pub(crate) fn source_ordinal(&self) -> Option<&super::source_causality::SourceOrdinal> {
+        self.observation.as_ref()?.1.as_ref()
+    }
+
+    pub(crate) fn attach_source_ordinal(
+        &mut self,
+        source: super::source_causality::SourceOrdinal,
+    ) -> Option<()> {
+        // An invalid source must not leave any previous observation attached.
+        self.observation = None;
+        let raw = Arc::new(source.raw_record()?.clone());
+        self.observation = Some(RecordObservation(raw, Some(source)));
+        Some(())
+    }
+
+    /// This inventory never emits assets and intentionally retains only
+    /// compacted fields. Drop the unneeded original before accounting memory.
+    pub(crate) fn discard_observation(&mut self) {
+        self.observation = None;
+    }
 }
 
 /// Response from `/changes/database`.
@@ -134,6 +196,12 @@ mod tests {
         assert_eq!(resp.zones.len(), 2);
         assert_eq!(resp.zones[0].zone_id.zone_name, "PrimarySync");
         assert_eq!(resp.zones[1].deleted, Some(true));
+    }
+
+    #[test]
+    fn generic_value_does_not_issue_source_evidence() {
+        let record: Record = serde_json::from_value(serde_json::json!({"recordName":"m","recordType":"CPLMaster","recordChangeTag":"synthetic","fields":{}})).unwrap();
+        assert!(record.observed_value().is_none());
     }
 
     #[test]

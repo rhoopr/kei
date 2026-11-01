@@ -113,6 +113,9 @@ async fn persistent_expiry_does_not_starve_delayed_healthy_peer() {
     };
     let result = run_download_pass(
         PassConfig {
+            retry_owners: None,
+            refresh_requests: None,
+            selection_run: None,
             prior_auth_errors: 0,
             url_obtained_at: Default::default(),
             client: &client,
@@ -497,6 +500,9 @@ async fn cancelled_explicit_dispatch_reports_and_persists_every_unfinished_task(
     };
     let worker = run_download_pass(
         PassConfig {
+            retry_owners: None,
+            refresh_requests: None,
+            selection_run: None,
             prior_auth_errors: 0,
             url_obtained_at: Default::default(),
             client: &client,
@@ -514,9 +520,9 @@ async fn cancelled_explicit_dispatch_reports_and_persists_every_unfinished_task(
         },
         tasks,
     );
-    let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+    let (result, ()) = Box::pin(tokio::time::timeout(Duration::from_secs(3), async {
         tokio::join!(worker, cancel)
-    })
+    }))
     .await
     .expect("shutdown must interrupt an active transfer promptly");
     assert_eq!(result.downloaded, 0);
@@ -851,6 +857,9 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
         };
         let result = run_download_pass(
             PassConfig {
+                retry_owners: None,
+                refresh_requests: None,
+                selection_run: None,
                 prior_auth_errors: 0,
                 url_obtained_at: plan.url_obtained_at,
                 client: &client,
@@ -1082,6 +1091,9 @@ async fn explicit_retry_enforces_cumulative_auth_threshold_and_retains_queued_de
     };
     let result = run_download_pass(
         PassConfig {
+            retry_owners: None,
+            refresh_requests: None,
+            selection_run: None,
             prior_auth_errors: 2,
             url_obtained_at: Default::default(),
             client: &client,
@@ -1336,4 +1348,70 @@ async fn recorded_retry_refresh_uses_original_pass_not_current_index() {
     assert!(refused.tasks.is_empty());
     assert_eq!(refused.unrefreshed.len(), 1);
     assert_eq!(original_requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn authenticated_cleanup_holds_value_only_task_without_selection_owner() {
+    use super::{RetryTaskKey, UrlRetrySource, build_selected_cleanup_request_plan};
+    let records = incremental_photo_records_with_url(
+        "MASTER",
+        "synthetic.jpg",
+        "https://example.invalid/synthetic",
+        8,
+    );
+    let mut task = retry_test_task("child-state", VersionSizeKey::Original, "unused");
+    task.asset_record_name = "asset-MASTER".into();
+    task.size = 8;
+    let passes = vec![AlbumPass {
+        kind: PassKind::Unfiled,
+        album: album_with_session(
+            "PrimarySync",
+            "",
+            Box::new(BoundedSession {
+                delta: Arc::new(Vec::new()),
+                fresh: Arc::new(records),
+                requests: Arc::default(),
+            }),
+        ),
+        exclude_ids: Arc::default(),
+    }];
+    let mut sources = rustc_hash::FxHashMap::default();
+    sources.insert(
+        RetryTaskKey::from(&task),
+        UrlRetrySource {
+            asset_record_name: Arc::clone(&task.asset_record_name),
+            master_record_name: "MASTER".into(),
+            provider_version: VersionSizeKey::Original,
+            pass_index: 0,
+            recorded_pass: None,
+        },
+    );
+    let plan =
+        build_selected_cleanup_request_plan(&passes, &sources, &[task], CancellationToken::new())
+            .await;
+    assert!(
+        plan.tasks.is_empty(),
+        "unowned selected work cannot reach a cleanup worker"
+    );
+    assert!(plan.refresh_requests.is_empty());
+    assert_eq!(plan.unrefreshed.len(), 1);
+}
+
+#[test]
+fn selected_refresh_scope_keeps_full_zone_and_checks_canonical_owner() {
+    let scoped = json!({"zone":{"zoneName":"SharedSync-test","ownerRecordName":"owner"}});
+    let full = json!({"zoneName":"SharedSync-test","ownerRecordName":"owner","zoneType":"REGULAR_CUSTOM_ZONE"});
+    assert!(super::scoped_zone_matches_full(&scoped, &full));
+    assert!(!super::scoped_zone_matches_full(
+        &scoped,
+        &json!({"zoneName":"SharedSync-test","ownerRecordName":"foreign","zoneType":"REGULAR_CUSTOM_ZONE"})
+    ));
+    assert!(!super::scoped_zone_matches_full(
+        &json!({"zone":{"zoneName":"SharedSync-test"}}),
+        &full
+    ));
+    assert!(!super::scoped_zone_matches_full(
+        &json!({"zone":{"zoneName":"SharedSync-test","ownerRecordName":"owner","extra":"unexpected"}}),
+        &full
+    ));
 }

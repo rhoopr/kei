@@ -1071,6 +1071,7 @@ async fn prepare(
                 bandwidth_limiter: config.bandwidth_limiter.as_ref(),
                 shutdown_token: cancel,
                 mode: crate::personality::Mode::Off,
+                selection_wait: None,
             };
             let (metadata_ok, checksum, source_checksum, bytes, disk, _) =
                 crate::download::pipeline::download_single_task(

@@ -22,14 +22,22 @@ use crate::state::{AssetRecord, error::StateError};
 
 mod adjusted_redirect;
 pub(crate) use adjusted_redirect::AdjustedRedirect;
+pub(crate) mod compact_attestation;
 pub(crate) mod coverage;
+pub(crate) mod immutable_epochs;
 pub(crate) mod observation;
 mod pending_path_cache;
 mod reference_refresh;
+mod refreshed_candidates;
+mod refreshed_source;
+mod refreshed_store;
+pub(crate) mod refreshed_transfer;
 mod retirement;
 mod root_admission_cache;
 mod selector_binding;
+pub(crate) mod transfer_wait;
 pub(super) use retirement::advance_completed_receipt;
+pub(crate) use transfer_wait::SelectionTransferKey;
 
 #[cfg(test)]
 pub(crate) use retirement::take_legacy_compaction_validation_count;
@@ -61,6 +69,24 @@ pub(crate) struct ActiveGeneration {
     pub(crate) sealed: bool,
     pub(crate) checkpoint_ready: bool,
     pub(crate) checkpoint_veto: Option<String>,
+}
+
+/// A non-clone capability created only by the transaction which inserted a
+/// new format-2 root. It is not persisted and cannot be reconstructed after
+/// restart. A root policy marker still requires authenticated first observation.
+pub(crate) struct NewRootPolicyPermit {
+    generation: String,
+    connection_identity: usize,
+    // Keep the original allocation alive, so its address cannot be reused.
+    _connection_owner: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+}
+
+impl NewRootPolicyPermit {
+    pub(crate) fn matches(&self, conn: &rusqlite::Connection, root: &ActiveGeneration) -> bool {
+        root.spec.format == 2
+            && self.generation == root.id
+            && self.connection_identity == std::ptr::from_ref(conn) as usize
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,17 +596,28 @@ fn refresh_progress_hash(
     Ok(())
 }
 
+fn charged_bytes(conn: &Connection, format: u8) -> Result<u64, StateError> {
+    if !matches!(format, 1 | 2) {
+        return invalid();
+    }
+    let used:i64=conn.query_row("SELECT
+          COALESCE((SELECT SUM(g.charged_bytes) FROM provider_active_generations g WHERE json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)
+          +COALESCE((SELECT SUM(p.charged_bytes) FROM provider_selection_rank_pages p JOIN provider_active_generations g ON g.id=p.generation WHERE json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)
+          +COALESCE((SELECT SUM(d.charged_bytes) FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE d.compacted_hash IS NULL AND json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)
+          +COALESCE((SELECT SUM(x.charged_bytes) FROM provider_transfer_dispatch x JOIN provider_active_generations g ON g.id=x.generation WHERE json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)
+          +COALESCE((SELECT SUM(f.charged_bytes) FROM provider_transfer_failures f JOIN provider_active_generations g ON g.id=f.generation WHERE json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)
+          +COALESCE((SELECT SUM(w.charged_bytes) FROM provider_transfer_waits w JOIN provider_active_generations g ON g.id=w.generation WHERE json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)
+          +CASE WHEN ?1=2 THEN COALESCE((SELECT SUM(charged_bytes) FROM provider_compact_root_policy),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_compact_observations),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_410_failure_epochs),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_410_shared_waits),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_refreshed_transfer),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_refreshed_waits),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_refreshed_success_receipts),0) ELSE 0 END",
+          [format],|r|r.get(0))?;
+    u64::try_from(used).map_err(|_invalid| StateError::ProviderSelectionInvalid)
+}
+
 fn charge(conn: &Connection, additional: u64, capacity: u64, format: u8) -> Result<(), StateError> {
     if !matches!(format, 1 | 2) {
         return invalid();
     }
     loop {
-        let used:i64=conn.query_row("SELECT
-          COALESCE((SELECT SUM(g.charged_bytes) FROM provider_active_generations g WHERE json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)
-          +COALESCE((SELECT SUM(p.charged_bytes) FROM provider_selection_rank_pages p JOIN provider_active_generations g ON g.id=p.generation WHERE json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)
-          +COALESCE((SELECT SUM(d.charged_bytes) FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE d.compacted_hash IS NULL AND json_extract(CAST(g.specification AS TEXT),'$.format')=?1),0)",
-          [format],|r|r.get(0))?;
-        let used = u64::try_from(used).map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+        let used = charged_bytes(conn, format)?;
         if used <= capacity && additional <= capacity - used {
             return Ok(());
         }
@@ -588,6 +625,35 @@ fn charge(conn: &Connection, additional: u64, capacity: u64, format: u8) -> Resu
             return Err(StateError::ProviderSelectionFull);
         }
     }
+}
+
+/// Reserve only after the caller has authenticated and validated the typed
+/// provider/zone scope. This low-level helper does not establish authority.
+// Optional evidence is noncompacting and cannot consume mandatory headroom.
+fn charge_optional_evidence(
+    conn: &Connection,
+    additional: u64,
+    capacity: u64,
+    format: u8,
+) -> Result<(), StateError> {
+    if format != 2 || conn.is_autocommit() {
+        return Err(StateError::ProviderSelectionInvalid);
+    }
+    let optional:i64=conn.query_row("SELECT COALESCE((SELECT SUM(charged_bytes) FROM provider_compact_root_policy),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_compact_observations),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_410_failure_epochs),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_410_shared_waits),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_refreshed_transfer),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_refreshed_waits),0)+COALESCE((SELECT SUM(charged_bytes) FROM provider_refreshed_success_receipts),0)",[],|r|r.get(0))?;
+    let optional =
+        u64::try_from(optional).map_err(|_redacted_error| StateError::ProviderSelectionInvalid)?;
+    let used = charged_bytes(conn, format)?;
+    let limit = 64_u64 * 1024 * 1024;
+    let reserve = 128_u64 * 1024 * 1024;
+    if optional > limit
+        || additional > limit - optional
+        || used > capacity
+        || additional > capacity - used
+        || capacity - used - additional < reserve
+    {
+        return Err(StateError::ProviderSelectionFull);
+    }
+    Ok(())
 }
 
 fn pass<'a>(root: &'a ActiveGeneration, key: &str) -> Result<&'a Value, StateError> {
@@ -1128,7 +1194,24 @@ impl SqliteStateDb {
         spec: GenerationSpec,
         capacity: u64,
     ) -> Result<ActiveGeneration, StateError> {
+        let (root, _permit) = self
+            .begin_selection_generation_with_policy_permit(owner, spec, capacity)
+            .await?;
+        Ok(root)
+    }
+
+    /// The optional permit is produced by this insertion transaction only.
+    /// No marker is written for a quiet root and no old-root permit can be
+    /// reconstructed after restart.
+    pub(crate) async fn begin_selection_generation_with_policy_permit(
+        &self,
+        owner: account::AccountOwner,
+        spec: GenerationSpec,
+        capacity: u64,
+    ) -> Result<(ActiveGeneration, Option<NewRootPolicyPermit>), StateError> {
+        let connection_owner = std::sync::Arc::clone(&self.conn);
         self.with_conn_mut("starting selection generation",move|conn|{
+            let connection_identity = std::ptr::from_ref(&*conn) as usize;
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;account::validate_authenticated(&tx,&owner)?;validate_spec(&spec)?;selector_binding::validate_owner(&tx,&spec)?;
             guard_library_scope(&tx, &spec.scope, spec.zone.get("zoneName").and_then(Value::as_str).ok_or(StateError::ProviderSelectionInvalid)?)?;
             if spec.format == 2 {
@@ -1147,10 +1230,12 @@ impl SqliteStateDb {
                 retirement::retire_completed_roots(&tx,&id,2)?;
                 retirement::optional_legacy_cleanup(&tx,&id)?;
             }
-            let out=load_generation(&tx,&id)?;tx.commit()?;
+            let out=load_generation(&tx,&id)?;
+            let permit=(out.spec.format==2).then(||NewRootPolicyPermit{generation:out.id.clone(), connection_identity, _connection_owner:connection_owner});
+            tx.commit()?;
             #[cfg(all(test,target_os="linux"))]
             crate::test_helpers::process_death_point("completion-root-retired");
-            Ok(out)
+            Ok((out,permit))
         }).await
     }
 
@@ -1287,6 +1372,7 @@ fn admission_hash(
     ))?))
 }
 
+#[cfg_attr(test, track_caller)]
 fn defer_attempt(
     conn: &Connection,
     root: &ActiveGeneration,
@@ -1297,8 +1383,20 @@ fn defer_attempt(
     if admission == "excluded" {
         return invalid();
     }
+    #[cfg(test)]
+    if std::env::var_os("KEI_ISSUE845_TRACE_RETRY").is_some() {
+        eprintln!(
+            "ISSUE845_TRACE defer caller={} generation={} pass={} child={} prior_attempts={} now={}",
+            std::panic::Location::caller(),
+            root.id,
+            key,
+            child,
+            attempts,
+            super::retry_clock::now_for_connection(conn)
+        );
+    }
     let delay = (3600_i64 * (1_i64 << attempts.min(5))).min(86400);
-    conn.execute("UPDATE provider_active_decisions SET attempts=?4,next_retry_at=?5,reason=CASE WHEN admission='admitted' THEN 'current_confirmation_unavailable' ELSE reason END WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child,attempts.saturating_add(1).min(32),Utc::now().timestamp()+delay])?;
+    conn.execute("UPDATE provider_active_decisions SET attempts=?4,next_retry_at=?5,reason=CASE WHEN admission='admitted' THEN 'current_confirmation_unavailable' ELSE reason END WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child,attempts.saturating_add(1).min(32),super::retry_clock::now_for_connection(conn)+delay])?;
     refresh_admission_hash(conn, root, key, child)
 }
 
@@ -1678,7 +1776,28 @@ impl SqliteStateDb {
         self.with_conn("checking selection retry deadline",move|conn|{
             account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;
             let state:Option<(String,i64)>=conn.query_row("SELECT admission,next_retry_at FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,key,child],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-            if let Some((admission,deadline))=state {load_decision(conn,&root,&key,&child)?;Ok(admission=="excluded" || deadline<=Utc::now().timestamp())} else {Ok(true)}
+            if let Some((admission,deadline))=state {load_decision(conn,&root,&key,&child)?;Ok(admission=="excluded" || deadline<=super::retry_clock::now_for_connection(conn))} else {Ok(true)}
+        }).await
+    }
+
+    /// Scheduling eligibility can include a proven never-dispatched sibling;
+    /// unlike selection_attempt_due it must not authorize a new retry epoch.
+    pub(crate) async fn selection_work_due(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        key: String,
+        child: String,
+    ) -> Result<bool, StateError> {
+        self.with_conn("checking selected destination scheduling", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let root=load_generation(conn,&generation)?;
+            let state:Option<(String,i64)>=conn.query_row("SELECT admission,next_retry_at FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,key,child],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let Some((admission,deadline))=state else {return Ok(true)};
+            let decision=load_decision(conn,&root,&key,&child)?;
+            let now=super::retry_clock::now_for_connection(conn);
+            if admission=="excluded" || deadline<=now {return Ok(true)}
+            transfer_wait::decision_has_due_work(conn,&root,&decision,now)
         }).await
     }
 
@@ -1713,7 +1832,7 @@ impl SqliteStateDb {
             let profile = compatible_profile.as_ref().map(serde_json::to_string)
                 .transpose().map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
             account::validate_authenticated(conn,&owner)?;
-            let id:Option<String>=conn.query_row("SELECT g.id FROM provider_active_generations g WHERE g.scope=?1 AND g.id<>?3 AND ((g.config_hash=?2 OR (?5 IS NOT NULL AND json_extract(CAST(g.specification AS TEXT),'$.format')=2 AND (json_extract(CAST(g.specification AS TEXT),'$.profile')=json(?5) OR (length(json_extract(?5,'$.admitted_retry_policy'))=64 AND json_extract(?5,'$.admitted_retry_policy') NOT GLOB '*[^0-9a-f]*' AND json_extract(CAST(g.specification AS TEXT),'$.profile.admitted_retry_policy')=json_extract(?5,'$.admitted_retry_policy'))))) AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.admission='deferred' AND d.next_retry_at<=?4) OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id AND w.admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=?4) AND (w.verified_media=0 OR (g.metadata_enabled=1 AND w.verified_metadata=0)))) OR (json_extract(CAST(g.specification AS TEXT),'$.format')=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d JOIN provider_active_destinations w ON w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child WHERE d.generation=g.id AND d.admission='admitted' AND d.next_retry_at<=?4 AND w.admitted=1 AND w.verified_media=0))) ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT 1",params![scope,config_hash,current,Utc::now().timestamp(),profile],|r|r.get(0)).optional()?;
+            let id:Option<String>=conn.query_row("SELECT g.id FROM provider_active_generations g WHERE g.scope=?1 AND g.id<>?3 AND ((g.config_hash=?2 OR (?5 IS NOT NULL AND json_extract(CAST(g.specification AS TEXT),'$.format')=2 AND (json_extract(CAST(g.specification AS TEXT),'$.profile')=json(?5) OR (length(json_extract(?5,'$.admitted_retry_policy'))=64 AND json_extract(?5,'$.admitted_retry_policy') NOT GLOB '*[^0-9a-f]*' AND json_extract(CAST(g.specification AS TEXT),'$.profile.admitted_retry_policy')=json_extract(?5,'$.admitted_retry_policy'))))) AND (EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=g.id AND d.admission='deferred' AND d.next_retry_at<=?4) OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=g.id AND w.admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child AND d.next_retry_at<=?4) AND (w.verified_media=0 OR (g.metadata_enabled=1 AND w.verified_metadata=0))) OR (json_extract(CAST(g.specification AS TEXT),'$.format')=2 AND EXISTS(SELECT 1 FROM provider_refreshed_transfer e WHERE e.generation=g.id AND e.phase='inflight'))) OR (json_extract(CAST(g.specification AS TEXT),'$.format')=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d JOIN provider_active_destinations w ON w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child WHERE d.generation=g.id AND d.admission='admitted' AND d.next_retry_at<=?4 AND w.admitted=1 AND w.verified_media=0))) ORDER BY g.last_replayed_at,g.created_at,g.id LIMIT 1",params![scope,config_hash,current,super::retry_clock::now_for_connection(conn),profile],|r|r.get(0)).optional()?;
             let root = id.map(|id|load_generation(conn,&id)).transpose()?;
             if let Some(root) = &root
                 && root.spec.config_hash != config_hash
@@ -1756,7 +1875,7 @@ impl SqliteStateDb {
             let stored:Option<String>=tx.query_row("SELECT replay_after FROM provider_active_generations WHERE id=?1",[&generation],|r|r.get(0))?;
             let after:Option<(String,String)>=stored.as_deref().map(|value|serde_json::from_str(value).map_err(|_invalid|StateError::ProviderSelectionInvalid)).transpose()?;
             let query=|after:Option<&(String,String)>|->Result<Vec<(String,String,i64)>,StateError> {
-                Ok(tx.prepare("SELECT d.pass_key,d.child,length(d.manifest) FROM provider_active_decisions d WHERE d.generation=?1 AND (?2 IS NULL OR (d.pass_key,d.child)>(?2,?3)) AND d.next_retry_at<=?4 AND ((?5=0 AND d.admission='deferred') OR ((?5=0 OR d.admission='admitted') AND EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND w.verified_media=0))) ORDER BY d.pass_key,d.child LIMIT 64")?.query_map(params![generation,after.map(|a|&a.0),after.map(|a|&a.1),Utc::now().timestamp(),admitted_only],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?)
+                Ok(tx.prepare("SELECT d.pass_key,d.child,length(d.manifest) FROM provider_active_decisions d WHERE d.generation=?1 AND (?2 IS NULL OR (d.pass_key,d.child)>(?2,?3)) AND d.next_retry_at<=?4 AND ((?5=0 AND d.admission='deferred') OR ((?5=0 OR d.admission='admitted') AND EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND w.verified_media=0))) ORDER BY d.pass_key,d.child LIMIT 64")?.query_map(params![generation,after.map(|a|&a.0),after.map(|a|&a.1),super::retry_clock::now_for_connection(&tx),admitted_only],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?)
             };
             let mut keys=query(after.as_ref())?;if keys.is_empty() && after.is_some() {keys=query(None)?;}
             let mut bytes=0_usize;let mut decisions=Vec::new();let mut last=None;
@@ -1820,7 +1939,7 @@ impl SqliteStateDb {
             }
             for (key,child) in keys {
                 load_decision(&tx,&root,&key,&child)?;
-                let due:bool=tx.query_row("SELECT next_retry_at<=?4 FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,key,child,Utc::now().timestamp()],|r|r.get(0))?;
+                let due:bool=tx.query_row("SELECT next_retry_at<=?4 FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,key,child,super::retry_clock::now_for_connection(&tx)],|r|r.get(0))?;
                 if due { defer_attempt(&tx,&root,&key,&child)?; }
             }
             tx.commit()?;Ok(retained)
@@ -1855,7 +1974,7 @@ impl SqliteStateDb {
             let mut statement=conn.prepare("SELECT pass_key,child FROM provider_active_decisions WHERE generation=?1")?;
             let mut rows=statement.query([&generation])?;
             while let Some(row)=rows.next()? {let key:String=row.get(0)?;let child:String=row.get(1)?;load_decision_with_sources(conn,&root,&key,&child,false)?;}
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission<>'excluded' AND next_retry_at>?2) AND NOT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) AND NOT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND (verified_media=0 OR (verified_metadata=0 AND EXISTS(SELECT 1 FROM provider_active_generations g WHERE g.id=provider_active_destinations.generation AND g.metadata_enabled=1))))",params![generation,Utc::now().timestamp()],|r|r.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission<>'excluded' AND next_retry_at>?2) AND NOT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) AND NOT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND (verified_media=0 OR (verified_metadata=0 AND EXISTS(SELECT 1 FROM provider_active_generations g WHERE g.id=provider_active_destinations.generation AND g.metadata_enabled=1))))",params![generation,super::retry_clock::now_for_connection(conn)],|r|r.get(0))?)
         }).await
     }
 
@@ -1918,6 +2037,56 @@ impl SqliteStateDb {
         records: Vec<AssetRecord>,
         fresh_confirmation: Option<Vec<u8>>,
         root_reuses: Vec<RootAdmissionReuse>,
+        capacity: u64,
+    ) -> Result<GenerationProjection, StateError> {
+        self.project_selection_decision_with_root_reuse_and_shared_wait(
+            owner,
+            generation,
+            manifest,
+            records,
+            fresh_confirmation,
+            root_reuses,
+            None,
+            capacity,
+        )
+        .await
+    }
+
+    pub(crate) async fn project_selection_decision_with_root_reuse_and_shared_wait(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        manifest: ActiveDecision,
+        records: Vec<AssetRecord>,
+        fresh_confirmation: Option<Vec<u8>>,
+        root_reuses: Vec<RootAdmissionReuse>,
+        observed_confirmation: Option<Vec<u8>>,
+        capacity: u64,
+    ) -> Result<GenerationProjection, StateError> {
+        self.project_selection_decision_with_compact(
+            owner,
+            generation,
+            manifest,
+            records,
+            fresh_confirmation,
+            root_reuses,
+            observed_confirmation,
+            None,
+            capacity,
+        )
+        .await
+    }
+
+    pub(crate) async fn project_selection_decision_with_compact(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        manifest: ActiveDecision,
+        records: Vec<AssetRecord>,
+        fresh_confirmation: Option<Vec<u8>>,
+        root_reuses: Vec<RootAdmissionReuse>,
+        observed_confirmation: Option<Vec<u8>>,
+        mut compact: Option<compact_attestation::OwnedCompactAdmission>,
         capacity: u64,
     ) -> Result<GenerationProjection, StateError> {
         self.with_conn_mut("projecting selection destinations",move|conn|{
@@ -2066,9 +2235,13 @@ impl SqliteStateDb {
             let attempts:u32=tx.query_row("SELECT attempts FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child],|r|r.get(0))?;
             let delay=(3600_i64*(1_i64<<attempts.min(5))).min(86400);
             // Consumption is the final write, and never means verified publication.
-            tx.execute("UPDATE provider_active_decisions SET admission=?4,reason=?5,attempts=?6,next_retry_at=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child,admission,reason,if admission=="deferred" {attempts.saturating_add(1).min(32)} else {0},if admission=="deferred" {Utc::now().timestamp()+delay} else {0}])?;
+            tx.execute("UPDATE provider_active_decisions SET admission=?4,reason=?5,attempts=?6,next_retry_at=?7 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child,admission,reason,if admission=="deferred" {attempts.saturating_add(1).min(32)} else {0},if admission=="deferred" {super::retry_clock::now_for_connection(&tx)+delay} else {0}])?;
             refresh_admission_hash(&tx,&root,&d.pass_key,&d.child)?;
             if admitted {
+                if (existing.is_none() || resolving) && root.spec.format == 2 { transfer_wait::initialize_dispatch(&tx, &root, &manifest, capacity)?; }
+                // The compact-source wait path is not yet wired. In particular,
+                // reconstructed Value bytes never authorize a shared wait.
+                let _ = (&observed_confirmation, &fresh_confirmation);
                 for proof in &root_reuses {
                     let record=records.iter().find(|record| record.version_size.as_str()==proof.receipt.version_size).ok_or(StateError::ProviderWorkConflict)?;
                     guard_root_reuse_ownership(&tx, &proof.receipt, &proof.binding.origin_pass)?;
@@ -2079,7 +2252,12 @@ impl SqliteStateDb {
                 }
             }
             if reseal_observation {reference_refresh::reseal(&tx,&root)?;}
+            let mut compact_inserted=false;
+            if admitted && let Some(evidence)=compact.as_ref() {
+                compact_inserted=compact_attestation::insert_compact_attestation_tx(&tx, &compact_attestation::CompactAttestationInput { owner: &owner, authority: &evidence.authority, root: &root, key: &d.pass_key, child: &d.child, lease: &evidence.lease, eligibility: &evidence.eligibility, permit: evidence.offer.as_ref(), capacity })?.is_some();
+            }
             tx.commit()?;
+            if compact_inserted && let Some(evidence)=compact.as_mut(){evidence.offer.take();}
             #[cfg(all(test, target_os = "linux"))]
             crate::test_helpers::process_death_point("selection-work-committed");
             Ok(GenerationProjection {admitted,reason})
@@ -2144,7 +2322,7 @@ impl SqliteStateDb {
     ) -> Result<Vec<ActiveDecision>, StateError> {
         self.with_conn("reading unfinished selected destinations",move|conn|{
             account::validate_authenticated(conn,&owner)?;let root=load_generation(conn,&generation)?;pass(&root,&key)?;
-            let children:Vec<String>=conn.prepare("SELECT d.child FROM provider_active_decisions d WHERE d.generation=?1 AND d.pass_key=?2 AND (?3 IS NULL OR d.child>?3) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND w.verified_media=0)) ORDER BY d.child LIMIT ?5")?.query_map(params![generation,key,after,Utc::now().timestamp(),limit],|r|r.get(0))?.collect::<Result<_,_>>()?;
+            let children:Vec<String>=conn.prepare("SELECT d.child FROM provider_active_decisions d WHERE d.generation=?1 AND d.pass_key=?2 AND (?3 IS NULL OR d.child>?3) AND d.next_retry_at<=?4 AND (d.admission='deferred' OR EXISTS(SELECT 1 FROM provider_active_destinations w WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child AND w.admitted=1 AND w.verified_media=0)) ORDER BY d.child LIMIT ?5")?.query_map(params![generation,key,after,super::retry_clock::now_for_connection(conn),limit],|r|r.get(0))?.collect::<Result<_,_>>()?;
             children.iter().map(|child|load_decision(conn,&root,&key,child)).collect()
         }).await
     }
@@ -2156,7 +2334,7 @@ impl SqliteStateDb {
     ) -> Result<bool, StateError> {
         self.with_conn("inspecting destination wake-up",move|conn|{
             account::validate_authenticated(conn,&owner)?;load_generation(conn,&generation)?;
-            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND (verified_media=0 OR (verified_metadata=0 AND EXISTS(SELECT 1 FROM provider_active_generations g WHERE g.id=provider_active_destinations.generation AND g.metadata_enabled=1))))",params![generation,Utc::now().timestamp()],|r|r.get(0))?)
+            Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND admission='deferred' AND next_retry_at<=?2) OR EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND admitted=1 AND EXISTS(SELECT 1 FROM provider_active_decisions d WHERE d.generation=provider_active_destinations.generation AND d.pass_key=provider_active_destinations.pass_key AND d.child=provider_active_destinations.child AND d.next_retry_at<=?2) AND (verified_media=0 OR (verified_metadata=0 AND EXISTS(SELECT 1 FROM provider_active_generations g WHERE g.id=provider_active_destinations.generation AND g.metadata_enabled=1)))) OR EXISTS(SELECT 1 FROM provider_refreshed_transfer e WHERE e.generation=?1 AND e.phase='inflight')",params![generation,super::retry_clock::now_for_connection(conn)],|r|r.get(0))?)
         }).await
     }
 }

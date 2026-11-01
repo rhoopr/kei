@@ -260,6 +260,14 @@ pub struct AlbumRelationDelta {
     pub is_deleted: bool,
 }
 
+struct ObservedPair(Value);
+
+impl std::fmt::Debug for ObservedPair {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted provider record pair>")
+    }
+}
+
 /// A photo or video asset from iCloud.
 ///
 /// Fields are ordered for optimal memory layout:
@@ -280,7 +288,10 @@ pub struct PhotoAsset {
     source_zone: Option<Arc<str>>,
     selector_membership: Option<Arc<Value>>,
     // A bounded item pair, retained durably only if current confirmation fails.
-    observed_pair: Option<Arc<Value>>,
+    observed_pair: Option<Arc<ObservedPair>>,
+    causal_pair: Option<Arc<super::source_causality::PairedObservation>>,
+    causal_route:
+        Option<Arc<tokio::sync::Mutex<Option<super::source_causality::RoutedObservation>>>>,
     filename: Option<Box<str>>,
     // Metadata behind Arc so downstream consumers (AssetRecord, the
     // pipeline's metadata-hash comparisons) can share the same
@@ -551,6 +562,26 @@ fn is_test_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "[::1]" | "localhost")
 }
 
+/// Read-only route reservation pending a state-issued commit receipt.
+pub(crate) struct CausalRouteLease {
+    inner: tokio::sync::OwnedMutexGuard<Option<super::source_causality::RoutedObservation>>,
+    active: Arc<std::sync::atomic::AtomicBool>,
+}
+impl CausalRouteLease {
+    pub(crate) fn observation(&self) -> Option<&super::source_causality::RoutedObservation> {
+        self.inner.as_ref()
+    }
+    pub(crate) fn candidate(&self) -> Option<super::source_causality::CompactCandidate> {
+        Some(self.inner.as_ref()?.candidate(Arc::clone(&self.active)))
+    }
+}
+impl Drop for CausalRouteLease {
+    fn drop(&mut self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl PhotoAsset {
     /// Construct from raw JSON values (used by tests).
     #[cfg(test)]
@@ -572,9 +603,11 @@ impl PhotoAsset {
             .unwrap_or(record_name.as_ref())
             .into();
         Self {
-            observed_pair: Some(Arc::new(
+            observed_pair: Some(Arc::new(ObservedPair(
                 serde_json::json!({"records":[master_record, asset_record]}),
-            )),
+            ))),
+            causal_pair: None,
+            causal_route: None,
             record_name,
             asset_record_name,
             state_record_name: None,
@@ -649,14 +682,24 @@ impl PhotoAsset {
         let asset_metadata = Arc::new(metadata::extract(&master.fields, &asset.fields));
         let rendition_facts =
             metadata::extract_renditions(item_type_val, &master.fields, &asset.fields);
-        let observed_pair = Some(Arc::new(serde_json::json!({"records":[
-            {"recordName":master.record_name,"recordType":master.record_type,
-             "fields":master.fields,"deleted":master.deleted.unwrap_or(false)},
-            {"recordName":asset.record_name,"recordType":asset.record_type,
-             "fields":asset.fields,"deleted":asset.deleted.unwrap_or(false)}
-        ]})));
+        let causal_pair = super::source_causality::PairedObservation::pair(&master, asset);
+        let observed_pair = Some(Arc::new(ObservedPair(
+            match (master.observed_value(), asset.observed_value()) {
+                (Some(master), Some(asset)) => serde_json::json!({"records":[master, asset]}),
+                // Preserve the existing ordinary-ingestion fallback. It is not
+                // eligible as causal retry-sharing evidence.
+                _ => serde_json::json!({"records":[
+                    {"recordName":master.record_name,"recordType":master.record_type,
+                     "fields":master.fields,"deleted":master.deleted.unwrap_or(false)},
+                    {"recordName":asset.record_name,"recordType":asset.record_type,
+                     "fields":asset.fields,"deleted":asset.deleted.unwrap_or(false)}
+                ]}),
+            },
+        )));
         Self {
             observed_pair,
+            causal_pair,
+            causal_route: None,
             record_name: Arc::from(master.record_name),
             asset_record_name: Arc::from(asset.record_name.as_str()),
             state_record_name: None,
@@ -738,8 +781,42 @@ impl PhotoAsset {
         .filter(|child| !child.is_empty())
     }
 
+    /// Carry the actual routed observation through a fresh lookup. This does
+    /// not prove equivalence: state must compare the full original pair and
+    /// fresh confirmation before authorizing any shared wait.
+    pub(crate) fn carry_causal_route_from(mut self, observed: &Self) -> Self {
+        if self.id() == observed.id() && self.asset_record_name() == observed.asset_record_name() {
+            self.causal_pair = observed.causal_pair.clone();
+            self.causal_route = observed.causal_route.clone();
+        }
+        self
+    }
+
+    /// Attach a candidate only at the real direct-zone routing decision.
+    /// State still owns the authenticated pass/exclusion proof.
+    pub(crate) fn with_direct_zone_route(mut self, pass: &str) -> Self {
+        self.causal_route = self.causal_pair.as_ref().and_then(|pair| {
+            pair.route(pass, super::source_causality::RouteWitness::DirectZone)
+                .map(|route| Arc::new(tokio::sync::Mutex::new(Some(route))))
+        });
+        self
+    }
+
+    /// Hold an immutable route reservation while state admission is pending.
+    /// No consuming method exists until state supplies a committed receipt.
+    pub(crate) async fn lock_causal_route(&self) -> Option<CausalRouteLease> {
+        Some(CausalRouteLease {
+            inner: Arc::clone(self.causal_route.as_ref()?).lock_owned().await,
+            active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        })
+    }
+
+    pub(crate) fn causal_pair(&self) -> Option<&Arc<super::source_causality::PairedObservation>> {
+        self.causal_pair.as_ref()
+    }
+
     pub(crate) fn observed_pair(&self) -> Option<&Value> {
-        self.observed_pair.as_deref()
+        self.observed_pair.as_deref().map(|pair| &pair.0)
     }
 
     pub(crate) fn selector_membership(&self) -> Option<&Value> {
@@ -1970,6 +2047,7 @@ mod tests {
                 "resOriginalFileType": {"value": "public.jpeg"}
             }),
             deleted: None,
+            observation: None,
         };
         let asset_rec = Record {
             record_name: "ASSET_1".to_string(),
@@ -1979,6 +2057,7 @@ mod tests {
                 "addedDate": {"value": 1736899200000.0}
             }),
             deleted: None,
+            observation: None,
         };
 
         let asset = PhotoAsset::from_records(master, &asset_rec);
@@ -2086,12 +2165,14 @@ mod tests {
             record_type: "CPLMaster".to_string(),
             fields: json!({}),
             deleted: None,
+            observation: None,
         };
         let asset_rec = Record {
             record_name: "A2".to_string(),
             record_type: "CPLAsset".to_string(),
             fields: json!({}),
             deleted: None,
+            observation: None,
         };
 
         let asset = PhotoAsset::from_records(master, &asset_rec);
@@ -2148,6 +2229,7 @@ mod tests {
             record_type: record_type.to_string(),
             fields,
             deleted,
+            observation: None,
         }
     }
 
@@ -2268,6 +2350,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"}
             }),
             deleted: None,
+            observation: None,
         }
     }
 
@@ -2286,6 +2369,7 @@ mod tests {
                 "addedDate": {"value": 1736899200000.0}
             }),
             deleted: None,
+            observation: None,
         }
     }
 
@@ -2394,6 +2478,18 @@ mod tests {
             events[0].token_unsafe_reason,
             Some(MALFORMED_REQUIRED_ASSET_FIELDS_REASON)
         );
+    }
+
+    #[test]
+    fn generic_value_pair_has_no_causal_source() {
+        let master = serde_json::from_value(
+            json!({"recordName":"m","recordType":"CPLMaster","recordChangeTag":"tag","fields":{}}),
+        )
+        .unwrap();
+        let child = serde_json::from_value(json!({"recordName":"c","recordType":"CPLAsset","fields":{"masterRef":{"value":{"recordName":"m"}}}})).unwrap();
+        let asset = PhotoAsset::from_records(master, &child);
+        assert!(asset.observed_pair().is_some());
+        assert!(asset.causal_pair().is_none());
     }
 
     #[test]
@@ -2525,6 +2621,7 @@ mod tests {
             record_type: String::new(),
             fields: json!({}),
             deleted: Some(true),
+            observation: None,
         };
 
         let events = buffer.process_records(vec![hard_deleted]);
@@ -2544,6 +2641,7 @@ mod tests {
             record_type: "CPLAlbum".to_string(),
             fields: json!({"albumName": {"value": "Vacation"}}),
             deleted: None,
+            observation: None,
         };
         let relation_record = Record {
             record_name: "ASSET_1-IN-ALBUM_1".to_string(),
@@ -2553,6 +2651,7 @@ mod tests {
                 "itemId": {"value": "ASSET_1"}
             }),
             deleted: None,
+            observation: None,
         };
 
         let events = buffer.process_records(vec![
@@ -2593,6 +2692,7 @@ mod tests {
             record_type: "CPLContainerRelation".to_string(),
             fields: json!({}),
             deleted: Some(true),
+            observation: None,
         };
 
         let events = buffer.process_records(vec![relation_delete]);
@@ -2616,6 +2716,7 @@ mod tests {
             record_type: "CPLContainerRelation".to_string(),
             fields: json!({}),
             deleted: Some(true),
+            observation: None,
         };
 
         let events = buffer.process_records(vec![relation_delete]);
@@ -2704,6 +2805,7 @@ mod tests {
             record_type: "CPLAsset".to_string(),
             fields: json!({"assetDate": {"value": 1736899200000.0}}),
             deleted: None,
+            observation: None,
         };
 
         let events = buffer.process_records(vec![asset_no_ref]);
@@ -2723,6 +2825,7 @@ mod tests {
             record_type: "CPLMaster".to_string(),
             fields: json!({"isDeleted": {"value": 1}}),
             deleted: Some(false),
+            observation: None,
         };
 
         // Master is soft-deleted but still has record_type and fields
@@ -2798,6 +2901,7 @@ mod tests {
                 "assetDate": {"value": 1736899200000.0}
             }),
             deleted: Some(false),
+            observation: None,
         };
 
         let events = buffer.process_records(vec![master, soft_deleted_asset]);
@@ -2822,6 +2926,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"}
             }),
             deleted: Some(false),
+            observation: None,
         };
         let normal_asset = make_asset_record("A_SD", "M_SD");
 
@@ -2852,6 +2957,7 @@ mod tests {
                 "assetDate": {"value": 1736899200000.0}
             }),
             deleted: Some(false),
+            observation: None,
         };
 
         let events = buffer.process_records(vec![normal_master, soft_deleted_asset]);
@@ -2874,6 +2980,7 @@ mod tests {
                 "itemType": {"value": "public.jpeg"}
             }),
             deleted: Some(false),
+            observation: None,
         };
 
         // Page 1: only the soft-deleted master
@@ -2909,6 +3016,7 @@ mod tests {
             record_type: "CPLAsset".to_string(),
             fields: json!({"assetDate": {"value": 1736899200000.0}}),
             deleted: None,
+            observation: None,
         };
 
         let events = buffer.process_records(vec![asset_no_ref]);
@@ -3107,6 +3215,7 @@ mod tests {
                 "resOriginalRes": null
             }),
             deleted: None,
+            observation: None,
         };
         let asset_rec = Record {
             record_name: "A_PARTIAL".to_string(),
@@ -3116,6 +3225,7 @@ mod tests {
                 "addedDate": null
             }),
             deleted: None,
+            observation: None,
         };
 
         let asset = PhotoAsset::from_records(master, &asset_rec);
@@ -3149,6 +3259,7 @@ mod tests {
                 "resOriginalFileType": {"value": "public.jpeg"}
             }),
             deleted: None,
+            observation: None,
         }]);
         assert!(
             events.is_empty(),
@@ -3170,6 +3281,7 @@ mod tests {
                 "addedDate": {"value": 1736899200000.0}
             }),
             deleted: None,
+            observation: None,
         }]);
         assert_eq!(events.len(), 1, "page 2 should pair M_SPLIT + A_SPLIT");
         assert_eq!(&*events[0].record_name, "M_SPLIT");
@@ -3574,6 +3686,7 @@ mod tests {
             record_type: "CPLMaster".to_string(),
             fields: json!({"isDeleted": {"value": 1}}),
             deleted: None,
+            observation: None,
         };
         assert_eq!(classify_change_reason(&record), ChangeReason::SoftDeleted);
     }
@@ -3586,6 +3699,7 @@ mod tests {
             record_type: "CPLMaster".to_string(),
             fields: json!({"isHidden": {"value": 1}}),
             deleted: None,
+            observation: None,
         };
         assert_eq!(classify_change_reason(&record), ChangeReason::Hidden);
     }
@@ -3599,6 +3713,7 @@ mod tests {
             record_type: "CPLMaster".to_string(),
             fields: json!({"isDeleted": {"value": 0}, "isHidden": {"value": 0}}),
             deleted: Some(true),
+            observation: None,
         };
         assert_eq!(classify_change_reason(&record), ChangeReason::HardDeleted);
     }
@@ -3611,6 +3726,7 @@ mod tests {
             record_type: "CPLMaster".to_string(),
             fields: json!({}),
             deleted: None,
+            observation: None,
         };
         assert_eq!(classify_change_reason(&record), ChangeReason::Created);
     }

@@ -9,7 +9,7 @@ use reqwest::Client;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::download::filter::{DownloadTask, FilterReason, is_asset_filtered};
+use crate::download::filter::{FilterReason, is_asset_filtered};
 use crate::download::metadata_rewrite::MetadataFlags;
 use crate::download::planner::TaskPlanner;
 use crate::download::{
@@ -375,7 +375,7 @@ where
         tracing::info!(target: "kei::download::pipeline", "Backfilling metadata for existing assets (one-time after upgrade)");
     }
 
-    let (task_tx, task_rx) = mpsc::channel::<DownloadTask>(concurrency * 2);
+    let (task_tx, task_rx) = mpsc::channel::<super::retry_owners::QueuedTask>(concurrency * 2);
 
     // Batch-size forecast: snapshot free space at enumeration start and
     // track bytes queued to consumers. Emit a one-time warn at 90% and

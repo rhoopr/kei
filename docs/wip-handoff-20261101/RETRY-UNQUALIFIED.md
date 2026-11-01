@@ -1,0 +1,3 @@
+# Retry WIP archive: not qualified
+
+Base 9a0b5eb58c0a3735ba7bafa28cafc2de27bc9586. Exact source patch SHA256 f81a667cfbafa8f5e18b193821065e7d62c417af3f677279a368232207b15d2e; source manifest SHA256 a39b18406085efcf89c7e1fd6498f25d250c8059ed1f3d14229e7db4797bf22d. This branch is unqualified and not a beta fix: no current runtime tests ran and exact-source Clippy failed. It excludes the unsafe sole-precheck draft, the denied into_lease action and separately unresolved sibling scheduling/changed-master work. Schema 43 is unpublished; coordinate migration order. See the retry owner handoff and its detailed evidence under /home/robhooper/dev/kei-retry-rebase-9a/.scratch/args-integrated-frozen/; do not treat earlier test results as this snapshot's pass. No release or merge.
