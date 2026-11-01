@@ -8808,3 +8808,368 @@ async fn selected_metadata_preprobe_and_gps_errors_do_not_suppress_ordinary_retr
         assert_bytes(&media, ORIGINAL);
     }
 }
+
+#[cfg(all(target_os = "linux", feature = "xmp"))]
+#[tokio::test]
+async fn review501_unreceipted_refresh_stage_remains_safely_held() {
+    let modes = [false, true];
+    for sidecar in modes {
+        let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, EDIT_TWO).await;
+        let root = tempfile::tempdir().unwrap();
+        eprintln!(
+            "REVIEW501_TEMP root={} sidecar={sidecar}",
+            root.path().display()
+        );
+        let media = root.path().join("media");
+        let options = |refresh_metadata| CycleOptions {
+            refresh_metadata,
+            private: true,
+            #[cfg(feature = "xmp")]
+            sidecar,
+            ..CycleOptions::default()
+        };
+        #[cfg(not(feature = "xmp"))]
+        let _ = sidecar;
+        let current =
+            records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT)));
+        let (initial, _) = cycle_options(
+            root.path(),
+            current.clone(),
+            false,
+            EditedNaming::Primary,
+            options(false),
+        )
+        .await;
+        assert_eq!(initial.failed_count, 0);
+        let owner = state::db::account::AccountOwner::authenticated(
+            "synthetic@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+        )
+        .unwrap();
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+                .await
+                .unwrap(),
+        );
+        let source = current.clone();
+        let provider = Session {
+            reported_count: None,
+            records: source,
+            quiet: true,
+            lookups: Arc::new(AtomicUsize::new(0)),
+            current: None,
+            lookup_change: None,
+            indexing: None,
+            baseline_successor: None,
+            cycle_token: None,
+            trace: None,
+        };
+        let mut album = crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::default(),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from("TestAlbum"),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(
+                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                ),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(provider),
+        );
+        album.set_shadow_capture(
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner, "com"),
+            Arc::from("private"),
+        );
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album,
+            exclude_ids: Arc::default(),
+        };
+        let expected_scope = json!({
+            "zone": {"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+            "name":"TestAlbum",
+            "list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+            "obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted",
+            "query_filter":null, "container_id":null, "cross_zone_sources":[]
+        });
+        assert_eq!(pass.album.selection_scope(), expected_scope);
+        let expected_pass = format!(
+            "{:x}",
+            Sha256::digest(
+                json!({"kind":"Unfiled","scope":expected_scope,"excludes":[]})
+                    .to_string()
+                    .as_bytes()
+            )
+        );
+        let store: Arc<dyn download::DownloadStore> = db.clone();
+        let build = make_run_cycle_download_config_builder(&media, store);
+        let mut config = build(
+            download::SyncMode::Full,
+            Arc::default(),
+            Arc::default(),
+            Arc::from("PrimarySync"),
+        )
+        .as_ref()
+        .clone();
+        config.folder_structure = String::new();
+        config.folder_structure_albums = Arc::from("");
+        config.folder_structure_smart_folders = Arc::from("");
+        config.edited = true;
+        config.edited_naming = EditedNaming::Primary;
+        #[cfg(feature = "xmp")]
+        {
+            config.metadata.xmp_sidecar = sidecar;
+        }
+        let mut op = download::seed_prepared_edited_compat(&config, &pass).await;
+        assert_eq!(op.phase, "prepared");
+        assert_eq!(op.source_library, "PrimarySync");
+        assert_eq!(op.child, "asset-501");
+        assert_eq!(op.pass, expected_pass);
+        assert!(op.members.iter().any(|m| {
+            m.record.as_ref().is_some_and(|r| {
+                r.version_size.as_str() == "adjusted"
+                    && r.checksum.as_ref() == provider_hash(VALID_EDIT)
+            })
+        }));
+        assert!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_claims WHERE operation IS NOT NULL"
+            ) > 0
+        );
+        download::finish_prepared_edited_compat(&config, &mut op).await;
+        assert!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let wrong_owner = state::db::account::AccountOwner::authenticated(
+            "other@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"other-provider"}})).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            state::SqliteStateDb::open_owned(&root.path().join("state.db"), &wrong_owner)
+                .await
+                .is_err()
+        );
+        let xmp = sidecar.then(|| std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap());
+        let requests = server.received_requests().await.unwrap().len();
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let (_generation, hash): (i64, String) = conn.query_row("SELECT b.generation,a.metadata_hash FROM primary_layout_bindings b JOIN assets a ON a.library=b.library AND a.id=b.child WHERE a.version_size='adjusted'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        // Simulate stale catalogue capture without changing any owned media.
+        conn.execute("UPDATE assets SET metadata_hash='stale-catalogue-capture' WHERE version_size='adjusted'", []).unwrap();
+        drop(conn);
+        // Produce the historical refresh through the layout owner, not ordinary
+        // sync: current policy deliberately does not plan new layout work.
+        config.refresh_metadata = true;
+        let refresh_operation = download::seed_unprepared_refresh(&config, &pass).await;
+        assert!(refresh_operation.refresh_metadata);
+        assert_eq!(refresh_operation.child, "asset-501");
+        assert_eq!(refresh_operation.pass, expected_pass);
+        assert!(refresh_operation.members.iter().any(|m| m.old.is_some()));
+        let recorded_stages: Vec<_> = refresh_operation
+            .members
+            .iter()
+            .filter_map(|member| member.stage.as_ref().map(|path| path.to_path()))
+            .collect();
+        assert!(!recorded_stages.is_empty());
+        assert!(recorded_stages.iter().all(|path| !path.exists()));
+        assert_eq!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let checkpoint = db.get_metadata("sync_token:PrimarySync").await.unwrap();
+        drop(config);
+        drop(build);
+        drop(pass);
+        drop(db);
+        eprintln!("REVIEW501_REACHED recorded_authenticated_refresh sidecar={sidecar}");
+        // The deliberately stale synthetic catalogue must fail closed before
+        // preparation. Restore only the exact value captured above.
+        let stale = try_cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            options(false),
+        )
+        .await
+        .expect_err("stale catalogue cannot authorize recorded refresh");
+        assert!(
+            format!("{stale:#}")
+                .contains("recorded layout differs from current provider observation")
+        );
+        assert_bytes(&media.join("IMG_0501.JPG"), VALID_EDIT);
+        assert_eq!(
+            db_count(
+                root.path(),
+                "SELECT COUNT(*) FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled')"
+            ),
+            1
+        );
+        eprintln!("REVIEW501_REACHED stale_catalogue_refused sidecar={sidecar}");
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        assert_eq!(conn.execute("UPDATE assets SET metadata_hash=?1 WHERE version_size='adjusted' AND metadata_hash='stale-catalogue-capture'", [&hash]).unwrap(), 1);
+        conn.execute_batch("CREATE TRIGGER fail_refresh_prepare BEFORE UPDATE OF phase ON primary_layout_operations WHEN NEW.phase='prepared' BEGIN SELECT RAISE(FAIL,'injected forced-refresh preparation failure'); END").unwrap();
+        drop(conn);
+        let held = try_cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            options(false),
+        )
+        .await
+        .expect_err("injected prepare failure must retain the recorded refresh");
+        assert!(format!("{held:#}").contains("injected forced-refresh preparation failure"));
+        let held_state = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        assert_eq!(
+            held_state
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap(),
+            checkpoint
+        );
+        drop(held_state);
+        assert_bytes(&media.join("IMG_0501.JPG"), VALID_EDIT);
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        let refresh: bool = conn.query_row("SELECT json_extract(CAST(header AS TEXT),'$.refresh_metadata') FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled')", [], |row| row.get(0)).unwrap();
+        assert!(refresh, "forced refresh intent was not durable");
+        eprintln!("REVIEW501_REACHED held_refresh sidecar={sidecar}");
+        eprintln!(
+            "REVIEW501_STAGE_AFTER_HOLD {:?}",
+            recorded_stages
+                .iter()
+                .map(|p| (p, p.exists(), std::fs::metadata(p).ok().map(|m| m.len())))
+                .collect::<Vec<_>>()
+        );
+        conn.execute_batch("DROP TRIGGER fail_refresh_prepare")
+            .unwrap();
+        drop(conn);
+        use std::os::unix::fs::MetadataExt as _;
+        fn tree(
+            root: &std::path::Path,
+        ) -> Vec<(std::path::PathBuf, Vec<u8>, u64, u64, std::time::SystemTime)> {
+            fn walk(
+                root: &std::path::Path,
+                dir: &std::path::Path,
+                out: &mut Vec<(std::path::PathBuf, Vec<u8>, u64, u64, std::time::SystemTime)>,
+            ) {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    let meta = std::fs::symlink_metadata(&path).unwrap();
+                    assert!(!meta.file_type().is_symlink());
+                    if meta.is_dir() {
+                        walk(root, &path, out);
+                    } else {
+                        out.push((
+                            path.strip_prefix(root).unwrap().to_path_buf(),
+                            std::fs::read(&path).unwrap(),
+                            meta.dev(),
+                            meta.ino(),
+                            meta.modified().unwrap(),
+                        ));
+                    }
+                }
+            }
+            let mut files = Vec::new();
+            walk(root, root, &mut files);
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+            files
+        }
+        fn rows(root: &std::path::Path) -> Vec<(String, Vec<String>)> {
+            let conn = rusqlite::Connection::open_with_flags(
+                root.join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            [
+                "account_owner",
+                "assets",
+                "asset_metadata_paths",
+                "primary_layout_operations",
+                "primary_layout_members",
+                "primary_layout_claims",
+                "primary_layout_bindings",
+                "primary_layout_preserved",
+                "download_receipts",
+                "provider_active_generations",
+                "provider_active_decisions",
+                "provider_active_sources",
+                "provider_active_destinations",
+                "metadata",
+            ]
+            .iter()
+            .map(|table| {
+                let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+                let count = stmt.column_count();
+                let mut values = stmt
+                    .query_map([], |row| {
+                        let mut fields = Vec::new();
+                        for i in 0..count {
+                            fields.push(format!("{:?}", row.get::<_, rusqlite::types::Value>(i)?));
+                        }
+                        Ok(fields.join("|"))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                values.sort();
+                ((*table).to_owned(), values)
+            })
+            .collect()
+        }
+        if let Some(expected_xmp) = &xmp {
+            assert_eq!(
+                std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap(),
+                *expected_xmp
+            );
+        }
+        let files_before = tree(&media);
+        let rows_before = rows(root.path());
+        assert!(recorded_stages.iter().all(|path| path.exists()));
+        let failure = try_cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            options(false),
+        )
+        .await
+        .expect_err("unreceipted occupied stage cannot be silently completed");
+        let rendered = format!("{failure:#}");
+        assert!(
+            rendered.contains("File exists"),
+            "the caller must receive the actual error: {rendered}"
+        );
+        assert_eq!(
+            tree(&media),
+            files_before,
+            "all media, sidecars and staged bytes and identities must remain unchanged"
+        );
+        assert_eq!(
+            rows(root.path()),
+            rows_before,
+            "owner, receipts, journal and checkpoint must remain unchanged"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        eprintln!("REVIEW501_REACHED safe_hold_verified sidecar={sidecar}");
+    }
+}
