@@ -574,6 +574,38 @@ mod tests {
     use std::path::{Path, PathBuf};
     use xmp_toolkit::{XmpMeta, XmpValue, xmp_ns};
 
+    // The held sidecar capability must reject a same-content inode swap as
+    // well as a mutation of the inode it originally read.
+    #[cfg(unix)]
+    #[test]
+    fn reconciled_sidecar_snapshot_rejects_replacement_and_changed_bytes() {
+        use crate::fs_util::{ConfinedParents, ConfinedPath};
+
+        for replace_inode in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("photo.jpg.xmp");
+            fs::write(&path, b"original sidecar").unwrap();
+            let confined =
+                ConfinedPath::open(root.path(), &path, ConfinedParents::Existing).unwrap();
+            let snapshot = super::ReconciledSidecarSnapshot::read(confined)
+                .unwrap()
+                .unwrap();
+            snapshot.validate().unwrap();
+            if replace_inode {
+                let displaced = root.path().join("original.xmp");
+                fs::rename(&path, &displaced).unwrap();
+                fs::write(&path, b"original sidecar").unwrap();
+                assert!(snapshot.validate().is_err());
+                assert_eq!(fs::read(displaced).unwrap(), b"original sidecar");
+                assert_eq!(fs::read(&path).unwrap(), b"original sidecar");
+            } else {
+                fs::write(&path, b"modified sidecar").unwrap();
+                assert!(snapshot.validate().is_err());
+                assert_eq!(fs::read(&path).unwrap(), b"modified sidecar");
+            }
+        }
+    }
+
     // ── Sidecar + format-dispatch tests ────────────────────────────────
 
     fn read_sidecar_meta(media_path: &Path) -> XmpMeta {

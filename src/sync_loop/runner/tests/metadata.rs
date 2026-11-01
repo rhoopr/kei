@@ -4394,3 +4394,886 @@ async fn run_cycle_hidden_invalid_capture_date_preserves_catalogue() {
 // Current invariants live in v027_baseline (including configuration_safety),
 // native requested-metadata and recorded-operation recovery tests. See
 // docs/plans/v027-sync.md for the retained behavior and qualification boundary.
+
+/// Two provider snapshots must not authorize an ordinary sync to rewrite
+/// recorded existing media or metadata. New-download, explicit refresh and
+/// authenticated recovery writers remain covered by their separate controls.
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn stable_provider_two_passes_preserve_recorded_media_and_sidecar() {
+    for prior_debt in [false, true] {
+        exercise_two_pass_preservation(prior_debt).await;
+    }
+}
+
+#[cfg(feature = "xmp")]
+async fn exercise_two_pass_preservation(prior_debt: bool) {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn tree(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                out.push(path.strip_prefix(root).unwrap().to_path_buf());
+                if entry.file_type().unwrap().is_dir() {
+                    walk(root, &path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    #[derive(Clone, Debug)]
+    struct ScopedPassSession {
+        records: Vec<serde_json::Value>,
+        returned_ranks: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        changes_cursors: Arc<std::sync::Mutex<Vec<String>>>,
+        requests: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::icloud::photos::PhotosSession for ScopedPassSession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            _: &[(&str, &str)],
+        ) -> anyhow::Result<serde_json::Value> {
+            let request: serde_json::Value = serde_json::from_str(&body)?;
+            self.requests
+                .lock()
+                .unwrap()
+                .push((url.to_owned(), request.clone()));
+            if url.contains("/changes/zone?") {
+                let zone = &request["zones"][0];
+                anyhow::ensure!(
+                    zone["zoneID"]["zoneName"] == "PrimarySync",
+                    "unexpected changes zone"
+                );
+                let cursor = zone["syncToken"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("missing changes cursor"))?;
+                self.changes_cursors.lock().unwrap().push(cursor.to_owned());
+                return Ok(serde_json::json!({"zones":[{
+                    "zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+                    "records":[], "syncToken":"fixture-zone-history-after",
+                    "moreComing":false
+                }]}));
+            }
+            if url.contains("/records/lookup?") {
+                let requested = request["records"]
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("missing lookup records"))?;
+                let records: Vec<_> = self
+                    .records
+                    .iter()
+                    .filter(|record| {
+                        requested
+                            .iter()
+                            .any(|item| item["recordName"] == record["recordName"])
+                    })
+                    .cloned()
+                    .collect();
+                return Ok(serde_json::json!({"records":records}));
+            }
+            if let Some(page) = sparse_fixture_inventory(url, &request, &self.records) {
+                if url.contains("/records/query?") {
+                    let names = page["records"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|record| record["recordName"].as_str().unwrap().to_owned())
+                        .collect::<Vec<_>>();
+                    if !names.is_empty() {
+                        self.returned_ranks.lock().unwrap().push(names);
+                    }
+                }
+                return Ok(page);
+            }
+            anyhow::bail!("unexpected fixture request: {url}")
+        }
+        fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/existing.jpg"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let config = make_run_cycle_config();
+    let state_dir = tempfile::tempdir().unwrap();
+    let state_path = state_dir.path().join("state.db");
+    let owner = state::db::account::AccountOwner::authenticated(
+        "two-pass@example.invalid",
+        "com",
+        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"two-pass-owner"}})).unwrap(),
+    )
+    .unwrap();
+    let sqlite = Arc::new(
+        state::SqliteStateDb::open_owned(&state_path, &owner)
+            .await
+            .unwrap(),
+    );
+    let inner: Arc<dyn download::DownloadStore> = sqlite.clone();
+    let download_dir = tempfile::tempdir().expect("download tempdir");
+    let media = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    let media_path = download_dir
+        .path()
+        .join(run_cycle_expected_date_dir())
+        .join("photo.jpg");
+    std::fs::create_dir_all(media_path.parent().unwrap()).unwrap();
+    std::fs::write(&media_path, media).unwrap();
+    let sidecar_path = media_path.with_file_name("photo.jpg.xmp");
+    let sidecar = br#"<?xml version="1.0"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="2"/></rdf:RDF></x:xmpmeta>"#;
+    std::fs::write(&sidecar_path, sidecar).unwrap();
+    let media_mtime = std::fs::metadata(&media_path).unwrap().modified().unwrap();
+    let sidecar_mtime = std::fs::metadata(&sidecar_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    let expected_tree = tree(download_dir.path());
+    let local_checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(media));
+    let mut signature = sha1::Sha1::new();
+    signature.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+    signature.update(media);
+    let mut signed = vec![1];
+    signed.extend_from_slice(&signature.finalize());
+    let provider_checksum = base64::engine::general_purpose::STANDARD.encode(signed);
+    let seed_page = full_album_page_with_download(
+        "PrimarySync",
+        "master-PrimarySync",
+        "zone-tok-new",
+        &format!("{}/existing.jpg", server.uri()),
+        media.len() as u64,
+        &provider_checksum,
+    );
+    let seed_asset = crate::icloud::photos::PhotoAsset::new(
+        seed_page["records"][0].clone(),
+        seed_page["records"][1].clone(),
+    );
+    let metadata = (*seed_asset.metadata_arc(state::VersionSizeKey::Original)).clone();
+    let old_metadata_hash = metadata.metadata_hash.clone().unwrap();
+    let record = crate::test_helpers::TestAssetRecord::new("asset-master-PrimarySync")
+        .filename("photo.jpg")
+        .added_at(chrono::DateTime::from_timestamp_millis(RUN_CYCLE_ASSET_DATE_MS).unwrap())
+        .created_at(chrono::DateTime::from_timestamp_millis(RUN_CYCLE_ASSET_DATE_MS).unwrap())
+        .checksum(&provider_checksum)
+        .size(media.len() as u64)
+        .metadata(metadata)
+        .build();
+    inner.upsert_seen(&record).await.unwrap();
+    sqlite
+        .upsert_asset_master_mapping(
+            "PrimarySync",
+            "asset-master-PrimarySync",
+            "master-PrimarySync",
+        )
+        .await
+        .unwrap();
+    inner
+        .mark_verified_download(
+            "PrimarySync",
+            "asset-master-PrimarySync",
+            "original",
+            &media_path,
+            &local_checksum,
+            Some(&local_checksum),
+            false,
+        )
+        .await
+        .unwrap();
+    if prior_debt {
+        inner
+            .record_metadata_write_failure("PrimarySync", "asset-master-PrimarySync", "original")
+            .await
+            .unwrap();
+    }
+    let marker_key = (
+        "PrimarySync".to_string(),
+        "asset-master-PrimarySync".to_string(),
+        "original".to_string(),
+    );
+    assert_eq!(
+        inner
+            .get_metadata_retry_markers()
+            .await
+            .unwrap()
+            .contains(&marker_key),
+        prior_debt
+    );
+    let prior_path_marker: Option<i64> = sqlite.acquire_lock("prior metadata debt").unwrap().query_row(
+        "SELECT metadata_write_failed_at FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-master-PrimarySync' AND version_size='original' AND local_path=?1",
+        [media_path.to_str().unwrap()], |row| row.get(0)
+    ).unwrap();
+    assert_eq!(prior_path_marker.is_some(), prior_debt);
+    let prior_catalog_marker: Option<i64> = sqlite.acquire_lock("prior catalogue debt").unwrap().query_row(
+        "SELECT metadata_write_failed_at FROM assets WHERE library='PrimarySync' AND id='asset-master-PrimarySync' AND version_size='original'",
+        [], |row| row.get(0)
+    ).unwrap();
+    assert_eq!(prior_catalog_marker.is_some(), prior_debt);
+    let original_markers = (prior_path_marker, prior_catalog_marker);
+    let (source, local, path_provider): (String, String, String) = sqlite.acquire_lock("verified initial source receipt").unwrap().query_row(
+        "SELECT source_checksum,local_checksum,provider_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-master-PrimarySync' AND version_size='original' AND local_path=?1",
+        [media_path.to_str().unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).unwrap();
+    assert_eq!(
+        (source, local, path_provider),
+        (
+            local_checksum.clone(),
+            local_checksum.clone(),
+            provider_checksum.clone()
+        )
+    );
+
+    let seeded = inner.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(seeded.len(), 1);
+    assert_eq!(seeded[0].library.as_ref(), "PrimarySync");
+    assert_eq!(seeded[0].id.as_ref(), "asset-master-PrimarySync");
+    assert_eq!(seeded[0].checksum.as_ref(), provider_checksum.as_str());
+    assert_eq!(seeded[0].size_bytes, media.len() as u64);
+    assert_eq!(seeded[0].local_path.as_deref(), Some(media_path.as_path()));
+    assert_eq!(
+        seeded[0].metadata.metadata_hash.as_deref(),
+        Some(old_metadata_hash.as_str())
+    );
+    assert_eq!(
+        sqlite
+            .get_master_record_name_for_asset("PrimarySync", "asset-master-PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("master-PrimarySync")
+    );
+    let initial_created_at = seeded[0].created_at;
+    let initial_added_at = seeded[0].added_at;
+    drop(seeded);
+
+    // TEMP triggers observe real owner transactions and survive generation
+    // retirement without changing the concrete store or its selection identity.
+    sqlite.acquire_lock("two-pass destination audit").unwrap().execute_batch(
+        "CREATE TEMP TABLE observed_destinations(event TEXT, generation TEXT, pass_key TEXT, child TEXT, asset_id TEXT, path TEXT, admitted INTEGER, verified_media INTEGER, verified_metadata INTEGER, grouping_hash TEXT, metadata_hash TEXT, metadata_enabled INTEGER, deadline INTEGER, catalog_hash TEXT, marker INTEGER, path_marker INTEGER);
+         CREATE TEMP TABLE observed_catalog(old_hash TEXT, new_hash TEXT, old_marker INTEGER, new_marker INTEGER);
+         CREATE TEMP TRIGGER observe_catalog_update AFTER UPDATE OF metadata_hash,metadata_write_failed_at ON assets WHEN NEW.library='PrimarySync' AND NEW.id='asset-master-PrimarySync' BEGIN
+           INSERT INTO observed_catalog VALUES(OLD.metadata_hash,NEW.metadata_hash,OLD.metadata_write_failed_at,NEW.metadata_write_failed_at);
+         END;
+         CREATE TEMP TRIGGER observe_destination_insert AFTER INSERT ON provider_active_destinations BEGIN
+           INSERT INTO observed_destinations VALUES('insert', NEW.generation, NEW.pass_key, NEW.child, NEW.asset_id, NEW.path, NEW.admitted, NEW.verified_media, NEW.verified_metadata, NEW.grouping_hash, NEW.metadata_hash,
+             (SELECT metadata_enabled FROM provider_active_generations WHERE id=NEW.generation),
+             (SELECT next_retry_at FROM provider_active_decisions WHERE generation=NEW.generation AND pass_key=NEW.pass_key AND child=NEW.child),
+             (SELECT metadata_hash FROM assets WHERE library=NEW.library AND id=NEW.asset_id AND version_size=NEW.version_size),
+             (SELECT metadata_write_failed_at FROM assets WHERE library=NEW.library AND id=NEW.asset_id AND version_size=NEW.version_size),
+             (SELECT metadata_write_failed_at FROM asset_metadata_paths WHERE library=NEW.library AND id=NEW.asset_id AND version_size=NEW.version_size AND provider_checksum=NEW.checksum AND local_path=json_extract(NEW.path,'$.path')));
+         END;
+         CREATE TEMP TRIGGER observe_destination_update AFTER UPDATE ON provider_active_destinations BEGIN
+           INSERT INTO observed_destinations VALUES('update', NEW.generation, NEW.pass_key, NEW.child, NEW.asset_id, NEW.path, NEW.admitted, NEW.verified_media, NEW.verified_metadata, NEW.grouping_hash, NEW.metadata_hash,
+             (SELECT metadata_enabled FROM provider_active_generations WHERE id=NEW.generation),
+             (SELECT next_retry_at FROM provider_active_decisions WHERE generation=NEW.generation AND pass_key=NEW.pass_key AND child=NEW.child),
+             (SELECT metadata_hash FROM assets WHERE library=NEW.library AND id=NEW.asset_id AND version_size=NEW.version_size),
+             (SELECT metadata_write_failed_at FROM assets WHERE library=NEW.library AND id=NEW.asset_id AND version_size=NEW.version_size),
+             (SELECT metadata_write_failed_at FROM asset_metadata_paths WHERE library=NEW.library AND id=NEW.asset_id AND version_size=NEW.version_size AND provider_checksum=NEW.checksum AND local_path=json_extract(NEW.path,'$.path')));
+         END;"
+    ).unwrap();
+    let db: Arc<dyn download::DownloadStore> = sqlite.clone();
+    let changes_cursors = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let first_ranks = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let second_ranks = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pass = |name: &str,
+                _favourite: bool,
+                returned_ranks: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+                capture_db: Arc<state::SqliteStateDb>| {
+        let mut page = full_album_page_with_download(
+            "PrimarySync",
+            "master-PrimarySync",
+            "zone-tok-new",
+            &format!("{}/existing.jpg", server.uri()),
+            media.len() as u64,
+            &provider_checksum,
+        );
+        page["records"][1]["fields"]["isFavorite"] =
+            serde_json::json!({"value": 1, "type":"INT64"});
+        let selected_asset = crate::icloud::photos::PhotoAsset::new(
+            page["records"][0].clone(),
+            page["records"][1].clone(),
+        );
+        let captured = selected_asset.metadata_arc(state::VersionSizeKey::Original);
+        snapshots.lock().unwrap().push((
+            name.to_owned(),
+            captured.metadata_hash.clone().unwrap(),
+            captured.rating,
+            captured.title.clone(),
+        ));
+        let mut album = crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::new(std::collections::HashMap::new()),
+                service_endpoint: Arc::from("https://example.invalid"),
+                name: Arc::from(name),
+                list_type: Arc::from("CPLContainerRelationLiveByAssetDate"),
+                obj_type: Arc::from(format!("CPLContainerRelationNotDeletedByAssetDate:{name}")),
+                query_filter: Some(Arc::new(
+                    serde_json::json!([{"fieldName":"parentId","comparator":"EQUALS","fieldValue":{"type":"STRING","value":name}}]),
+                )),
+                page_size: 100,
+                zone_id: Arc::new(
+                    serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                ),
+                retry_config: retry::RetryConfig::default(),
+                container_id: Some(Arc::from(name)),
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(ScopedPassSession {
+                records: page["records"].as_array().unwrap().clone(),
+                returned_ranks: returned_ranks.clone(),
+                changes_cursors: changes_cursors.clone(),
+                requests: provider_requests.clone(),
+            }),
+        );
+        album.set_shadow_capture(
+            crate::icloud::photos::inbox::ShadowCapture::new(capture_db, owner.clone(), "com"),
+            Arc::from("private"),
+        );
+        crate::commands::AlbumPass {
+            kind: crate::commands::PassKind::Album,
+            album,
+            exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+        }
+    };
+    let lib_state = make_run_cycle_library_state_with_passes(
+        "PrimarySync",
+        "sync_token:PrimarySync",
+        vec![
+            pass("Favourited", true, first_ranks.clone(), sqlite.clone()),
+            pass("Captioned", false, second_ranks.clone(), sqlite.clone()),
+        ],
+    );
+    let actual_snapshots = snapshots.lock().unwrap().clone();
+    assert_eq!(actual_snapshots.len(), 2);
+    assert_eq!(
+        actual_snapshots[0].1, actual_snapshots[1].1,
+        "stable provider returns the same metadata in both albums"
+    );
+    assert!(
+        actual_snapshots
+            .iter()
+            .all(|snapshot| snapshot.1 != old_metadata_hash)
+    );
+    for pass in &lib_state.plan.passes {
+        let (capture, scope, zone) = pass
+            .album
+            .download_scope()
+            .unwrap()
+            .expect("authenticated pass scope");
+        assert!(
+            Arc::ptr_eq(&capture.db, &sqlite),
+            "selection and download must use the same concrete owner"
+        );
+        assert!(
+            capture.owner == owner,
+            "selection must use the authenticated owner"
+        );
+        assert_eq!(zone["zoneName"], "PrimarySync");
+        assert_eq!(zone["ownerRecordName"], "_defaultOwner");
+        assert!(
+            pass.album.selection_scope()["container_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        sqlite
+            .validate_download_scope(owner.clone(), scope, "PrimarySync".to_owned())
+            .await
+            .unwrap();
+    }
+    let expected_passes: std::collections::HashSet<_> = lib_state
+        .plan
+        .passes
+        .iter()
+        .map(|pass| {
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::json!({
+                        "kind": format!("{:?}", pass.kind),
+                        "scope": pass.album.selection_scope(),
+                        "excludes": Vec::<String>::new(),
+                    })
+                    .to_string()
+                    .as_bytes()
+                )
+            )
+        })
+        .collect();
+    assert_eq!(expected_passes.len(), 2);
+    let build_download_config = make_run_cycle_download_config_builder_with_options(
+        download_dir.path(),
+        Arc::clone(&db),
+        RunCycleDownloadConfigOptions {
+            xmp_sidecar: true,
+            concurrent_downloads: Some(2),
+            ..RunCycleDownloadConfigOptions::default()
+        },
+    );
+    assert!(!config.runtime.refresh_metadata);
+    let probe_config = build_download_config(
+        download::SyncMode::Full,
+        Arc::new(rustc_hash::FxHashSet::default()),
+        Arc::new(download::AssetGroupings::default()),
+        Arc::from("PrimarySync"),
+    );
+    assert!(
+        !probe_config.refresh_metadata,
+        "automatic drift must not request explicit refresh"
+    );
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    let sidecar_entries = crate::download::metadata_rewrite::test_sidecar_entries(&media_path);
+    run_cycle(
+        &[&lib_state],
+        &config,
+        Some(db.as_ref()),
+        false,
+        &build_download_config,
+        download::DownloadControls::download_hidden(),
+        &shared_session,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("run cycle");
+    assert_eq!(
+        *changes_cursors.lock().unwrap(),
+        vec!["fixture-zone-history-boundary"],
+        "the scoped empty bridge must be consumed"
+    );
+    assert_eq!(
+        sidecar_entries.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "ordinary sync must not invoke the recorded sidecar writer"
+    );
+    assert_eq!(
+        tree(download_dir.path()),
+        expected_tree,
+        "ordinary sync must not add duplicate paths"
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "recorded media must not be fetched"
+    );
+    assert_eq!(
+        std::fs::read(&media_path).unwrap().as_slice(),
+        media.as_slice()
+    );
+    assert_eq!(
+        std::fs::read(&sidecar_path).unwrap().as_slice(),
+        sidecar.as_slice()
+    );
+    assert_eq!(
+        std::fs::metadata(&media_path).unwrap().modified().unwrap(),
+        media_mtime
+    );
+    assert_eq!(
+        std::fs::metadata(&sidecar_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        sidecar_mtime
+    );
+
+    let expected = full_album_page_with_download(
+        "PrimarySync",
+        "master-PrimarySync",
+        "zone-tok-new",
+        &format!("{}/existing.jpg", server.uri()),
+        media.len() as u64,
+        &provider_checksum,
+    );
+    let expected_names: Vec<String> = expected["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["recordName"].as_str().unwrap().to_owned())
+        .collect();
+    for returned in [&first_ranks, &second_ranks] {
+        assert!(
+            returned
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|names| names == &expected_names),
+            "both authenticated passes must return the selected child and master"
+        );
+    }
+    let expected_path = crate::state::db::provider_selection::SelectionPath::from_path(&media_path)
+        .key()
+        .unwrap();
+    let audit = {
+        let conn = sqlite
+            .acquire_lock("preserved selected destination evidence")
+            .unwrap();
+        let mut query = conn.prepare("SELECT DISTINCT pass_key, child, asset_id, path, verified_media, metadata_hash FROM observed_destinations WHERE admitted=1").unwrap();
+        query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let passes: std::collections::HashSet<_> = audit
+        .iter()
+        .filter(|(_, child, asset, path, _, _)| {
+            child == &expected_names[1]
+                && asset == "asset-master-PrimarySync"
+                && path == &expected_path
+        })
+        .map(|entry| entry.0.clone())
+        .collect();
+    assert_eq!(
+        passes, expected_passes,
+        "both passes must identify the recorded destination: {audit:?}"
+    );
+
+    let assert_preserved_state = |db: &state::SqliteStateDb| {
+        let conn = db.acquire_lock("preserved source and debt").unwrap();
+        let row: (String, String, String, String, Option<String>, Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT p.local_path,p.provider_checksum,p.source_checksum,p.local_checksum,p.download_checksum,p.metadata_write_failed_at,a.metadata_write_failed_at FROM asset_metadata_paths p JOIN assets a USING(library,id,version_size) WHERE p.library='PrimarySync' AND p.id='asset-master-PrimarySync' AND p.version_size='original' AND p.local_path=?1",
+            [media_path.to_str().unwrap()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))
+        ).unwrap();
+        assert_eq!(row.0, media_path.to_str().unwrap());
+        assert_eq!(row.1, provider_checksum);
+        assert_eq!(row.2, local_checksum);
+        assert_eq!(row.3, local_checksum);
+        assert_eq!(row.4.as_deref(), Some(local_checksum.as_str()));
+        if prior_debt {
+            assert!(
+                row.5.is_some() && row.6.is_some(),
+                "prior path and catalogue debt must remain visible"
+            );
+        }
+        (row.5, row.6)
+    };
+    let retained_markers = assert_preserved_state(&sqlite);
+    if prior_debt {
+        assert_eq!(
+            retained_markers, original_markers,
+            "ordinary sync must preserve the exact original path and catalogue debt markers"
+        );
+    }
+    let markers = inner.get_metadata_retry_markers().await.unwrap();
+    if prior_debt {
+        assert!(
+            markers.contains(&marker_key),
+            "ordinary sync must not silently retire prior metadata debt"
+        );
+    }
+    let rows = inner.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].local_path.as_deref(), Some(media_path.as_path()));
+    assert_eq!(rows[0].checksum.as_ref(), provider_checksum.as_str());
+    assert_eq!(rows[0].created_at, initial_created_at);
+    assert_eq!(rows[0].added_at, initial_added_at);
+    let winning_hash = rows[0]
+        .metadata
+        .metadata_hash
+        .as_deref()
+        .expect("winning metadata hash");
+    assert!(
+        audit.iter().any(
+            |(pass, child, asset, path, verified_media, selected_hash)| expected_passes
+                .contains(pass)
+                && child == &expected_names[1]
+                && asset == "asset-master-PrimarySync"
+                && path == &expected_path
+                && *verified_media == 1
+                && selected_hash == winning_hash
+        ),
+        "the admitted winning destination must reach verified media reuse: {audit:?}"
+    );
+    let row_metadata = rows[0].metadata.clone();
+    let catalog_metadata = serde_json::to_value(&row_metadata).unwrap();
+    // Compare every compact receipt column, including optional trust fields.
+    let compact_receipts = |db: &state::SqliteStateDb| -> Vec<String> {
+        let conn = db.acquire_lock("stable provider compact receipts").unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT json_array(id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,trust_receipt,selected_metadata_hash,generation_id) FROM download_receipts WHERE library='PrimarySync' AND child='asset-master-PrimarySync' AND master='master-PrimarySync' AND version_size='original' ORDER BY id"
+        ).unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let original_receipts = compact_receipts(&sqlite);
+    assert_eq!(
+        original_receipts.len(),
+        1,
+        "winning scoped compact receipt must exist"
+    );
+    let receipt: serde_json::Value = serde_json::from_str(&original_receipts[0]).unwrap();
+    let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+    let expected_scope =
+        crate::icloud::photos::inbox::ShadowCapture::new(sqlite.clone(), owner.clone(), "com")
+            .scope(
+                "private",
+                &serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+            )
+            .unwrap();
+    assert_eq!(receipt[1], account_key);
+    assert_eq!(receipt[2], provider_key);
+    assert_eq!(receipt[3], expected_scope);
+    assert_eq!(receipt[4], "PrimarySync");
+    assert_eq!(receipt[5], "asset-master-PrimarySync");
+    assert_eq!(receipt[6], "master-PrimarySync");
+    assert_eq!(receipt[7], "asset-master-PrimarySync");
+    let raw_passes = receipt[8].as_str().unwrap();
+    let receipt_passes: Vec<String> = if raw_passes.starts_with('[') {
+        serde_json::from_str(raw_passes).unwrap()
+    } else {
+        assert!(!raw_passes.trim().is_empty());
+        vec![raw_passes.to_owned()]
+    };
+    assert!(!receipt_passes.is_empty());
+    assert!(receipt_passes.iter().all(|pass| !pass.trim().is_empty()));
+    assert!(receipt_passes.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(
+        audit
+            .iter()
+            .any(
+                |(pass, child, asset, path, verified, hash)| expected_passes.contains(pass)
+                    && receipt_passes.contains(pass)
+                    && child == "asset-master-PrimarySync"
+                    && asset == "asset-master-PrimarySync"
+                    && path == &expected_path
+                    && *verified == 1
+                    && hash == winning_hash
+            ),
+        "compact receipt must include the proven winning pass"
+    );
+    assert!(
+        receipt_passes
+            .iter()
+            .all(|pass| expected_passes.contains(pass))
+    );
+    assert_eq!(receipt[9], "original");
+    assert_eq!(receipt[10], provider_checksum);
+    assert_eq!(receipt[11], media.len());
+    assert_eq!(receipt[12], expected_path);
+    assert_eq!(receipt[13], local_checksum);
+    assert_eq!(receipt[14], local_checksum);
+    assert!(!receipt[0].as_str().unwrap().is_empty());
+    assert!(!receipt[15].as_str().unwrap().is_empty());
+    assert!(receipt[16].is_null() && receipt[17].is_null() && receipt[18].is_null());
+    drop(rows);
+    drop(probe_config);
+    drop(build_download_config);
+    drop(lib_state);
+    drop(db);
+    drop(inner);
+    assert_eq!(
+        Arc::strong_count(&sqlite),
+        1,
+        "all first-cycle owner, capture and config handles must be released"
+    );
+    assert_eq!(tree(download_dir.path()), expected_tree);
+    let closed_owner = Arc::downgrade(&sqlite);
+    drop(sqlite);
+    assert!(
+        closed_owner.upgrade().is_none(),
+        "the first SQLite owner must be dropped before reopen"
+    );
+
+    let reopened = Arc::new(
+        state::SqliteStateDb::open_owned(&state_path, &owner)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(assert_preserved_state(&reopened), retained_markers);
+    if prior_debt {
+        assert_eq!(
+            assert_preserved_state(&reopened),
+            original_markers,
+            "closed-owner reopen must preserve exact original debt markers"
+        );
+    }
+    if prior_debt {
+        assert!(
+            reopened
+                .get_metadata_retry_markers()
+                .await
+                .unwrap()
+                .contains(&marker_key)
+        );
+    }
+    assert_eq!(
+        compact_receipts(&reopened),
+        original_receipts,
+        "complete compact receipt must survive closed-owner reopen"
+    );
+    let reopened_rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(reopened_rows.len(), 1);
+    assert_eq!(
+        reopened_rows[0].local_path.as_deref(),
+        Some(media_path.as_path())
+    );
+    assert_eq!(reopened_rows[0].created_at, initial_created_at);
+    assert_eq!(reopened_rows[0].added_at, initial_added_at);
+    assert_eq!(
+        reopened_rows[0].metadata.metadata_hash,
+        row_metadata.metadata_hash
+    );
+    assert_eq!(
+        std::fs::read(&media_path).unwrap().as_slice(),
+        media.as_slice()
+    );
+    assert_eq!(
+        std::fs::read(&sidecar_path).unwrap().as_slice(),
+        sidecar.as_slice()
+    );
+    assert_eq!(
+        std::fs::metadata(&media_path).unwrap().modified().unwrap(),
+        media_mtime
+    );
+    assert_eq!(
+        std::fs::metadata(&sidecar_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        sidecar_mtime
+    );
+
+    let quiet_requests_before = provider_requests.lock().unwrap().len();
+    let quiet_db: Arc<dyn download::DownloadStore> = reopened.clone();
+    let quiet_library = make_run_cycle_library_state_with_passes(
+        "PrimarySync",
+        "sync_token:PrimarySync",
+        vec![
+            pass("Favourited", true, first_ranks.clone(), reopened.clone()),
+            pass("Captioned", false, second_ranks.clone(), reopened.clone()),
+        ],
+    );
+    let quiet_builder = make_run_cycle_download_config_builder_with_options(
+        download_dir.path(),
+        quiet_db.clone(),
+        RunCycleDownloadConfigOptions {
+            xmp_sidecar: true,
+            concurrent_downloads: Some(2),
+            ..RunCycleDownloadConfigOptions::default()
+        },
+    );
+    let quiet_result = run_cycle(
+        &[&quiet_library],
+        &config,
+        Some(quiet_db.as_ref()),
+        false,
+        &quiet_builder,
+        download::DownloadControls::download_hidden(),
+        &shared_session,
+        &CancellationToken::new(),
+    )
+    .await;
+    quiet_result.expect("quiet reopened cycle");
+    {
+        let requests = provider_requests.lock().unwrap();
+        let quiet = &requests[quiet_requests_before..];
+        assert!(
+            quiet.iter().any(|(url, _)| url.contains("/changes/zone?")),
+            "quiet cycle must consume provider changes"
+        );
+        assert!(
+            quiet.iter().all(|(url, _)| !url.contains("/records/query?")
+                && !url.contains("/internal/records/query/batch?")),
+            "quiet cycle must not redo rank inventory: {quiet:?}"
+        );
+    }
+    assert_eq!(
+        tree(download_dir.path()),
+        expected_tree,
+        "quiet reopen must not add duplicate paths"
+    );
+    let quiet_rows = reopened.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(quiet_rows.len(), 1);
+    assert_eq!(
+        quiet_rows[0].local_path.as_deref(),
+        Some(media_path.as_path())
+    );
+    assert_eq!(quiet_rows[0].created_at, initial_created_at);
+    assert_eq!(quiet_rows[0].added_at, initial_added_at);
+    assert_eq!(
+        serde_json::to_value(&quiet_rows[0].metadata).unwrap(),
+        catalog_metadata,
+        "quiet cycle must preserve complete catalogue metadata and hash"
+    );
+    assert_eq!(
+        compact_receipts(&reopened),
+        original_receipts,
+        "quiet cycle must preserve complete compact receipt"
+    );
+    let quiet_markers = assert_preserved_state(&reopened);
+    if prior_debt {
+        assert_eq!(
+            quiet_markers, original_markers,
+            "quiet cycle must preserve exact original debt markers"
+        );
+    }
+    if retained_markers.0.is_some() {
+        assert!(
+            quiet_markers.0.is_some(),
+            "path metadata debt must remain visible"
+        );
+    }
+    if retained_markers.1.is_some() {
+        assert!(
+            quiet_markers.1.is_some(),
+            "catalogue metadata debt must remain visible"
+        );
+    }
+    if prior_debt {
+        assert!(
+            reopened
+                .get_metadata_retry_markers()
+                .await
+                .unwrap()
+                .contains(&marker_key)
+        );
+    }
+    assert_eq!(
+        std::fs::read(&media_path).unwrap().as_slice(),
+        media.as_slice()
+    );
+    assert_eq!(
+        std::fs::read(&sidecar_path).unwrap().as_slice(),
+        sidecar.as_slice()
+    );
+    assert_eq!(
+        std::fs::metadata(&media_path).unwrap().modified().unwrap(),
+        media_mtime
+    );
+    assert_eq!(
+        std::fs::metadata(&sidecar_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        sidecar_mtime
+    );
+    assert_eq!(
+        sidecar_entries.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "quiet reopen must not invoke the recorded sidecar writer"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    eprintln!("PRESERVATION_REACHED prior_debt={prior_debt} quiet_reopen=true");
+}

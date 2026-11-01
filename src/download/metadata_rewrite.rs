@@ -105,7 +105,7 @@ pub(crate) async fn test_metadata_budget<F: std::future::Future>(
 }
 
 #[cfg(all(test, feature = "xmp"))]
-pub(crate) use sidecar::test_sidecar_successes;
+pub(crate) use sidecar::{test_sidecar_entries, test_sidecar_successes};
 
 #[cfg(all(test, feature = "xmp"))]
 pub(crate) use crate::download::file::test_sidecar_publications;

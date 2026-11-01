@@ -39,6 +39,40 @@ fn record_test_sidecar_success(path: &Path) {
     }
 }
 
+#[cfg(all(test, feature = "xmp"))]
+static TEST_SIDECAR_ENTRIES: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            std::path::PathBuf,
+            std::sync::Weak<std::sync::atomic::AtomicUsize>,
+        >,
+    >,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, feature = "xmp"))]
+pub(crate) fn test_sidecar_entries(path: &Path) -> Arc<std::sync::atomic::AtomicUsize> {
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    TEST_SIDECAR_ENTRIES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(path.to_owned(), Arc::downgrade(&count));
+    count
+}
+
+#[cfg(all(test, feature = "xmp"))]
+fn record_test_sidecar_entry(path: &Path) {
+    if let Some(count) = TEST_SIDECAR_ENTRIES.get().and_then(|entries| {
+        entries
+            .lock()
+            .unwrap()
+            .get(path)
+            .and_then(std::sync::Weak::upgrade)
+    }) {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[cfg(feature = "xmp")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SidecarOutcome {
@@ -79,6 +113,8 @@ pub(super) async fn write_sidecar_metadata_observed(
     source_checksum: Option<&str>,
     temp_suffix: &str,
 ) -> SidecarOutcome {
+    #[cfg(test)]
+    record_test_sidecar_entry(path);
     let source_checksum = source_checksum.map(str::to_owned);
     let sidecar_path = path.to_path_buf();
     let log_path = sidecar_path.clone();
