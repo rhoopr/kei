@@ -32,6 +32,9 @@ use crate::state::db::provider_selection::{
     SelectionDecision, SelectionDestination, SelectionOutcome, SelectionPath,
 };
 
+mod compact_policy;
+pub(crate) use compact_policy::{CurrentPassPolicy, CurrentPolicyEligibility, NewRootPolicy};
+
 const MAX_REPLAY_DECISIONS: u32 = 64;
 const DEFERRED_REASON: &str = "selection_generation_deferred";
 
@@ -486,6 +489,14 @@ pub(crate) struct SelectionRun {
     fresh_confirmation: bool,
     pub(in crate::download) retained_retry: bool,
     retry_sources: Arc<std::sync::Mutex<SelectionRetrySources>>,
+    compact_offer: Arc<
+        tokio::sync::Mutex<
+            Option<crate::state::db::provider_generations::compact_attestation::NewRootPolicyOffer>,
+        >,
+    >,
+    compact_passes: BTreeMap<String, AlbumPass>,
+    compact_base: Arc<DownloadConfig>,
+    compact_context: Arc<SelectionContext>,
 }
 
 impl SelectionContext {
@@ -619,17 +630,33 @@ impl SelectionContext {
                 .await?
         };
         let spec = self.spec(config, basis);
-        let root = if self.format == 1
+        let new_policy = if let [pass] = passes {
+            compact_policy::prepare_new_root(self, pass, config)
+        } else {
+            None
+        };
+        let (root, permit) = if self.format == 1
             && let Some(current) = self.current().await?
             && !current.sealed
         {
-            current
+            (current, None)
         } else {
             self.capture
                 .db
-                .begin_selection_generation(self.capture.owner.clone(), spec, MAX_GENERATION_BYTES)
+                .begin_selection_generation_with_policy_permit(
+                    self.capture.owner.clone(),
+                    spec,
+                    MAX_GENERATION_BYTES,
+                )
                 .await?
         };
+        let offer = permit.zip(new_policy).and_then(|(permit, policy)| {
+            crate::state::db::provider_generations::compact_attestation::NewRootPolicyOffer::new(
+                permit, policy, &root,
+            )
+        });
+        let mut compact_base = config.clone();
+        compact_base.selection_run = None;
         Ok(Arc::new(SelectionRun {
             capture: self.capture.clone(),
             root,
@@ -643,6 +670,13 @@ impl SelectionContext {
             fresh_confirmation: false,
             retained_retry: false,
             retry_sources: Arc::clone(&self.retry_sources),
+            compact_offer: Arc::new(tokio::sync::Mutex::new(offer)),
+            compact_passes: passes
+                .iter()
+                .map(|pass| (pass_key(pass), pass.clone()))
+                .collect(),
+            compact_base: Arc::new(compact_base),
+            compact_context: Arc::new(self.clone()),
         }))
     }
 
@@ -650,9 +684,12 @@ impl SelectionContext {
         &self,
         root: ActiveGeneration,
         passes: &[AlbumPass],
+        config: &DownloadConfig,
         fresh_confirmation: bool,
         retained_retry: bool,
     ) -> Arc<SelectionRun> {
+        let mut compact_base = config.clone();
+        compact_base.selection_run = None;
         Arc::new(SelectionRun {
             capture: self.capture.clone(),
             root,
@@ -666,6 +703,13 @@ impl SelectionContext {
             fresh_confirmation,
             retained_retry,
             retry_sources: Arc::clone(&self.retry_sources),
+            compact_offer: Arc::new(tokio::sync::Mutex::new(None)),
+            compact_passes: passes
+                .iter()
+                .map(|pass| (pass_key(pass), pass.clone()))
+                .collect(),
+            compact_base: Arc::new(compact_base),
+            compact_context: Arc::new(self.clone()),
         })
     }
 }
@@ -687,7 +731,544 @@ fn classify_selection_reference_deferral(error: &anyhow::Error) -> bool {
             .is_some()
 }
 
+pub(in crate::download) fn retry_source_item_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::state::error::StateError>()
+        .is_some_and(|cause| {
+            matches!(
+                cause,
+                crate::state::error::StateError::ProviderSelectionAmbiguous
+                    | crate::state::error::StateError::ProviderSelectionFull
+                    | crate::state::error::StateError::ProviderWorkConflict
+            )
+        })
+}
+
 impl SelectionRun {
+    fn transfer_owner<'a>(
+        &'a self,
+        pass: &str,
+        task: &filter::DownloadTask,
+    ) -> Result<
+        Option<(
+            &'a Self,
+            crate::state::db::provider_generations::SelectionTransferKey,
+        )>,
+    > {
+        let run = if self.root.spec.zone.get("zoneName").and_then(Value::as_str)
+            == Some(task.library.as_ref())
+        {
+            self
+        } else {
+            self.source_runs
+                .get(task.library.as_ref())
+                .map(AsRef::as_ref)
+                .context("Transfer has no authenticated source ledger")?
+        };
+        let Some(binding) = task.publication_binding.as_ref() else {
+            return Ok(None);
+        };
+        let (account, provider) = run.capture.owner.authenticated_keys()?;
+        if binding.account_key != account
+            || binding.provider_key != provider
+            || binding.scope != run.root.spec.scope
+            || binding.library != task.library.as_ref()
+            || binding.child != task.asset_record_name.as_ref()
+            || binding.state_id != task.asset_id.as_ref()
+            || binding.origin_pass != pass
+        {
+            return Ok(None);
+        }
+        Ok(Some((
+            run,
+            crate::state::db::provider_generations::SelectionTransferKey {
+                generation: run.root.id.clone(),
+                pass_key: pass.to_owned(),
+                child: task.asset_record_name.to_string(),
+                state_id: task.asset_id.to_string(),
+                master: binding.master.clone(),
+                version_size: task.version_size.as_str().to_owned(),
+                path: SelectionPath::from_path(&std::path::absolute(&task.download_path)?),
+                checksum: task.checksum.to_string(),
+                size: task.size,
+                url: task.url.to_string(),
+            },
+        )))
+    }
+
+    /// Verify a cleanup lookup plan against its actual selected task owner.
+    /// This is not state dispatch authority; the selected retry remains held.
+    pub(in crate::download) fn matches_refresh_request(
+        &self,
+        pass: &str,
+        task: &filter::DownloadTask,
+        request: &crate::icloud::photos::RefreshRequest,
+    ) -> bool {
+        let Ok(Some((run, key))) = self.transfer_owner(pass, task) else {
+            return false;
+        };
+        let Ok(scope) = crate::icloud::photos::changes_json::parse(run.root.spec.scope.as_bytes())
+        else {
+            return false;
+        };
+        let Some(database) = scope.get("database").and_then(Value::as_str) else {
+            return false;
+        };
+        let target = crate::icloud::photos::RefreshTarget {
+            database,
+            zone: &run.root.spec.zone,
+            child: &key.child,
+            master: &key.master,
+            version: task.version_size,
+            checksum: &key.checksum,
+            size: key.size,
+        };
+        request.matches(&run.capture.owner, &target)
+    }
+
+    async fn compact_transfer_witness(
+        &self,
+        pass: &str,
+        key: &crate::state::db::provider_generations::SelectionTransferKey,
+    ) -> Result<
+        Option<(
+            crate::download::CurrentPolicyEligibility,
+            String,
+            crate::icloud::photos::session::SourceAuthority,
+        )>,
+    > {
+        let Some(album_pass) = self.compact_passes.get(pass) else {
+            return Ok(None);
+        };
+        let Some(zone) = album_pass.album.authenticated_zone_scope().await else {
+            return Ok(None);
+        };
+        if zone.owner() != &self.capture.owner
+            || zone.scope() != self.root.spec.scope
+            || zone.zone() != &self.root.spec.zone
+        {
+            return Ok(None);
+        }
+        let Some(decision) = self
+            .capture
+            .db
+            .selection_decision(
+                self.capture.owner.clone(),
+                self.root.id.clone(),
+                pass.to_owned(),
+                key.child.clone(),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(body) = decision.decision.confirmation.as_deref() else {
+            return Ok(None);
+        };
+        let Some(master) = decision.decision.master.as_deref() else {
+            return Ok(None);
+        };
+        let asset = current_asset(body, &key.child, master, &self.root.spec.zone)?;
+        let Some(marker) = self
+            .capture
+            .db
+            .compact_root_policy(self.capture.owner.clone(), self.root.id.clone())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(policy) = compact_policy::mint(
+            &self.compact_context,
+            &self.root,
+            album_pass,
+            &self.compact_base,
+            &asset,
+            body,
+            &marker,
+        ) else {
+            return Ok(None);
+        };
+        let Some(route) = self
+            .capture
+            .db
+            .compact_410_route_hint(
+                self.capture.owner.clone(),
+                self.root.id.clone(),
+                pass.to_owned(),
+                key.child.clone(),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((policy, route, zone.authority().clone())))
+    }
+
+    /// Called only while the destination guard is held after actual HTTP 410.
+    pub(in crate::download) async fn record_expired_transfer(
+        &self,
+        pass: &str,
+        task: &filter::DownloadTask,
+    ) -> Result<()> {
+        let Some((run, key)) = self.transfer_owner(pass, task)? else {
+            return Ok(());
+        };
+        if run.root.spec.format != 2 {
+            return Ok(());
+        }
+        if let Some((policy, route, authority)) = run.compact_transfer_witness(pass, &key).await? {
+            run.capture
+                .db
+                .record_real_expired_transfer(
+                    run.capture.owner.clone(),
+                    authority,
+                    key,
+                    policy,
+                    route,
+                    MAX_GENERATION_BYTES,
+                )
+                .await?;
+        } else {
+            run.capture
+                .db
+                .record_expired_selection_transfer(
+                    run.capture.owner.clone(),
+                    key,
+                    MAX_GENERATION_BYTES,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Discover and remint the exact selected predecessors before the state
+    /// owner claims the lookup. The caller retains the destination guard.
+    pub(in crate::download) async fn begin_refreshed_transfer(
+        &self,
+        pass: &str,
+        task: &filter::DownloadTask,
+        witness: crate::icloud::photos::AuthenticatedRefresh,
+    ) -> Result<
+        Option<crate::state::db::provider_generations::refreshed_transfer::RefreshedDispatchTicket>,
+    > {
+        use crate::state::db::provider_generations::refreshed_transfer::RefreshedBegin;
+        let (run, key) = self
+            .transfer_owner(pass, task)?
+            .context("Refreshed transfer has no selected owner")?;
+        anyhow::ensure!(
+            run.root.spec.format == 2,
+            "Unsupported selected source format"
+        );
+        let (policy, route, authority) = run
+            .compact_transfer_witness(pass, &key)
+            .await?
+            .context("Selected refresh has no current compact authority")?;
+        let provider_version = witness.provider_version();
+        let (witness, policy, original_hints, refreshed_hints) = run
+            .capture
+            .db
+            .discover_authenticated_refreshed_wait_candidates(
+                run.capture.owner.clone(),
+                authority.clone(),
+                key.clone(),
+                policy,
+                route.clone(),
+                witness,
+                provider_version,
+            )
+            .await?;
+        let mut original_policies = Vec::with_capacity(original_hints.len());
+        for hint in original_hints.iter().cloned() {
+            let (hint, old) = run
+                .capture
+                .db
+                .current_410_epoch_context(run.capture.owner.clone(), hint)
+                .await?;
+            let old = old.context("Selected predecessor policy unavailable")?;
+            let album_pass = run
+                .compact_passes
+                .get(&hint.pass_key)
+                .context("Selected predecessor pass unavailable")?;
+            let body = old
+                .decision
+                .decision
+                .confirmation
+                .as_deref()
+                .context("Selected predecessor confirmation unavailable")?;
+            let master = old
+                .decision
+                .decision
+                .master
+                .as_deref()
+                .context("Selected predecessor master unavailable")?;
+            let asset = current_asset(
+                body,
+                &old.decision.decision.child,
+                master,
+                &old.root.spec.zone,
+            )?;
+            let old_policy = compact_policy::mint(
+                &run.compact_context,
+                &old.root,
+                album_pass,
+                &run.compact_base,
+                &asset,
+                body,
+                &old.policy,
+            )
+            .context("Selected predecessor policy cannot be reminted")?;
+            original_policies.push((hint, old_policy));
+        }
+        let mut refreshed_policies = Vec::with_capacity(refreshed_hints.len());
+        for hint in refreshed_hints.iter().cloned() {
+            let (hint, old) = run
+                .capture
+                .db
+                .current_refreshed_epoch_context(run.capture.owner.clone(), hint)
+                .await?;
+            let old = old.context("Refreshed predecessor policy unavailable")?;
+            let album_pass = run
+                .compact_passes
+                .get(&hint.pass)
+                .context("Refreshed predecessor pass unavailable")?;
+            let body = old
+                .decision
+                .decision
+                .confirmation
+                .as_deref()
+                .context("Refreshed predecessor confirmation unavailable")?;
+            let master = old
+                .decision
+                .decision
+                .master
+                .as_deref()
+                .context("Refreshed predecessor master unavailable")?;
+            let asset = current_asset(
+                body,
+                &old.decision.decision.child,
+                master,
+                &old.root.spec.zone,
+            )?;
+            let old_policy = compact_policy::mint(
+                &run.compact_context,
+                &old.root,
+                album_pass,
+                &run.compact_base,
+                &asset,
+                body,
+                &old.policy,
+            )
+            .context("Refreshed predecessor policy cannot be reminted")?;
+            refreshed_policies.push((hint, old_policy));
+        }
+        Ok(run
+            .capture
+            .db
+            .begin_authenticated_refreshed_transfer(RefreshedBegin {
+                owner: run.capture.owner.clone(),
+                authority,
+                original: key,
+                policy,
+                route,
+                witness,
+                provider_version,
+                original_hints,
+                original_policies,
+                refreshed_hints,
+                refreshed_policies,
+                capacity: MAX_GENERATION_BYTES,
+            })
+            .await?)
+    }
+
+    pub(in crate::download) async fn record_refreshed_410(
+        &self,
+        ticket: crate::state::db::provider_generations::refreshed_transfer::RefreshedDispatchTicket,
+    ) -> Result<()> {
+        self.capture
+            .db
+            .record_authenticated_refreshed_410(ticket)
+            .await?;
+        Ok(())
+    }
+
+    /// Record only a completed, typed HTTP failure while retaining the same guard.
+    pub(in crate::download) async fn record_refreshed_http_failure(
+        &self,
+        ticket: crate::state::db::provider_generations::refreshed_transfer::RefreshedDispatchTicket,
+        status: u16,
+        error: String,
+        replace_truncated: bool,
+    ) -> Result<()> {
+        self.capture
+            .db
+            .record_authenticated_refreshed_http_failure(ticket, status, error, replace_truncated)
+            .await?;
+        Ok(())
+    }
+
+    /// Called with the same destination guard after the verified receipt was persisted.
+    pub(in crate::download) async fn finish_refreshed_transfer(
+        &self,
+        ticket: crate::state::db::provider_generations::refreshed_transfer::RefreshedDispatchTicket,
+        task: &filter::DownloadTask,
+        local_checksum: String,
+        source_checksum: String,
+    ) -> Result<()> {
+        use crate::state::db::download_receipts::DownloadReceipt;
+        let binding = task
+            .publication_binding
+            .as_ref()
+            .context("Missing selected publication binding")?;
+        let path = std::path::absolute(&task.download_path)?;
+        let receipt = DownloadReceipt {
+            account_key: binding.account_key.clone(),
+            provider_key: binding.provider_key.clone(),
+            scope: binding.scope.clone(),
+            library: task.library.to_string(),
+            child: binding.child.clone(),
+            master: binding.master.clone(),
+            state_id: task.asset_id.to_string(),
+            origin_pass: binding.origin_pass.clone(),
+            version_size: task.version_size.as_str().to_owned(),
+            provider_checksum: task.checksum.to_string(),
+            provider_size: task.size,
+            native_path: SelectionPath::from_path(&path),
+            source_checksum,
+            local_checksum,
+        };
+        let receipt_id = receipt.id()?;
+        let anchor = path
+            .ancestors()
+            .last()
+            .context("Selected destination has no root")?;
+        let file = crate::download::file::retain_pending_file(anchor, &path)
+            .await?
+            .context("Published selected file is unavailable")?;
+        anyhow::ensure!(
+            data_encoding::HEXLOWER.encode(&file.fingerprint.sha256) == receipt.local_checksum,
+            "Published selected file differs from receipt"
+        );
+        self.capture
+            .db
+            .record_authenticated_refreshed_success(ticket, receipt_id, move |saved| {
+                if saved.local_checksum != receipt.local_checksum
+                    || saved.source_checksum != receipt.source_checksum
+                {
+                    return Err(crate::state::error::StateError::ProviderWorkConflict);
+                }
+                file.validate_blocking()
+                    .map_err(|_error| crate::state::error::StateError::ProviderWorkConflict)
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Destination guard is held. Check all bounded candidates and atomically
+    /// verify the set has not changed before marking physical dispatch.
+    pub(in crate::download) async fn begin_transfer(
+        &self,
+        pass: &str,
+        task: &filter::DownloadTask,
+    ) -> Result<bool> {
+        let Some((run, key)) = self.transfer_owner(pass, task)? else {
+            return Ok(true);
+        };
+        if run.root.spec.format != 2 {
+            return Ok(true);
+        }
+        let Some((policy, route, authority)) = run.compact_transfer_witness(pass, &key).await?
+        else {
+            return Ok(run
+                .capture
+                .db
+                .begin_selection_transfer(run.capture.owner.clone(), key, MAX_GENERATION_BYTES)
+                .await?);
+        };
+        let (policy, hints) = run
+            .capture
+            .db
+            .discover_410_wait_candidates(run.capture.owner.clone(), key.clone(), policy)
+            .await?;
+        let expected = hints.clone();
+        let Some(album_pass) = run.compact_passes.get(pass) else {
+            return Ok(false);
+        };
+        for hint in hints {
+            if hint.generation == key.generation {
+                continue;
+            }
+            let (hint, old) = run
+                .capture
+                .db
+                .current_410_epoch_context(run.capture.owner.clone(), hint)
+                .await?;
+            let Some(old) = old else { continue };
+            let (Some(body), Some(master)) = (
+                old.decision.decision.confirmation.as_deref(),
+                old.decision.decision.master.as_deref(),
+            ) else {
+                continue;
+            };
+            let Ok(asset) = current_asset(
+                body,
+                &old.decision.decision.child,
+                master,
+                &old.root.spec.zone,
+            ) else {
+                continue;
+            };
+            let Some(old_policy) = compact_policy::mint(
+                &run.compact_context,
+                &old.root,
+                album_pass,
+                &run.compact_base,
+                &asset,
+                body,
+                &old.policy,
+            ) else {
+                continue;
+            };
+            let Some((target_policy, target_route, current_authority)) =
+                run.compact_transfer_witness(pass, &key).await?
+            else {
+                continue;
+            };
+            if target_route != route {
+                return Err(anyhow::anyhow!("Selected compact route changed"));
+            }
+            let deadline = hint.deadline;
+            if run
+                .capture
+                .db
+                .record_immutable_shared_wait(
+                    run.capture.owner.clone(),
+                    current_authority,
+                    key.clone(),
+                    route.clone(),
+                    target_policy,
+                    hint,
+                    old_policy,
+                    MAX_GENERATION_BYTES,
+                )
+                .await?
+                && run.capture.db.retry_clock_now() < deadline
+            {
+                return Ok(false);
+            }
+        }
+        let _ = authority;
+        Ok(run
+            .capture
+            .db
+            .begin_selection_transfer_checked(
+                run.capture.owner.clone(),
+                key,
+                MAX_GENERATION_BYTES,
+                Some((policy, expected)),
+            )
+            .await?)
+    }
     pub(in crate::download) fn is_changed_legacy_retry(&self, config: &DownloadConfig) -> bool {
         self.retained_retry
             && self.root.spec.format == 1
@@ -811,6 +1392,10 @@ impl SelectionRun {
                     fresh_confirmation: true,
                     retained_retry: self.retained_retry,
                     retry_sources: self.retry_sources.clone(),
+                    compact_offer: Arc::new(tokio::sync::Mutex::new(None)),
+                    compact_passes: self.compact_passes.clone(),
+                    compact_base: self.compact_base.clone(),
+                    compact_context: self.compact_context.clone(),
                 });
                 return Ok((
                     run,
@@ -930,6 +1515,10 @@ impl SelectionRun {
             fresh_confirmation: true,
             retained_retry: self.retained_retry,
             retry_sources: self.retry_sources.clone(),
+            compact_offer: Arc::new(tokio::sync::Mutex::new(None)),
+            compact_passes: self.compact_passes.clone(),
+            compact_base: self.compact_base.clone(),
+            compact_context: self.compact_context.clone(),
         });
         Ok((
             run,
@@ -1158,22 +1747,27 @@ impl SelectionRun {
         tasks: &[filter::DownloadTask],
         passes: &[AlbumPass],
         config: &DownloadConfig,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut sources = Vec::new();
         let mut deferred = std::collections::HashSet::new();
         for task in tasks {
-            let run = if self.root.spec.zone.get("zoneName").and_then(Value::as_str)
-                == Some(task.library.as_ref())
+            let Some(binding) = task.publication_binding.as_deref() else {
+                continue;
+            };
+            if self.root.spec.zone.get("zoneName").and_then(Value::as_str)
+                != Some(task.library.as_ref())
+                && !self.source_runs.contains_key(task.library.as_ref())
             {
-                self
-            } else {
-                self.source_runs
-                    .get(task.library.as_ref())
-                    .map(AsRef::as_ref)
-                    .context("Failed task has no authenticated source root")?
+                return Err(crate::state::error::StateError::ProviderSelectionAmbiguous.into());
+            }
+            let Some((run, _key)) = self.transfer_owner(&binding.origin_pass, task)? else {
+                continue;
             };
             for (pass_index, pass) in passes.iter().enumerate() {
                 let key = pass_key(pass);
+                if key != binding.origin_pass {
+                    continue;
+                }
                 let Some(manifest) = run
                     .capture
                     .db
@@ -1188,6 +1782,7 @@ impl SelectionRun {
                     continue;
                 };
                 if manifest.state_id != task.asset_id.as_ref()
+                    || manifest.decision.master.as_deref() != Some(binding.master.as_str())
                     || !manifest.decision.destinations.iter().any(|destination| {
                         destination.version_size == task.version_size.as_str()
                             && destination.path.to_path() == task.download_path
@@ -1225,8 +1820,11 @@ impl SelectionRun {
                 else {
                     continue;
                 };
-                let asset =
-                    current_asset(body, &manifest.decision.child, master, &run.root.spec.zone)?;
+                let Ok(asset) =
+                    current_asset(body, &manifest.decision.child, master, &run.root.spec.zone)
+                else {
+                    continue;
+                };
                 sources.push((
                     super::url_refresh::RetryTaskKey::from(task),
                     super::url_refresh::UrlRetrySource {
@@ -1244,10 +1842,34 @@ impl SelectionRun {
                 break;
             }
         }
+        let found = !sources.is_empty();
         self.retry_sources
             .lock()
             .map_err(|_poisoned| anyhow::anyhow!("Selection retry evidence lock poisoned"))?
             .extend(sources);
+        Ok(found)
+    }
+
+    /// Keep one unresolved owner from discarding independent failed tasks.
+    pub(in crate::download) async fn remember_retry_sources_individually(
+        &self,
+        tasks: &[filter::DownloadTask],
+        passes: &[AlbumPass],
+        config: &DownloadConfig,
+    ) -> Result<()> {
+        for task in tasks {
+            match self
+                .remember_retry_sources(std::slice::from_ref(task), passes, config)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => self.held.store(true, Ordering::Relaxed),
+                Err(error) if retry_source_item_error(&error) => {
+                    self.held.store(true, Ordering::Relaxed);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(())
     }
 
@@ -1343,6 +1965,7 @@ impl SelectionRun {
                 return Ok((
                     current
                         .asset
+                        .carry_causal_route_from(&observed)
                         .with_state_record_name(Arc::from(previous.state_id)),
                     SelectionConfirmation {
                         retained: body,
@@ -1386,7 +2009,7 @@ impl SelectionRun {
             current.asset = current.asset.with_selector_membership(witness);
         }
         Ok((
-            current.asset,
+            current.asset.carry_causal_route_from(&observed),
             SelectionConfirmation {
                 retained: current.body.clone(),
                 fresh: Some(current.body),
@@ -1536,10 +2159,71 @@ impl SelectionRun {
         Ok(())
     }
 
+    /// Preserve the actual provider route and fresh-root permit guards through
+    /// the authenticated selection-admission transaction. Missing optional
+    /// source evidence falls back to ordinary selection without sharing.
+    async fn prepare_compact_admission(
+        &self,
+        key: &str,
+        asset: &PhotoAsset,
+        body: &[u8],
+    ) -> Result<
+        Option<crate::state::db::provider_generations::compact_attestation::OwnedCompactAdmission>,
+    > {
+        let Some(pass) = self.compact_passes.get(key) else {
+            return Ok(None);
+        };
+        let Some(zone) = pass.album.authenticated_zone_scope().await else {
+            return Ok(None);
+        };
+        if zone.owner() != &self.capture.owner
+            || zone.scope() != self.root.spec.scope
+            || zone.zone() != &self.root.spec.zone
+        {
+            return Ok(None);
+        }
+        let Some(lease) = asset.lock_causal_route().await else {
+            return Ok(None);
+        };
+        let offer = Arc::clone(&self.compact_offer).lock_owned().await;
+        let marker = match self
+            .capture
+            .db
+            .compact_root_policy(self.capture.owner.clone(), self.root.id.clone())
+            .await?
+        {
+            Some(marker) => Some(marker),
+            None => offer.as_ref().and_then(|offer| offer.marker(&self.root)),
+        };
+        let Some(marker) = marker else {
+            return Ok(None);
+        };
+        let Some(eligibility) = compact_policy::mint(
+            &self.compact_context,
+            &self.root,
+            pass,
+            &self.compact_base,
+            asset,
+            body,
+            &marker,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            crate::state::db::provider_generations::compact_attestation::OwnedCompactAdmission::new(
+                lease,
+                offer,
+                zone.authority().clone(),
+                eligibility,
+            ),
+        ))
+    }
+
     pub(in crate::download) async fn project(
         &self,
         key: &str,
         asset: &PhotoAsset,
+        _observed_asset: &PhotoAsset,
         confirmation: SelectionConfirmation,
         plan: &mut AssetTaskPlan,
         planner: &mut TaskPlanner,
@@ -1976,17 +2660,33 @@ impl SelectionRun {
             },
         };
         let freshly_confirmed = fresh.is_some();
+        let compact = if freshly_confirmed && reason.is_empty() {
+            self.prepare_compact_admission(
+                key,
+                asset,
+                manifest
+                    .decision
+                    .confirmation
+                    .as_deref()
+                    .context("Missing admitted confirmation")?,
+            )
+            .await?
+        } else {
+            None
+        };
         let fresh_for_trust = fresh.clone();
         let mut projection = self
             .capture
             .db
-            .project_selection_decision_with_root_reuse(
+            .project_selection_decision_with_compact(
                 self.capture.owner.clone(),
                 self.root.id.clone(),
                 manifest.clone(),
                 records,
                 fresh,
                 root_reuses.into_iter().map(|(_, proof)| proof).collect(),
+                None,
+                compact,
                 MAX_GENERATION_BYTES,
             )
             .await?;
@@ -2184,6 +2884,488 @@ impl SelectionRun {
     }
 }
 
+// The page supplies scheduling hints only. Exact selection, current policy,
+// native destination and an authenticated receipt remain mandatory.
+async fn recover_receipted_refreshes(
+    run: &Arc<SelectionRun>,
+    passes: &[AlbumPass],
+    config: &DownloadConfig,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    use crate::state::db::provider_generations::refreshed_transfer::RefreshedRecovery;
+    let mut page_hold = crate::download::pipeline::HoldSelectionOnDrop::new(run.clone());
+    let (hints, incomplete) = run
+        .capture
+        .db
+        .due_refreshed_recovery_page(run.capture.owner.clone(), run.root.id.clone())
+        .await?;
+    page_hold.disarm();
+    if incomplete {
+        run.held.store(true, Ordering::Relaxed);
+    }
+    for hint in hints {
+        if cancel.is_cancelled() {
+            run.held.store(true, Ordering::Relaxed);
+            break;
+        }
+        let mut item_hold = crate::download::pipeline::HoldSelectionOnDrop::new(run.clone());
+        let result: Result<()> = async {
+            let pass = passes
+                .iter()
+                .find(|pass| pass_key(pass) == hint.pass)
+                .context("Recovery pass is no longer selected")?;
+            let decision = run
+                .capture
+                .db
+                .selection_decision(
+                    run.capture.owner.clone(),
+                    run.root.id.clone(),
+                    hint.pass.clone(),
+                    hint.child.clone(),
+                )
+                .await?
+                .context("Recovery decision is unavailable")?;
+            let body = decision
+                .decision
+                .confirmation
+                .as_deref()
+                .context("Recovery confirmation is unavailable")?;
+            let master = decision
+                .decision
+                .master
+                .as_deref()
+                .context("Recovery master is unavailable")?;
+            let asset = current_asset(body, &hint.child, master, &run.root.spec.zone)?
+                .with_state_record_name(Arc::from(decision.state_id.clone()));
+            let pass_config = config.with_pass(pass);
+            anyhow::ensure!(
+                filter::is_asset_filtered(&asset, &pass_config).is_none()
+                    && !filter::fallback_filename_excluded(&asset, &pass_config),
+                "Recovery resource is no longer selected"
+            );
+            let expected = filter::derive_expected_paths(&asset, &pass_config);
+            anyhow::ensure!(
+                filter::malformed_no_task_resource(&asset, &pass_config).is_none(),
+                "Malformed recovery resource"
+            );
+            let mut destinations = decision
+                .decision
+                .destinations
+                .iter()
+                .filter(|dest| dest.version_size == hint.version && dest.path == hint.path);
+            let dest = destinations
+                .next()
+                .context("Recovery destination is unavailable")?;
+            anyhow::ensure!(
+                destinations.next().is_none(),
+                "Ambiguous recovery destination"
+            );
+            let mut tasks = expected.iter().filter(|task| {
+                task.version_size.as_str() == dest.version_size
+                    && task.checksum.as_ref() == dest.checksum
+                    && task.size == dest.size
+            });
+            let task = tasks.next().context("Recovery resource is unavailable")?;
+            anyhow::ensure!(
+                tasks.next().is_none()
+                    && filter::stored_path_matches_current_collision_family(
+                        &decision.state_id,
+                        task,
+                        &expected,
+                        &pass_config,
+                        &hint.path.to_path()
+                    ),
+                "Ambiguous recovery path"
+            );
+            let key = crate::state::db::provider_generations::SelectionTransferKey {
+                generation: run.root.id.clone(),
+                pass_key: hint.pass.clone(),
+                child: hint.child.clone(),
+                state_id: decision.state_id.clone(),
+                master: master.to_owned(),
+                version_size: dest.version_size.clone(),
+                path: dest.path.clone(),
+                checksum: dest.checksum.clone(),
+                size: dest.size,
+                url: task.url.to_string(),
+            };
+            let (policy, route, authority) = run
+                .compact_transfer_witness(&hint.pass, &key)
+                .await?
+                .context("Recovery owner is unavailable")?;
+            let path = hint.path.to_path();
+            let guard = crate::download::file::lock_download_destination(&path, cancel).await?;
+            let retained = crate::download::file::retain_pending_file(&config.directory, &path)
+                .await?
+                .context("Recovery file is unavailable")?;
+            let input = RefreshedRecovery {
+                owner: run.capture.owner.clone(),
+                authority,
+                original: key,
+                policy,
+                route,
+                id: hint.id,
+                capacity: MAX_GENERATION_BYTES,
+            };
+            let db = run.capture.db.clone();
+            let owned_run = run.clone();
+            let mut waiter = crate::download::pipeline::HoldSelectionOnDrop::new(run.clone());
+            let (_guard, finished) =
+                crate::download::pipeline::hold_guard_through(guard, async move {
+                    let mut owner = crate::download::pipeline::HoldSelectionOnDrop::new(owned_run);
+                    let finished = db
+                        .recover_verified_refreshed_transfer(input, move |receipt| {
+                            if data_encoding::HEXLOWER.encode(&retained.fingerprint.sha256)
+                                != receipt.local_checksum
+                            {
+                                return Err(crate::state::error::StateError::ProviderWorkConflict);
+                            }
+                            retained.validate_blocking().map_err(|_error| {
+                                crate::state::error::StateError::ProviderWorkConflict
+                            })
+                        })
+                        .await;
+                    if matches!(finished, Ok(true)) {
+                        owner.disarm();
+                    }
+                    finished
+                })
+                .await?;
+            if finished? {
+                waiter.disarm();
+                Ok(())
+            } else {
+                anyhow::bail!("Recovery receipt remains pending")
+            }
+        }
+        .await;
+        match result {
+            Ok(()) => item_hold.disarm(),
+            Err(error) => {
+                run.held.store(true, Ordering::Relaxed);
+                if let Some(cause) = error.downcast_ref::<crate::state::error::StateError>()
+                    && !matches!(
+                        cause,
+                        crate::state::error::StateError::ProviderSelectionAmbiguous
+                            | crate::state::error::StateError::ProviderSelectionInvalid
+                            | crate::state::error::StateError::ProviderSelectionFull
+                            | crate::state::error::StateError::ProviderWorkConflict
+                    )
+                {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    reason = "selected_refresh_recovery_pending",
+                    "Selected refresh recovery remains pending"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// REVIEW ONLY: replay fast path. It never authenticates a new observation,
+/// publishes a file, or changes an admitted path. Every candidate is checked
+/// against the current asset filter, production planner and compact receipts.
+async fn preconfirm_immutable_wait(
+    context: &SelectionContext,
+    run: &Arc<SelectionRun>,
+    pass: &AlbumPass,
+    config: &DownloadConfig,
+    decision: &ActiveDecision,
+    asset: &PhotoAsset,
+) -> Result<usize> {
+    let Some(body) = decision.decision.confirmation.as_deref() else {
+        return Ok(0);
+    };
+    let Some(master) = decision.decision.master.as_deref() else {
+        return Ok(0);
+    };
+    let Some(zone) = pass.album.authenticated_zone_scope().await else {
+        return Ok(0);
+    };
+    if zone.owner() != &run.capture.owner
+        || zone.scope() != context.scope
+        || zone.zone() != &context.zone
+    {
+        return Ok(0);
+    }
+    let Some(store) = config.state_db.as_ref() else {
+        return Ok(0);
+    };
+    let concrete = Arc::clone(&run.capture.db) as Arc<dyn super::models::DownloadStore>;
+    if !Arc::ptr_eq(store, &concrete) {
+        return Ok(0);
+    }
+    let key = pass_key(pass);
+    let Some(target_marker) = run
+        .capture
+        .db
+        .compact_root_policy(run.capture.owner.clone(), run.root.id.clone())
+        .await?
+    else {
+        return Ok(0);
+    };
+    let Some(target_route) = run
+        .capture
+        .db
+        .compact_410_route_hint(
+            run.capture.owner.clone(),
+            run.root.id.clone(),
+            key.clone(),
+            decision.decision.child.clone(),
+        )
+        .await?
+    else {
+        return Ok(0);
+    };
+    let pending = run
+        .capture
+        .db
+        .pending_410_components(
+            run.capture.owner.clone(),
+            run.root.id.clone(),
+            key.clone(),
+            decision.decision.child.clone(),
+        )
+        .await?;
+    if pending.ready_metadata
+        || pending.unadmitted
+        || pending.media.is_empty()
+        || pending.decision.decision != decision.decision
+        || pending.decision.state_id != decision.state_id
+        || pending.decision.sources != decision.sources
+    {
+        return Ok(0);
+    }
+    let pass_config = config.with_pass(pass);
+    if filter::is_asset_filtered(asset, &pass_config).is_some()
+        || filter::fallback_filename_excluded(asset, &pass_config)
+    {
+        return Ok(0);
+    }
+    let expected = filter::derive_expected_paths(asset, &pass_config);
+    if expected.is_empty() || filter::malformed_no_task_resource(asset, &pass_config).is_some() {
+        return Ok(0);
+    }
+    if expected.iter().any(|task| {
+        !decision.decision.destinations.iter().any(|dest| {
+            task.version_size.as_str() == dest.version_size
+                && task.checksum.as_ref() == dest.checksum
+                && task.size == dest.size
+        })
+    }) {
+        return Ok(0);
+    }
+    // Every pending destination must map one-to-one to a current derived
+    // resource. Collision-family matching only restricts the saved spelling;
+    // authenticated state and compact receipts supply ownership evidence.
+    let pending_count = pending.media.len();
+    let mut proofs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut confined = Vec::new();
+    for dest in pending.media {
+        if !seen.insert(dest.version_size.clone())
+            || expected
+                .iter()
+                .filter(|task| {
+                    task.version_size.as_str() == dest.version_size
+                        && task.checksum.as_ref() == dest.checksum
+                        && task.size == dest.size
+                })
+                .count()
+                != 1
+        {
+            return Ok(0);
+        }
+        let Some(task) = expected.iter().find(|task| {
+            task.version_size.as_str() == dest.version_size
+                && task.checksum.as_ref() == dest.checksum
+                && task.size == dest.size
+        }) else {
+            return Ok(0);
+        };
+        let frozen = dest.path.to_path();
+        if !filter::stored_path_matches_current_collision_family(
+            &decision.state_id,
+            task,
+            &expected,
+            &pass_config,
+            &frozen,
+        ) {
+            return Ok(0);
+        }
+        let root_path = config.directory.to_path_buf();
+        let guarded_path = frozen.clone();
+        let path_guard = tokio::task::spawn_blocking(move || {
+            crate::fs_util::ConfinedPath::open(
+                &root_path,
+                &guarded_path,
+                crate::fs_util::ConfinedParents::Existing,
+            )
+        })
+        .await?;
+        let Ok(path_guard) = path_guard else {
+            return Ok(0);
+        };
+        if path_guard.entry_exists().unwrap_or(true) {
+            return Ok(0);
+        }
+        confined.push(path_guard);
+        let target = crate::state::db::provider_generations::SelectionTransferKey {
+            generation: run.root.id.clone(),
+            pass_key: key.clone(),
+            child: decision.decision.child.clone(),
+            state_id: decision.state_id.clone(),
+            master: master.to_owned(),
+            version_size: dest.version_size.clone(),
+            path: dest.path.clone(),
+            checksum: dest.checksum.clone(),
+            size: dest.size,
+            url: task.url.to_string(),
+        };
+        let Some(target_policy) = compact_policy::mint(
+            context,
+            &run.root,
+            pass,
+            config,
+            asset,
+            body,
+            &target_marker,
+        ) else {
+            return Ok(0);
+        };
+        let (_target_policy, hints) = run
+            .capture
+            .db
+            .discover_410_wait_candidates(run.capture.owner.clone(), target.clone(), target_policy)
+            .await?;
+        let mut waiting = false;
+        for hint in hints {
+            if hint.generation == target.generation {
+                continue;
+            }
+            let (hint, old) = run
+                .capture
+                .db
+                .current_410_epoch_context(run.capture.owner.clone(), hint)
+                .await?;
+            let Some(old) = old else { continue };
+            let (Some(old_body), Some(old_master)) = (
+                old.decision.decision.confirmation.as_deref(),
+                old.decision.decision.master.as_deref(),
+            ) else {
+                continue;
+            };
+            let Ok(old_asset) = current_asset(
+                old_body,
+                &old.decision.decision.child,
+                old_master,
+                &old.root.spec.zone,
+            ) else {
+                continue;
+            };
+            let Some(old_policy) = compact_policy::mint(
+                context,
+                &old.root,
+                pass,
+                config,
+                &old_asset,
+                old_body,
+                &old.policy,
+            ) else {
+                continue;
+            };
+            let Some(target_policy) = compact_policy::mint(
+                context,
+                &run.root,
+                pass,
+                config,
+                asset,
+                body,
+                &target_marker,
+            ) else {
+                return Ok(0);
+            };
+            if run
+                .capture
+                .db
+                .record_immutable_shared_wait(
+                    run.capture.owner.clone(),
+                    zone.authority().clone(),
+                    target.clone(),
+                    target_route.clone(),
+                    target_policy,
+                    hint.clone(),
+                    old_policy,
+                    MAX_GENERATION_BYTES,
+                )
+                .await?
+            {
+                let Some(old_policy) = compact_policy::mint(
+                    context,
+                    &old.root,
+                    pass,
+                    config,
+                    &old_asset,
+                    old_body,
+                    &old.policy,
+                ) else {
+                    return Ok(0);
+                };
+                let Some(target_policy) = compact_policy::mint(
+                    context,
+                    &run.root,
+                    pass,
+                    config,
+                    asset,
+                    body,
+                    &target_marker,
+                ) else {
+                    return Ok(0);
+                };
+                proofs.push(crate::state::db::provider_generations::immutable_epochs::PreconfirmWaitEvidence{target:target.clone(),target_route:target_route.clone(),target_policy,hint,source_policy:old_policy});
+                waiting = true;
+                break;
+            }
+        }
+        if !waiting {
+            return Ok(0);
+        }
+    }
+    let Some(earliest) = proofs.iter().map(|e| e.hint.deadline).min() else {
+        return Ok(0);
+    };
+    if !run
+        .capture
+        .db
+        .all_410_components_waiting(
+            run.capture.owner.clone(),
+            zone.authority().clone(),
+            run.root.id.clone(),
+            key,
+            decision.decision.child.clone(),
+            proofs,
+        )
+        .await?
+    {
+        return Ok(0);
+    }
+    let paths_clear = tokio::task::spawn_blocking(move || {
+        confined.iter().all(|path| {
+            path.validate_namespace().is_ok() && matches!(path.entry_exists(), Ok(false))
+        })
+    })
+    .await?;
+    Ok(
+        if paths_clear && run.capture.db.retry_clock_now() < earliest {
+            pending_count
+        } else {
+            0
+        },
+    )
+}
+
 pub(crate) async fn has_due(
     passes: &[AlbumPass],
     config: &DownloadConfig,
@@ -2241,6 +3423,9 @@ pub(super) async fn inventory(
         .as_ref()
         .context("Missing selection context")?;
     let run = context.start(passes, config).await?;
+    if run.root.spec.format == 2 {
+        recover_receipted_refreshes(&run, passes, config, &cancel).await?;
+    }
     let captured_passes: Vec<_> = passes
         .iter()
         .map(|pass| AlbumPass {
@@ -2851,7 +4036,10 @@ async fn recover_retained(
         .db
         .retained_selection_decisions(context.capture.owner.clone(), root.id.clone(), legacy)
         .await?;
-    let run = context.replay_run(root.clone(), passes, true, true);
+    let run = context.replay_run(root.clone(), passes, config, true, true);
+    if root.spec.format == 2 {
+        recover_receipted_refreshes(&run, passes, config, &cancel).await?;
+    }
     for decision in &decisions {
         if !passes
             .iter()
@@ -2921,6 +4109,33 @@ async fn recover_retained(
             };
             if let Some(asset) = asset {
                 let asset = asset.with_state_record_name(Arc::from(decision.state_id.clone()));
+                let pending =
+                    match preconfirm_immutable_wait(context, &run, pass, config, decision, &asset)
+                        .await
+                    {
+                        Ok(count) => count,
+                        // Fall through to normal planning; the destination guard holds
+                        // only the affected component if its proof is ambiguous.
+                        Err(error)
+                            if error
+                                .downcast_ref::<crate::state::error::StateError>()
+                                .is_some_and(|e| {
+                                    matches!(
+                                    e,
+                                    crate::state::error::StateError::ProviderSelectionAmbiguous
+                                        | crate::state::error::StateError::ProviderSelectionFull
+                                )
+                                }) =>
+                        {
+                            0
+                        }
+                        Err(error) => return Err(error),
+                    };
+                if pending > 0 {
+                    combined.skip_summary.uncertain =
+                        combined.skip_summary.uncertain.saturating_add(pending);
+                    continue;
+                }
                 let (owner, asset) = run
                     .prepare_replay_or_retain(decision, asset, &pass_config)
                     .await?;
@@ -2949,7 +4164,7 @@ async fn recover_retained(
                     .deferring_metadata_drain(),
             )
             .await?;
-            run.remember_retry_sources(&result.failed, passes, config)
+            run.remember_retry_sources_individually(&result.failed, passes, config)
                 .await?;
             if run.root.id != root.id {
                 combined.exif_failures +=
@@ -2987,7 +4202,10 @@ async fn replay(
         .selection_context
         .as_ref()
         .context("Missing replay context")?;
-    let run = context.replay_run(root.clone(), passes, root.spec.format == 2, false);
+    let run = context.replay_run(root.clone(), passes, config, root.spec.format == 2, false);
+    if root.spec.format == 2 {
+        recover_receipted_refreshes(&run, passes, config, &cancel).await?;
+    }
     let metadata = context
         .capture
         .db
@@ -3051,6 +4269,18 @@ async fn replay(
                     let asset =
                         current_asset(body, &decision.decision.child, master, &root.spec.zone)?
                             .with_state_record_name(Arc::from(decision.state_id.clone()));
+                    let pending=match preconfirm_immutable_wait(context,&run,pass,config,&decision,&asset).await {
+                        Ok(count)=>count,
+                        // Fall through to normal planning; the destination guard holds
+                    // only the affected component if its proof is ambiguous.
+                    Err(error) if error.downcast_ref::<crate::state::error::StateError>().is_some_and(|e|matches!(e,crate::state::error::StateError::ProviderSelectionAmbiguous|crate::state::error::StateError::ProviderSelectionFull))=>0,
+                        Err(error)=>return Err(error),
+                    };
+                    if pending > 0 {
+                        combined.skip_summary.uncertain =
+                            combined.skip_summary.uncertain.saturating_add(pending);
+                        continue;
+                    }
                     let (owner, asset) = run
                         .prepare_replay_or_retain(&decision, asset, &config.with_pass(pass))
                         .await?;
@@ -3078,7 +4308,7 @@ async fn replay(
                         .deferring_metadata_drain(),
                 )
                 .await?;
-                run.remember_retry_sources(&result.failed, passes, config)
+                run.remember_retry_sources_individually(&result.failed, passes, config)
                     .await?;
                 if run.root.id != root.id {
                     context
@@ -3224,6 +4454,9 @@ async fn deliver_delta_single(
         return Ok(result);
     }
     let run = context.start(passes, config).await?;
+    if run.root.spec.format == 2 {
+        recover_receipted_refreshes(&run, passes, config, &cancel).await?;
+    }
     let started = Instant::now();
     let mut combined =
         recover_retained(client, passes, config, controls, cancel.clone(), &run.root).await?;
@@ -3253,7 +4486,7 @@ async fn deliver_delta_single(
             crate::download::pipeline::StreamRuntime::new(None, None).deferring_metadata_drain(),
         )
         .await?;
-        run.remember_retry_sources(&result.failed, passes, config)
+        run.remember_retry_sources_individually(&result.failed, passes, config)
             .await?;
         super::models::merge_streaming_result(&mut combined, result);
     }

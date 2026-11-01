@@ -49,6 +49,11 @@ pub(in crate::download) struct CleanupRetryPlan {
     pub(in crate::download) tasks: Vec<DownloadTask>,
     pub(in crate::download) unrefreshed: Vec<DownloadTask>,
     pub(in crate::download) url_obtained_at: FxHashMap<RetryTaskKey, Instant>,
+    /// Per-task source plans, not yet authenticated refresh evidence.
+    /// A selected worker must take its plan once, obtain a witness under its
+    /// destination guard and hold until state authorizes the exact dispatch.
+    pub(in crate::download) refresh_requests:
+        FxHashMap<RetryTaskKey, crate::icloud::photos::RefreshRequest>,
     pub(in crate::download) provider_auth_errors: usize,
     pub(in crate::download) rate_limit_observations: usize,
 }
@@ -483,6 +488,164 @@ pub(in crate::download) async fn build_incremental_expired_url_retry_tasks(
     refresh_failed_download_urls(passes, failed_tasks, &shutdown_token, Some(retry_sources)).await
 }
 
+fn scoped_zone_matches_full(scope: &serde_json::Value, zone: &serde_json::Value) -> bool {
+    let (Some(scoped), Some(actual)) = (
+        scope.get("zone").and_then(serde_json::Value::as_object),
+        zone.as_object(),
+    ) else {
+        return false;
+    };
+    ["zoneName", "ownerRecordName"].iter().all(|key| {
+        scoped
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+            && scoped.get(*key) == actual.get(*key)
+    }) && scoped
+        .iter()
+        .all(|(key, value)| actual.get(key) == Some(value))
+}
+
+/// Plan selected cleanup without treating the earlier Value-only resolution as
+/// source evidence. Each non-clone request is moved to its exact worker; only
+/// the provider's later original paired lookup may determine the task URL.
+pub(in crate::download) async fn build_selected_cleanup_request_plan(
+    passes: &[crate::commands::AlbumPass],
+    retry_sources: &FxHashMap<RetryTaskKey, UrlRetrySource>,
+    failed_tasks: &[DownloadTask],
+    shutdown_token: CancellationToken,
+) -> CleanupRetryPlan {
+    let mut plan =
+        refresh_failed_download_urls(passes, failed_tasks, &shutdown_token, Some(retry_sources))
+            .await;
+    let mut originals = FxHashMap::default();
+    let mut ambiguous = FxHashSet::default();
+    for task in failed_tasks {
+        let key = RetryTaskKey::from(task);
+        if originals.insert(key.clone(), task).is_some() {
+            ambiguous.insert(key);
+        }
+    }
+    let candidates = std::mem::take(&mut plan.tasks);
+    for candidate in candidates {
+        let key = RetryTaskKey::from(&candidate);
+        if ambiguous.contains(&key) {
+            plan.url_obtained_at.remove(&key);
+            plan.unrefreshed.extend(
+                failed_tasks
+                    .iter()
+                    .filter(|task| RetryTaskKey::from(*task) == key)
+                    .cloned(),
+            );
+            continue;
+        }
+        let Some(original) = originals.get(&key).copied() else {
+            plan.url_obtained_at.remove(&key);
+            plan.unrefreshed.push(candidate);
+            continue;
+        };
+        let result = async {
+            if shutdown_token.is_cancelled() {
+                return Ok(None);
+            }
+            let Some(source) = retry_sources.get(&key) else {
+                return Ok(None);
+            };
+            let Some(binding) = original.publication_binding.as_deref() else {
+                return Ok(None);
+            };
+            let Some(pass) = source
+                .recorded_pass
+                .as_ref()
+                .map(|(_, pass)| pass)
+                .or_else(|| passes.get(source.pass_index))
+            else {
+                return Ok(None);
+            };
+            if super::generation::pass_key(pass) != binding.origin_pass
+                || source
+                    .recorded_pass
+                    .as_ref()
+                    .is_some_and(|(key, _)| key != &binding.origin_pass)
+                || source.asset_record_name != original.asset_record_name
+                || source.master_record_name.as_ref() != binding.master
+                || binding.child != original.asset_record_name.as_ref()
+                || binding.state_id != original.asset_id.as_ref()
+                || binding.library != original.library.as_ref()
+            {
+                return Ok(None);
+            }
+            let Some(album) = pass.album.task_source(original.library.as_ref())? else {
+                return Ok(None);
+            };
+            let Some((capture, scope, zone)) =
+                album.publication_scope(original.library.as_ref())?
+            else {
+                return Ok(None);
+            };
+            let (account, provider) = capture.owner.authenticated_keys()?;
+            if account != binding.account_key
+                || provider != binding.provider_key
+                || scope != binding.scope
+            {
+                return Ok(None);
+            }
+            let scope_value = crate::icloud::photos::changes_json::parse(scope.as_bytes())?;
+            if !scoped_zone_matches_full(&scope_value, &zone) {
+                return Ok(None);
+            }
+            let Some(database) = scope_value
+                .get("database")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return Ok(None);
+            };
+            let target = crate::icloud::photos::RefreshTarget {
+                database,
+                zone: &zone,
+                child: original.asset_record_name.as_ref(),
+                master: source.master_record_name.as_ref(),
+                version: source.provider_version,
+                checksum: &original.checksum,
+                size: original.size,
+            };
+            Ok(Some(crate::icloud::photos::RefreshRequest::new(
+                album,
+                capture.owner,
+                &target,
+            )))
+        }
+        .await;
+        match result {
+            Ok(Some(request)) => {
+                // Never pass the Value-only URL to a selected worker. The
+                // worker will derive its URL from the actual raw lookup.
+                plan.url_obtained_at.remove(&key);
+                plan.refresh_requests.insert(key, request);
+                plan.tasks.push(original.clone());
+            }
+            Ok(None) => {
+                plan.url_obtained_at.remove(&key);
+                plan.unrefreshed.push(original.clone());
+            }
+            Err(error) => {
+                if crate::icloud::photos::session::is_session_error(&error) {
+                    plan.provider_auth_errors = plan.provider_auth_errors.saturating_add(1);
+                }
+                plan.url_obtained_at.remove(&key);
+                plan.unrefreshed.push(original.clone());
+            }
+        }
+    }
+    if plan.provider_auth_errors > 0 {
+        plan.tasks.clear();
+        plan.refresh_requests.clear();
+        plan.url_obtained_at.clear();
+        plan.unrefreshed = failed_tasks.to_vec();
+    }
+    plan
+}
+
 pub(super) fn merge_expired_url_retry_result(
     pass_result: &mut PassResult,
     expired_retry_candidates: Vec<DownloadTask>,
@@ -503,6 +666,15 @@ pub(super) fn merge_expired_url_retry_result(
     let mut seen = FxHashSet::default();
     still_failed.retain(|task| seen.insert(RetryTaskKey::from(task)));
     pass_result.failed = still_failed;
+    // A task already reported as failed in the first pass remains one
+    // pending task even if its cleanup attempt is held.
+    let failed_keys: FxHashSet<_> = pass_result.failed.iter().map(RetryTaskKey::from).collect();
+    pass_result.shared_waiting.extend(
+        retry_result
+            .shared_waiting
+            .into_iter()
+            .filter(|task| !failed_keys.contains(&RetryTaskKey::from(task))),
+    );
     pass_result.downloaded += retry_result.downloaded;
     pass_result
         .downloaded_tasks

@@ -335,6 +335,7 @@ impl PhotoAlbum {
         sync_token: &str,
         observed: Option<Arc<std::sync::atomic::AtomicBool>>,
         collection_independent: bool,
+        stage: Option<super::super::source_causality::ZoneStage>,
     ) -> (ChangeStream, tokio::sync::oneshot::Receiver<String>) {
         let (tx, rx) = mpsc::channel::<anyhow::Result<ChangeEvent>>(200);
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
@@ -376,19 +377,20 @@ impl PhotoAlbum {
 
                 // Receiver closure cancels read-only requests and retry delays.
                 // An already-started durable shadow capture still finishes below.
-                let raw_body = tokio::select! {
+                let (raw_body, staged_records) = tokio::select! {
                     biased;
                     () = tx.closed() => {
                         let _ = token_tx.send(current_token);
                         return;
                     }
-                    result = session::retry_post_changes_body(
-                        session.as_ref(),
-                        &url,
-                        &body,
-                        &[("Content-type", "text/plain")],
-                        &retry_config,
-                    ) => match result {
+                    result = async {
+                        let headers = [("Content-type", "text/plain")];
+                        if let Some(request) = stage.as_ref().and_then(|stage| stage.request(body.clone(), &headers)) {
+                            request.execute(session.as_ref(), &url, stage.as_ref().map(|stage| stage.context().database()).unwrap_or(""), &retry_config).await
+                        } else {
+                            session::retry_post_changes_body(session.as_ref(), &url, &body, &headers, &retry_config).await.map(|body| (body, None))
+                        }
+                    } => match result {
                         Ok(body) => body,
                         Err(error) => break Some(error),
                     },
@@ -398,7 +400,7 @@ impl PhotoAlbum {
                     Ok(value) => value,
                     Err(error) => break Some(error),
                 };
-                let zone_result = match ValidatedChangesPage::parse(response, &zone_id) {
+                let mut zone_result = match ValidatedChangesPage::parse(response, &zone_id) {
                     Ok(page) => page,
                     Err(error) => break Some(shadow_error(error)),
                 };
@@ -420,6 +422,15 @@ impl PhotoAlbum {
                 }
                 if let Err(error) = validate_accountable_records(&zone_result.records) {
                     break Some(error);
+                }
+
+                // Staged records were decoded from this exact response and
+                // are used only after the normal scope, cursor and accountability
+                // checks above. A missing proof leaves ordinary records intact.
+                if let Some(records) = staged_records {
+                    if records.len() == zone_result.records.len() {
+                        zone_result.records = records;
+                    }
                 }
 
                 // New observations are admitted by the download ledger before
@@ -486,6 +497,92 @@ impl PhotoAlbum {
 #[cfg(test)]
 mod tests {
     use super::{CancellationToken, FxHashSet, ProviderRecordId, Value};
+
+    #[tokio::test]
+    async fn synthetic_shared_session_stream_carries_cross_page_causal_pair() {
+        use crate::icloud::photos::source_causality::{AuthenticatedZoneScope, ZoneStage};
+        use tokio_stream::StreamExt;
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let endpoint = "/database/1/com.apple.photos.cloud/production/private/changes/zone";
+        let zone = super::super::test_support::default_zone();
+        let master = super::super::test_support::changes_master("synthetic-master");
+        let child =
+            super::super::test_support::changes_asset("synthetic-child", "synthetic-master");
+        for (cursor, record, next, more) in [
+            ("saved", master, "page-1", true),
+            ("page-1", child, "done", false),
+        ] {
+            let response_zone = serde_json::json!({"zoneName":zone["zoneName"],"ownerRecordName":zone["ownerRecordName"]});
+            let page = serde_json::json!({"zones":[{"zoneID":response_zone,"records":[record],"syncToken":next,"moreComing":more}]});
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .and(body_string_contains(format!("\"syncToken\":\"{cursor}\"")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = crate::auth::session::Session::new(
+            tmp.path(),
+            "stream@example.invalid",
+            "https://www.icloud.com",
+            None,
+        )
+        .await
+        .unwrap();
+        let login: crate::auth::AccountLoginResponse =
+            serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"synthetic-stream"}}))
+                .unwrap();
+        session.bind_principal(&login, None).unwrap();
+        session
+            .session_data
+            .insert("ckdatabasews_url".to_owned(), server.uri());
+        let owner = crate::state::db::account::AccountOwner::authenticated(
+            "stream@example.invalid",
+            "com",
+            &login,
+        )
+        .unwrap();
+        let shared: crate::auth::SharedSession = Arc::new(tokio::sync::RwLock::new(session));
+        let authority = crate::icloud::photos::session::source_authority(&shared)
+            .await
+            .unwrap();
+        let scope = serde_json::json!({"database":"private","zone":{"zoneName":zone["zoneName"],"ownerRecordName":zone["ownerRecordName"]}}).to_string();
+        let context = AuthenticatedZoneScope::from_album(
+            owner,
+            scope,
+            zone.clone(),
+            "private".to_owned(),
+            authority,
+        )
+        .unwrap();
+        let stage =
+            ZoneStage::new(context, ["synthetic-pass".to_owned()].into_iter().collect()).unwrap();
+        let mut album = super::super::test_support::make_album_with_session(100, Box::new(shared));
+        album.service_endpoint = Arc::from(format!(
+            "{}/database/1/com.apple.photos.cloud/production/private",
+            server.uri()
+        ));
+        let (stream, token, _) = album.changes_stream_observed_with_stage("saved", false, stage);
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(token.await.unwrap(), "done");
+        assert_eq!(events.len(), 1);
+        let asset = events.into_iter().next().unwrap().unwrap().asset.unwrap();
+        assert!(asset.causal_pair().is_some());
+        let routed = asset.with_direct_zone_route("synthetic-pass");
+        let lease = routed.lock_causal_route().await.unwrap();
+        let candidate = lease.candidate().unwrap();
+        assert!(candidate.is_leased());
+        let (master, child) = candidate.page_attestations().unwrap();
+        let (master_id, _, _, master_request, _, _) = master.fields();
+        let (child_id, _, _, child_request, _, _) = child.fields();
+        assert_ne!(master_id, child_id);
+        assert!(master_request.valid_changes_zone_request(&zone));
+        assert!(child_request.valid_changes_zone_request(&zone));
+    }
 
     #[test]
     fn missing_successor_does_not_hide_malformed_page() {

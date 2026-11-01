@@ -91,8 +91,15 @@ pub(super) fn take_test_writer_denial(path: &std::path::Path) -> bool {
         .is_some_and(|paths| paths.lock().unwrap().remove(path))
 }
 
+#[cfg(test)]
+pub(in crate::download) use embedded::{
+    EmbedPrepareResult as TestEmbedPrepareResult,
+    prepare_embed_metadata as test_prepare_embed_metadata,
+};
 #[cfg(all(test, feature = "xmp"))]
 pub(crate) use queued::test_metadata_suppressions;
+#[cfg(test)]
+pub(crate) use queued::{test_arm_rating_commit_gate, test_arm_selected_rating_gate};
 
 #[cfg(all(test, feature = "xmp"))]
 pub(crate) async fn test_metadata_budget<F: std::future::Future>(

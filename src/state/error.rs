@@ -12,6 +12,10 @@ pub enum StateError {
     )]
     ProviderSelectionFull,
     #[error(
+        "Too many predecessor candidates to establish a bounded shared retry wait; selected work remains pending."
+    )]
+    ProviderSelectionAmbiguous,
+    #[error(
         "Provider selection provenance or replay is inconsistent; retained work cannot be consumed."
     )]
     ProviderSelectionInvalid,

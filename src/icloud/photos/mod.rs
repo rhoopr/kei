@@ -3,7 +3,7 @@
 
 mod album;
 pub(crate) mod asset;
-mod changes_json;
+pub(crate) mod changes_json;
 pub mod cloudkit;
 pub(crate) mod diagnostic;
 pub(crate) mod enc;
@@ -16,6 +16,7 @@ mod projection;
 pub mod queries;
 pub mod session;
 pub(crate) mod smart_folders;
+pub(crate) mod source_causality;
 pub(crate) mod transport_evidence;
 pub mod types;
 
@@ -26,7 +27,10 @@ pub use album::PhotoAlbum;
 pub use album::PhotoAlbumConfig;
 pub(crate) use album::ProviderLookupError;
 pub(crate) use album::catalog_observed_page;
-pub(crate) use album::work::{current_asset, same_selected_facts};
+pub(crate) use album::work::{
+    AUTH_REFRESH_MAX_IN_FLIGHT, AuthenticatedRefresh, ClaimedRefreshSource, RefreshDiscoveryView,
+    RefreshRequest, RefreshTarget, current_asset, same_selected_facts,
+};
 pub(crate) use album::{
     ProviderRecordId, RecordLookupRequest, RecordResolution, RecordResolutionBatch,
 };

@@ -44,7 +44,7 @@ pub(super) use replacement::ConditionalPublishTargetChanged;
 pub(super) use replacement::FinalPublication;
 pub(super) use replacement::classify_conditional_publish_error;
 pub(super) use replacement::publish_file_if_unchanged_blocking;
-pub(super) use staging::{CleanupLeases, lock_download_destination};
+pub(super) use staging::{CleanupLeases, StagingGuard, lock_download_destination};
 pub(super) use transfer::DownloadClient;
 pub(super) use transfer::DownloadLimits;
 pub(super) use transfer::DownloadOpts;

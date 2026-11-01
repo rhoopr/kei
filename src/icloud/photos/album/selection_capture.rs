@@ -286,6 +286,27 @@ impl PhotoAlbum {
         )))
     }
 
+    /// Mint the opaque source context only from this album's existing
+    /// authenticated publication scope and its pinned session authority.
+    pub(crate) async fn authenticated_zone_scope(
+        &self,
+    ) -> Option<super::super::source_causality::AuthenticatedZoneScope> {
+        let (capture, scope, zone) = self.authenticated_publication_scope().ok()??;
+        let database = serde_json::from_str::<Value>(&scope)
+            .ok()?
+            .get("database")?
+            .as_str()?
+            .to_owned();
+        let authority = self.session.current_source_authority().await?;
+        super::super::source_causality::AuthenticatedZoneScope::from_album(
+            capture.owner,
+            scope,
+            zone,
+            database,
+            authority,
+        )
+    }
+
     /// Independently bound ownership protects old private obligations even if
     /// the current pass is not an eligible activation selector.
     pub(crate) fn owned_private_scope(&self) -> Result<Option<(ShadowCapture, String, Value)>> {

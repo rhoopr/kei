@@ -2916,6 +2916,26 @@ mod tests {
     }
 
     #[test]
+    fn accounted_delta_advances_with_unattempted_wait_pending() {
+        let mut stats = download::SyncStats::default();
+        stats.skipped.uncertain = 1;
+        let result = download::SyncResult::from_execution(
+            download::DownloadOutcome::PartialFailure { failed_count: 1 },
+            Some("zone-token-next".to_owned()),
+            stats,
+        );
+        assert_eq!(result.stats.failed, 0);
+        assert_eq!(result.stats.skipped.uncertain, 1);
+        assert_eq!(
+            source_checkpoint_decision(&result, false, false, CheckpointBasis::IncrementalDelta),
+            SourceCheckpointDecision::Advance {
+                token: "zone-token-next".to_owned(),
+                basis: CheckpointBasis::IncrementalDelta
+            }
+        );
+    }
+
+    #[test]
     fn durable_transfer_failure_can_advance_source_checkpoint() {
         let result = download::SyncResult::from_execution(
             download::DownloadOutcome::PartialFailure { failed_count: 1 },

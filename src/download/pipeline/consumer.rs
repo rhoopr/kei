@@ -34,6 +34,7 @@ pub(super) struct StreamConsumerResult {
     pub(super) downloaded: usize,
     pub(super) exif_failures: usize,
     pub(super) failed: Vec<DownloadTask>,
+    pub(super) retry_owners: super::retry_owners::RetryOwners,
     pub(super) auth_errors: usize,
     pub(super) pending_state_writes: Vec<PendingStateWrite>,
     pub(super) bytes_downloaded_total: u64,
@@ -44,10 +45,11 @@ pub(super) struct StreamConsumerResult {
     pub(super) videos_downloaded: usize,
     pub(super) recap: crate::download::recap::RunRecap,
     pub(super) state_write_circuit_error: Option<anyhow::Error>,
+    pub(super) shared_waits: usize,
 }
 
 pub(super) async fn consume_stream_download_tasks(
-    task_rx: mpsc::Receiver<DownloadTask>,
+    task_rx: mpsc::Receiver<super::retry_owners::QueuedTask>,
     download_client: Client,
     shared: StreamPipelineShared,
     settings: StreamConsumerSettings,
@@ -68,13 +70,17 @@ pub(super) async fn consume_stream_download_tasks(
     let bandwidth_limiter = config.bandwidth_limiter.clone();
     let rate_limit_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let download_stream = ReceiverStream::new(task_rx)
-        .map(|task| {
+        .map(|queued| {
+            let task = queued.task;
+            let origin = queued.origin;
             let client = download_client.clone();
             let task_state_db = state_db.clone();
             let temp_suffix = Arc::clone(&temp_suffix);
             let rate_limit_counter = Arc::clone(&rate_limit_counter);
             let bandwidth_limiter = bandwidth_limiter.clone();
             let shutdown_token = pipeline_shutdown.clone();
+            let selection_run = config.selection_run.clone();
+            let selection_pass = config.selection_pass.clone();
             async move {
                 let result = Box::pin(download_single_task(
                     &client,
@@ -88,10 +94,11 @@ pub(super) async fn consume_stream_download_tasks(
                         bandwidth_limiter: bandwidth_limiter.as_ref(),
                         shutdown_token: &shutdown_token,
                         mode,
+                        selection_wait: selection_run.as_ref().zip(selection_pass.as_deref()),
                     },
                 ))
                 .await;
-                (task, result)
+                (task, result, origin)
             }
         })
         .buffer_unordered(concurrency);
@@ -115,8 +122,10 @@ pub(super) async fn consume_stream_download_tasks(
     let mut videos_downloaded = 0usize;
     let mut recap = crate::download::recap::RunRecap::default();
     let mut drain_logged = false;
+    let mut shared_waits = 0;
     let mut state_write_circuit_error: Option<anyhow::Error> = None;
-    while let Some((task, result)) = download_stream.next().await {
+    let mut retry_owners = super::retry_owners::RetryOwners::default();
+    while let Some((task, result, origin)) = download_stream.next().await {
         if pipeline_shutdown.is_cancelled() && !drain_logged {
             pb.suspend(|| tracing::info!(target: "kei::download::pipeline", "Shutdown requested, draining in-flight downloads..."));
             drain_logged = true;
@@ -206,12 +215,37 @@ pub(super) async fn consume_stream_download_tasks(
             }
             Err(e) => {
                 match classify_download_task_error(&e) {
+                    DownloadTaskErrorClass::SelectedRefreshPending => {
+                        if let super::retry_owners::ProducerOrigin::Selected { run, .. } = &origin {
+                            run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                        } else if let Some(run) = &config.selection_run {
+                            run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        retry_owners.record(&task, origin);
+                        failed.push(task);
+                        continue;
+                    }
+                    DownloadTaskErrorClass::SharedWait => {
+                        shared_waits += 1;
+                        continue;
+                    }
+                    DownloadTaskErrorClass::SharedWaitInvalid => {
+                        if let Some(run) = &config.selection_run {
+                            run.held.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if state_write_circuit_error.is_none() {
+                            state_write_circuit_error = Some(e);
+                        }
+                        // This exact task remains held; independent tasks continue.
+                        continue;
+                    }
                     DownloadTaskErrorClass::Interrupted => {
                         log_interrupted_download(pb, &task, &e);
                         // Preserve interrupted peers if expiry was observed.
                         // User shutdown still gates cleanup through the parent
                         // token; expiry itself does not cancel healthy work.
                         if url_expired_abort {
+                            retry_owners.record(&task, origin);
                             failed.push(task);
                         }
                         continue;
@@ -248,6 +282,7 @@ pub(super) async fn consume_stream_download_tasks(
                                 "Download URL expired; retaining task for bounded refresh"
                             );
                         });
+                        retry_owners.record(&task, origin);
                         failed.push(task);
                         // A stale URL belongs to this task. Continue admitting
                         // and transferring healthy peers in the same inventory.
@@ -269,12 +304,14 @@ pub(super) async fn consume_stream_download_tasks(
                         "Failed to mark failure"
                     );
                 }
+                retry_owners.record(&task, origin);
                 failed.push(task);
             }
         }
     }
 
     StreamConsumerResult {
+        retry_owners,
         downloaded,
         exif_failures,
         failed,
@@ -288,6 +325,7 @@ pub(super) async fn consume_stream_download_tasks(
         videos_downloaded,
         recap,
         state_write_circuit_error,
+        shared_waits,
     }
 }
 

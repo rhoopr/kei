@@ -21,6 +21,9 @@ fn pass_config_debug_keeps_runtime_handles_out_of_output() {
     let client = reqwest::Client::new();
     let retry_config = RetryConfig::default();
     let config = PassConfig {
+        retry_owners: None,
+        refresh_requests: None,
+        selection_run: None,
         prior_auth_errors: 0,
         url_obtained_at: Default::default(),
         client: &client,
@@ -103,6 +106,9 @@ fn test_run_download_pass_skips_all_tasks_when_cancelled() {
                     let retry = RetryConfig::default();
 
                     let pass_config = PassConfig {
+                        retry_owners: None,
+                        refresh_requests: None,
+                        selection_run: None,
                         prior_auth_errors: 0,
                         url_obtained_at: Default::default(),
                         client: &client,
@@ -170,6 +176,9 @@ fn test_run_download_pass_processes_tasks_when_not_cancelled() {
                     };
 
                     let pass_config = PassConfig {
+                        retry_owners: None,
+                        refresh_requests: None,
+                        selection_run: None,
                         prior_auth_errors: 0,
                         url_obtained_at: Default::default(),
                         client: &client,
@@ -241,6 +250,9 @@ async fn download_pass_invalid_unknown_media_marks_failed_not_downloaded() {
 
     let result = run_download_pass(
         PassConfig {
+            retry_owners: None,
+            refresh_requests: None,
+            selection_run: None,
             prior_auth_errors: 0,
             url_obtained_at: Default::default(),
             client: &client,
@@ -358,6 +370,9 @@ async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
 
     let result = run_download_pass(
         PassConfig {
+            retry_owners: None,
+            refresh_requests: None,
+            selection_run: None,
             prior_auth_errors: 0,
             url_obtained_at: Default::default(),
             client: &client,
@@ -564,4 +579,145 @@ async fn shutdown_cancellation_exits_download_pass_promptly() {
         !result.enumeration_complete,
         "cancelled enumeration must not be considered complete"
     );
+}
+
+#[tokio::test]
+async fn selected_cleanup_without_owner_is_held_without_http() {
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/selected"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let dir = TempDir::new().unwrap();
+    let task = DownloadTask {
+        require_created_entry: true,
+        url: format!("{}/selected", server.uri()).into(),
+        download_path: dir.path().join("selected.jpg"),
+        replacement_fingerprint: None,
+        publication_binding: None,
+        pending_cross_parent_root: None,
+        checksum: "checksum".into(),
+        created_local: chrono::Utc::now().fixed_offset(),
+        size: 3,
+        asset_id: "asset".into(),
+        asset_record_name: "child".into(),
+        library: "PrimarySync".into(),
+        metadata: Arc::new(MetadataPayload::default()),
+        version_size: VersionSizeKey::Original,
+        media_type: crate::state::MediaType::Photo,
+    };
+    let client = reqwest::Client::new();
+    let retry = RetryConfig::default();
+    let config = PassConfig {
+        retry_owners: Some(Arc::new(Default::default())),
+        refresh_requests: None,
+        selection_run: None,
+        prior_auth_errors: 0,
+        url_obtained_at: Default::default(),
+        client: &client,
+        retry_config: &retry,
+        metadata: MetadataFlags::empty(),
+        mark_capture_repair_after_download: false,
+        concurrency: 1,
+        reporting: DownloadReporting::hidden(),
+        temp_suffix: Arc::from(".part"),
+        shutdown_token: CancellationToken::new(),
+        state_db: None,
+        rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        bandwidth_limiter: None,
+        library: Arc::from("PrimarySync"),
+    };
+    let result = run_download_pass(config, vec![task]).await;
+    assert_eq!(result.downloaded, 0);
+    assert_eq!(result.shared_waiting.len(), 1);
+    assert_eq!(result.state_write_failures, 1);
+    assert!(!dir.path().join("selected.jpg").exists());
+}
+
+#[tokio::test]
+async fn ordinary_cleanup_progresses_when_selected_owner_missing() {
+    use crate::download::pipeline::retry_owners::{ProducerOrigin, RetryOwners};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/selected"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/ordinary"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = TempDir::new().unwrap();
+    let make_task = |name: &str| DownloadTask {
+        require_created_entry: true,
+        url: format!("{}/{name}", server.uri()).into(),
+        download_path: dir.path().join(format!("{name}.jpg")),
+        replacement_fingerprint: None,
+        publication_binding: None,
+        pending_cross_parent_root: None,
+        checksum: "checksum".into(),
+        created_local: chrono::Utc::now().fixed_offset(),
+        size: 3,
+        asset_id: Arc::from(name),
+        asset_record_name: Arc::from(name),
+        library: "PrimarySync".into(),
+        metadata: Arc::new(MetadataPayload::default()),
+        version_size: VersionSizeKey::Original,
+        media_type: crate::state::MediaType::Photo,
+    };
+    let selected = make_task("selected");
+    let ordinary = make_task("ordinary");
+    let mut owners = RetryOwners::default();
+    owners.record(&ordinary, ProducerOrigin::Unknown);
+    let client = reqwest::Client::new();
+    let retry = RetryConfig {
+        max_retries: 0,
+        base_delay_secs: 0,
+        max_delay_secs: 0,
+    };
+    let config = PassConfig {
+        retry_owners: Some(Arc::new(owners)),
+        refresh_requests: None,
+        selection_run: None,
+        prior_auth_errors: 0,
+        url_obtained_at: Default::default(),
+        client: &client,
+        retry_config: &retry,
+        metadata: MetadataFlags::empty(),
+        mark_capture_repair_after_download: false,
+        concurrency: 2,
+        reporting: DownloadReporting::hidden(),
+        temp_suffix: Arc::from(".part"),
+        shutdown_token: CancellationToken::new(),
+        state_db: None,
+        rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        bandwidth_limiter: None,
+        library: Arc::from("PrimarySync"),
+    };
+    let result = run_download_pass(config, vec![selected, ordinary]).await;
+    assert_eq!(result.downloaded, 0);
+    assert_eq!(
+        result.shared_waiting.len(),
+        1,
+        "missing selected owner must remain held"
+    );
+    assert_eq!(
+        result.failed.len(),
+        1,
+        "ordinary 503 must use the normal failure path"
+    );
+    assert_eq!(result.state_write_failures, 1);
 }

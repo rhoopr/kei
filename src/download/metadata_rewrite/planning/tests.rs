@@ -319,3 +319,47 @@ fn metadata_flags_any_embed_captures_embed_only() {
     flags.insert(MetadataFlags::EMBED_XMP);
     assert!(flags.any_embed());
 }
+
+#[test]
+fn rating_only_absent_is_no_write_for_distinct_probe_states() {
+    let payload = MetadataPayload::default();
+    let created = now_local();
+    let probes = [
+        crate::download::metadata::ExifProbe::default(),
+        crate::download::metadata::ExifProbe {
+            datetime_original: Some("2020:01:02 03:04:05".to_owned()),
+            offset_time_original: Some("+01:00".to_owned()),
+            has_other_datetime_offset: true,
+            has_gps: true,
+            ..crate::download::metadata::ExifProbe::default()
+        },
+    ];
+    for probe in probes {
+        assert!(
+            plan_metadata_write_with_repair(
+                MetadataFlags::RATING,
+                &payload,
+                &created,
+                CaptureTimestampRepair::Preserve,
+                &probe,
+            )
+            .is_empty()
+        );
+    }
+    for rating in 1..=5 {
+        let payload = MetadataPayload {
+            rating: Some(rating),
+            ..MetadataPayload::default()
+        };
+        assert!(
+            !plan_metadata_write_with_repair(
+                MetadataFlags::RATING,
+                &payload,
+                &created,
+                CaptureTimestampRepair::Preserve,
+                &crate::download::metadata::ExifProbe::default(),
+            )
+            .is_empty()
+        );
+    }
+}

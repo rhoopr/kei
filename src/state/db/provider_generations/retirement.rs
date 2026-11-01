@@ -230,6 +230,12 @@ pub(super) fn compact_batch(
     let keys:Vec<(String,String,String)>=conn.prepare("SELECT d.generation,d.pass_key,d.child FROM provider_active_decisions d
         JOIN provider_active_generations g ON g.id=d.generation
         WHERE d.compacted_hash IS NULL AND (?1 IS NULL OR d.generation=?1)
+          AND NOT EXISTS(SELECT 1 FROM provider_compact_observations o
+            WHERE o.generation=d.generation AND o.pass_key=d.pass_key AND o.child=d.child)
+          AND NOT EXISTS(SELECT 1 FROM provider_410_failure_epochs e
+            WHERE e.generation=d.generation AND e.pass_key=d.pass_key AND e.child=d.child)
+          AND NOT EXISTS(SELECT 1 FROM provider_410_shared_waits w
+            WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child)
           AND json_extract(CAST(g.specification AS TEXT),'$.format')=?2
           AND ((json_extract(CAST(g.specification AS TEXT),'$.format')=2)
             OR (json_extract(CAST(g.specification AS TEXT),'$.format')=1 AND g.sealed=1))
@@ -391,6 +397,10 @@ pub(super) fn retire_completed_roots(
 ) -> Result<(), StateError> {
     let ids:Vec<String>=conn.prepare(&format!("SELECT g.id FROM provider_active_generations g
         WHERE g.id<>?1 AND g.scope=(SELECT scope FROM provider_active_generations WHERE id=?1)
+          AND NOT EXISTS(SELECT 1 FROM provider_compact_root_policy p WHERE p.generation=g.id)
+          AND NOT EXISTS(SELECT 1 FROM provider_compact_observations o WHERE o.generation=g.id)
+          AND NOT EXISTS(SELECT 1 FROM provider_410_failure_epochs e WHERE e.generation=g.id)
+          AND NOT EXISTS(SELECT 1 FROM provider_410_shared_waits w WHERE w.generation=g.id)
           AND json_extract(CAST(g.specification AS TEXT),'$.format')=?2
           AND ((json_extract(CAST(g.specification AS TEXT),'$.format')=2)
             OR (json_extract(CAST(g.specification AS TEXT),'$.format')=1 AND g.sealed=1))

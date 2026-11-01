@@ -17,9 +17,14 @@ mod outcome;
 mod pass;
 mod producer;
 mod progress;
+pub(in crate::download) mod retry_owners;
 mod streaming;
 mod task;
-pub(in crate::download) use task::{DownloadSingleContext, download_single_task};
+#[cfg(test)]
+pub(crate) use task::real_410_abort_hook;
+pub(in crate::download) use task::{
+    DownloadSingleContext, HoldSelectionOnDrop, download_single_task, hold_guard_through,
+};
 
 #[cfg(test)]
 mod test_support;

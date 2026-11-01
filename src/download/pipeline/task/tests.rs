@@ -291,6 +291,9 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
     let winner_store: Arc<dyn DownloadStore> = winner_db.clone();
     let winner_result = run_download_pass(
         PassConfig {
+            retry_owners: None,
+            refresh_requests: None,
+            selection_run: None,
             prior_auth_errors: 0,
             url_obtained_at: Default::default(),
             client: &client,
@@ -319,6 +322,9 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
     let loser_store: Arc<dyn DownloadStore> = loser_db.clone();
     let loser_result = run_download_pass(
         PassConfig {
+            retry_owners: None,
+            refresh_requests: None,
+            selection_run: None,
             prior_auth_errors: 0,
             url_obtained_at: Default::default(),
             client: &client,
@@ -423,7 +429,7 @@ async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() 
                 planner::upsert_seen_for_task(db.as_ref(), &config, asset, &task)
                     .await
                     .unwrap();
-                tx.send(task).await.unwrap();
+                tx.send(task.into()).await.unwrap();
             }
         }
         drop(tx);
@@ -472,6 +478,9 @@ async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() 
             .collect();
         let recovered = run_download_pass(
             PassConfig {
+                retry_owners: None,
+                refresh_requests: None,
+                selection_run: None,
                 prior_auth_errors: 0,
                 url_obtained_at: Default::default(),
                 client: &client,
@@ -576,6 +585,7 @@ async fn unscoped_publication_proof_survives_finalization_and_other_transfer_int
             rate_limit_counter: None,
             bandwidth_limiter: None,
             shutdown_token: &running,
+            selection_wait: None,
             mode: crate::personality::Mode::Off,
         },
     )
@@ -635,6 +645,7 @@ async fn unscoped_publication_proof_survives_finalization_and_other_transfer_int
             rate_limit_counter: None,
             bandwidth_limiter: None,
             shutdown_token: &cancelled,
+            selection_wait: None,
             mode: crate::personality::Mode::Off,
         },
     )
@@ -1593,4 +1604,117 @@ async fn restricted_new_media_preserves_sidecar_and_metadata_debt_after_reopen()
         assert_eq!(fs::read(&media).unwrap(), MINIMAL_JPEG);
     }
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_while_pretransaction_witness_keeps_destination_guard() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("movie.mov");
+    let cancel = CancellationToken::new();
+    let guard = crate::download::file::lock_download_destination(&path, &cancel)
+        .await
+        .unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mark = Arc::clone(&finished);
+    let waiter = tokio::spawn(async move {
+        super::hold_guard_through(guard, async move {
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            mark.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+    });
+    entered_rx.await.unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            crate::download::file::lock_download_destination(&path, &cancel)
+        )
+        .await
+        .is_err(),
+        "aborting the waiter must not release the live witness owner"
+    );
+    release_tx.send(()).unwrap();
+    let second = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::download::file::lock_download_destination(&path, &cancel),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    drop(second);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_while_sqlite_transaction_waits_keeps_destination_guard() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("movie.mov");
+    let db_path = temp.path().join("state.sqlite");
+    let blocker = rusqlite::Connection::open(&db_path).unwrap();
+    blocker.execute_batch("CREATE TABLE test_retry(value INTEGER NOT NULL); INSERT INTO test_retry VALUES(0); BEGIN IMMEDIATE;").unwrap();
+    let cancel = CancellationToken::new();
+    let guard = crate::download::file::lock_download_destination(&path, &cancel)
+        .await
+        .unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let waiter = tokio::spawn(async move {
+        super::hold_guard_through(guard, async move {
+            tokio::task::spawn_blocking(move || {
+                let db = rusqlite::Connection::open(db_path).unwrap();
+                db.busy_timeout(Duration::from_secs(5)).unwrap();
+                entered_tx.send(()).unwrap();
+                db.execute_batch("BEGIN IMMEDIATE; UPDATE test_retry SET value=1; COMMIT;")
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        })
+        .await
+    });
+    entered_rx.await.unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            crate::download::file::lock_download_destination(&path, &cancel)
+        )
+        .await
+        .is_err(),
+        "aborting the waiter must not release the SQLite owner"
+    );
+    blocker.execute_batch("COMMIT;").unwrap();
+    let second = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::download::file::lock_download_destination(&path, &cancel),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        blocker
+            .query_row("SELECT value FROM test_retry", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    drop(second);
+}
+
+#[test]
+fn selected_refresh_unresolved_is_not_a_shared_wait() {
+    let unresolved = super::selected_refresh_pending();
+    assert_eq!(
+        super::classify_download_task_error(&unresolved),
+        super::DownloadTaskErrorClass::SelectedRefreshPending
+    );
+    assert_ne!(
+        super::classify_download_task_error(&unresolved),
+        super::DownloadTaskErrorClass::SharedWait
+    );
 }

@@ -96,6 +96,544 @@ const DIAGNOSTIC_RESPONSE_BYTES: usize = 64 * 1024;
 ///
 /// Abstracted as a trait so album/library code can be tested with stubs
 /// without hitting the real iCloud API.
+/// One transport invocation; adapters cannot construct or clone this token.
+struct InvocationIdentity {
+    id: uuid::Uuid,
+}
+pub struct InvocationToken(std::sync::Arc<InvocationIdentity>);
+
+/// A non-clone accepted invocation; state uses its ID for durable uniqueness
+/// and checks the private in-process identity against the same original body.
+pub(crate) struct AcceptedInvocation(std::sync::Arc<InvocationIdentity>);
+impl AcceptedInvocation {
+    pub(crate) fn id(&self) -> uuid::Uuid {
+        self.0.id
+    }
+    pub(crate) fn matches_original(&self, original: &OriginalBody) -> bool {
+        original
+            .invocation
+            .as_ref()
+            .is_some_and(|inner| std::sync::Arc::ptr_eq(inner, &self.0))
+    }
+}
+
+/// Raw changes body for the existing strict parser, with separately optional
+/// evidence. Missing proof never changes the body used by ingestion.
+pub struct ChangesResponse {
+    pub(crate) body: Vec<u8>,
+    pub(crate) original: Option<OriginalBody>,
+    pub(crate) accepted: Option<AcceptedInvocation>,
+}
+
+/// Request identity for a runtime attestation. URL, body and headers exist only
+/// in memory and are skipped during serialization; persisted digests alone do
+/// not independently reconstruct or authenticate the original request.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RetainedRequest {
+    // Present only in memory for the actual request; never serialized.
+    #[serde(skip)]
+    url: String,
+    #[serde(skip)]
+    body: String,
+    #[serde(skip)]
+    headers: Vec<(String, String)>,
+    request_binding: [u8; 32],
+    body_digest: [u8; 32],
+    changes: Option<SafeChangesRequest>,
+}
+
+/// Nonsecret facts attested at actual request time. On replay this is an
+/// integrity-checked runtime attestation, not reconstruction of the wire.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SafeChangesRequest {
+    zone_digest: [u8; 32],
+    cursor_digest: [u8; 32],
+    results_limit: u64,
+}
+fn safe_changes_request(body: &str) -> Option<SafeChangesRequest> {
+    use sha2::{Digest, Sha256};
+    let value = super::changes_json::parse(body.as_bytes()).ok()?;
+    let root = value.as_object()?;
+    if root.len() != 1 {
+        return None;
+    }
+    let zones = root.get("zones")?.as_array()?;
+    if zones.len() != 1 {
+        return None;
+    }
+    let zone = zones[0].as_object()?;
+    if zone.len() != 3 {
+        return None;
+    }
+    let identity = zone.get("zoneID")?;
+    let cursor = zone.get("syncToken")?.as_str()?;
+    let limit = zone.get("resultsLimit")?.as_u64()?;
+    if cursor.trim().is_empty() || limit != 200 {
+        return None;
+    }
+    Some(SafeChangesRequest {
+        zone_digest: Sha256::digest(serde_json::to_vec(identity).ok()?).into(),
+        cursor_digest: Sha256::digest(cursor.as_bytes()).into(),
+        results_limit: limit,
+    })
+}
+impl RetainedRequest {
+    fn new(url: &str, body: &str, headers: &[(&str, &str)]) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            request_binding: original_request_hash(url, body, headers),
+            body_digest: Sha256::digest(body.as_bytes()).into(),
+            changes: safe_changes_request(body),
+            url: url.to_owned(),
+            body: body.to_owned(),
+            headers: headers
+                .iter()
+                .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+                .collect(),
+        }
+    }
+    pub(crate) fn valid_changes_zone_request(&self, zone: &Value) -> bool {
+        use sha2::{Digest, Sha256};
+        let Some(changes) = &self.changes else {
+            return false;
+        };
+        let Ok(encoded) = serde_json::to_vec(zone) else {
+            return false;
+        };
+        let digest: [u8; 32] = Sha256::digest(encoded).into();
+        changes.zone_digest == digest && changes.results_limit == 200
+    }
+
+    pub(crate) fn cursor_digest(&self) -> Option<[u8; 32]> {
+        self.changes.as_ref().map(|changes| changes.cursor_digest)
+    }
+
+    pub(crate) fn matches_body(&self, body: &str) -> bool {
+        use sha2::{Digest, Sha256};
+        let actual: [u8; 32] = Sha256::digest(body.as_bytes()).into();
+        self.body_digest == actual
+    }
+
+    fn header_refs(&self) -> Vec<(&str, &str)> {
+        self.headers
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect()
+    }
+}
+
+/// Same-response bytes sealed by the live transport. No constructor is exposed
+/// to Value-based adapters; obtaining a body does not by itself prove owner or scope.
+pub(crate) struct OriginalBody {
+    bytes: Vec<u8>,
+    request_hash: [u8; 32],
+    request_url: String,
+    retained_request: Option<RetainedRequest>,
+    principal: Option<String>,
+    namespace: Option<String>,
+    service_root: Option<String>,
+    // Existing session ownership only; this does not attest immutable cookies
+    // or complete redirect history.
+    session_bound: bool,
+    invocation: Option<std::sync::Arc<InvocationIdentity>>,
+    // Held through duplicate-safe parsing and until evidence is consumed.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+// At most four pages are being captured/validated or retained as evidence.
+// This bounds proof input, not the heap expansion of ordinary JSON Values.
+pub(crate) const MAX_ORIGINAL_IN_FLIGHT_PAGES: usize = 4;
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_ORIGINAL_SLOTS: std::sync::Arc<tokio::sync::Semaphore>;
+}
+
+static ORIGINAL_SLOTS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_ORIGINAL_IN_FLIGHT_PAGES))
+    });
+
+fn valid_source_scheme(url: &reqwest::Url) -> bool {
+    if url.scheme() == "https" {
+        return true;
+    }
+    // Synthetic local HTTP fixture only; production always requires HTTPS.
+    #[cfg(test)]
+    if url.scheme() == "http" && url.host_str() == Some("127.0.0.1") {
+        return true;
+    }
+    false
+}
+
+/// Snapshot of the current session source identity. This capability does not
+/// by itself fence concurrent cookie-jar mutation or prove a page observation.
+#[derive(Clone)]
+pub struct SourceAuthority {
+    namespace: String,
+    principal: String,
+    service_root: String,
+}
+
+impl SourceAuthority {
+    #[cfg(test)]
+    pub(crate) fn synthetic(
+        owner: &crate::state::db::account::AccountOwner,
+        service_root: &str,
+    ) -> Option<Self> {
+        let (namespace, principal) = owner.authenticated_keys().ok()?;
+        Some(Self {
+            namespace: namespace.to_owned(),
+            principal: principal.to_owned(),
+            service_root: service_root.to_owned(),
+        })
+    }
+
+    /// Recompute the retained request binding under a current authenticated
+    /// source snapshot. Final dispatch must still revalidate its live fence.
+    pub(crate) fn validate_retained_request(
+        &self,
+        owner: &crate::state::db::account::AccountOwner,
+        database: &str,
+        operation: &str,
+        request: &RetainedRequest,
+        expected: &[u8; 32],
+    ) -> bool {
+        if self.binding(owner, database, operation).is_none() || request.url.is_empty() {
+            return false;
+        }
+        let Ok(root) = reqwest::Url::parse(&self.service_root) else {
+            return false;
+        };
+        let Ok(actual) = reqwest::Url::parse(&request.url) else {
+            return false;
+        };
+        let path = format!(
+            "{}/database/1/com.apple.photos.cloud/production/{database}/{operation}",
+            root.path().trim_end_matches('/')
+        );
+        if actual.origin() != root.origin()
+            || actual.path() != path
+            || actual.fragment().is_some()
+            || !actual.username().is_empty()
+            || actual.password().is_some()
+        {
+            return false;
+        }
+        request.request_binding == *expected
+            && original_request_hash(&request.url, &request.body, &request.header_refs())
+                == *expected
+    }
+
+    pub(crate) fn binding(
+        &self,
+        owner: &crate::state::db::account::AccountOwner,
+        database: &str,
+        operation: &str,
+    ) -> Option<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        let (namespace, principal) = owner.authenticated_keys().ok()?;
+        if self.namespace != namespace
+            || self.principal != principal
+            || !matches!(database, "private" | "shared")
+            || !matches!(
+                operation,
+                "records/query" | "changes/zone" | "records/lookup"
+            )
+        {
+            return None;
+        }
+        let root = reqwest::Url::parse(&self.service_root).ok()?;
+        if !valid_source_scheme(&root)
+            || !root.username().is_empty()
+            || root.password().is_some()
+            || root.query().is_some()
+            || root.fragment().is_some()
+        {
+            return None;
+        }
+        let mut hash = Sha256::new();
+        for field in [
+            "kei-source-authority-v1",
+            namespace,
+            principal,
+            &self.service_root,
+            database,
+            operation,
+        ] {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field.as_bytes());
+        }
+        Some(hash.finalize().into())
+    }
+}
+
+/// Acquire a fresh current authority directly from the pinned shared session.
+/// Caller must separately establish credential-generation safety.
+pub(crate) async fn source_authority(
+    session: &crate::auth::SharedSession,
+) -> Option<SourceAuthority> {
+    let session = session.read().await;
+    // This follows the existing SharedSession ownership model. It does not
+    // prove that the shared cookie jar is immutable during a request.
+    Some(SourceAuthority {
+        namespace: session.account_namespace().to_owned(),
+        principal: session.principal()?.to_owned(),
+        service_root: session.photos_service_root()?.to_owned(),
+    })
+}
+
+impl OriginalBody {
+    fn slot() -> Option<tokio::sync::OwnedSemaphorePermit> {
+        #[cfg(test)]
+        if let Ok(result) = TEST_ORIGINAL_SLOTS.try_with(Self::slot_from) {
+            return result;
+        }
+        Self::slot_from(&ORIGINAL_SLOTS)
+    }
+
+    fn slot_from(
+        pool: &std::sync::Arc<tokio::sync::Semaphore>,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        std::sync::Arc::clone(pool).try_acquire_owned().ok()
+    }
+
+    fn seal(
+        bytes: &[u8],
+        permit: tokio::sync::OwnedSemaphorePermit,
+        request_hash: [u8; 32],
+        request_url: &str,
+    ) -> Option<Self> {
+        if bytes.len() > super::inbox::MAX_CHANGES_PAGE_BYTES {
+            return None;
+        }
+        Some(Self {
+            bytes: bytes.to_vec(),
+            request_hash,
+            request_url: request_url.to_owned(),
+            retained_request: None,
+            principal: None,
+            namespace: None,
+            service_root: None,
+            session_bound: false,
+            invocation: None,
+            _permit: permit,
+        })
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn retained_request(&self) -> Option<&RetainedRequest> {
+        self.retained_request.as_ref()
+    }
+
+    /// State must independently validate the account namespace, root, pass,
+    /// zone and request semantics. A bare reqwest client has no principal.
+    pub(crate) fn matches_authenticated_request(
+        &self,
+        owner: &crate::state::db::account::AccountOwner,
+        url: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> bool {
+        let Ok((namespace, provider)) = owner.authenticated_keys() else {
+            return false;
+        };
+        self.namespace.as_deref() == Some(namespace)
+            && self.principal.as_deref() == Some(provider)
+            && self.request_hash == original_request_hash(url, body, headers)
+    }
+
+    /// Verify the request was sent to the Photos endpoint pinned from the
+    /// authenticated login response. Account namespace, zone and page
+    /// semantics remain the responsibility of the state transaction.
+    pub(crate) fn matches_authenticated_source(
+        &self,
+        owner: &crate::state::db::account::AccountOwner,
+        database: &str,
+        operation: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> bool {
+        if !self.session_bound
+            || !matches!(database, "private" | "shared")
+            || !matches!(
+                operation,
+                "records/query" | "changes/zone" | "records/lookup"
+            )
+            || !self.matches_authenticated_request(owner, &self.request_url, body, headers)
+        {
+            return false;
+        }
+        let Some(root) = self
+            .service_root
+            .as_deref()
+            .and_then(|value| reqwest::Url::parse(value).ok())
+        else {
+            return false;
+        };
+        let Ok(actual) = reqwest::Url::parse(&self.request_url) else {
+            return false;
+        };
+        if !valid_source_scheme(&root)
+            || !root.username().is_empty()
+            || root.password().is_some()
+            || root.query().is_some()
+            || root.fragment().is_some()
+            || actual.origin() != root.origin()
+            || actual.fragment().is_some()
+            || !actual.username().is_empty()
+            || actual.password().is_some()
+        {
+            return false;
+        }
+        let expected_path = format!(
+            "{}/database/1/com.apple.photos.cloud/production/{database}/{operation}",
+            root.path().trim_end_matches('/')
+        );
+        actual.path() == expected_path
+    }
+
+    pub(crate) fn attested_bindings(
+        &self,
+        owner: &crate::state::db::account::AccountOwner,
+        database: &str,
+        operation: &str,
+    ) -> Option<([u8; 32], [u8; 32], &RetainedRequest)> {
+        let request = self.retained_request()?;
+        let headers = request.header_refs();
+        let request_binding =
+            self.request_binding(owner, database, operation, &request.body, &headers)?;
+        let authority_binding =
+            self.binding(owner, database, operation, &request.body, &headers)?;
+        Some((request_binding, authority_binding, request))
+    }
+
+    /// Stable redacted identity of the exact successful request. It is not a
+    /// substitute for the run/pass causal capability or source authority.
+    pub(crate) fn request_binding(
+        &self,
+        owner: &crate::state::db::account::AccountOwner,
+        database: &str,
+        operation: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> Option<[u8; 32]> {
+        self.matches_authenticated_source(owner, database, operation, body, headers)
+            .then_some(self.request_hash)
+    }
+
+    pub(crate) fn binding(
+        &self,
+        owner: &crate::state::db::account::AccountOwner,
+        database: &str,
+        operation: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> Option<[u8; 32]> {
+        if !self.matches_authenticated_source(owner, database, operation, body, headers) {
+            return None;
+        }
+        SourceAuthority {
+            namespace: self.namespace.clone()?,
+            principal: self.principal.clone()?,
+            service_root: self.service_root.clone()?,
+        }
+        .binding(owner, database, operation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_accepted(mut self) -> (Self, AcceptedInvocation) {
+        let invocation = std::sync::Arc::new(InvocationIdentity {
+            id: uuid::Uuid::new_v4(),
+        });
+        self.invocation = Some(std::sync::Arc::clone(&invocation));
+        (self, AcceptedInvocation(invocation))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_source(
+        owner: &crate::state::db::account::AccountOwner,
+        root: &str,
+        url: &str,
+        request: &str,
+        headers: &[(&str, &str)],
+        bytes: &[u8],
+    ) -> Option<Self> {
+        super::changes_json::parse(bytes).ok()?;
+        let (namespace, principal) = owner.authenticated_keys().ok()?;
+        let pool = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let mut original = Self::seal(
+            bytes,
+            Self::slot_from(&pool)?,
+            original_request_hash(url, request, headers),
+            url,
+        )?;
+        original.namespace = Some(namespace.to_owned());
+        original.principal = Some(principal.to_owned());
+        original.service_root = Some(root.to_owned());
+        original.retained_request = Some(RetainedRequest::new(url, request, headers));
+        original.session_bound = true;
+        Some(original)
+    }
+
+    #[cfg(test)]
+    fn synthetic(bytes: &[u8]) -> Option<Self> {
+        let pool = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        Self::seal(
+            bytes,
+            Self::slot_from(&pool)?,
+            [0; 32],
+            "https://synthetic.invalid",
+        )
+    }
+}
+
+fn original_request_hash(url: &str, body: &str, headers: &[(&str, &str)]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for field in std::iter::once(url)
+        .chain(std::iter::once(body))
+        .chain(headers.iter().flat_map(|(name, value)| [*name, *value]))
+    {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field.as_bytes());
+    }
+    hash.finalize().into()
+}
+
+impl ChangesResponse {
+    /// Explicit synthetic raw adapter; never available in production.
+    #[cfg(test)]
+    pub(crate) fn synthetic(
+        owner: &crate::state::db::account::AccountOwner,
+        service_root: &str,
+        url: &str,
+        request: &str,
+        headers: &[(&str, &str)],
+        response_body: &[u8],
+        invocation: InvocationToken,
+    ) -> anyhow::Result<Self> {
+        let mut original = OriginalBody::synthetic_source(
+            owner,
+            service_root,
+            url,
+            request,
+            headers,
+            response_body,
+        );
+        if let Some(original) = original.as_mut() {
+            original.invocation = Some(invocation.0);
+        }
+        Ok(Self {
+            body: response_body.to_vec(),
+            original,
+            accepted: None,
+        })
+    }
+}
+
 #[async_trait::async_trait]
 pub trait PhotosSession: Send + Sync {
     async fn post(
@@ -104,6 +642,11 @@ pub trait PhotosSession: Send + Sync {
         body: String,
         headers: &[(&str, &str)],
     ) -> anyhow::Result<Value>;
+
+    /// Only a pinned shared session can provide current source authority.
+    async fn current_source_authority(&self) -> Option<SourceAuthority> {
+        None
+    }
 
     /// Optional diagnostic transport: no retries, body dumps or error-body logs.
     /// Adapters must opt in; falling back to ordinary post can expose secrets.
@@ -132,6 +675,23 @@ pub trait PhotosSession: Send + Sync {
             ))
         );
         Ok(body)
+    }
+
+    /// Preserve the existing bounded changes body even when evidence is
+    /// unavailable. Value-based adapters cannot manufacture an original seal.
+    async fn post_changes_with_evidence(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+        invocation: InvocationToken,
+    ) -> anyhow::Result<ChangesResponse> {
+        let _ = invocation;
+        Ok(ChangesResponse {
+            body: self.post_changes_body(url, body, headers).await?,
+            original: None,
+            accepted: None,
+        })
     }
 
     /// Clone this session into a new boxed trait object.
@@ -284,6 +844,43 @@ async fn post_response(
     Ok((resp, dump))
 }
 
+/// Read exactly one ordinary changes response while observing its effective
+/// endpoint and status. Normal raw ingestion gets identical bytes; a response
+/// at a different final URL or without 2xx cannot issue source evidence.
+async fn source_changes_body(
+    client: &reqwest::Client,
+    url: &str,
+    body: String,
+    headers: &[(&str, &str)],
+) -> anyhow::Result<(Vec<u8>, bool)> {
+    let (mut response, _dump) = post_response(client, url, body, headers).await?;
+    let source_endpoint = response.status().is_success() && response.url().as_str() == url;
+    let limit = super::inbox::MAX_CHANGES_PAGE_BYTES;
+    anyhow::ensure!(
+        response
+            .content_length()
+            .is_none_or(|size| size <= limit as u64),
+        super::error::ShadowPageError::from(anyhow::anyhow!(
+            "Provider changes page exceeded the capture byte limit"
+        ))
+    );
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            chunk.len() <= limit.saturating_sub(bytes.len()),
+            super::error::ShadowPageError::from(anyhow::anyhow!(
+                "Provider changes page exceeded the capture byte limit"
+            ))
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    #[cfg(debug_assertions)]
+    if let Some((dir, id)) = &_dump {
+        dump_body(dir, *id, "res", &String::from_utf8_lossy(&bytes)).await;
+    }
+    Ok((bytes, source_endpoint))
+}
+
 // SharedSession delegates to the inner Session's http_client(). The read lock
 // is held only long enough to clone the Arc-backed Client, then released before
 // the actual HTTP call so other tasks can read concurrently.
@@ -297,6 +894,10 @@ impl PhotosSession for crate::auth::SharedSession {
     ) -> anyhow::Result<Value> {
         let client = self.read().await.http_client().clone();
         PhotosSession::post(&client, url, body, headers).await
+    }
+
+    async fn current_source_authority(&self) -> Option<SourceAuthority> {
+        source_authority(self).await
     }
 
     async fn post_diagnostic(
@@ -317,6 +918,65 @@ impl PhotosSession for crate::auth::SharedSession {
     ) -> anyhow::Result<Vec<u8>> {
         let client = self.read().await.http_client().clone();
         PhotosSession::post_changes_body(&client, url, body, headers).await
+    }
+
+    /// Same authenticated SharedSession and strict raw request used by the
+    /// ordinary path. This follows kei's existing session model; it does not
+    /// assert that the shared cookie jar is immutable or record every redirect.
+    async fn post_changes_with_evidence(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+        invocation: InvocationToken,
+    ) -> anyhow::Result<ChangesResponse> {
+        let (client, principal, namespace, service_root) = {
+            let session = self.read().await;
+            (
+                session.http_client().clone(),
+                session.principal().map(str::to_owned),
+                session.account_namespace().to_owned(),
+                session.photos_service_root().map(str::to_owned),
+            )
+        };
+        if principal.is_none() || service_root.is_none() {
+            return Ok(ChangesResponse {
+                body: PhotosSession::post_changes_body(&client, url, body, headers).await?,
+                original: None,
+                accepted: None,
+            });
+        }
+        let request_hash = original_request_hash(url, &body, headers);
+        let request = RetainedRequest::new(url, &body, headers);
+        let (bytes, source_endpoint) = source_changes_body(&client, url, body, headers).await?;
+        let unchanged = {
+            let session = self.read().await;
+            session.principal() == principal.as_deref()
+                && session.account_namespace() == namespace
+                && session.photos_service_root() == service_root.as_deref()
+        };
+        let original = if unchanged && source_endpoint {
+            OriginalBody::slot()
+                .and_then(|permit| OriginalBody::seal(&bytes, permit, request_hash, url))
+                .map(|mut original| {
+                    original.invocation = Some(invocation.0);
+                    original.principal = principal;
+                    original.namespace = Some(namespace);
+                    original.service_root = service_root;
+                    original.retained_request = Some(request);
+                    // This means session-bound under the existing model, not
+                    // a proof of immutable cookies or redirect history.
+                    original.session_bound = true;
+                    original
+                })
+        } else {
+            None
+        };
+        Ok(ChangesResponse {
+            body: bytes,
+            original,
+            accepted: None,
+        })
     }
 
     fn clone_box(&self) -> Box<dyn PhotosSession> {
@@ -630,6 +1290,64 @@ pub async fn retry_post(
     result
 }
 
+/// Same strict changes parser and size limit as the existing ingestion path;
+/// optional provenance never substitutes a reserialized Value for raw bytes.
+pub(crate) async fn retry_post_changes_with_evidence(
+    session: &dyn PhotosSession,
+    url: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+    retry_config: &RetryConfig,
+) -> anyhow::Result<ChangesResponse> {
+    hydration_progress::request_started();
+    let result = retry::retry_with_backoff(retry_config, classify_api_error, || async {
+        hydration_progress::attempt_started();
+        let result = async {
+            let invocation = std::sync::Arc::new(InvocationIdentity {
+                id: uuid::Uuid::new_v4(),
+            });
+            let mut response = session
+                .post_changes_with_evidence(
+                    url,
+                    body.to_owned(),
+                    headers,
+                    InvocationToken(std::sync::Arc::clone(&invocation)),
+                )
+                .await?;
+            // Never trust an adapter-provided acceptance capability.
+            response.accepted = None;
+            let valid_original = response.original.as_ref().is_some_and(|original| {
+                original
+                    .invocation
+                    .as_ref()
+                    .is_some_and(|actual| std::sync::Arc::ptr_eq(actual, &invocation))
+                    && original.as_bytes() == response.body.as_slice()
+            });
+            if !valid_original {
+                response.original = None;
+            }
+            anyhow::ensure!(
+                response.body.len() <= super::inbox::MAX_CHANGES_PAGE_BYTES,
+                super::error::ShadowPageError::from(anyhow::anyhow!(
+                    "Provider changes page exceeded the capture byte limit"
+                ))
+            );
+            let value = super::changes_json::parse(&response.body)?;
+            check_cloudkit_errors(value)?;
+            if valid_original {
+                response.accepted = Some(AcceptedInvocation(invocation));
+            }
+            Ok(response)
+        }
+        .await;
+        hydration_progress::attempt_finished();
+        result
+    })
+    .await;
+    hydration_progress::request_finished();
+    result
+}
+
 pub(crate) async fn retry_post_changes_body(
     session: &dyn PhotosSession,
     url: &str,
@@ -751,6 +1469,408 @@ pub fn check_changes_zone_error(
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn synthetic_shared_session_actual_response_grants_scoped_source() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let endpoint = "/database/1/com.apple.photos.cloud/production/private/changes/zone";
+        let raw = r#"{"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"records":[],"syncToken":"next","moreComing":false}]}"#;
+        Mock::given(method("POST"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_string(raw))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = crate::auth::session::Session::new(
+            tmp.path(),
+            "synthetic@example.invalid",
+            "https://www.icloud.com",
+            None,
+        )
+        .await
+        .unwrap();
+        let login: crate::auth::AccountLoginResponse =
+            serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"synthetic"}})).unwrap();
+        session.bind_principal(&login, None).unwrap();
+        session
+            .session_data
+            .insert("ckdatabasews_url".to_owned(), server.uri());
+        let owner = crate::state::db::account::AccountOwner::authenticated(
+            "synthetic@example.invalid",
+            "com",
+            &login,
+        )
+        .unwrap();
+        let shared: crate::auth::SharedSession =
+            std::sync::Arc::new(tokio::sync::RwLock::new(session));
+        let request = serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"syncToken":"saved","resultsLimit":200}]}).to_string();
+        let headers = [("Content-type", "text/plain")];
+        let retry = crate::retry::RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let response = super::retry_post_changes_with_evidence(
+            &shared,
+            &format!("{}{endpoint}", server.uri()),
+            &request,
+            &headers,
+            &retry,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.body, raw.as_bytes());
+        let original = response.original.unwrap();
+        let accepted = response.accepted.unwrap();
+        assert!(accepted.matches_original(&original));
+        assert!(original.matches_authenticated_source(
+            &owner,
+            "private",
+            "changes/zone",
+            &request,
+            &headers
+        ));
+        assert!(
+            original
+                .attested_bindings(&owner, "private", "changes/zone")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn retained_request_serialization_never_contains_url_body_or_headers() {
+        let request = super::RetainedRequest::new(
+            "https://synthetic.invalid/path?secret=synthetic-url-secret",
+            "synthetic-body-secret",
+            &[("Authorization", "synthetic-header-secret")],
+        );
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        for secret in [
+            "synthetic-url-secret",
+            "synthetic-body-secret",
+            "synthetic-header-secret",
+            "Authorization",
+        ] {
+            assert!(!text.contains(secret));
+        }
+        let decoded: super::RetainedRequest = serde_json::from_slice(&bytes).unwrap();
+        assert!(decoded.matches_body("synthetic-body-secret"));
+        assert!(!decoded.matches_body("different"));
+        assert!(decoded.url.is_empty() && decoded.body.is_empty() && decoded.headers.is_empty());
+    }
+
+    #[test]
+    fn retained_zone_attestation_omits_cursor_but_rechecks_zone() {
+        let zone = serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        let body = serde_json::json!({"zones":[{"zoneID":zone,"syncToken":"synthetic-secret-cursor","resultsLimit":200}]}).to_string();
+        let request = super::RetainedRequest::new("https://synthetic.invalid", &body, &[]);
+        assert!(request.valid_changes_zone_request(&zone));
+        let bytes = serde_json::to_vec(&request).unwrap();
+        assert!(
+            !std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains("synthetic-secret-cursor")
+        );
+        let restored: super::RetainedRequest = serde_json::from_slice(&bytes).unwrap();
+        assert!(restored.valid_changes_zone_request(&zone));
+        assert!(!restored.valid_changes_zone_request(&serde_json::json!({"zoneName":"foreign"})));
+    }
+
+    #[test]
+    fn retained_zone_attestation_rejects_malformed_request_shapes() {
+        let zone = serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        let good =
+            serde_json::json!({"zones":[{"zoneID":zone,"syncToken":"cursor","resultsLimit":200}]});
+        let mut invalid = Vec::new();
+        let mut v = good.clone();
+        v["zones"][0]["syncToken"] = serde_json::json!(" ");
+        invalid.push(v);
+        let mut v = good.clone();
+        v["zones"][0]["syncToken"] = serde_json::json!(null);
+        invalid.push(v);
+        let mut v = good.clone();
+        v["zones"][0]["resultsLimit"] = serde_json::json!(201);
+        invalid.push(v);
+        let mut v = good.clone();
+        v["zones"][0]["extra"] = serde_json::json!(true);
+        invalid.push(v);
+        let mut v = good.clone();
+        v["extra"] = serde_json::json!(true);
+        invalid.push(v);
+        let mut v = good.clone();
+        v["zones"]
+            .as_array_mut()
+            .unwrap()
+            .push(good["zones"][0].clone());
+        invalid.push(v);
+        for value in invalid {
+            let request =
+                super::RetainedRequest::new("https://synthetic.invalid", &value.to_string(), &[]);
+            assert!(!request.valid_changes_zone_request(&zone));
+        }
+        let request =
+            super::RetainedRequest::new("https://synthetic.invalid", &good.to_string(), &[]);
+        assert!(!request.valid_changes_zone_request(
+            &serde_json::json!({"zoneName":"foreign","ownerRecordName":"_defaultOwner"})
+        ));
+        assert!(!request.matches_body("altered"));
+    }
+
+    #[test]
+    fn synthetic_source_requires_matching_authenticated_owner_and_request() {
+        let make_owner = |id: &str| {
+            crate::state::db::account::AccountOwner::authenticated(
+                "source@example.invalid",
+                "com",
+                &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":id}})).unwrap(),
+            )
+            .unwrap()
+        };
+        let owner = make_owner("source-a");
+        let other = make_owner("source-b");
+        let headers = [("Content-type", "text/plain")];
+        let url = "https://source.invalid/query";
+        let response = super::OriginalBody::synthetic_source(
+            &owner,
+            "https://source.invalid",
+            url,
+            "{}",
+            &headers,
+            br#"{"records":[]}"#,
+        )
+        .unwrap();
+        let proof = response;
+        assert!(proof.matches_authenticated_request(&owner, url, "{}", &headers));
+        assert!(!proof.matches_authenticated_request(&other, url, "{}", &headers));
+        assert!(!proof.matches_authenticated_request(
+            &owner,
+            "https://other.invalid/query",
+            "{}",
+            &headers
+        ));
+        assert!(!proof.matches_authenticated_request(&owner, url, "{ }", &headers));
+        assert!(!proof.matches_authenticated_request(&owner, url, "{}", &[]));
+    }
+
+    #[test]
+    fn synthetic_source_checks_endpoint_operation_and_exact_namespace() {
+        let login =
+            serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"one-provider"}})).unwrap();
+        let owner = crate::state::db::account::AccountOwner::authenticated(
+            "a@example.invalid",
+            "com",
+            &login,
+        )
+        .unwrap();
+        let alias = crate::state::db::account::AccountOwner::authenticated(
+            "b@example.invalid",
+            "com",
+            &login,
+        )
+        .unwrap();
+        let headers = [("Content-type", "text/plain")];
+        let url = "https://photos.invalid/database/1/com.apple.photos.cloud/production/private/changes/zone?x=1";
+        let response = super::OriginalBody::synthetic_source(
+            &owner,
+            "https://photos.invalid",
+            url,
+            "{}",
+            &headers,
+            br#"{"zones":[]}"#,
+        )
+        .unwrap();
+        let proof = response;
+        assert!(proof.matches_authenticated_source(
+            &owner,
+            "private",
+            "changes/zone",
+            "{}",
+            &headers
+        ));
+        assert!(!proof.matches_authenticated_source(
+            &alias,
+            "private",
+            "changes/zone",
+            "{}",
+            &headers
+        ));
+        assert!(!proof.matches_authenticated_source(
+            &owner,
+            "shared",
+            "changes/zone",
+            "{}",
+            &headers
+        ));
+        assert!(!proof.matches_authenticated_source(
+            &owner,
+            "private",
+            "records/query",
+            "{}",
+            &headers
+        ));
+        let foreign = super::OriginalBody::synthetic_source(&owner, "https://photos.invalid", "https://photos.invalid.evil/database/1/com.apple.photos.cloud/production/private/changes/zone", "{}", &headers, br#"{"zones":[]}"#).unwrap();
+        assert!(!foreign.matches_authenticated_source(
+            &owner,
+            "private",
+            "changes/zone",
+            "{}",
+            &headers
+        ));
+    }
+
+    #[test]
+    fn fifth_evidence_page_falls_back_without_consuming_ingestion() {
+        let pool = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let permit = super::OriginalBody::slot_from(&pool).unwrap();
+            held.push(
+                super::OriginalBody::seal(b"{}", permit, [0; 32], "https://synthetic.invalid")
+                    .unwrap(),
+            );
+        }
+        assert!(super::OriginalBody::slot_from(&pool).is_none());
+        // The ordinary raw changes body remains parseable without a proof slot.
+        assert!(super::super::changes_json::parse(br#"{"zones":[]}"#).is_ok());
+        held.pop();
+        assert!(super::OriginalBody::slot_from(&pool).is_some());
+    }
+
+    #[test]
+    fn evidence_slots_release_on_drop_and_reject_oversized() {
+        let pool = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let first = super::OriginalBody::seal(
+            b"one",
+            super::OriginalBody::slot_from(&pool).unwrap(),
+            [0; 32],
+            "https://synthetic.invalid",
+        )
+        .unwrap();
+        let second = super::OriginalBody::seal(
+            b"two",
+            super::OriginalBody::slot_from(&pool).unwrap(),
+            [0; 32],
+            "https://synthetic.invalid",
+        )
+        .unwrap();
+        assert!(super::OriginalBody::slot_from(&pool).is_none());
+        std::thread::spawn(move || drop(first)).join().unwrap();
+        let reacquired = super::OriginalBody::slot_from(&pool).unwrap();
+        let too_big = vec![b'x'; super::super::inbox::MAX_CHANGES_PAGE_BYTES + 1];
+        assert!(
+            super::OriginalBody::seal(&too_big, reacquired, [0; 32], "https://synthetic.invalid")
+                .is_none()
+        );
+        assert!(super::OriginalBody::slot_from(&pool).is_some());
+        drop(second);
+    }
+
+    #[test]
+    fn malformed_raw_provenance_is_unavailable() {
+        let owner = crate::state::db::account::AccountOwner::authenticated(
+            "synthetic@example.invalid",
+            "com",
+            &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"synthetic"}})).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            super::OriginalBody::synthetic_source(
+                &owner,
+                "https://source.invalid",
+                "https://source.invalid/query",
+                "{}",
+                &[],
+                br#"{"records":["#
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_supplied_stale_acceptance_is_cleared() {
+        struct Stale;
+        #[async_trait::async_trait]
+        impl super::PhotosSession for Stale {
+            async fn post(
+                &self,
+                _: &str,
+                _: String,
+                _: &[(&str, &str)],
+            ) -> anyhow::Result<serde_json::Value> {
+                panic!("raw path expected")
+            }
+            async fn post_changes_with_evidence(
+                &self,
+                _: &str,
+                _: String,
+                _: &[(&str, &str)],
+                _: super::InvocationToken,
+            ) -> anyhow::Result<super::ChangesResponse> {
+                Ok(super::ChangesResponse {
+                    body: br#"{"zones":[]}"#.to_vec(),
+                    original: None,
+                    accepted: Some(super::AcceptedInvocation(std::sync::Arc::new(
+                        super::InvocationIdentity {
+                            id: uuid::Uuid::new_v4(),
+                        },
+                    ))),
+                })
+            }
+            fn clone_box(&self) -> Box<dyn super::PhotosSession> {
+                Box::new(Stale)
+            }
+        }
+        let retry = crate::retry::RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let response = super::retry_post_changes_with_evidence(&Stale, "", "{}", &[], &retry)
+            .await
+            .unwrap();
+        assert!(response.original.is_none());
+        assert!(response.accepted.is_none());
+    }
+
+    #[tokio::test]
+    async fn strict_changes_ingestion_rejects_duplicate_even_without_proof() {
+        struct DuplicateChanges;
+        #[async_trait::async_trait]
+        impl super::PhotosSession for DuplicateChanges {
+            async fn post(
+                &self,
+                _: &str,
+                _: String,
+                _: &[(&str, &str)],
+            ) -> anyhow::Result<serde_json::Value> {
+                panic!("raw changes path expected")
+            }
+            async fn post_changes_body(
+                &self,
+                _: &str,
+                _: String,
+                _: &[(&str, &str)],
+            ) -> anyhow::Result<Vec<u8>> {
+                Ok(br#"{"zones":[],"zones":[]}"#.to_vec())
+            }
+            fn clone_box(&self) -> Box<dyn super::PhotosSession> {
+                Box::new(DuplicateChanges)
+            }
+        }
+        let retry = crate::retry::RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let result =
+            super::retry_post_changes_with_evidence(&DuplicateChanges, "", "{}", &[], &retry).await;
+        assert!(result.is_err());
+    }
+
     use super::*;
 
     #[tokio::test]

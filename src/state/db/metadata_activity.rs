@@ -14,6 +14,39 @@ pub(crate) const DDL: &str = "CREATE TABLE metadata_activity_prerequisite (
  CREATE INDEX metadata_activity_prerequisite_library ON metadata_activity_prerequisite(account_key,provider_key,library);
  CREATE TABLE metadata_activity_prepared_prerequisite (operation_id TEXT PRIMARY KEY, binding BLOB NOT NULL);";
 
+// Version 42/43 records never retained an admission inode. They remain unknown;
+// reopening a pathname today cannot reconstruct the inode originally admitted.
+pub(crate) const IDENTITY_INDEX_MIGRATION: &str = "
+ ALTER TABLE metadata_activity_prerequisite ADD COLUMN target_key TEXT;
+ ALTER TABLE metadata_activity_prerequisite ADD COLUMN lookup_state INTEGER NOT NULL DEFAULT 0
+   CHECK (CASE lookup_state
+       WHEN 0 THEN target_key IS NULL
+       WHEN 1 THEN CASE WHEN target_key IS NOT NULL AND length(target_key)>0
+           AND json_valid(target_key) AND json_valid(binding)
+           THEN COALESCE(json_type(binding,'$.path')='object'
+                AND json_extract(binding,'$.path')=target_key
+                AND json_type(binding,'$.version')='integer'
+                AND json_extract(binding,'$.version')=2
+                AND json_type(binding,'$.asset')='object'
+                AND json_type(binding,'$.asset.id')='text'
+                AND length(json_extract(binding,'$.asset.id'))>0
+                AND json_type(binding,'$.asset.checksum')='text'
+                AND length(json_extract(binding,'$.asset.checksum'))>0
+                AND json_type(binding,'$.asset.library')='text'
+                AND json_extract(binding,'$.asset.library')=library
+                AND json_type(binding,'$.queue')='text'
+                AND json_extract(binding,'$.queue')='ordinary'
+                AND json_type(binding,'$.component')='text'
+                AND json_extract(binding,'$.component')='embedded'
+                AND json_type(binding,'$.capture')='null'
+                AND json_type(binding,'$.flags')='integer'
+                AND json_extract(binding,'$.flags') BETWEEN 0 AND 63
+                AND (json_extract(binding,'$.flags') & 32)=0,0)
+           ELSE 0 END
+       ELSE 0 END);
+ CREATE INDEX metadata_activity_lookup_unknown ON metadata_activity_prerequisite(account_key,provider_key,library,lookup_state);
+ CREATE INDEX metadata_activity_lookup_target ON metadata_activity_prerequisite(account_key,provider_key,library,target_key,lookup_state);";
+
 /// An account-owned exact work binding, never a publication or deletion permit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetadataActivity {
@@ -32,6 +65,75 @@ pub struct ActivityAdmission {
     activity: MetadataActivity,
     // A reopened or copied database cannot reconstruct a live capability.
     origin: std::sync::Weak<std::sync::Mutex<rusqlite::Connection>>,
+    held: Option<std::sync::Arc<HeldFile>>,
+}
+
+// Live evidence is never reconstructed from SQLite after capability loss.
+// Another connection, process, restart, or poisoned registry yields unknown.
+struct LiveActivity {
+    origin: std::sync::Weak<std::sync::Mutex<rusqlite::Connection>>,
+    file: std::sync::Weak<HeldFile>,
+}
+static LIVE_ACTIVITIES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, LiveActivity>>,
+> = std::sync::OnceLock::new();
+fn live_activities() -> &'static std::sync::Mutex<std::collections::HashMap<String, LiveActivity>> {
+    LIVE_ACTIVITIES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+fn register_live(
+    active: &MetadataActivity,
+    origin: &std::sync::Weak<std::sync::Mutex<rusqlite::Connection>>,
+    file: &std::sync::Arc<HeldFile>,
+) -> Result<(), StateError> {
+    let mut live = live_activities().lock().map_err(|_poisoned| invalid())?;
+    if live.contains_key(&active.operation_id) {
+        return Err(invalid());
+    }
+    live.insert(
+        active.operation_id.clone(),
+        LiveActivity {
+            origin: origin.clone(),
+            file: std::sync::Arc::downgrade(file),
+        },
+    );
+    Ok(())
+}
+impl Drop for ActivityAdmission {
+    fn drop(&mut self) {
+        if self.held.is_some()
+            && let Ok(mut live) = live_activities().lock()
+        {
+            live.remove(&self.activity.operation_id);
+        }
+    }
+}
+
+/// A selected, rating-only no-write observation retaining the exact file
+/// opened before its durable activity was inserted. This is not authority to
+/// publish, finalize metadata, clear work, or retire the activity.
+#[allow(
+    dead_code,
+    reason = "the retained capability is not connected to completion until indexed conflict fencing exists"
+)]
+pub struct RatingNoWriteAdmission {
+    activity: ActivityAdmission,
+    file: std::sync::Arc<HeldFile>,
+    lease: std::sync::Arc<std::sync::Mutex<super::metadata_identity::IdentityActivity>>,
+}
+
+#[cfg(test)]
+impl RatingNoWriteAdmission {
+    pub(crate) fn test_validate_file(&self) -> Result<(), StateError> {
+        self.file.validate()
+    }
+
+    pub(crate) fn test_operation_id(&self) -> &str {
+        &self.activity.activity.operation_id
+    }
+
+    pub(crate) fn test_admission(&self) -> &ActivityAdmission {
+        &self.activity
+    }
 }
 
 impl std::fmt::Debug for ActivityAdmission {
@@ -41,6 +143,11 @@ impl std::fmt::Debug for ActivityAdmission {
 }
 
 impl ActivityAdmission {
+    #[cfg(test)]
+    pub(crate) fn test_operation_id(&self) -> &str {
+        &self.activity.operation_id
+    }
+
     fn belongs_to(&self, db: &SqliteStateDb) -> bool {
         std::sync::Weak::ptr_eq(&self.origin, &std::sync::Arc::downgrade(&db.conn))
     }
@@ -106,7 +213,6 @@ fn validate_live(
 }
 
 /// A no-follow open file and parent kept through the evidence transaction.
-#[cfg(test)]
 struct HeldFile {
     path: crate::fs_util::ConfinedPath,
     file: std::fs::File,
@@ -115,7 +221,6 @@ struct HeldFile {
     sha256: String,
 }
 
-#[cfg(test)]
 impl HeldFile {
     fn open(root: &std::path::Path, name: &std::path::Path) -> Result<Self, StateError> {
         let path = crate::fs_util::ConfinedPath::open(
@@ -167,8 +272,200 @@ impl HeldFile {
         }
         Ok(())
     }
+    fn lookup_target(&self) -> Result<String, StateError> {
+        // The held open file is authoritative only while retained. Never use
+        // a durable inode inequality as evidence that paths are independent.
+        if crate::fs_util::file_link_count(&self.file).map_err(|_source| invalid())? != 1 {
+            return Err(invalid());
+        }
+        super::provider_selection::SelectionPath::from_path(self.path.path()).key()
+    }
+    #[cfg(test)]
     fn evidence(&self) -> serde_json::Value {
         serde_json::json!({"path":super::provider_selection::SelectionPath::from_path(self.path.path()),"identity":self.identity,"size":self.size,"sha256":self.sha256})
+    }
+}
+
+// Exact path lookup is a possible-conflict index, not proof of filesystem
+// namespace independence or permission to mutate. Unknown legacy rows hold.
+fn indexed_conflict(
+    conn: &rusqlite::Connection,
+    account: &str,
+    provider: &str,
+    library: &str,
+    target: &str,
+) -> Result<bool, StateError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM metadata_activity_prerequisite WHERE account_key=?1 AND provider_key=?2 AND library=?3 AND lookup_state=0) OR EXISTS(SELECT 1 FROM metadata_activity_prerequisite WHERE account_key=?1 AND provider_key=?2 AND library=?3 AND target_key=?4 AND lookup_state=1)",
+        params![account, provider, library, target], |row| row.get(0),
+    )?)
+}
+
+// The bounded owner check compares actual confined files for differently
+// spelled paths. An unclassifiable record or more than 256 candidates holds
+// this operation; it never treats stale inode inequality as durable proof.
+fn check_live_competitors(
+    conn: &rusqlite::Connection,
+    owner: &account::AccountOwner,
+    pending: &PendingMetadataRewrite,
+    candidate: &HeldFile,
+    origin: &std::sync::Weak<std::sync::Mutex<rusqlite::Connection>>,
+    except: Option<&str>,
+) -> Result<(), StateError> {
+    let (account, provider) = owner.authenticated_keys()?;
+    let mut stmt = conn.prepare("SELECT operation_id,binding FROM metadata_activity_prerequisite WHERE account_key=?1 AND provider_key=?2 AND library=?3 ORDER BY operation_id LIMIT 257")?;
+    let rows = stmt
+        .query_map(params![account, provider, pending.asset.library], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.len() > 256 {
+        return Err(invalid());
+    }
+    for (operation_id, binding) in rows {
+        if except == Some(operation_id.as_str()) {
+            continue;
+        }
+        let active = MetadataActivity {
+            operation_id,
+            account_key: account.to_owned(),
+            provider_key: provider.to_owned(),
+            library: pending.asset.library.to_string(),
+            binding,
+        };
+        let saved = active.validated_binding()?;
+        if saved.path.to_path() == candidate.path.path() {
+            return Err(invalid());
+        }
+        let other = {
+            let live = live_activities().lock().map_err(|_poisoned| invalid())?;
+            let entry = live.get(&active.operation_id).ok_or_else(invalid)?;
+            if !std::sync::Weak::ptr_eq(&entry.origin, origin) {
+                return Err(invalid());
+            }
+            entry.file.upgrade().ok_or_else(invalid)?
+        };
+        // Compare simultaneously retained capabilities, never a reopened
+        // historical name or a persisted inode across restart/remount.
+        other.validate()?;
+        other.lookup_target()?;
+        candidate.validate()?;
+        candidate.lookup_target()?;
+        if other.identity == candidate.identity {
+            return Err(invalid());
+        }
+        other.validate()?;
+        candidate.validate()?;
+    }
+    Ok(())
+}
+
+/// Retained owner proof for an unchanged, explicitly selected rating request.
+pub(super) struct RatingNoWriteGuard {
+    active: MetadataActivity,
+    file: std::sync::Arc<HeldFile>,
+    owner: account::AccountOwner,
+    origin: std::sync::Weak<std::sync::Mutex<rusqlite::Connection>>,
+    current_flags: u8,
+    lease: std::sync::Arc<std::sync::Mutex<super::metadata_identity::IdentityActivity>>,
+}
+
+impl RatingNoWriteGuard {
+    pub(super) fn validate(
+        &self,
+        conn: &rusqlite::Connection,
+        pending: &PendingMetadataRewrite,
+    ) -> Result<(), StateError> {
+        account::validate_authenticated(conn, &self.owner)?;
+        if !self
+            .lease
+            .lock()
+            .map_err(|_| invalid())?
+            .validates_observer(&self.file.file)
+        {
+            return Err(invalid());
+        }
+        if self.current_flags & 2 == 0
+            || pending.capture_repair_receipt.is_some()
+            || pending.asset.metadata.rating.is_some()
+            || pending.asset.metadata.is_favorite
+        {
+            return Err(invalid());
+        }
+        let receipt = pending.selection_receipt.as_ref().ok_or_else(invalid)?;
+        if receipt.metadata_flags != 2 || receipt.prepared.is_some() {
+            return Err(invalid());
+        }
+        self.file.validate()?;
+        let target = self.file.lookup_target()?;
+        if pending.asset.local_checksum.as_deref() != Some(self.file.sha256.as_str())
+            || binding(pending, MetadataRewriteQueue::Ordinary, 2)? != self.active.binding
+        {
+            return Err(invalid());
+        }
+        validate_live(conn, pending, MetadataRewriteQueue::Ordinary, 2)?;
+        super::provider_generations::validate_explicit_rating_refresh(conn, pending)?;
+        let (account, provider) = self.owner.authenticated_keys()?;
+        let exact: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM metadata_activity_prerequisite WHERE operation_id=?1 AND account_key=?2 AND provider_key=?3 AND library=?4 AND binding=?5 AND lookup_state=1 AND target_key=?6 AND NOT EXISTS(SELECT 1 FROM metadata_activity_prepared_prerequisite WHERE operation_id=?1))", params![self.active.operation_id,account,provider,self.active.library,self.active.binding,target], |r|r.get(0))?;
+        if !exact {
+            return Err(invalid());
+        }
+        if receipt.frozen_metadata_hash.is_none() {
+            let absent: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND metadata_hash IS ?4 AND rating IS NULL AND is_favorite=0 AND is_deleted=0)",params![pending.asset.library,pending.asset.id,pending.asset.version_size.as_str(),pending.asset.metadata.metadata_hash],|r|r.get(0))?;
+            if !absent {
+                return Err(invalid());
+            }
+        }
+        check_live_competitors(
+            conn,
+            &self.owner,
+            pending,
+            &self.file,
+            &self.origin,
+            Some(&self.active.operation_id),
+        )?;
+        self.file.validate()?;
+        self.file.lookup_target()?;
+        Ok(())
+    }
+
+    pub(super) fn retire(&self, conn: &rusqlite::Connection) -> Result<(), StateError> {
+        let (account, provider) = self.owner.authenticated_keys()?;
+        let target = self.file.lookup_target()?;
+        let count = conn.execute("DELETE FROM metadata_activity_prerequisite WHERE operation_id=?1 AND account_key=?2 AND provider_key=?3 AND library=?4 AND binding=?5 AND lookup_state=1 AND target_key=?6 AND NOT EXISTS(SELECT 1 FROM metadata_activity_prepared_prerequisite WHERE operation_id=?1)", params![self.active.operation_id,account,provider,self.active.library,self.active.binding,target])?;
+        if count != 1 {
+            return Err(invalid());
+        }
+        self.file.validate()?;
+        self.file.lookup_target()?;
+        Ok(())
+    }
+
+    /// Revalidate the live owner binding after the exact receipt commits.
+    pub(super) fn committed_binding(
+        &self,
+    ) -> Result<(super::metadata_identity::LeaseBinding, String), StateError> {
+        let lease = self.lease.lock().map_err(|_| invalid())?;
+        if !lease.validates_observer(&self.file.file) {
+            return Err(invalid());
+        }
+        Ok((
+            lease.commit_binding().ok_or_else(invalid)?,
+            self.active.operation_id.clone(),
+        ))
+    }
+
+    pub(super) fn committed(
+        &self,
+        seal: super::metadata::CommittedLease,
+    ) -> Result<(), StateError> {
+        let mut lease = self.lease.lock().map_err(|_| invalid())?;
+        if !lease.validates_observer(&self.file.file)
+            || !lease.settled_with(seal, &self.active.operation_id)
+        {
+            return Err(invalid());
+        }
+        Ok(())
     }
 }
 
@@ -207,14 +504,9 @@ struct FrozenSelection {
 }
 
 impl MetadataActivity {
-    /// Existing active records are never evidence of completed content. This
-    /// read-only preflight cannot authorize a filesystem mutation.
-    fn classify_preflight(
-        &self,
-        pending: &PendingMetadataRewrite,
-        flags: u8,
-        root: &std::path::Path,
-    ) -> Result<ActivityPreflight, StateError> {
+    // Strictly decode and validate the entire supported operation binding
+    // before its path may be promoted into the possible-conflict index.
+    fn validated_binding(&self) -> Result<FrozenActivity, StateError> {
         let saved: FrozenActivity =
             serde_json::from_slice(&self.binding).map_err(|_invalid| invalid())?;
         if uuid::Uuid::parse_str(&self.operation_id).is_err()
@@ -254,6 +546,18 @@ impl MetadataActivity {
                 &selected.prepared,
             );
         }
+        Ok(saved)
+    }
+
+    /// Existing active records are never evidence of completed content. This
+    /// read-only preflight cannot authorize a filesystem mutation.
+    fn classify_preflight(
+        &self,
+        pending: &PendingMetadataRewrite,
+        flags: u8,
+        root: &std::path::Path,
+    ) -> Result<ActivityPreflight, StateError> {
+        let saved = self.validated_binding()?;
         let media = pending.asset.local_path.as_deref().ok_or_else(invalid)?;
         let saved_path = saved.path.to_path();
         let mut targets = Vec::new();
@@ -319,6 +623,29 @@ pub trait MetadataActivityOwner: Send + Sync {
         queue: MetadataRewriteQueue,
         flags: u8,
     ) -> Result<ActivityAdmission, StateError>;
+    /// Bind the real selected rating-only no-op and its held pre-admission
+    /// file. This alone is not a conflict fence or completion authority.
+    #[allow(
+        dead_code,
+        reason = "production connection waits for indexed conflict fencing and exact owner completion"
+    )]
+    async fn admit_selected_rating_no_write(
+        &self,
+        pending: &PendingMetadataRewrite,
+        root: &std::path::Path,
+        current_flags: u8,
+        current_queue: MetadataRewriteQueue,
+    ) -> Result<RatingNoWriteAdmission, StateError>;
+    async fn is_explicit_rating_refresh(
+        &self,
+        pending: &PendingMetadataRewrite,
+    ) -> Result<bool, StateError>;
+    async fn finish_selected_rating_no_write(
+        &self,
+        pending: &PendingMetadataRewrite,
+        proof: &RatingNoWriteAdmission,
+        current_flags: u8,
+    ) -> Result<bool, StateError>;
     #[cfg(test)]
     async fn list_activity(&self, library: &str) -> Result<Vec<MetadataActivity>, StateError>;
     /// Reject-only preflight, not authority to publish or settle.
@@ -390,7 +717,7 @@ impl MetadataActivityOwner for SqliteStateDb {
                 binding: binding(&pending, queue, flags)?,
             };
             tx.execute(
-                "INSERT INTO metadata_activity_prerequisite VALUES(?1,?2,?3,?4,?5)",
+                "INSERT INTO metadata_activity_prerequisite(operation_id,account_key,provider_key,library,binding) VALUES(?1,?2,?3,?4,?5)",
                 params![
                     active.operation_id,
                     active.account_key,
@@ -403,9 +730,136 @@ impl MetadataActivityOwner for SqliteStateDb {
             Ok(ActivityAdmission {
                 activity: active,
                 origin,
+                held: None,
             })
         })
         .await
+    }
+
+    async fn admit_selected_rating_no_write(
+        &self,
+        pending: &PendingMetadataRewrite,
+        root: &std::path::Path,
+        current_flags: u8,
+        current_queue: MetadataRewriteQueue,
+    ) -> Result<RatingNoWriteAdmission, StateError> {
+        const RATING_ONLY: u8 = 1 << 1;
+        let receipt = pending.selection_receipt.as_ref().ok_or_else(invalid)?;
+        if receipt.metadata_flags != RATING_ONLY
+            || current_flags & RATING_ONLY == 0
+            || current_queue != MetadataRewriteQueue::Ordinary
+            || pending.activity_admission.is_some()
+            || receipt.prepared.is_some()
+            || pending.capture_repair_receipt.is_some()
+            || pending.asset.metadata.rating.is_some()
+            || pending.asset.metadata.is_favorite
+        {
+            return Err(invalid());
+        }
+        let owner = self
+            .owner
+            .clone()
+            .ok_or(StateError::AccountIdentityUnavailable)?;
+        let root = root.to_owned();
+        let path = pending.asset.local_path.clone().ok_or_else(invalid)?;
+        let file = tokio::task::spawn_blocking(move || HeldFile::open(&root, &path)).await??;
+        if pending.asset.local_checksum.as_deref() != Some(file.sha256.as_str()) {
+            return Err(invalid());
+        }
+        let pending = pending.clone();
+        let origin = std::sync::Arc::downgrade(&self.conn);
+        self.with_conn_mut("admit selected rating no-write evidence", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            account::validate_authenticated(&tx, &owner)?;
+            validate_live(&tx, &pending, MetadataRewriteQueue::Ordinary, RATING_ONLY)?;
+            super::provider_generations::validate_explicit_rating_refresh(&tx, &pending)?;
+            let receipt = pending.selection_receipt.as_ref().ok_or_else(invalid)?;
+            if receipt.frozen_metadata_hash.is_none() {
+                // The row decoder maps invalid integer ratings to None. A
+                // live-catalogue snapshot must prove SQL NULL directly.
+                let absent: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND metadata_hash IS ?4 AND rating IS NULL AND is_favorite=0 AND is_deleted=0)",
+                    params![pending.asset.library, pending.asset.id, pending.asset.version_size.as_str(), pending.asset.metadata.metadata_hash],
+                    |row| row.get(0),
+                )?;
+                if !absent { return Err(invalid()); }
+            }
+            // The original inode comes from the retained open file, not a
+            // later reopening of the recorded pathname. Unknown legacy rows
+            // cannot prove disjointness and therefore conservatively hold.
+            file.validate()?;
+            let target_key = file.lookup_target()?;
+            let (account, provider) = owner.authenticated_keys()?;
+            if indexed_conflict(&tx, account, provider, &pending.asset.library, &target_key)? { return Err(invalid()); }
+            check_live_competitors(&tx,&owner,&pending,&file,&origin,None)?;
+            let active = MetadataActivity {
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                account_key: account.to_owned(),
+                provider_key: provider.to_owned(),
+                library: pending.asset.library.to_string(),
+                binding: binding(&pending, MetadataRewriteQueue::Ordinary, RATING_ONLY)?,
+            };
+            let decoded = active.validated_binding()?;
+            if decoded.path.key()? != target_key { return Err(invalid()); }
+            tx.execute(
+                "INSERT INTO metadata_activity_prerequisite(operation_id,account_key,provider_key,library,binding,target_key,lookup_state) VALUES(?1,?2,?3,?4,?5,?6,1)",
+                params![active.operation_id, active.account_key, active.provider_key, active.library, active.binding, target_key],
+            )?;
+            file.validate()?;
+            tx.commit()?;
+            let file = std::sync::Arc::new(file);
+            let pin = std::sync::Arc::new(file.file.try_clone().map_err(|_| invalid())?);
+            let lease = super::metadata_identity::IdentityActivity::observe(pin).ok_or_else(invalid)?;
+            file.validate()?;
+            file.lookup_target()?;
+            register_live(&active, &origin, &file)?;
+            Ok(RatingNoWriteAdmission {
+                activity: ActivityAdmission { activity: active, origin, held: Some(std::sync::Arc::clone(&file)) },
+                file,
+                lease: std::sync::Arc::new(std::sync::Mutex::new(lease)),
+            })
+        }).await
+    }
+
+    async fn is_explicit_rating_refresh(
+        &self,
+        pending: &PendingMetadataRewrite,
+    ) -> Result<bool, StateError> {
+        let owner = self
+            .owner
+            .clone()
+            .ok_or(StateError::AccountIdentityUnavailable)?;
+        let pending = pending.clone();
+        self.with_conn("classify selected explicit rating refresh", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            validate_live(conn, &pending, MetadataRewriteQueue::Ordinary, 2)?;
+            super::provider_generations::is_explicit_rating_refresh(conn, &pending)
+        })
+        .await
+    }
+
+    async fn finish_selected_rating_no_write(
+        &self,
+        pending: &PendingMetadataRewrite,
+        proof: &RatingNoWriteAdmission,
+        current_flags: u8,
+    ) -> Result<bool, StateError> {
+        if !proof.activity.belongs_to(self) {
+            return Err(invalid());
+        }
+        let owner = self
+            .owner
+            .clone()
+            .ok_or(StateError::AccountIdentityUnavailable)?;
+        let guard = RatingNoWriteGuard {
+            active: proof.activity.activity.clone(),
+            file: std::sync::Arc::clone(&proof.file),
+            owner,
+            origin: proof.activity.origin.clone(),
+            current_flags,
+            lease: std::sync::Arc::clone(&proof.lease),
+        };
+        self.finish_rating_no_write_guarded(pending, guard).await
     }
 
     async fn validate_conflicts(
@@ -443,7 +897,8 @@ impl MetadataActivityOwner for SqliteStateDb {
         if continuation.is_some_and(|capability| !capability.belongs_to(self)) {
             return Err(invalid());
         }
-        let continuation = continuation.map(|capability| capability.activity.clone());
+        let continuation =
+            continuation.map(|capability| (capability.activity.clone(), capability.held.clone()));
         self.with_conn_mut("validate metadata activity conflicts", move |conn| {
             // A preflight is read-only and is not a publication-time fence.
             let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
@@ -464,8 +919,13 @@ impl MetadataActivityOwner for SqliteStateDb {
             }
             let mut continuation_seen = false;
             for active in rows {
-                if continuation.as_ref() == Some(&active) {
-                    if binding(&pending,queue,flags)? != active.binding { return Err(invalid()); }
+                if continuation.as_ref().is_some_and(|(claimed, _)| claimed == &active) {
+                    let held = continuation.as_ref().and_then(|(_, held)| held.as_ref()).ok_or_else(invalid)?;
+                    held.validate()?;
+                    // Recheck live link count at the continuation boundary;
+                    // an admission-time single-link observation can go stale.
+                    held.lookup_target()?;
+                    if held.path.path() != pending.asset.local_path.as_deref().ok_or_else(invalid)? || binding(&pending,queue,flags)? != active.binding { return Err(invalid()); }
                     validate_live(&tx,&pending,queue,flags)?;
                     // A prepared row without an operation-bound settlement
                     // witness remains ambiguous even to the original owner.
@@ -687,15 +1147,19 @@ mod tests {
         );
         let mut own_pending = pending.clone();
         own_pending.activity_admission = Some(Arc::clone(&admission));
-        crate::state::db::MetadataRewriteStore::validate_metadata_activity_conflicts(
-            db.as_ref(),
-            &own_pending,
-            MetadataRewriteQueue::Ordinary,
-            0,
-            dir.path(),
-        )
-        .await
-        .unwrap();
+        // A legacy admission has no retained file capability and cannot
+        // authorize same-operation continuation, even on the same connection.
+        assert!(
+            crate::state::db::MetadataRewriteStore::validate_metadata_activity_conflicts(
+                db.as_ref(),
+                &own_pending,
+                MetadataRewriteQueue::Ordinary,
+                0,
+                dir.path(),
+            )
+            .await
+            .is_err()
+        );
         assert!(
             db.validate_conflicts(
                 &pending,
@@ -707,15 +1171,17 @@ mod tests {
             .await
             .is_err()
         );
-        db.validate_conflicts(
-            &pending,
-            MetadataRewriteQueue::Ordinary,
-            0,
-            dir.path(),
-            Some(&admission),
-        )
-        .await
-        .unwrap();
+        assert!(
+            db.validate_conflicts(
+                &pending,
+                MetadataRewriteQueue::Ordinary,
+                0,
+                dir.path(),
+                Some(&admission),
+            )
+            .await
+            .is_err()
+        );
         assert!(
             db.validate_conflicts(
                 &wrong,
@@ -988,6 +1454,7 @@ mod tests {
         let altered_admission = ActivityAdmission {
             activity: altered,
             origin: std::sync::Arc::downgrade(&reopened.conn),
+            held: None,
         };
         assert!(
             reopened
@@ -1056,5 +1523,137 @@ mod tests {
                 .is_err()
         );
         assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_index_rejects_inconsistent_binding_and_preserves_multilink() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("media");
+        let external = dir.path().join("external");
+        std::fs::write(&path, b"preserve bytes").unwrap();
+        let held = super::HeldFile::open(dir.path(), &path).unwrap();
+        let target = held.lookup_target().unwrap();
+        let mut asset = TestAssetRecord::new("asset").checksum("source").build();
+        asset.local_path = Some(path.clone());
+        let pending = PendingMetadataRewrite {
+            asset,
+            selection_receipt: None,
+            activity_admission: None,
+            capture_repair_receipt: None,
+            source_checksum: None,
+        };
+        let binding = super::binding(&pending, MetadataRewriteQueue::Ordinary, 0).unwrap();
+        let valid = MetadataActivity {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            account_key: "a".into(),
+            provider_key: "p".into(),
+            library: pending.asset.library.to_string(),
+            binding: binding.clone(),
+        };
+        valid.validated_binding().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(super::DDL).unwrap();
+        conn.execute_batch(super::IDENTITY_INDEX_MIGRATION).unwrap();
+        conn.execute("INSERT INTO metadata_activity_prerequisite(operation_id,account_key,provider_key,library,binding,target_key,lookup_state) VALUES('one','a','p','PrimarySync',?1,?2,1)", rusqlite::params![binding,target]).unwrap();
+        assert!(super::indexed_conflict(&conn, "a", "p", "PrimarySync", &target).unwrap());
+        assert!(!super::indexed_conflict(&conn, "a", "p", "PrimarySync", "other").unwrap());
+        assert!(conn.execute("INSERT INTO metadata_activity_prerequisite(operation_id,account_key,provider_key,library,binding,target_key,lookup_state) VALUES('bad','a','p','PrimarySync',?1,?2,1)", rusqlite::params![b"{}".as_slice(),target]).is_err());
+        let mut malformed: serde_json::Value = serde_json::from_slice(&binding).unwrap();
+        malformed["version"] = serde_json::json!(3);
+        let malformed = serde_json::to_vec(&malformed).unwrap();
+        assert!(conn.execute("INSERT INTO metadata_activity_prerequisite(operation_id,account_key,provider_key,library,binding,target_key,lookup_state) VALUES('bad-version','a','p','PrimarySync',?1,?2,1)", rusqlite::params![malformed,target]).is_err());
+        std::fs::hard_link(&path, &external).unwrap();
+        let before = std::fs::metadata(&external).unwrap();
+        assert!(held.lookup_target().is_err());
+        let after = std::fs::metadata(&external).unwrap();
+        assert_eq!(
+            (before.ino(), before.mtime(), before.mtime_nsec()),
+            (after.ino(), after.mtime(), after.mtime_nsec())
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve bytes");
+        assert_eq!(std::fs::read(&external).unwrap(), b"preserve bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_competitor_preserves_original_identity_after_name_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original");
+        let moved = dir.path().join("moved");
+        let independent = dir.path().join("independent");
+        std::fs::write(&original, b"original bytes").unwrap();
+        std::fs::write(&independent, b"independent bytes").unwrap();
+        let mut a = TestAssetRecord::new("a").checksum("provider-a").build();
+        a.local_path = Some(original.clone());
+        let pending_a = PendingMetadataRewrite {
+            asset: a,
+            selection_receipt: None,
+            activity_admission: None,
+            capture_repair_receipt: None,
+            source_checksum: None,
+        };
+        let mut b = TestAssetRecord::new("b").checksum("provider-b").build();
+        b.local_path = Some(independent.clone());
+        let mut pending_b = PendingMetadataRewrite {
+            asset: b,
+            selection_receipt: None,
+            activity_admission: None,
+            capture_repair_receipt: None,
+            source_checksum: None,
+        };
+        let owner = owner();
+        let (account, provider) = owner.authenticated_keys().unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(super::DDL).unwrap();
+        conn.execute_batch(super::IDENTITY_INDEX_MIGRATION).unwrap();
+        let active = MetadataActivity {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            account_key: account.into(),
+            provider_key: provider.into(),
+            library: pending_a.asset.library.to_string(),
+            binding: super::binding(&pending_a, MetadataRewriteQueue::Ordinary, 0).unwrap(),
+        };
+        let held = Arc::new(super::HeldFile::open(dir.path(), &original).unwrap());
+        let target = held.lookup_target().unwrap();
+        conn.execute("INSERT INTO metadata_activity_prerequisite(operation_id,account_key,provider_key,library,binding,target_key,lookup_state) VALUES(?1,?2,?3,?4,?5,?6,1)", rusqlite::params![active.operation_id, active.account_key, active.provider_key, active.library, active.binding,target]).unwrap();
+        let owner_connection = Arc::new(std::sync::Mutex::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        ));
+        let origin = Arc::downgrade(&owner_connection);
+        super::register_live(&active, &origin, &held).unwrap();
+        let capability = ActivityAdmission {
+            activity: active,
+            origin: origin.clone(),
+            held: Some(Arc::clone(&held)),
+        };
+        let independent_file = super::HeldFile::open(dir.path(), &independent).unwrap();
+        super::check_live_competitors(&conn, &owner, &pending_b, &independent_file, &origin, None)
+            .unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::write(&original, b"original bytes").unwrap();
+        pending_b.asset.local_path = Some(moved.clone());
+        let moved_file = super::HeldFile::open(dir.path(), &moved).unwrap();
+        assert!(
+            super::check_live_competitors(&conn, &owner, &pending_b, &moved_file, &origin, None)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&original).unwrap(), b"original bytes");
+        assert_eq!(std::fs::read(&moved).unwrap(), b"original bytes");
+        drop(capability);
+        pending_b.asset.local_path = Some(independent.clone());
+        assert!(
+            super::check_live_competitors(
+                &conn,
+                &owner,
+                &pending_b,
+                &independent_file,
+                &origin,
+                None
+            )
+            .is_err(),
+            "lost proof is unknown, not an independent identity"
+        );
     }
 }

@@ -165,6 +165,12 @@ impl SqliteStateDb {
             }
             #[cfg(all(test,target_os="linux"))]
             crate::test_helpers::process_death_point("selection-reference-transferred");
+            // The retained manifest is changing. Its auxiliary proofs were
+            // bound to the prior complete manifest and cannot be reused.
+            tx.execute("DELETE FROM provider_transfer_waits WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child])?;
+            tx.execute("DELETE FROM provider_transfer_failures WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child])?;
+            tx.execute("DELETE FROM provider_transfer_observations WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child])?;
+            tx.execute("DELETE FROM provider_transfer_dispatch WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child])?;
             let previous=encode(&predecessor)?;
             tx.execute("UPDATE provider_active_decisions SET manifest=?4,manifest_hash=?5,attempts=0,next_retry_at=0,reason='',charged_bytes=?6 WHERE generation=?1 AND pass_key=?2 AND child=?3",params![generation,d.pass_key,d.child,previous,digest(&previous),i64::try_from(remaining_charge).map_err(|_invalid|StateError::ProviderSelectionFull)?])?;
             refresh_admission_hash(&tx,&root,&d.pass_key,&d.child)?;

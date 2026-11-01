@@ -3822,6 +3822,26 @@ async fn private_metadata_recovery_fixture(
 tokio::task_local! { static EXPLICIT_REFRESH_FAILURE: bool; }
 
 #[cfg(feature = "xmp")]
+tokio::task_local! { static EXACT_RECEIPT_PROBE: bool; }
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn exact_receipt_acknowledges_one_authenticated_alias_and_rolls_back() {
+    EXACT_RECEIPT_PROBE
+        .scope(
+            true,
+            private_metadata_recovery_fixture(
+                true,
+                false,
+                false,
+                false,
+                MetadataStateFault::AfterWrite,
+            ),
+        )
+        .await;
+}
+
+#[cfg(feature = "xmp")]
 async fn private_metadata_recovery_fixture_with_signature(
     shared: bool,
     interrupted: bool,
@@ -4008,6 +4028,68 @@ async fn private_metadata_recovery_fixture_with_signature(
                 .await
                 .unwrap()
                 .remove(0);
+        if EXACT_RECEIPT_PROBE
+            .try_with(|enabled| *enabled)
+            .unwrap_or(false)
+        {
+            use rusqlite::types::Value;
+            let conn =
+                f.db.acquire_lock("probe exact receipt with real prepared aliases")
+                    .unwrap();
+            conn.execute_batch(
+                "SAVEPOINT exact_receipt_probe; DROP TRIGGER interrupt_metadata_finish;",
+            )
+            .unwrap();
+            let snapshot = || {
+                let mut stmt = conn.prepare("SELECT generation,pass_key,child,path,verified_media,verified_metadata,prepared_checksum,prepared_size,prepared_hash,local_checksum FROM provider_active_destinations WHERE admitted=1 AND verified_media=1 ORDER BY generation,pass_key,child,path").unwrap();
+                let rows = stmt
+                    .query_map([], |row| {
+                        (0..10)
+                            .map(|i| row.get::<_, Value>(i))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                drop(stmt);
+                rows
+            };
+            let before = snapshot();
+            assert_eq!(before.len(), 2, "two genuine selected aliases must exist");
+            assert_eq!(
+                crate::state::db::provider_generations::test_finish_exact_metadata_receipt(
+                    &conn,
+                    &pending,
+                    Some(&prepared)
+                )
+                .unwrap(),
+                Some(true)
+            );
+            let after = snapshot();
+            assert_eq!(after.len(), before.len());
+            let selected = pending.selection_receipt.as_ref().unwrap();
+            let mut changed = 0;
+            for (old, new) in before.iter().zip(&after) {
+                if old != new {
+                    changed += 1;
+                    assert_eq!(old[0], Value::Text(selected.generation.clone()));
+                    assert_eq!(old[1], Value::Text(selected.pass_key.clone()));
+                    assert_eq!(old[2], Value::Text(selected.child.clone()));
+                    assert_eq!(new[5], Value::Integer(1));
+                }
+            }
+            assert_eq!(
+                changed, 1,
+                "only the authenticated exact receipt may change"
+            );
+            conn.execute_batch("ROLLBACK TO exact_receipt_probe; RELEASE exact_receipt_probe;")
+                .unwrap();
+            assert_eq!(
+                snapshot(),
+                before,
+                "probe rollback preserves both real aliases"
+            );
+        }
         let held = crate::download::file::retain_pending_file(&f.config.directory, &written_path)
             .await
             .unwrap()
@@ -9986,4 +10068,1144 @@ async fn historical_service_restart_worker() {
     )
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn selected_rating_no_write_preserves_independent_path_debt() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let server = wiremock::MockServer::start().await;
+    let media = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    Mock::given(method("GET"))
+        .and(path("/rating-path-debt"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = "copies".into();
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/rating-path-debt",server.uri()),"size":media.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))});
+    f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"] =
+        json!({"value":"debt.JPG", "type":"STRING"});
+    // Both synthetic provider observations carry the same real capture offset.
+    f.session.records.lock().unwrap()[1]["fields"]["timeZoneOffset"] =
+        json!({"value":0,"type":"INT64"});
+    let mut history = records("m", OLD, "retained-history");
+    history[1]["fields"]["timeZoneOffset"] = json!({"value":0,"type":"INT64"});
+    f.capture(history, "debt-history").await;
+    let pass = destination_pass(&f, "A");
+    crate::download::orchestration::test_support::seed_complete_album_snapshot(
+        f.db.as_ref(),
+        pass.album.container_id().unwrap(),
+        pass.album.name.as_ref(),
+        &[("asset-m", "m")],
+    )
+    .await;
+    let prime = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        std::slice::from_ref(&pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prime.stats.downloaded, 1);
+    let file = f.config.directory.join("copies/debt.JPG");
+    let bytes = std::fs::read(&file).unwrap();
+    let media_identity =
+        crate::fs_util::file_identity(&std::fs::File::open(&file).unwrap()).unwrap();
+    let media_mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+    f.config.metadata.set_exif_rating = true;
+    f.config.refresh_metadata = true;
+    let (entered, release, observation) =
+        crate::download::metadata_rewrite::test_arm_rating_commit_gate(&file);
+    let running_passes = vec![destination_pass(&f, "A")];
+    let config = Arc::new(f.config.clone());
+    let task = async move {
+        crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &running_passes,
+            config,
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+    };
+    let source_snapshot = |db: &SqliteStateDb| {
+        let conn = db
+            .acquire_lock("snapshot authenticated source receipt")
+            .unwrap();
+        let mut stmt = conn
+            .prepare("SELECT * FROM download_receipts ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                (0..r.as_ref().column_count())
+                    .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        drop(stmt);
+        rows
+    };
+    let observe = async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered.notified())
+            .await
+            .expect("real admitted producer must reach commit gate");
+        let original_pending = observation
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("actual selected pending work");
+        // The real admitted no-write owner holds the original live identity.
+        // A participating writer for this file must defer; an unrelated file
+        // remains independently eligible.
+        let same = Arc::new(std::fs::File::open(&file).unwrap());
+        assert!(crate::state::db::metadata_identity::IdentityActivity::publish(same).is_none());
+        let other_path = f.config.directory.join("independent-identity-control");
+        let other = Arc::new(std::fs::File::create(&other_path).unwrap());
+        let mut independent = crate::state::db::metadata_identity::IdentityActivity::publish(other)
+            .expect("independent file must not be held");
+        independent.test_settle();
+        drop(independent);
+        let selected: (String,String,String,String) = f.db.acquire_lock("capture exact pending selection").unwrap().query_row("SELECT generation,pass_key,child,path FROM provider_active_destinations WHERE child='asset-m' AND admitted=1 AND verified_media=1 AND verified_metadata=0", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        let operation: String =
+            f.db.acquire_lock("capture exact admitted operation")
+                .unwrap()
+                .query_row(
+                    "SELECT operation_id FROM metadata_activity_prerequisite",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        let source_before = source_snapshot(&f.db);
+        assert_eq!(source_before.len(), 1);
+        // Establish a real independent capture-repair obligation using the
+        // unchanged selected inputs and the production metadata owner.
+        let asset = &original_pending.asset;
+        let capture = crate::state::MetadataCapture {
+            shared: Arc::clone(&asset.metadata),
+            renditions: Arc::from([(
+                asset.version_size,
+                crate::state::RenditionMetadata {
+                    checksum: Some(Arc::from(asset.checksum.as_ref())),
+                    width: asset.metadata.width,
+                    height: asset.metadata.height,
+                    duration_secs: asset.metadata.duration_secs,
+                },
+            )]),
+        };
+        assert!(
+            f.db.refresh_downloaded_asset_metadata(
+                "PrimarySync",
+                "asset-m",
+                (&capture, asset.created_at, asset.added_at),
+                false,
+                true,
+                crate::state::METADATA_CAPTURE_REVISION
+            )
+            .await
+            .unwrap()
+                > 0
+        );
+        let capture_pending =
+            f.db.get_pending_metadata_rewrites_page_for_queue(
+                crate::state::db::MetadataRewriteQueue::CaptureRepair,
+                Some(&["PrimarySync"]),
+                0,
+                20,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.asset.local_path.as_deref() == Some(file.as_path()))
+            .expect("real capture-repair obligation for the selected file");
+        let offset = capture_pending
+            .asset
+            .metadata
+            .timezone_offset
+            .expect("provider capture offset must be present");
+        assert_eq!(offset, asset.metadata.timezone_offset.unwrap());
+        let payload = crate::download::filter::MetadataPayload {
+            timezone_offset: Some(offset),
+            ..Default::default()
+        };
+        let created = asset
+            .created_at
+            .with_timezone(&chrono::FixedOffset::east_opt(offset).unwrap());
+        let input_guard = crate::download::file::retain_pending_file(&f.config.directory, &file)
+            .await
+            .unwrap()
+            .unwrap();
+        input_guard.validate_blocking().unwrap();
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&input_guard.fingerprint.sha256),
+            original_pending.asset.local_checksum.as_deref().unwrap()
+        );
+        let prepared_stage = match crate::download::metadata_rewrite::test_prepare_embed_metadata(
+            &file,
+            Some(input_guard.fingerprint),
+            Arc::new(payload),
+            created,
+            crate::download::pipeline::MetadataFlags::DATETIME,
+            crate::download::metadata_rewrite::CaptureTimestampRepair::ReplaceWithCaptureLocal,
+            ".capture-debt-proof",
+        )
+        .await
+        {
+            crate::download::metadata_rewrite::TestEmbedPrepareResult::Prepared(stage) => stage,
+            _ => panic!("production preparer must produce a synthetic capture-repair stage"),
+        };
+        let output = prepared_stage.output_fingerprint();
+        let namespace = crate::fs_util::ConfinedPath::open(
+            &f.config.directory,
+            &file,
+            crate::fs_util::ConfinedParents::Existing,
+        )
+        .unwrap();
+        let (stage_path, _stage_witness) =
+            prepared_stage.retained_output_witness(&namespace).unwrap();
+        let stage_bytes = std::fs::read(&stage_path).unwrap();
+        let stage_identity =
+            crate::fs_util::file_identity(&std::fs::File::open(&stage_path).unwrap()).unwrap();
+        let stage_mtime = std::fs::metadata(&stage_path).unwrap().modified().unwrap();
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&Sha256::digest(&stage_bytes)),
+            data_encoding::HEXLOWER.encode(&output.sha256)
+        );
+        let output_checksum = data_encoding::HEXLOWER.encode(&output.sha256);
+        let prepared_receipt =
+            f.db.record_capture_repair_prepared(&capture_pending, &output_checksum, output.size)
+                .await
+                .unwrap();
+        let capture_hash = match capture_pending.capture_repair_receipt.as_ref().unwrap() {
+            crate::state::db::CaptureRepairReceipt::Pending { metadata_hash } => metadata_hash,
+            _ => panic!("capture owner must begin with a pending receipt"),
+        };
+        assert!(
+            matches!(prepared_receipt, Some(crate::state::db::CaptureRepairReceipt::Prepared { ref metadata_hash, ref output_checksum, output_size }) if metadata_hash == capture_hash && output_checksum == &data_encoding::HEXLOWER.encode(&output.sha256) && output_size == output.size)
+        );
+        // Test-only catalogue perturbation models distinct path-owned capture
+        // debt. It does not fabricate or alter the owner-created path receipt.
+        f.db.acquire_lock("model independent catalogue capture state").unwrap().execute("UPDATE assets SET capture_repair_metadata_hash=NULL,capture_repair_output_checksum=NULL,capture_repair_output_size=NULL WHERE library='PrimarySync' AND id='asset-m' AND version_size='original'",[]).unwrap();
+        let current_pending = {
+            let conn =
+                f.db.acquire_lock("revalidate exact selected pending input")
+                    .unwrap();
+            crate::state::db::provider_generations::test_metadata_receipt(
+                &conn,
+                &selected.0,
+                &selected.1,
+                &selected.2,
+                "original",
+                &selected.3,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            current_pending.selection_receipt,
+            original_pending.selection_receipt
+        );
+        assert_eq!(
+            current_pending.source_checksum,
+            original_pending.source_checksum
+        );
+        assert_eq!(
+            serde_json::to_value(&current_pending.asset).unwrap(),
+            serde_json::to_value(&original_pending.asset).unwrap(),
+            "capture setup must not alter frozen selected input"
+        );
+        f.db.record_metadata_write_failure("PrimarySync", "asset-m", "original")
+            .await
+            .unwrap();
+        // Test-only catalogue perturbation models separately retained path debt;
+        // the path marker itself was created by the real metadata owner.
+        f.db.clear_metadata_write_failure("PrimarySync", "asset-m", "original")
+            .await
+            .unwrap();
+        let snapshot = |db: &SqliteStateDb| {
+            let conn = db
+                .acquire_lock("snapshot independently retained path debt")
+                .unwrap();
+            conn.query_row("SELECT a.metadata_write_failed_at,p.metadata_write_failed_at,p.capture_repair_metadata_hash,p.capture_repair_output_checksum,p.capture_repair_output_size,p.source_checksum,p.local_checksum,p.download_checksum,a.capture_repair_metadata_hash,a.capture_repair_output_checksum,a.capture_repair_output_size FROM assets a JOIN asset_metadata_paths p ON p.library=a.library AND p.id=a.id AND p.version_size=a.version_size AND p.local_path=a.local_path WHERE a.library='PrimarySync' AND a.id='asset-m' AND a.version_size='original'",[],|r| {
+                (0..11).map(|i| r.get::<_,rusqlite::types::Value>(i)).collect::<rusqlite::Result<Vec<_>>>()
+            }).unwrap()
+        };
+        let before = snapshot(&f.db);
+        assert_eq!(before[0], rusqlite::types::Value::Null);
+        assert_ne!(before[1], rusqlite::types::Value::Null);
+        assert_ne!(before[2], rusqlite::types::Value::Null);
+        assert_eq!(
+            &before[8..11],
+            &[
+                rusqlite::types::Value::Null,
+                rusqlite::types::Value::Null,
+                rusqlite::types::Value::Null
+            ]
+        );
+        assert_eq!(before[3], rusqlite::types::Value::Text(output_checksum));
+        assert_eq!(
+            before[4],
+            rusqlite::types::Value::Integer(i64::try_from(output.size).unwrap())
+        );
+        release.notify_one();
+        (
+            snapshot,
+            before,
+            selected,
+            operation,
+            source_before,
+            prepared_stage,
+            input_guard,
+            stage_path,
+            stage_bytes,
+            stage_identity,
+            stage_mtime,
+        )
+    };
+    let (
+        result,
+        (
+            snapshot,
+            before,
+            selected,
+            operation,
+            source_before,
+            _prepared_stage,
+            input_guard,
+            stage_path,
+            stage_bytes,
+            stage_identity,
+            stage_mtime,
+        ),
+    ) = tokio::join!(task, observe);
+    let result = result.unwrap();
+    assert_eq!(result.stats.downloaded, 0);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(snapshot(&f.db), before);
+    assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    let (activity,completed):(i64,i64) = f.db.acquire_lock("verify exact selected receipt completion").unwrap().query_row("SELECT (SELECT count(*) FROM metadata_activity_prerequisite WHERE operation_id=?1),(SELECT count(*) FROM provider_active_destinations WHERE generation=?2 AND pass_key=?3 AND child=?4 AND path=?5 AND admitted=1 AND verified_media=1 AND verified_metadata=1)",rusqlite::params![operation,selected.0,selected.1,selected.2,selected.3],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(activity, 0, "the exact admitted operation must retire");
+    assert_eq!(
+        completed, 1,
+        "the same previously pending selected receipt must complete"
+    );
+    assert_eq!(source_snapshot(&f.db), source_before);
+    drop(pass);
+    let Fixture {
+        dir,
+        db,
+        capture,
+        session,
+        pass: fixture_pass,
+        config,
+    } = f;
+    drop(config);
+    drop(fixture_pass);
+    drop(capture);
+    drop(session);
+    drop(db);
+    let reopened = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+        .await
+        .unwrap();
+    assert_eq!(snapshot(&reopened), before);
+    assert_eq!(source_snapshot(&reopened), source_before);
+    assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    input_guard.validate_blocking().unwrap();
+    assert_eq!(
+        crate::fs_util::file_identity(&std::fs::File::open(&file).unwrap()).unwrap(),
+        media_identity
+    );
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().modified().unwrap(),
+        media_mtime
+    );
+    assert_eq!(std::fs::read(&stage_path).unwrap(), stage_bytes);
+    assert_eq!(
+        crate::fs_util::file_identity(&std::fs::File::open(&stage_path).unwrap()).unwrap(),
+        stage_identity
+    );
+    assert_eq!(
+        std::fs::metadata(&stage_path).unwrap().modified().unwrap(),
+        stage_mtime
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_rating_no_write_cancelled_waiter_retains_identity_until_commit() {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let server = wiremock::MockServer::start().await;
+    let media = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    Mock::given(method("GET"))
+        .and(path("/rating-cancel-owner"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = "copies".into();
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL": format!("{}/rating-cancel-owner", server.uri()),
+        "size": media.len(),
+        "fileChecksum": data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"] =
+        json!({"value":"rating-cancel.JPG", "type":"STRING"});
+    f.capture(
+        records("m", OLD, "retained-history"),
+        "rating-cancel-history",
+    )
+    .await;
+    let pass = destination_pass(&f, "A");
+    crate::download::orchestration::test_support::seed_complete_album_snapshot(
+        f.db.as_ref(),
+        pass.album.container_id().unwrap(),
+        pass.album.name.as_ref(),
+        &[("asset-m", "m")],
+    )
+    .await;
+    let prime = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        std::slice::from_ref(&pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prime.stats.downloaded, 1);
+    let file = f.config.directory.join("copies/rating-cancel.JPG");
+    let before = std::fs::read(&file).unwrap();
+    let gate = crate::state::db::rating_transaction_pause::install(&file);
+    f.config.metadata.set_exif_rating = true;
+    f.config.refresh_metadata = true;
+    let passes = vec![destination_pass(&f, "A")];
+    let config = Arc::new(f.config.clone());
+    let mut waiter = Box::pin(async move {
+        crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &passes,
+            config,
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+    });
+    tokio::select! {
+        result = &mut waiter => panic!("owner finished before the transaction gate: {result:?}"),
+        entered = tokio::time::timeout(std::time::Duration::from_secs(20), gate.entered()) => {
+            entered.expect("authenticated owner transaction must reach the pre-commit gate");
+        }
+    }
+    // Drop the actual calling future while its blocking SQLite transaction is paused.
+    drop(waiter);
+    let same = Arc::new(std::fs::File::open(&file).unwrap());
+    assert!(
+        crate::state::db::metadata_identity::IdentityActivity::publish(same).is_none(),
+        "blocking owner transaction must retain its identity after waiter cancellation"
+    );
+    let independent_path = f.config.directory.join("cancel-independent");
+    let independent = Arc::new(std::fs::File::create(independent_path).unwrap());
+    let mut lease = crate::state::db::metadata_identity::IdentityActivity::publish(independent)
+        .expect("unrelated target must remain eligible");
+    lease.test_settle();
+    drop(lease);
+    gate.release();
+    let db = Arc::clone(&f.db);
+    let committed = tokio::task::spawn_blocking(move || {
+        let conn = db
+            .acquire_lock("inspect completed selected rating transaction")
+            .unwrap();
+        let active: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM metadata_activity_prerequisite",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let pending: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-m' AND admitted=1 AND verified_media=1 AND verified_metadata=0", [], |row| row.get(0)).unwrap();
+        let verified: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-m' AND admitted=1 AND verified_media=1 AND verified_metadata=1", [], |row| row.get(0)).unwrap();
+        (active, pending, verified)
+    });
+    let (active, pending, verified) =
+        tokio::time::timeout(std::time::Duration::from_secs(20), committed)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!((active, pending), (0, 0));
+    assert!(verified >= 1);
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let same = Arc::new(std::fs::File::open(&file).unwrap());
+    let mut after = crate::state::db::metadata_identity::IdentityActivity::publish(same)
+        .expect("exact committed owner transaction must release its live identity");
+    after.test_settle();
+}
+
+#[tokio::test]
+async fn selected_rating_no_write_real_producer_completes_and_reopens() {
+    selected_rating_no_write_producer_fixture(false).await;
+}
+
+#[tokio::test]
+async fn selected_rating_no_write_retirement_failure_rolls_back_and_reopens() {
+    selected_rating_no_write_producer_fixture(true).await;
+}
+
+async fn selected_rating_no_write_producer_fixture(fail_retirement: bool) {
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let server = wiremock::MockServer::start().await;
+    let media = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    Mock::given(method("GET"))
+        .and(path("/real-rating-no-write"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = "copies".into();
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL": format!("{}/real-rating-no-write", server.uri()),
+        "size": media.len(),
+        "fileChecksum": data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"] =
+        json!({"value":"real-rating.JPG", "type":"STRING"});
+    f.capture(records("m", OLD, "retained-history"), "real-rating-history")
+        .await;
+    let pass = destination_pass(&f, "A");
+    crate::download::orchestration::test_support::seed_complete_album_snapshot(
+        f.db.as_ref(),
+        pass.album.container_id().unwrap(),
+        pass.album.name.as_ref(),
+        &[("asset-m", "m")],
+    )
+    .await;
+    let prime = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        std::slice::from_ref(&pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prime.stats.downloaded, 1);
+    let file = f.config.directory.join("copies/real-rating.JPG");
+    let before = std::fs::read(&file).unwrap();
+    assert_eq!(before, media.as_slice());
+    let checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(media));
+    if fail_retirement {
+        f.db.acquire_lock("inject selected no-write retirement failure").unwrap().execute_batch(
+            "CREATE TRIGGER fail_no_write_retire BEFORE DELETE ON metadata_activity_prerequisite BEGIN SELECT RAISE(ABORT,'synthetic no-write retirement failure'); END;"
+        ).unwrap();
+    }
+    f.config.metadata.set_exif_rating = true;
+    f.config.refresh_metadata = true;
+    let refresh = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        std::slice::from_ref(&pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refresh.stats.downloaded, 0);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+    let snapshot = |db: &SqliteStateDb| {
+        let conn = db.acquire_lock("snapshot real no-write outcome").unwrap();
+        let activity: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM metadata_activity_prerequisite",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let pending: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-m' AND admitted=1 AND verified_media=1 AND verified_metadata=0", [], |r|r.get(0)).unwrap();
+        let verified: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-m' AND admitted=1 AND verified_media=1 AND verified_metadata=1", [], |r|r.get(0)).unwrap();
+        let local: String = conn.query_row("SELECT local_checksum FROM assets WHERE library='PrimarySync' AND id='asset-m' AND version_size='original'", [], |r|r.get(0)).unwrap();
+        (activity, pending, verified, local)
+    };
+    let before_reopen = snapshot(&f.db);
+    assert_eq!(before_reopen.3, checksum);
+    if fail_retirement {
+        assert_eq!(
+            (before_reopen.0, before_reopen.1),
+            (1, 1),
+            "failed delete must roll back selected acknowledgement and preserve the admission"
+        );
+    } else {
+        assert_eq!(
+            (before_reopen.0, before_reopen.1),
+            (0, 0),
+            "accepted exact completion must retire its admission and selected debt"
+        );
+        assert!(before_reopen.2 >= 1);
+    }
+    drop(pass);
+    let Fixture {
+        dir,
+        db,
+        capture,
+        session,
+        pass: fixture_pass,
+        config,
+    } = f;
+    drop(config);
+    drop(fixture_pass);
+    drop(capture);
+    drop(session);
+    drop(db);
+    let reopened = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+        .await
+        .unwrap();
+    assert_eq!(snapshot(&reopened), before_reopen);
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+}
+
+/// Real selected rating-only work produces an owner-issued no-write admission;
+/// the capability retains the exact file opened before its activity insertion.
+#[tokio::test]
+async fn selected_rating_no_write_admission_retains_real_file_and_receipt() {
+    use crate::state::db::metadata_activity::MetadataActivityOwner;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = wiremock::MockServer::start().await;
+    let media = include_bytes!("../../../../tests/data/media/pattern.jpg");
+    Mock::given(method("GET"))
+        .and(path("/rating-no-write"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(media.as_slice()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut f = Fixture::new().await;
+    f.config.folder_structure_albums = "copies".into();
+    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+        "downloadURL": format!("{}/rating-no-write", server.uri()),
+        "size": media.len(),
+        "fileChecksum": data_encoding::BASE64.encode(&Sha256::digest(media)),
+    });
+    f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"] =
+        json!({"value":"rating.JPG", "type":"STRING"});
+    f.capture(records("m", OLD, "retained-history"), "rating-history")
+        .await;
+    let pass = destination_pass(&f, "A");
+    crate::download::orchestration::test_support::seed_complete_album_snapshot(
+        f.db.as_ref(),
+        pass.album.container_id().unwrap(),
+        pass.album.name.as_ref(),
+        &[("asset-m", "m")],
+    )
+    .await;
+    let prime = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        std::slice::from_ref(&pass),
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prime.stats.downloaded, 1);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let file = f.config.directory.join("copies/rating.JPG");
+    assert_eq!(std::fs::read(&file).unwrap(), media.as_slice());
+    let receipt_snapshot = |db: &SqliteStateDb, id: Option<&str>| {
+        let conn = db
+            .acquire_lock("snapshot synthetic compact source receipt")
+            .unwrap();
+        let mut statement = conn
+            .prepare("SELECT * FROM download_receipts WHERE (?1 IS NULL OR id=?1) ORDER BY id")
+            .unwrap();
+        let rows = statement
+            .query_map([id], |row| {
+                (0..row.as_ref().column_count())
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        drop(statement);
+        rows
+    };
+    let prime_receipts = receipt_snapshot(&f.db, None);
+    assert_eq!(prime_receipts.len(), 1);
+    let rusqlite::types::Value::Text(prime_id) = prime_receipts[0][0].clone() else {
+        panic!("synthetic compact receipt id must be text");
+    };
+    let pass_key = crate::download::orchestration::generation::pass_key(&pass);
+    let (_, scope, _) = pass.album.owned_private_scope().unwrap().unwrap();
+    let synthetic_owner = owner();
+    let (account, provider) = synthetic_owner.authenticated_keys().unwrap();
+    let checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(media));
+    let provider_checksum = data_encoding::BASE64.encode(&Sha256::digest(media));
+    let native_path = SelectionPath::from_path(&file).key().unwrap();
+    let exact_receipt: bool = f.db.acquire_lock("verify synthetic receipt binding").unwrap().query_row(
+        "SELECT EXISTS(SELECT 1 FROM download_receipts WHERE id=?1 AND account_key=?2 AND provider_key=?3 AND scope=?4 AND library='PrimarySync' AND child='asset-m' AND master='m' AND state_id='asset-m' AND origin_pass=?5 AND version_size='original' AND provider_checksum=?6 AND provider_size=?7 AND native_path=?8 AND source_checksum=?9 AND local_checksum=?9 AND length(proof_hash)=64)",
+        rusqlite::params![prime_id, account, provider, scope, pass_key, provider_checksum, media.len() as i64, native_path, checksum], |row| row.get(0),
+    ).unwrap();
+    assert!(exact_receipt);
+    let verified_paths =
+        f.db.verified_selection_paths(
+            owner(),
+            scope,
+            pass_key.clone(),
+            "asset-m".to_owned(),
+            "m".to_owned(),
+            "original".to_owned(),
+            (provider_checksum, media.len() as u64),
+        )
+        .await
+        .unwrap();
+    assert!(verified_paths.contains(&SelectionPath::from_path(&file)));
+
+    f.config.metadata.set_exif_rating = true;
+    f.config.refresh_metadata = true;
+    assert_eq!(
+        crate::download::metadata_rewrite::MetadataFlags::from(&f.config.metadata).bits(),
+        2
+    );
+    let (entered, release, observation) =
+        crate::download::metadata_rewrite::test_arm_selected_rating_gate(&file);
+    let running_passes = vec![destination_pass(&f, "A")];
+    let running_config = Arc::new(f.config.clone());
+    let task = async move {
+        crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &running_passes,
+            running_config,
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+    };
+    let observe = async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered.notified())
+            .await
+            .expect("the real selected rating writer must reach the gate");
+        let observed = observation
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("selected writer observation");
+        let pending = observed.0;
+        assert_eq!(pending.asset.local_path.as_deref(), Some(file.as_path()));
+        assert_eq!(observed.1, crate::state::db::MetadataRewriteQueue::Ordinary);
+        assert_eq!(observed.2, 2);
+        let receipt = pending.selection_receipt.as_ref().unwrap();
+        let generation = receipt.generation.clone();
+        let selected_path = SelectionPath::from_path(&file).key().unwrap();
+        let (debt, retry_at, now): (i64, Option<i64>, i64) = f.db.acquire_lock("read exact selected rating debt").unwrap().query_row(
+            "SELECT COUNT(*), min(d.next_retry_at), unixepoch() FROM provider_active_destinations w JOIN provider_active_decisions d ON d.generation=w.generation AND d.pass_key=w.pass_key AND d.child=w.child WHERE w.generation=?1 AND w.pass_key=?2 AND w.child='asset-m' AND w.path=?3 AND w.admitted=1 AND w.verified_media=1 AND w.verified_metadata=0",
+            rusqlite::params![generation, pass_key, selected_path], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(debt, 1);
+        let due =
+            f.db.pending_selection_metadata(owner(), generation.clone(), 250)
+                .await
+                .unwrap();
+        eprintln!(
+            "synthetic selected due rows={}, retry_at={retry_at:?}, now={now}",
+            due.len()
+        );
+        assert_eq!(receipt.generation, generation);
+        assert_eq!(receipt.pass_key, pass_key);
+        assert_eq!(receipt.child, "asset-m");
+        assert_eq!(receipt.metadata_flags, 2);
+        assert!(receipt.frozen_metadata_hash.is_some());
+        assert!(receipt.prepared.is_none());
+        let specification: Vec<u8> =
+            f.db.acquire_lock("read explicit selected profile")
+                .unwrap()
+                .query_row(
+                    "SELECT specification FROM provider_active_generations WHERE id=?1",
+                    [&generation],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        let specification: serde_json::Value = serde_json::from_slice(&specification).unwrap();
+        assert_eq!(
+            specification.pointer("/profile/explicit_metadata_refresh"),
+            Some(&json!(1))
+        );
+        assert!(pending.asset.metadata.rating.is_none());
+        assert!(!pending.asset.metadata.is_favorite);
+        assert_eq!(pending.source_checksum.as_deref(), Some(checksum.as_str()));
+        assert_eq!(
+            pending.asset.local_checksum.as_deref(),
+            Some(checksum.as_str())
+        );
+        assert!(
+            f.db.admit_selected_rating_no_write(
+                &pending,
+                &f.config.directory,
+                0,
+                crate::state::db::MetadataRewriteQueue::Ordinary,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            f.db.admit_selected_rating_no_write(
+                &pending,
+                &f.config.directory,
+                1,
+                crate::state::db::MetadataRewriteQueue::Ordinary,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            f.db.admit_selected_rating_no_write(
+                &pending,
+                &f.config.directory,
+                2,
+                crate::state::db::MetadataRewriteQueue::CaptureRepair,
+            )
+            .await
+            .is_err()
+        );
+        let mut wrong = pending.clone();
+        Arc::make_mut(&mut wrong.asset.metadata).rating = Some(4);
+        assert!(
+            f.db.admit_selected_rating_no_write(
+                &wrong,
+                &f.config.directory,
+                2,
+                crate::state::db::MetadataRewriteQueue::Ordinary
+            )
+            .await
+            .is_err()
+        );
+        let mut wrong = pending.clone();
+        Arc::make_mut(&mut wrong.asset.metadata).is_favorite = true;
+        assert!(
+            f.db.admit_selected_rating_no_write(
+                &wrong,
+                &f.config.directory,
+                2,
+                crate::state::db::MetadataRewriteQueue::Ordinary
+            )
+            .await
+            .is_err()
+        );
+        let mut wrong = pending.clone();
+        wrong.selection_receipt.as_mut().unwrap().metadata_flags = 3;
+        assert!(
+            f.db.admit_selected_rating_no_write(
+                &wrong,
+                &f.config.directory,
+                2,
+                crate::state::db::MetadataRewriteQueue::Ordinary
+            )
+            .await
+            .is_err()
+        );
+        let mut wrong = pending.clone();
+        wrong.selection_receipt.as_mut().unwrap().prepared =
+            Some((checksum.clone(), media.len() as u64));
+        assert!(
+            f.db.admit_selected_rating_no_write(
+                &wrong,
+                &f.config.directory,
+                2,
+                crate::state::db::MetadataRewriteQueue::Ordinary
+            )
+            .await
+            .is_err()
+        );
+        let foreign_db = SqliteStateDb::open_owned(&f.dir.path().join("foreign.db"), &owner())
+            .await
+            .unwrap();
+        assert!(
+            foreign_db
+                .admit_selected_rating_no_write(
+                    &pending,
+                    &f.config.directory,
+                    2,
+                    crate::state::db::MetadataRewriteQueue::Ordinary
+                )
+                .await
+                .is_err()
+        );
+        f.db.acquire_lock("inject admission rollback").unwrap().execute_batch(
+        "CREATE TRIGGER fail_rating_admission BEFORE INSERT ON metadata_activity_prerequisite BEGIN SELECT RAISE(ABORT, 'synthetic admission failure'); END;"
+    ).unwrap();
+        assert!(
+            f.db.admit_selected_rating_no_write(
+                &pending,
+                &f.config.directory,
+                2,
+                crate::state::db::MetadataRewriteQueue::Ordinary
+            )
+            .await
+            .is_err()
+        );
+        let before: i64 =
+            f.db.acquire_lock("verify failed admission rollback")
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM metadata_activity_prerequisite",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_eq!(before, 0);
+        f.db.acquire_lock("remove synthetic admission failure")
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_rating_admission")
+            .unwrap();
+        let proof =
+            f.db.admit_selected_rating_no_write(
+                &pending,
+                &f.config.directory,
+                2,
+                crate::state::db::MetadataRewriteQueue::Ordinary,
+            )
+            .await
+            .unwrap();
+        proof.test_validate_file().unwrap();
+        let queue = crate::state::db::MetadataRewriteQueue::Ordinary;
+        assert!(
+            f.db.validate_conflicts(&pending, queue, 2, &f.config.directory, None)
+                .await
+                .is_err()
+        );
+        f.db.validate_conflicts(
+            &pending,
+            queue,
+            2,
+            &f.config.directory,
+            Some(proof.test_admission()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            f.db.validate_conflicts(
+                &pending,
+                queue,
+                3,
+                &f.config.directory,
+                Some(proof.test_admission())
+            )
+            .await
+            .is_err()
+        );
+        // A same-byte path substitution must not validate the held proof.
+        let retained = f.config.directory.join("continuation-original.JPG");
+        let displaced = f.config.directory.join("continuation-substitute.JPG");
+        std::fs::rename(&file, &retained).unwrap();
+        std::fs::write(&file, media).unwrap();
+        assert!(
+            f.db.validate_conflicts(
+                &pending,
+                queue,
+                2,
+                &f.config.directory,
+                Some(proof.test_admission())
+            )
+            .await
+            .is_err()
+        );
+        std::fs::rename(&file, &displaced).unwrap();
+        std::fs::rename(&retained, &file).unwrap();
+        assert_eq!(std::fs::read(&displaced).unwrap(), media.as_slice());
+        f.db.validate_conflicts(
+            &pending,
+            queue,
+            2,
+            &f.config.directory,
+            Some(proof.test_admission()),
+        )
+        .await
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let external = f.config.directory.join("continuation-external.JPG");
+            std::fs::hard_link(&file, &external).unwrap();
+            let before = std::fs::metadata(&external).unwrap();
+            assert!(
+                f.db.validate_conflicts(
+                    &pending,
+                    queue,
+                    2,
+                    &f.config.directory,
+                    Some(proof.test_admission())
+                )
+                .await
+                .is_err()
+            );
+            let after = std::fs::metadata(&external).unwrap();
+            assert_eq!(
+                (before.ino(), before.mtime(), before.mtime_nsec()),
+                (after.ino(), after.mtime(), after.mtime_nsec())
+            );
+            assert_eq!(std::fs::read(&external).unwrap(), media.as_slice());
+        }
+        let evidence: i64 =
+            f.db.acquire_lock("read synthetic exact activity")
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM metadata_activity_prerequisite WHERE operation_id=?1",
+                    [proof.test_operation_id()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_eq!(evidence, 1);
+        let existing =
+            f.db.admit_activity(
+                &pending,
+                crate::state::db::MetadataRewriteQueue::Ordinary,
+                2,
+            )
+            .await
+            .unwrap();
+        let existing_id = existing.test_operation_id().to_owned();
+        assert!(
+            f.db.validate_conflicts(
+                &pending,
+                queue,
+                2,
+                &f.config.directory,
+                Some(proof.test_admission())
+            )
+            .await
+            .is_err()
+        );
+        let mut already_admitted = pending.clone();
+        already_admitted.activity_admission = Some(Arc::new(existing));
+        assert!(
+            f.db.admit_selected_rating_no_write(
+                &already_admitted,
+                &f.config.directory,
+                2,
+                crate::state::db::MetadataRewriteQueue::Ordinary
+            )
+            .await
+            .is_err()
+        );
+        let moved = f.config.directory.join("held-original.JPG");
+        let foreign = f.config.directory.join("same-bytes-replacement.JPG");
+        std::fs::rename(&file, &moved).unwrap();
+        std::fs::write(&file, media).unwrap();
+        assert!(proof.test_validate_file().is_err());
+        assert_eq!(std::fs::read(&moved).unwrap(), media.as_slice());
+        assert_eq!(std::fs::read(&file).unwrap(), media.as_slice());
+        std::fs::rename(&file, &foreign).unwrap();
+        std::fs::rename(&moved, &file).unwrap();
+        proof.test_validate_file().unwrap();
+        release.notify_one();
+        (proof, generation, foreign, existing_id)
+    };
+    let (refresh, (proof, generation, foreign, existing_id)) = tokio::join!(task, observe);
+    let refresh = refresh.expect("explicit refresh reports its outcome");
+    assert_eq!(refresh.stats.downloaded, 0);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(receipt_snapshot(&f.db, Some(&prime_id)), prime_receipts);
+    assert_eq!(std::fs::read(&file).unwrap(), media.as_slice());
+    assert_eq!(std::fs::read(&foreign).unwrap(), media.as_slice());
+    let selected_path = SelectionPath::from_path(&file).key().unwrap();
+    let debt: i64 = f.db.acquire_lock("selected no-write remains pending").unwrap().query_row(
+        "SELECT COUNT(*) FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child='asset-m' AND path=?3 AND admitted=1 AND verified_media=1 AND verified_metadata=0",
+        rusqlite::params![generation, pass_key, selected_path], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(debt, 1);
+    let activity_snapshot = |db: &SqliteStateDb| {
+        let conn = db
+            .acquire_lock("snapshot exact synthetic activities")
+            .unwrap();
+        let mut statement = conn.prepare("SELECT operation_id,account_key,provider_key,library,binding FROM metadata_activity_prerequisite ORDER BY operation_id").unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                (0..5)
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        drop(statement);
+        rows
+    };
+    let prepared_snapshot = |db: &SqliteStateDb| {
+        let conn = db
+            .acquire_lock("snapshot synthetic prepared activities")
+            .unwrap();
+        let mut statement = conn.prepare("SELECT operation_id,binding FROM metadata_activity_prepared_prerequisite ORDER BY operation_id").unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        drop(statement);
+        rows
+    };
+    let prepared_before = prepared_snapshot(&f.db);
+    assert!(prepared_before.is_empty());
+    let activities_before = activity_snapshot(&f.db);
+    assert_eq!(activities_before.len(), 2);
+    let proof_id = proof.test_operation_id().to_owned();
+    for id in [&proof_id, &existing_id] {
+        assert!(
+            activities_before
+                .iter()
+                .any(|row| row.first() == Some(&rusqlite::types::Value::Text(id.clone())))
+        );
+    }
+    drop(proof);
+    drop(pass);
+    let Fixture {
+        dir,
+        db,
+        capture,
+        session,
+        pass: fixture_pass,
+        config,
+    } = f;
+    drop(config);
+    drop(fixture_pass);
+    drop(capture);
+    drop(session);
+    drop(db);
+    let reopened = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+        .await
+        .unwrap();
+    let debt: i64 = reopened.acquire_lock("reopened selected no-write debt").unwrap().query_row(
+        "SELECT COUNT(*) FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child='asset-m' AND path=?3 AND admitted=1 AND verified_media=1 AND verified_metadata=0",
+        rusqlite::params![generation, pass_key, selected_path], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(debt, 1);
+    let activity: i64 = reopened
+        .acquire_lock("reopened selected activity")
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM metadata_activity_prerequisite",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        activity, 2,
+        "both real synthetic admissions survive capability loss"
+    );
+    assert_eq!(activity_snapshot(&reopened), activities_before);
+    assert_eq!(prepared_snapshot(&reopened), prepared_before);
+    assert_eq!(receipt_snapshot(&reopened, Some(&prime_id)), prime_receipts);
+    assert_eq!(std::fs::read(&file).unwrap(), media.as_slice());
 }

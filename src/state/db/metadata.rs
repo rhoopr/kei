@@ -1,5 +1,117 @@
 //! Metadata capture revisions, path-specific rewrite debt, and repair receipts.
 
+/// Non-cloneable authority created only in this owner module after commit.
+pub(super) struct CommittedLease {
+    binding: super::metadata_identity::LeaseBinding,
+    operation: String,
+}
+
+impl CommittedLease {
+    pub(super) fn matches(
+        self,
+        binding: super::metadata_identity::LeaseBinding,
+        operation: &str,
+    ) -> bool {
+        self.operation == operation && self.binding == binding
+    }
+}
+
+#[cfg(test)]
+mod committed_lease_tests {
+    use super::CommittedLease;
+    use crate::state::db::metadata_identity::IdentityActivity;
+    use std::sync::Arc;
+
+    #[test]
+    fn owner_seal_rejects_other_lease_and_other_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(std::fs::File::create(dir.path().join("seal-a")).unwrap());
+        let b = Arc::new(std::fs::File::create(dir.path().join("seal-b")).unwrap());
+        let mut first = IdentityActivity::observe(a).unwrap();
+        let mut second = IdentityActivity::observe(b).unwrap();
+        let seal = CommittedLease {
+            binding: first.commit_binding().unwrap(),
+            operation: "operation-a".into(),
+        };
+        assert!(!second.settled_with(seal, "operation-a"));
+        let seal = CommittedLease {
+            binding: first.commit_binding().unwrap(),
+            operation: "operation-a".into(),
+        };
+        assert!(!first.settled_with(seal, "operation-b"));
+        let seal = CommittedLease {
+            binding: first.commit_binding().unwrap(),
+            operation: "operation-a".into(),
+        };
+        assert!(first.settled_with(seal, "operation-a"));
+        second.test_settle();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod rating_transaction_pause {
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::{Arc, Condvar, Mutex, OnceLock},
+    };
+    struct Gate {
+        entered: tokio::sync::Notify,
+        release: Mutex<bool>,
+        changed: Condvar,
+    }
+    static GATES: OnceLock<Mutex<HashMap<PathBuf, Arc<Gate>>>> = OnceLock::new();
+    pub(crate) struct Pause(Arc<Gate>);
+    impl Pause {
+        pub(crate) async fn entered(&self) {
+            self.0.entered.notified().await;
+        }
+        pub(crate) fn release(&self) {
+            *self.0.release.lock().unwrap() = true;
+            self.0.changed.notify_all();
+        }
+    }
+    impl Drop for Pause {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+    pub(crate) fn install(path: &Path) -> Pause {
+        let gate = Arc::new(Gate {
+            entered: tokio::sync::Notify::new(),
+            release: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        GATES
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), Arc::clone(&gate));
+        Pause(gate)
+    }
+    pub(super) fn wait(path: &Path) {
+        let gate = GATES
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap()
+            .remove(path);
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            let released = gate.release.lock().unwrap();
+            let (_released, timeout) = gate
+                .changed
+                .wait_timeout_while(released, std::time::Duration::from_secs(30), |released| {
+                    !*released
+                })
+                .unwrap();
+            assert!(
+                !timeout.timed_out(),
+                "synthetic rating transaction gate must be released"
+            );
+        }
+    }
+}
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -992,6 +1104,50 @@ impl SqliteStateDb {
         completion: MetadataRewriteCompletion,
         validate_file: Option<Box<dyn FnOnce() -> Result<(), StateError> + Send>>,
     ) -> Result<bool, StateError> {
+        self.finish_metadata_rewrite_guarded(
+            pending,
+            selected_queue,
+            local_checksum,
+            pre_rewrite_checksum,
+            completion,
+            validate_file,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn finish_rating_no_write_guarded(
+        &self,
+        pending: &PendingMetadataRewrite,
+        guard: super::metadata_activity::RatingNoWriteGuard,
+    ) -> Result<bool, StateError> {
+        let checksum = pending
+            .asset
+            .local_checksum
+            .as_deref()
+            .ok_or(StateError::ProviderWorkConflict)?;
+        self.finish_metadata_rewrite_guarded(
+            pending,
+            MetadataRewriteQueue::Ordinary,
+            Some(checksum),
+            None,
+            MetadataRewriteCompletion::Ordinary,
+            None,
+            Some(guard),
+        )
+        .await
+    }
+
+    async fn finish_metadata_rewrite_guarded(
+        &self,
+        pending: &PendingMetadataRewrite,
+        selected_queue: MetadataRewriteQueue,
+        local_checksum: Option<&str>,
+        pre_rewrite_checksum: Option<&str>,
+        completion: MetadataRewriteCompletion,
+        validate_file: Option<Box<dyn FnOnce() -> Result<(), StateError> + Send>>,
+        rating_guard: Option<super::metadata_activity::RatingNoWriteGuard>,
+    ) -> Result<bool, StateError> {
         let metadata_hash = pending
             .asset
             .metadata
@@ -1066,7 +1222,10 @@ impl SqliteStateDb {
         let capture_metadata_hash = capture_metadata_hash.map(str::to_owned);
         let capture_output_checksum = capture_output_checksum.map(str::to_owned);
         let selected_capture = i64::from(selected_queue == MetadataRewriteQueue::CaptureRepair);
-        let clear_ordinary = i64::from(completion.clears(MetadataRewriteQueue::Ordinary));
+        // A catalogue retry marker is not scoped to this frozen rating-only
+        // selection; preserve it in case it represents independent work.
+        let clear_ordinary =
+            i64::from(rating_guard.is_none() && completion.clears(MetadataRewriteQueue::Ordinary));
         let clear_capture = i64::from(completion.clears(MetadataRewriteQueue::CaptureRepair));
         let Some(path) = pending.asset.local_path.clone() else {
             return Ok(false);
@@ -1079,8 +1238,16 @@ impl SqliteStateDb {
             if let Some(validate_file) = validate_file {
                 validate_file()?;
             }
+            if let Some(guard) = &rating_guard {
+                guard.validate(&tx, &selection_pending)?;
+            }
             let target = metadata_rewrite_target(&tx, &library, &asset_id, &version_size, &path)?;
-            let updated = if let Some(target) = target {
+            // A rating-only no-write selection does not own the unscoped
+            // catalogue or path retry markers. Only its exact selected receipt
+            // is acknowledged; independent local metadata debt stays intact.
+            let updated = if rating_guard.is_some() {
+                0
+            } else if let Some(target) = target {
                 let (table, evidence) = target.sql();
                 let updated = tx
                     .execute(
@@ -1142,14 +1309,36 @@ impl SqliteStateDb {
             } else {
                 0
             };
-            let selected = super::provider_generations::finish_metadata_receipt(
-                &tx,
-                &selection_pending,
-                local_checksum.as_deref(),
-                completion.clears(MetadataRewriteQueue::Ordinary),
-            )?;
+            let selected = if rating_guard.is_some() {
+                super::provider_generations::finish_exact_metadata_receipt(
+                    &tx,
+                    &selection_pending,
+                    local_checksum.as_deref(),
+                    completion.clears(MetadataRewriteQueue::Ordinary),
+                )?
+            } else {
+                super::provider_generations::finish_metadata_receipt(
+                    &tx,
+                    &selection_pending,
+                    local_checksum.as_deref(),
+                    completion.clears(MetadataRewriteQueue::Ordinary),
+                )?
+            };
+            if let Some(guard) = &rating_guard {
+                if selected != Some(true) {
+                    return Err(StateError::ProviderWorkConflict);
+                }
+                guard.retire(&tx)?;
+                #[cfg(test)]
+                rating_transaction_pause::wait(&path);
+            }
             tx.commit()
                 .map_err(|e| StateError::query("finish_metadata_rewrite::commit", e))?;
+            if let Some(guard) = &rating_guard {
+                let (binding, operation) = guard.committed_binding()?;
+                let seal = CommittedLease { binding, operation };
+                guard.committed(seal)?;
+            }
             Ok(selected.unwrap_or(updated > 0 && completion.clears(selected_queue)))
         })
         .await

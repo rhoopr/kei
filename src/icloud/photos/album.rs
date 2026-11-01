@@ -593,6 +593,27 @@ impl PhotoAlbum {
             sync_token,
             Some(Arc::clone(&observed)),
             collection_independent,
+            None,
+        );
+        (stream, token, observed)
+    }
+
+    pub(crate) fn changes_stream_observed_with_stage(
+        &self,
+        sync_token: &str,
+        collection_independent: bool,
+        stage: super::source_causality::ZoneStage,
+    ) -> (
+        ChangeStream,
+        tokio::sync::oneshot::Receiver<String>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (stream, token) = self.stream_changes(
+            sync_token,
+            Some(Arc::clone(&observed)),
+            collection_independent,
+            Some(stage),
         );
         (stream, token, observed)
     }
@@ -603,7 +624,7 @@ impl PhotoAlbum {
         &self,
         sync_token: &str,
     ) -> (ChangeStream, tokio::sync::oneshot::Receiver<String>) {
-        self.stream_changes(sync_token, None, false)
+        self.stream_changes(sync_token, None, false, None)
     }
 }
 

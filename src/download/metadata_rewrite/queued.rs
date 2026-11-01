@@ -19,6 +19,103 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+type SelectedRatingObservation = (
+    crate::state::db::PendingMetadataRewrite,
+    MetadataRewriteQueue,
+    u8,
+);
+#[cfg(test)]
+type SelectedRatingGate = (
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+    Arc<std::sync::Mutex<Option<SelectedRatingObservation>>>,
+);
+#[cfg(test)]
+static TEST_SELECTED_RATING_GATE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<PathBuf, SelectedRatingGate>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn test_arm_selected_rating_gate(path: &std::path::Path) -> SelectedRatingGate {
+    let gate = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(std::sync::Mutex::new(None)),
+    );
+    TEST_SELECTED_RATING_GATE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(path.to_owned(), gate.clone());
+    gate
+}
+
+#[cfg(test)]
+async fn test_selected_rating_gate(
+    path: &std::path::Path,
+    pending: &crate::state::db::PendingMetadataRewrite,
+    queue: MetadataRewriteQueue,
+    flags: MetadataFlags,
+) -> bool {
+    if pending.selection_receipt.is_none() {
+        return false;
+    }
+    if queue != MetadataRewriteQueue::Ordinary || flags.bits() != 2 {
+        return false;
+    }
+    let gate = TEST_SELECTED_RATING_GATE
+        .get()
+        .and_then(|gates| gates.lock().unwrap().remove(path));
+    if let Some((entered, release, observation)) = gate {
+        *observation.lock().unwrap() = Some((pending.clone(), queue, flags.bits()));
+        entered.notify_one();
+        release.notified().await;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+type RatingCommitGate = (
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+    Arc<std::sync::Mutex<Option<crate::state::db::PendingMetadataRewrite>>>,
+);
+#[cfg(test)]
+static TEST_RATING_COMMIT_GATE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<PathBuf, RatingCommitGate>>,
+> = std::sync::OnceLock::new();
+#[cfg(test)]
+pub(crate) fn test_arm_rating_commit_gate(path: &std::path::Path) -> RatingCommitGate {
+    let gate = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(std::sync::Mutex::new(None)),
+    );
+    TEST_RATING_COMMIT_GATE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(path.to_owned(), gate.clone());
+    gate
+}
+#[cfg(test)]
+async fn test_rating_commit_gate(
+    path: &std::path::Path,
+    pending: &crate::state::db::PendingMetadataRewrite,
+) {
+    let gate = TEST_RATING_COMMIT_GATE
+        .get()
+        .and_then(|gates| gates.lock().unwrap().remove(path));
+    if let Some((entered, release, observation)) = gate {
+        *observation.lock().unwrap() = Some(pending.clone());
+        entered.notify_one();
+        release.notified().await;
+    }
+}
+
 #[cfg(all(test, feature = "xmp"))]
 static TEST_AFTER_ACTIVITY_STOPS: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
     std::sync::OnceLock::new();
@@ -468,6 +565,7 @@ where
     let mut errored = 0usize;
     let mut deferred = 0usize;
     let mut retired_from_selected_queue = 0usize;
+    let current_run_metadata_flags = metadata_flags;
     for (idx, pending_rewrite) in pending.into_iter().enumerate() {
         let record = &pending_rewrite.asset;
         let metadata_flags = if let Some(receipt) = &pending_rewrite.selection_receipt {
@@ -574,6 +672,14 @@ where
             deferred += 1;
             continue;
         }
+        #[cfg(test)]
+        if test_selected_rating_gate(&path, &pending_rewrite, selected_queue, metadata_flags).await
+        {
+            // Keep this real selected operation pending after the test's
+            // observation; the test may have inserted activity evidence.
+            deferred += 1;
+            continue;
+        }
 
         if let Err(error) = async {
             let retained = namespace
@@ -588,6 +694,64 @@ where
                 "Could not recover metadata replacement; leaving marker for retry");
             errored += 1;
             continue;
+        }
+        // A selected rating-only request with no rating has no metadata
+        // output. The authenticated owner binds the real current run options,
+        // retained file and exact selected work before acknowledging it.
+        if selected_queue == MetadataRewriteQueue::Ordinary
+            && metadata_flags == MetadataFlags::RATING
+            && pending_rewrite
+                .selection_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.prepared.is_none())
+            && pending_rewrite.capture_repair_receipt.is_none()
+            && pending_rewrite.asset.metadata.rating.is_none()
+            && !pending_rewrite.asset.metadata.is_favorite
+            && let Some(owner) = db.metadata_activity_owner()
+        {
+            match owner.is_explicit_rating_refresh(&pending_rewrite).await {
+                Ok(true) => {
+                    match owner
+                        .admit_selected_rating_no_write(
+                            &pending_rewrite,
+                            activity_root,
+                            current_run_metadata_flags.bits(),
+                            selected_queue,
+                        )
+                        .await
+                    {
+                        Ok(proof) => {
+                            #[cfg(test)]
+                            test_rating_commit_gate(&path, &pending_rewrite).await;
+                            match owner
+                                .finish_selected_rating_no_write(
+                                    &pending_rewrite,
+                                    &proof,
+                                    current_run_metadata_flags.bits(),
+                                )
+                                .await
+                            {
+                                Ok(true) => {
+                                    applied += 1;
+                                    retired_from_selected_queue += 1;
+                                }
+                                Ok(false) | Err(_) => {
+                                    deferred += 1;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            deferred += 1;
+                        }
+                    }
+                    continue;
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    deferred += 1;
+                    continue;
+                }
+            }
         }
         // tokio::fs defers the stat to the blocking pool; raw
         // std::Path::exists() would block the async runtime thread.
