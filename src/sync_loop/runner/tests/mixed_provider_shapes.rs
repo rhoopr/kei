@@ -56,6 +56,11 @@ struct Provider {
     quiet: bool,
     requests: Arc<AtomicUsize>,
     hydrations: Arc<AtomicUsize>,
+    invalid_token_hits: Arc<AtomicUsize>,
+    incomplete_query_hits: Arc<AtomicUsize>,
+    partial_query_hits: Arc<AtomicUsize>,
+    page_cursor_hits: Arc<AtomicUsize>,
+    empty_page_hits: Arc<AtomicUsize>,
 }
 impl Provider {
     fn pages(&self) -> Vec<Vec<Value>> {
@@ -89,10 +94,26 @@ impl PhotosSession for Provider {
         let count = self.requests.fetch_add(1, Ordering::SeqCst);
         assert!(count < 300, "bounded provider work per history");
         let request: Value = serde_json::from_str(&body)?;
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(
+                json!({"records":[{"recordName":"index","fields":{"state":{"value":"FINISHED"}}}]}),
+            );
+        }
         if url.contains("/changes/zone?") {
             assert_eq!(request["zones"][0]["zoneID"]["zoneName"], self.zone);
             let cursor = request["zones"][0]["syncToken"].as_str();
-            let inventory = cursor.is_none() || cursor.is_some_and(|s| s.starts_with("page-"));
+            if self.incomplete && cursor == Some("before") {
+                self.invalid_token_hits.fetch_add(1, Ordering::SeqCst);
+                return Ok(
+                    json!({"zones":[{"zoneID":{"zoneName":self.zone,"ownerRecordName":"_defaultOwner"},"serverErrorCode":"BAD_REQUEST"}]}),
+                );
+            }
+            let inventory = cursor.is_none()
+                || cursor == Some("before")
+                || cursor.is_some_and(|s| s.starts_with("page-"));
+            if cursor.is_some_and(|s| s.starts_with("page-")) {
+                self.page_cursor_hits.fetch_add(1, Ordering::SeqCst);
+            }
             let pages = self.pages();
             let index = cursor
                 .and_then(|s| s.strip_prefix("page-"))
@@ -103,6 +124,9 @@ impl PhotosSession for Provider {
             } else {
                 Vec::new()
             };
+            if inventory && records.is_empty() && !final_page {
+                self.empty_page_hits.fetch_add(1, Ordering::SeqCst);
+            }
             let token = if final_page {
                 "after".to_string()
             } else {
@@ -120,7 +144,13 @@ impl PhotosSession for Provider {
             return Ok(response);
         }
         if url.contains("/records/query/batch?") {
-            return Ok(album_count_response((self.query_records.len() / 2) as u64));
+            // An underreported count is only a planning hint. Zero schedules
+            // a single tail fetcher that must prove the stream ending.
+            return Ok(album_count_response(if self.incomplete {
+                0
+            } else {
+                (self.query_records.len() / 2) as u64
+            }));
         }
         if url.contains("/records/query?") {
             let offset = request["query"]["filterBy"]
@@ -129,7 +159,29 @@ impl PhotosSession for Provider {
                 .flatten()
                 .find(|f| f["fieldName"] == "startRank")
                 .and_then(|f| f["fieldValue"]["value"].as_u64())
-                .unwrap_or(0);
+                .expect("rank queries must carry an explicit startRank");
+            if self.incomplete {
+                if offset == 0 {
+                    assert_eq!(self.query_records[0]["recordType"], "CPLMaster");
+                    assert_eq!(self.query_records[1]["recordType"], "CPLAsset");
+                    let master = self.query_records[0]["recordName"].as_str().unwrap();
+                    let child = self.query_records[1]["recordName"].as_str().unwrap();
+                    assert!(matches!(
+                        (master, child),
+                        ("legacy-master", "current-a") | ("owned-master", "asset-owned-master")
+                    ));
+                    self.partial_query_hits.fetch_add(1, Ordering::SeqCst);
+                    return Ok(
+                        json!({"records": self.query_records[..2].to_vec(), "syncToken":"after"}),
+                    );
+                }
+                assert_eq!(
+                    offset, 1,
+                    "the single fetcher must consume the prefix before its failure"
+                );
+                self.incomplete_query_hits.fetch_add(1, Ordering::SeqCst);
+                return Ok(json!({"records":"injected incomplete rank page"}));
+            }
             return Ok(
                 json!({"records":if offset == 0 {self.query_records.clone()} else {Vec::new()},"syncToken":"after"}),
             );
@@ -492,6 +544,11 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
     );
     let requests: Vec<_> = (0..2).map(|_| Arc::new(AtomicUsize::new(0))).collect();
     let hydrations: Vec<_> = (0..2).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+    let invalid_token_hits = Arc::new(AtomicUsize::new(0));
+    let incomplete_query_hits = Arc::new(AtomicUsize::new(0));
+    let partial_query_hits = Arc::new(AtomicUsize::new(0));
+    let page_cursor_hits = Arc::new(AtomicUsize::new(0));
+    let empty_page_hits = Arc::new(AtomicUsize::new(0));
     let (_session_dir, session) = make_shared_session_for_run_cycle().await;
     let mut outputs = Vec::new();
     let mut stable_files = None;
@@ -499,6 +556,9 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
     let mut stable_hydrations = 0;
     let mut child_paths = BTreeMap::new();
     for cycle in 0..CYCLES {
+        let token_hits_before = invalid_token_hits.load(Ordering::SeqCst);
+        let query_hits_before = incomplete_query_hits.load(Ordering::SeqCst);
+        let partial_hits_before = partial_query_hits.load(Ordering::SeqCst);
         eprintln!("{replay:?} cycle={cycle}/{CYCLES}");
         if cycle == 2 {
             // Model the scheduled recovery becoming eligible without waiting
@@ -542,6 +602,11 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
                     quiet: cycle >= 4,
                     requests: requests[zone].clone(),
                     hydrations: hydrations[zone].clone(),
+                    invalid_token_hits: invalid_token_hits.clone(),
+                    incomplete_query_hits: incomplete_query_hits.clone(),
+                    partial_query_hits: partial_query_hits.clone(),
+                    page_cursor_hits: page_cursor_hits.clone(),
+                    empty_page_hits: empty_page_hits.clone(),
                 };
                 let labels: &[&str] = if matches!(replay.history, History::SelectionChange) {
                     match cycle {
@@ -629,6 +694,24 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
             .await
             .unwrap()
         };
+        if cycle < 2 && matches!(replay.history, History::IncompleteInventory) {
+            assert!(
+                invalid_token_hits.load(Ordering::SeqCst) > token_hits_before,
+                "the invalid-token response must be reached in cycle {cycle}"
+            );
+            assert!(
+                partial_query_hits.load(Ordering::SeqCst) > partial_hits_before,
+                "the valid rank prefix must be reached in cycle {cycle}"
+            );
+            assert!(
+                incomplete_query_hits.load(Ordering::SeqCst) > query_hits_before,
+                "the fallback rank failure must be reached in cycle {cycle}"
+            );
+            assert!(
+                result.stats.enumeration_incomplete || result.stats.enumeration_errors > 0,
+                "the rank failure must report incomplete enumeration: {result:?}"
+            );
+        }
         // All production handles are gone. Reopen independently after EVERY
         // cycle, including both quiet tail cycles and the final comparison.
         assert_eq!(
@@ -780,6 +863,18 @@ async fn run_history(replay: Replay) -> Vec<Vec<Vec<Vec<rusqlite::types::Value>>
         }
         outputs.push(state);
     }
+    if !matches!(replay.encoding, Encoding::Baseline) {
+        assert!(
+            page_cursor_hits.load(Ordering::SeqCst) > 0,
+            "paginated provider response was not reached: {replay:?}"
+        );
+    }
+    if matches!(replay.encoding, Encoding::DuplicateEmpty) {
+        assert!(
+            empty_page_hits.load(Ordering::SeqCst) > 0,
+            "continuing empty provider page was not reached: {replay:?}"
+        );
+    }
     assert!(
         server.received_requests().await.unwrap().len() <= 12,
         "bounded media work"
@@ -915,6 +1010,11 @@ async fn mixed_numbered_album_mode_transition_repro() {
                 quiet: false,
                 requests: Arc::new(AtomicUsize::new(0)),
                 hydrations: Arc::new(AtomicUsize::new(0)),
+                invalid_token_hits: Arc::new(AtomicUsize::new(0)),
+                incomplete_query_hits: Arc::new(AtomicUsize::new(0)),
+                partial_query_hits: Arc::new(AtomicUsize::new(0)),
+                page_cursor_hits: Arc::new(AtomicUsize::new(0)),
+                empty_page_hits: Arc::new(AtomicUsize::new(0)),
             };
             let passes = labels
                 .iter()
@@ -1094,6 +1194,11 @@ async fn mixed_recorded_recovery_preserves_legacy_debt_without_new_reservations(
         quiet: false,
         requests: Arc::new(AtomicUsize::new(0)),
         hydrations: Arc::new(AtomicUsize::new(0)),
+        invalid_token_hits: Arc::new(AtomicUsize::new(0)),
+        incomplete_query_hits: Arc::new(AtomicUsize::new(0)),
+        partial_query_hits: Arc::new(AtomicUsize::new(0)),
+        page_cursor_hits: Arc::new(AtomicUsize::new(0)),
+        empty_page_hits: Arc::new(AtomicUsize::new(0)),
     };
     let passes = vec![AlbumPass {
         kind: PassKind::Unfiled,
