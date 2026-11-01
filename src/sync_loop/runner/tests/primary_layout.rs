@@ -4629,7 +4629,9 @@ async fn review501_legacy_original_survives_adjusted_only_migration_as_archive()
 
 #[tokio::test]
 async fn review501_legacy_reverted_edit_is_preserved_outside_visible_library() {
-    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+    // The historical test name predates the no-convergence policy. The
+    // safety obligation is that a reverted edit remains independently owned
+    // and byte-identical, at its recorded native path.
     #[cfg(feature = "xmp")]
     let sidecar_modes = [false, true];
     #[cfg(not(feature = "xmp"))]
@@ -4639,25 +4641,175 @@ async fn review501_legacy_reverted_edit_is_preserved_outside_visible_library() {
         let root = tempfile::tempdir().unwrap();
         let media = root.path().join("media");
         let options = || CycleOptions {
+            private: true,
             #[cfg(feature = "xmp")]
             sidecar,
             ..CycleOptions::default()
         };
+        #[cfg(not(feature = "xmp"))]
+        let _ = sidecar;
+        let initial_records =
+            records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT)));
         let (initial, _) = cycle_options(
             root.path(),
-            records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT))),
+            initial_records,
             false,
             EditedNaming::Suffix,
             options(),
         )
         .await;
-        assert_eq!(initial.failed_count, 0);
+        assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+        assert!(initial.db_sync_token_advance_safe);
+        assert_bytes(&media.join("IMG_0501.JPG"), VALID_ORIGINAL);
         assert_bytes(&media.join("IMG_0501_edited.JPG"), VALID_EDIT);
-        let edited_sidecar =
-            sidecar.then(|| std::fs::read(media.join("IMG_0501_edited.JPG.xmp")).unwrap());
+        let owner = state::db::account::AccountOwner::authenticated(
+            "synthetic@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+        )
+        .unwrap();
+        let wrong_owner = state::db::account::AccountOwner::authenticated(
+            "different@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"different-provider"}})).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            state::SqliteStateDb::open_owned(&root.path().join("state.db"), &wrong_owner).await,
+            Err(state::error::StateError::AccountOwnerMismatch)
+        ));
+        let owned = Arc::new(
+            state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+                .await
+                .unwrap(),
+        );
+        let expected_scope =
+            crate::icloud::photos::inbox::ShadowCapture::new(owned.clone(), owner.clone(), "com")
+                .scope(
+                    "private",
+                    &json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                )
+                .unwrap();
+        let expected_selection = json!({
+            "zone":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+            "name":"TestAlbum",
+            "list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+            "obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted",
+            "query_filter":null, "container_id":null, "cross_zone_sources":[]
+        });
+        let expected_pass = format!(
+            "{:x}",
+            Sha256::digest(
+                json!({"kind":"Unfiled","scope":expected_selection,"excludes":[]})
+                    .to_string()
+                    .as_bytes()
+            )
+        );
+        let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+        let snapshot = || {
+            let conn = rusqlite::Connection::open_with_flags(
+                root.path().join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT json_array(id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,trust_receipt,selected_metadata_hash,generation_id) FROM download_receipts WHERE library='PrimarySync' AND child='asset-501' ORDER BY version_size"
+            ).unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let receipts = snapshot();
+        assert_eq!(receipts.len(), 2);
+        for (receipt, version, path, bytes) in [
+            (
+                &receipts[0],
+                "adjusted",
+                media.join("IMG_0501_edited.JPG"),
+                VALID_EDIT,
+            ),
+            (
+                &receipts[1],
+                "original",
+                media.join("IMG_0501.JPG"),
+                VALID_ORIGINAL,
+            ),
+        ] {
+            let row: serde_json::Value = serde_json::from_str(receipt).unwrap();
+            let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+            assert_eq!(row[1], account_key);
+            assert_eq!(row[2], provider_key);
+            assert_eq!(row[3], expected_scope);
+            assert_eq!(row[4], "PrimarySync");
+            assert_eq!(row[5], "asset-501");
+            assert_eq!(row[6], "501");
+            assert_eq!(row[7], "asset-501");
+            assert_eq!(row[8], expected_pass);
+            assert_eq!(row[9], version);
+            assert_eq!(row[10], provider_hash(bytes));
+            assert_eq!(row[11], bytes.len());
+            assert_eq!(
+                row[12],
+                crate::state::db::provider_selection::SelectionPath::from_path(&path)
+                    .key()
+                    .unwrap()
+            );
+            assert_eq!(row[13], hash);
+            assert_eq!(row[14], hash);
+            assert!(!row[0].as_str().unwrap().is_empty());
+            assert!(!row[15].as_str().unwrap().is_empty());
+            assert!(row[16].is_null() && row[17].is_null() && row[18].is_null());
+        }
+        drop(owned);
+        let tree = || {
+            let mut files = std::fs::read_dir(&media)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let meta = entry.metadata().unwrap();
+                    assert!(meta.is_file());
+                    (
+                        entry.file_name(),
+                        std::fs::read(entry.path()).unwrap(),
+                        meta.modified().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+            files
+        };
+        if sidecar {
+            for name in ["IMG_0501.JPG.xmp", "IMG_0501_edited.JPG.xmp"] {
+                assert!(
+                    !std::fs::read(media.join(name)).unwrap().is_empty(),
+                    "sidecar-enabled initial download must create {name}"
+                );
+            }
+        }
+        let original_tree = tree();
+        let names: Vec<_> = original_tree
+            .iter()
+            .map(|entry| entry.0.to_string_lossy().into_owned())
+            .collect();
+        let expected_names = if sidecar {
+            vec![
+                "IMG_0501.JPG",
+                "IMG_0501.JPG.xmp",
+                "IMG_0501_edited.JPG",
+                "IMG_0501_edited.JPG.xmp",
+            ]
+        } else {
+            vec!["IMG_0501.JPG", "IMG_0501_edited.JPG"]
+        };
+        assert_eq!(
+            names, expected_names,
+            "initial selection must not create extra copies"
+        );
         let requests = server.received_requests().await.unwrap().len();
+        assert_eq!(requests, 2);
         let current = records_with_original(&server, VALID_ORIGINAL, None);
-        let (migrated, _) = cycle_options(
+        let (reverted, _) = cycle_options(
             root.path(),
             current.clone(),
             false,
@@ -4665,64 +4817,49 @@ async fn review501_legacy_reverted_edit_is_preserved_outside_visible_library() {
             options(),
         )
         .await;
+        assert_eq!(reverted.failed_count, 0, "{:?}", reverted.stats);
+        assert!(reverted.db_sync_token_advance_safe);
+        assert_eq!(reverted.stats.downloaded, 0);
         assert_eq!(
-            migrated.failed_count,
-            0,
-            "sidecar={sidecar}: {:?}; events {:?}",
-            migrated.stats,
-            capture
-                .events()
-                .into_iter()
-                .filter(|event| event.level == tracing::Level::WARN
-                    || event.level == tracing::Level::ERROR)
-                .collect::<Vec<_>>()
+            tree(),
+            original_tree,
+            "ordinary revert must preserve both recorded files, sidecars and mtimes"
         );
-        assert!(migrated.db_sync_token_advance_safe);
-        assert_bytes(&media.join("IMG_0501.JPG"), VALID_ORIGINAL);
-        assert!(!media.join("IMG_0501_edited.JPG").exists());
-        assert!(!media.join("IMG_0501_edited.JPG.xmp").exists());
-        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
-            .await
-            .unwrap();
-        let manifest = db.get_manifest_assets().await.unwrap();
-        let history = manifest
-            .iter()
-            .flat_map(|row| &row.preserved_files)
-            .find(|receipt| std::fs::read(receipt.native_path.to_path()).unwrap() == VALID_EDIT)
-            .expect("reverted edit has no independently preserved history receipt");
-        let path = history.native_path.to_path();
+        assert_eq!(
+            snapshot(),
+            receipts,
+            "ordinary revert must retain both exact scoped receipts"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        let conn = rusqlite::Connection::open_with_flags(
+            root.path().join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let original_path_key = crate::state::db::provider_selection::SelectionPath::from_path(
+            &media.join("IMG_0501.JPG"),
+        )
+        .key()
+        .unwrap();
+        let original_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(VALID_ORIGINAL));
+        let selected: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.library='PrimarySync' AND d.child='asset-501' AND d.asset_id='asset-501' AND d.master='501' AND d.version_size='original' AND d.pass_key=?1 AND d.path=?2 AND d.checksum=?3 AND d.size_bytes=?4 AND d.local_checksum=?5 AND d.source_checksum=?5 AND g.account_key=?6 AND g.provider_key=?7 AND g.scope=?8 AND d.admitted=1 AND d.verified_media=1",
+            rusqlite::params![expected_pass, original_path_key, provider_hash(VALID_ORIGINAL),
+                i64::try_from(VALID_ORIGINAL.len()).unwrap(), original_hash, account_key, provider_key, expected_scope],
+            |row| row.get(0),
+        ).unwrap();
         assert!(
-            path.strip_prefix(&media)
-                .unwrap()
-                .components()
-                .any(|part| part.as_os_str() == ".kei-history")
+            selected > 0,
+            "current original must actually reach verified selection"
         );
-        assert_eq!(history.provider_checksum, provider_hash(VALID_EDIT));
-        assert_eq!(
-            history.local_checksum,
-            data_encoding::HEXLOWER.encode(&Sha256::digest(VALID_EDIT))
-        );
-        if let Some(expected) = &edited_sidecar {
-            let mut xmp = path.as_os_str().to_os_string();
-            xmp.push(".xmp");
-            assert_bytes(&std::path::PathBuf::from(xmp), expected);
-            assert_eq!(
-                history.sidecar_checksum.as_deref(),
-                Some(
-                    data_encoding::HEXLOWER
-                        .encode(&Sha256::digest(expected))
-                        .as_str()
-                )
-            );
-        }
-        let summary = db.get_summary().await.unwrap().primary_layout.unwrap();
-        let inventory = (
-            summary.bound_families,
-            summary.preserved_files,
-            summary.pending_operations,
-            summary.held_operations,
-        );
-        drop(db);
+        let checkpoint: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
         for _ in 0..2 {
             let (quiet, lookups) = cycle_options(
                 root.path(),
@@ -4736,29 +4873,24 @@ async fn review501_legacy_reverted_edit_is_preserved_outside_visible_library() {
             assert!(quiet.db_sync_token_advance_safe);
             assert_eq!(quiet.stats.downloaded, 0);
             assert_eq!(lookups, 0);
-            assert_bytes(&media.join("IMG_0501.JPG"), VALID_ORIGINAL);
-            assert_bytes(&path, VALID_EDIT);
-            if let Some(expected) = &edited_sidecar {
-                let mut xmp = path.as_os_str().to_os_string();
-                xmp.push(".xmp");
-                assert_bytes(&std::path::PathBuf::from(xmp), expected);
-            }
-            assert!(!media.join("IMG_0501_edited.JPG").exists());
+            assert_eq!(tree(), original_tree);
+            assert_eq!(snapshot(), receipts);
             assert_eq!(server.received_requests().await.unwrap().len(), requests);
-            let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
-                .await
+            let conn = rusqlite::Connection::open_with_flags(
+                root.path().join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let current_checkpoint: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                    [],
+                    |row| row.get(0),
+                )
                 .unwrap();
-            let summary = db.get_summary().await.unwrap().primary_layout.unwrap();
-            assert_eq!(
-                (
-                    summary.bound_families,
-                    summary.preserved_files,
-                    summary.pending_operations,
-                    summary.held_operations
-                ),
-                inventory
-            );
+            assert_eq!(current_checkpoint, checkpoint);
         }
+        eprintln!("REVERT_PRESERVATION_REACHED sidecar={sidecar}");
     }
 }
 
