@@ -658,114 +658,313 @@ async fn refresh_authentication_and_shutdown_remain_authoritative() {
 #[tokio::test]
 async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
     use super::{RetryTaskKey, UrlRetrySource, build_incremental_expired_url_retry_tasks};
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha256};
     use wiremock::matchers::method;
-    use wiremock::{Mock, ResponseTemplate};
-    let server = crate::start_wiremock_or_skip!();
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(BYTES))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("selected-path.jpg");
-    std::fs::write(&path, b"external file edit").unwrap();
-    let db_path = dir.path().join("state.db");
-    let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
-    let records = incremental_photo_records_with_url(
-        "MASTER",
-        "different-provider-name.jpg",
-        &server.uri(),
-        8,
-    );
-    let mut task = retry_test_task("child-state", VersionSizeKey::Original, "unused");
-    task.asset_record_name = "asset-MASTER".into();
-    task.download_path = path.clone();
-    task.size = 8;
-    db.upsert_seen(
-        &TestAssetRecord::new("child-state")
-            .filename("selected-path.jpg")
-            .size(8)
-            .build(),
-    )
-    .await
-    .unwrap();
-    let passes = vec![AlbumPass {
-        kind: PassKind::Unfiled,
-        album: album_with_session(
-            "PrimarySync",
-            "",
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // A URL refresh must preserve each original publication mode. An
+    // occupied foreign file is never authority to finalize a download.
+    for (require_created_entry, occupied) in
+        [(false, true), (true, true), (false, false), (true, false)]
+    {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(BYTES))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("selected-path.jpg");
+        let foreign = b"external file edit";
+        if occupied {
+            std::fs::write(&path, foreign).unwrap();
+        }
+        let foreign_mtime = occupied.then(|| std::fs::metadata(&path).unwrap().modified().unwrap());
+        #[cfg(unix)]
+        let foreign_identity = {
+            use std::os::unix::fs::MetadataExt as _;
+            occupied.then(|| {
+                let metadata = std::fs::metadata(&path).unwrap();
+                (metadata.dev(), metadata.ino())
+            })
+        };
+        let db_path = dir.path().join("state.db");
+        let owner = crate::state::db::account::AccountOwner::authenticated(
+            "retry-fixture@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"retry-fixture-provider"}})).unwrap(),
+        )
+        .unwrap();
+        let wrong_owner = crate::state::db::account::AccountOwner::authenticated(
+            "different@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"different-provider"}})).unwrap(),
+        )
+        .unwrap();
+        let db = Arc::new(SqliteStateDb::open_owned(&db_path, &owner).await.unwrap());
+        assert!(matches!(
+            SqliteStateDb::open_owned(&db_path, &wrong_owner).await,
+            Err(crate::state::error::StateError::AccountOwnerMismatch)
+        ));
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(BYTES));
+        let new_url = server.uri();
+        let mut records = incremental_photo_records_with_url(
+            "MASTER",
+            "different-provider-name.jpg",
+            &new_url,
+            BYTES.len() as u64,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+        for record in &mut records {
+            record["zoneID"] = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        }
+        records[1]["fields"]["masterRef"]["value"]["zoneID"] =
+            json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+        let mut task = retry_test_task("child-state", VersionSizeKey::Original, "unused");
+        task.require_created_entry = require_created_entry;
+        task.asset_record_name = "asset-MASTER".into();
+        task.download_path = path.clone();
+        task.size = BYTES.len() as u64;
+        task.checksum = checksum.clone().into();
+        assert!(task.replacement_fingerprint.is_none());
+        if require_created_entry {
+            assert!(matches!(
+                task.publication(),
+                crate::download::file::FinalPublication::CreateOnly
+            ));
+        } else {
+            assert!(matches!(
+                task.publication(),
+                crate::download::file::FinalPublication::NoReplace
+            ));
+        }
+        db.upsert_seen(
+            &TestAssetRecord::new("child-state")
+                .filename("selected-path.jpg")
+                .checksum(&checksum)
+                .size(BYTES.len() as u64)
+                .build(),
+        )
+        .await
+        .unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut album = crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::default(),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from(""),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(
+                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                ),
+                retry_config: RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
             Box::new(BoundedSession {
                 delta: Arc::new(Vec::new()),
                 fresh: Arc::new(records),
-                requests: Arc::new(Mutex::new(Vec::new())),
+                requests: requests.clone(),
             }),
-        ),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    }];
-    let mut sources = rustc_hash::FxHashMap::default();
-    sources.insert(
-        RetryTaskKey::from(&task),
-        UrlRetrySource {
-            asset_record_name: task.asset_record_name.clone(),
-            master_record_name: "MASTER".into(),
-            provider_version: VersionSizeKey::Original,
-            pass_index: 0,
-            recorded_pass: None,
-        },
-    );
-    let plan = build_incremental_expired_url_retry_tasks(
-        &passes,
-        &sources,
-        &[task.clone()],
-        CancellationToken::new(),
-    )
-    .await;
-    assert_eq!(plan.tasks.len(), 1);
-    let refreshed = &plan.tasks[0];
-    assert_eq!(refreshed.download_path, path);
-    assert_eq!(refreshed.asset_id.as_ref(), "child-state");
-    assert_eq!(refreshed.asset_record_name.as_ref(), "asset-MASTER");
-    assert_eq!(refreshed.created_local, task.created_local);
-    assert_eq!(refreshed.checksum, task.checksum);
-    assert_eq!(refreshed.version_size, task.version_size);
-    assert!(Arc::ptr_eq(&refreshed.metadata, &task.metadata));
-    assert!(matches!(
-        refreshed.publication(),
-        crate::download::file::FinalPublication::NoReplace
-    ));
-    let client = reqwest::Client::new();
-    let retry = RetryConfig {
-        max_retries: 0,
-        base_delay_secs: 0,
-        max_delay_secs: 0,
-    };
-    let result = run_download_pass(
-        PassConfig {
-            prior_auth_errors: 0,
-            url_obtained_at: plan.url_obtained_at,
-            client: &client,
-            retry_config: &retry,
-            metadata: MetadataFlags::default(),
-            mark_capture_repair_after_download: false,
-            concurrency: 1,
-            reporting: DownloadReporting::hidden(),
-            temp_suffix: ".part".into(),
-            shutdown_token: CancellationToken::new(),
-            state_db: Some(db.clone()),
-            rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            bandwidth_limiter: None,
-            library: "PrimarySync".into(),
-        },
-        plan.tasks,
-    )
-    .await;
-    assert_eq!(result.downloaded, 0);
-    assert_eq!(result.failed.len(), 1);
-    assert_eq!(std::fs::read(&path).unwrap(), b"external file edit");
-    drop(db);
-    let reopened = SqliteStateDb::open(&db_path).await.unwrap();
-    assert_eq!(reopened.get_summary().await.unwrap().failed, 1);
-    server.verify().await;
+        );
+        album.set_shadow_capture(
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com"),
+            Arc::from("private"),
+        );
+        let (capture, scope, zone) = album.download_scope().unwrap().expect("scoped retry owner");
+        assert!(Arc::ptr_eq(&capture.db, &db));
+        assert!(capture.owner == owner);
+        assert_eq!(
+            zone,
+            json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})
+        );
+        db.validate_download_scope(owner.clone(), scope, "PrimarySync".to_owned())
+            .await
+            .unwrap();
+        drop(capture);
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album,
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+        let mut sources = rustc_hash::FxHashMap::default();
+        sources.insert(
+            RetryTaskKey::from(&task),
+            UrlRetrySource {
+                asset_record_name: task.asset_record_name.clone(),
+                master_record_name: "MASTER".into(),
+                provider_version: VersionSizeKey::Original,
+                pass_index: 0,
+                recorded_pass: None,
+            },
+        );
+        let plan = build_incremental_expired_url_retry_tasks(
+            &passes,
+            &sources,
+            &[task.clone()],
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(plan.tasks.len(), 1);
+        let refreshed = &plan.tasks[0];
+        assert_eq!(refreshed.url.as_ref(), new_url);
+        assert_ne!(refreshed.url, task.url);
+        assert_eq!(refreshed.download_path, path);
+        assert_eq!(refreshed.asset_id.as_ref(), "child-state");
+        assert_eq!(refreshed.asset_record_name.as_ref(), "asset-MASTER");
+        assert_eq!(refreshed.created_local, task.created_local);
+        assert_eq!(refreshed.checksum, task.checksum);
+        assert_eq!(refreshed.size, task.size);
+        assert_eq!(refreshed.version_size, task.version_size);
+        assert_eq!(refreshed.require_created_entry, require_created_entry);
+        assert!(refreshed.replacement_fingerprint.is_none());
+        assert!(Arc::ptr_eq(&refreshed.metadata, &task.metadata));
+        if require_created_entry {
+            assert!(matches!(
+                refreshed.publication(),
+                crate::download::file::FinalPublication::CreateOnly
+            ));
+        } else {
+            assert!(matches!(
+                refreshed.publication(),
+                crate::download::file::FinalPublication::NoReplace
+            ));
+        }
+        let looked_up: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|request| request["records"].as_array().into_iter().flatten())
+            .filter_map(|record| record["recordName"].as_str().map(str::to_owned))
+            .collect();
+        assert!(looked_up.iter().any(|name| name == "asset-MASTER"));
+        assert!(looked_up.iter().any(|name| name == "MASTER"));
+        let client = reqwest::Client::new();
+        let retry = RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        let result = run_download_pass(
+            PassConfig {
+                prior_auth_errors: 0,
+                url_obtained_at: plan.url_obtained_at,
+                client: &client,
+                retry_config: &retry,
+                metadata: MetadataFlags::default(),
+                mark_capture_repair_after_download: false,
+                concurrency: 1,
+                reporting: DownloadReporting::hidden(),
+                temp_suffix: ".part".into(),
+                shutdown_token: CancellationToken::new(),
+                state_db: Some(db.clone()),
+                rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                bandwidth_limiter: None,
+                library: "PrimarySync".into(),
+            },
+            plan.tasks,
+        )
+        .await;
+        if occupied {
+            assert_eq!(result.downloaded, 0);
+            assert_eq!(result.failed.len(), 1);
+            assert_eq!(result.failed[0].asset_id.as_ref(), "child-state");
+            assert_eq!(result.failed[0].version_size, VersionSizeKey::Original);
+            assert_eq!(std::fs::read(&path).unwrap(), foreign);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                foreign_mtime.unwrap()
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let metadata = std::fs::metadata(&path).unwrap();
+                assert_eq!(Some((metadata.dev(), metadata.ino())), foreign_identity);
+            }
+        } else {
+            assert_eq!(result.downloaded, 1);
+            assert!(result.failed.is_empty());
+            assert_eq!(std::fs::read(&path).unwrap(), BYTES);
+        }
+        assert_eq!(result.state_write_failures, 0);
+        drop(passes);
+        let closed_owner = Arc::downgrade(&db);
+        assert_eq!(
+            Arc::strong_count(&db),
+            1,
+            "all scoped capture and pass handles must be closed"
+        );
+        drop(db);
+        assert!(
+            closed_owner.upgrade().is_none(),
+            "owner must close before reopening"
+        );
+        let reopened = SqliteStateDb::open_owned(&db_path, &owner).await.unwrap();
+        {
+            let conn = reopened.acquire_lock("retry publication evidence").unwrap();
+            let (status, last_error): (String, Option<String>) = conn.query_row(
+            "SELECT status,last_error FROM assets WHERE library='PrimarySync' AND id='child-state' AND version_size='original' AND checksum=?1",
+            [&checksum], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+            let path_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM asset_metadata_paths WHERE local_path=?1",
+                    [path.to_str().unwrap()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let receipts: i64 = conn
+                .query_row("SELECT COUNT(*) FROM download_receipts", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            if occupied {
+                assert_eq!(status, "failed");
+                let error = last_error.expect("foreign collision must remain visible");
+                if require_created_entry {
+                    assert!(
+                        error.contains("Destination already exists"),
+                        "unexpected create-only error: {error}"
+                    );
+                } else {
+                    assert!(
+                        error.contains("Refusing to deduplicate"),
+                        "unexpected no-replace error: {error}"
+                    );
+                }
+                assert_eq!(
+                    path_rows, 0,
+                    "foreign file must not acquire any path ownership"
+                );
+                assert_eq!(
+                    receipts, 0,
+                    "foreign file must not acquire any compact receipt"
+                );
+            } else {
+                assert_eq!(status, "downloaded");
+                assert_eq!(path_rows, 1);
+                let (library, id, version, provider, local, source): (String,String,String,String,String,String) =
+                conn.query_row(
+                    "SELECT library,id,version_size,provider_checksum,local_checksum,download_checksum FROM asset_metadata_paths WHERE local_path=?1",
+                    [path.to_str().unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+                ).unwrap();
+                let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(BYTES));
+                assert_eq!(
+                    (library.as_str(), id.as_str(), version.as_str()),
+                    ("PrimarySync", "child-state", "original")
+                );
+                assert_eq!(provider, checksum);
+                assert_eq!(local, digest);
+                assert_eq!(source, digest);
+            }
+        }
+        server.verify().await;
+        eprintln!("URL_RETRY_REACHED create_only={require_created_entry} occupied={occupied}");
+    }
 }
 
 #[tokio::test]
