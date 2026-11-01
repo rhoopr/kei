@@ -10,3 +10,5 @@
 - User-approved storage cleanup manifest `.scratch/approved-reclamation-20261101/deletion-manifest.tsv`; preserve remaining outputs. A full read-only registered worktree list at snapshot is `WORKTREES-ALL.txt`. This list includes user or stale worktrees and does not imply permission to edit/delete any of them.
 
 All `.scratch` paths above are under `/home/robhooper/dev/kei-v027-sync` unless an absolute path is given. Snapshots may age while in-flight owners finish. Check current status and use exact source/binary hashes from each packet before drawing conclusions.
+
+- Parked Hidden WIP: `/home/robhooper/dev/kei-hidden-deletion-gate`, base `dd47eca26e882cf4a722ee6702f35bfd72932a93`, tracked diff SHA-256 `c6bd6c8d53773c2ce2d3d51e74f6056e47f682d0fcba7888e9eda88b53153acf`; local only due unresolved prior denial boundary. See HANDOFF.md.
