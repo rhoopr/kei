@@ -80,5 +80,13 @@ pub(crate) use orchestration::primary_layout::tests::{
     seed_prepared_edited_compat, seed_unprepared_refresh,
 };
 
+#[cfg(all(test, target_os = "linux", feature = "xmp"))]
+pub(crate) use orchestration::primary_layout::tests::{
+    try_finish_prepared_edited_compat, try_seed_prepared_edited_compat,
+};
+
+#[cfg(all(test, target_os = "linux", feature = "xmp"))]
+pub(crate) use orchestration::generation::project_test_selection;
+
 #[cfg(test)]
 pub(crate) use orchestration::generation::TEST_GENERATION_FORMAT;

@@ -283,6 +283,17 @@ pub(crate) trait ReconciliationStateStore: Send + Sync {
             detail: "state store does not support layout recovery confirmation".into(),
         })
     }
+    async fn preflight_primary_layout_copy(
+        &self,
+        _op: super::primary_layout::LayoutOperation,
+        _index: usize,
+        _source: super::primary_layout::LayoutFile,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "primary_layout",
+            detail: "state store does not support copied-original preflight".into(),
+        })
+    }
     async fn save_primary_layout(
         &self,
         _op: super::primary_layout::LayoutOperation,

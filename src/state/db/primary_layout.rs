@@ -55,6 +55,20 @@ pub(crate) struct LayoutFingerprint {
     pub(crate) identity: crate::fs_util::FileIdentity,
 }
 
+// Durable evidence for what preparation actually did. Older journals have no
+// outcome and must not be assumed to have applied or verified metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) enum LayoutMetadataOutcome {
+    Copied {
+        source: SelectionPath,
+        fingerprint: LayoutFingerprint,
+        sidecar: Option<LayoutFingerprint>,
+        source_checksum: Option<String>,
+        previous_decision: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LayoutFile {
@@ -66,6 +80,8 @@ pub(crate) struct LayoutFile {
     pub(crate) sidecar: Option<LayoutFingerprint>,
     pub(crate) archive_original: bool,
     pub(crate) metadata_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) metadata_outcome: Option<LayoutMetadataOutcome>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -464,6 +480,156 @@ pub(crate) struct PreservedManifestFile {
 
 const fn is_false(value: &bool) -> bool {
     !*value
+}
+
+// A copied original is not metadata completion. Only the same operation's
+// recorded, claimed original can use this path. Pending or prepared metadata
+// debt is held rather than transferred without its owner's authority.
+fn guard_copied_original(conn: &Connection, op: &LayoutOperation) -> Result<(), StateError> {
+    for member in &op.members {
+        let Some(record) = &member.record else {
+            continue;
+        };
+        if member.installed.as_ref().is_some_and(|f| {
+            matches!(
+                &f.metadata_outcome,
+                Some(LayoutMetadataOutcome::Copied { .. })
+            )
+        }) && !member.prepared.as_ref().is_some_and(|f| {
+            matches!(
+                &f.metadata_outcome,
+                Some(LayoutMetadataOutcome::Copied { .. })
+            )
+        }) {
+            return Err(invalid(
+                "installed copied metadata has no prepared owner evidence",
+            ));
+        }
+        let Some(file) = member.prepared.as_ref() else {
+            continue;
+        };
+        if file.metadata_outcome.is_none() && file.metadata_decision.is_none() {
+            return Err(invalid("legacy selected metadata has no recorded decision"));
+        }
+        let Some(LayoutMetadataOutcome::Copied {
+            source,
+            fingerprint,
+            sidecar,
+            source_checksum,
+            previous_decision,
+        }) = &file.metadata_outcome
+        else {
+            continue;
+        };
+        if member.old.is_some() {
+            return Err(invalid(
+                "copied original archive destination is already occupied",
+            ));
+        }
+        if sidecar.is_none()
+            || op.refresh_metadata
+            || !file.archive_original
+            || record.version_size.as_str() != "original"
+            || file.version != record.version_size.as_str()
+            || file.provider_checksum != record.checksum.as_ref()
+            || member.stage.as_ref() != Some(&file.path)
+            || member.destination.is_none()
+            || member.destination.as_ref() == member.stage.as_ref()
+            || file.metadata_decision != *previous_decision
+            || file.fingerprint.size != fingerprint.size
+            || file.fingerprint.sha256 != fingerprint.sha256
+            || file.sidecar.as_ref().map(|f| (f.size, f.sha256))
+                != sidecar.as_ref().map(|f| (f.size, f.sha256))
+            || file.source_checksum != *source_checksum
+        {
+            return Err(invalid("copied original evidence is inconsistent"));
+        }
+        if let Some(installed) = &member.installed {
+            if member.destination.as_ref() != Some(&installed.path)
+                || installed.version != file.version
+                || installed.provider_checksum != file.provider_checksum
+                || installed.source_checksum != file.source_checksum
+                || installed.archive_original != file.archive_original
+                || installed.metadata_decision != file.metadata_decision
+                || encode(&installed.metadata_outcome)? != encode(&file.metadata_outcome)?
+                || installed.fingerprint.size != file.fingerprint.size
+                || installed.fingerprint.sha256 != file.fingerprint.sha256
+                || installed.sidecar.as_ref().map(|f| (f.size, f.sha256))
+                    != file.sidecar.as_ref().map(|f| (f.size, f.sha256))
+            {
+                return Err(invalid(
+                    "installed copied metadata differs from prepared evidence",
+                ));
+            }
+        }
+        let matches_old = op
+            .members
+            .iter()
+            .filter_map(|m| m.old.as_ref())
+            .filter(|old| {
+                old.path == *source
+                    && old.version == "original"
+                    && old.provider_checksum == record.checksum.as_ref()
+                    && old.fingerprint == *fingerprint
+                    && old.sidecar == *sidecar
+                    && old.source_checksum == *source_checksum
+                    && old.metadata_decision == *previous_decision
+            })
+            .count();
+        if matches_old != 1 {
+            return Err(invalid("copied original has no unique recorded source"));
+        }
+        let target = member
+            .destination
+            .as_ref()
+            .ok_or_else(|| invalid("copied original destination is missing"))?
+            .to_path();
+        if target.to_str().is_none() {
+            return Err(invalid(
+                "copied original destination has no exact catalogue path",
+            ));
+        }
+        let native = source.to_path();
+        let exact = native
+            .to_str()
+            .ok_or_else(|| invalid("copied original source has no exact catalogue path"))?;
+        let key = path_key(&native)?;
+        let claimed: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM primary_layout_claims WHERE path_key=?1 AND family=?2 AND operation=?3 AND library=?4 AND child=?5)",
+            params![key,op.family,op.operation,op.library,op.child], |r|r.get(0))?;
+        if !claimed {
+            return Err(invalid(
+                "copied original source is not claimed by this operation",
+            ));
+        }
+        let source_sha = source_checksum
+            .as_deref()
+            .ok_or_else(|| invalid("copied original has no source checksum"))?;
+        if source_sha.len() != 64
+            || !source_sha
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(invalid("copied original source checksum is invalid"));
+        }
+        let checksum = data_encoding::HEXLOWER.encode(&fingerprint.sha256);
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND provider_checksum=?5 AND local_checksum=?6 AND source_checksum IS ?7",
+            params![op.library,op.child,record.version_size.as_str(),exact,record.checksum.as_ref(),checksum,source_checksum],
+            |r|r.get(0))?;
+        if count != 1 {
+            return Err(invalid("copied original source receipt is not unique"));
+        }
+        let has_debt: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND (metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL)) OR EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size=?3 AND (metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL))",
+            params![op.library,op.child,record.version_size.as_str()], |r|r.get(0))?;
+        if has_debt {
+            return Err(invalid(
+                "copied original has unresolved metadata or capture-repair debt",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn invalid(detail: impl Into<String>) -> StateError {
@@ -1074,6 +1240,51 @@ impl SqliteStateDb {
         })
         .await
     }
+    /// Read-only check before creating copied-original stage files. The
+    /// normal owner saves and commit repeat this guard; it is not a
+    /// cross-process filesystem lease.
+    pub(crate) async fn preflight_primary_layout_copy(
+        &self,
+        op: LayoutOperation,
+        index: usize,
+        source: LayoutFile,
+    ) -> Result<(), StateError> {
+        self.with_conn("preflight_primary_layout_copy", move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            guard_recorded_catalogue(&tx, &op)?;
+            let header: Vec<u8> = tx.query_row(
+                "SELECT header FROM primary_layout_operations WHERE operation=?1 AND phase='planned'",
+                [&op.operation], |r| r.get(0),
+            )?;
+            let mut identity = op.clone();
+            identity.members.clear();
+            if encode(&identity)? != header { return Err(invalid("copy preflight operation changed")); }
+            let stored: Vec<Vec<u8>> = tx.prepare("SELECT evidence FROM primary_layout_members WHERE operation=?1 ORDER BY member")?
+                .query_map([&op.operation], |r|r.get(0))?.collect::<Result<_,_>>()?;
+            if stored.len() != op.members.len() || op.members.iter().zip(stored).any(|(m,bytes)|encode(m).map_or(true,|v|v!=bytes)) {
+                return Err(invalid("copy preflight membership changed"));
+            }
+            let mut probe = op.clone();
+            let mut candidate = source.clone();
+            candidate.archive_original = true;
+            candidate.metadata_outcome = Some(LayoutMetadataOutcome::Copied {
+                source: source.path.clone(),
+                fingerprint: source.fingerprint.clone(),
+                sidecar: source.sidecar.clone(),
+                source_checksum: source.source_checksum.clone(),
+                previous_decision: source.metadata_decision.clone(),
+            });
+            let member = probe.members.get_mut(index).ok_or_else(||invalid("copy preflight member missing"))?;
+            if member.prepared.is_some() { return Err(invalid("copy preflight member already prepared")); }
+            // This temporary value is used only for owner validation; it is
+            // never saved as evidence that the stage already exists.
+            candidate.path = member.stage.clone().ok_or_else(||invalid("copy preflight stage missing"))?;
+            member.prepared = Some(candidate);
+            guard_copied_original(&tx, &probe)?;
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
     pub(crate) async fn save_primary_layout(&self, op: LayoutOperation) -> Result<(), StateError> {
         self.save_primary_layout_with_recovery(op, None).await
     }
@@ -1087,6 +1298,7 @@ impl SqliteStateDb {
             let previous:Vec<u8>=tx.query_row("SELECT header FROM primary_layout_operations WHERE operation=?1 AND phase NOT IN ('committed','cancelled')",[&op.operation],|row|row.get(0))?;
             let old:LayoutOperation=decode(&previous)?;
             if let Some(proof) = &proof { guard_recovery_snapshot(&tx, &op, proof)?; } else { guard_recorded_catalogue(&tx, &op)?; }
+            guard_copied_original(&tx, &op)?;
             let phase=|phase:&str|match phase {"planned"=>0,"prepared"=>1,"preserved"=>2,"publishing"=>3,_=>4};
             if phase(&op.phase)<phase(&old.phase) || phase(&op.phase)>phase(&old.phase)+1 {return Err(invalid("invalid layout phase transition"));}
             let mut identity=op.clone();identity.members.clear();identity.phase=old.phase.clone();
@@ -1142,7 +1354,9 @@ impl SqliteStateDb {
             let stored_members:Vec<Vec<u8>>=tx.prepare("SELECT evidence FROM primary_layout_members WHERE operation=?1 ORDER BY member")?.query_map([&op.operation],|r|r.get(0))?.collect::<Result<_,_>>()?;
             if stored_members.len()!=op.members.len() || op.members.iter().zip(stored_members).any(|(member,stored)|encode(member).map_or(true,|bytes|bytes!=stored)) {return Err(invalid("commit differs from recorded member evidence"));}
             if let Some(proof) = &proof { guard_recovery_snapshot(&tx, &op, proof)?; } else { guard_recorded_catalogue(&tx, &op)?; }
+            guard_copied_original(&tx, &op)?;
             let mut files=Vec::new();
+            let mut all_metadata_verified = true;
             for member in &op.members {
                 if let Some(old)=&member.old {
                     if member.preserved.is_none() { return Err(invalid("displaced file has no preservation receipt")); }
@@ -1163,18 +1377,91 @@ impl SqliteStateDb {
                 if let Some(record)=&member.record {
                     let installed=member.installed.as_ref().ok_or_else(||invalid("member is not installed"))?;
                     let path=installed.path.to_path();
+                    // The untagged ff3d producer recorded Some(decision)
+                    // after its existing preparation contract. Preserve that
+                    // legacy contract, without claiming new component proof.
+                    let metadata_verified = installed.metadata_outcome.is_none()
+                        && installed.metadata_decision.is_some();
+                    all_metadata_verified &= metadata_verified;
+
+                    // A copied packet does not prove current metadata. Snapshot
+                    // independent catalogue/path debt before the catalogue upsert
+                    // changes paths. Capture-repair receipts are path-bound and
+                    // cannot be transferred by this owner.
+                    let debt = if !metadata_verified {
+                        type Debt = (Option<i64>, Option<String>, Option<String>, Option<i64>);
+                        let catalog: Option<Debt> = tx.query_row(
+                            "SELECT metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size FROM assets WHERE library=?1 AND id=?2 AND version_size=?3",
+                            params![op.library,op.child,record.version_size.as_str()],
+                            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+                        ).optional()?;
+                        let source_debt = match &installed.metadata_outcome {
+                            Some(LayoutMetadataOutcome::Copied { source, fingerprint, sidecar, source_checksum, .. }) => {
+                                if !installed.archive_original || op.refresh_metadata
+                                    || installed.fingerprint.size != fingerprint.size
+                                    || installed.fingerprint.sha256 != fingerprint.sha256
+                                    || installed.sidecar.as_ref().map(|s|(s.size,s.sha256)) != sidecar.as_ref().map(|s|(s.size,s.sha256))
+                                    || installed.source_checksum != *source_checksum {
+                                    return Err(invalid("copied original metadata evidence does not match installed bytes"));
+                                }
+                                let source_path=source.to_path();
+                                let source_text=source_path.to_str().ok_or_else(||invalid("copied metadata source has no exact catalogue path"))?;
+                                let checksum=data_encoding::HEXLOWER.encode(&installed.fingerprint.sha256);
+                                let source: Debt = tx.query_row(
+                                    "SELECT metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND provider_checksum=?5 AND local_checksum=?6 AND source_checksum IS ?7",
+                                    params![op.library,op.child,record.version_size.as_str(),source_text,record.checksum.as_ref(),checksum,source_checksum],
+                                    |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+                                ).optional()?.ok_or_else(||invalid("copied metadata source debt is not uniquely recorded"))?;
+                                Some(source)
+                            }
+                            None => {
+                                // Legacy prepared journals did not record a
+                                // copied-source path. Do not invent one.
+                                let path_debt: bool = tx.query_row(
+                                    "SELECT EXISTS(SELECT 1 FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size=?3 AND (metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL))",
+                                    params![op.library,op.child,record.version_size.as_str()],
+                                    |r| r.get(0),
+                                )?;
+                                if path_debt { return Err(invalid("legacy prepared metadata source debt is ambiguous")); }
+                                None
+                            }
+                        };
+                        for item in catalog.iter().chain(source_debt.iter()) {
+                            if item.1.is_some() || item.2.is_some() || item.3.is_some() {
+                                return Err(invalid("capture repair must settle before metadata-preserving relocation"));
+                            }
+                        }
+                        if let Some(source) = &source_debt {
+                            let target: Option<Debt> = tx.query_row(
+                                "SELECT metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4",
+                                params![op.library,op.child,record.version_size.as_str(),path.to_string_lossy()],
+                                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+                            ).optional()?;
+                            if target.as_ref().is_some_and(|t|t != source) {
+                                return Err(invalid("metadata destination debt conflicts with copied source"));
+                            }
+                        }
+                        Some((catalog,source_debt))
+                    } else { None };
                     // Release only this operation's claim before the atomic
                     // catalogue write. Other operations keep their fences.
                     tx.execute("UPDATE primary_layout_claims SET operation=NULL,local_checksum=?1 WHERE path_key=?2 AND operation=?3",params![data_encoding::HEXLOWER.encode(&installed.fingerprint.sha256),path_key(&path)?,op.operation])?;
                     super::asset_writes::upsert_asset_row(&tx,record,chrono::Utc::now().timestamp())?;
                     super::asset_writes::update_status_to_downloaded(&tx,&op.library,&op.child,record.version_size.as_str(),&path,&data_encoding::HEXLOWER.encode(&installed.fingerprint.sha256),installed.source_checksum.as_deref(),false,chrono::Utc::now().timestamp())?;
-                    tx.execute("UPDATE assets SET metadata_write_failed_at=NULL WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND checksum=?5 AND metadata_hash IS ?6",params![op.library,op.child,record.version_size.as_str(),path.to_string_lossy(),record.checksum.as_ref(),record.metadata.metadata_hash])?;
-                    tx.execute("UPDATE asset_metadata_paths SET metadata_write_failed_at=NULL,source_checksum=?7 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND provider_checksum=?5 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND a.metadata_hash IS ?6)",params![op.library,op.child,record.version_size.as_str(),path.to_string_lossy(),record.checksum.as_ref(),record.metadata.metadata_hash,installed.source_checksum])?;
-                    super::provider_generations::record_layout_destination(&tx,record,installed,op.metadata_flags)?;
+                    if let Some((catalog,source)) = debt {
+                        let catalog_marker=catalog.and_then(|d|d.0);
+                        let source_marker=source.and_then(|d|d.0);
+                        tx.execute("UPDATE assets SET metadata_write_failed_at=?4 WHERE library=?1 AND id=?2 AND version_size=?3",params![op.library,op.child,record.version_size.as_str(),catalog_marker])?;
+                        tx.execute("UPDATE asset_metadata_paths SET metadata_write_failed_at=?5,source_checksum=?6 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4",params![op.library,op.child,record.version_size.as_str(),path.to_string_lossy(),source_marker,installed.source_checksum])?;
+                    } else {
+                        tx.execute("UPDATE assets SET metadata_write_failed_at=NULL WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND checksum=?5 AND metadata_hash IS ?6",params![op.library,op.child,record.version_size.as_str(),path.to_string_lossy(),record.checksum.as_ref(),record.metadata.metadata_hash])?;
+                        tx.execute("UPDATE asset_metadata_paths SET metadata_write_failed_at=NULL,source_checksum=?7 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND provider_checksum=?5 AND EXISTS(SELECT 1 FROM assets a WHERE a.library=?1 AND a.id=?2 AND a.version_size=?3 AND a.metadata_hash IS ?6)",params![op.library,op.child,record.version_size.as_str(),path.to_string_lossy(),record.checksum.as_ref(),record.metadata.metadata_hash,installed.source_checksum])?;
+                    }
+                    super::provider_generations::record_layout_destination(&tx,record,installed,op.metadata_flags,metadata_verified)?;
                     files.push(installed.clone());
                 }
             }
-            if op.members.iter().any(|member|member.record.is_some()) {
+            if all_metadata_verified && op.members.iter().any(|member|member.record.is_some()) {
                 // Match the ordinary verified-download finalizer: the selected
                 // metadata was captured from the confirmed provider source and
                 // committed with its independently validated files.
@@ -1211,6 +1498,48 @@ mod tests {
         AssetMetadata, AssetRecord, AssetStatus, MediaType, SqliteStateDb, VersionSizeKey,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn copied_metadata_evidence_is_new_and_old_reader_fails_closed() {
+        // This mirrors the prior serialized field set, including its strict
+        // unknown-field rule; it does not manufacture an owner receipt.
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct LegacyLayoutFile {
+            path: serde_json::Value,
+            version: serde_json::Value,
+            provider_checksum: serde_json::Value,
+            fingerprint: serde_json::Value,
+            source_checksum: serde_json::Value,
+            sidecar: serde_json::Value,
+            archive_original: serde_json::Value,
+            metadata_decision: serde_json::Value,
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let op = fixture(root.path());
+        let original = op.members[0].old.as_ref().unwrap().clone();
+        let old_json = serde_json::to_value(&original).unwrap();
+        assert!(old_json.get("metadata_outcome").is_none());
+        serde_json::from_value::<LegacyLayoutFile>(old_json.clone()).unwrap();
+        let reopened: LayoutFile = serde_json::from_value(old_json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&reopened).unwrap(), old_json);
+
+        let mut copied = original.clone();
+        copied.metadata_outcome = Some(super::LayoutMetadataOutcome::Copied {
+            source: original.path.clone(),
+            fingerprint: original.fingerprint.clone(),
+            sidecar: original.sidecar.clone(),
+            source_checksum: original.source_checksum.clone(),
+            previous_decision: original.metadata_decision.clone(),
+        });
+        let new_json = serde_json::to_value(copied).unwrap();
+        assert!(
+            serde_json::from_value::<LegacyLayoutFile>(new_json).is_err(),
+            "older strict readers must reject a new copied outcome"
+        );
+    }
 
     fn fixture(root: &std::path::Path) -> LayoutOperation {
         let identity_file = std::fs::File::create(root.join("identity")).unwrap();
@@ -1276,6 +1605,7 @@ mod tests {
             sidecar: Some(fingerprint.clone()),
             archive_original: false,
             metadata_decision: Some("old-metadata-transform".into()),
+            metadata_outcome: None,
         };
         LayoutOperation {
             operation: "operation-1".into(),

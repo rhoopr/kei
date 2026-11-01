@@ -97,6 +97,7 @@ async fn v027_indexing_running_finished_quiet_preserves_recorded_layout() {
             sidecar: None,
             archive_original: false,
             metadata_decision: None,
+            metadata_outcome: None,
         }],
     };
     let binding_bytes = serde_json::to_vec(&binding).unwrap();

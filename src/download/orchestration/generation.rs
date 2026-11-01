@@ -193,6 +193,44 @@ pub(super) async fn hold_retained_debt(
     Ok(())
 }
 
+// Exercise the real selector up to its admitted decision, without dispatching
+// media tasks. Test-only: no rows or trust are inserted by the fixture.
+#[cfg(all(test, target_os = "linux", feature = "xmp"))]
+pub(crate) async fn project_test_selection(
+    config: &DownloadConfig,
+    pass: &AlbumPass,
+) -> Result<String> {
+    let config = config.with_pass(pass).check_ownership().await?;
+    let passes = [pass.clone()];
+    let context = context(&passes, &config, DownloadControls::download_hidden())
+        .await?
+        .context("no authenticated selection context")?;
+    let run = context.start(&passes, &config).await?;
+    let observed = pass
+        .album
+        .confirm_layout_asset("asset-501", "PrimarySync")
+        .await?
+        .asset;
+    let key = pass_key(pass);
+    let (asset, confirmation) = run.confirm(&key, observed).await?;
+    let mut planner = TaskPlanner::for_download(config.state_db.as_deref()).await?;
+    let mut plan = planner.plan_download_asset(&asset, &config).await?;
+    anyhow::ensure!(
+        run.project(
+            &key,
+            &asset,
+            confirmation,
+            &mut plan,
+            &mut planner,
+            &config,
+            &CancellationToken::new()
+        )
+        .await?,
+        "normal selector did not admit the decision"
+    );
+    Ok(run.root.id.clone())
+}
+
 pub(crate) async fn context(
     passes: &[AlbumPass],
     config: &DownloadConfig,

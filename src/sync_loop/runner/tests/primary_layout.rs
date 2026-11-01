@@ -220,6 +220,8 @@ struct CycleOptions {
     cycle_token: Option<&'static str>,
     trace: Option<RequestTrace>,
     refresh_metadata: bool,
+    edited: bool,
+    unfiled_all: bool,
     embed_rating: bool,
     media_directory: &'static str,
     state_file: &'static str,
@@ -246,6 +248,8 @@ impl Default for CycleOptions {
             cycle_token: None,
             trace: None,
             refresh_metadata: false,
+            edited: true,
+            unfiled_all: false,
             embed_rating: false,
             media_directory: "media",
             state_file: "state.db",
@@ -319,7 +323,11 @@ async fn try_cycle_options(
             crate::icloud::photos::PhotoAlbumConfig {
                 params: Arc::default(),
                 service_endpoint: Arc::from("https://example.com"),
-                name: Arc::from("TestAlbum"),
+                name: if options.unfiled_all && options.pass_kind == PassKind::Unfiled {
+                    Arc::from("")
+                } else {
+                    Arc::from("TestAlbum")
+                },
                 list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
                 obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
                 query_filter: None,
@@ -385,7 +393,7 @@ async fn try_cycle_options(
         let config = Arc::make_mut(&mut config);
         config.refresh_metadata = options.refresh_metadata;
         config.metadata.set_exif_rating = options.embed_rating;
-        config.edited = true;
+        config.edited = options.edited;
         config.edited_naming = naming;
         config.recent = options
             .indexing
@@ -414,7 +422,7 @@ async fn try_cycle_options(
     config.download.folder_structure_smart_folders = options.folder_structure.to_owned();
     config.runtime.refresh_metadata = options.refresh_metadata;
     config.metadata.set_exif_rating = options.embed_rating;
-    config.photos.edited = true;
+    config.photos.edited = options.edited;
     config.photos.edited_naming = naming;
     config.photos.resolution = resolution;
     #[cfg(feature = "xmp")]
@@ -443,6 +451,28 @@ async fn try_cycle_options(
     drop(db);
     Ok((result, lookups.load(Ordering::SeqCst)))
 }
+#[cfg(feature = "xmp")]
+fn assert_no_original_metadata_debt(db: &state::SqliteStateDb) {
+    let conn = db
+        .acquire_lock("synthetic original debt precondition")
+        .unwrap();
+    let (asset, paths): (i64, i64) = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND (metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL)), (SELECT COUNT(*) FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND (metadata_write_failed_at IS NOT NULL OR capture_repair_metadata_hash IS NOT NULL OR capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL))",
+        [], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(
+        (asset, paths),
+        (0, 0),
+        "fixture must not suppress authentic original debt"
+    );
+    let albums: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM asset_albums WHERE library='PrimarySync' AND asset_id='asset-501'",
+        [], |r|r.get(0)).unwrap();
+    assert_eq!(
+        albums, 0,
+        "production Unfiled scope must not invent album membership"
+    );
+}
+
 fn assert_bytes(path: &std::path::Path, bytes: &[u8]) {
     assert_eq!(std::fs::read(path).unwrap(), bytes, "{}", path.display());
 }
@@ -9303,5 +9333,3545 @@ async fn review501_unreceipted_refresh_stage_remains_safely_held() {
         );
         assert_eq!(server.received_requests().await.unwrap().len(), requests);
         eprintln!("REVIEW501_REACHED safe_hold_verified sidecar={sidecar}");
+    }
+}
+
+/// A released-style owner-created selected-original operation must preserve the
+/// original sidecar packet at its staged and visible archive destinations.
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn recorded_selected_original_preserves_exact_sidecar_packet_through_recovery() {
+    use crate::state::MetadataRewriteStore as _;
+
+    async fn original_gets(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method.to_string() == "GET" && request.url.path() == "/original"
+            })
+            .count()
+    }
+    fn media_tree(
+        root: &std::path::Path,
+    ) -> Vec<(
+        std::path::PathBuf,
+        Vec<u8>,
+        std::time::SystemTime,
+        crate::fs_util::FileIdentity,
+    )> {
+        fn walk(
+            root: &std::path::Path,
+            dir: &std::path::Path,
+            out: &mut Vec<(
+                std::path::PathBuf,
+                Vec<u8>,
+                std::time::SystemTime,
+                crate::fs_util::FileIdentity,
+            )>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let ty = entry.file_type().unwrap();
+                if ty.is_dir() {
+                    walk(root, &entry.path(), out);
+                } else {
+                    assert!(ty.is_file());
+                    let file = std::fs::File::open(entry.path()).unwrap();
+                    out.push((
+                        entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(entry.path()).unwrap(),
+                        file.metadata().unwrap().modified().unwrap(),
+                        crate::fs_util::file_identity(&file).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut result = Vec::new();
+        walk(root, root, &mut result);
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+    }
+    fn durable_receipts(path: &std::path::Path) -> Vec<Vec<String>> {
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        [
+            "SELECT json_array(id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,trust_receipt,selected_metadata_hash,generation_id) FROM download_receipts ORDER BY id",
+            "SELECT json_array(library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum,source_checksum,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size) FROM asset_metadata_paths ORDER BY library,id,version_size,local_path",
+            "SELECT json_array(operation,member,hex(native_path),media_checksum,sidecar_checksum,hex(evidence)) FROM primary_layout_preserved ORDER BY operation,member",
+            "SELECT json_array(path_key,family,operation,library,child,version,provider_checksum,local_checksum,hex(native_path)) FROM primary_layout_claims ORDER BY path_key",
+            "SELECT json_array(family,library,source_library,child,generation,decision,policy,hex(binding)) FROM primary_layout_bindings ORDER BY family",
+        ].iter().map(|sql| {
+            let mut stmt=conn.prepare(sql).unwrap();
+            stmt.query_map([], |row| row.get::<_,String>(0)).unwrap()
+                .collect::<Result<Vec<_>,_>>().unwrap()
+        }).collect()
+    }
+
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let options = || CycleOptions {
+        private: true,
+        unfiled_all: true,
+        sidecar: true,
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
+        root.path(),
+        records(&server, Some(("edit-one", EDIT_ONE))),
+        false,
+        EditedNaming::Primary,
+        CycleOptions {
+            edited: false,
+            ..options()
+        },
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    assert!(initial.db_sync_token_advance_safe);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(
+                |request| request.method.to_string() == "GET" && request.url.path() == "/edit-one"
+            )
+            .count(),
+        0,
+        "initial owner selects only the original"
+    );
+    let initial_original_gets = original_gets(&server).await;
+    assert_eq!(
+        initial_original_gets, 1,
+        "initial owner must fetch the original exactly once"
+    );
+    let primary = media.join("IMG_0501.JPG");
+    let archive = media.join("IMG_0501_original.JPG");
+    let original_xmp = media.join("IMG_0501.JPG.xmp");
+    let archive_xmp = media.join("IMG_0501_original.JPG.xmp");
+    assert_bytes(&primary, ORIGINAL);
+    let packet = std::fs::read_to_string(&original_xmp).unwrap();
+    let field =
+        r#"<fixture:UserNote xmlns:fixture="urn:kei-test:user">retain-my-note</fixture:UserNote>"#;
+    let annotated = packet.replace("</rdf:Description>", &format!("{field}</rdf:Description>"));
+    assert_ne!(annotated, packet, "synthetic user metadata must be present");
+    std::fs::write(&original_xmp, annotated.as_bytes()).unwrap();
+    let old_xmp = std::fs::read(&original_xmp).unwrap();
+    assert!(!old_xmp.is_empty());
+    let old_xmp_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(&old_xmp));
+
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let wrong_owner = state::db::account::AccountOwner::authenticated(
+        "other@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"other-provider"}})).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        state::SqliteStateDb::open_owned(&root.path().join("state.db"), &wrong_owner).await,
+        Err(state::error::StateError::AccountOwnerMismatch)
+    ));
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    let provider = Session {
+        reported_count: None,
+        records: records(&server, Some(("edit-one", EDIT_ONE))),
+        quiet: true,
+        lookups: Arc::new(AtomicUsize::new(0)),
+        current: None,
+        lookup_change: None,
+        indexing: None,
+        baseline_successor: None,
+        cycle_token: None,
+        trace: None,
+    };
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::default(),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from(""),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(provider),
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com"),
+        Arc::from("private"),
+    );
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::default(),
+    };
+    let scope = json!({
+        "zone":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+        "name":"", "list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+        "obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted", "query_filter":null,
+        "container_id":null, "cross_zone_sources":[]
+    });
+    assert_eq!(pass.album.selection_scope(), scope);
+    let expected_pass = format!(
+        "{:x}",
+        Sha256::digest(
+            json!({"kind":"Unfiled","scope":scope,"excludes":[]})
+                .to_string()
+                .as_bytes()
+        )
+    );
+    let expected_db_scope =
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com")
+            .scope(
+                "private",
+                &json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+            )
+            .unwrap();
+    let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+    let source_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL));
+    let source_native = state::db::provider_selection::SelectionPath::from_path(&primary)
+        .key()
+        .unwrap();
+    let source_receipts: Vec<String> = {
+        let conn = db.acquire_lock("initial compact original source").unwrap();
+        let mut stmt = conn.prepare("SELECT json_array(id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,trust_receipt,selected_metadata_hash,generation_id) FROM download_receipts WHERE library='PrimarySync' AND child='asset-501' AND version_size='original' ORDER BY id").unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        source_receipts.len(),
+        1,
+        "normal owner must create one source-backed compact original receipt"
+    );
+    let source_receipt: Value = serde_json::from_str(&source_receipts[0]).unwrap();
+    assert!(!source_receipt[0].as_str().unwrap().is_empty());
+    assert_eq!(source_receipt[1], account_key);
+    assert_eq!(source_receipt[2], provider_key);
+    assert_eq!(source_receipt[3], expected_db_scope);
+    assert_eq!(source_receipt[4], "PrimarySync");
+    assert_eq!(source_receipt[5], "asset-501");
+    assert_eq!(source_receipt[6], "501");
+    assert_eq!(source_receipt[7], "asset-501");
+    assert_eq!(source_receipt[8], expected_pass);
+    assert_eq!(source_receipt[9], "original");
+    assert_eq!(source_receipt[10], provider_hash(ORIGINAL));
+    assert_eq!(source_receipt[11], ORIGINAL.len());
+    assert_eq!(source_receipt[12], source_native);
+    assert_eq!(source_receipt[13], source_hash);
+    assert_eq!(source_receipt[14], source_hash);
+    assert!(!source_receipt[15].as_str().unwrap().is_empty());
+    assert!(
+        source_receipt[16].is_null()
+            && source_receipt[17].is_null()
+            && source_receipt[18].is_null()
+    );
+    let source_path_receipt: (String, String, String, String) = {
+        let conn = db
+            .acquire_lock("initial exact original path receipt")
+            .unwrap();
+        conn.query_row("SELECT provider_checksum,source_checksum,local_checksum,download_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?1",
+            [primary.to_str().unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap()
+    };
+    assert_eq!(
+        source_path_receipt,
+        (
+            provider_hash(ORIGINAL),
+            source_hash.clone(),
+            source_hash.clone(),
+            source_hash.clone()
+        )
+    );
+    assert_no_original_metadata_debt(&db);
+    let store: Arc<dyn download::DownloadStore> = db.clone();
+    let build = make_run_cycle_download_config_builder(&media, store);
+    let mut config = build(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from("PrimarySync"),
+    )
+    .as_ref()
+    .clone();
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    config.edited_naming = EditedNaming::Primary;
+    config.metadata.xmp_sidecar = true;
+    assert!(!config.refresh_metadata);
+    let op = download::seed_prepared_edited_compat(&config, &pass).await;
+    assert_eq!(
+        original_gets(&server).await,
+        initial_original_gets,
+        "preparation must reuse the proved original"
+    );
+    assert_eq!(op.phase, "prepared");
+    assert_eq!(op.source_library, "PrimarySync");
+    assert_eq!(op.child, "asset-501");
+    assert_eq!(op.pass, expected_pass);
+    assert!(!op.refresh_metadata);
+    let original = op
+        .members
+        .iter()
+        .find(|member| {
+            member.record.as_ref().is_some_and(|record| {
+                record.version_size.as_str() == "original"
+                    && record.checksum.as_ref() == provider_hash(ORIGINAL)
+            })
+        })
+        .expect("selected original must be part of the recorded operation");
+    assert!(
+        original.archive_source.is_none(),
+        "exercise selected original, not archive-only branch"
+    );
+    assert_eq!(original.destination.as_ref().unwrap().to_path(), archive);
+    let adjusted = op
+        .members
+        .iter()
+        .find(|member| {
+            member.record.as_ref().is_some_and(|r| {
+                r.version_size.as_str() == "adjusted"
+                    && r.checksum.as_ref() == provider_hash(EDIT_ONE)
+            })
+        })
+        .expect("the independent adjusted rendition must be selected");
+    let adjusted_prepared = adjusted
+        .prepared
+        .as_ref()
+        .expect("fresh adjusted rendition prepared");
+    assert!(
+        adjusted_prepared.metadata_outcome.is_none(),
+        "fresh download uses the established untagged contract"
+    );
+    assert!(adjusted_prepared.metadata_decision.is_some());
+    assert_bytes(&adjusted_prepared.path.to_path(), EDIT_ONE);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(
+                |request| request.method.to_string() == "GET" && request.url.path() == "/edit-one"
+            )
+            .count(),
+        1,
+        "fresh adjusted rendition must be downloaded exactly once"
+    );
+    let stage = original.stage.as_ref().unwrap().to_path();
+    let prepared = original
+        .prepared
+        .as_ref()
+        .expect("selected original is durably prepared");
+    assert_eq!(prepared.path.to_path(), stage);
+    match prepared
+        .metadata_outcome
+        .as_ref()
+        .expect("copied outcome must be durable")
+    {
+        state::db::primary_layout::LayoutMetadataOutcome::Copied {
+            source,
+            fingerprint,
+            sidecar,
+            source_checksum,
+            previous_decision,
+        } => {
+            assert_eq!(source.to_path(), primary);
+            assert_eq!(
+                data_encoding::HEXLOWER.encode(&fingerprint.sha256),
+                source_hash
+            );
+            assert_eq!(
+                sidecar
+                    .as_ref()
+                    .map(|f| data_encoding::HEXLOWER.encode(&f.sha256)),
+                Some(old_xmp_hash.clone())
+            );
+            assert_eq!(source_checksum.as_deref(), Some(source_hash.as_str()));
+            assert_eq!(previous_decision, &prepared.metadata_decision);
+        }
+    }
+    assert_eq!(prepared.provider_checksum, provider_hash(ORIGINAL));
+    assert_eq!(
+        prepared.source_checksum.as_deref(),
+        Some(source_hash.as_str())
+    );
+    assert_bytes(&stage, ORIGINAL);
+    assert!(
+        op.members
+            .iter()
+            .filter_map(|member| member.old.as_ref())
+            .any(|old| old.path.to_path() == primary
+                && old.version == "original"
+                && old.provider_checksum == provider_hash(ORIGINAL)
+                && old.source_checksum.as_deref() == Some(source_hash.as_str())
+                && data_encoding::HEXLOWER.encode(&old.fingerprint.sha256) == source_hash
+                && old
+                    .sidecar
+                    .as_ref()
+                    .is_some_and(|fp| data_encoding::HEXLOWER.encode(&fp.sha256) == old_xmp_hash))
+    );
+    let original_claim: i64 = {
+        let conn = db.acquire_lock("selected original archive claim").unwrap();
+        conn.query_row("SELECT COUNT(*) FROM primary_layout_claims WHERE operation=?1 AND family=?2 AND path_key=?3 AND library='PrimarySync' AND child='asset-501' AND version='original' AND provider_checksum=?4",
+            rusqlite::params![op.operation,op.family,original.path_key.as_deref().unwrap(),provider_hash(ORIGINAL)],
+            |row| row.get(0)).unwrap()
+    };
+    assert_eq!(original_claim, 1);
+    assert!(matches!(db.guard_primary_writer(&primary).await,
+        Err(state::error::StateError::Invariant { operation: "primary_layout", detail })
+        if detail == "managed primary slot requires its layout publication owner"
+    ));
+    assert_eq!(
+        db.primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut stage_xmp_name = stage.as_os_str().to_os_string();
+    stage_xmp_name.push(".xmp");
+    let stage_xmp = std::path::PathBuf::from(stage_xmp_name);
+    assert_bytes(&original_xmp, &old_xmp);
+    assert_bytes(&stage_xmp, &old_xmp);
+    let stage_fingerprint = prepared.sidecar.as_ref().expect("prepared sidecar receipt");
+    assert_eq!(
+        data_encoding::HEXLOWER.encode(&stage_fingerprint.sha256),
+        old_xmp_hash
+    );
+    assert_eq!(stage_fingerprint.size, old_xmp.len() as u64);
+    eprintln!("VISIBLE_ARCHIVE_EXACT_STAGE_REACHED");
+
+    let requests = server.received_requests().await.unwrap().len();
+    let op_id = op.operation.clone();
+    let family = op.family.clone();
+    let closed = Arc::downgrade(&db);
+    drop(config);
+    drop(build);
+    drop(pass);
+    drop(db);
+    assert!(
+        closed.upgrade().is_none(),
+        "all first-owner handles must close before recovery"
+    );
+    let (recovered, _) = cycle_options(
+        root.path(),
+        records(&server, Some(("edit-one", EDIT_ONE))),
+        true,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await;
+    assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
+    assert!(recovered.db_sync_token_advance_safe);
+    assert_eq!(recovered.stats.downloaded, 0);
+    assert_bytes(&primary, EDIT_ONE);
+    assert_bytes(&archive, ORIGINAL);
+    assert_bytes(&archive_xmp, &old_xmp);
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    assert_eq!(
+        original_gets(&server).await,
+        initial_original_gets,
+        "recovery must not redownload the original"
+    );
+    let reopened = Arc::new(
+        state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        reopened
+            .primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let binding = reopened
+        .primary_layout_binding(family.clone())
+        .await
+        .unwrap()
+        .expect("owner-committed binding");
+    assert_eq!(binding.family, family);
+    assert_eq!(binding.library, "PrimarySync");
+    assert_eq!(binding.child, "asset-501");
+    assert_eq!(binding.generation, op.generation + 1);
+    assert!(
+        binding
+            .files
+            .iter()
+            .any(|file| file.path.to_path() == primary
+                && file.version == "adjusted"
+                && file.provider_checksum == provider_hash(EDIT_ONE)
+                && file.metadata_outcome.is_none()
+                && file.metadata_decision.is_some()),
+        "fresh adjusted member must settle through its existing contract"
+    );
+    let adjusted_binding = binding
+        .files
+        .iter()
+        .find(|file| {
+            file.path.to_path() == primary
+                && file.version == "adjusted"
+                && file.provider_checksum == provider_hash(EDIT_ONE)
+        })
+        .unwrap();
+    let adjusted_xmp = std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap();
+    assert!(!adjusted_xmp.is_empty());
+    assert_eq!(
+        adjusted_binding.sidecar.as_ref().map(|f| f.sha256),
+        Some(Sha256::digest(&adjusted_xmp).into())
+    );
+    let adjusted_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_ONE));
+    let adjusted_state: (String, String, String, String) = {
+        let conn = reopened
+            .acquire_lock("fresh adjusted finalized state")
+            .unwrap();
+        conn.query_row("SELECT a.status,a.local_path,a.local_checksum,p.source_checksum FROM assets a JOIN asset_metadata_paths p ON p.library=a.library AND p.id=a.id AND p.version_size=a.version_size AND p.local_path=a.local_path WHERE a.library='PrimarySync' AND a.id='asset-501' AND a.version_size='adjusted' AND a.checksum=?1",
+            [provider_hash(EDIT_ONE)], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap()
+    };
+    assert_eq!(
+        adjusted_state,
+        (
+            "downloaded".into(),
+            primary.to_str().unwrap().into(),
+            adjusted_hash.clone(),
+            adjusted_hash
+        )
+    );
+    assert!(binding.files.iter().any(|file| {
+        file.path.to_path() == archive
+            && file.version == "original"
+            && file.provider_checksum == provider_hash(ORIGINAL)
+            && matches!(&file.metadata_outcome,
+                Some(state::db::primary_layout::LayoutMetadataOutcome::Copied { source, fingerprint, sidecar, source_checksum, previous_decision })
+                if source.to_path() == primary
+                    && data_encoding::HEXLOWER.encode(&fingerprint.sha256) == source_hash
+                    && sidecar.as_ref().is_some_and(|f|data_encoding::HEXLOWER.encode(&f.sha256)==old_xmp_hash)
+                    && source_checksum.as_deref()==Some(source_hash.as_str())
+                    && previous_decision==&file.metadata_decision)
+            && file
+                .sidecar
+                .as_ref()
+                .is_some_and(|fp| data_encoding::HEXLOWER.encode(&fp.sha256) == old_xmp_hash)
+    }));
+    let (preserved_native, preserved_sidecar): (String, String) = {
+        let conn = reopened
+            .acquire_lock("exact old packet preservation")
+            .unwrap();
+        let mut stmt=conn.prepare("SELECT CAST(native_path AS TEXT),sidecar_checksum FROM primary_layout_preserved WHERE operation=?1 AND json_extract(CAST(evidence AS TEXT),'$.version')='original' AND json_extract(CAST(evidence AS TEXT),'$.provider_checksum')=?2").unwrap();
+        let rows = stmt
+            .query_map(rusqlite::params![op_id, provider_hash(ORIGINAL)], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<(String, String)>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one owner-recorded original history receipt"
+        );
+        rows.into_iter().next().unwrap()
+    };
+    assert_eq!(preserved_sidecar, old_xmp_hash);
+    let preserved: state::db::provider_selection::SelectionPath =
+        serde_json::from_str(&preserved_native).unwrap();
+    let mut preserved_xmp = preserved.to_path().into_os_string();
+    preserved_xmp.push(".xmp");
+    assert_bytes(&std::path::PathBuf::from(preserved_xmp), &old_xmp);
+    assert!(matches!(reopened.guard_primary_writer(&primary).await,
+        Err(state::error::StateError::Invariant { operation: "primary_layout", detail })
+        if detail == "managed primary slot requires its layout publication owner"
+    ));
+    let stale_marker: i64 = {
+        let conn = reopened
+            .acquire_lock("actual stale original marker")
+            .unwrap();
+        conn.query_row("SELECT metadata_write_failed_at FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?1 AND provider_checksum=?2",
+            rusqlite::params![primary.to_str().unwrap(),provider_hash(ORIGINAL)], |row| row.get(0)).unwrap()
+    };
+    assert!(
+        stale_marker > 0,
+        "the stale queue fence requires a real outstanding marker"
+    );
+    let pending = reopened.get_pending_metadata_rewrites(100).await.unwrap();
+    assert!(
+        pending.len() < 100,
+        "queue proof must not stop at the page limit"
+    );
+    assert!(
+        pending
+            .iter()
+            .all(|row| row.local_path.as_deref() != Some(primary.as_path())
+                || row.version_size.as_str() != "original"),
+        "the actual stale original marker cannot enter the ordinary writer queue for adjusted Primary"
+    );
+    let post_recovery_tree = media_tree(&media);
+    let post_recovery_receipts = durable_receipts(&root.path().join("state.db"));
+    let checkpoint = reopened
+        .get_metadata("sync_token:PrimarySync")
+        .await
+        .unwrap();
+    let closed = Arc::downgrade(&reopened);
+    drop(reopened);
+    assert!(closed.upgrade().is_none());
+    let (quiet, lookups) = cycle_options(
+        root.path(),
+        records(&server, Some(("edit-one", EDIT_ONE))),
+        true,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await;
+    assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+    assert!(quiet.db_sync_token_advance_safe);
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(lookups, 0);
+    assert_bytes(&primary, EDIT_ONE);
+    assert_bytes(&archive, ORIGINAL);
+    assert_bytes(&archive_xmp, &old_xmp);
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    assert_eq!(
+        original_gets(&server).await,
+        initial_original_gets,
+        "quiet cycle must not redownload original"
+    );
+    assert_eq!(
+        media_tree(&media),
+        post_recovery_tree,
+        "quiet cycle must preserve exact complete media tree"
+    );
+    assert_eq!(
+        durable_receipts(&root.path().join("state.db")),
+        post_recovery_receipts,
+        "quiet cycle must preserve all path, compact, history, claim and binding receipts"
+    );
+    let reopened = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap(),
+        checkpoint
+    );
+    eprintln!("VISIBLE_ARCHIVE_EXACT_RECOVERY_REACHED");
+}
+
+#[cfg(all(target_os = "linux", feature = "xmp"))]
+#[tokio::test]
+async fn recorded_selected_original_debt_after_prepare_blocks_visible_publication() {
+    use crate::state::MetadataRewriteStore as _;
+
+    async fn original_gets(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method.to_string() == "GET" && request.url.path() == "/original"
+            })
+            .count()
+    }
+    fn media_tree(
+        root: &std::path::Path,
+    ) -> Vec<(
+        std::path::PathBuf,
+        Vec<u8>,
+        std::time::SystemTime,
+        crate::fs_util::FileIdentity,
+    )> {
+        fn walk(
+            root: &std::path::Path,
+            dir: &std::path::Path,
+            out: &mut Vec<(
+                std::path::PathBuf,
+                Vec<u8>,
+                std::time::SystemTime,
+                crate::fs_util::FileIdentity,
+            )>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let ty = entry.file_type().unwrap();
+                if ty.is_dir() {
+                    walk(root, &entry.path(), out);
+                } else {
+                    assert!(ty.is_file());
+                    let file = std::fs::File::open(entry.path()).unwrap();
+                    out.push((
+                        entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(entry.path()).unwrap(),
+                        file.metadata().unwrap().modified().unwrap(),
+                        crate::fs_util::file_identity(&file).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut result = Vec::new();
+        walk(root, root, &mut result);
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+    }
+    fn durable_receipts(path: &std::path::Path) -> Vec<Vec<String>> {
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        [
+            "SELECT json_array(id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,trust_receipt,selected_metadata_hash,generation_id) FROM download_receipts ORDER BY id",
+            "SELECT json_array(library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum,source_checksum,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size) FROM asset_metadata_paths ORDER BY library,id,version_size,local_path",
+            "SELECT json_array(operation,member,hex(native_path),media_checksum,sidecar_checksum,hex(evidence)) FROM primary_layout_preserved ORDER BY operation,member",
+            "SELECT json_array(path_key,family,operation,library,child,version,provider_checksum,local_checksum,hex(native_path)) FROM primary_layout_claims ORDER BY path_key",
+            "SELECT json_array(family,library,source_library,child,generation,decision,policy,hex(binding)) FROM primary_layout_bindings ORDER BY family",
+            "SELECT json_array(operation,family,library,source_library,prior_generation,decision,policy,phase,hex(header),conflict) FROM primary_layout_operations ORDER BY operation",
+            "SELECT json_array(operation,member,hex(evidence)) FROM primary_layout_members ORDER BY operation,member",
+        ].iter().map(|sql| {
+            let mut stmt=conn.prepare(sql).unwrap();
+            stmt.query_map([], |row| row.get::<_,String>(0)).unwrap()
+                .collect::<Result<Vec<_>,_>>().unwrap()
+        }).collect()
+    }
+
+    fn original_asset_and_checkpoints(path: &std::path::Path) -> Vec<Vec<Vec<String>>> {
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        ["SELECT * FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='original'", "SELECT * FROM metadata WHERE key LIKE '%token%'", "SELECT * FROM scoped_db_sync_tokens"].iter().map(|sql| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let columns = stmt.column_count();
+            let mut rows = stmt.query_map([], |row| (0..columns).map(|i| row.get_ref(i).map(|value| format!("{value:?}"))).collect::<Result<Vec<_>, _>>()).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            rows.sort();
+            rows
+        }).collect()
+    }
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let options = || CycleOptions {
+        private: true,
+        unfiled_all: true,
+        sidecar: true,
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
+        root.path(),
+        records(&server, Some(("edit-one", EDIT_ONE))),
+        false,
+        EditedNaming::Primary,
+        CycleOptions {
+            edited: false,
+            ..options()
+        },
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    assert!(initial.db_sync_token_advance_safe);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(
+                |request| request.method.to_string() == "GET" && request.url.path() == "/edit-one"
+            )
+            .count(),
+        0,
+        "initial owner selects only the original"
+    );
+    let initial_original_gets = original_gets(&server).await;
+    assert_eq!(
+        initial_original_gets, 1,
+        "initial owner must fetch the original exactly once"
+    );
+    let primary = media.join("IMG_0501.JPG");
+    let archive = media.join("IMG_0501_original.JPG");
+    let original_xmp = media.join("IMG_0501.JPG.xmp");
+    let archive_xmp = media.join("IMG_0501_original.JPG.xmp");
+    assert_bytes(&primary, ORIGINAL);
+    let packet = std::fs::read_to_string(&original_xmp).unwrap();
+    let field =
+        r#"<fixture:UserNote xmlns:fixture="urn:kei-test:user">retain-my-note</fixture:UserNote>"#;
+    let annotated = packet.replace("</rdf:Description>", &format!("{field}</rdf:Description>"));
+    assert_ne!(annotated, packet, "synthetic user metadata must be present");
+    std::fs::write(&original_xmp, annotated.as_bytes()).unwrap();
+    let old_xmp = std::fs::read(&original_xmp).unwrap();
+    assert!(!old_xmp.is_empty());
+    let old_xmp_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(&old_xmp));
+
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let wrong_owner = state::db::account::AccountOwner::authenticated(
+        "other@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"other-provider"}})).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        state::SqliteStateDb::open_owned(&root.path().join("state.db"), &wrong_owner).await,
+        Err(state::error::StateError::AccountOwnerMismatch)
+    ));
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    let provider = Session {
+        reported_count: None,
+        records: records(&server, Some(("edit-one", EDIT_ONE))),
+        quiet: true,
+        lookups: Arc::new(AtomicUsize::new(0)),
+        current: None,
+        lookup_change: None,
+        indexing: None,
+        baseline_successor: None,
+        cycle_token: None,
+        trace: None,
+    };
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::default(),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from(""),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(provider),
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com"),
+        Arc::from("private"),
+    );
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::default(),
+    };
+    let scope = json!({
+        "zone":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+        "name":"", "list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+        "obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted", "query_filter":null,
+        "container_id":null, "cross_zone_sources":[]
+    });
+    assert_eq!(pass.album.selection_scope(), scope);
+    let expected_pass = format!(
+        "{:x}",
+        Sha256::digest(
+            json!({"kind":"Unfiled","scope":scope,"excludes":[]})
+                .to_string()
+                .as_bytes()
+        )
+    );
+    let expected_db_scope =
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com")
+            .scope(
+                "private",
+                &json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+            )
+            .unwrap();
+    let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+    let source_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL));
+    let source_native = state::db::provider_selection::SelectionPath::from_path(&primary)
+        .key()
+        .unwrap();
+    let source_receipts: Vec<String> = {
+        let conn = db.acquire_lock("initial compact original source").unwrap();
+        let mut stmt = conn.prepare("SELECT json_array(id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,trust_receipt,selected_metadata_hash,generation_id) FROM download_receipts WHERE library='PrimarySync' AND child='asset-501' AND version_size='original' ORDER BY id").unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        source_receipts.len(),
+        1,
+        "normal owner must create one source-backed compact original receipt"
+    );
+    let source_receipt: Value = serde_json::from_str(&source_receipts[0]).unwrap();
+    assert!(!source_receipt[0].as_str().unwrap().is_empty());
+    assert_eq!(source_receipt[1], account_key);
+    assert_eq!(source_receipt[2], provider_key);
+    assert_eq!(source_receipt[3], expected_db_scope);
+    assert_eq!(source_receipt[4], "PrimarySync");
+    assert_eq!(source_receipt[5], "asset-501");
+    assert_eq!(source_receipt[6], "501");
+    assert_eq!(source_receipt[7], "asset-501");
+    assert_eq!(source_receipt[8], expected_pass);
+    assert_eq!(source_receipt[9], "original");
+    assert_eq!(source_receipt[10], provider_hash(ORIGINAL));
+    assert_eq!(source_receipt[11], ORIGINAL.len());
+    assert_eq!(source_receipt[12], source_native);
+    assert_eq!(source_receipt[13], source_hash);
+    assert_eq!(source_receipt[14], source_hash);
+    assert!(!source_receipt[15].as_str().unwrap().is_empty());
+    assert!(
+        source_receipt[16].is_null()
+            && source_receipt[17].is_null()
+            && source_receipt[18].is_null()
+    );
+    let source_path_receipt: (String, String, String, String) = {
+        let conn = db
+            .acquire_lock("initial exact original path receipt")
+            .unwrap();
+        conn.query_row("SELECT provider_checksum,source_checksum,local_checksum,download_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?1",
+            [primary.to_str().unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap()
+    };
+    assert_eq!(
+        source_path_receipt,
+        (
+            provider_hash(ORIGINAL),
+            source_hash.clone(),
+            source_hash.clone(),
+            source_hash.clone()
+        )
+    );
+    assert_no_original_metadata_debt(&db);
+    let store: Arc<dyn download::DownloadStore> = db.clone();
+    let build = make_run_cycle_download_config_builder(&media, store);
+    let mut config = build(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from("PrimarySync"),
+    )
+    .as_ref()
+    .clone();
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    config.edited_naming = EditedNaming::Primary;
+    config.metadata.xmp_sidecar = true;
+    assert!(!config.refresh_metadata);
+    let mut op = download::seed_prepared_edited_compat(&config, &pass).await;
+    assert_eq!(
+        original_gets(&server).await,
+        initial_original_gets,
+        "preparation must reuse the proved original"
+    );
+    assert_eq!(op.phase, "prepared");
+    assert_eq!(op.source_library, "PrimarySync");
+    assert_eq!(op.child, "asset-501");
+    assert_eq!(op.pass, expected_pass);
+    assert!(!op.refresh_metadata);
+    let original = op
+        .members
+        .iter()
+        .find(|member| {
+            member.record.as_ref().is_some_and(|record| {
+                record.version_size.as_str() == "original"
+                    && record.checksum.as_ref() == provider_hash(ORIGINAL)
+            })
+        })
+        .expect("selected original must be part of the recorded operation");
+    assert!(
+        original.archive_source.is_none(),
+        "exercise selected original, not archive-only branch"
+    );
+    assert_eq!(original.destination.as_ref().unwrap().to_path(), archive);
+    let stage = original.stage.as_ref().unwrap().to_path();
+    let prepared = original
+        .prepared
+        .as_ref()
+        .expect("selected original is durably prepared");
+    assert_eq!(prepared.path.to_path(), stage);
+    assert_eq!(prepared.provider_checksum, provider_hash(ORIGINAL));
+    assert_eq!(
+        prepared.source_checksum.as_deref(),
+        Some(source_hash.as_str())
+    );
+    assert_bytes(&stage, ORIGINAL);
+    assert!(
+        op.members
+            .iter()
+            .filter_map(|member| member.old.as_ref())
+            .any(|old| old.path.to_path() == primary
+                && old.version == "original"
+                && old.provider_checksum == provider_hash(ORIGINAL)
+                && old.source_checksum.as_deref() == Some(source_hash.as_str())
+                && data_encoding::HEXLOWER.encode(&old.fingerprint.sha256) == source_hash
+                && old
+                    .sidecar
+                    .as_ref()
+                    .is_some_and(|fp| data_encoding::HEXLOWER.encode(&fp.sha256) == old_xmp_hash))
+    );
+    let original_claim: i64 = {
+        let conn = db.acquire_lock("selected original archive claim").unwrap();
+        conn.query_row("SELECT COUNT(*) FROM primary_layout_claims WHERE operation=?1 AND family=?2 AND path_key=?3 AND library='PrimarySync' AND child='asset-501' AND version='original' AND provider_checksum=?4",
+            rusqlite::params![op.operation,op.family,original.path_key.as_deref().unwrap(),provider_hash(ORIGINAL)],
+            |row| row.get(0)).unwrap()
+    };
+    assert_eq!(original_claim, 1);
+    assert!(matches!(db.guard_primary_writer(&primary).await,
+        Err(state::error::StateError::Invariant { operation: "primary_layout", detail })
+        if detail == "managed primary slot requires its layout publication owner"
+    ));
+    assert_eq!(
+        db.primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // The owner records pending debt after prepare; no receipt is fabricated.
+    db.record_metadata_write_failure("PrimarySync", "asset-501", "original")
+        .await
+        .unwrap();
+    let debt_before: (i64, i64) = {
+        let conn = db
+            .acquire_lock("capture owner-created metadata debt")
+            .unwrap();
+        conn.query_row("SELECT a.metadata_write_failed_at,p.metadata_write_failed_at FROM assets a JOIN asset_metadata_paths p ON a.library=p.library AND a.id=p.id AND a.version_size=p.version_size WHERE a.library='PrimarySync' AND a.id='asset-501' AND a.version_size='original' AND p.local_path=?1", [primary.to_str().unwrap()], |r| Ok((r.get(0)?,r.get(1)?))).unwrap()
+    };
+    assert_eq!(debt_before.0, debt_before.1);
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("cycle-token")
+    );
+    let asset_checkpoint_before = original_asset_and_checkpoints(&root.path().join("state.db"));
+    assert_eq!(asset_checkpoint_before[0].len(), 1);
+    let tree_before = media_tree(&media);
+    let receipts_before = durable_receipts(&root.path().join("state.db"));
+    assert_eq!(
+        db.primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(!archive.exists());
+    assert!(!archive_xmp.exists());
+    let error = download::try_finish_prepared_edited_compat(&config, &mut op)
+        .await
+        .expect_err("new owner debt must block publication");
+    assert!(
+        format!("{error:#}")
+            .contains("copied original has unresolved metadata or capture-repair debt"),
+        "unexpected hold: {error:#}"
+    );
+    assert_eq!(media_tree(&media), tree_before);
+    assert_eq!(
+        original_asset_and_checkpoints(&root.path().join("state.db")),
+        asset_checkpoint_before
+    );
+    assert_eq!(
+        durable_receipts(&root.path().join("state.db")),
+        receipts_before
+    );
+    assert_eq!(
+        db.primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let debt_after: (i64, i64) = {
+        let conn = db.acquire_lock("retained metadata debt").unwrap();
+        conn.query_row("SELECT a.metadata_write_failed_at,p.metadata_write_failed_at FROM assets a JOIN asset_metadata_paths p ON a.library=p.library AND a.id=p.id AND a.version_size=p.version_size WHERE a.library='PrimarySync' AND a.id='asset-501' AND a.version_size='original' AND p.local_path=?1", [primary.to_str().unwrap()], |r| Ok((r.get(0)?,r.get(1)?))).unwrap()
+    };
+    assert_eq!(debt_after, debt_before);
+    assert_eq!(original_gets(&server).await, initial_original_gets);
+    assert_bytes(&primary, ORIGINAL);
+    assert_bytes(&original_xmp, &old_xmp);
+    assert!(!archive.exists());
+    assert!(!archive_xmp.exists());
+    eprintln!("VISIBLE_ARCHIVE_DEBT_AFTER_PREPARE_HELD");
+}
+
+#[cfg(all(target_os = "linux", feature = "xmp"))]
+#[tokio::test]
+async fn recorded_selected_original_existing_metadata_debt_blocks_preparation() {
+    async fn original_gets(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method.to_string() == "GET" && request.url.path() == "/original"
+            })
+            .count()
+    }
+    fn media_tree(
+        root: &std::path::Path,
+    ) -> Vec<(
+        std::path::PathBuf,
+        Vec<u8>,
+        std::time::SystemTime,
+        crate::fs_util::FileIdentity,
+    )> {
+        fn walk(
+            root: &std::path::Path,
+            dir: &std::path::Path,
+            out: &mut Vec<(
+                std::path::PathBuf,
+                Vec<u8>,
+                std::time::SystemTime,
+                crate::fs_util::FileIdentity,
+            )>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let ty = entry.file_type().unwrap();
+                if ty.is_dir() {
+                    walk(root, &entry.path(), out);
+                } else {
+                    assert!(ty.is_file());
+                    let file = std::fs::File::open(entry.path()).unwrap();
+                    out.push((
+                        entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(entry.path()).unwrap(),
+                        file.metadata().unwrap().modified().unwrap(),
+                        crate::fs_util::file_identity(&file).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut result = Vec::new();
+        walk(root, root, &mut result);
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+    }
+    fn original_asset_and_checkpoints(path: &std::path::Path) -> Vec<Vec<Vec<String>>> {
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        ["SELECT * FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='original'", "SELECT * FROM metadata WHERE key LIKE '%token%'", "SELECT * FROM scoped_db_sync_tokens"].iter().map(|sql| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let columns = stmt.column_count();
+            let mut rows = stmt.query_map([], |row| (0..columns).map(|i| row.get_ref(i).map(|value| format!("{value:?}"))).collect::<Result<Vec<_>, _>>()).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            rows.sort();
+            rows
+        }).collect()
+    }
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let options = || CycleOptions {
+        private: true,
+        sidecar: true,
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    assert!(initial.db_sync_token_advance_safe);
+    let initial_original_gets = original_gets(&server).await;
+    assert_eq!(
+        initial_original_gets, 1,
+        "initial owner must fetch the original exactly once"
+    );
+    let primary = media.join("IMG_0501.JPG");
+    let archive = media.join("IMG_0501_original.JPG");
+    let original_xmp = media.join("IMG_0501.JPG.xmp");
+    let archive_xmp = media.join("IMG_0501_original.JPG.xmp");
+    assert_bytes(&primary, ORIGINAL);
+    let packet = std::fs::read_to_string(&original_xmp).unwrap();
+    let field =
+        r#"<fixture:UserNote xmlns:fixture="urn:kei-test:user">retain-my-note</fixture:UserNote>"#;
+    let annotated = packet.replace("</rdf:Description>", &format!("{field}</rdf:Description>"));
+    assert_ne!(annotated, packet, "synthetic user metadata must be present");
+    std::fs::write(&original_xmp, annotated.as_bytes()).unwrap();
+    let old_xmp = std::fs::read(&original_xmp).unwrap();
+    assert!(!old_xmp.is_empty());
+
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let wrong_owner = state::db::account::AccountOwner::authenticated(
+        "other@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"other-provider"}})).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        state::SqliteStateDb::open_owned(&root.path().join("state.db"), &wrong_owner).await,
+        Err(state::error::StateError::AccountOwnerMismatch)
+    ));
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    let provider = Session {
+        reported_count: None,
+        records: records(&server, Some(("edit-one", EDIT_ONE))),
+        quiet: true,
+        lookups: Arc::new(AtomicUsize::new(0)),
+        current: None,
+        lookup_change: None,
+        indexing: None,
+        baseline_successor: None,
+        cycle_token: None,
+        trace: None,
+    };
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::default(),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from("TestAlbum"),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(provider),
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com"),
+        Arc::from("private"),
+    );
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::default(),
+    };
+    let scope = json!({
+        "zone":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+        "name":"TestAlbum", "list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+        "obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted", "query_filter":null,
+        "container_id":null, "cross_zone_sources":[]
+    });
+    assert_eq!(pass.album.selection_scope(), scope);
+    let expected_pass = format!(
+        "{:x}",
+        Sha256::digest(
+            json!({"kind":"Unfiled","scope":scope,"excludes":[]})
+                .to_string()
+                .as_bytes()
+        )
+    );
+    let expected_db_scope =
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com")
+            .scope(
+                "private",
+                &json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+            )
+            .unwrap();
+    let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+    let source_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL));
+    let source_native = state::db::provider_selection::SelectionPath::from_path(&primary)
+        .key()
+        .unwrap();
+    let source_receipts: Vec<String> = {
+        let conn = db.acquire_lock("initial compact original source").unwrap();
+        let mut stmt = conn.prepare("SELECT json_array(id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,trust_receipt,selected_metadata_hash,generation_id) FROM download_receipts WHERE library='PrimarySync' AND child='asset-501' AND version_size='original' ORDER BY id").unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        source_receipts.len(),
+        1,
+        "normal owner must create one source-backed compact original receipt"
+    );
+    let source_receipt: Value = serde_json::from_str(&source_receipts[0]).unwrap();
+    assert!(!source_receipt[0].as_str().unwrap().is_empty());
+    assert_eq!(source_receipt[1], account_key);
+    assert_eq!(source_receipt[2], provider_key);
+    assert_eq!(source_receipt[3], expected_db_scope);
+    assert_eq!(source_receipt[4], "PrimarySync");
+    assert_eq!(source_receipt[5], "asset-501");
+    assert_eq!(source_receipt[6], "501");
+    assert_eq!(source_receipt[7], "asset-501");
+    assert_eq!(source_receipt[8], expected_pass);
+    assert_eq!(source_receipt[9], "original");
+    assert_eq!(source_receipt[10], provider_hash(ORIGINAL));
+    assert_eq!(source_receipt[11], ORIGINAL.len());
+    assert_eq!(source_receipt[12], source_native);
+    assert_eq!(source_receipt[13], source_hash);
+    assert_eq!(source_receipt[14], source_hash);
+    assert!(!source_receipt[15].as_str().unwrap().is_empty());
+    assert!(
+        source_receipt[16].is_null()
+            && source_receipt[17].is_null()
+            && source_receipt[18].is_null()
+    );
+    let source_path_receipt: (String, String, String, String) = {
+        let conn = db
+            .acquire_lock("initial exact original path receipt")
+            .unwrap();
+        conn.query_row("SELECT provider_checksum,source_checksum,local_checksum,download_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?1",
+            [primary.to_str().unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap()
+    };
+    assert_eq!(
+        source_path_receipt,
+        (
+            provider_hash(ORIGINAL),
+            source_hash.clone(),
+            source_hash.clone(),
+            source_hash.clone()
+        )
+    );
+    let store: Arc<dyn download::DownloadStore> = db.clone();
+    let build = make_run_cycle_download_config_builder(&media, store);
+    let mut config = build(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from("PrimarySync"),
+    )
+    .as_ref()
+    .clone();
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    config.edited_naming = EditedNaming::Primary;
+    config.metadata.xmp_sidecar = true;
+    assert!(!config.refresh_metadata);
+
+    db.record_metadata_write_failure("PrimarySync", "asset-501", "original")
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("cycle-token")
+    );
+    let asset_checkpoint_before = original_asset_and_checkpoints(&root.path().join("state.db"));
+    assert_eq!(asset_checkpoint_before[0].len(), 1);
+    let tree_before = media_tree(&media);
+    let debt_before: (i64, i64) = {
+        let conn = db.acquire_lock("metadata debt before layout").unwrap();
+        conn.query_row("SELECT a.metadata_write_failed_at,p.metadata_write_failed_at FROM assets a JOIN asset_metadata_paths p ON a.library=p.library AND a.id=p.id AND a.version_size=p.version_size WHERE a.library='PrimarySync' AND a.id='asset-501' AND a.version_size='original' AND p.local_path=?1", [primary.to_str().unwrap()], |r| Ok((r.get(0)?,r.get(1)?))).unwrap()
+    };
+    assert_eq!(debt_before.0, debt_before.1);
+    // Snapshot the real owner state after planning and upsert_seen, immediately
+    // before prepare, so legitimate provider observation updates are not
+    // mistaken for changes caused by the rejected publication.
+    let after_plan = std::cell::RefCell::new(None);
+    let error = download::try_seed_prepared_edited_compat(&config, &pass, || {
+        *after_plan.borrow_mut() = Some(original_asset_and_checkpoints(
+            &root.path().join("state.db"),
+        ));
+    })
+    .await
+    .expect_err("existing debt must stop preparation");
+    let after_plan = after_plan
+        .into_inner()
+        .expect("owner reached post-plan boundary");
+    assert_eq!(after_plan[0].len(), 1);
+    assert_eq!(
+        &after_plan[1..],
+        &asset_checkpoint_before[1..],
+        "planning did not advance checkpoints"
+    );
+    assert!(
+        format!("{error:#}")
+            .contains("copied original has unresolved metadata or capture-repair debt"),
+        "unexpected hold: {error:#}"
+    );
+    let operations = db
+        .primary_layout_operations("PrimarySync".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        operations.len(),
+        1,
+        "hold must follow genuine recorded planning"
+    );
+    let op = &operations[0];
+    assert_eq!(op.child, "asset-501");
+    assert_eq!(op.pass, expected_pass);
+    assert!(!op.refresh_metadata);
+    assert!(
+        op.members
+            .iter()
+            .filter_map(|m| m.old.as_ref())
+            .any(|old| old.path.to_path() == primary
+                && old.version == "original"
+                && old.provider_checksum == provider_hash(ORIGINAL)
+                && old.source_checksum.as_deref() == Some(source_hash.as_str())
+                && data_encoding::HEXLOWER.encode(&old.fingerprint.sha256) == source_hash)
+    );
+    assert_eq!(op.phase, "planned");
+    let selected_original = op
+        .members
+        .iter()
+        .find(|member| {
+            member.record.as_ref().is_some_and(|record| {
+                record.version_size.as_str() == "original"
+                    && record.checksum.as_ref() == provider_hash(ORIGINAL)
+            })
+        })
+        .expect("selected original must have a planned archive member");
+    assert!(selected_original.archive_source.is_none());
+    assert_eq!(
+        selected_original.destination.as_ref().unwrap().to_path(),
+        archive
+    );
+    let selected_adjusted = op
+        .members
+        .iter()
+        .find(|member| {
+            member.record.as_ref().is_some_and(|record| {
+                record.version_size.as_str() == "adjusted"
+                    && record.checksum.as_ref() == provider_hash(EDIT_ONE)
+            })
+        })
+        .expect("selected adjusted member");
+    assert_eq!(
+        selected_adjusted.destination.as_ref().unwrap().to_path(),
+        primary
+    );
+    let stages: Vec<_> = op.members.iter().filter_map(|m| m.stage.as_ref()).collect();
+    assert!(!stages.is_empty());
+    assert!(selected_original.stage.is_some());
+    assert!(selected_adjusted.stage.is_some());
+    for stage in stages {
+        let path = stage.to_path();
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(".xmp");
+        assert!(
+            !path.exists(),
+            "media stage must not exist: {}",
+            path.display()
+        );
+        assert!(
+            !std::path::PathBuf::from(sidecar).exists(),
+            "XMP stage must not exist"
+        );
+    }
+    let conn = db
+        .acquire_lock("exact operation-owned selected claims")
+        .unwrap();
+    for (member, version, checksum) in [
+        (selected_original, "original", provider_hash(ORIGINAL)),
+        (selected_adjusted, "adjusted", provider_hash(EDIT_ONE)),
+    ] {
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM primary_layout_claims WHERE operation=?1 AND family=?2 AND path_key=?3 AND library='PrimarySync' AND child='asset-501' AND version=?4 AND provider_checksum=?5", rusqlite::params![op.operation, op.family, member.path_key.as_deref().unwrap(), version, checksum], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1, "exact selected claim for {version}");
+    }
+    drop(conn);
+    assert_eq!(media_tree(&media), tree_before);
+    assert_eq!(
+        original_asset_and_checkpoints(&root.path().join("state.db")),
+        after_plan
+    );
+    assert_eq!(original_gets(&server).await, initial_original_gets);
+    assert_bytes(&primary, ORIGINAL);
+    assert_bytes(&original_xmp, &old_xmp);
+    assert!(!archive.exists());
+    assert!(!archive_xmp.exists());
+    let debt_after: (i64, i64) = {
+        let conn = db.acquire_lock("metadata debt retained").unwrap();
+        conn.query_row("SELECT a.metadata_write_failed_at,p.metadata_write_failed_at FROM assets a JOIN asset_metadata_paths p ON a.library=p.library AND a.id=p.id AND a.version_size=p.version_size WHERE a.library='PrimarySync' AND a.id='asset-501' AND a.version_size='original' AND p.local_path=?1", [primary.to_str().unwrap()], |r| Ok((r.get(0)?,r.get(1)?))).unwrap()
+    };
+    assert_eq!(debt_after, debt_before);
+    eprintln!("VISIBLE_ARCHIVE_EXISTING_DEBT_HELD");
+}
+
+#[cfg(all(target_os = "linux", feature = "xmp"))]
+#[tokio::test]
+async fn unrelated_fresh_owned_download_keeps_sidecar_and_source_receipt() {
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let mut selected = records(&server, None);
+    let mut other = records(&server, None);
+    for record in &mut other {
+        record["recordName"] = json!(record["recordName"].as_str().unwrap().replace("501", "502"));
+        if let Some(reference) = record["fields"].get_mut("masterRef") {
+            reference["value"]["recordName"] = json!("502");
+        }
+    }
+    other[0]["fields"]["filenameEnc"]["value"] = json!("IMG_0502.JPG");
+    other[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/edit-two",server.uri()),"size":EDIT_TWO.len(),"fileChecksum":provider_hash(EDIT_TWO)});
+    selected.extend(other);
+    let options = || CycleOptions {
+        private: true,
+        sidecar: true,
+        refresh_metadata: false,
+        embed_rating: false,
+        ..CycleOptions::default()
+    };
+    let (result, _) = cycle_options(
+        root.path(),
+        selected.clone(),
+        false,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await;
+    assert_eq!(result.failed_count, 0, "{:?}", result.stats);
+    assert_eq!(result.stats.downloaded, 2);
+    assert!(result.db_sync_token_advance_safe);
+    let new_path = media.join("IMG_0502.JPG");
+    let sidecar = media.join("IMG_0502.JPG.xmp");
+    assert_bytes(&new_path, EDIT_TWO);
+    assert!(!std::fs::read(&sidecar).unwrap().is_empty());
+    let gets = server.received_requests().await.unwrap();
+    assert_eq!(
+        gets.iter()
+            .filter(|r| r.method.to_string() == "GET" && r.url.path() == "/edit-two")
+            .count(),
+        1
+    );
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    let (account, provider) = owner.authenticated_keys().unwrap();
+    let zone = json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"});
+    let scope = crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com")
+        .scope("private", &zone)
+        .unwrap();
+    let selection_scope = json!({"zone":zone,"name":"TestAlbum","list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted","obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted","query_filter":null,"container_id":null,"cross_zone_sources":[]});
+    let pass = format!(
+        "{:x}",
+        Sha256::digest(
+            json!({"kind":"Unfiled","scope":selection_scope,"excludes":[]})
+                .to_string()
+                .as_bytes()
+        )
+    );
+    let path_key = state::db::provider_selection::SelectionPath::from_path(&new_path)
+        .key()
+        .unwrap();
+    let local_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_TWO));
+    let conn = db.acquire_lock("unrelated fresh selected receipt").unwrap();
+    let (receipt,): (String,) = conn.query_row("SELECT json_array(account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,trust_receipt,selected_metadata_hash,generation_id) FROM download_receipts WHERE child='asset-502' AND version_size='original'", [], |row| Ok((row.get(0)?,))).unwrap();
+    let receipt: Value = serde_json::from_str(&receipt).unwrap();
+    assert_eq!(
+        receipt,
+        json!([
+            account,
+            provider,
+            scope,
+            "PrimarySync",
+            "asset-502",
+            "502",
+            "asset-502",
+            pass,
+            "original",
+            provider_hash(EDIT_TWO),
+            EDIT_TWO.len(),
+            path_key,
+            local_hash,
+            local_hash,
+            null,
+            null,
+            null
+        ])
+    );
+    let row: (String, String, String, String) = conn.query_row("SELECT a.status,a.local_path,a.local_checksum,p.source_checksum FROM assets a JOIN asset_metadata_paths p ON p.library=a.library AND p.id=a.id AND p.version_size=a.version_size AND p.local_path=a.local_path WHERE a.library='PrimarySync' AND a.id='asset-502' AND a.version_size='original'", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+    assert_eq!(
+        row,
+        (
+            "downloaded".to_owned(),
+            new_path.to_str().unwrap().to_owned(),
+            local_hash.clone(),
+            local_hash
+        )
+    );
+    drop(conn);
+    drop(db);
+    let sidecar_before = std::fs::read(&sidecar).unwrap();
+    let media_mtime = std::fs::metadata(&new_path).unwrap().modified().unwrap();
+    let sidecar_mtime = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
+    let requests_before = server.received_requests().await.unwrap().len();
+    let (quiet, _) = cycle_options(
+        root.path(),
+        selected,
+        true,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await;
+    assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        requests_before
+    );
+    assert_bytes(&new_path, EDIT_TWO);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_before);
+    assert_eq!(
+        std::fs::metadata(&new_path).unwrap().modified().unwrap(),
+        media_mtime
+    );
+    assert_eq!(
+        std::fs::metadata(&sidecar).unwrap().modified().unwrap(),
+        sidecar_mtime
+    );
+    eprintln!("FRESH_UNRELATED_OWNER_RECEIPT_AND_SIDECAR_REACHED");
+}
+
+#[cfg(all(target_os = "linux", feature = "xmp"))]
+#[tokio::test]
+async fn explicit_refresh_selected_original_applies_owner_metadata_before_archive() {
+    use crate::state::MetadataRewriteStore as _;
+    async fn original_gets(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method.to_string() == "GET" && request.url.path() == "/original"
+            })
+            .count()
+    }
+    fn rating(packet: &[u8]) -> i32 {
+        let meta: xmp_toolkit::XmpMeta = std::str::from_utf8(packet).unwrap().parse().unwrap();
+        meta.property_i32(xmp_toolkit::xmp_ns::XMP, "Rating")
+            .unwrap()
+            .value
+    }
+    async fn media_gets(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method.to_string() == "GET"
+                    && ["/original", "/edit-one", "/edit-two"].contains(&request.url.path())
+            })
+            .map(|request| request.url.path().to_owned())
+            .collect()
+    }
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let options = || CycleOptions {
+        private: true,
+        sidecar: true,
+        ..CycleOptions::default()
+    };
+    let mut initial_records = records(&server, None);
+    initial_records[1]["fields"]["isFavorite"] = json!({"value":1});
+    let mut edited_records = records(&server, Some(("edit-one", EDIT_ONE)));
+    edited_records[1]["fields"]["isFavorite"] = json!({"value":1});
+    let (initial, _) = cycle_options(
+        root.path(),
+        initial_records,
+        false,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    assert!(initial.db_sync_token_advance_safe);
+    let initial_original_gets = original_gets(&server).await;
+    assert_eq!(
+        initial_original_gets, 1,
+        "initial owner must fetch the original exactly once"
+    );
+    let primary = media.join("IMG_0501.JPG");
+    let archive = media.join("IMG_0501_original.JPG");
+    let original_xmp = media.join("IMG_0501.JPG.xmp");
+    let archive_xmp = media.join("IMG_0501_original.JPG.xmp");
+    assert_bytes(&primary, ORIGINAL);
+    let packet = std::fs::read_to_string(&original_xmp).unwrap();
+    assert_eq!(rating(packet.as_bytes()), 5);
+    let annotated = packet.replace("Rating>5", "Rating>4");
+    assert_ne!(
+        annotated, packet,
+        "synthetic prior managed rating must change from 5 to 4"
+    );
+    assert_eq!(rating(annotated.as_bytes()), 4);
+    std::fs::write(&original_xmp, annotated.as_bytes()).unwrap();
+    let old_xmp = std::fs::read(&original_xmp).unwrap();
+    assert!(!old_xmp.is_empty());
+    let old_xmp_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(&old_xmp));
+
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let wrong_owner = state::db::account::AccountOwner::authenticated(
+        "other@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"other-provider"}})).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        state::SqliteStateDb::open_owned(&root.path().join("state.db"), &wrong_owner).await,
+        Err(state::error::StateError::AccountOwnerMismatch)
+    ));
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    let provider = Session {
+        reported_count: None,
+        records: edited_records.clone(),
+        quiet: true,
+        lookups: Arc::new(AtomicUsize::new(0)),
+        current: None,
+        lookup_change: None,
+        indexing: None,
+        baseline_successor: None,
+        cycle_token: None,
+        trace: None,
+    };
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::default(),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from("TestAlbum"),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(provider),
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com"),
+        Arc::from("private"),
+    );
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::default(),
+    };
+    let scope = json!({
+        "zone":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+        "name":"TestAlbum", "list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+        "obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted", "query_filter":null,
+        "container_id":null, "cross_zone_sources":[]
+    });
+    assert_eq!(pass.album.selection_scope(), scope);
+    let expected_pass = format!(
+        "{:x}",
+        Sha256::digest(
+            json!({"kind":"Unfiled","scope":scope,"excludes":[]})
+                .to_string()
+                .as_bytes()
+        )
+    );
+    let expected_db_scope =
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com")
+            .scope(
+                "private",
+                &json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+            )
+            .unwrap();
+    let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+    let source_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL));
+    let source_native = state::db::provider_selection::SelectionPath::from_path(&primary)
+        .key()
+        .unwrap();
+    let source_receipts: Vec<String> = {
+        let conn = db.acquire_lock("initial compact original source").unwrap();
+        let mut stmt = conn.prepare("SELECT json_array(id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,trust_receipt,selected_metadata_hash,generation_id) FROM download_receipts WHERE library='PrimarySync' AND child='asset-501' AND version_size='original' ORDER BY id").unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        source_receipts.len(),
+        1,
+        "normal owner must create one source-backed compact original receipt"
+    );
+    let source_receipt: Value = serde_json::from_str(&source_receipts[0]).unwrap();
+    assert!(!source_receipt[0].as_str().unwrap().is_empty());
+    assert_eq!(source_receipt[1], account_key);
+    assert_eq!(source_receipt[2], provider_key);
+    assert_eq!(source_receipt[3], expected_db_scope);
+    assert_eq!(source_receipt[4], "PrimarySync");
+    assert_eq!(source_receipt[5], "asset-501");
+    assert_eq!(source_receipt[6], "501");
+    assert_eq!(source_receipt[7], "asset-501");
+    assert_eq!(source_receipt[8], expected_pass);
+    assert_eq!(source_receipt[9], "original");
+    assert_eq!(source_receipt[10], provider_hash(ORIGINAL));
+    assert_eq!(source_receipt[11], ORIGINAL.len());
+    assert_eq!(source_receipt[12], source_native);
+    assert_eq!(source_receipt[13], source_hash);
+    assert_eq!(source_receipt[14], source_hash);
+    assert!(!source_receipt[15].as_str().unwrap().is_empty());
+    assert!(
+        source_receipt[16].is_null()
+            && source_receipt[17].is_null()
+            && source_receipt[18].is_null()
+    );
+    let source_path_receipt: (String, String, String, String) = {
+        let conn = db
+            .acquire_lock("initial exact original path receipt")
+            .unwrap();
+        conn.query_row("SELECT provider_checksum,source_checksum,local_checksum,download_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?1",
+            [primary.to_str().unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap()
+    };
+    assert_eq!(
+        source_path_receipt,
+        (
+            provider_hash(ORIGINAL),
+            source_hash.clone(),
+            source_hash.clone(),
+            source_hash.clone()
+        )
+    );
+    let store: Arc<dyn download::DownloadStore> = db.clone();
+    let build = make_run_cycle_download_config_builder(&media, store.clone());
+    let mut config = build(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from("PrimarySync"),
+    )
+    .as_ref()
+    .clone();
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    config.edited_naming = EditedNaming::Primary;
+    config.metadata.xmp_sidecar = true;
+    config.refresh_metadata = true;
+    assert!(config.refresh_metadata);
+    let op = download::seed_prepared_edited_compat(&config, &pass).await;
+    assert_eq!(
+        original_gets(&server).await,
+        initial_original_gets,
+        "preparation must reuse the proved original"
+    );
+    assert_eq!(op.phase, "prepared");
+    assert_eq!(op.source_library, "PrimarySync");
+    assert_eq!(op.child, "asset-501");
+    assert_eq!(op.pass, expected_pass);
+    assert!(op.refresh_metadata);
+    let original = op
+        .members
+        .iter()
+        .find(|member| {
+            member.record.as_ref().is_some_and(|record| {
+                record.version_size.as_str() == "original"
+                    && record.checksum.as_ref() == provider_hash(ORIGINAL)
+            })
+        })
+        .expect("selected original must be part of the recorded operation");
+    assert!(
+        original.archive_source.is_none(),
+        "exercise selected original, not archive-only branch"
+    );
+    assert_eq!(original.destination.as_ref().unwrap().to_path(), archive);
+    let stage = original.stage.as_ref().unwrap().to_path();
+    let prepared = original
+        .prepared
+        .as_ref()
+        .expect("selected original is durably prepared");
+    assert_eq!(prepared.path.to_path(), stage);
+    assert_eq!(prepared.provider_checksum, provider_hash(ORIGINAL));
+    assert_eq!(
+        prepared.source_checksum.as_deref(),
+        Some(source_hash.as_str())
+    );
+    assert_bytes(&stage, ORIGINAL);
+    assert!(
+        op.members
+            .iter()
+            .filter_map(|member| member.old.as_ref())
+            .any(|old| old.path.to_path() == primary
+                && old.version == "original"
+                && old.provider_checksum == provider_hash(ORIGINAL)
+                && old.source_checksum.as_deref() == Some(source_hash.as_str())
+                && data_encoding::HEXLOWER.encode(&old.fingerprint.sha256) == source_hash
+                && old
+                    .sidecar
+                    .as_ref()
+                    .is_some_and(|fp| data_encoding::HEXLOWER.encode(&fp.sha256) == old_xmp_hash))
+    );
+    let original_claim: i64 = {
+        let conn = db.acquire_lock("selected original archive claim").unwrap();
+        conn.query_row("SELECT COUNT(*) FROM primary_layout_claims WHERE operation=?1 AND family=?2 AND path_key=?3 AND library='PrimarySync' AND child='asset-501' AND version='original' AND provider_checksum=?4",
+            rusqlite::params![op.operation,op.family,original.path_key.as_deref().unwrap(),provider_hash(ORIGINAL)],
+            |row| row.get(0)).unwrap()
+    };
+    assert_eq!(original_claim, 1);
+    assert!(matches!(db.guard_primary_writer(&primary).await,
+        Err(state::error::StateError::Invariant { operation: "primary_layout", detail })
+        if detail == "managed primary slot requires its layout publication owner"
+    ));
+    assert_eq!(
+        db.primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let mut stage_xmp_name = stage.as_os_str().to_os_string();
+    stage_xmp_name.push(".xmp");
+    let stage_xmp = std::path::PathBuf::from(stage_xmp_name);
+    let staged_packet = std::fs::read(&stage_xmp).unwrap();
+    assert_eq!(
+        rating(&staged_packet),
+        5,
+        "the explicit owner refresh must reach the writer"
+    );
+    assert_ne!(staged_packet, old_xmp);
+    assert_bytes(&original_xmp, &old_xmp);
+    assert_bytes(&primary, ORIGINAL);
+    assert!(prepared.metadata_decision.is_some());
+    assert!(
+        serde_json::to_value(prepared)
+            .unwrap()
+            .get("metadata_outcome")
+            .is_none(),
+        "explicit refresh keeps the legacy untagged completion path"
+    );
+    let staged_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(&staged_packet));
+    assert_eq!(
+        data_encoding::HEXLOWER.encode(&prepared.sidecar.as_ref().unwrap().sha256),
+        staged_hash
+    );
+    let gets_before_recovery = media_gets(&server).await;
+    assert_eq!(
+        gets_before_recovery
+            .iter()
+            .filter(|path| path.as_str() == "/original")
+            .count(),
+        1
+    );
+    assert_eq!(
+        gets_before_recovery
+            .iter()
+            .filter(|path| path.as_str() == "/edit-one")
+            .count(),
+        1,
+        "prepare must fetch the adjusted resource exactly once"
+    );
+    assert_eq!(gets_before_recovery.len(), 2);
+    let checkpoint = db.get_metadata("sync_token:PrimarySync").await.unwrap();
+    assert_eq!(checkpoint.as_deref(), Some("cycle-token"));
+    let family = op.family.clone();
+    let closed = Arc::downgrade(&db);
+    drop(config);
+    drop(build);
+    drop(store);
+    drop(pass);
+    drop(db);
+    assert!(closed.upgrade().is_none());
+    eprintln!("EXPLICIT_REFRESH_OWNER_WRITER_REACHED");
+    let (recovered, _) = cycle_options(
+        root.path(),
+        edited_records.clone(),
+        true,
+        EditedNaming::Primary,
+        options(),
+    )
+    .await;
+    assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
+    assert_eq!(recovered.stats.downloaded, 0);
+    assert!(recovered.db_sync_token_advance_safe);
+    assert_bytes(&primary, EDIT_ONE);
+    assert_bytes(&archive, ORIGINAL);
+    assert_bytes(&archive_xmp, &staged_packet);
+    assert_eq!(rating(&std::fs::read(&archive_xmp).unwrap()), 5);
+    assert_eq!(
+        media_gets(&server).await,
+        gets_before_recovery,
+        "recovery must issue no media GETs"
+    );
+    assert_eq!(original_gets(&server).await, initial_original_gets);
+    let reopened = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        reopened
+            .get_metadata("sync_token:PrimarySync")
+            .await
+            .unwrap(),
+        checkpoint
+    );
+    let binding = reopened
+        .primary_layout_binding(family)
+        .await
+        .unwrap()
+        .unwrap();
+    let archived = binding
+        .files
+        .iter()
+        .find(|file| file.path.to_path() == archive && file.version == "original")
+        .expect("owner recorded archive");
+    assert_eq!(archived.provider_checksum, provider_hash(ORIGINAL));
+    assert_eq!(
+        archived.source_checksum.as_deref(),
+        Some(source_hash.as_str())
+    );
+    assert_eq!(
+        data_encoding::HEXLOWER.encode(&archived.sidecar.as_ref().unwrap().sha256),
+        staged_hash
+    );
+    assert!(archived.metadata_decision.is_some());
+    assert!(
+        serde_json::to_value(archived)
+            .unwrap()
+            .get("metadata_outcome")
+            .is_none()
+    );
+    let final_path_receipt: (String, String, String, Option<i64>) = {
+        let conn = reopened
+            .acquire_lock("explicit refreshed archive receipt")
+            .unwrap();
+        conn.query_row("SELECT provider_checksum,local_checksum,source_checksum,metadata_write_failed_at FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?1", [archive.to_str().unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap()
+    };
+    assert_eq!(
+        final_path_receipt,
+        (
+            provider_hash(ORIGINAL),
+            source_hash.clone(),
+            source_hash,
+            None
+        )
+    );
+    eprintln!("EXPLICIT_REFRESH_OWNER_RECOVERED");
+}
+
+#[cfg(all(target_os = "linux", feature = "xmp"))]
+#[tokio::test]
+async fn copied_original_does_not_settle_real_admitted_metadata_selection() {
+    use crate::state::MetadataRewriteStore as _;
+    async fn original_gets(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method.to_string() == "GET" && request.url.path() == "/original"
+            })
+            .count()
+    }
+    let server = server().await;
+    let root = tempfile::tempdir().unwrap();
+    let media = root.path().join("media");
+    let options = || CycleOptions {
+        private: true,
+        unfiled_all: true,
+        sidecar: true,
+        ..CycleOptions::default()
+    };
+    let (initial, _) = cycle_options(
+        root.path(),
+        records(&server, Some(("edit-one", EDIT_ONE))),
+        false,
+        EditedNaming::Primary,
+        CycleOptions {
+            edited: false,
+            ..options()
+        },
+    )
+    .await;
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    assert!(initial.db_sync_token_advance_safe);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(
+                |request| request.method.to_string() == "GET" && request.url.path() == "/edit-one"
+            )
+            .count(),
+        0,
+        "initial owner selects only the original"
+    );
+    let initial_original_gets = original_gets(&server).await;
+    assert_eq!(
+        initial_original_gets, 1,
+        "initial owner must fetch the original exactly once"
+    );
+    let primary = media.join("IMG_0501.JPG");
+    let archive = media.join("IMG_0501_original.JPG");
+    let original_xmp = media.join("IMG_0501.JPG.xmp");
+    let archive_xmp = media.join("IMG_0501_original.JPG.xmp");
+    assert_bytes(&primary, ORIGINAL);
+    let packet = std::fs::read_to_string(&original_xmp).unwrap();
+    let field =
+        r#"<fixture:UserNote xmlns:fixture="urn:kei-test:user">retain-my-note</fixture:UserNote>"#;
+    let annotated = packet.replace("</rdf:Description>", &format!("{field}</rdf:Description>"));
+    assert_ne!(annotated, packet, "synthetic user metadata must be present");
+    std::fs::write(&original_xmp, annotated.as_bytes()).unwrap();
+    let old_xmp = std::fs::read(&original_xmp).unwrap();
+    assert!(!old_xmp.is_empty());
+    let old_xmp_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(&old_xmp));
+
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let wrong_owner = state::db::account::AccountOwner::authenticated(
+        "other@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"other-provider"}})).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        state::SqliteStateDb::open_owned(&root.path().join("state.db"), &wrong_owner).await,
+        Err(state::error::StateError::AccountOwnerMismatch)
+    ));
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    let provider = Session {
+        reported_count: None,
+        records: records(&server, Some(("edit-one", EDIT_ONE))),
+        quiet: true,
+        lookups: Arc::new(AtomicUsize::new(0)),
+        current: None,
+        lookup_change: None,
+        indexing: None,
+        baseline_successor: None,
+        cycle_token: None,
+        trace: None,
+    };
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::default(),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from(""),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(provider),
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com"),
+        Arc::from("private"),
+    );
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::default(),
+    };
+    let scope = json!({
+        "zone":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+        "name":"", "list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+        "obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted", "query_filter":null,
+        "container_id":null, "cross_zone_sources":[]
+    });
+    assert_eq!(pass.album.selection_scope(), scope);
+    let expected_pass = format!(
+        "{:x}",
+        Sha256::digest(
+            json!({"kind":"Unfiled","scope":scope,"excludes":[]})
+                .to_string()
+                .as_bytes()
+        )
+    );
+    let expected_db_scope =
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com")
+            .scope(
+                "private",
+                &json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+            )
+            .unwrap();
+    let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+    let source_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL));
+    let source_native = state::db::provider_selection::SelectionPath::from_path(&primary)
+        .key()
+        .unwrap();
+    let source_receipts: Vec<String> = {
+        let conn = db.acquire_lock("initial compact original source").unwrap();
+        let mut stmt = conn.prepare("SELECT json_array(id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,trust_receipt,selected_metadata_hash,generation_id) FROM download_receipts WHERE library='PrimarySync' AND child='asset-501' AND version_size='original' ORDER BY id").unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        source_receipts.len(),
+        1,
+        "normal owner must create one source-backed compact original receipt"
+    );
+    let source_receipt: Value = serde_json::from_str(&source_receipts[0]).unwrap();
+    assert!(!source_receipt[0].as_str().unwrap().is_empty());
+    assert_eq!(source_receipt[1], account_key);
+    assert_eq!(source_receipt[2], provider_key);
+    assert_eq!(source_receipt[3], expected_db_scope);
+    assert_eq!(source_receipt[4], "PrimarySync");
+    assert_eq!(source_receipt[5], "asset-501");
+    assert_eq!(source_receipt[6], "501");
+    assert_eq!(source_receipt[7], "asset-501");
+    assert_eq!(source_receipt[8], expected_pass);
+    assert_eq!(source_receipt[9], "original");
+    assert_eq!(source_receipt[10], provider_hash(ORIGINAL));
+    assert_eq!(source_receipt[11], ORIGINAL.len());
+    assert_eq!(source_receipt[12], source_native);
+    assert_eq!(source_receipt[13], source_hash);
+    assert_eq!(source_receipt[14], source_hash);
+    assert!(!source_receipt[15].as_str().unwrap().is_empty());
+    assert!(
+        source_receipt[16].is_null()
+            && source_receipt[17].is_null()
+            && source_receipt[18].is_null()
+    );
+    let source_path_receipt: (String, String, String, String) = {
+        let conn = db
+            .acquire_lock("initial exact original path receipt")
+            .unwrap();
+        conn.query_row("SELECT provider_checksum,source_checksum,local_checksum,download_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?1",
+            [primary.to_str().unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap()
+    };
+    assert_eq!(
+        source_path_receipt,
+        (
+            provider_hash(ORIGINAL),
+            source_hash.clone(),
+            source_hash.clone(),
+            source_hash.clone()
+        )
+    );
+    assert_no_original_metadata_debt(&db);
+    let store: Arc<dyn download::DownloadStore> = db.clone();
+    let build = make_run_cycle_download_config_builder(&media, store);
+    let mut config = build(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from("PrimarySync"),
+    )
+    .as_ref()
+    .clone();
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    config.edited_naming = EditedNaming::Primary;
+    config.metadata.xmp_sidecar = true;
+    assert!(!config.refresh_metadata);
+    let generation = download::project_test_selection(&config, &pass)
+        .await
+        .expect("real current selection must project");
+    assert_no_original_metadata_debt(&db);
+    let mut op = download::seed_prepared_edited_compat(&config, &pass).await;
+    assert_eq!(
+        original_gets(&server).await,
+        initial_original_gets,
+        "preparation must reuse the proved original"
+    );
+    assert_eq!(op.phase, "prepared");
+    assert_eq!(op.source_library, "PrimarySync");
+    assert_eq!(op.child, "asset-501");
+    assert_eq!(op.pass, expected_pass);
+    assert!(!op.refresh_metadata);
+    let original = op
+        .members
+        .iter()
+        .find(|member| {
+            member.record.as_ref().is_some_and(|record| {
+                record.version_size.as_str() == "original"
+                    && record.checksum.as_ref() == provider_hash(ORIGINAL)
+            })
+        })
+        .expect("selected original must be part of the recorded operation");
+    assert!(
+        original.archive_source.is_none(),
+        "exercise selected original, not archive-only branch"
+    );
+    assert_eq!(original.destination.as_ref().unwrap().to_path(), archive);
+    let stage = original.stage.as_ref().unwrap().to_path();
+    let prepared = original
+        .prepared
+        .as_ref()
+        .expect("selected original is durably prepared");
+    assert_eq!(prepared.path.to_path(), stage);
+    assert_eq!(prepared.provider_checksum, provider_hash(ORIGINAL));
+    assert_eq!(
+        prepared.source_checksum.as_deref(),
+        Some(source_hash.as_str())
+    );
+    assert_bytes(&stage, ORIGINAL);
+    assert!(
+        op.members
+            .iter()
+            .filter_map(|member| member.old.as_ref())
+            .any(|old| old.path.to_path() == primary
+                && old.version == "original"
+                && old.provider_checksum == provider_hash(ORIGINAL)
+                && old.source_checksum.as_deref() == Some(source_hash.as_str())
+                && data_encoding::HEXLOWER.encode(&old.fingerprint.sha256) == source_hash
+                && old
+                    .sidecar
+                    .as_ref()
+                    .is_some_and(|fp| data_encoding::HEXLOWER.encode(&fp.sha256) == old_xmp_hash))
+    );
+    let original_claim: i64 = {
+        let conn = db.acquire_lock("selected original archive claim").unwrap();
+        conn.query_row("SELECT COUNT(*) FROM primary_layout_claims WHERE operation=?1 AND family=?2 AND path_key=?3 AND library='PrimarySync' AND child='asset-501' AND version='original' AND provider_checksum=?4",
+            rusqlite::params![op.operation,op.family,original.path_key.as_deref().unwrap(),provider_hash(ORIGINAL)],
+            |row| row.get(0)).unwrap()
+    };
+    assert_eq!(original_claim, 1);
+    assert!(matches!(db.guard_primary_writer(&primary).await,
+        Err(state::error::StateError::Invariant { operation: "primary_layout", detail })
+        if detail == "managed primary slot requires its layout publication owner"
+    ));
+    assert_eq!(
+        db.primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let copied = serde_json::to_value(prepared).unwrap()["metadata_outcome"]["Copied"].clone();
+    assert!(
+        copied.is_object(),
+        "actual prepared receipt must be tagged Copied"
+    );
+    let source = op
+        .members
+        .iter()
+        .filter_map(|member| member.old.as_ref())
+        .find(|old| {
+            old.path.to_path() == primary
+                && old.version == "original"
+                && old.provider_checksum == provider_hash(ORIGINAL)
+        })
+        .expect("actual claimed source");
+    assert_eq!(
+        copied["source"],
+        serde_json::to_value(&source.path).unwrap()
+    );
+    assert_eq!(
+        copied["fingerprint"],
+        serde_json::to_value(&source.fingerprint).unwrap()
+    );
+    assert_eq!(
+        copied["sidecar"],
+        serde_json::to_value(&source.sidecar).unwrap()
+    );
+    assert_eq!(
+        copied["source_checksum"],
+        serde_json::to_value(&source.source_checksum).unwrap()
+    );
+    assert_eq!(
+        copied["previous_decision"],
+        serde_json::to_value(&source.metadata_decision).unwrap()
+    );
+    assert_eq!(prepared.metadata_decision, source.metadata_decision);
+    let selection_path_key = original.destination.as_ref().unwrap().key().unwrap();
+    let normalized_claim_key = state::db::primary_layout::path_key(&archive).unwrap();
+    assert_eq!(
+        original.path_key.as_deref(),
+        Some(normalized_claim_key.as_str())
+    );
+    let selection = || {
+        let conn = db.acquire_lock("real admitted original selection").unwrap();
+        conn.query_row("SELECT json_array(d.generation,d.pass_key,d.child,d.library,d.asset_id,d.master,d.version_size,d.path,d.checksum,d.size_bytes,d.admitted,d.verified_media,d.verified_metadata,d.progress_hash,json_extract(CAST(g.specification AS TEXT),'$.metadata_flags'),d.metadata_hash,g.account_key,g.provider_key,g.scope) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.generation=?1 AND d.pass_key=?2 AND d.child='asset-501' AND d.version_size='original' AND d.path=?3 AND d.checksum=?4", rusqlite::params![generation,expected_pass,selection_path_key,provider_hash(ORIGINAL)], |row|row.get::<_,String>(0)).unwrap()
+    };
+    let revision = || {
+        let conn = db.acquire_lock("exact child capture revision").unwrap();
+        let mut stmt = conn.prepare("SELECT json_array(library,asset_id,revision,updated_at) FROM asset_metadata_capture_revisions WHERE library='PrimarySync' AND asset_id='asset-501'").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let before_selection = selection();
+    let before: Value = serde_json::from_str(&before_selection).unwrap();
+    assert_eq!(before[0], generation);
+    assert_eq!(before[1], expected_pass);
+    assert_eq!(before[2], "asset-501");
+    assert_eq!(before[3], "PrimarySync");
+    assert_eq!(before[4], "asset-501");
+    assert_eq!(before[5], "501");
+    assert_eq!(before[6], "original");
+    assert_eq!(before[7], selection_path_key);
+    assert_eq!(before[8], provider_hash(ORIGINAL));
+    assert_eq!(before[9], ORIGINAL.len());
+    assert_eq!(before[10], 1, "destination must really be admitted");
+    assert_eq!(
+        before[12], 0,
+        "metadata must remain unverified before commit"
+    );
+    assert_eq!(
+        before[14], 32,
+        "the active selector requested XMP sidecar metadata"
+    );
+    assert_eq!(
+        before[15],
+        serde_json::to_value(&original.record.as_ref().unwrap().metadata.metadata_hash).unwrap(),
+        "selected metadata hash must match the exact committed record"
+    );
+    assert!(!before[15].is_null());
+    assert_eq!(before[16], account_key);
+    assert_eq!(before[17], provider_key);
+    assert_eq!(before[18], expected_db_scope);
+    let profile: String = {
+        let conn = db
+            .acquire_lock("real selection generation profile")
+            .unwrap();
+        conn.query_row("SELECT json_extract(CAST(specification AS TEXT),'$.profile') FROM provider_active_generations WHERE id=?1", [&generation], |row| row.get(0)).unwrap()
+    };
+    let profile: Value = serde_json::from_str(&profile).unwrap();
+    assert_eq!(profile["format"], 2);
+    assert_eq!(profile["coverage"], "selected_downloads");
+    assert_eq!(
+        profile["passes"],
+        json!([{"key":expected_pass,"kind":"Unfiled","scope":scope,"excludes":[]}])
+    );
+    let before_revision = revision();
+    assert!(before_revision.len() <= 1);
+    let operation = op.operation.clone();
+    let family = op.family.clone();
+    let stage_packet = std::fs::read(stage.with_file_name(format!(
+        "{}.xmp",
+        stage.file_name().unwrap().to_string_lossy()
+    )))
+    .unwrap();
+    assert_eq!(stage_packet, old_xmp);
+    eprintln!("COPIED_SELECTED_ADMITTED_BEFORE_COMMIT");
+    download::finish_prepared_edited_compat(&config, &mut op).await;
+    assert_eq!(
+        selection(),
+        before_selection,
+        "copied bytes must not settle selected metadata or advance progress"
+    );
+    assert_eq!(
+        revision(),
+        before_revision,
+        "copy must not advance the child capture revision"
+    );
+    let installed = op
+        .members
+        .iter()
+        .find(|member| {
+            member
+                .destination
+                .as_ref()
+                .is_some_and(|path| path.to_path() == archive)
+        })
+        .unwrap()
+        .installed
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(installed).unwrap()["metadata_outcome"]["Copied"],
+        copied
+    );
+    let binding = db.primary_layout_binding(family).await.unwrap().unwrap();
+    let bound = binding
+        .files
+        .iter()
+        .find(|file| file.path.to_path() == archive)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(bound).unwrap()["metadata_outcome"]["Copied"],
+        copied
+    );
+    assert_bytes(&archive, ORIGINAL);
+    assert_bytes(&archive_xmp, &old_xmp);
+    assert_eq!(original_gets(&server).await, initial_original_gets);
+    let committed: String = {
+        let conn = db.acquire_lock("committed copied journal").unwrap();
+        conn.query_row(
+            "SELECT phase FROM primary_layout_operations WHERE operation=?1",
+            [operation],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(committed, "committed");
+    eprintln!("COPIED_SELECTED_ACCOUNTING_VERIFIED");
+}
+
+#[cfg(all(target_os = "linux", feature = "xmp"))]
+#[tokio::test]
+async fn copied_original_occupied_archive_holds_and_exact_install_retries() {
+    use crate::state::MetadataRewriteStore as _;
+    async fn original_gets(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method.to_string() == "GET" && request.url.path() == "/original"
+            })
+            .count()
+    }
+    fn media_tree(
+        root: &std::path::Path,
+    ) -> Vec<(
+        std::path::PathBuf,
+        Vec<u8>,
+        std::time::SystemTime,
+        crate::fs_util::FileIdentity,
+    )> {
+        fn walk(
+            root: &std::path::Path,
+            dir: &std::path::Path,
+            out: &mut Vec<(
+                std::path::PathBuf,
+                Vec<u8>,
+                std::time::SystemTime,
+                crate::fs_util::FileIdentity,
+            )>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let ty = entry.file_type().unwrap();
+                if ty.is_dir() {
+                    walk(root, &entry.path(), out);
+                } else {
+                    assert!(ty.is_file());
+                    let file = std::fs::File::open(entry.path()).unwrap();
+                    out.push((
+                        entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(entry.path()).unwrap(),
+                        file.metadata().unwrap().modified().unwrap(),
+                        crate::fs_util::file_identity(&file).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut result = Vec::new();
+        walk(root, root, &mut result);
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+    }
+    for retry in [false, true] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("media");
+        let options = || CycleOptions {
+            private: true,
+            unfiled_all: true,
+            sidecar: true,
+            ..CycleOptions::default()
+        };
+        let (initial, _) = cycle_options(
+            root.path(),
+            records(&server, Some(("edit-one", EDIT_ONE))),
+            false,
+            EditedNaming::Primary,
+            CycleOptions {
+                edited: false,
+                ..options()
+            },
+        )
+        .await;
+        assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+        assert!(initial.db_sync_token_advance_safe);
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.method.to_string() == "GET"
+                    && request.url.path() == "/edit-one")
+                .count(),
+            0,
+            "initial owner selects only the original"
+        );
+        let initial_original_gets = original_gets(&server).await;
+        assert_eq!(
+            initial_original_gets, 1,
+            "initial owner must fetch the original exactly once"
+        );
+        let primary = media.join("IMG_0501.JPG");
+        let archive = media.join("IMG_0501_original.JPG");
+        let original_xmp = media.join("IMG_0501.JPG.xmp");
+        let archive_xmp = media.join("IMG_0501_original.JPG.xmp");
+        assert_bytes(&primary, ORIGINAL);
+        let packet = std::fs::read_to_string(&original_xmp).unwrap();
+        let field = r#"<fixture:UserNote xmlns:fixture="urn:kei-test:user">retain-my-note</fixture:UserNote>"#;
+        let annotated = packet.replace("</rdf:Description>", &format!("{field}</rdf:Description>"));
+        assert_ne!(annotated, packet, "synthetic user metadata must be present");
+        std::fs::write(&original_xmp, annotated.as_bytes()).unwrap();
+        let old_xmp = std::fs::read(&original_xmp).unwrap();
+        assert!(!old_xmp.is_empty());
+        let old_xmp_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(&old_xmp));
+
+        let owner = state::db::account::AccountOwner::authenticated(
+            "synthetic@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+        )
+        .unwrap();
+        let wrong_owner = state::db::account::AccountOwner::authenticated(
+            "other@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"other-provider"}})).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            state::SqliteStateDb::open_owned(&root.path().join("state.db"), &wrong_owner).await,
+            Err(state::error::StateError::AccountOwnerMismatch)
+        ));
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+                .await
+                .unwrap(),
+        );
+        let provider = Session {
+            reported_count: None,
+            records: records(&server, Some(("edit-one", EDIT_ONE))),
+            quiet: true,
+            lookups: Arc::new(AtomicUsize::new(0)),
+            current: None,
+            lookup_change: None,
+            indexing: None,
+            baseline_successor: None,
+            cycle_token: None,
+            trace: None,
+        };
+        let mut album = crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::default(),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from(""),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(
+                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                ),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(provider),
+        );
+        album.set_shadow_capture(
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com"),
+            Arc::from("private"),
+        );
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album,
+            exclude_ids: Arc::default(),
+        };
+        let scope = json!({
+            "zone":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+            "name":"", "list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+            "obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted", "query_filter":null,
+            "container_id":null, "cross_zone_sources":[]
+        });
+        assert_eq!(pass.album.selection_scope(), scope);
+        let expected_pass = format!(
+            "{:x}",
+            Sha256::digest(
+                json!({"kind":"Unfiled","scope":scope,"excludes":[]})
+                    .to_string()
+                    .as_bytes()
+            )
+        );
+        let expected_db_scope =
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com")
+                .scope(
+                    "private",
+                    &json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                )
+                .unwrap();
+        let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+        let source_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL));
+        let source_native = state::db::provider_selection::SelectionPath::from_path(&primary)
+            .key()
+            .unwrap();
+        let source_receipts: Vec<String> = {
+            let conn = db.acquire_lock("initial compact original source").unwrap();
+            let mut stmt = conn.prepare("SELECT json_array(id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,trust_receipt,selected_metadata_hash,generation_id) FROM download_receipts WHERE library='PrimarySync' AND child='asset-501' AND version_size='original' ORDER BY id").unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            source_receipts.len(),
+            1,
+            "normal owner must create one source-backed compact original receipt"
+        );
+        let source_receipt: Value = serde_json::from_str(&source_receipts[0]).unwrap();
+        assert!(!source_receipt[0].as_str().unwrap().is_empty());
+        assert_eq!(source_receipt[1], account_key);
+        assert_eq!(source_receipt[2], provider_key);
+        assert_eq!(source_receipt[3], expected_db_scope);
+        assert_eq!(source_receipt[4], "PrimarySync");
+        assert_eq!(source_receipt[5], "asset-501");
+        assert_eq!(source_receipt[6], "501");
+        assert_eq!(source_receipt[7], "asset-501");
+        assert_eq!(source_receipt[8], expected_pass);
+        assert_eq!(source_receipt[9], "original");
+        assert_eq!(source_receipt[10], provider_hash(ORIGINAL));
+        assert_eq!(source_receipt[11], ORIGINAL.len());
+        assert_eq!(source_receipt[12], source_native);
+        assert_eq!(source_receipt[13], source_hash);
+        assert_eq!(source_receipt[14], source_hash);
+        assert!(!source_receipt[15].as_str().unwrap().is_empty());
+        assert!(
+            source_receipt[16].is_null()
+                && source_receipt[17].is_null()
+                && source_receipt[18].is_null()
+        );
+        let source_path_receipt: (String, String, String, String) = {
+            let conn = db
+                .acquire_lock("initial exact original path receipt")
+                .unwrap();
+            conn.query_row("SELECT provider_checksum,source_checksum,local_checksum,download_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?1",
+            [primary.to_str().unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap()
+        };
+        assert_eq!(
+            source_path_receipt,
+            (
+                provider_hash(ORIGINAL),
+                source_hash.clone(),
+                source_hash.clone(),
+                source_hash.clone()
+            )
+        );
+        assert_no_original_metadata_debt(&db);
+        let store: Arc<dyn download::DownloadStore> = db.clone();
+        let build = make_run_cycle_download_config_builder(&media, store.clone());
+        let mut config = build(
+            download::SyncMode::Full,
+            Arc::default(),
+            Arc::default(),
+            Arc::from("PrimarySync"),
+        )
+        .as_ref()
+        .clone();
+        config.folder_structure = String::new();
+        config.folder_structure_albums = Arc::from("");
+        config.folder_structure_smart_folders = Arc::from("");
+        config.edited = true;
+        config.edited_naming = EditedNaming::Primary;
+        config.metadata.xmp_sidecar = true;
+        assert!(!config.refresh_metadata);
+        let mut op = download::seed_prepared_edited_compat(&config, &pass).await;
+        assert_eq!(
+            original_gets(&server).await,
+            initial_original_gets,
+            "preparation must reuse the proved original"
+        );
+        assert_eq!(op.phase, "prepared");
+        assert_eq!(op.source_library, "PrimarySync");
+        assert_eq!(op.child, "asset-501");
+        assert_eq!(op.pass, expected_pass);
+        assert!(!op.refresh_metadata);
+        let original = op
+            .members
+            .iter()
+            .find(|member| {
+                member.record.as_ref().is_some_and(|record| {
+                    record.version_size.as_str() == "original"
+                        && record.checksum.as_ref() == provider_hash(ORIGINAL)
+                })
+            })
+            .expect("selected original must be part of the recorded operation");
+        assert!(
+            original.archive_source.is_none(),
+            "exercise selected original, not archive-only branch"
+        );
+        assert_eq!(original.destination.as_ref().unwrap().to_path(), archive);
+        let stage = original.stage.as_ref().unwrap().to_path();
+        let prepared = original
+            .prepared
+            .as_ref()
+            .expect("selected original is durably prepared");
+        assert_eq!(prepared.path.to_path(), stage);
+        assert_eq!(prepared.provider_checksum, provider_hash(ORIGINAL));
+        assert_eq!(
+            prepared.source_checksum.as_deref(),
+            Some(source_hash.as_str())
+        );
+        assert_bytes(&stage, ORIGINAL);
+        assert!(
+            op.members
+                .iter()
+                .filter_map(|member| member.old.as_ref())
+                .any(|old| old.path.to_path() == primary
+                    && old.version == "original"
+                    && old.provider_checksum == provider_hash(ORIGINAL)
+                    && old.source_checksum.as_deref() == Some(source_hash.as_str())
+                    && data_encoding::HEXLOWER.encode(&old.fingerprint.sha256) == source_hash
+                    && old
+                        .sidecar
+                        .as_ref()
+                        .is_some_and(
+                            |fp| data_encoding::HEXLOWER.encode(&fp.sha256) == old_xmp_hash
+                        ))
+        );
+        let original_claim: i64 = {
+            let conn = db.acquire_lock("selected original archive claim").unwrap();
+            conn.query_row("SELECT COUNT(*) FROM primary_layout_claims WHERE operation=?1 AND family=?2 AND path_key=?3 AND library='PrimarySync' AND child='asset-501' AND version='original' AND provider_checksum=?4",
+            rusqlite::params![op.operation,op.family,original.path_key.as_deref().unwrap(),provider_hash(ORIGINAL)],
+            |row| row.get(0)).unwrap()
+        };
+        assert_eq!(original_claim, 1);
+        assert!(matches!(db.guard_primary_writer(&primary).await,
+            Err(state::error::StateError::Invariant { operation: "primary_layout", detail })
+            if detail == "managed primary slot requires its layout publication owner"
+        ));
+        assert_eq!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let stage_packet = {
+            let mut name = stage.as_os_str().to_os_string();
+            name.push(".xmp");
+            std::fs::read(std::path::PathBuf::from(name)).unwrap()
+        };
+        assert_eq!(stage_packet, old_xmp);
+        assert!(!archive.exists());
+        let archive_index = op
+            .members
+            .iter()
+            .position(|member| {
+                member
+                    .destination
+                    .as_ref()
+                    .is_some_and(|path| path.to_path() == archive)
+            })
+            .unwrap();
+        assert_eq!(
+            archive_index, 0,
+            "the retry fixture must stop immediately after the copied archive member"
+        );
+        assert!(serde_json::to_value(prepared).unwrap()["metadata_outcome"]["Copied"].is_object());
+        let first_family = op.family.clone();
+        if retry {
+            // The real owner saves the first installed member, then fails the next
+            // owner transition. This trigger adds no authority and cannot run until
+            // an installed receipt is already durably recorded.
+            {
+                let conn = db.acquire_lock("inject after installed receipt").unwrap();
+                conn.execute_batch("CREATE TEMP TRIGGER test_stop_after_archive BEFORE UPDATE OF phase ON primary_layout_operations WHEN NEW.phase='publishing' AND EXISTS(SELECT 1 FROM primary_layout_members m WHERE m.operation=NEW.operation AND json_type(CAST(m.evidence AS TEXT),'$.installed')='object') BEGIN SELECT RAISE(FAIL,'synthetic stop after installed archive'); END").unwrap();
+            }
+            let error = download::try_finish_prepared_edited_compat(&config, &mut op)
+                .await
+                .expect_err("fixture must stop after a durable installed receipt");
+            assert!(
+                format!("{error:#}").contains("synthetic stop after installed archive"),
+                "unexpected failure: {error:#}"
+            );
+            {
+                let conn = db
+                    .acquire_lock("remove injected transition failure")
+                    .unwrap();
+                conn.execute_batch("DROP TRIGGER test_stop_after_archive")
+                    .unwrap();
+            }
+            let pending = db
+                .primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].phase, "publishing");
+            let saved = pending[0]
+                .members
+                .iter()
+                .find(|m| {
+                    m.destination
+                        .as_ref()
+                        .is_some_and(|p| p.to_path() == archive)
+                })
+                .unwrap();
+            assert!(saved.old.is_none());
+            let installed = saved
+                .installed
+                .as_ref()
+                .expect("real owner saved the installed receipt");
+            let prepared = saved.prepared.as_ref().unwrap();
+            assert!(
+                serde_json::to_value(installed).unwrap()["metadata_outcome"]["Copied"].is_object()
+            );
+            assert_eq!(installed.path.to_path(), archive);
+            assert_eq!(installed.fingerprint, prepared.fingerprint);
+            assert_eq!(installed.sidecar, prepared.sidecar);
+            assert_eq!(
+                serde_json::to_value(installed).unwrap()["metadata_outcome"],
+                serde_json::to_value(prepared).unwrap()["metadata_outcome"]
+            );
+            assert_bytes(&archive, ORIGINAL);
+            assert_bytes(&archive_xmp, &old_xmp);
+            assert_bytes(&primary, ORIGINAL);
+            let media_file = std::fs::File::open(&archive).unwrap();
+            let xmp_file = std::fs::File::open(&archive_xmp).unwrap();
+            let media_identity = crate::fs_util::file_identity(&media_file).unwrap();
+            let xmp_identity = crate::fs_util::file_identity(&xmp_file).unwrap();
+            let media_mtime = media_file.metadata().unwrap().modified().unwrap();
+            let xmp_mtime = xmp_file.metadata().unwrap().modified().unwrap();
+            drop(media_file);
+            drop(xmp_file);
+            let expected_gets = server.received_requests().await.unwrap().len();
+            let closed = Arc::downgrade(&db);
+            drop(config);
+            drop(build);
+            drop(store);
+            drop(pass);
+            drop(db);
+            assert!(closed.upgrade().is_none());
+            eprintln!("COPIED_ARCHIVE_INSTALLED_RECEIPT_REACHED");
+            let (resumed, _) = cycle_options(
+                root.path(),
+                records(&server, Some(("edit-one", EDIT_ONE))),
+                true,
+                EditedNaming::Primary,
+                options(),
+            )
+            .await;
+            assert_eq!(resumed.failed_count, 0, "{:?}", resumed.stats);
+            assert_eq!(resumed.stats.downloaded, 0);
+            assert_bytes(&archive, ORIGINAL);
+            assert_bytes(&archive_xmp, &old_xmp);
+            assert_bytes(&primary, EDIT_ONE);
+            let media_file = std::fs::File::open(&archive).unwrap();
+            let xmp_file = std::fs::File::open(&archive_xmp).unwrap();
+            assert_eq!(
+                crate::fs_util::file_identity(&media_file).unwrap(),
+                media_identity
+            );
+            assert_eq!(
+                crate::fs_util::file_identity(&xmp_file).unwrap(),
+                xmp_identity
+            );
+            assert_eq!(
+                media_file.metadata().unwrap().modified().unwrap(),
+                media_mtime
+            );
+            assert_eq!(xmp_file.metadata().unwrap().modified().unwrap(), xmp_mtime);
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                expected_gets
+            );
+            let reopened = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+                .await
+                .unwrap();
+            assert!(
+                reopened
+                    .primary_layout_operations("PrimarySync".into())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let binding = reopened
+                .primary_layout_binding(first_family)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                binding
+                    .files
+                    .iter()
+                    .any(|file| file.path.to_path() == archive && file.version == "original")
+            );
+            eprintln!("COPIED_ARCHIVE_EXACT_INSTALL_RETRIED");
+        } else {
+            download::finish_prepared_edited_compat(&config, &mut op).await;
+            assert_bytes(&archive, ORIGINAL);
+            assert_bytes(&archive_xmp, &old_xmp);
+            let binding_before = db
+                .primary_layout_binding(first_family.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            let first_archive = binding_before
+                .files
+                .iter()
+                .find(|file| file.path.to_path() == archive && file.version == "original")
+                .expect("real owner published original archive");
+            let first_json = serde_json::to_value(first_archive).unwrap();
+            assert!(first_json["metadata_outcome"]["Copied"].is_object());
+            let tree_before = media_tree(&media);
+            let checkpoint = db.get_metadata("sync_token:PrimarySync").await.unwrap();
+            let error = download::try_seed_prepared_edited_compat(&config, &pass, || {})
+                .await
+                .expect_err("occupied recorded archive cannot be replaced");
+            assert!(
+                format!("{error:#}")
+                    .contains("copied original archive destination is already occupied"),
+                "unexpected hold: {error:#}"
+            );
+            let pending = db
+                .primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].phase, "planned");
+            let occupied = pending[0]
+                .members
+                .iter()
+                .find(|member| {
+                    member
+                        .destination
+                        .as_ref()
+                        .is_some_and(|p| p.to_path() == archive)
+                        && member
+                            .record
+                            .as_ref()
+                            .is_some_and(|r| r.version_size.as_str() == "original")
+                })
+                .expect("selected occupied archive");
+            let old = occupied
+                .old
+                .as_ref()
+                .expect("archive already has genuine prior binding");
+            assert_eq!(serde_json::to_value(old).unwrap(), first_json);
+            assert!(occupied.prepared.is_none());
+            let stages: Vec<_> = pending[0]
+                .members
+                .iter()
+                .filter_map(|m| m.stage.as_ref())
+                .collect();
+            assert!(!stages.is_empty());
+            for stage in stages {
+                let path = stage.to_path();
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push(".xmp");
+                assert!(!path.exists());
+                assert!(!std::path::PathBuf::from(sidecar).exists());
+            }
+            assert_eq!(media_tree(&media), tree_before);
+            assert_eq!(
+                db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+                checkpoint
+            );
+            let binding_after = db
+                .primary_layout_binding(first_family)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(binding_after).unwrap(),
+                serde_json::to_value(binding_before).unwrap()
+            );
+            assert_eq!(original_gets(&server).await, initial_original_gets);
+            eprintln!("COPIED_ARCHIVE_OCCUPIED_HELD");
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "xmp"))]
+#[tokio::test]
+async fn copied_archive_refuses_late_foreign_media_and_xmp() {
+    use crate::state::MetadataRewriteStore as _;
+    async fn original_gets(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method.to_string() == "GET" && request.url.path() == "/original"
+            })
+            .count()
+    }
+    for foreign_xmp in [false, true] {
+        let server = server().await;
+        let root = tempfile::tempdir().unwrap();
+        let media = root.path().join("media");
+        let options = || CycleOptions {
+            private: true,
+            unfiled_all: true,
+            sidecar: true,
+            ..CycleOptions::default()
+        };
+        let (initial, _) = cycle_options(
+            root.path(),
+            records(&server, Some(("edit-one", EDIT_ONE))),
+            false,
+            EditedNaming::Primary,
+            CycleOptions {
+                edited: false,
+                ..options()
+            },
+        )
+        .await;
+        assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+        assert!(initial.db_sync_token_advance_safe);
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.method.to_string() == "GET"
+                    && request.url.path() == "/edit-one")
+                .count(),
+            0,
+            "initial owner selects only the original"
+        );
+        let initial_original_gets = original_gets(&server).await;
+        assert_eq!(
+            initial_original_gets, 1,
+            "initial owner must fetch the original exactly once"
+        );
+        let primary = media.join("IMG_0501.JPG");
+        let archive = media.join("IMG_0501_original.JPG");
+        let original_xmp = media.join("IMG_0501.JPG.xmp");
+        let archive_xmp = media.join("IMG_0501_original.JPG.xmp");
+        assert_bytes(&primary, ORIGINAL);
+        let packet = std::fs::read_to_string(&original_xmp).unwrap();
+        let field = r#"<fixture:UserNote xmlns:fixture="urn:kei-test:user">retain-my-note</fixture:UserNote>"#;
+        let annotated = packet.replace("</rdf:Description>", &format!("{field}</rdf:Description>"));
+        assert_ne!(annotated, packet, "synthetic user metadata must be present");
+        std::fs::write(&original_xmp, annotated.as_bytes()).unwrap();
+        let old_xmp = std::fs::read(&original_xmp).unwrap();
+        assert!(!old_xmp.is_empty());
+        let old_xmp_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(&old_xmp));
+
+        let owner = state::db::account::AccountOwner::authenticated(
+            "synthetic@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+        )
+        .unwrap();
+        let wrong_owner = state::db::account::AccountOwner::authenticated(
+            "other@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"other-provider"}})).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            state::SqliteStateDb::open_owned(&root.path().join("state.db"), &wrong_owner).await,
+            Err(state::error::StateError::AccountOwnerMismatch)
+        ));
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+                .await
+                .unwrap(),
+        );
+        let provider = Session {
+            reported_count: None,
+            records: records(&server, Some(("edit-one", EDIT_ONE))),
+            quiet: true,
+            lookups: Arc::new(AtomicUsize::new(0)),
+            current: None,
+            lookup_change: None,
+            indexing: None,
+            baseline_successor: None,
+            cycle_token: None,
+            trace: None,
+        };
+        let mut album = crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::default(),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from(""),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(
+                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                ),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(provider),
+        );
+        album.set_shadow_capture(
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com"),
+            Arc::from("private"),
+        );
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album,
+            exclude_ids: Arc::default(),
+        };
+        let scope = json!({
+            "zone":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},
+            "name":"", "list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+            "obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted", "query_filter":null,
+            "container_id":null, "cross_zone_sources":[]
+        });
+        assert_eq!(pass.album.selection_scope(), scope);
+        let expected_pass = format!(
+            "{:x}",
+            Sha256::digest(
+                json!({"kind":"Unfiled","scope":scope,"excludes":[]})
+                    .to_string()
+                    .as_bytes()
+            )
+        );
+        let expected_db_scope =
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com")
+                .scope(
+                    "private",
+                    &json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                )
+                .unwrap();
+        let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+        let source_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL));
+        let source_native = state::db::provider_selection::SelectionPath::from_path(&primary)
+            .key()
+            .unwrap();
+        let source_receipts: Vec<String> = {
+            let conn = db.acquire_lock("initial compact original source").unwrap();
+            let mut stmt = conn.prepare("SELECT json_array(id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,trust_receipt,selected_metadata_hash,generation_id) FROM download_receipts WHERE library='PrimarySync' AND child='asset-501' AND version_size='original' ORDER BY id").unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            source_receipts.len(),
+            1,
+            "normal owner must create one source-backed compact original receipt"
+        );
+        let source_receipt: Value = serde_json::from_str(&source_receipts[0]).unwrap();
+        assert!(!source_receipt[0].as_str().unwrap().is_empty());
+        assert_eq!(source_receipt[1], account_key);
+        assert_eq!(source_receipt[2], provider_key);
+        assert_eq!(source_receipt[3], expected_db_scope);
+        assert_eq!(source_receipt[4], "PrimarySync");
+        assert_eq!(source_receipt[5], "asset-501");
+        assert_eq!(source_receipt[6], "501");
+        assert_eq!(source_receipt[7], "asset-501");
+        assert_eq!(source_receipt[8], expected_pass);
+        assert_eq!(source_receipt[9], "original");
+        assert_eq!(source_receipt[10], provider_hash(ORIGINAL));
+        assert_eq!(source_receipt[11], ORIGINAL.len());
+        assert_eq!(source_receipt[12], source_native);
+        assert_eq!(source_receipt[13], source_hash);
+        assert_eq!(source_receipt[14], source_hash);
+        assert!(!source_receipt[15].as_str().unwrap().is_empty());
+        assert!(
+            source_receipt[16].is_null()
+                && source_receipt[17].is_null()
+                && source_receipt[18].is_null()
+        );
+        let source_path_receipt: (String, String, String, String) = {
+            let conn = db
+                .acquire_lock("initial exact original path receipt")
+                .unwrap();
+            conn.query_row("SELECT provider_checksum,source_checksum,local_checksum,download_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?1",
+            [primary.to_str().unwrap()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap()
+        };
+        assert_eq!(
+            source_path_receipt,
+            (
+                provider_hash(ORIGINAL),
+                source_hash.clone(),
+                source_hash.clone(),
+                source_hash.clone()
+            )
+        );
+        assert_no_original_metadata_debt(&db);
+        let store: Arc<dyn download::DownloadStore> = db.clone();
+        let build = make_run_cycle_download_config_builder(&media, store);
+        let mut config = build(
+            download::SyncMode::Full,
+            Arc::default(),
+            Arc::default(),
+            Arc::from("PrimarySync"),
+        )
+        .as_ref()
+        .clone();
+        config.folder_structure = String::new();
+        config.folder_structure_albums = Arc::from("");
+        config.folder_structure_smart_folders = Arc::from("");
+        config.edited = true;
+        config.edited_naming = EditedNaming::Primary;
+        config.metadata.xmp_sidecar = true;
+        assert!(!config.refresh_metadata);
+        let mut op = download::seed_prepared_edited_compat(&config, &pass).await;
+        assert_eq!(
+            original_gets(&server).await,
+            initial_original_gets,
+            "preparation must reuse the proved original"
+        );
+        assert_eq!(op.phase, "prepared");
+        assert_eq!(op.source_library, "PrimarySync");
+        assert_eq!(op.child, "asset-501");
+        assert_eq!(op.pass, expected_pass);
+        assert!(!op.refresh_metadata);
+        let original = op
+            .members
+            .iter()
+            .find(|member| {
+                member.record.as_ref().is_some_and(|record| {
+                    record.version_size.as_str() == "original"
+                        && record.checksum.as_ref() == provider_hash(ORIGINAL)
+                })
+            })
+            .expect("selected original must be part of the recorded operation");
+        assert!(
+            original.archive_source.is_none(),
+            "exercise selected original, not archive-only branch"
+        );
+        assert_eq!(original.destination.as_ref().unwrap().to_path(), archive);
+        let stage = original.stage.as_ref().unwrap().to_path();
+        let prepared = original
+            .prepared
+            .as_ref()
+            .expect("selected original is durably prepared");
+        assert_eq!(prepared.path.to_path(), stage);
+        assert_eq!(prepared.provider_checksum, provider_hash(ORIGINAL));
+        assert_eq!(
+            prepared.source_checksum.as_deref(),
+            Some(source_hash.as_str())
+        );
+        assert_bytes(&stage, ORIGINAL);
+        assert!(
+            op.members
+                .iter()
+                .filter_map(|member| member.old.as_ref())
+                .any(|old| old.path.to_path() == primary
+                    && old.version == "original"
+                    && old.provider_checksum == provider_hash(ORIGINAL)
+                    && old.source_checksum.as_deref() == Some(source_hash.as_str())
+                    && data_encoding::HEXLOWER.encode(&old.fingerprint.sha256) == source_hash
+                    && old
+                        .sidecar
+                        .as_ref()
+                        .is_some_and(
+                            |fp| data_encoding::HEXLOWER.encode(&fp.sha256) == old_xmp_hash
+                        ))
+        );
+        let original_claim: i64 = {
+            let conn = db.acquire_lock("selected original archive claim").unwrap();
+            conn.query_row("SELECT COUNT(*) FROM primary_layout_claims WHERE operation=?1 AND family=?2 AND path_key=?3 AND library='PrimarySync' AND child='asset-501' AND version='original' AND provider_checksum=?4",
+            rusqlite::params![op.operation,op.family,original.path_key.as_deref().unwrap(),provider_hash(ORIGINAL)],
+            |row| row.get(0)).unwrap()
+        };
+        assert_eq!(original_claim, 1);
+        assert!(matches!(db.guard_primary_writer(&primary).await,
+            Err(state::error::StateError::Invariant { operation: "primary_layout", detail })
+            if detail == "managed primary slot requires its layout publication owner"
+        ));
+        assert_eq!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let index = op
+            .members
+            .iter()
+            .position(|member| {
+                member
+                    .destination
+                    .as_ref()
+                    .is_some_and(|p| p.to_path() == archive)
+            })
+            .unwrap();
+        assert_eq!(
+            index, 0,
+            "foreign collision must be on the first selected publication"
+        );
+        assert!(
+            original.old.is_none(),
+            "the archive was absent when the real owner planned it"
+        );
+        assert!(serde_json::to_value(prepared).unwrap()["metadata_outcome"]["Copied"].is_object());
+        let prepared_json = serde_json::to_value(prepared).unwrap();
+        let prepared_media_identity = prepared.fingerprint.identity;
+        let source_media = std::fs::File::open(&primary).unwrap();
+        let source_xmp = std::fs::File::open(&original_xmp).unwrap();
+        let source_media_identity = crate::fs_util::file_identity(&source_media).unwrap();
+        let source_xmp_identity = crate::fs_util::file_identity(&source_xmp).unwrap();
+        let source_media_mtime = source_media.metadata().unwrap().modified().unwrap();
+        let source_xmp_mtime = source_xmp.metadata().unwrap().modified().unwrap();
+        drop(source_media);
+        drop(source_xmp);
+        let foreign = if foreign_xmp { &archive_xmp } else { &archive };
+        assert!(!archive.exists());
+        assert!(!archive_xmp.exists());
+        let foreign_bytes = b"synthetic foreign entry; retain exactly";
+        std::fs::write(foreign, foreign_bytes).unwrap();
+        let foreign_file = std::fs::File::open(foreign).unwrap();
+        let foreign_identity = crate::fs_util::file_identity(&foreign_file).unwrap();
+        let foreign_mtime = foreign_file.metadata().unwrap().modified().unwrap();
+        drop(foreign_file);
+        let checkpoint = db.get_metadata("sync_token:PrimarySync").await.unwrap();
+        assert_eq!(checkpoint.as_deref(), Some("cycle-token"));
+        let claims_before = {
+            let conn = db.acquire_lock("late foreign exact claims").unwrap();
+            let mut stmt=conn.prepare("SELECT json_array(path_key,family,operation,library,child,version,provider_checksum,local_checksum,hex(native_path)) FROM primary_layout_claims WHERE operation=?1 ORDER BY path_key").unwrap();
+            stmt.query_map([&op.operation], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(claims_before.len() >= 2);
+        let operation_id = op.operation.clone();
+        let requests_before = server.received_requests().await.unwrap().len();
+        let error = download::try_finish_prepared_edited_compat(&config, &mut op)
+            .await
+            .expect_err("foreign target must be refused without replacement");
+        assert!(
+            format!("{error:#}").contains("Foreign file appeared in a primary layout destination"),
+            "unexpected refusal: {error:#}"
+        );
+        let foreign_file = std::fs::File::open(foreign).unwrap();
+        assert_eq!(std::fs::read(foreign).unwrap(), foreign_bytes);
+        assert_eq!(
+            crate::fs_util::file_identity(&foreign_file).unwrap(),
+            foreign_identity
+        );
+        assert_eq!(
+            foreign_file.metadata().unwrap().modified().unwrap(),
+            foreign_mtime
+        );
+        assert_bytes(&primary, ORIGINAL);
+        assert_bytes(&original_xmp, &old_xmp);
+        let source_media = std::fs::File::open(&primary).unwrap();
+        let source_xmp = std::fs::File::open(&original_xmp).unwrap();
+        assert_eq!(
+            crate::fs_util::file_identity(&source_media).unwrap(),
+            source_media_identity
+        );
+        assert_eq!(
+            crate::fs_util::file_identity(&source_xmp).unwrap(),
+            source_xmp_identity
+        );
+        assert_eq!(
+            source_media.metadata().unwrap().modified().unwrap(),
+            source_media_mtime
+        );
+        assert_eq!(
+            source_xmp.metadata().unwrap().modified().unwrap(),
+            source_xmp_mtime
+        );
+        if foreign_xmp {
+            assert_bytes(&archive, ORIGINAL);
+            let media_file = std::fs::File::open(&archive).unwrap();
+            assert_eq!(
+                crate::fs_util::file_identity(&media_file).unwrap(),
+                prepared_media_identity,
+                "only the exact prepared media may be visible"
+            );
+        } else {
+            assert!(!archive_xmp.exists());
+        }
+        let pending = db
+            .primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].operation, operation_id);
+        assert_eq!(pending[0].phase, "publishing");
+        let saved = pending[0]
+            .members
+            .iter()
+            .find(|member| {
+                member
+                    .destination
+                    .as_ref()
+                    .is_some_and(|path| path.to_path() == archive)
+            })
+            .unwrap();
+        assert!(saved.old.is_none());
+        assert!(
+            saved.installed.is_none(),
+            "partial media is not a fabricated completed member"
+        );
+        assert_eq!(
+            serde_json::to_value(saved.prepared.as_ref().unwrap()).unwrap(),
+            prepared_json
+        );
+        let claims_after = {
+            let conn = db.acquire_lock("late foreign retained claims").unwrap();
+            let mut stmt=conn.prepare("SELECT json_array(path_key,family,operation,library,child,version,provider_checksum,local_checksum,hex(native_path)) FROM primary_layout_claims WHERE operation=?1 ORDER BY path_key").unwrap();
+            stmt.query_map([&operation_id], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(claims_after, claims_before);
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync").await.unwrap(),
+            checkpoint
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            requests_before
+        );
+        assert_eq!(original_gets(&server).await, initial_original_gets);
+        eprintln!("COPIED_ARCHIVE_FOREIGN_HOLD_REACHED xmp={foreign_xmp}");
     }
 }

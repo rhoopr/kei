@@ -3,7 +3,7 @@
 use crate::download::{DownloadConfig, DownloadStore, file, filter, planner};
 use crate::icloud::photos::PhotoAsset;
 use crate::state::db::primary_layout::{
-    LayoutBinding, LayoutFile, LayoutMember, LayoutOperation, path_key,
+    LayoutBinding, LayoutFile, LayoutMember, LayoutMetadataOutcome, LayoutOperation, path_key,
 };
 use crate::state::db::provider_selection::SelectionPath;
 use crate::state::{DownloadedFileRecord, ReconciliationCatalogPath, VersionSizeKey};
@@ -168,6 +168,7 @@ async fn file_receipt(
         sidecar: snapshot(root, &sidecar(path)).await?,
         archive_original: false,
         metadata_decision: None,
+        metadata_outcome: None,
     })
 }
 async fn validate_file(root: &Path, file: &LayoutFile) -> Result<()> {
@@ -958,6 +959,7 @@ async fn prepare(
                     && old.provider_checksum == record.checksum.as_ref()
             })
             .cloned();
+        let source_is_claimed = owned.is_some();
         let source = if let Some(source) = owned {
             Some(source)
         } else {
@@ -994,7 +996,21 @@ async fn prepare(
             found
         };
         let transform = metadata_decision(asset, config, record.version_size, &record.checksum)?;
+        let mut metadata_outcome = None;
         let prepared = if let Some(source) = source {
+            let preserve_unverified_archive = expected.naming_role
+                == filter::NamingRole::OriginalArchive
+                && !op.refresh_metadata
+                && config.capture_timestamp_repair
+                    == crate::download::CaptureTimestampRepair::Preserve;
+            if preserve_unverified_archive {
+                anyhow::ensure!(
+                    source_is_claimed && source.sidecar.is_some(),
+                    "Original archive source lacks a claimed sidecar"
+                );
+                db.preflight_primary_layout_copy(op.clone(), index, source.clone())
+                    .await?;
+            }
             let media = file::primary_layout::copy_verified_create_only(
                 &config.directory,
                 &source.path.to_path(),
@@ -1011,7 +1027,15 @@ async fn prepare(
                 )
                 .await?;
             }
-            if op.refresh_metadata
+            if preserve_unverified_archive {
+                metadata_outcome = Some(LayoutMetadataOutcome::Copied {
+                    source: source.path.clone(),
+                    fingerprint: source.fingerprint.clone(),
+                    sidecar: source.sidecar.clone(),
+                    source_checksum: source.source_checksum.clone(),
+                    previous_decision: source.metadata_decision.clone(),
+                });
+            } else if op.refresh_metadata
                 || source.metadata_decision.as_deref() != Some(transform.as_str())
             {
                 let flags = crate::download::pipeline::MetadataFlags::from(config);
@@ -1111,7 +1135,13 @@ async fn prepare(
         let _target = target;
         let mut prepared = prepared;
         prepared.archive_original = expected.naming_role == filter::NamingRole::OriginalArchive;
-        prepared.metadata_decision = Some(transform);
+        prepared.metadata_decision = match &metadata_outcome {
+            Some(LayoutMetadataOutcome::Copied {
+                previous_decision, ..
+            }) => previous_decision.clone(),
+            _ => Some(transform),
+        };
+        prepared.metadata_outcome = metadata_outcome;
         op.members
             .get_mut(index)
             .context("Layout member disappeared")?
@@ -1188,6 +1218,9 @@ async fn finish_with_recovery(
         );
     }
 
+    // Debt may have appeared after preparation. Check before creating even
+    // the operation-owned preservation copies, and again at later transitions.
+    save_recovery(db, op, proof).await?;
     // Preserve every member before the first visible change, including sidecars.
     for index in 0..op.members.len() {
         let member = op.members.get(index).context("Layout member disappeared")?;
@@ -1244,10 +1277,9 @@ async fn finish_with_recovery(
             .await?;
             continue;
         }
-        if let Some(proof) = proof {
-            db.save_primary_layout_with_recovery(op.clone(), proof.clone())
-                .await?;
-        }
+        // Revalidate recorded ownership and copied-source debt immediately
+        // before each visible publication, including ordinary owner execution.
+        save_recovery(db, op, proof).await?;
         if let (Some(target), Some(prepared)) = (&member.destination, &member.prepared) {
             let target = target.to_path();
             file::primary_layout::recover_prepared_link(
@@ -1287,6 +1319,9 @@ async fn finish_with_recovery(
                 )
                 .await?
             };
+            // A media publication is not authority to publish its sidecar;
+            // check the recorded owner and copied-source debt again.
+            save_recovery(db, op, proof).await?;
             let xmp_path = sidecar(&target);
             let xmp = if let Some(prepared_xmp) = &prepared.sidecar {
                 file::primary_layout::recover_prepared_link(
@@ -2657,6 +2692,69 @@ pub(crate) mod tests {
         op.phase = "prepared".into();
         db.save_primary_layout(op.clone()).await.unwrap();
         op
+    }
+
+    #[cfg(all(target_os = "linux", feature = "xmp"))]
+    pub(crate) async fn try_seed_prepared_edited_compat(
+        config: &DownloadConfig,
+        pass: &crate::commands::AlbumPass,
+        after_plan: impl FnOnce(),
+    ) -> anyhow::Result<LayoutOperation> {
+        let config = config.with_pass(pass).check_ownership().await.unwrap();
+        let asset = pass
+            .album
+            .confirm_layout_asset("asset-501", "PrimarySync")
+            .await
+            .unwrap()
+            .asset;
+        let db = config.state_db.as_deref().unwrap();
+        let session = LayoutSession::load(db).await.unwrap();
+        let key = family(&asset, &config).unwrap();
+        let binding = db.primary_layout_binding(key.clone()).await.unwrap();
+        let mut op = plan(
+            &asset,
+            &config,
+            &session,
+            binding.as_ref(),
+            key,
+            decision(&asset, &config).unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+        for member in &op.members {
+            if let Some(record) = &member.record {
+                db.upsert_seen(record).await.unwrap();
+            }
+        }
+        after_plan();
+        super::prepare(
+            &reqwest::Client::new(),
+            &asset,
+            &config,
+            &session,
+            &mut op,
+            &CancellationToken::new(),
+            &mut LayoutOutcome::default(),
+        )
+        .await?;
+        op.phase = "prepared".into();
+        db.save_primary_layout(op.clone()).await.unwrap();
+        Ok(op)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "xmp"))]
+    pub(crate) async fn try_finish_prepared_edited_compat(
+        config: &DownloadConfig,
+        op: &mut LayoutOperation,
+    ) -> anyhow::Result<()> {
+        super::finish(
+            config.state_db.as_deref().unwrap(),
+            op,
+            &CancellationToken::new(),
+            &mut LayoutOutcome::default(),
+        )
+        .await
     }
 
     pub(crate) async fn finish_prepared_edited_compat(

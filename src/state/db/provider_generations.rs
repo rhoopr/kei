@@ -2865,7 +2865,13 @@ pub(super) fn record_layout_destination(
     record: &AssetRecord,
     file: &super::primary_layout::LayoutFile,
     flags: u8,
+    metadata_verified: bool,
 ) -> Result<(), StateError> {
+    // Copied metadata is not selected-work completion. Do not even read
+    // unrelated selected rows, and never change their existing evidence.
+    if !metadata_verified {
+        return Ok(());
+    }
     validate_identity_decisions(conn, &record.library, &record.id)?;
     let path = file.path.key()?;
     let rows:Vec<(String,String,String)>=conn.prepare("SELECT generation,pass_key,child FROM provider_active_destinations WHERE library=?1 AND asset_id=?2 AND version_size=?3 AND path=?4 AND checksum=?5 AND size_bytes=?6 AND metadata_hash IS ?7 AND admitted=1")?.query_map(params![record.library,record.id,record.version_size.as_str(),path,record.checksum.as_ref(),i64::try_from(record.size_bytes).map_err(|_error|StateError::ProviderSelectionInvalid)?,record.metadata.metadata_hash],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
