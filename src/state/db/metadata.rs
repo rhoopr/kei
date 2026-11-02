@@ -1228,12 +1228,15 @@ impl SqliteStateDb {
             })?;
             metadata_capture_retry::retire_completed(&tx, &library)?;
             let remaining = metadata_capture_remaining(&tx, &library, target_revision)?;
-            let protected: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM unattributed_legacy WHERE library=?1)",
-                [&library],
-                |row| row.get(0),
-            )?;
-            if remaining == 0 && !protected {
+            // PATCH (local): do not let a permanently-quarantined unattributed_legacy
+            // asset (kei's deliberate, correct give-up-safely path for genuinely
+            // unresolvable legacy-master ambiguity) block active_revision advancement
+            // for the WHOLE library forever. unattributed_legacy visibility is
+            // unaffected -- metadata_capture_status() below reads it independently
+            // via legacy_preservation::counts(), so kei status still reports these
+            // assets as needing attribution. Only the sync-token-blocking side
+            // effect on unrelated, already-resolved assets is removed.
+            if remaining == 0 {
                 tx.execute(
                     "UPDATE metadata_capture_state SET active_revision = MAX(active_revision, ?1), \
                         pending_revision = NULL, failed_assets = 0, last_error = NULL, \
