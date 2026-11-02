@@ -416,6 +416,22 @@ async fn collect_metadata_capture_repair(
                         .into_iter()
                         .filter(|asset| metadata_capture_candidate_matches(asset, &candidate));
                     let Some(asset) = matches.next() else {
+                        // PATCH (local): without a durable retry row, this candidate
+                        // is invisible to legacy_preparation_snapshots() (reads only
+                        // metadata_capture_retries) and can never be authoritatively
+                        // resolved or escalated to unattributed_legacy -- remaining()
+                        // then never reaches 0. Defer exactly like the sibling
+                        // ambiguity branches below do.
+                        if let Err(error) = db
+                            .defer_metadata_capture_ambiguity(
+                                &candidate,
+                                crate::state::METADATA_CAPTURE_REVISION,
+                            )
+                            .await
+                        {
+                            repair.checkpoint.state_write_failures += 1;
+                            tracing::warn!(error = %error, "Could not persist metadata-capture retry");
+                        }
                         record_metadata_capture_failure(
                             db.as_ref(),
                             &candidate.library,
