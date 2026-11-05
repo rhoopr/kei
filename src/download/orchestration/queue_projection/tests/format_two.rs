@@ -12,6 +12,335 @@ use serde_json::json;
 use std::sync::Arc;
 
 #[tokio::test]
+#[cfg(unix)]
+async fn admitted_publication_choice_prefix_reopens_before_missing_and_dispatch() {
+    use crate::download::orchestration::generation;
+    use crate::download::pipeline::{StreamRuntime, stream_and_download_from_stream};
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::Ordering;
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let original = b"\xff\xd8\xff\xe0unchanged original";
+    let edited = b"\xff\xd8\xff\xe0current adjusted";
+    let checksum = |bytes: &[u8]| data_encoding::BASE64.encode(&Sha256::digest(bytes));
+    let server = wiremock::MockServer::start().await;
+    for (name, bytes) in [
+        ("original", original.as_slice()),
+        ("edited", edited.as_slice()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let mut f = Fixture::new().await;
+    f.config.folder_structure = "none".into();
+    f.config.edited = true;
+    f.config.edited_naming = crate::types::EditedNaming::Primary;
+    {
+        let mut values = f.session.records.lock().unwrap();
+        values[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+        values[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/original",server.uri()),"size":original.len(),"fileChecksum":checksum(original)});
+    }
+    let client = reqwest::Client::new();
+    {
+        let asset = f
+            .pass
+            .album
+            .confirm_catalog_asset("asset-m")
+            .await
+            .unwrap()
+            .asset;
+        let result = stream_and_download_from_stream(
+            &client,
+            futures_util::stream::iter([Ok(asset)]),
+            &Arc::new(f.config.with_pass(&f.pass)),
+            super::controls(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.downloaded, 1);
+        assert!(result.failed.is_empty());
+        assert_eq!(result.state_write_failures, 0);
+    }
+    let p = f.config.directory.join("photo.JPG");
+    assert_eq!(std::fs::read(&p).unwrap(), original);
+    let before = std::fs::metadata(&p).unwrap();
+    let proof_sql = "SELECT json_array(id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-m' AND version_size='original'";
+    let proof: String =
+        f.db.acquire_lock("prefix original proof")
+            .unwrap()
+            .query_row(proof_sql, [], |r| r.get(0))
+            .unwrap();
+    {
+        let mut values = f.session.records.lock().unwrap();
+        values[1]["fields"]["resJPEGFullRes"] = json!({"value":{"downloadURL":format!("{}/edited",server.uri()),"size":edited.len(),"fileChecksum":checksum(edited)}});
+        values[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+        values[1]["fields"]["adjustmentRenderType"] = json!({"value":1});
+    }
+    f.config.resolution = crate::types::PhotoResolution::None;
+    let map_sql = "SELECT json_array(library,id,version_size,requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size) FROM reconciliation_paths WHERE version_size='adjusted'";
+    let (s, mapping, root, pass, binding) = {
+        let context = generation::context_for_format(
+            std::slice::from_ref(&f.pass),
+            &f.config,
+            super::controls(),
+            2,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let run = context
+            .start_for_test(std::slice::from_ref(&f.pass), &f.config)
+            .await
+            .unwrap();
+        assert_eq!(run.root.spec.format, 2);
+        let key = generation::pass_key(&f.pass);
+        let observed = f
+            .pass
+            .album
+            .confirm_catalog_asset("asset-m")
+            .await
+            .unwrap()
+            .asset;
+        let (asset, confirmation) = run.confirm(&key, observed).await.unwrap();
+        let mut config = f.config.with_pass(&f.pass);
+        config.selection_run = Some(run.clone());
+        config.selection_pass = Some(key.clone());
+        let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+            .await
+            .unwrap();
+        let mut plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(
+            f.db.acquire_lock("no seeded prefix intent")
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM reconciliation_paths WHERE version_size='adjusted'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert!(
+            run.project(
+                &key,
+                &asset,
+                confirmation,
+                &mut plan,
+                &mut planner,
+                &config,
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap()
+        );
+        // Inspect the returned production-owner prefix before caller matching/dispatch.
+        let s = plan.tasks[0].download_path.clone();
+        assert_ne!(s, p);
+        assert!(!s.exists());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let conn = rusqlite::Connection::open_with_flags(
+            f.dir.path().join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mapping: String = conn.query_row(map_sql, [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            mapping,
+            json!([
+                "PrimarySync",
+                "asset-m",
+                "adjusted",
+                crate::fs_util::confined_path_key(&p).unwrap(),
+                crate::fs_util::confined_path_key(&s).unwrap(),
+                s.to_str().unwrap(),
+                checksum(edited),
+                edited.len()
+            ])
+            .to_string()
+        );
+        let rows: Vec<String> = conn.prepare("SELECT json_array(d.generation,d.pass_key,d.child,d.library,d.asset_id,d.master,d.version_size,d.path,d.checksum,d.size_bytes,d.verified_media,g.scope,g.account_key,g.provider_key) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.version_size='adjusted' AND d.admitted=1").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(rows.len(), 1);
+        let row: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        let (account, provider) = f.capture.owner.authenticated_keys().unwrap();
+        assert_eq!(
+            row,
+            json!([
+                run.root.id,
+                key,
+                "asset-m",
+                "PrimarySync",
+                "asset-m",
+                "m",
+                "adjusted",
+                SelectionPath::from_path(&s).key().unwrap(),
+                checksum(edited),
+                edited.len(),
+                0,
+                run.root.spec.scope,
+                account,
+                provider
+            ])
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM download_receipts WHERE version_size='adjusted'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(proof_sql, [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            proof
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+        let prefix_metadata = std::fs::metadata(&p).unwrap();
+        assert_eq!(
+            (before.ino(), before.mtime(), before.mtime_nsec()),
+            (
+                prefix_metadata.ino(),
+                prefix_metadata.mtime(),
+                prefix_metadata.mtime_nsec()
+            )
+        );
+        eprintln!(
+            "ADMITTED_PREFIX root={} pass={key} scope={} resource={} size={} P={} S={} admitted=1 media=0 edited_GET=0",
+            run.root.id,
+            run.root.spec.scope,
+            checksum(edited),
+            edited.len(),
+            p.display(),
+            s.display()
+        );
+        (
+            s,
+            mapping,
+            run.root.id.clone(),
+            key,
+            plan.tasks[0]
+                .publication_binding
+                .as_deref()
+                .unwrap()
+                .clone(),
+        )
+    };
+    let old_state = Arc::downgrade(&f.db);
+    f = super::reopen_streaming_fixture(f).await;
+    assert!(
+        old_state.upgrade().is_none(),
+        "old planner/run/source/state handle survived reopen"
+    );
+    {
+        let asset = f
+            .pass
+            .album
+            .confirm_catalog_asset("asset-m")
+            .await
+            .unwrap()
+            .asset;
+        let config = f.config.with_pass(&f.pass);
+        let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+            .await
+            .unwrap();
+        let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].download_path, s);
+        assert!(plan.tasks[0].superseded_requested_path.is_none());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let result = stream_and_download_from_stream(
+            &client,
+            futures_util::stream::iter([Ok(asset)]),
+            &Arc::new(config),
+            super::controls(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.downloaded, 1);
+        assert!(result.failed.is_empty());
+        assert_eq!(result.state_write_failures, 0);
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert_eq!(std::fs::read(&s).unwrap(), edited);
+    let receipts =
+        f.db.bound_download_receipts(
+            binding,
+            "adjusted".into(),
+            checksum(edited),
+            edited.len() as u64,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].native_path.to_path(), s);
+    assert!(receipts[0].fulfills_pass(&pass));
+    assert_eq!(
+        receipts[0].source_checksum,
+        data_encoding::HEXLOWER.encode(&Sha256::digest(edited))
+    );
+    assert!(
+        f.db.selection_destination_verified(
+            owner(),
+            root,
+            pass,
+            "asset-m".into(),
+            "adjusted".into()
+        )
+        .await
+        .unwrap()
+    );
+    let lookups = f.session.calls.load(Ordering::SeqCst);
+    let quiet = crate::download::download_photos_with_sync(
+        &client,
+        std::slice::from_ref(&f.pass),
+        Arc::new(f.config.clone()),
+        super::controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(quiet.outcome, crate::download::DownloadOutcome::Success),
+        "{quiet:?}"
+    );
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), lookups);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    let conn = f.db.acquire_lock("final admitted prefix proof").unwrap();
+    assert_eq!(
+        conn.query_row(map_sql, [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        mapping
+    );
+    assert_eq!(
+        conn.query_row(proof_sql, [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        proof
+    );
+    assert_eq!(conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE version_size='adjusted' AND (verified_media=0 OR path<>?1)", [SelectionPath::from_path(&s).key().unwrap()], |r| r.get::<_,i64>(0)).unwrap(), 0);
+    assert_eq!(std::fs::read(&p).unwrap(), original);
+    let after = std::fs::metadata(&p).unwrap();
+    assert_eq!(
+        (before.ino(), before.mtime(), before.mtime_nsec()),
+        (after.ino(), after.mtime(), after.mtime_nsec())
+    );
+}
+
+#[tokio::test]
 async fn publication_choice_pending_companions_are_path_local() {
     use crate::state::error::StateError;
     for (companion, allowed) in [

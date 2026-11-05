@@ -489,6 +489,15 @@ pub(crate) struct SelectionRun {
 }
 
 impl SelectionContext {
+    #[cfg(test)]
+    pub(super) async fn start_for_test(
+        &self,
+        passes: &[AlbumPass],
+        config: &DownloadConfig,
+    ) -> Result<Arc<SelectionRun>> {
+        self.start(passes, config).await
+    }
+
     pub(super) fn spec(&self, config: &DownloadConfig, basis: String) -> GenerationSpec {
         GenerationSpec {
             format: self.format,
