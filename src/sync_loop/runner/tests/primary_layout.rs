@@ -5011,81 +5011,702 @@ async fn primary_layout_real_live_photo_pair_edits_reverts_and_reopens() {
     }
 }
 
+async fn source_mutation_layout_context(
+    root: &std::path::Path,
+    current: Arc<std::sync::Mutex<Vec<Value>>>,
+    lookups: Arc<AtomicUsize>,
+) -> (download::DownloadConfig, AlbumPass) {
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&root.join("state.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    let provider = Session {
+        reported_count: None,
+        records: current.lock().unwrap().clone(),
+        quiet: true,
+        lookups,
+        current: Some(current.clone()),
+        lookup_change: None,
+        indexing: None,
+        baseline_successor: None,
+        cycle_token: None,
+        trace: None,
+    };
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::default(),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from("TestAlbum"),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(provider),
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner, "com"),
+        Arc::from("private"),
+    );
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::default(),
+    };
+    let media = root.join("media");
+    let store: Arc<dyn download::DownloadStore> = db.clone();
+    let build = make_run_cycle_download_config_builder(&media, store);
+    let mut config = build(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from("PrimarySync"),
+    )
+    .as_ref()
+    .clone();
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    config.edited_naming = EditedNaming::Primary;
+    let (capture, _, _) = pass
+        .album
+        .publication_scope("PrimarySync")
+        .unwrap()
+        .unwrap();
+    assert!(Arc::ptr_eq(&db, &capture.db));
+    (config.with_pass(&pass), pass)
+}
+
 #[tokio::test]
-async fn primary_layout_source_change_during_preparation_retains_work_then_replans() {
+async fn primary_layout_prepared_source_drift_holds_then_recovers_same_operation() {
+    use rusqlite::types::Value as SqlValue;
+    use tracing::instrument::WithSubscriber;
+
+    struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_poisoned| {
+                    std::io::Error::other("source drift log capture lock poisoned")
+                })?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     let server = server().await;
-    let root = tempfile::tempdir().unwrap();
+    let mut root = tempfile::tempdir().unwrap();
+    if std::env::var_os("KEI_SOURCE_DRIFT_RETAIN_FIXTURE").is_some() {
+        root.disable_cleanup(true);
+        eprintln!("source drift fixture: {}", root.path().display());
+    }
     let media = root.path().join("media");
-    cycle(
+    let (initial, _) = cycle_options(
         root.path(),
         records(&server, None),
         false,
         EditedNaming::Primary,
-    )
-    .await;
-    let first = records(&server, Some(("edit-changing", EDIT_ONE)));
-    let second = records(&server, Some(("edit-two", EDIT_TWO)));
-    let current = Arc::new(std::sync::Mutex::new(first.clone()));
-    let update = current.clone();
-    let next = second.clone();
-    Mock::given(method("GET"))
-        .and(path("/edit-changing"))
-        .respond_with(move |_: &wiremock::Request| {
-            *update.lock().unwrap() = next.clone();
-            ResponseTemplate::new(200).set_body_bytes(EDIT_ONE)
-        })
-        .mount(&server)
-        .await;
-    let (held, _) = cycle_options(
-        root.path(),
-        first,
-        false,
-        EditedNaming::Primary,
         CycleOptions {
-            current: Some(current),
+            private: true,
+            baseline_successor: Some("source-original"),
+            cycle_token: Some("source-original"),
             ..CycleOptions::default()
         },
     )
     .await;
-    assert!(
-        !held.db_sync_token_advance_safe,
-        "changed source promoted checkpoint"
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    assert!(initial.db_sync_token_advance_safe);
+    assert_eq!(initial.stats.downloaded, 1);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    let rows = |sql: &str| {
+        let conn = rusqlite::Connection::open_with_flags(
+            root.path().join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut statement = conn.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|i| row.get::<_, SqlValue>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let custody = || {
+        [
+            rows("SELECT * FROM primary_layout_operations ORDER BY operation"),
+            rows("SELECT * FROM primary_layout_members ORDER BY operation,member"),
+            rows("SELECT * FROM primary_layout_claims ORDER BY path_key"),
+            rows("SELECT * FROM primary_layout_bindings ORDER BY family"),
+            rows("SELECT * FROM primary_layout_preserved ORDER BY operation,member"),
+            rows(
+                "SELECT * FROM primary_layout_superseded_paths ORDER BY library,child,version,provider_checksum,native_path",
+            ),
+        ]
+    };
+    let file = |path: &std::path::Path| {
+        let handle = std::fs::File::open(path).unwrap();
+        (
+            std::fs::read(path).unwrap(),
+            crate::fs_util::file_identity(&handle).unwrap(),
+            handle.metadata().unwrap().modified().unwrap(),
+        )
+    };
+    let tree = || {
+        let mut files = std::collections::BTreeMap::new();
+        let mut directories = vec![media.clone()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    directories.push(entry.path());
+                } else {
+                    assert!(entry.file_type().unwrap().is_file());
+                    files.insert(entry.path(), file(&entry.path()));
+                }
+            }
+        }
+        files
+    };
+    let members = || {
+        rows("SELECT evidence FROM primary_layout_members ORDER BY operation,member")
+            .into_iter()
+            .map(|row| {
+                let [SqlValue::Blob(bytes)] = row.as_slice() else {
+                    panic!("non-BLOB layout member")
+                };
+                serde_json::from_slice::<state::db::primary_layout::LayoutMember>(bytes).unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let visible = media.join("IMG_0501.JPG");
+    let archive = media.join("IMG_0501_original.JPG");
+    let original_file = file(&visible);
+    assert_eq!(original_file.0, ORIGINAL);
+    assert!(!archive.exists());
+    let original_receipts = rows("SELECT * FROM download_receipts ORDER BY id");
+    assert_eq!(original_receipts.len(), 1);
+
+    let first = records(&server, Some(("edit-one", EDIT_ONE)));
+    let second = records(&server, Some(("edit-two", EDIT_TWO)));
+    let current = Arc::new(std::sync::Mutex::new(first.clone()));
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let (op, scope) = {
+        let (config, pass) =
+            source_mutation_layout_context(root.path(), current.clone(), lookups.clone()).await;
+        let db = config.state_db.as_ref().unwrap();
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("source-original")
+        );
+        let (_, scope, _) = pass
+            .album
+            .publication_scope("PrimarySync")
+            .unwrap()
+            .unwrap();
+        let op = download::seed_prepared_edited_compat(&config, &pass).await;
+        assert_eq!(op.phase, "prepared");
+        assert_eq!(op.pass, config.primary_layout_pass.as_deref().unwrap());
+        assert_eq!(op.child, "asset-501");
+        assert_eq!(op.members.len(), 2);
+        assert!(!op.refresh_metadata);
+        assert!(
+            op.members
+                .iter()
+                .all(|member| member.installed.is_none() && member.preserved.is_none())
+        );
+        assert_eq!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        (op, scope)
+    };
+    assert_eq!(file(&visible), original_file);
+    assert!(!archive.exists());
+    for member in &op.members {
+        let prepared = member.prepared.as_ref().unwrap();
+        let (bytes, identity, _) = file(&prepared.path.to_path());
+        assert_eq!(prepared.fingerprint.identity, identity);
+        assert_eq!(prepared.fingerprint.size, bytes.len() as u64);
+        assert_eq!(
+            prepared.fingerprint.sha256.as_slice(),
+            Sha256::digest(&bytes).as_slice()
+        );
+        let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(&bytes));
+        assert_eq!(prepared.source_checksum.as_deref(), Some(hash.as_str()));
+        assert_eq!(prepared.provider_checksum, provider_hash(&bytes));
+        assert_eq!(
+            bytes,
+            if prepared.version == "adjusted" {
+                EDIT_ONE
+            } else {
+                ORIGINAL
+            }
+        );
+    }
+    assert_eq!(
+        rows("SELECT * FROM download_receipts ORDER BY id"),
+        original_receipts
     );
-    assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
-    assert!(!media.join("IMG_0501_original.JPG").exists());
+    let original_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL));
+    let original_path = serde_json::to_string(
+        &state::db::provider_selection::SelectionPath::from_path(&visible),
+    )
+    .unwrap();
+    assert_eq!(
+        rows(
+            "SELECT r.scope,r.origin_pass,r.provider_checksum,r.source_checksum,r.local_checksum,r.native_path FROM download_receipts r JOIN account_owner a ON a.account_key=r.account_key AND a.provider_key=r.provider_key WHERE r.library='PrimarySync' AND r.child='asset-501' AND r.master='501' AND r.state_id='asset-501' AND r.version_size='original' AND length(r.proof_hash)=64"
+        ),
+        vec![vec![
+            SqlValue::Text(scope.clone()),
+            SqlValue::Text(op.pass.clone()),
+            SqlValue::Text(provider_hash(ORIGINAL)),
+            SqlValue::Text(original_hash.clone()),
+            SqlValue::Text(original_hash),
+            SqlValue::Text(original_path)
+        ]]
+    );
+    assert!(rows("SELECT * FROM primary_layout_bindings").is_empty());
+    assert!(rows("SELECT * FROM primary_layout_preserved").is_empty());
+    let held_custody = custody();
+    let held_temps = rows("SELECT * FROM owned_temp_files ORDER BY path");
+    let held_tree = tree();
+    let checkpoints = rows("SELECT key,value FROM metadata ORDER BY key");
+    let requests = server.received_requests().await.unwrap().len();
+    assert_eq!(
+        requests, 2,
+        "only ORIGINAL and the prepared EDIT_ONE were fetched"
+    );
+    let recorded_edit = op
+        .members
+        .iter()
+        .find_map(|member| {
+            member
+                .record
+                .as_ref()
+                .filter(|record| record.version_size == state::VersionSizeKey::Adjusted)
+        })
+        .unwrap();
+
+    *current.lock().unwrap() = second;
+    for _ in 0..2 {
+        // Each iteration owns a fresh authenticated SQLite connection and source.
+        let (config, pass) =
+            source_mutation_layout_context(root.path(), current.clone(), lookups.clone()).await;
+        let db = config.state_db.as_ref().unwrap();
+        let observed = pass
+            .album
+            .confirm_layout_asset(&op.asset_record_name, &op.library)
+            .await
+            .unwrap()
+            .asset;
+        assert_eq!(observed.state_id(), op.child);
+        assert_eq!(observed.id(), "501");
+        let expected = download::filter::expected_paths_for(&observed, &config);
+        let selected = expected
+            .iter()
+            .find(|path| path.version_size == state::VersionSizeKey::Adjusted)
+            .unwrap();
+        assert_eq!(selected.checksum.as_ref(), provider_hash(EDIT_TWO));
+        let observation = state::AssetRecord::new_pending(
+            Arc::from(observed.source_zone().unwrap()),
+            observed.state_id().to_owned(),
+            selected.version_size,
+            selected.checksum.to_string(),
+            selected
+                .path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            observed.created(),
+            Some(observed.added_date()),
+            selected.size,
+            download::determine_media_type(selected.version_size, &observed),
+        )
+        .with_metadata_arc(download::filter::metadata_for_selected_version(
+            &observed,
+            &config,
+            selected.version_size,
+        ));
+        assert_ne!(observation.checksum, recorded_edit.checksum);
+        db.upsert_seen(&observation).await.expect("provider-derived EDIT_TWO observation must remain admissible while EDIT_ONE is prepared");
+        let pending = db.get_pending().await.unwrap();
+        let persisted = pending
+            .iter()
+            .find(|record| record.version_size == state::VersionSizeKey::Adjusted)
+            .unwrap();
+        assert_eq!(persisted.checksum, observation.checksum);
+        assert_eq!(persisted.filename, observation.filename);
+        assert_eq!(
+            serde_json::to_value(&persisted.metadata).unwrap(),
+            serde_json::to_value(&observation.metadata).unwrap()
+        );
+        assert!(
+            db.capture_layout_recovery(op.clone())
+                .await
+                .unwrap()
+                .is_some(),
+            "catalogue/journal disagreement must require authenticated reconfirmation"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                &db.primary_layout_operations("PrimarySync".into())
+                    .await
+                    .unwrap()[0]
+            )
+            .unwrap(),
+            serde_json::to_value(&op).unwrap()
+        );
+
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || LogWriter(sink.clone()))
+            .finish();
+        let before = lookups.load(Ordering::SeqCst);
+        let held = download::recover_recorded_sources(
+            &reqwest::Client::new(),
+            std::slice::from_ref(&pass),
+            Arc::new(config.clone()),
+            CancellationToken::new(),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+        assert!(!held.complete && !held.complete_after_smart_query);
+        assert_eq!(held.stats.failed, 1);
+        assert_eq!(held.stats.downloaded, 0);
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            before + 2,
+            "recovery must perform fresh child and paired lookups"
+        );
+        let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        let failures: Vec<_> = text.lines().filter(|line| line.contains("Could not recover managed layouts before path reconciliation; keeping checkpoints unchanged")).collect();
+        assert_eq!(failures.len(), 1, "{text}");
+        assert_eq!(
+            failures[0]
+                .rsplit_once("error=")
+                .map(|(_, reason)| reason.trim()),
+            Some("Recorded recovery provider facts changed"),
+            "{text}"
+        );
+        drop(pass);
+        drop(config);
+        assert_eq!(custody(), held_custody);
+        assert_eq!(
+            rows("SELECT * FROM owned_temp_files ORDER BY path"),
+            held_temps
+        );
+        assert_eq!(tree(), held_tree);
+        assert_eq!(file(&visible), original_file);
+        assert!(!archive.exists());
+        assert_eq!(
+            rows("SELECT * FROM download_receipts ORDER BY id"),
+            original_receipts
+        );
+        assert_eq!(
+            rows("SELECT key,value FROM metadata ORDER BY key"),
+            checkpoints
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    }
+
+    // Restore every provider fact, but leave the genuine EDIT_TWO catalogue
+    // observation in place so production must reconfirm before saving/committing.
+    *current.lock().unwrap() = first.clone();
+    {
+        let (config, pass) =
+            source_mutation_layout_context(root.path(), current.clone(), lookups.clone()).await;
+        let db = config.state_db.as_ref().unwrap();
+        let pending = db.get_pending().await.unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .find(|record| record.version_size == state::VersionSizeKey::Adjusted)
+                .unwrap()
+                .checksum
+                .as_ref(),
+            provider_hash(EDIT_TWO)
+        );
+        assert!(
+            db.capture_layout_recovery(op.clone())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let before = lookups.load(Ordering::SeqCst);
+        let recovered = download::recover_recorded_sources(
+            &reqwest::Client::new(),
+            std::slice::from_ref(&pass),
+            Arc::new(config.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(recovered.complete);
+        assert_eq!(recovered.stats.failed, 0);
+        assert_eq!(recovered.stats.downloaded, 0);
+        assert_eq!(lookups.load(Ordering::SeqCst), before + 2);
+        assert!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("source-original"),
+            "recovery-only does not own source checkpoint advancement"
+        );
+        for owned in db.get_owned_temp_files_before(i64::MAX).await.unwrap() {
+            assert!(
+                !owned.path.exists(),
+                "owned temporary link remains: {}",
+                owned.path.display()
+            );
+        }
+    }
+    assert_bytes(&visible, EDIT_ONE);
+    assert_bytes(&archive, ORIGINAL);
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    assert_eq!(
+        rows("SELECT operation,phase FROM primary_layout_operations ORDER BY operation"),
+        vec![vec![
+            SqlValue::Text(op.operation.clone()),
+            SqlValue::Text("committed".into())
+        ]]
+    );
+    let header = rows("SELECT header FROM primary_layout_operations");
+    let [SqlValue::Blob(header)] = header[0].as_slice() else {
+        panic!("non-BLOB operation header")
+    };
+    let header: state::db::primary_layout::LayoutOperation =
+        serde_json::from_slice(header).unwrap();
+    let mut identity = op.clone();
+    identity.members.clear();
+    identity.phase = header.phase.clone();
+    assert_eq!(
+        serde_json::to_value(&header).unwrap(),
+        serde_json::to_value(&identity).unwrap()
+    );
+    let bindings = rows("SELECT binding FROM primary_layout_bindings");
+    assert_eq!(bindings.len(), 1);
+    let [SqlValue::Blob(binding)] = bindings[0].as_slice() else {
+        panic!("non-BLOB layout binding")
+    };
+    let binding: state::db::primary_layout::LayoutBinding =
+        serde_json::from_slice(binding).unwrap();
+    assert_eq!(binding.family, op.family);
+    assert_eq!(binding.decision, op.decision);
+    assert_eq!(binding.generation, op.generation + 1);
+    let finished = members();
+    assert_eq!(finished.len(), op.members.len());
+    assert_eq!(binding.files.len(), finished.len());
+    for (before, after) in op.members.iter().zip(&finished) {
+        let mut expected = before.clone();
+        expected.preserved = after.preserved.clone();
+        expected.installed = after.installed.clone();
+        assert_eq!(
+            serde_json::to_value(&expected).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
+        assert!(after.installed.is_some());
+        assert_eq!(after.old.is_some(), after.preserved.is_some());
+        for saved in [&after.preserved, &after.installed].into_iter().flatten() {
+            let (bytes, identity, _) = file(&saved.path.to_path());
+            assert_eq!(saved.fingerprint.identity, identity);
+            assert_eq!(saved.fingerprint.size, bytes.len() as u64);
+            assert_eq!(
+                saved.fingerprint.sha256.as_slice(),
+                Sha256::digest(&bytes).as_slice()
+            );
+            let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(&bytes));
+            assert_eq!(saved.source_checksum.as_deref(), Some(hash.as_str()));
+            assert_eq!(saved.provider_checksum, provider_hash(&bytes));
+        }
+        let installed = after.installed.as_ref().unwrap();
+        assert!(
+            binding
+                .files
+                .iter()
+                .any(|saved| serde_json::to_value(saved).unwrap()
+                    == serde_json::to_value(installed).unwrap())
+        );
+        if let Some(stage) = &after.stage
+            && stage.to_path().exists()
+        {
+            // Conditional exchange may retain the displaced original at the
+            // consumed stage, never unaccounted-for EDIT_ONE scratch bytes.
+            let old = after
+                .old
+                .as_ref()
+                .expect("only a recorded displaced original may remain at a consumed stage");
+            let retained = file(&stage.to_path());
+            assert_eq!(retained, original_file);
+            assert_eq!(retained.1, old.fingerprint.identity);
+        }
+    }
     assert_eq!(
         db_count(
             root.path(),
-            "SELECT COUNT(*) FROM primary_layout_operations WHERE phase='prepared' AND conflict='verified_recovery_required'"
+            "SELECT COUNT(*) FROM primary_layout_claims WHERE operation IS NOT NULL"
         ),
-        1
+        0
     );
-    let (replanned, _) = cycle(root.path(), second.clone(), true, EditedNaming::Primary).await;
-    assert_eq!(replanned.failed_count, 0, "{:?}", replanned.stats);
-    assert!(replanned.db_sync_token_advance_safe);
-    assert_bytes(&media.join("IMG_0501.JPG"), EDIT_TWO);
-    assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
-    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-    let members:Vec<Vec<u8>>=conn.prepare("SELECT m.evidence FROM primary_layout_members m JOIN primary_layout_operations o ON o.operation=m.operation WHERE o.phase='cancelled'").unwrap().query_map([],|row|row.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
-    assert!(
-        members.iter().any(|evidence| {
-            let member: state::db::primary_layout::LayoutMember =
-                serde_json::from_slice(evidence).unwrap();
-            member
-                .prepared
-                .is_some_and(|prepared| std::fs::read(prepared.path.to_path()).unwrap() == EDIT_ONE)
-        }),
-        "cancelled preparation lost its downloaded bytes"
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT COUNT(*) FROM primary_layout_claims WHERE local_checksum IS NOT NULL"
+        ),
+        2
     );
-    drop(conn);
-    let requests = server.received_requests().await.unwrap().len();
+    let mut expected_claims: Vec<_> = finished
+        .iter()
+        .map(|member| {
+            let installed = member.installed.as_ref().unwrap();
+            vec![
+                SqlValue::Text(
+                    state::db::primary_layout::path_key(&installed.path.to_path()).unwrap(),
+                ),
+                SqlValue::Text(installed.version.clone()),
+                SqlValue::Text(installed.provider_checksum.clone()),
+                SqlValue::Text(data_encoding::HEXLOWER.encode(&installed.fingerprint.sha256)),
+                SqlValue::Blob(serde_json::to_vec(&installed.path).unwrap()),
+                SqlValue::Null,
+            ]
+        })
+        .collect();
+    expected_claims.sort_by(|left, right| {
+        let (SqlValue::Text(left), SqlValue::Text(right)) = (&left[0], &right[0]) else {
+            panic!("non-text expected path key")
+        };
+        left.cmp(right)
+    });
+    assert_eq!(
+        rows(
+            "SELECT path_key,version,provider_checksum,local_checksum,native_path,operation FROM primary_layout_claims ORDER BY path_key"
+        ),
+        expected_claims
+    );
+    let prove_receipts = || {
+        let conn = rusqlite::Connection::open_with_flags(
+            root.path().join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        for (version, path, bytes) in [
+            ("original", &archive, ORIGINAL),
+            ("adjusted", &visible, EDIT_ONE),
+        ] {
+            let native = serde_json::to_string(
+                &state::db::provider_selection::SelectionPath::from_path(path),
+            )
+            .unwrap();
+            let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+            let count: i64 = conn.query_row("SELECT count(*) FROM download_receipts r JOIN account_owner a ON a.account_key=r.account_key AND a.provider_key=r.provider_key WHERE r.scope=?1 AND r.library='PrimarySync' AND r.child='asset-501' AND r.master='501' AND r.state_id='asset-501' AND r.origin_pass=?2 AND r.version_size=?3 AND r.provider_checksum=?4 AND r.provider_size=?5 AND r.native_path=?6 AND r.source_checksum=?7 AND r.local_checksum=?7 AND length(r.proof_hash)=64", rusqlite::params![scope,op.pass,version,provider_hash(bytes),i64::try_from(bytes.len()).unwrap(),native,hash], |row| row.get(0)).unwrap();
+            assert_eq!(count, 1, "missing scoped completion proof for {version}");
+        }
+        let receipts = rows("SELECT * FROM download_receipts ORDER BY id");
+        for original in &original_receipts {
+            assert!(receipts.contains(original));
+        }
+    };
+    prove_receipts();
+    let stable_custody = custody();
+    let stable_tree = tree();
+    for path in stable_tree.keys() {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(!name.ends_with(".part") && !name.starts_with(".kei-replace-"));
+    }
+    let stable_receipts = rows("SELECT * FROM download_receipts ORDER BY id");
     for _ in 0..2 {
-        let (quiet, lookups) =
-            cycle(root.path(), second.clone(), true, EditedNaming::Primary).await;
-        assert_eq!(quiet.failed_count, 0);
+        let (quiet, quiet_lookups) = cycle_options(
+            root.path(),
+            first.clone(),
+            true,
+            EditedNaming::Primary,
+            CycleOptions {
+                private: true,
+                cycle_token: Some("source-recovered"),
+                ..CycleOptions::default()
+            },
+        )
+        .await;
+        assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
         assert!(quiet.db_sync_token_advance_safe);
-        assert_eq!(lookups, 0);
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_eq!(quiet_lookups, 0);
+        assert_eq!(custody(), stable_custody);
+        assert_eq!(tree(), stable_tree);
+        assert_eq!(
+            rows("SELECT * FROM download_receipts ORDER BY id"),
+            stable_receipts
+        );
+        prove_receipts();
         assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        let (config, _) =
+            source_mutation_layout_context(root.path(), current.clone(), lookups.clone()).await;
+        assert_eq!(
+            config
+                .state_db
+                .as_ref()
+                .unwrap()
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("source-recovered")
+        );
+        for owned in config
+            .state_db
+            .as_ref()
+            .unwrap()
+            .get_owned_temp_files_before(i64::MAX)
+            .await
+            .unwrap()
+        {
+            assert!(
+                !owned.path.exists(),
+                "quiet cleanup left an owned temporary link"
+            );
+        }
     }
 }
 
