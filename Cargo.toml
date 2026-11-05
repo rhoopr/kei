@@ -253,3 +253,7 @@ print_stderr = "warn"
 
 # ── MSRV ─────────────────────────────────────────────────────────────
 incompatible_msrv = "warn"
+
+# xmp-toolkit-rs v1.12.1 with the SDK on teh-hippo/XMP-Toolkit-SDK@c3b6e43 (adobe/XMP-Toolkit-SDK#124).
+[patch.crates-io]
+xmp_toolkit = { git = "https://github.com/teh-hippo/xmp-toolkit-rs", rev = "0b0327852c69b9e4d9ef5d1cf7d6b708a445c118" }

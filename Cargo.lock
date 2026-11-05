@@ -3842,8 +3842,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 [[package]]
 name = "xmp_toolkit"
 version = "1.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04517ad6f440d16e52ade0ad6d781029313bdacaac4590de9a9114f8d737af61"
+source = "git+https://github.com/teh-hippo/xmp-toolkit-rs?rev=0b0327852c69b9e4d9ef5d1cf7d6b708a445c118#0b0327852c69b9e4d9ef5d1cf7d6b708a445c118"
 dependencies = [
  "cc",
  "fs_extra",

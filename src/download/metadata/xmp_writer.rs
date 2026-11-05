@@ -112,8 +112,8 @@ pub(super) fn prepare_metadata_xmp_toolkit(
     })
 }
 
-/// The toolkit assumes every nested `meta` has a four-byte FullBox prefix.
-/// QuickTime also permits bare child boxes there, which its rewrite corrupts.
+/// Rejects malformed movie box bounds. A nested `meta` may be an ISO FullBox or
+/// a bare QuickTime atom.
 fn validate_movie_metadata_layout(path: &Path) -> Result<()> {
     let mut file = std::fs::File::open(path)?;
     let end = file.metadata()?.len();
@@ -200,11 +200,9 @@ fn validate_movie_boxes(
                 file.seek(SeekFrom::Start(children))?;
                 let mut prefix = [0; 4];
                 file.read_exact(&mut prefix)?;
-                anyhow::ensure!(
-                    prefix == [0; 4],
-                    "Refusing embedded metadata rewrite: nested QuickTime metadata lacks a supported FullBox prefix; the XMP toolkit could damage existing metadata"
-                );
-                children += 4;
+                if prefix == [0; 4] {
+                    children += 4;
+                }
             }
             validate_movie_boxes(file, children, next, Some(kind), depth + 1, budget)?;
         }
@@ -235,21 +233,35 @@ mod tests {
     use xmp_toolkit::xmp_ns;
 
     #[test]
-    fn quicktime_rewrite_rejects_bare_track_metadata_before_damage() {
+    fn quicktime_rewrite_embeds_metadata_and_preserves_bare_track_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("live.mov");
+        let path = dir.path().join("live.mov.kei-tmp");
         let original = crate::test_helpers::bare_track_meta_movie();
         fs::write(&path, &original).unwrap();
-        let error = apply_metadata_with_default_suffix(
+        apply_metadata_with_default_suffix(
             &path,
             &MetadataWrite {
                 rating: Some(3),
                 ..MetadataWrite::default()
             },
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("nested QuickTime metadata"));
-        assert_eq!(fs::read(&path).unwrap(), original);
+        .unwrap();
+        let rewritten = fs::read(&path).unwrap();
+        for kind in [b"trak", b"mdat"] {
+            let atom = |bytes: &[u8]| {
+                let start = bytes.windows(4).position(|value| value == kind).unwrap() - 4;
+                let size = u32::from_be_bytes(bytes[start..start + 4].try_into().unwrap());
+                bytes[start..start + usize::try_from(size).unwrap()].to_vec()
+            };
+            assert_eq!(atom(&rewritten), atom(&original), "{kind:?}");
+        }
+        assert_eq!(
+            read_meta(&path)
+                .property_i32(xmp_ns::XMP, "Rating")
+                .unwrap()
+                .value,
+            3
+        );
         assert!(embed_temp_entries(dir.path(), ".meta-tmp").is_empty());
     }
 
