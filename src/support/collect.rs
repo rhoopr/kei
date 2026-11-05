@@ -1,5 +1,5 @@
 //! Collection reads only fixed local inputs. No migration, credentials or provider objects.
-use super::{configuration, history, history_path};
+use super::configuration;
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -17,11 +17,7 @@ fn read_bytes(path: &Path, limit: u64) -> Option<Vec<u8>> {
     (bytes.len() as u64 <= limit).then_some(bytes)
 }
 
-pub(super) fn export(
-    config_path: &Path,
-    explicit: bool,
-    output: &Path,
-) -> anyhow::Result<(usize, bool)> {
+pub(super) fn export(config_path: &Path, explicit: bool, output: &Path) -> anyhow::Result<bool> {
     let bytes = read_bytes(config_path, INPUT_BYTES);
     let toml = bytes
         .as_deref()
@@ -40,11 +36,6 @@ pub(super) fn export(
         &crate::cli::PasswordArgs::default(),
         toml.as_ref(),
     );
-    let (history, history_status) = if username.is_empty() {
-        (history::History::default(), "account_unavailable")
-    } else {
-        history::read(&history_path(&directory, &username, domain.as_str()))
-    };
     let state = if username.is_empty() {
         json!({"status": "account_unavailable"})
     } else {
@@ -82,24 +73,14 @@ pub(super) fn export(
             .and_then(|d| d.directory.as_deref()),
     );
     let partial = config_status != "available"
-        || history_status != "available"
         || state.get("status").and_then(Value::as_str) != Some("available")
         || health.is_none()
-        || state.get("complete").and_then(Value::as_bool) == Some(false)
-        || history.previous_history_unavailable
-        || history.queue_dropped > 0
-        || history.groups_omitted > 0
-        || history.cycles_evicted > 0
-        || history
-            .cycles
-            .iter()
-            .any(|c| c.observations_total.is_none());
-    let cycles = history.cycles.len();
+        || state.get("complete").and_then(Value::as_bool) == Some(false);
     let bundle = json!({
         "schema_version": 1,
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "privacy_contract": "allowlist_v1",
-        "summary": {"retained_records": cycles, "partial": partial,
+        "summary": {"retained_records": 0, "partial": partial,
             "collection": "offline_read_only", "automatic_upload": false},
         "build": {
             "version": env!("CARGO_PKG_VERSION"), "revision": option_env!("KEI_BUILD_REVISION").unwrap_or("unavailable"),
@@ -111,27 +92,21 @@ pub(super) fn export(
         },
         "configuration": {"status": config_status, "scope": "current_file_and_bootstrap_environment",
             "values": configuration(toml.as_ref(), explicit),
-            "effective_sync_overrides": "see_retained_cycle_configuration"},
+            "effective_sync_overrides": "unavailable_after_recorder_removal"},
         "state": state,
         "health": {"status": if health.is_some() { "available" } else { "unavailable" }, "counters": health},
         "filesystem": filesystem,
-        "history": {"status": history_status, "scope": "configured_account_normal_operations",
-            "max_records": history::MAX_CYCLES, "max_groups_per_record": history::MAX_GROUPS,
-            "max_bytes": history::MAX_BYTES, "units": "counts_bytes_seconds_utc",
-            "group_counts": "repeated_observations_not_unique_assets",
-            "data": history},
+        "history": {"status": "unavailable",
+            "data": {"schema_version": 0, "cycles_evicted": 0, "queue_dropped": 0,
+                "groups_omitted": 0, "previous_history_unavailable": false, "cycles": []}},
         "limitations": [
-            "Only evidence recorded by a supporting build is retained. Old logs and overwritten errors are not reconstructed.",
-            "A running record without completed_at means no completion was saved; it does not prove a crash or its cause.",
+            "Operation history is not retained by this build. This snapshot describes current local state only; old support history is not read or merged.",
             "Host supervisor, OOM and container restart history are unavailable. Supply those separately for unexplained restarts.",
             "Docker digest is unavailable; provide your image digest separately if needed.",
             "Novel provider fields and historical account participation are unavailable. A maintainer may request a controlled private reproduction.",
             "No media scan, checksum calculation, metadata read or filesystem write probe was performed. Real-platform media verification is case-specific.",
-            "Item and scope aliases correlate only within a bounded process lifetime; restart aliases differ. SQL publication observations before commit do not prove durable finalization.",
-            "Fields absent from a typed diagnostic were not recorded. Null selection comparability means unavailable, not comparable.",
-            "Grouped observations may overlap. Diagnostic request counts, inventory counts and selected-pass totals must not be summed as unique assets.",
         ],
-        "next_actions": next_actions(&history),
+        "next_actions": next_actions(),
     });
     let bytes = serde_json::to_vec_pretty(&bundle)?;
     if bytes.len() > OUTPUT_BYTES {
@@ -153,44 +128,14 @@ pub(super) fn export(
         .map_err(|_excluded| {
             anyhow::anyhow!("support export write failed; the output may be incomplete")
         })?;
-    Ok((cycles, partial))
+    Ok(partial)
 }
 
-fn next_actions(history: &history::History) -> Vec<&'static str> {
-    let mut actions = Vec::new();
-    if history.cycles.is_empty() {
-        actions.push("No retained runtime evidence is available. Submit the report anyway with symptoms, expected behavior and version; no new sync is required to export.");
-    }
-    if history.cycles.iter().any(|c| c.completed_at.is_none()) {
-        actions.push("For unfinished operations, compare recorded startup/shutdown and task errors with the host supervisor or OOM history.");
-    }
-    if history
-        .cycles
-        .iter()
-        .flat_map(|c| &c.diagnostics)
-        .any(|d| d.kind == "exact_lookup_rejection_v1")
-    {
-        actions.push("Inspect exact lookup target, stage, owner category and scope reason. These retained requests may overlap; scope rejection does not authorize choosing an owner.");
-    }
-    if history
-        .cycles
-        .iter()
-        .any(|c| c.stats.get("sync_token_blocked").and_then(Value::as_bool) == Some(true))
-    {
-        actions.push("Use the checkpoint reason, pass completion and receiver observations to distinguish intentional bounds, provider token conflict, identity debt and state-write failure.");
-    }
-    if history
-        .cycles
-        .iter()
-        .flat_map(|cycle| &cycle.diagnostics)
-        .any(|diagnostic| diagnostic.kind == "recovery_decision_v1")
-    {
-        actions.push("Recovery decisions apply only to their recorded evidence and scope. Partial work is not a complete backup; local acceptance is not provider authority. Preserve unresolved obligations and historical files. Unsupported means this recovery path cannot proceed with the available proof, not permission to reset state or request another diagnostic run.");
-    }
-    if history.queue_dropped > 0 || history.groups_omitted > 0 || history.cycles_evicted > 0 {
-        actions.push("Evidence was bounded or omitted. Treat retained records as a sample and tell the maintainer which operation/time window you are investigating.");
-    }
-    actions
+fn next_actions() -> Vec<&'static str> {
+    vec![
+        "Describe the symptoms, expected behavior, version and incident window. No new sync is required to export.",
+        "Attach ordinary service or supervisor logs for the incident window separately. This snapshot does not retain them.",
+    ]
 }
 
 fn install_method() -> &'static str {

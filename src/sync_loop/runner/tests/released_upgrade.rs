@@ -340,6 +340,7 @@ async fn released_v0240_metadata_policy_selection_restart_preserves_siblings() {
             assert_eq!(
                 download::drain_pending_metadata_rewrites(
                     &db,
+                    dir.path(),
                     &metadata,
                     download::CaptureTimestampRepair::Preserve,
                     &scope,

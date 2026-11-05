@@ -1,16 +1,9 @@
-//! Windows backend for `kei install` / `kei uninstall` /
-//! `kei service status` plus the SCM service-main bridge for
-//! `kei service run`.
+//! Windows backend for `kei service status` plus the SCM service-main
+//! bridge for `kei service run`.
 //!
-//! Registers kei with the Windows Service Control Manager (SCM) under a
-//! per-user account. On install we prompt for the operator's Windows
-//! login password via rpassword and pass it to `CreateServiceW` as the
-//! LSA secret; SCM launches the daemon under that user's profile so the
-//! Credential Manager vault and `~/.config/kei` data dir match the
-//! interactive login.
-//!
-//! Domain-user / roaming-profile accounts are out of scope: the
-//! `.\<user>` LSA-secret form covers local-machine accounts only.
+//! `kei service status` queries an existing Service Control Manager (SCM)
+//! registration. kei no longer creates or removes SCM entries; existing
+//! services that run `kei service run --config ...` keep working.
 //!
 //! `kei service run` on Windows double-dispatches: when SCM launches
 //! the binary, `StartServiceCtrlDispatcher` must be called within 30s
@@ -24,105 +17,16 @@
     reason = "kei service status renders human-readable output to stdout, matching kei status / kei verify."
 )]
 
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use anyhow::Result;
 
-use anyhow::{Context, Result, anyhow};
-
-use crate::cli::UninstallArgs;
-use crate::service::env::{
-    SERVICE_DESCRIPTION, SERVICE_IDENTIFIER, current_executable, kei_state_dir_dotted,
-    purge_kei_state,
-};
-use crate::service::plan::{self, InstallPlan};
+#[cfg(target_os = "windows")]
+use crate::service::env::SERVICE_IDENTIFIER;
 use crate::service::status::ServiceState;
 
 /// SCM service name (matches `SERVICE_IDENTIFIER` so `sc.exe query
 /// com.rhoopr.kei` works for ad-hoc inspection).
+#[cfg(target_os = "windows")]
 pub(crate) const SERVICE_NAME: &str = SERVICE_IDENTIFIER;
-
-/// Restart-on-failure cadence applied via `ChangeServiceConfig2W`.
-const RESTART_DELAY: Duration = Duration::from_secs(10);
-
-/// Number of times SCM should restart kei after a crash before giving up.
-const RESTART_COUNT: usize = 3;
-
-/// Window over which SCM counts crashes against the failure action list.
-const FAILURE_RESET_PERIOD: Duration = Duration::from_secs(86_400);
-
-// ── Public surface ──────────────────────────────────────────────────────
-
-/// Top-level entry for `kei install` (also the bare default; on Windows
-/// `--user` and the default both produce the same per-user SCM entry).
-pub(crate) async fn install_user(plan: InstallPlan, config_path: &Path) -> Result<()> {
-    let exe = current_executable()?;
-    let user = current_user_name().context(
-        "Could not determine the current Windows user. USERNAME or USERPROFILE is not set.",
-    )?;
-
-    let inputs = ServiceInfoInputs {
-        exec: &exe,
-        config: config_path,
-        account_user: &user,
-    };
-
-    if plan.is_preview() {
-        let preview = render_service_info_preview(&inputs);
-        tracing::info!(
-            service = SERVICE_NAME,
-            executable = %exe.display(),
-            config = %config_path.display(),
-            account = %inputs.account_name(),
-            dry_run = true,
-            "previewing kei service registration",
-        );
-        for line in preview.lines() {
-            println!("{line}");
-        }
-        return Ok(());
-    }
-
-    let password = prompt_windows_password(&user)?;
-    scm_impl::install(&inputs, &password).await?;
-
-    tracing::info!(
-        service = SERVICE_NAME,
-        executable = %exe.display(),
-        config = %config_path.display(),
-        account = %inputs.account_name(),
-        "registered kei with the Windows Service Control Manager. \
-         Run `kei uninstall` to remove this service.",
-    );
-    Ok(())
-}
-
-/// `--system` is rejected: a system-wide install would mean LocalSystem
-/// (no user keyring) or a virtual `NT SERVICE\kei` account (no
-/// Credential Manager). Both break the "credentials follow the
-/// operator" contract the per-user form provides.
-pub(crate) fn install_system(_plan: InstallPlan, _config_path: &Path) -> Result<()> {
-    plan::reject_windows_system_install()
-}
-
-/// Top-level entry for `kei uninstall`.
-pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
-    match scm_impl::uninstall_existing().await? {
-        true => tracing::info!(service = SERVICE_NAME, "removed kei from SCM"),
-        false => tracing::info!(
-            service = SERVICE_NAME,
-            "kei service was already removed. Nothing to do.",
-        ),
-    }
-
-    if args.purge {
-        let kei_dir = kei_state_dir()
-            .ok_or_else(|| anyhow!("`--purge` needs USERPROFILE so kei can find its state."))?;
-        purge_kei_state(&kei_dir, &[])?;
-    }
-
-    Ok(())
-}
 
 /// `kei service status` implementation.
 pub(crate) async fn status() -> Result<()> {
@@ -167,64 +71,11 @@ pub(crate) async fn run_under_scm_or_foreground(
     scm_impl::run_or_foreground(globals, args).await
 }
 
-// ── Inputs / pure renderers (testable on every target) ──────────────────
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ServiceInfoInputs<'a> {
-    pub exec: &'a Path,
-    pub config: &'a Path,
-    pub account_user: &'a str,
-}
-
-impl ServiceInfoInputs<'_> {
-    fn launch_arguments(&self) -> Vec<OsString> {
-        vec![
-            OsString::from("service"),
-            OsString::from("run"),
-            OsString::from("--config"),
-            self.config.as_os_str().to_owned(),
-        ]
-    }
-
-    fn account_name(&self) -> String {
-        format!(r".\{}", self.account_user)
-    }
-}
-
-/// Human-readable preview of the registration `--dry-run` would create.
-/// Same lines `sc.exe qc com.rhoopr.kei` would surface post-install, in
-/// the same order, so the operator can eyeball the install before
-/// committing.
-fn render_service_info_preview(inputs: &ServiceInfoInputs<'_>) -> String {
-    let argv = std::iter::once(inputs.exec.display().to_string())
-        .chain(
-            inputs
-                .launch_arguments()
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned()),
-        )
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!(
-        "Service name        : {SERVICE_NAME}\n\
-         Display name        : {SERVICE_DESCRIPTION}\n\
-         Description         : {SERVICE_DESCRIPTION}\n\
-         Account             : {account}\n\
-         Service type        : OWN_PROCESS\n\
-         Start type          : AUTO_START\n\
-         Error control       : NORMAL\n\
-         Failure actions     : restart x{count}, delay {delay}s, reset after {reset}s\n\
-         Binary path         : {argv}",
-        account = inputs.account_name(),
-        count = RESTART_COUNT,
-        delay = RESTART_DELAY.as_secs(),
-        reset = FAILURE_RESET_PERIOD.as_secs(),
-    )
-}
+// ── Status rendering (testable on every target) ────────────────────────
 
 /// Mirror of `windows_service::service::ServiceState` that compiles on
 /// every target. The runtime arm in `scm_impl` maps the windows-service
-/// enum into this view so the renderer + its tests stay reachable from
+/// enum into this view so the renderer and its tests stay reachable from
 /// linux/macOS hosts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ServiceStateView {
@@ -285,50 +136,25 @@ fn render_status(inputs: StatusInputs) -> String {
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────
-
-fn current_user_name() -> Option<String> {
-    if let Ok(u) = std::env::var("USERNAME")
-        && !u.is_empty()
-    {
-        return Some(u);
-    }
-    // USERPROFILE is `C:\Users\Alice`; the basename is the account name.
-    let profile = std::env::var("USERPROFILE").ok()?;
-    Path::new(&profile)
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-}
-
-fn kei_state_dir() -> Option<PathBuf> {
-    kei_state_dir_dotted()
-}
-
-fn prompt_windows_password(user: &str) -> Result<String> {
-    let prompt = format!(
-        "Windows password for {user} (used by SCM to launch kei under your account; \
-         stored as an LSA secret, not in kei): "
-    );
-    rpassword::prompt_password(prompt).context("Could not read Windows password from stdin")
-}
-
 // ── SCM glue ───────────────────────────────────────────────────────────
 //
-// The real impl is `#[cfg(target_os = "windows")]`. Stubs on the other
-// arms exist so the renderer/tests above compile and run on linux/macOS;
-// the runtime arm bails because the dispatch tables in install.rs /
-// uninstall.rs / status.rs route only Windows targets here.
+// The real impl is `#[cfg(target_os = "windows")]`. The stub on other
+// targets exists so the renderer and its tests compile and run on
+// linux/macOS; the status dispatcher in status.rs routes only Windows
+// targets here.
 
 #[cfg(target_os = "windows")]
 mod scm_impl {
     use super::*;
+    use anyhow::{Context, anyhow};
+    use std::ffi::OsString;
     use std::sync::{Mutex, MutexGuard};
+    use std::time::Duration;
     use windows_service::{
         define_windows_service,
         service::{
-            ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
-            ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
-            ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+            ServiceAccess, ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState,
+            ServiceStatus, ServiceType,
         },
         service_control_handler::{self, ServiceControlHandlerResult},
         service_dispatcher,
@@ -370,126 +196,10 @@ mod scm_impl {
             .map_err(|_| anyhow!("internal: SCM shutdown mutex poisoned"))
     }
 
-    /// Owned form of [`ServiceInfoInputs`] -- crosses the spawn_blocking
-    /// boundary, so cannot borrow from the async caller.
-    struct OwnedServiceInfoInputs {
-        exec: PathBuf,
-        config: PathBuf,
-        account_user: String,
-    }
-
-    impl OwnedServiceInfoInputs {
-        fn as_borrowed(&self) -> ServiceInfoInputs<'_> {
-            ServiceInfoInputs {
-                exec: &self.exec,
-                config: &self.config,
-                account_user: &self.account_user,
-            }
-        }
-    }
-
     fn raw_os_error(e: &windows_service::Error) -> Option<u32> {
         match e {
             windows_service::Error::Winapi(io) => io.raw_os_error().map(|n| n as u32),
             _ => None,
-        }
-    }
-
-    pub(super) async fn install(inputs: &ServiceInfoInputs<'_>, password: &str) -> Result<()> {
-        let owned = OwnedServiceInfoInputs {
-            exec: inputs.exec.to_path_buf(),
-            config: inputs.config.to_path_buf(),
-            account_user: inputs.account_user.to_string(),
-        };
-        let password = password.to_owned();
-        tokio::task::spawn_blocking(move || install_blocking(&owned, &password))
-            .await
-            .context("install task panicked")?
-    }
-
-    fn install_blocking(owned: &OwnedServiceInfoInputs, password: &str) -> Result<()> {
-        let manager =
-            open_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
-        let inputs = owned.as_borrowed();
-        let info = ServiceInfo {
-            name: OsString::from(SERVICE_NAME),
-            display_name: OsString::from(SERVICE_DESCRIPTION),
-            service_type: ServiceType::OWN_PROCESS,
-            start_type: ServiceStartType::AutoStart,
-            error_control: ServiceErrorControl::Normal,
-            executable_path: owned.exec.clone(),
-            launch_arguments: inputs.launch_arguments(),
-            dependencies: Vec::new(),
-            account_name: Some(OsString::from(inputs.account_name())),
-            account_password: Some(OsString::from(password)),
-        };
-        let service = manager
-            .create_service(
-                &info,
-                ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
-            )
-            .context("Could not create the Windows service. Run from an elevated PowerShell.")?;
-        service
-            .set_description(SERVICE_DESCRIPTION)
-            .context("Could not set the Windows service description")?;
-        service
-            .update_failure_actions(ServiceFailureActions {
-                reset_period: ServiceFailureResetPeriod::After(FAILURE_RESET_PERIOD),
-                reboot_msg: None,
-                command: None,
-                actions: Some(vec![
-                    ServiceAction {
-                        action_type: ServiceActionType::Restart,
-                        delay: RESTART_DELAY,
-                    };
-                    RESTART_COUNT
-                ]),
-            })
-            .context("Could not set Windows service failure actions")?;
-        let no_args: &[&str] = &[];
-        service
-            .start(no_args)
-            .context("Could not start the Windows service")?;
-        Ok(())
-    }
-
-    pub(super) async fn uninstall_existing() -> Result<bool> {
-        tokio::task::spawn_blocking(uninstall_blocking)
-            .await
-            .context("uninstall task panicked")?
-    }
-
-    fn uninstall_blocking() -> Result<bool> {
-        let manager = open_manager(ServiceManagerAccess::CONNECT)?;
-        let access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
-        let service = match manager.open_service(SERVICE_NAME, access) {
-            Ok(s) => s,
-            Err(ref e) if raw_os_error(e) == Some(ERROR_SERVICE_DOES_NOT_EXIST) => {
-                return Ok(false);
-            }
-            Err(e) => return Err(anyhow!("Could not open the Windows service: {e}")),
-        };
-
-        if let Ok(status) = service.query_status() {
-            if status.current_state != ServiceState::Stopped {
-                let _ = service.stop();
-                wait_for_stop(&service, Duration::from_secs(30));
-            }
-        }
-        service
-            .delete()
-            .context("Could not delete the Windows service")?;
-        Ok(true)
-    }
-
-    fn wait_for_stop(service: &windows_service::service::Service, timeout: Duration) {
-        let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            match service.query_status() {
-                Ok(status) if status.current_state == ServiceState::Stopped => return,
-                Ok(_) => std::thread::sleep(Duration::from_millis(250)),
-                Err(_) => return,
-            }
         }
     }
 
@@ -521,9 +231,8 @@ mod scm_impl {
     }
 
     fn open_manager(access: ServiceManagerAccess) -> Result<ServiceManager> {
-        ServiceManager::local_computer(None::<&str>, access).context(
-            "Could not open the Windows Service Control Manager. `kei install` and `kei uninstall` on Windows require an elevated PowerShell or Command Prompt.",
-        )
+        ServiceManager::local_computer(None::<&str>, access)
+            .context("Could not open the Windows Service Control Manager.")
     }
 
     fn service_state_view(state: ServiceState) -> ServiceStateView {
@@ -680,20 +389,6 @@ mod scm_impl {
 mod scm_impl {
     use super::*;
 
-    pub(super) async fn install(_inputs: &ServiceInfoInputs<'_>, _password: &str) -> Result<()> {
-        anyhow::bail!(
-            "internal error: Windows install path reached on a non-Windows target; \
-             this is a build configuration bug"
-        )
-    }
-
-    pub(super) async fn uninstall_existing() -> Result<bool> {
-        anyhow::bail!(
-            "internal error: Windows uninstall path reached on a non-Windows target; \
-             this is a build configuration bug"
-        )
-    }
-
     pub(super) async fn probe() -> Result<StatusInputs> {
         anyhow::bail!(
             "internal error: Windows status path reached on a non-Windows target; \
@@ -704,88 +399,13 @@ mod scm_impl {
 
 // ── Tests ──────────────────────────────────────────────────────────────
 //
-// Pure renderer / formatter coverage. These run on every unix host as
-// well as on Windows so a regression in shape (preview lines, status
-// strings) is caught on linux CI before windows-latest sees the change.
+// Status formatter coverage. These run on every unix host as well as on
+// Windows so a regression in shape is caught on linux CI before
+// windows-latest sees the change.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    struct SampleFixture {
-        exe: PathBuf,
-        cfg: PathBuf,
-    }
-
-    impl SampleFixture {
-        fn new() -> Self {
-            Self {
-                exe: PathBuf::from(r"C:\Program Files\kei\kei.exe"),
-                cfg: PathBuf::from(r"C:\Users\Alice\.config\kei\config.toml"),
-            }
-        }
-
-        fn inputs(&self) -> ServiceInfoInputs<'_> {
-            ServiceInfoInputs {
-                exec: &self.exe,
-                config: &self.cfg,
-                account_user: "Alice",
-            }
-        }
-    }
-
-    #[test]
-    fn launch_arguments_pass_service_run_with_config() {
-        let fixture = SampleFixture::new();
-        let argv = fixture.inputs().launch_arguments();
-        let strs: Vec<String> = argv
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(strs[0], "service");
-        assert_eq!(strs[1], "run");
-        assert_eq!(strs[2], "--config");
-        assert_eq!(strs[3], r"C:\Users\Alice\.config\kei\config.toml");
-    }
-
-    #[test]
-    fn account_name_uses_local_machine_prefix() {
-        // `.\Alice` is the SCM "local machine, account Alice" form;
-        // domain accounts (`DOMAIN\Alice`) are out of scope.
-        let fixture = SampleFixture::new();
-        assert_eq!(fixture.inputs().account_name(), r".\Alice");
-    }
-
-    #[test]
-    fn render_service_info_preview_lists_every_field() {
-        // SERVICE_NAME / SERVICE_DESCRIPTION are platform-resolved
-        // constants -- on linux SERVICE_IDENTIFIER is "kei", on
-        // macOS/Windows it is "com.rhoopr.kei". Reference the constants
-        // in the assertion so the test passes on every host.
-        let fixture = SampleFixture::new();
-        let preview = render_service_info_preview(&fixture.inputs());
-        for needle in [
-            format!("Service name        : {SERVICE_NAME}"),
-            format!("Display name        : {SERVICE_DESCRIPTION}"),
-            format!("Description         : {SERVICE_DESCRIPTION}"),
-            r"Account             : .\Alice".to_string(),
-            "Service type        : OWN_PROCESS".to_string(),
-            "Start type          : AUTO_START".to_string(),
-            "Error control       : NORMAL".to_string(),
-            format!(
-                "Failure actions     : restart x{RESTART_COUNT}, delay {}s, reset after {}s",
-                RESTART_DELAY.as_secs(),
-                FAILURE_RESET_PERIOD.as_secs(),
-            ),
-            r"Binary path         : C:\Program Files\kei\kei.exe service run --config C:\Users\Alice\.config\kei\config.toml".to_string(),
-        ] {
-            assert!(
-                preview.contains(&needle),
-                "expected preview to contain {needle:?}; got:\n{preview}"
-            );
-        }
-    }
 
     #[test]
     fn render_status_reports_not_installed() {

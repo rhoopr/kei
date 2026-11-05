@@ -32,6 +32,51 @@ use super::super::test_support::{
 };
 use super::super::url_refresh::INCREMENTAL_PREFLIGHT_URL_REFRESH_AFTER;
 
+#[tokio::test]
+async fn legacy_identity_modes_keep_claim_writes_and_selected_names_separate() {
+    use super::super::context::{ClaimedLegacyMasterStates, DownloadContext, LegacyOwnerClaimMode};
+    for mode in [
+        LegacyOwnerClaimMode::ExistingOnly,
+        LegacyOwnerClaimMode::ReadOnly,
+        LegacyOwnerClaimMode::Persist,
+    ] {
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let records = incremental_photo_records("master");
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        db.upsert_seen(
+            &TestAssetRecord::new(asset.id())
+                .checksum(&asset.versions()[0].1.checksum)
+                .added_at(asset.added_date())
+                .build(),
+        )
+        .await
+        .unwrap();
+        let ctx = DownloadContext::load(db.as_ref(), false).await;
+        let mut config = test_config();
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+        let selected = IncrementalDeltaSummary::default()
+            .select_asset_state_identity(
+                asset.clone(),
+                &config,
+                &ctx,
+                &mut ClaimedLegacyMasterStates::default(),
+                mode,
+            )
+            .await
+            .unwrap();
+        let expected = if mode == LegacyOwnerClaimMode::ExistingOnly {
+            asset.asset_record_name()
+        } else {
+            asset.id()
+        };
+        assert_eq!(selected.state_id(), expected);
+        assert_eq!(
+            db.get_legacy_master_state_owners().await.unwrap().len(),
+            usize::from(mode == LegacyOwnerClaimMode::Persist)
+        );
+    }
+}
+
 #[derive(Clone)]
 struct RelationHydrationSession {
     incremental_calls: Arc<AtomicUsize>,
@@ -2097,7 +2142,7 @@ async fn shared_delta_state_preserves_strategy_failure_precedence() {
 #[tokio::test(start_paused = true)]
 async fn issue958_hydration_wait_reports_progress_and_terminal_outcomes_without_values() {
     use tracing_subscriber::layer::SubscriberExt;
-    let (layer, diagnostics) = crate::support::history::test_layer();
+    let (layer, diagnostics) = crate::support::test_capture::test_layer();
     let _default = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
     let _worker_callsite_registration = tracing::Dispatch::new(tracing_subscriber::registry());
     for cancel in [false, true] {

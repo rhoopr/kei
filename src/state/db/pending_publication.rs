@@ -227,7 +227,7 @@ impl SqliteStateDb {
         let shutdown = shutdown.clone();
         self.with_conn_mut("recover_pending_publication", move |conn| {
             if shutdown.is_cancelled() {
-                crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "cancelled"}));
+                crate::support::observe("support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "cancelled"}));
                 return Ok(false);
             }
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -238,24 +238,24 @@ impl SqliteStateDb {
                 || selected.size_bytes != proof.size
                 || selected.metadata.is_deleted
             {
-                crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "selection_source_mismatch"}));
+                crate::support::observe("support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "selection_source_mismatch"}));
                 return Ok(false);
             }
             let Some(current) =
                 read_publication(&tx, &proof.library, &proof.id, proof.version_size)?
             else {
-                crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "receipt_missing"}));
+                crate::support::observe("support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "receipt_missing"}));
                 return Ok(false);
             };
             let mut completed = proof.clone();
             completed.status = "downloaded".into();
             completed.last_error = None;
             if current != proof && current != completed {
-                crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "receipt_changed"}));
+                crate::support::observe("support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "receipt_changed"}));
                 return Ok(false);
             }
             if !owns_publication(&tx, &proof)? || !identity_matches(&tx, &proof, &child, &master)? {
-                crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "publication_owner_mismatch"}));
+                crate::support::observe("support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "publication_owner_mismatch"}));
                 return Ok(false);
             }
             // A managed handover may claim this path after the reader snapshot.
@@ -283,7 +283,7 @@ impl SqliteStateDb {
             super::provider_work::guard_projected_generation(&tx, &selected)?;
             super::provider_work::guard_projected_mapping(&tx, &proof.library, &child, &master)?;
             if shutdown.is_cancelled() {
-                crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "cancelled"}));
+                crate::support::observe("support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "cancelled"}));
                 return Ok(false);
             }
             if current.status == "pending" {
@@ -295,7 +295,7 @@ impl SqliteStateDb {
                     params![proof.library, proof.id, proof.version_size.as_str()],
                 )?;
                 if changed != 1 {
-                    crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "state_transition_mismatch"}));
+                    crate::support::observe("support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "state_transition_mismatch"}));
                 return Ok(false);
                 }
             }
@@ -305,11 +305,11 @@ impl SqliteStateDb {
                 params![proof.library, proof.id, proof.version_size.as_str()],
             )?;
             if shutdown.is_cancelled() {
-                crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "cancelled"}));
+                crate::support::observe("support_publication_v1", serde_json::json!({"operation": "receipt_recovery", "receipt_match": false, "actual_publication": false, "reason": "cancelled"}));
                 return Ok(false);
             }
             tx.commit()?;
-            crate::support::observe_scoped(&proof.library, Some((&proof.id, proof.version_size.as_str())), "support_publication_v1", serde_json::json!({
+            crate::support::observe("support_publication_v1", serde_json::json!({
                 "operation": "receipt_recovery", "receipt_match": true,
                 "content_equal": true, "size_equal": selected.size_bytes == proof.size,
                 "publication_time_retained": true,

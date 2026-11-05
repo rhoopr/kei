@@ -197,7 +197,7 @@ implementation.
 | [#634](https://github.com/rhoopr/kei/issues/634) native MQTT | No native backend planned. Existing scripts/adapters remain the route; repeated unmet demand is required to reopen the product decision. |
 | [#591](https://github.com/rhoopr/kei/issues/591) prune planning | No command planned until deletion, selection and uncertainty evidence is trustworthy. A candidate list must not imply unsupported deletion safety. |
 | [#442](https://github.com/rhoopr/kei/issues/442) Cargo workspace | No split planned without a named enforceable boundary that current modules cannot provide. |
-| [#586](https://github.com/rhoopr/kei/issues/586) service lifecycle boundary | Decide long-term ownership before expanding or removing native lifecycle commands. Existing users need a migration assessment. |
+| [#586](https://github.com/rhoopr/kei/issues/586) service lifecycle boundary | Resolved: host supervisors own service registration. kei keeps service execution, status, and manual removal guidance. |
 | [#684](https://github.com/rhoopr/kei/issues/684) STRICT SQLite | Deferred hardening. Reassess demonstrated integrity benefit against broad durable-state migration cost. |
 | [#549](https://github.com/rhoopr/kei/issues/549) full-enumeration planning | Re-audit after #780. Close as superseded if appropriate, or name the concrete residual duplicated responsibility. |
 | [#443](https://github.com/rhoopr/kei/issues/443), [#630](https://github.com/rhoopr/kei/issues/630), [#436](https://github.com/rhoopr/kei/issues/436), [#438](https://github.com/rhoopr/kei/issues/438) lint/allocation/filesystem hygiene | Opportunistic or evidence-driven only. No blanket lint, allocation or sync-to-async campaign. |

@@ -78,6 +78,7 @@ pub(crate) async fn copy_local_file_no_replace(
 
 /// Create the private stage exclusively and retain its open file identity.
 /// An interrupted or failed copy is retained as an unreceipted occupied stage.
+#[cfg(test)]
 pub(in crate::download) async fn copy_local_file_create_only(
     root: &Path,
     source: &Path,
@@ -90,6 +91,7 @@ pub(in crate::download) async fn copy_local_file_create_only(
     .await?
 }
 
+#[cfg(test)]
 fn copy_local_file_create_only_blocking(
     root: &Path,
     source: &Path,

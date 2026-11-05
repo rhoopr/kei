@@ -8,6 +8,7 @@ use rustc_hash::FxHashMap;
 
 use crate::state::VersionSizeKey;
 use crate::state::db::BaselineReceipt;
+use crate::state::db::identity::{LegacyOwnersByLibrary, same_logical_asset};
 use crate::state::db::provider_generations::SelectedCopyScope;
 
 use crate::state::db::match_diagnostics::{MatchAttempt, MatchDiagnostics, MatchExplanation};
@@ -127,11 +128,21 @@ pub(in crate::download) async fn commit_match(
                     }
                 });
             if provider {
-                db.adopt_provider_signature(&record, &receipt, validate)
-                    .await?;
+                db.adopt_provider_signature(
+                    &record,
+                    &receipt,
+                    task.asset_record_name.as_ref(),
+                    validate,
+                )
+                .await?;
             } else {
-                db.adopt_baseline_receipt(&record, &receipt, validate)
-                    .await?;
+                db.adopt_baseline_receipt(
+                    &record,
+                    &receipt,
+                    task.asset_record_name.as_ref(),
+                    validate,
+                )
+                .await?;
             }
         }
     }
@@ -158,12 +169,42 @@ impl Default for BaselineCandidates {
 #[derive(Debug, Default)]
 pub(in crate::download) struct BaselineMatcher {
     receipts: FxHashMap<(VersionSizeKey, String, u64), Vec<BaselineReceipt>>,
+    legacy_owners: LegacyOwnersByLibrary,
+    path_owners: FxHashMap<String, Vec<(String, String)>>,
+    unindexable_paths: rustc_hash::FxHashSet<std::path::PathBuf>,
 }
 
 impl BaselineMatcher {
+    #[must_use]
+    pub(super) fn accepts_legacy_claim(&self, library: &str, master: &str, child: &str) -> bool {
+        self.legacy_owners.accepts_claim(library, master, child)
+    }
+
+    pub(super) fn remember_legacy_claim(&mut self, library: &str, master: &str, child: &str) {
+        self.legacy_owners.remember_claim(library, master, child);
+    }
+
+    #[cfg(test)]
     pub(in crate::download) fn new(receipts: Vec<BaselineReceipt>) -> Self {
+        Self::with_legacy_owners(receipts, LegacyOwnersByLibrary::default())
+    }
+
+    pub(in crate::download) fn with_legacy_owners(
+        receipts: Vec<BaselineReceipt>,
+        legacy_owners: LegacyOwnersByLibrary,
+    ) -> Self {
         let mut index = Self::default();
         for receipt in receipts {
+            match crate::fs_util::confined_path_key(&receipt.local_path) {
+                Ok(key) => index
+                    .path_owners
+                    .entry(key)
+                    .or_default()
+                    .push((receipt.library.clone(), receipt.id.clone())),
+                Err(_) => {
+                    index.unindexable_paths.insert(receipt.local_path.clone());
+                }
+            }
             index
                 .receipts
                 .entry((
@@ -174,6 +215,10 @@ impl BaselineMatcher {
                 .or_default()
                 .push(receipt);
         }
+        for owners in index.path_owners.values_mut() {
+            owners.sort();
+            owners.dedup();
+        }
         for candidates in index.receipts.values_mut() {
             candidates.sort_by(|left, right| {
                 right
@@ -182,7 +227,82 @@ impl BaselineMatcher {
                     .then_with(|| left.local_path.cmp(&right.local_path))
             });
         }
+        index.legacy_owners = legacy_owners;
         index
+    }
+
+    fn same_asset(&self, task: &DownloadTask, library: &str, state_id: &str) -> bool {
+        same_logical_asset(
+            task.library.as_ref(),
+            task.asset_id.as_ref(),
+            task.asset_record_name.as_ref(),
+            library,
+            state_id,
+            &self.legacy_owners,
+        )
+    }
+
+    fn path_has_exact_target(&self, task: &DownloadTask, path: &Path) -> bool {
+        if self.unindexable_paths.contains(path) {
+            return false;
+        }
+        let Ok(key) = crate::fs_util::confined_path_key(path) else {
+            return false;
+        };
+        self.path_owners.get(&key).is_some_and(|owners| {
+            owners.iter().any(|(library, id)| {
+                library.as_str() == task.library.as_ref() && id.as_str() == task.asset_id.as_ref()
+            })
+        })
+    }
+
+    /// A completed current publication for this exact target can keep a path
+    /// that also carries a foreign historical owner. Pending or catalog-only
+    /// same-id rows do not qualify; a retained source/local pair or a supported
+    /// provider signature does.
+    pub(in crate::download) fn has_exact_current_receipt(
+        &self,
+        task: &DownloadTask,
+        path: &Path,
+    ) -> bool {
+        let Ok(key) = crate::fs_util::confined_path_key(path) else {
+            return false;
+        };
+        let Some(candidates) =
+            self.receipts
+                .get(&(task.version_size, task.checksum.to_string(), task.size))
+        else {
+            return false;
+        };
+        candidates.iter().any(|receipt| {
+            receipt.is_current_path
+                && receipt.library == task.library.as_ref()
+                && receipt.id == task.asset_id.as_ref()
+                && crate::fs_util::confined_path_key(&receipt.local_path)
+                    .ok()
+                    .is_some_and(|receipt_key| receipt_key == key)
+                && (receipt
+                    .source_checksum
+                    .as_deref()
+                    .filter(|source| valid_sha256(source))
+                    .is_some()
+                    && receipt.local_checksum.is_some()
+                    || super::file::supported_provider_signature(&receipt.provider_checksum))
+        })
+    }
+
+    fn path_has_incompatible_owner(&self, task: &DownloadTask, path: &Path) -> bool {
+        if self.unindexable_paths.contains(path) {
+            return true;
+        }
+        let Ok(key) = crate::fs_util::confined_path_key(path) else {
+            return true;
+        };
+        self.path_owners.get(&key).is_some_and(|owners| {
+            owners
+                .iter()
+                .any(|(library, id)| !self.same_asset(task, library, id))
+        })
     }
 
     /// Current provider facts select content candidates across historical labels.
@@ -245,6 +365,7 @@ impl BaselineMatcher {
     }
 
     /// Pass-specific copies cannot reuse another directory's receipt as coverage.
+    #[cfg(test)]
     pub(in crate::download) async fn match_task_with_distinct(
         &self,
         root: &Path,
@@ -258,7 +379,44 @@ impl BaselineMatcher {
             &std::collections::HashSet<std::path::PathBuf>,
         ),
     ) -> BaselineMatch {
+        self.match_task_with_distinct_and_exclusions(
+            root,
+            task,
+            requested_path,
+            require_requested_parent,
+            selected,
+            discovered,
+            evidence,
+            &|_path: &Path| false,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "matcher entry keeps proof lanes explicit for the planner and tests"
+    )]
+    pub(in crate::download) async fn match_task_with_distinct_and_exclusions(
+        &self,
+        root: &Path,
+        task: &DownloadTask,
+        requested_path: &Path,
+        require_requested_parent: bool,
+        selected: &SelectedCopyScope,
+        discovered: &BaselineCandidates,
+        evidence: (
+            &[crate::state::db::download_receipts::DownloadReceipt],
+            &std::collections::HashSet<std::path::PathBuf>,
+        ),
+        owner_excluded: &(dyn Fn(&Path) -> bool + Sync),
+    ) -> BaselineMatch {
         let (historical, distinct) = evidence;
+        let excluded = |path: &Path| {
+            if self.unindexable_paths.contains(path) {
+                return true;
+            }
+            owner_excluded(path)
+        };
         if task.checksum.trim().is_empty() {
             return uncertain("provider_signature_missing", None);
         }
@@ -293,10 +451,11 @@ impl BaselineMatcher {
         };
         let mut source_digest: Option<&str> = None;
         let mut conflicting_sources = false;
-        for receipt in candidates
-            .iter()
-            .filter(|receipt| !belongs_to_other_copy(receipt))
-        {
+        for receipt in candidates.iter().filter(|receipt| {
+            !belongs_to_other_copy(receipt)
+                && !excluded(&receipt.local_path)
+                && self.same_asset(task, &receipt.library, &receipt.id)
+        }) {
             if let Some(source) = receipt
                 .source_checksum
                 .as_deref()
@@ -319,11 +478,33 @@ impl BaselineMatcher {
         let is_identity = |receipt: &&BaselineReceipt| {
             receipt.library == task.library.as_ref() && receipt.id == task.asset_id.as_ref()
         };
+        let compatible =
+            |receipt: &&BaselineReceipt| self.same_asset(task, &receipt.library, &receipt.id);
         let ordered = candidates
             .iter()
-            .filter(is_identity)
-            .chain(candidates.iter().filter(|receipt| !is_identity(receipt)));
+            .filter(|receipt| is_identity(receipt) && compatible(receipt))
+            .chain(
+                candidates
+                    .iter()
+                    .filter(|receipt| !is_identity(receipt) && compatible(receipt)),
+            );
         for receipt in ordered.filter(|receipt| !belongs_to_other_copy(receipt)) {
+            if excluded(&receipt.local_path) {
+                let planned = crate::fs_util::confined_path_key(&task.download_path)
+                    .ok()
+                    .zip(crate::fs_util::confined_path_key(&receipt.local_path).ok())
+                    .is_some_and(|(planned, candidate)| planned == candidate);
+                explanation.add(
+                    Some(&receipt.local_path),
+                    if planned {
+                        uncertain = true;
+                        "foreign_asset_owns_destination"
+                    } else {
+                        "foreign_asset_occupant"
+                    },
+                );
+                continue;
+            }
             if distinct.contains(&receipt.local_path) {
                 continue;
             }
@@ -486,6 +667,9 @@ impl BaselineMatcher {
         }
         // An occupied path is only a candidate. Supported provider signatures
         // can prove its complete bytes even when historical receipts are absent.
+        let superseded = task
+            .superseded_requested(root, requested_path)
+            .and_then(|path| crate::fs_util::confined_path_key(path).ok());
         let mut visited = std::collections::HashSet::new();
         for path in [requested_path, task.download_path.as_path()]
             .into_iter()
@@ -502,11 +686,52 @@ impl BaselineMatcher {
             }) {
                 continue;
             }
+            if excluded(path) {
+                let planned = crate::fs_util::confined_path_key(&task.download_path)
+                    .ok()
+                    .zip(crate::fs_util::confined_path_key(path).ok())
+                    .is_some_and(|(planned, candidate)| planned == candidate);
+                explanation.add(
+                    Some(path),
+                    if planned {
+                        uncertain = true;
+                        "foreign_asset_owns_destination"
+                    } else {
+                        "foreign_asset_occupant"
+                    },
+                );
+                continue;
+            }
+            if self.path_has_incompatible_owner(task, path)
+                && !self.path_has_exact_target(task, path)
+            {
+                let planned = crate::fs_util::confined_path_key(&task.download_path)
+                    .ok()
+                    .zip(crate::fs_util::confined_path_key(path).ok())
+                    .is_some_and(|(planned, candidate)| planned == candidate);
+                explanation.add(
+                    Some(path),
+                    if planned {
+                        uncertain = true;
+                        "foreign_asset_owns_destination"
+                    } else {
+                        "foreign_asset_occupant"
+                    },
+                );
+                continue;
+            }
             if let Some(changed) = historical_candidate(root, task, path, historical).await {
                 if changed {
                     explanation.add(Some(path), "historical_occupant_changed_or_unsafe");
                     uncertain = true;
                 }
+                continue;
+            }
+            if let Some(superseded) = &superseded
+                && crate::fs_util::confined_path_key(path)
+                    .ok()
+                    .is_some_and(|path_key| path_key == *superseded)
+            {
                 continue;
             }
             // No known content proof can result from hashing this unreceipted
@@ -717,8 +942,8 @@ mod tests {
         let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(b"good"));
         BaselineReceipt {
             is_current_path: true,
-            library: "PrimarySync".into(),
-            id: "old-master".into(),
+            library: task.library.to_string(),
+            id: task.asset_id.to_string(),
             version_size: task.version_size,
             provider_checksum: task.checksum.to_string(),
             provider_size: task.size,
@@ -792,7 +1017,9 @@ mod tests {
                 .await,
             BaselineMatch::Uncertain(_)
         ));
-        std::fs::write(&old, b"evil").unwrap();
+        target.remember_superseded_requested(dir.path(), old.clone());
+        std::fs::remove_file(&old).unwrap();
+        std::fs::create_dir(&old).unwrap();
         assert!(matches!(
             matcher
                 .match_task_in_scope(
@@ -807,6 +1034,8 @@ mod tests {
                 .await,
             BaselineMatch::Uncertain(_)
         ));
+        std::fs::remove_dir(&old).unwrap();
+        std::fs::write(&old, b"evil").unwrap();
         // A modified historical path cannot be adopted even when its bytes
         // match the currently selected provider resource.
         use base64::Engine as _;
@@ -816,6 +1045,7 @@ mod tests {
         target.checksum = base64::engine::general_purpose::STANDARD
             .encode([vec![1], provider.finalize().to_vec()].concat())
             .into();
+        target.remember_superseded_requested(dir.path(), old.clone());
         assert!(matches!(
             matcher
                 .match_task_in_scope(
@@ -884,29 +1114,182 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mixed_labels_reuse_exact_source_bytes_without_merging_identities() {
+    async fn superseded_requested_skips_only_after_history_and_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut task = task(dir.path());
+        let p = task.download_path.clone();
+        task.download_path = dir.path().join("IMG_0001-current.JPG");
+        std::fs::write(&p, b"good").unwrap();
+        let matcher = BaselineMatcher::new(Vec::new());
+        assert!(matches!(
+            matcher.match_task(dir.path(), &task, &p).await,
+            BaselineMatch::Uncertain(_)
+        ));
+        task.remember_superseded_requested(dir.path(), p.clone());
+        assert_eq!(task.superseded_requested(dir.path(), &p), Some(p.as_path()));
+        assert!(matches!(
+            matcher.match_task(dir.path(), &task, &p).await,
+            BaselineMatch::Missing
+        ));
+        let clone = task.clone();
+        assert!(matches!(
+            matcher.match_task(dir.path(), &clone, &p).await,
+            BaselineMatch::Missing
+        ));
+        for mutate in [
+            |t: &mut filter::DownloadTask| {
+                t.download_path = t.download_path.with_extension("other")
+            },
+            |t: &mut filter::DownloadTask| t.checksum = "other".into(),
+            |t: &mut filter::DownloadTask| t.library = "other".into(),
+            |t: &mut filter::DownloadTask| t.asset_id = "other".into(),
+            |t: &mut filter::DownloadTask| t.asset_record_name = "other".into(),
+            |t: &mut filter::DownloadTask| t.version_size = crate::state::VersionSizeKey::Adjusted,
+            |t: &mut filter::DownloadTask| t.size += 1,
+        ] {
+            let mut changed = task.clone();
+            mutate(&mut changed);
+            assert_eq!(changed.superseded_requested(dir.path(), &p), None);
+        }
+        assert_eq!(
+            task.superseded_requested(&dir.path().join("other"), &p),
+            None
+        );
+        assert_eq!(
+            task.superseded_requested(dir.path(), &dir.path().join("other.JPG")),
+            None
+        );
+        let mut foreign_receipt = receipt(&task, &task.download_path);
+        foreign_receipt.library = "Foreign".into();
+        foreign_receipt.id = "foreign".into();
+        let foreign = BaselineMatcher::new(vec![foreign_receipt]);
+        assert!(matches!(
+            foreign.match_task(dir.path(), &task, &p).await,
+            BaselineMatch::Uncertain(_)
+        ));
+        let current = BaselineMatcher::new(vec![receipt(&task, &p)]);
+        assert!(matches!(
+            current.match_task(dir.path(), &task, &p).await,
+            BaselineMatch::Present { .. }
+                | BaselineMatch::ProviderPresent { .. }
+                | BaselineMatch::RecordedPresent { .. }
+        ));
+        let discovered = super::BaselineCandidates {
+            paths: vec![p.clone()],
+            complete: false,
+        };
+        assert!(matches!(
+            matcher
+                .match_task_in_scope(
+                    dir.path(),
+                    &task,
+                    &p,
+                    false,
+                    &Default::default(),
+                    &discovered,
+                    &[]
+                )
+                .await,
+            BaselineMatch::Uncertain(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn foreign_receipt_with_same_bytes_is_not_reused() {
         let tmp = tempfile::tempdir().unwrap();
         let task = task(tmp.path());
         let path = tmp.path().join("old-renamed-4096.JPG");
         std::fs::write(&path, b"good").unwrap();
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let matcher = BaselineMatcher::new(vec![receipt(&task, &path)]);
-        for current_id in ["current-child", "distinct-child-with-same-bytes"] {
-            let mut selected = task.clone();
-            selected.asset_id = current_id.into();
-            let BaselineMatch::Present { receipt, file } = matcher
-                .match_task(tmp.path(), &selected, &selected.download_path)
+        let mut foreign = receipt(&task, &path);
+        foreign.library = "PrimarySync".into();
+        foreign.id = "old-master".into();
+        assert!(matches!(
+            BaselineMatcher::new(vec![foreign])
+                .match_task(tmp.path(), &task, &task.download_path)
+                .await,
+            BaselineMatch::Missing
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"good");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert!(!task.download_path.exists());
+    }
+
+    #[tokio::test]
+    async fn exclusive_legacy_owner_reuses_same_logical_master_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut task = task(tmp.path());
+        task.library = "PrimarySync".into();
+        let path = tmp.path().join("old-renamed-4096.JPG");
+        std::fs::write(&path, b"good").unwrap();
+        let mut foreign = receipt(&task, &path);
+        foreign.library = "PrimarySync".into();
+        foreign.id = "old-master".into();
+        let owners = crate::state::db::identity::LegacyOwnersByLibrary::from_rows(
+            std::collections::HashSet::from([(
+                "PrimarySync".into(),
+                "old-master".into(),
+                task.asset_id.to_string(),
+            )]),
+        );
+        let BaselineMatch::Present { receipt, .. } =
+            BaselineMatcher::with_legacy_owners(vec![foreign], owners)
+                .match_task(tmp.path(), &task, &task.download_path)
                 .await
-            else {
-                panic!("receipt-backed content should be reusable");
-            };
-            assert_eq!(receipt.library, "PrimarySync");
-            assert_eq!(receipt.id, "old-master");
-            assert_eq!(receipt.local_path, path);
-            assert_eq!(selected.asset_id.as_ref(), current_id);
-            assert_eq!(selected.library.as_ref(), "SharedSync");
-            file.validate().await.unwrap();
-        }
+        else {
+            panic!("exclusive legacy owner should reuse the same logical asset");
+        };
+        assert_eq!(receipt.id, "old-master");
+        assert_eq!(receipt.local_path, path);
+    }
+
+    #[tokio::test]
+    async fn relative_owner_path_matches_absolute_candidate() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("kei-noalias-relative-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let absolute = dir.path().join("owned.JPG");
+        std::fs::write(&absolute, b"good").unwrap();
+        let relative = absolute.strip_prefix(&cwd).unwrap().to_path_buf();
+        let mut task = task(dir.path());
+        task.download_path = dir.path().join("current.JPG");
+        let mut foreign = receipt(&task, &absolute);
+        foreign.library = "PrimarySync".into();
+        foreign.id = "old-master".into();
+        foreign.local_path = relative;
+        assert!(matches!(
+            BaselineMatcher::new(vec![foreign])
+                .match_task(dir.path(), &task, &absolute)
+                .await,
+            BaselineMatch::Missing
+        ));
+        assert_eq!(std::fs::read(&absolute).unwrap(), b"good");
+        assert!(!task.download_path.exists());
+    }
+
+    #[tokio::test]
+    async fn same_identity_receipt_reuses_exact_source_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let task = task(tmp.path());
+        let path = tmp.path().join("old-renamed-4096.JPG");
+        std::fs::write(&path, b"good").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let BaselineMatch::Present { receipt, file } =
+            BaselineMatcher::new(vec![receipt(&task, &path)])
+                .match_task(tmp.path(), &task, &task.download_path)
+                .await
+        else {
+            panic!("same-identity receipt-backed content should be reusable");
+        };
+        assert_eq!(receipt.library, task.library.as_ref());
+        assert_eq!(receipt.id, task.asset_id.as_ref());
+        assert_eq!(receipt.local_path, path);
+        file.validate().await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"good");
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),
@@ -959,7 +1342,6 @@ mod tests {
         std::fs::write(&path, b"good").unwrap();
         let first = receipt(&task, &path);
         let mut second = first.clone();
-        second.id = "another-child".into();
         second.source_checksum = Some(data_encoding::HEXLOWER.encode(&Sha256::digest(b"evil")));
         assert!(matches!(
             BaselineMatcher::new(vec![first, second])
@@ -1037,7 +1419,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("state.db");
         let db = SqliteStateDb::open(&db_path).await.unwrap();
-        let selected = task(tmp.path());
+        let mut selected = task(tmp.path());
+        selected.library = "PrimarySync".into();
+        selected.asset_id = "downloaded-old".into();
+        selected.asset_record_name = "downloaded-old".into();
         for (id, verified) in [("downloaded-old", true), ("imported-old", false)] {
             let path = tmp.path().join(format!("{id}.JPG"));
             std::fs::write(&path, b"good").unwrap();
@@ -1081,9 +1466,12 @@ mod tests {
             .find(|receipt| receipt.id == "imported-old")
             .unwrap();
         assert_eq!(imported.source_checksum, None);
+        let mut imported_task = selected.clone();
+        imported_task.asset_id = "imported-old".into();
+        imported_task.asset_record_name = "imported-old".into();
         assert!(matches!(
             BaselineMatcher::new(vec![imported.clone()])
-                .match_task(tmp.path(), &selected, &selected.download_path)
+                .match_task(tmp.path(), &imported_task, &imported_task.download_path)
                 .await,
             BaselineMatch::Uncertain(_)
         ));
@@ -1160,6 +1548,9 @@ mod tests {
             let db_path = tmp.path().join("state.db");
             let db = SqliteStateDb::open(&db_path).await.unwrap();
             let mut selected = task(tmp.path());
+            selected.library = "PrimarySync".into();
+            selected.asset_id = "legacy".into();
+            selected.asset_record_name = "legacy".into();
             selected.checksum = "opaque-mmcs-generation+/=".into();
             let requested = selected.download_path.clone();
             selected.download_path = tmp.path().join("IMG_0001-4.JPG");
@@ -1270,7 +1661,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("state.db");
         let db = SqliteStateDb::open(&db_path).await.unwrap();
-        let selected = task(tmp.path());
+        let mut selected = task(tmp.path());
+        selected.library = "PrimarySync".into();
+        selected.asset_id = "legacy".into();
+        selected.asset_record_name = "legacy".into();
         let path = tmp.path().join("historical-suffixed.JPG");
         let row = TestAssetRecord::new("legacy")
             .checksum(&selected.checksum)
@@ -1359,7 +1753,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("state.db");
         let db = SqliteStateDb::open(&db_path).await.unwrap();
-        let selected = task(tmp.path());
+        let mut selected = task(tmp.path());
+        selected.library = "PrimarySync".into();
+        selected.asset_id = "legacy".into();
+        selected.asset_record_name = "legacy".into();
         let path = tmp.path().join("layout.JPG");
         std::fs::write(&path, b"good").unwrap();
         let row = TestAssetRecord::new("legacy")
@@ -1789,7 +2186,7 @@ mod provider_v1_matching_tests {
     }
 
     #[tokio::test]
-    async fn v027_provider_v1_reuses_renamed_missing_receipt_without_changing_historical_owner() {
+    async fn v027_provider_v1_foreign_receipt_is_not_adopted_and_owner_is_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("renamed-legacy-1.JPG");
         std::fs::write(&path, b"good").unwrap();
@@ -1810,32 +2207,12 @@ mod provider_v1_matching_tests {
             .unwrap();
         let receipts = db.get_baseline_receipts().await.unwrap();
         assert_eq!(receipts[0].source_checksum, None);
-        let BaselineMatch::ProviderPresent { receipt, file } = BaselineMatcher::new(receipts)
-            .match_task(dir.path(), &task, &task.download_path)
-            .await
-        else {
-            panic!("complete supported provider signature should verify missing source receipt");
-        };
-        assert_eq!(receipt.id, "current-child");
-        assert_eq!(receipt.library, "SharedSync");
-        let current = TestAssetRecord::new("current-child")
-            .library("SharedSync")
-            .checksum(&task.checksum)
-            .size(4)
-            .build();
-        let expected = task.checksum.to_string();
-        db.adopt_provider_signature(
-            &current,
-            &receipt,
-            Box::new(move || {
-                if file.matches_provider_v1_blocking(&expected).ok() != Some(Some(true)) {
-                    return Err(crate::state::error::StateError::ProviderSelectionInvalid);
-                }
-                Ok(())
-            }),
-        )
-        .await
-        .unwrap();
+        assert!(matches!(
+            BaselineMatcher::new(receipts)
+                .match_task(dir.path(), &task, &task.download_path)
+                .await,
+            BaselineMatch::Missing
+        ));
         drop(db);
         for _ in 0..2 {
             let db = SqliteStateDb::open(&state).await.unwrap();
@@ -1850,7 +2227,7 @@ mod provider_v1_matching_tests {
                 BaselineMatcher::new(receipts)
                     .match_task(dir.path(), &task, &task.download_path)
                     .await,
-                BaselineMatch::Present { .. }
+                BaselineMatch::Missing
             ));
             assert_eq!(std::fs::read(&path).unwrap(), b"good");
             assert_eq!(
@@ -1890,10 +2267,7 @@ mod provider_v1_matching_tests {
         task.checksum = signature(b"good").into();
         let local = crate::download::file::compute_sha256(&path).await.unwrap();
         let mut first = provider_receipt(&task, &path, &local);
-        first.library = "PrimarySync".into();
-        first.id = "old-master".into();
         let mut contradictory = first.clone();
-        contradictory.id = "other-old-master".into();
         contradictory.source_checksum = Some("a".repeat(64));
         let matcher = BaselineMatcher::new(vec![first.clone(), contradictory.clone()]);
         assert!(matches!(

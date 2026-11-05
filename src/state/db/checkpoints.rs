@@ -6,6 +6,7 @@ use rusqlite::OptionalExtension;
 
 use super::provider_generations::observation::{self, ObservationProof};
 use super::sparse_identity;
+use super::sync_epoch;
 use super::{CheckpointTransition, ScopedDbSyncToken, SqliteStateDb, SyncTokenStore};
 use crate::state::error::StateError;
 
@@ -121,6 +122,87 @@ impl SqliteStateDb {
         .await
     }
 
+    /// Explicit `reset sync-token` owner. One IMMEDIATE transaction clears the
+    /// database token, every active/legacy/staged zone token, scoped tokens, and
+    /// rotates each enrolled library epoch to a fresh due baseline attempt while
+    /// quarantining its staged proof/descriptor. Generations, destinations,
+    /// decisions, receipts, assets and media are untouched. Any failure rolls
+    /// back every part, so the command can print success only after commit.
+    pub(crate) async fn reset_sync_tokens_atomic(&self) -> Result<(u64, u64), StateError> {
+        self.with_conn_mut("resetting sync tokens atomically", move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let old_policy = observation::policy(&tx)?;
+            let mut changed = vec!["db_sync_token".to_owned()];
+            tx.execute(
+                "INSERT INTO metadata(key,value) VALUES('db_sync_token','') \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [],
+            )?;
+            let active: Vec<String> = tx
+                .prepare("SELECT key FROM metadata WHERE key LIKE 'sync_token:%'")?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            let zone_tokens = active.len() as u64;
+            for key in active {
+                tx.execute("DELETE FROM metadata WHERE key=?1", [&key])?;
+                changed.push(key);
+            }
+            // Staged keys are removed per enrolled library by the epoch owner
+            // below. Unenrolled or legacy staged keys are inert and retained as
+            // evidence; only active/legacy tokens are cleared globally.
+            let scoped_tokens = tx.execute("DELETE FROM scoped_db_sync_tokens", [])? as u64;
+            changed.extend(super::sync_epoch::reset_libraries_for_token_reset(
+                &tx,
+                chrono::Utc::now().timestamp(),
+            )?);
+            observation::invalidate(&tx, &changed, old_policy)?;
+            tx.commit()?;
+            Ok((zone_tokens, scoped_tokens))
+        })
+        .await
+    }
+
+    /// Remove pending zone tokens that are not the exact token referenced by a
+    /// current ready epoch binding. The purge is one transaction and never
+    /// touches an epoch record or a non-pending checkpoint.
+    pub(crate) async fn purge_superseded_pending_tokens(&self) -> Result<u64, StateError> {
+        self.with_conn_mut("purge_superseded_pending_tokens", move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let conn = &tx;
+            let prefix = crate::sync_cycle::PENDING_ZONE_TOKEN_PREFIX;
+            let old_policy = observation::policy(conn)?;
+            let keys: Vec<String> = conn
+                .prepare("SELECT key FROM metadata WHERE substr(key, 1, length(?1)) = ?1")?
+                .query_map([prefix], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            let mut deleted = Vec::new();
+            for key in keys {
+                let Some(zone) = key
+                    .strip_prefix(prefix)
+                    .and_then(|rest| rest.split_once(':'))
+                    .map(|(_, zone)| zone)
+                else {
+                    continue;
+                };
+                let protected = match sync_epoch::read_library(conn, zone)? {
+                    Some(record) if record.state == "ready" => record
+                        .binding
+                        .is_some_and(|binding| binding.token_key == key),
+                    _ => false,
+                };
+                if protected {
+                    continue;
+                }
+                conn.execute("DELETE FROM metadata WHERE key=?1", [&key])?;
+                deleted.push(key);
+            }
+            observation::invalidate(conn, &deleted, old_policy)?;
+            tx.commit()?;
+            Ok(deleted.len() as u64)
+        })
+        .await
+    }
+
     pub(crate) async fn commit_checkpoint_transition(
         &self,
         transition: CheckpointTransition,
@@ -152,6 +234,16 @@ impl SqliteStateDb {
                 &transition.metadata_updates,
                 &transition.expected_metadata,
             )?;
+            let epoch_completions = if promote {
+                observation::validate_epoch_promotion(&tx, &prepared_observation, &transition)?
+            } else {
+                observation::record_epoch_stage(
+                    &tx,
+                    proof.as_ref(),
+                    &prepared_observation,
+                    &transition,
+                )?
+            };
             let changed_keys = transition
                 .metadata_updates
                 .iter()
@@ -231,12 +323,29 @@ impl SqliteStateDb {
                 )
                 .map_err(|e| StateError::query("commit_checkpoint_transition::update", e))?;
             }
+            let staged_epoch_baselines = if !promote && epoch_completions.is_empty() {
+                super::sync_epoch::ready_proof_baseline_keys(&tx)?
+            } else {
+                rustc_hash::FxHashSet::default()
+            };
             for key in transition.metadata_deletes {
+                if staged_epoch_baselines.contains(&key) {
+                    // Keep only the exact baseline bound by a currently ready
+                    // staged proof. Completed or unrelated baselines delete.
+                    continue;
+                }
                 tx.execute("DELETE FROM metadata WHERE key = ?1", [key])
                     .map_err(|e| StateError::query("commit_checkpoint_transition::delete", e))?;
             }
             observation::invalidate(&tx, &changed_keys, old_policy)?;
             observation::apply(&tx, prepared_observation)?;
+            for completion in epoch_completions {
+                super::sync_epoch::complete(&tx, &completion.library, &completion.attempt)?;
+                tx.execute(
+                    "DELETE FROM metadata WHERE key=?1",
+                    [completion.baseline_key],
+                )?;
+            }
             #[cfg(all(test, target_os = "linux"))]
             if writes_current_token {
                 crate::test_helpers::process_death_point("checkpoint-before-commit");
@@ -343,6 +452,10 @@ impl SyncTokenStore for SqliteStateDb {
         SqliteStateDb::delete_metadata_by_prefix(self, prefix).await
     }
 
+    async fn purge_superseded_pending_tokens(&self) -> Result<u64, StateError> {
+        SqliteStateDb::purge_superseded_pending_tokens(self).await
+    }
+
     async fn commit_checkpoint_transition(
         &self,
         transition: CheckpointTransition,
@@ -390,6 +503,61 @@ impl SyncTokenStore for SqliteStateDb {
 
     async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
         SqliteStateDb::list_interrupted_enumerations(self).await
+    }
+
+    async fn sync_epoch_enroll(&self, libraries: Vec<(String, String)>) -> Result<(), StateError> {
+        SqliteStateDb::enroll_sync_epoch(self, libraries).await
+    }
+
+    async fn sync_epoch_gate(
+        &self,
+        library: String,
+        baseline_scope: String,
+        watch_interval: Option<u64>,
+    ) -> Result<super::SyncEpochGate, StateError> {
+        SqliteStateDb::sync_epoch_gate(self, library, baseline_scope, watch_interval).await
+    }
+
+    async fn sync_epoch_should_wake(&self, library: String) -> Result<bool, StateError> {
+        SqliteStateDb::sync_epoch_should_wake(self, library).await
+    }
+
+    async fn sync_epoch_has_pending(&self, library: String) -> Result<bool, StateError> {
+        SqliteStateDb::sync_epoch_has_pending(self, library).await
+    }
+
+    async fn sync_epoch_backoff(&self, library: String) -> Result<bool, StateError> {
+        SqliteStateDb::sync_epoch_backoff(self, library).await
+    }
+
+    async fn defer_sync_epoch(
+        &self,
+        library: String,
+        watch_interval: Option<u64>,
+        outcome: &'static str,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::defer_sync_epoch(self, library, watch_interval, outcome).await
+    }
+
+    async fn recover_sync_epoch_attempt(
+        &self,
+        library: String,
+        provider_failure: bool,
+        watch_interval: Option<u64>,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::recover_sync_epoch_attempt(self, library, provider_failure, watch_interval)
+            .await
+    }
+
+    async fn sync_epoch_baseline_evidence(
+        &self,
+        library: String,
+    ) -> Result<Option<(String, Option<String>)>, StateError> {
+        SqliteStateDb::sync_epoch_baseline_evidence(self, library).await
+    }
+
+    async fn sync_epoch_id(&self) -> Result<Option<String>, StateError> {
+        SqliteStateDb::sync_epoch_id(self).await
     }
 }
 

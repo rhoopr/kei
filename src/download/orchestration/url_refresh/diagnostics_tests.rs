@@ -31,7 +31,7 @@ impl std::io::Write for LogWriter {
 async fn capture<T>(future: impl std::future::Future<Output = T>) -> (T, String) {
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let sink = bytes.clone();
-    let (recorder, evidence) = crate::support::history::test_layer();
+    let (recorder, evidence) = crate::support::test_capture::test_layer();
     let subscriber = tracing_subscriber::registry().with(recorder).with(
         tracing_subscriber::fmt::layer()
             .without_time()
@@ -652,12 +652,10 @@ fn page(records: Vec<Value>, cursor: &str, more: bool) -> Value {
     json!({"zones":[{"zoneID":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"records":records,"syncToken":cursor,"moreComing":more}]})
 }
 
-/// Capture the production allowlisted projection without using saved history or
-/// private state. This checks producer meaning, not just allowlist membership.
+/// Capture the production allowlisted projection without a persistent recorder
+/// or private state. This checks producer meaning, not just allowlist membership.
 async fn support_capture<T>(future: impl std::future::Future<Output = T>) -> (T, Vec<Value>) {
-    let directory = TempDir::new().unwrap();
-    let path = directory.path().join("support.json");
-    let (recorder, guard) = crate::support::history::start(path.clone(), json!({})).unwrap();
+    let (recorder, evidence) = crate::support::test_capture::test_layer();
     let result = future
         .with_subscriber(
             tracing_subscriber::registry().with(recorder).with(
@@ -667,8 +665,7 @@ async fn support_capture<T>(future: impl std::future::Future<Output = T>) -> (T,
             ),
         )
         .await;
-    guard.finish().await;
-    let observations = crate::support::history::test_retained_events(&path);
+    let observations = evidence();
     for observation in &observations {
         assert!(!observation.to_string().contains("PRIVATE_"));
         assert!(!observation.to_string().contains("https://"));

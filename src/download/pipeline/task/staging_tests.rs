@@ -81,6 +81,7 @@ fn task(path: std::path::PathBuf, id: &str, size: u64) -> DownloadTask {
         replacement_fingerprint: None,
         publication_binding: None,
         pending_cross_parent_root: None,
+        superseded_requested_path: None,
         checksum: "AAAA".into(),
         asset_id: id.into(),
         asset_record_name: id.into(),

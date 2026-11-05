@@ -649,6 +649,238 @@ const WORKER_BUDGET_JPEG: &[u8] = &[
     0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
 ];
 
+#[tokio::test]
+async fn full_sync_no_selection_lazy_master_claim_reuses_first_pass() {
+    use crate::state::DownloadStateStore;
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/reuse"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(WORKER_BUDGET_JPEG.to_vec()))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let asset_date = 1_736_899_200_000_i64;
+    let checksum = data_encoding::BASE64.encode(&[1_u8; 32]);
+    let mut records = mock_photo_records_for_zone_with_filename_and_asset_date(
+        "current-child",
+        "PrimarySync",
+        "reuse.JPG",
+        asset_date,
+    );
+    records[0]["fields"]["resOriginalRes"]["value"]["size"] =
+        json!(WORKER_BUDGET_JPEG.len() as u64);
+    records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    records[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] =
+        json!(format!("{}/reuse", server.uri()));
+    let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+    let dir = TempDir::new().expect("temp dir");
+    let db_path = dir.path().join("state.db");
+    let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+    let mut config = test_config();
+    config.directory = Arc::from(dir.path());
+    config.folder_structure = "none".into();
+    config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+    assert!(config.selection_context.is_none());
+    assert!(config.selection_run.is_none());
+    let pass = AlbumPass {
+        kind: PassKind::Album,
+        album: mock_album(
+            "LazyClaim",
+            MockPhotosFlow::new()
+                .album_count(1)
+                .query_page(records, Some("zone-token"))
+                .build(),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let pass_config = config.with_pass(&pass);
+    assert!(pass_config.selection_context.is_none());
+    assert!(pass_config.selection_run.is_none());
+    let expected = filter::expected_paths_for(&asset, &pass_config)
+        .into_iter()
+        .next()
+        .expect("mock asset should have an expected path");
+    std::fs::create_dir_all(expected.path.parent().expect("path has parent")).unwrap();
+    std::fs::write(&expected.path, WORKER_BUDGET_JPEG).unwrap();
+    let mtime = std::fs::metadata(&expected.path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    let digest = file::compute_sha256(&expected.path).await.unwrap();
+    let master = asset.id().to_string();
+    let child = asset.asset_record_name().to_string();
+    db.upsert_seen(
+        &TestAssetRecord::new(&master)
+            .library("PrimarySync")
+            .filename("reuse.JPG")
+            .checksum(&checksum)
+            .size(WORKER_BUDGET_JPEG.len() as u64)
+            .created_at(asset.created())
+            .added_at(asset.added_date())
+            .build(),
+    )
+    .await
+    .unwrap();
+    db.mark_verified_download(
+        "PrimarySync",
+        &master,
+        "original",
+        &expected.path,
+        &digest,
+        Some(&digest),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fallback_claim_count(&db_path, &master, &child), 0);
+    assert_eq!(fallback_preserved_marker(&db_path, &master), None);
+    let result = download_photos_full_with_token(
+        &Client::new(),
+        std::slice::from_ref(&pass),
+        &Arc::new(config),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("fallback full sync should succeed");
+    let state = rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT status,local_path,local_checksum,download_checksum,last_error FROM assets \
+             WHERE library='PrimarySync' AND id=?1 AND version_size='original'",
+            [&master],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let gets = requests
+        .iter()
+        .filter(|request| request.method.as_str() == "GET")
+        .count();
+    eprintln!(
+        "fallback first pass: claims={}, marker={:?}, GET attempts={gets}, state={state:?}, result={result:?}",
+        fallback_claim_count(&db_path, &master, &child),
+        fallback_preserved_marker(&db_path, &master),
+    );
+    assert_eq!(gets, 0, "must not attempt any media GET");
+    server.verify().await;
+    assert_eq!(std::fs::read(&expected.path).unwrap(), WORKER_BUDGET_JPEG);
+    assert_eq!(
+        std::fs::metadata(&expected.path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        mtime
+    );
+    assert_eq!(fallback_claim_count(&db_path, &master, &child), 1);
+    assert_eq!(result.stats.failed, 0, "{result:?}");
+    assert_eq!(result.stats.downloaded, 0, "{result:?}");
+    let current = db
+        .get_downloaded_page(0, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| {
+            row.library.as_ref() == "PrimarySync"
+                && row.id.as_ref() == master
+                && row.version_size.as_str() == "original"
+        })
+        .expect("completed legacy state must remain downloaded on first pass");
+    assert_eq!(current.local_path.as_ref(), Some(&expected.path));
+    assert_eq!(current.local_checksum.as_deref(), Some(digest.as_str()));
+    assert!(
+        fallback_preserved_marker(&db_path, &master).is_some(),
+        "matcher/commit adoption must establish the read-only marker"
+    );
+    assert_eq!(std::fs::read(&expected.path).unwrap(), WORKER_BUDGET_JPEG);
+    assert_eq!(
+        std::fs::metadata(&expected.path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        mtime
+    );
+    drop((db, pass_config));
+    let reopened = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+    let mut quiet_config = test_config();
+    quiet_config.directory = Arc::from(dir.path());
+    quiet_config.folder_structure = "none".into();
+    quiet_config.state_db = Some(Arc::clone(&reopened) as Arc<dyn DownloadStore>);
+    let quiet_pass_config = quiet_config.with_pass(&pass);
+    let quiet = download_photos_full_with_token(
+        &Client::new(),
+        std::slice::from_ref(&pass),
+        &Arc::new(quiet_pass_config),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("quiet fallback full sync should succeed");
+    assert_eq!(quiet.stats.failed, 0, "{quiet:?}");
+    assert_eq!(quiet.stats.downloaded, 0, "{quiet:?}");
+    assert_eq!(fallback_claim_count(&db_path, &master, &child), 1);
+    let quiet_current = reopened
+        .get_downloaded_page(0, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| {
+            row.library.as_ref() == "PrimarySync"
+                && row.id.as_ref() == master
+                && row.version_size.as_str() == "original"
+        })
+        .expect("reopened quiet pass must retain completed legacy state");
+    assert_eq!(quiet_current.local_path.as_ref(), Some(&expected.path));
+    assert_eq!(
+        quiet_current.local_checksum.as_deref(),
+        Some(digest.as_str())
+    );
+    assert_eq!(std::fs::read(&expected.path).unwrap(), WORKER_BUDGET_JPEG);
+    assert_eq!(
+        std::fs::metadata(&expected.path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        mtime
+    );
+    server.verify().await;
+}
+fn fallback_claim_count(path: &std::path::Path, master: &str, child: &str) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM legacy_master_state_owners \
+             WHERE library='PrimarySync' AND master_record_name=?1 AND asset_record_name=?2",
+            [master, child],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+fn fallback_preserved_marker(path: &std::path::Path, master: &str) -> Option<String> {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT preserved_path_key FROM asset_metadata_paths
+             WHERE library='PrimarySync' AND id=?1 AND version_size='original'
+               AND local_path=(SELECT local_path FROM assets
+                   WHERE library='PrimarySync' AND id=?1 AND version_size='original')",
+            [master],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
 #[derive(Default)]
 struct WorkerBudgetProbe {
     active: AtomicUsize,
@@ -2088,7 +2320,7 @@ impl PhotosSession for DiagnosticMismatchSession {
 }
 
 #[tokio::test]
-async fn support_history_keeps_initial_mismatch_and_repaired_token_counts_at_info() {
+async fn support_token_evidence_keeps_initial_mismatch_and_repaired_token_counts() {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
     let passes = ["PRIVATE_INITIAL_A", "PRIVATE_INITIAL_B"]
@@ -2110,10 +2342,8 @@ async fn support_history_keeps_initial_mismatch_and_repaired_token_counts_at_inf
     let mut config = test_config();
     let media_dir = TempDir::new().unwrap();
     config.directory = Arc::from(media_dir.path());
-    let history_dir = TempDir::new().unwrap();
-    let path = history_dir.path().join("history.json");
-    let (recorder, guard) = crate::support::history::start(path.clone(), json!({})).unwrap();
-    let subscriber = tracing_subscriber::registry().with(recorder).with(
+    let (layer, drain) = crate::support::test_capture::test_layer();
+    let subscriber = tracing_subscriber::registry().with(layer).with(
         tracing_subscriber::fmt::layer()
             .with_writer(std::io::sink)
             .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
@@ -2133,14 +2363,12 @@ async fn support_history_keeps_initial_mismatch_and_repaired_token_counts_at_inf
     assert_eq!(result.stats.same_cycle_recovery_attempts, 1);
     assert_eq!(result.stats.same_cycle_recovery_successes, 1);
     assert_eq!(result.stats.sync_token_unique_values, Some(1));
-    guard.finish().await;
-    let history: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    let events = history["cycles"][0]["diagnostics"].as_array().unwrap();
+    let events = drain();
     let proof = |phase: &str| -> &Value {
         &events
             .iter()
             .find(|d| d["kind"] == "support_token_evidence_v1" && d["fields"]["phase"] == phase)
-            .unwrap_or_else(|| panic!("missing {phase} evidence: {history}"))["fields"]
+            .unwrap_or_else(|| panic!("missing {phase} evidence: {events:?}"))["fields"]
     };
     assert_eq!(proof("initial")["reason"], "icloud_sync_token_mismatch");
     assert_eq!(proof("initial")["sync_token_expected_receivers"], 2);
@@ -2151,37 +2379,10 @@ async fn support_history_keeps_initial_mismatch_and_repaired_token_counts_at_inf
         2
     );
     assert_eq!(proof("same_cycle_recovery")["sync_token_unique_values"], 1);
-    let relationships = &events
-        .iter()
-        .find(|event| {
-            event["kind"] == "support_token_equivalence_v1"
-                && event["fields"]["phase"] == "same_cycle_recovery"
-        })
-        .unwrap()["fields"]["rows"];
-    assert_ne!(
-        relationships[0]["initial_group"],
-        relationships[1]["initial_group"]
-    );
-    assert_eq!(
-        relationships[0]["recovery_group"],
-        relationships[1]["recovery_group"]
-    );
-    assert_ne!(
-        relationships[0]["initial_group"],
-        relationships[0]["recovery_group"]
-    );
-    assert_ne!(
-        relationships[1]["initial_group"],
-        relationships[0]["recovery_group"]
-    );
 
-    for private in [
-        "PRIVATE",
-        "PrimarySync",
-        media_dir.path().to_str().unwrap(),
-        history_dir.path().to_str().unwrap(),
-    ] {
-        assert!(!history.to_string().contains(private));
+    assert!(!events.is_empty());
+    for private in ["PRIVATE", "PrimarySync", media_dir.path().to_str().unwrap()] {
+        assert!(!serde_json::to_string(&events).unwrap().contains(private));
     }
 }
 
@@ -3535,5 +3736,3 @@ fn issue845_46_completed_passes_with_two_tokens_require_recovery() {
         }
     }
 }
-
-mod token_equivalence;

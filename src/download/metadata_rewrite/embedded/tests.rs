@@ -239,9 +239,24 @@ async fn production_metadata_plan_and_io_error_are_safe_support_evidence() {
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::layer::SubscriberExt;
     let dir = tempfile::tempdir().unwrap();
-    let history = dir.path().join("retained.support.json");
-    let (layer, guard) =
-        crate::support::history::start(history.clone(), serde_json::json!({})).unwrap();
+    let (layer, drain) = crate::support::test_capture::test_layer();
+    // Avoid tracing-core's single-dispatcher cache using an unsubscribed
+    // peer's interest when it first registers the shared support callsite.
+    let _parallel_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let dispatcher = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
+    // Reproduce a parallel test reaching the shared support callsite first
+    // without using this test's subscriber.
+    std::thread::spawn(|| {
+        tracing::dispatcher::with_default(&tracing::Dispatch::none(), || {
+            crate::support::observe_metadata(
+                "support_metadata_v1",
+                serde_json::json!({"operation": "prepare", "source_fractional": false}),
+            );
+        });
+    })
+    .join()
+    .unwrap();
+    assert!(drain().is_empty());
     let path = dir.path().join("PRIVATE_MEDIA.jpg");
     let created = chrono::DateTime::parse_from_rfc3339("2026-10-10T10:20:30.123+00:00").unwrap();
     let result = super::prepare_embed_metadata(
@@ -253,14 +268,13 @@ async fn production_metadata_plan_and_io_error_are_safe_support_evidence() {
         CaptureTimestampRepair::Preserve,
         ".temp",
     )
-    .with_subscriber(tracing_subscriber::registry().with(layer))
+    .with_subscriber(dispatcher)
     .await;
     assert!(matches!(
         result,
         super::EmbedPrepareResult::Failed | super::EmbedPrepareResult::InputChanged
     ));
-    guard.finish().await;
-    let evidence = crate::support::history::test_retained_events(&history);
+    let evidence = drain();
     let plan = evidence
         .iter()
         .find(|v| v["kind"] == "support_metadata_v1" && v["fields"]["source_fractional"] == true)

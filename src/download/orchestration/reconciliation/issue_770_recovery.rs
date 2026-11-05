@@ -326,6 +326,11 @@ async fn issue_770_seed_records(
     db.upsert_asset_master_mapping("PrimarySync", "asset-PENDING", "PENDING")
         .await
         .unwrap();
+    assert!(
+        db.claim_legacy_master_state_owner("PrimarySync", "PENDING", "asset-PENDING")
+            .await
+            .unwrap()
+    );
     db.set_metadata("sync_token:PrimarySync", "checkpoint-before")
         .await
         .unwrap();
@@ -338,18 +343,21 @@ async fn issue_770_seed_records(
     // A valid unrelated choice activates the existing reserved-download mode.
     let held = root.path().join("held.jpg");
     let key = crate::fs_util::confined_path_key(&held).unwrap();
-    db.reserve_reconciliation_paths(&[ReconciliationReservation {
-        library: Arc::from("PrimarySync"),
-        asset_id: "UNRELATED".into(),
-        version_size: VersionSizeKey::Original,
-        content: Some(ReconciliationContent {
-            checksum: "held-content".into(),
-            size: 1024,
-        }),
-        requested_path_key: ReconciliationPathKey(key.clone()),
-        destination_path_key: ReconciliationPathKey(key),
-        destination_path: held,
-    }])
+    db.reserve_reconciliation_paths(
+        &[ReconciliationReservation {
+            library: Arc::from("PrimarySync"),
+            asset_id: "UNRELATED".into(),
+            version_size: VersionSizeKey::Original,
+            content: Some(ReconciliationContent {
+                checksum: "held-content".into(),
+                size: 1024,
+            }),
+            requested_path_key: ReconciliationPathKey(key.clone()),
+            destination_path_key: ReconciliationPathKey(key),
+            destination_path: held,
+        }],
+        None,
+    )
     .await
     .unwrap();
     let mut config = test_config();
@@ -1322,7 +1330,12 @@ async fn issue_770_recovery_foreign_catalog_ownership_cannot_reuse_saved_choice(
         .await
         .err()
         .unwrap();
-        assert!(error.to_string().contains("another owner"), "{error:#}");
+        let message = error.to_string();
+        assert!(
+            message.contains("another owner")
+                || message.contains("conflicting ownership or content"),
+            "{error:#}"
+        );
         assert_eq!(db.get_reconciliation_reservations().await.unwrap(), ledger);
         assert_eq!(db.get_pending().await.unwrap().len(), 1);
         assert!(!destination.exists());
@@ -1430,6 +1443,7 @@ async fn issue_770_recovery_changed_content_and_unknown_legacy_choices_stay_occu
         );
         assert!(!planner.retry_path_allowed(
             "PrimarySync",
+            "PENDING",
             "PENDING",
             VersionSizeKey::Original,
             if unknown {

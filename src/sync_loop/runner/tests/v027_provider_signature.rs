@@ -1,5 +1,8 @@
 //! Complete-file provider proof exercised through the bound normal cycle.
-use super::{BaselineSession, MEDIA, OLD_TOKEN, ZONE, baseline_owner, historical_rows, pair, zone};
+use super::{
+    BaselineSession, MEDIA, OLD_TOKEN, ZONE, baseline_owner, generation, historical_rows, pair,
+    zone,
+};
 use crate::commands::{AlbumPass, PassKind};
 use crate::download;
 use crate::icloud::photos::PhotoLibrary;
@@ -30,47 +33,27 @@ fn signature(bytes: &[u8]) -> String {
 }
 
 #[tokio::test]
-async fn v027_provider_signature_missing_receipt_reuses_renamed_bytes_across_normal_cycles() {
+async fn v027_source_backed_foreign_receipt_materializes_own_path_across_normal_cycles() {
     for database in ["private", "shared"] {
-        exercise(database, None).await;
+        exercise(database, None, true).await;
+    }
+}
+
+#[tokio::test]
+async fn v027_provider_signature_foreign_bytes_materialize_own_path_across_normal_cycles() {
+    for database in ["private", "shared"] {
+        exercise(database, None, false).await;
     }
 }
 
 #[tokio::test]
 async fn v027_provider_signature_wrong_tail_unknown_prefix_and_edited_bytes_stay_pending() {
     for failure in ["tail", "unsupported", "edited"] {
-        exercise("private", Some(failure)).await;
+        exercise("private", Some(failure), false).await;
     }
 }
 
-async fn exercise(database: &'static str, failure: Option<&str>) {
-    let server = crate::start_wiremock_or_skip!();
-    for (endpoint, expected) in [("/existing", 0), ("/missing", 1), ("/concurrent", 1)] {
-        Mock::given(method("GET"))
-            .and(path(endpoint))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(MEDIA)
-                    .insert_header("content-type", "image/jpeg"),
-            )
-            .expect(expected)
-            .mount(&server)
-            .await;
-    }
-    Mock::given(method("GET"))
-        .and(path("/companion"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_bytes(MOTION)
-                .insert_header("content-type", "video/quicktime"),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("photos");
-    std::fs::create_dir_all(&root).unwrap();
-    let old_path = root.join("renamed-old_2.JPG");
+async fn exercise(database: &'static str, failure: Option<&str>, source_backed: bool) {
     // The tail control is deliberately beyond the old 64KiB prefix limit.
     let mut provider_bytes = MEDIA.to_vec();
     provider_bytes.resize(provider_bytes.len().max(65_537), 42);
@@ -89,6 +72,48 @@ async fn exercise(database: &'static str, failure: Option<&str>) {
         decoded[0] = 4;
         checksum = base64::engine::general_purpose::STANDARD.encode(decoded);
     }
+    let existing_body = if failure.is_some() {
+        MEDIA.to_vec()
+    } else {
+        provider_bytes.clone()
+    };
+    let server = crate::start_wiremock_or_skip!();
+    for (endpoint, expected, body) in [
+        ("/existing", usize::from(failure.is_none()), existing_body),
+        ("/missing", 1, MEDIA.to_vec()),
+        ("/concurrent", 1, MEDIA.to_vec()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(expected as u64)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/companion"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(MOTION)
+                .insert_header("content-type", "video/quicktime"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let old_path = if failure.is_some() {
+        // The negative proof control is an unowned candidate at the requested
+        // name, not a foreign owner that the new identity policy would skip.
+        root.join("existing.JPG")
+    } else {
+        root.join("renamed-old_2.JPG")
+    };
     std::fs::write(&old_path, &old_bytes).unwrap();
     let old_mtime = std::fs::metadata(&old_path).unwrap().modified().unwrap();
     let db_path = dir.path().join("state.db");
@@ -96,25 +121,28 @@ async fn exercise(database: &'static str, failure: Option<&str>) {
         let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
             .await
             .unwrap();
-        let record = crate::test_helpers::TestAssetRecord::new("old-primary-master")
-            .library("PrimarySync")
-            .filename("existing.JPG")
-            .checksum(&checksum)
-            .size(provider_bytes.len() as u64)
-            .build();
-        db.upsert_seen(&record).await.unwrap();
-        let local = download::file::compute_sha256(&old_path).await.unwrap();
-        db.mark_verified_download(
-            "PrimarySync",
-            "old-primary-master",
-            "original",
-            &old_path,
-            &local,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
+        if failure.is_none() {
+            let record = crate::test_helpers::TestAssetRecord::new("old-primary-master")
+                .library("PrimarySync")
+                .filename("existing.JPG")
+                .checksum(&checksum)
+                .size(provider_bytes.len() as u64)
+                .build();
+            db.upsert_seen(&record).await.unwrap();
+            let local = download::file::compute_sha256(&old_path).await.unwrap();
+            let source = source_backed.then_some(local.as_str());
+            db.mark_verified_download(
+                "PrimarySync",
+                "old-primary-master",
+                "original",
+                &old_path,
+                &local,
+                source,
+                false,
+            )
+            .await
+            .unwrap();
+        }
         db.set_metadata(&format!("sync_token:{ZONE}"), OLD_TOKEN)
             .await
             .unwrap();
@@ -212,10 +240,7 @@ async fn exercise(database: &'static str, failure: Option<&str>) {
             old_mtime
         );
         assert_eq!(historical_rows(&db_path), original_rows);
-        assert!(
-            !root.join("existing.JPG").exists(),
-            "never download a duplicate"
-        );
+        let new_path = root.join("existing.JPG");
         assert_eq!(
             db.get_metadata(&format!("sync_token:{ZONE}"))
                 .await
@@ -229,10 +254,20 @@ async fn exercise(database: &'static str, failure: Option<&str>) {
                 && r.id.as_ref() == "asset-current-existing"
                 && r.version_size.as_str() == "original"
         });
+        let old = completed.iter().find(|r| {
+            r.library.as_ref() == "PrimarySync"
+                && r.id.as_ref() == "old-primary-master"
+                && r.version_size.as_str() == "original"
+        });
         if failure.is_some() {
             assert!(
                 current.is_none(),
                 "negative provider proof must not complete"
+            );
+            assert_eq!(
+                std::fs::read(&new_path).unwrap(),
+                old_bytes,
+                "negative provider proof must leave the occupied candidate unchanged"
             );
             let connection = rusqlite::Connection::open(&db_path).unwrap();
             let pending: i64 = connection.query_row(
@@ -243,10 +278,19 @@ async fn exercise(database: &'static str, failure: Option<&str>) {
                 "uncertainty must retain independently visible work"
             );
         } else {
-            assert_eq!(current.unwrap().local_path.as_ref(), Some(&old_path));
+            let current = current.unwrap();
+            assert_eq!(current.local_path.as_ref(), Some(&new_path));
+            assert_eq!(std::fs::read(&new_path).unwrap(), provider_bytes);
+            let new_local = download::file::compute_sha256(&new_path).await.unwrap();
+            assert_eq!(current.local_checksum.as_deref(), Some(new_local.as_str()));
+            assert_eq!(
+                old.unwrap().local_path.as_ref(),
+                Some(&old_path),
+                "foreign legacy owner path must remain unchanged"
+            );
             assert_eq!(result.failed_count, 0, "{result:?}");
             assert!(result.db_sync_token_advance_safe, "{result:?}");
-            assert_eq!(result.stats.downloaded, if cycle == 0 { 3 } else { 0 });
+            assert_eq!(result.stats.downloaded, if cycle == 0 { 4 } else { 0 });
             assert_eq!(
                 db.get_metadata(&token_key).await.unwrap().as_deref(),
                 Some(format!("v27-after-cycle-{}", cycle + 1).as_str())
@@ -284,18 +328,41 @@ async fn issue853_ambiguous_plain_path_stays_pending_across_reopens() {
 
 async fn exercise_issue853(failure: Option<&str>) {
     let database = "shared";
+    // The tail control is deliberately beyond the old 64KiB prefix limit.
+    let mut provider_bytes = MEDIA.to_vec();
+    provider_bytes.resize(provider_bytes.len().max(65_537), 42);
+    let mut checksum = signature(&provider_bytes);
+    if failure == Some("unsupported") {
+        let mut decoded = base64::engine::general_purpose::STANDARD
+            .decode(&checksum)
+            .unwrap();
+        decoded[0] = 4;
+        checksum = base64::engine::general_purpose::STANDARD.encode(decoded);
+    }
+    let mut selected_candidate_bytes = provider_bytes.clone();
+    if failure == Some("tail") {
+        *selected_candidate_bytes.last_mut().unwrap() ^= 1;
+    }
+    if failure == Some("edited") {
+        selected_candidate_bytes[32] ^= 1;
+    }
+    let existing_gets = usize::from(failure != Some("tail"));
     let server = crate::test_helpers::start_wiremock_or_skip("issue853 acceptance")
         .await
         .expect("acceptance server must bind");
-    for (endpoint, expected) in [("/existing", 0), ("/missing", 1), ("/concurrent", 1)] {
+    for (endpoint, expected, body) in [
+        ("/existing", existing_gets, provider_bytes.clone()),
+        ("/missing", 1, MEDIA.to_vec()),
+        ("/concurrent", 1, MEDIA.to_vec()),
+    ] {
         Mock::given(method("GET"))
             .and(path(endpoint))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_bytes(MEDIA)
+                    .set_body_bytes(body)
                     .insert_header("content-type", "image/jpeg"),
             )
-            .expect(expected)
+            .expect(expected as u64)
             .mount(&server)
             .await;
     }
@@ -306,7 +373,7 @@ async fn exercise_issue853(failure: Option<&str>) {
                 .set_body_bytes(MOTION)
                 .insert_header("content-type", "video/quicktime"),
         )
-        .expect(0)
+        .expect(1)
         .mount(&server)
         .await;
     let dir = tempfile::tempdir().unwrap();
@@ -315,6 +382,8 @@ async fn exercise_issue853(failure: Option<&str>) {
     let old_path = root.join("existing.JPG");
     let motion_path = root.join("existing.MOV");
     let sidecar_path = root.join("existing.JPG.xmp");
+    let selected_own_still = root.join("existing_YXNzZXQ.JPG");
+    let selected_own_motion = root.join("existing_YXNzZXQ.MOV");
     std::fs::write(&motion_path, MOTION).unwrap();
     std::fs::write(&sidecar_path, b"historical sidecar evidence").unwrap();
     let motion_mtime = std::fs::metadata(&motion_path).unwrap().modified().unwrap();
@@ -322,30 +391,26 @@ async fn exercise_issue853(failure: Option<&str>) {
         .unwrap()
         .modified()
         .unwrap();
-    // The tail control is deliberately beyond the old 64KiB prefix limit.
-    let mut provider_bytes = MEDIA.to_vec();
-    provider_bytes.resize(provider_bytes.len().max(65_537), 42);
-    let mut old_bytes = provider_bytes.clone();
-    if failure == Some("tail") {
-        *old_bytes.last_mut().unwrap() ^= 1;
-    }
-    if failure == Some("edited") {
-        old_bytes[32] ^= 1;
-    }
-    let mut checksum = signature(&provider_bytes);
-    if failure == Some("unsupported") {
-        let mut decoded = base64::engine::general_purpose::STANDARD
-            .decode(&checksum)
-            .unwrap();
-        decoded[0] = 4;
-        checksum = base64::engine::general_purpose::STANDARD.encode(decoded);
-    }
+    let old_bytes = provider_bytes.clone();
     std::fs::write(&old_path, &old_bytes).unwrap();
+    if failure == Some("tail") {
+        std::fs::write(&selected_own_still, &selected_candidate_bytes).unwrap();
+    }
     let foreign_path = root.join("foreign-shared.JPG");
     if failure == Some("foreign") {
         std::fs::write(&foreign_path, &provider_bytes).unwrap();
     }
     let old_mtime = std::fs::metadata(&old_path).unwrap().modified().unwrap();
+    let selected_candidate_mtime = if failure == Some("tail") {
+        Some(
+            std::fs::metadata(&selected_own_still)
+                .unwrap()
+                .modified()
+                .unwrap(),
+        )
+    } else {
+        None
+    };
     let db_path = dir.path().join("state.db");
     {
         let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
@@ -617,6 +682,15 @@ async fn exercise_issue853(failure: Option<&str>) {
                 "existing.JPG.xmp".to_owned(),
                 b"historical sidecar evidence".to_vec(),
             ),
+            (
+                "existing_YXNzZXQ.JPG".to_owned(),
+                if failure == Some("tail") {
+                    selected_candidate_bytes.clone()
+                } else {
+                    provider_bytes.clone()
+                },
+            ),
+            ("existing_YXNzZXQ.MOV".to_owned(), MOTION.to_vec()),
             ("missing_YXNzZXQ.JPG".to_owned(), MEDIA.to_vec()),
             ("concurrent_YXNzZXQ.JPG".to_owned(), MEDIA.to_vec()),
         ]);
@@ -676,7 +750,7 @@ async fn exercise_issue853(failure: Option<&str>) {
             &connection,
             "SELECT * FROM provider_active_destinations ORDER BY generation,pass_key,child,version_size,path",
         );
-        assert_eq!(receipts.len(), if failure == Some("tail") { 2 } else { 4 });
+        assert_eq!(receipts.len(), if failure == Some("tail") { 3 } else { 4 });
         assert_eq!(
             destinations.len(),
             if failure == Some("tail") { 6 } else { 4 }
@@ -706,49 +780,60 @@ async fn exercise_issue853(failure: Option<&str>) {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        if failure == Some("tail") {
-            assert!(
-                selected_receipts.is_empty(),
-                "ambiguous pair must not obtain compact completion"
+        let expected_selected_receipts: Vec<(&str, &std::path::Path, &[u8], String)> =
+            if failure == Some("tail") {
+                vec![(
+                    "live_original",
+                    &selected_own_motion,
+                    MOTION,
+                    signature(MOTION),
+                )]
+            } else {
+                vec![
+                    (
+                        "live_original",
+                        &selected_own_motion,
+                        MOTION,
+                        signature(MOTION),
+                    ),
+                    (
+                        "original",
+                        &selected_own_still,
+                        provider_bytes.as_slice(),
+                        checksum.clone(),
+                    ),
+                ]
+            };
+        assert_eq!(selected_receipts.len(), expected_selected_receipts.len());
+        for (row, (version, path, content, provider)) in
+            selected_receipts.iter().zip(expected_selected_receipts)
+        {
+            let digest = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(content));
+            let native = crate::state::db::provider_selection::SelectionPath::from_path(path)
+                .key()
+                .unwrap();
+            let expected = vec![
+                SqlValue::Text(account_key.into()),
+                SqlValue::Text(provider_key.into()),
+                SqlValue::Text(expected_scope.clone()),
+                SqlValue::Text(ZONE.into()),
+                SqlValue::Text("asset-current-existing".into()),
+                SqlValue::Text("current-existing".into()),
+                SqlValue::Text("asset-current-existing".into()),
+                SqlValue::Text(expected_pass.clone()),
+                SqlValue::Text(version.into()),
+                SqlValue::Text(provider),
+                SqlValue::Integer(i64::try_from(content.len()).unwrap()),
+                SqlValue::Text(native),
+                SqlValue::Text(digest.clone()),
+                SqlValue::Text(digest),
+            ];
+            assert_eq!(
+                &row[..14],
+                expected.as_slice(),
+                "incorrect scoped current receipt"
             );
-        } else {
-            assert_eq!(selected_receipts.len(), 2);
-            for (row, (version, path, content, provider)) in selected_receipts.iter().zip([
-                ("live_original", &motion_path, MOTION, signature(MOTION)),
-                (
-                    "original",
-                    &old_path,
-                    provider_bytes.as_slice(),
-                    checksum.clone(),
-                ),
-            ]) {
-                let digest = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(content));
-                let native = crate::state::db::provider_selection::SelectionPath::from_path(path)
-                    .key()
-                    .unwrap();
-                let expected = vec![
-                    SqlValue::Text(account_key.into()),
-                    SqlValue::Text(provider_key.into()),
-                    SqlValue::Text(expected_scope.clone()),
-                    SqlValue::Text(ZONE.into()),
-                    SqlValue::Text("asset-current-existing".into()),
-                    SqlValue::Text("current-existing".into()),
-                    SqlValue::Text("asset-current-existing".into()),
-                    SqlValue::Text(expected_pass.clone()),
-                    SqlValue::Text(version.into()),
-                    SqlValue::Text(provider),
-                    SqlValue::Integer(i64::try_from(content.len()).unwrap()),
-                    SqlValue::Text(native),
-                    SqlValue::Text(digest.clone()),
-                    SqlValue::Text(digest),
-                ];
-                assert_eq!(
-                    &row[..14],
-                    expected.as_slice(),
-                    "incorrect scoped current receipt"
-                );
-                assert!(matches!(&row[14], SqlValue::Text(proof) if proof.len() == 64));
-            }
+            assert!(matches!(&row[14], SqlValue::Text(proof) if proof.len() == 64));
         }
         let mut stmt = connection.prepare(
             "SELECT DISTINCT version_size,path,checksum,admitted,verified_media,source_checksum,local_checksum FROM provider_active_destinations WHERE library=?1 AND child=?2 ORDER BY version_size"
@@ -770,11 +855,10 @@ async fn exercise_issue853(failure: Option<&str>) {
         let motion_hash = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(MOTION));
         let still_hash = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(&provider_bytes));
         let pending = failure == Some("tail");
-        let pending_path = root.join("existing_YXNzZXQ.JPG");
         let expected_destinations = vec![
             vec![
                 SqlValue::Text("live_original".into()),
-                SqlValue::Text(native(&motion_path)),
+                SqlValue::Text(native(&selected_own_motion)),
                 SqlValue::Text(signature(MOTION)),
                 SqlValue::Integer(1),
                 SqlValue::Integer(1),
@@ -783,7 +867,7 @@ async fn exercise_issue853(failure: Option<&str>) {
             ],
             vec![
                 SqlValue::Text("original".into()),
-                SqlValue::Text(native(if pending { &pending_path } else { &old_path })),
+                SqlValue::Text(native(&selected_own_still)),
                 SqlValue::Text(checksum.clone()),
                 SqlValue::Integer(1),
                 SqlValue::Integer(i64::from(!pending)),
@@ -831,13 +915,26 @@ async fn exercise_issue853(failure: Option<&str>) {
                     .expect("selected Shared child must complete")
                     .local_path
                     .as_ref(),
-                Some(&old_path),
-                "the selected child must use the independently proven Primary path"
+                Some(&selected_own_still),
+                "the selected child must materialize its own Shared identity path"
             );
         } else if failure.is_some() {
             assert!(
                 current.is_none(),
                 "negative provider proof must not complete"
+            );
+            assert_eq!(
+                std::fs::read(&selected_own_still).unwrap(),
+                selected_candidate_bytes,
+                "negative proof must not overwrite the unowned candidate"
+            );
+            assert_eq!(
+                std::fs::metadata(&selected_own_still)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                selected_candidate_mtime.unwrap(),
+                "negative proof must not rewrite the unowned candidate"
             );
             let connection = rusqlite::Connection::open(&db_path).unwrap();
             let pending: i64 = connection.query_row(
@@ -847,8 +944,12 @@ async fn exercise_issue853(failure: Option<&str>) {
                 pending, 1,
                 "uncertainty must retain independently visible work"
             );
+            assert_eq!(result.stats.downloaded, if cycle == 0 { 3 } else { 0 });
         } else {
-            assert_eq!(current.unwrap().local_path.as_ref(), Some(&old_path));
+            assert_eq!(
+                current.unwrap().local_path.as_ref(),
+                Some(&selected_own_still)
+            );
             let motion = completed
                 .iter()
                 .find(|r| {
@@ -857,10 +958,10 @@ async fn exercise_issue853(failure: Option<&str>) {
                         && r.version_size.as_str() == "live_original"
                 })
                 .unwrap();
-            assert_eq!(motion.local_path.as_ref(), Some(&motion_path));
+            assert_eq!(motion.local_path.as_ref(), Some(&selected_own_motion));
             assert_eq!(result.failed_count, 0, "{result:?}");
             assert!(result.db_sync_token_advance_safe, "{result:?}");
-            assert_eq!(result.stats.downloaded, if cycle == 0 { 2 } else { 0 });
+            assert_eq!(result.stats.downloaded, if cycle == 0 { 4 } else { 0 });
             assert_eq!(
                 db.get_metadata(&token_key).await.unwrap().as_deref(),
                 Some(format!("v27-after-cycle-{}", cycle + 1).as_str())
@@ -885,10 +986,10 @@ async fn exercise_issue853(failure: Option<&str>) {
                 count("/missing"),
                 count("/concurrent")
             ),
-            (0, 0, 1, 1)
+            (existing_gets, 1, 1, 1)
         );
         eprintln!(
-            "ISSUE853_REACHED scenario={failure:?} cycle={cycle} selected_receipts={} active_destinations={} media_files={} existing_gets=0 companion_gets=0 independent_gets=2",
+            "ISSUE853_REACHED scenario={failure:?} cycle={cycle} selected_receipts={} active_destinations={} media_files={} existing_gets={existing_gets} companion_gets=1 independent_gets=2",
             selected_receipts.len(),
             destinations.len(),
             actual_tree.len()
@@ -981,4 +1082,615 @@ async fn issue853_wrong_account_cannot_use_owned_historical_state() {
         mtime
     );
     eprintln!("ISSUE853_REACHED account_wrong_and_unbound_refused");
+}
+
+fn owner_rows(path: &std::path::Path, id: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let mut rows = Vec::new();
+    for table in ["assets", "asset_metadata_paths"] {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT * FROM {table} WHERE library=?1 AND id=?2 ORDER BY version_size"
+            ))
+            .unwrap();
+        let count = stmt.column_count();
+        rows.extend(
+            stmt.query_map([ZONE, id], |row| {
+                (0..count)
+                    .map(|i| row.get(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap(),
+        );
+    }
+    rows
+}
+
+fn legacy_claim_count(path: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM legacy_master_state_owners \
+             WHERE library=?1 AND master_record_name='old-master' \
+               AND asset_record_name='asset-current-child'",
+            [ZONE],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+async fn mount_issue853_jpeg(server: &wiremock::MockServer, route: &str, expected: u64) {
+    Mock::given(method("GET"))
+        .and(path(route))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(MEDIA)
+                .insert_header("content-type", "image/jpeg"),
+        )
+        .expect(expected)
+        .mount(server)
+        .await;
+}
+
+async fn run_issue853_cycle(
+    database: &'static str,
+    root: &std::path::Path,
+    db_path: &std::path::Path,
+    inventory: Vec<serde_json::Value>,
+    concurrent: Vec<serde_json::Value>,
+    cycle: usize,
+) -> (crate::sync_cycle::CycleResult, BaselineSession) {
+    let db = Arc::new(
+        SqliteStateDb::open_owned(db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let session = BaselineSession {
+        database,
+        cycle,
+        inventory: Arc::new(inventory),
+        concurrent: Arc::new(concurrent),
+        incremental_addition: Arc::new(Vec::new()),
+        requests: Arc::new(Mutex::new(Vec::new())),
+        inventory_queries: Arc::new(AtomicUsize::new(0)),
+        inventory_starts: Arc::new(AtomicUsize::new(0)),
+        boundaries: Arc::new(AtomicUsize::new(0)),
+        changes: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut library = PhotoLibrary::new(
+        format!("https://synthetic.example/database/1/photos/production/{database}"),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(session.clone()),
+        Arc::new(zone()),
+        database.into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        baseline_owner(),
+        "com",
+    ));
+    let passes = vec![AlbumPass {
+        kind: PassKind::Unfiled,
+        album: library.all(),
+        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+    }];
+    let token_key = sync_token_key(ZONE);
+    let mut selected = make_run_cycle_library_state_with_passes(ZONE, &token_key, passes);
+    selected.library = library;
+    let base = make_run_cycle_download_config_builder(root, db.clone());
+    let builder = |mode, exclude, groups, zone| {
+        let mut config = (*base(mode, exclude, groups, zone)).clone();
+        config.folder_structure = "none".into();
+        Arc::new(config)
+    };
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let result = run_cycle(
+        &[&selected],
+        &make_run_cycle_config(),
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        &shared,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    (result, session)
+}
+
+#[tokio::test]
+async fn issue853_existing_file_m_to_a_reuses_without_download() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(true, issue853_existing_file_m_to_a_case())
+        .await;
+}
+
+async fn issue853_existing_file_m_to_a_case() {
+    let server = crate::test_helpers::start_wiremock_or_skip("issue853 m-to-a reuse")
+        .await
+        .expect("acceptance server must bind");
+    mount_issue853_jpeg(&server, "/reuse", 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("reuse.JPG");
+    std::fs::write(&path, MEDIA).unwrap();
+    let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let checksum = generation(1);
+    let digest = download::file::compute_sha256(&path).await.unwrap();
+    let db_path = dir.path().join("state.db");
+    {
+        let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        db.upsert_seen(
+            &crate::test_helpers::TestAssetRecord::new("old-master")
+                .library(ZONE)
+                .filename("reuse.JPG")
+                .checksum(&checksum)
+                .size(MEDIA.len() as u64)
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.mark_verified_download(
+            ZONE,
+            "old-master",
+            "original",
+            &path,
+            &digest,
+            Some(&digest),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.claim_legacy_master_state_owner(ZONE, "old-master", "asset-current-child")
+                .await
+                .unwrap()
+        );
+        db.set_metadata(&format!("sync_token:{ZONE}"), OLD_TOKEN)
+            .await
+            .unwrap();
+    }
+    let old_rows = owner_rows(&db_path, "old-master");
+    let inventory = pair(
+        "current-child",
+        "reuse.JPG",
+        &format!("{}/reuse", server.uri()),
+        1,
+    );
+    let (result, _) =
+        run_issue853_cycle("shared", &root, &db_path, inventory.clone(), Vec::new(), 0).await;
+    assert_eq!(result.failed_count, 0, "{result:?}");
+    assert_eq!(result.stats.downloaded, 0);
+    {
+        let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        let completed = db.get_downloaded_page(0, 100).await.unwrap();
+        let current = completed
+            .iter()
+            .find(|row| {
+                row.library.as_ref() == ZONE
+                    && row.id.as_ref() == "asset-current-child"
+                    && row.version_size.as_str() == "original"
+            })
+            .unwrap();
+        assert_eq!(current.local_path.as_ref(), Some(&path));
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    assert_eq!(owner_rows(&db_path, "old-master"), old_rows);
+    assert_eq!(legacy_claim_count(&db_path), 1);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "GET" && request.url.path() == "/reuse")
+            .count(),
+        0
+    );
+    {
+        let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        db.set_metadata(&sync_token_key(ZONE), "v27-after-cycle-1")
+            .await
+            .unwrap();
+    }
+    let (quiet, _) = run_issue853_cycle("shared", &root, &db_path, inventory, Vec::new(), 1).await;
+    assert_eq!(quiet.failed_count, 0, "{quiet:?}");
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn issue853_lazy_claim_existing_file_m_to_a_reuses_on_first_cycle() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(true, issue853_lazy_claim_existing_file_m_to_a_case())
+        .await;
+}
+
+async fn issue853_lazy_claim_existing_file_m_to_a_case() {
+    let server = crate::test_helpers::start_wiremock_or_skip("issue853 lazy m-to-a reuse")
+        .await
+        .expect("acceptance server must bind");
+    mount_issue853_jpeg(&server, "/reuse", 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("reuse.JPG");
+    std::fs::write(&path, MEDIA).unwrap();
+    let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let checksum = generation(1);
+    let digest = download::file::compute_sha256(&path).await.unwrap();
+    let db_path = dir.path().join("state.db");
+    {
+        let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        db.upsert_seen(
+            &crate::test_helpers::TestAssetRecord::new("old-master")
+                .library(ZONE)
+                .filename("reuse.JPG")
+                .checksum(&checksum)
+                .size(MEDIA.len() as u64)
+                .added_at(chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap())
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.mark_verified_download(
+            ZONE,
+            "old-master",
+            "original",
+            &path,
+            &digest,
+            Some(&digest),
+            false,
+        )
+        .await
+        .unwrap();
+        db.set_metadata(&format!("sync_token:{ZONE}"), OLD_TOKEN)
+            .await
+            .unwrap();
+    }
+    assert_eq!(legacy_claim_count(&db_path), 0);
+    let mut inventory = pair(
+        "old-master",
+        "reuse.JPG",
+        &format!("{}/reuse", server.uri()),
+        1,
+    );
+    inventory[1]["recordName"] = json!("asset-current-child");
+    let (result, _) =
+        run_issue853_cycle("shared", &root, &db_path, inventory.clone(), Vec::new(), 0).await;
+    assert_eq!(legacy_claim_count(&db_path), 1);
+    assert_eq!(result.failed_count, 0, "{result:?}");
+    assert_eq!(result.stats.downloaded, 0);
+    {
+        let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        let completed = db.get_downloaded_page(0, 100).await.unwrap();
+        if let Some(current) = completed.iter().find(|row| {
+            row.library.as_ref() == ZONE
+                && row.id.as_ref() == "asset-current-child"
+                && row.version_size.as_str() == "original"
+        }) {
+            assert_eq!(
+                current.local_path.as_ref(),
+                Some(&path),
+                "selected child must reuse the logical M path"
+            );
+            assert_eq!(current.local_checksum.as_deref(), Some(digest.as_str()));
+        }
+        let old = completed
+            .iter()
+            .find(|row| {
+                row.library.as_ref() == ZONE
+                    && row.id.as_ref() == "old-master"
+                    && row.version_size.as_str() == "original"
+            })
+            .expect("completed legacy owner must remain downloaded");
+        assert_eq!(old.local_path.as_ref(), Some(&path));
+        assert_eq!(old.local_checksum.as_deref(), Some(digest.as_str()));
+        assert_eq!(&*old.checksum, checksum.as_str());
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    let after_first = owner_rows(&db_path, "old-master");
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "GET" && request.url.path() == "/reuse")
+            .count(),
+        0
+    );
+    {
+        let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        db.set_metadata(&sync_token_key(ZONE), "v27-after-cycle-1")
+            .await
+            .unwrap();
+    }
+    let (quiet, _) = run_issue853_cycle("shared", &root, &db_path, inventory, Vec::new(), 1).await;
+    assert_eq!(quiet.failed_count, 0, "{quiet:?}");
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(legacy_claim_count(&db_path), 1);
+    assert_eq!(owner_rows(&db_path, "old-master"), after_first);
+    assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn issue853_mixed_owner_completion_publishes_safe_sibling_and_reopens() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(true, issue853_mixed_owner_completion_case())
+        .await;
+}
+
+async fn issue853_mixed_owner_completion_case() {
+    use crate::state::{
+        ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
+        ReconciliationStateStore, VersionSizeKey,
+    };
+
+    let server = crate::test_helpers::start_wiremock_or_skip("issue853 mixed completion")
+        .await
+        .expect("acceptance server must bind");
+    mount_issue853_jpeg(&server, "/mixed", 1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("mixed.JPG");
+    std::fs::write(&path, MEDIA).unwrap();
+    let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let checksum = generation(1);
+    let digest = download::file::compute_sha256(&path).await.unwrap();
+    let db_path = dir.path().join("state.db");
+    {
+        let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        db.upsert_seen(
+            &crate::test_helpers::TestAssetRecord::new("old-master")
+                .library(ZONE)
+                .filename("mixed.JPG")
+                .checksum(&checksum)
+                .size(MEDIA.len() as u64)
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.mark_verified_download(
+            ZONE,
+            "old-master",
+            "original",
+            &path,
+            &digest,
+            Some(&digest),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.claim_legacy_master_state_owner(ZONE, "old-master", "asset-current-child")
+                .await
+                .unwrap()
+        );
+        let key = crate::fs_util::confined_path_key(&path).unwrap();
+        db.reserve_reconciliation_paths(
+            &[ReconciliationReservation {
+                content: Some(ReconciliationContent {
+                    checksum: checksum.clone().into_boxed_str(),
+                    size: MEDIA.len() as u64,
+                }),
+                library: ZONE.into(),
+                asset_id: "foreign".into(),
+                version_size: VersionSizeKey::Original,
+                requested_path_key: ReconciliationPathKey(key.clone()),
+                destination_path_key: ReconciliationPathKey(key),
+                destination_path: path.clone(),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+        db.set_metadata(&format!("sync_token:{ZONE}"), OLD_TOKEN)
+            .await
+            .unwrap();
+    }
+    let old_rows = owner_rows(&db_path, "old-master");
+    let inventory = pair(
+        "current-child",
+        "mixed.JPG",
+        &format!("{}/mixed", server.uri()),
+        1,
+    );
+    let (result, _) =
+        run_issue853_cycle("shared", &root, &db_path, inventory.clone(), Vec::new(), 0).await;
+    assert_eq!(result.failed_count, 0, "{result:?}");
+    assert_eq!(result.stats.downloaded, 1);
+    let safe = {
+        let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        let completed = db.get_downloaded_page(0, 100).await.unwrap();
+        let current = completed
+            .iter()
+            .find(|row| {
+                row.library.as_ref() == ZONE
+                    && row.id.as_ref() == "asset-current-child"
+                    && row.version_size.as_str() == "original"
+            })
+            .expect("selected child must complete");
+        let safe = current.local_path.as_ref().unwrap().clone();
+        assert_ne!(safe, path);
+        let reservations = db.get_reconciliation_reservations().await.unwrap();
+        assert!(reservations.iter().any(|reservation| {
+            reservation.asset_id.as_ref() == "foreign" && reservation.destination_path == path
+        }));
+        safe
+    };
+    assert_eq!(std::fs::read(&safe).unwrap(), MEDIA);
+    assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    assert_eq!(owner_rows(&db_path, "old-master"), old_rows);
+    assert_eq!(legacy_claim_count(&db_path), 1);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "GET" && request.url.path() == "/mixed")
+            .count(),
+        1
+    );
+    {
+        let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        db.set_metadata(&sync_token_key(ZONE), "v27-after-cycle-1")
+            .await
+            .unwrap();
+    }
+    let (quiet, _) = run_issue853_cycle("shared", &root, &db_path, inventory, Vec::new(), 1).await;
+    assert_eq!(quiet.failed_count, 0, "{quiet:?}");
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(std::fs::read(&safe).unwrap(), MEDIA);
+    assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn issue853_proven_reservation_missing_file_completes_at_retained_path() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(true, issue853_proven_reservation_missing_case())
+        .await;
+}
+
+async fn issue853_proven_reservation_missing_case() {
+    use crate::state::{
+        ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
+        ReconciliationStateStore, VersionSizeKey,
+    };
+
+    let server = crate::test_helpers::start_wiremock_or_skip("issue853 reservation completion")
+        .await
+        .expect("acceptance server must bind");
+    mount_issue853_jpeg(&server, "/reserved", 1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("reserved.JPG");
+    let checksum = generation(1);
+    let db_path = dir.path().join("state.db");
+    {
+        let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        assert!(
+            db.claim_legacy_master_state_owner(ZONE, "old-master", "asset-current-child")
+                .await
+                .unwrap()
+        );
+        let key = crate::fs_util::confined_path_key(&path).unwrap();
+        db.reserve_reconciliation_paths(
+            &[ReconciliationReservation {
+                content: Some(ReconciliationContent {
+                    checksum: checksum.clone().into_boxed_str(),
+                    size: MEDIA.len() as u64,
+                }),
+                library: ZONE.into(),
+                asset_id: "old-master".into(),
+                version_size: VersionSizeKey::Original,
+                requested_path_key: ReconciliationPathKey(key.clone()),
+                destination_path_key: ReconciliationPathKey(key),
+                destination_path: path.clone(),
+            }],
+            Some("asset-current-child"),
+        )
+        .await
+        .unwrap();
+        db.set_metadata(&format!("sync_token:{ZONE}"), OLD_TOKEN)
+            .await
+            .unwrap();
+    }
+    let old_rows = owner_rows(&db_path, "old-master");
+    let inventory = pair(
+        "current-child",
+        "reserved.JPG",
+        &format!("{}/reserved", server.uri()),
+        1,
+    );
+    let (result, _) =
+        run_issue853_cycle("shared", &root, &db_path, inventory.clone(), Vec::new(), 0).await;
+    assert_eq!(result.failed_count, 0, "{result:?}");
+    assert_eq!(result.stats.downloaded, 1);
+    assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+    {
+        let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        let completed = db.get_downloaded_page(0, 100).await.unwrap();
+        let current = completed
+            .iter()
+            .find(|row| {
+                row.library.as_ref() == ZONE
+                    && row.id.as_ref() == "asset-current-child"
+                    && row.version_size.as_str() == "original"
+            })
+            .expect("selected child must complete");
+        assert_eq!(current.local_path.as_ref(), Some(&path));
+        assert!(
+            !root.join("reserved_YXNzZXQ.JPG").exists(),
+            "canonical reservation must not spill to a sibling"
+        );
+        assert_eq!(owner_rows(&db_path, "old-master"), old_rows);
+        let reservations = db.get_reconciliation_reservations().await.unwrap();
+        assert!(
+            reservations
+                .iter()
+                .all(|reservation| reservation.asset_id.as_ref() != "asset-current-child"),
+            "no unnecessary A reservation row"
+        );
+        if let Some(reservation) = reservations
+            .iter()
+            .find(|reservation| reservation.asset_id.as_ref() == "old-master")
+        {
+            assert_eq!(reservation.destination_path, path);
+        }
+    }
+    {
+        let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap();
+        db.set_metadata(&sync_token_key(ZONE), "v27-after-cycle-1")
+            .await
+            .unwrap();
+    }
+    let (quiet, _) = run_issue853_cycle("shared", &root, &db_path, inventory, Vec::new(), 1).await;
+    assert_eq!(quiet.failed_count, 0, "{quiet:?}");
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(std::fs::read(&path).unwrap(), MEDIA);
+    server.verify().await;
 }

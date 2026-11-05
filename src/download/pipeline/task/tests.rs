@@ -250,6 +250,7 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
         replacement_fingerprint: None,
         publication_binding: None,
         pending_cross_parent_root: None,
+        superseded_requested_path: None,
         checksum: base64::engine::general_purpose::STANDARD
             .encode([checksum_byte; 32])
             .into(),
@@ -537,6 +538,7 @@ async fn unscoped_publication_proof_survives_finalization_and_other_transfer_int
         replacement_fingerprint: None,
         publication_binding: None,
         pending_cross_parent_root: None,
+        superseded_requested_path: None,
         checksum: base64::engine::general_purpose::STANDARD
             .encode([checksum_byte; 32])
             .into(),

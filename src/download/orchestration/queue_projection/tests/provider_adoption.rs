@@ -216,6 +216,7 @@ async fn assert_provider_adoption_interruption(
         .adopt_provider_signature(
             &record,
             &receipt,
+            task.asset_record_name.as_ref(),
             Box::new(move || {
                 if fault == "callback" {
                     return Err(StateError::ProviderSelectionInvalid);
@@ -285,6 +286,7 @@ async fn assert_provider_adoption_interruption(
     db.adopt_provider_signature(
         &record,
         &receipt,
+        task.asset_record_name.as_ref(),
         Box::new(move || {
             if file.fingerprint.size == 4
                 && matches!(file.matches_provider_v1_blocking(&expected), Ok(Some(true)))

@@ -258,6 +258,15 @@ async fn seed_pending_retry_with_recorded_path(
     db.upsert_asset_master_mapping("PrimarySync", asset.asset_record_name(), asset.state_id())
         .await
         .expect("seed asset/master mapping");
+    assert!(
+        db.claim_legacy_master_state_owner(
+            "PrimarySync",
+            asset.state_id(),
+            asset.asset_record_name(),
+        )
+        .await
+        .expect("claim logical retry owner")
+    );
 }
 
 #[tokio::test]
@@ -711,6 +720,15 @@ async fn approved_truncated_reconcile_retry_replaces_the_recorded_path() {
     db.upsert_asset_master_mapping("PrimarySync", "asset-FAILED_WITH_PATH", "FAILED_WITH_PATH")
         .await
         .expect("seed asset/master mapping");
+    assert!(
+        db.claim_legacy_master_state_owner(
+            "PrimarySync",
+            "FAILED_WITH_PATH",
+            "asset-FAILED_WITH_PATH",
+        )
+        .await
+        .expect("claim logical retry owner")
+    );
 
     let download_url = format!("{}/photo.jpg", server.uri());
     let mut records = incremental_photo_records_with_url(
@@ -1435,25 +1453,28 @@ async fn same_size_provider_change_retry_does_not_adopt_stale_recorded_path() {
                 ReconciliationStateStore,
             };
             let other = dir.path().join("media/other/changed.jpg");
-            db.reserve_reconciliation_paths(&[ReconciliationReservation {
-                library: "PrimarySync".into(),
-                asset_id: "asset-SAME_SIZE_CHANGED".into(),
-                version_size: VersionSizeKey::Original,
-                requested_path_key: ReconciliationPathKey(
-                    crate::fs_util::confined_path_key(
-                        &dir.path().join("media/other-request/changed.jpg"),
-                    )
-                    .unwrap(),
-                ),
-                destination_path_key: ReconciliationPathKey(
-                    crate::fs_util::confined_path_key(&other).unwrap(),
-                ),
-                destination_path: other,
-                content: Some(ReconciliationContent {
-                    checksum: new_checksum.clone().into_boxed_str(),
-                    size: new_body.len() as u64,
-                }),
-            }])
+            db.reserve_reconciliation_paths(
+                &[ReconciliationReservation {
+                    library: "PrimarySync".into(),
+                    asset_id: "asset-SAME_SIZE_CHANGED".into(),
+                    version_size: VersionSizeKey::Original,
+                    requested_path_key: ReconciliationPathKey(
+                        crate::fs_util::confined_path_key(
+                            &dir.path().join("media/other-request/changed.jpg"),
+                        )
+                        .unwrap(),
+                    ),
+                    destination_path_key: ReconciliationPathKey(
+                        crate::fs_util::confined_path_key(&other).unwrap(),
+                    ),
+                    destination_path: other,
+                    content: Some(ReconciliationContent {
+                        checksum: new_checksum.clone().into_boxed_str(),
+                        size: new_body.len() as u64,
+                    }),
+                }],
+                None,
+            )
             .await
             .unwrap();
             config.folder_structure = "future-template".into();

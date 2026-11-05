@@ -67,7 +67,7 @@ async fn import_adopt_respects_reservation_ownership() {
             if legacy {
                 reservation.content = None;
             }
-            db.reserve_reconciliation_paths(std::slice::from_ref(&reservation))
+            db.reserve_reconciliation_paths(std::slice::from_ref(&reservation), None)
                 .await
                 .unwrap();
             let allowed = index == 0 && !legacy;

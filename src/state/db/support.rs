@@ -25,7 +25,7 @@ pub(crate) fn collect(directory: &Path, username: &str, realm: &str) -> Value {
     if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
         return json!({"status": "live_wal_snapshot_unavailable", "wal_present": true,
             "snapshot": "not_collected", "next_action": "stop_the_sync_process_cleanly_then_export_again_without_a_new_sync",
-            "runtime_counts": "see_retained_cycle_stats"});
+            "runtime_counts": "see_health_and_state_snapshot"});
     }
     let Ok(mut uri) = url::Url::from_file_path(&path) else {
         return json!({"status": "unavailable"});

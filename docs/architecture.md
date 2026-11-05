@@ -42,7 +42,8 @@ match their headings, so searching a label finds the section.
 ### Wrong-layer traps
 
 - `src/commands/service.rs` plans provider libraries and collection passes.
-  Platform service installation and execution belong in `src/service/`.
+  Service execution and status belong in `src/service/`; service registration
+  belongs to the host supervisor.
 - `src/selection.rs` parses selectors. Live collection lookup and pass planning
   belong in `src/commands/service.rs`; path rendering cannot resolve them.
 - `src/sync_loop/precheck.rs` handles the database change pre-check. Zone
@@ -115,7 +116,7 @@ match their headings, so searching a label finds the section.
 | File platform primitives | `src/download/file/platform.rs` | Owns platform rename, exchange, hard-link, and directory durability operations. |
 | Linux replacement recovery | `src/download/file/replacement_recovery.rs` | Journals conditional replacement when atomic exchange is unsupported, and recovers interrupted publication without overwriting concurrent edits. |
 | Staging identity | `src/download/file/staging.rs` | Coordinates destination guards, versioned staging names, and cleanup leases so retries and collisions keep independent staging files. |
-| Managed layout file handover | `src/download/file/primary_layout.rs` | Snapshots layout fingerprints, copies verified members, publishes, recovers prepared links, and retires aliases for a confined managed layout. Transition policy stays in `src/download/orchestration/primary_layout.rs`. |
+| Managed layout file handover | `src/download/file/primary_layout.rs` | Snapshots layout fingerprints, copies verified members, publishes, recovers prepared links, and retires aliases for a confined managed layout. New downloads use ordinary naming; recorded schema-35 operations recover through `src/download/orchestration/primary_layout.rs`. |
 | State finalization | `src/download/finalize.rs` | Persists downloaded or failed outcomes and retries deferred state writes. |
 | Sparse identity retries | `src/download/orchestration/delta/sparse_identity.rs`, `src/state/db/sparse_identity.rs` | Selects bounded source retries and persists generation-fenced evidence; the cycle owner retains checkpoint authority. Current observations without a master reference use source lookup rather than historical mappings. Omitted hints do not bypass saved retry deadlines. |
 | Durable retry resolution | `src/download/retry.rs` | Revalidates pending provider identity and builds exact retry tasks. |
@@ -162,8 +163,8 @@ match their headings, so searching a label finds the section.
 | Legacy preservation evidence | `src/state/db/legacy_preservation.rs` | Stores immutable legacy evidence and generation-fenced current-coverage receipts. It never assigns identity, writes files, or infers provider completion. |
 | State reports | `src/state/db/reports.rs` | Reads status, verification and manifest data, and records sync-run history. |
 | Import-existing | `src/commands/import.rs` | Matches existing files to expected iCloud paths and adopts verified files into state. |
-| Service integration | `src/service/` | Owns install, uninstall, status, service execution, and platform renderers. |
-| Support evidence | `src/support/`, `src/state/db/support.rs` | Allowlisted bounded runtime history and strictly offline immutable collection; see [support export](support-export.md). |
+| Service integration | `src/service/` | Owns status, service execution, and the Windows SCM runtime adapter. Host supervisors own registration. |
+| Support evidence | `src/support/`, `src/state/db/support.rs` | Redacted one-shot current-state snapshot and strictly offline immutable collection; no normal-operation recorder. See [support export](support-export.md). |
 | Operator surfaces | `src/commands/status.rs`, `src/commands/doctor.rs`, `src/commands/manifest.rs` | Read local state for status, redacted diagnostics, and catalog export. |
 | Reports and monitoring | `src/cycle_reporter.rs`, `src/report.rs`, `src/health.rs`, `src/metrics.rs`, `src/notifications.rs` | Converts cycle facts into reports, health, metrics, and notifications. |
 
@@ -182,7 +183,7 @@ and changes do not call sibling owners. The facade retains stream routing and
 public entry points. No album child owns durable checkpoint policy.
 
 Targeted lookup rejections retain fixed `master_status` and `child_status`
-response categories in bounded support history. These distinguish omitted,
+response categories in redacted support diagnostics. These distinguish omitted,
 not-requested, returned, tombstoned and provider-error members without storing
 raw codes, messages or identifiers. `returned` describes response presence,
 not owner, identity, resource or checkpoint proof. Lookup resolution and
@@ -416,8 +417,29 @@ require preservation before their mutable-row guards can be retired. Aggregate
 cross-zone routing and complete selection coverage remain under validation.
 
 Existing-file matching keeps current provider identity separate from content
-equivalence. A historical source deletion does not invalidate a content receipt; current
-target restoration still requires authenticated admission before adoption.
+equivalence. New path adoption requires every durable owner at that path to be
+the same logical asset: the exact scoped state or child, or an existing exclusive
+`legacy_master_state_owners` claim naming the actual child. `asset_master_mappings`
+is family history and never identity. A target whose state id is not its actual
+child needs its own explicit owner claim. Mixed compatible and foreign owners
+refuse a new alias; an already target-owned mixed path stays idempotent unless a
+foreign pending reservation blocks it. A known foreign requested destination
+uses the existing identity-sibling planner and reservation owner instead of
+turning the new task into an indefinite hold. Planner setup adds compact native
+paths to the same in-memory owner inventory; they are occupancy only, never
+positive byte proof. Candidate receipt reuse and hashing skip that path when its
+owners are incompatible and the target has no completed current publication.
+Reserved-destination replay may carry the validated actual child so an explicit
+legacy owner can reuse its exact saved path without rewriting the durable
+reservation. Missing `preserved_path_key` values are filled only after all
+adoption refusals; source, local bytes, provider facts, metadata debt, and
+timestamps stay unchanged. An exact completed target may skip unrelated
+completed-owner scans for read-only settlement; target-path reconciliation and
+pending provider reservations still gate it, while new admission keeps the full
+canonical census. Unrelated malformed completed rows are neither trusted nor
+repaired. A historical source deletion does
+not invalidate a content receipt; current target restoration still requires
+authenticated admission before adoption.
 Unchanged historical raw-file receipts require source SHA-256,
 recorded local SHA-256 and freshly read bytes to agree. Old source/local
 mismatches cannot certify metadata edits because older generic adoption could
@@ -501,8 +523,10 @@ only for old-state fixtures. Their production trait surfaces have been removed;
 retained retry counts, explicit metadata queues and unfinished-operation guards
 remain live.
 
-Normal path reconciliation now recovers recorded journals only. It does not
-plan new layout convergence. Unfinished operations retain their bookkeeping and
+Path-policy changes are prospective. Normal recorded-source recovery finishes
+recorded journals only; it does not plan a new layout or apply a new template to
+existing files. Known verified files stay at recorded paths, including paths
+outside the current root. Unfinished operations retain their bookkeeping and
 configuration/checkpoint guards. The removed LegacyCycle orchestrator no longer
 makes historical attribution or archive certification prerequisites for source
 progress.
@@ -1384,11 +1408,11 @@ the existing skip rules. New companions use a verified still filename. Existing
 companions with older numbered still stems remain usable after hash verification;
 Kei does not rename or delete them.
 
-Historical smart-folder membership cannot complete local path reconciliation. It reports separate conditional evidence when the fresh smart query
+Historical smart-folder membership cannot complete recorded-source recovery. It reports separate conditional evidence when the fresh smart query
 is its only remaining dependency: album snapshots and catalog identity must be
 complete, with no deferred missing file or failed local work. The cycle owner
 can discharge that dependency only after successful current smart enumeration
-and durable work. During pending path drift, recent-count and lower-date-bounded
+and durable work. During pending path-policy verification, recent-count and lower-date-bounded
 selections drain ordered provider queries to EOF while forwarding only their
 configured selection to the existing download planner. The global recent
 frontier also drains to EOF and must report the same usable token as every
@@ -1399,13 +1423,13 @@ Fresh query evidence certifies selected local work separately from source
 checkpoint coverage. Any excluded tail, including equal-date global-frontier
 IDs, still holds zone and database checkpoints. Stale plans, interruption,
 unresolved identity, failed enumeration, local work or state transactions retain
-the pending path hash. Every selected library must finish. Atomic promotion
+the pending path-policy hash. Every selected library must finish. Atomic promotion
 compares the active path hash and exact pending target before publishing the new
 hash and removing its marker. Eligibility inventory-and-bridge promotion remains
-separate. Unchanged cycles skip catalog reconciliation and the exhaustive path
+separate. Unchanged cycles skip recorded-source verification and the exhaustive path
 proof; ordinary bounded smart-folder refreshes may still query the provider.
 
-Local path reconciliation retains an unowned legacy master with multiple
+Recorded-source recovery retains an unowned legacy master with multiple
 historical children as unresolved work, even when targeted lookup returns one
 usable sibling. It does not reserve that master's path or relax preservation
 eligibility. Independently owned current children can still reconcile, and later
@@ -1422,78 +1446,27 @@ remain unchanged. Explicit local-byte acceptance does not satisfy this exception
 Ordinary adoption and skip decisions cannot reuse a protected original merely
 because a child has a historical receipt there.
 
-Local path reconciliation also loads these publication receipts. A verified
-copy in the selected pass satisfies that rendition even when the catalogue's
-current path belongs to another album. Reconciliation preserves a verified
-numbered still filename when planning its companion, so changing Live Photo
-selection or album order does not create another copy of an owned pair.
+Recorded-source recovery loads publication receipts and existing destination
+reservations to reuse or finish recorded work. A verified receipt can satisfy a
+selected rendition even when the catalogue path belongs to another album.
+Recorded destination choices are naming evidence, not a new layout decision.
+Equivalent relative and absolute roots share ownership, and a collision with
+another asset or rendition selects a stable identity-suffixed path. Existing
+files alone do not select another name. Conflicting bytes never authorize
+overwrite or a fresh filename on every retry.
 
-Local path reconciliation opens source and destination leaf entries without
-following symlinks. It hashes the opened file and rechecks its identity before
-accepting a destination, including entries that appear during publication.
-Temporary copies use new unique names, verified bytes, and no-overwrite
-publication. On Unix, they start with owner-only permissions, so a failed copy
-remains private. A completed copy receives the source permissions.
-An unsafe or replaced entry preserves the previous catalogue path
-and leaves reconciliation incomplete. A blocking reconciliation failure skips
-that library's normal source/download pass, so adoption cannot bypass the
-rejection. Its provider checkpoint and the aggregate database pre-check token
-remain unchanged. Ambiguous temporary entries remain for
-inspection.
+Recovery opens each recorded source without following symlinks, verifies the
+opened bytes and namespace, and keeps a failed or conflicting entry at its
+previous catalogue path. A blocking recorded-work failure skips that library's
+normal source/download/adoption pass and withholds its provider checkpoint and
+the aggregate database pre-check token. Recorded sidecars and no-overwrite
+publication remain required. A safe retry can finish without downloading or
+creating another media copy. Path-policy changes do not plan destination writes;
+only recorded work may publish or preserve at its recorded path.
 
-Reconciliation retains directory capabilities through state finalization.
-Configured roots, recorded sources, destinations, and temporary siblings must
-not contain `..` components. Reconciliation rejects these paths before lexical
-normalization or filesystem writes, because a linked preceding component can
-change which directory `..` selects. Ordinary relative roots remain supported.
-Descendant directories are opened without following symlinks. Source reads,
-temporary creation, validation, and publication use these retained handles;
-namespace replacement leaves reconciliation incomplete. Windows directory
-handles deny rename and delete sharing while the receipt is live. Unix checks
-that the retained parent still occupies the planned namespace before accepting
-the result. Publication and temporary-file checks remain descriptor-relative.
-When the configured root changes, the recorded old source is opened beneath
-the common lexical ancestor of the old path and new root, with no-follow
-traversal below that anchor. This allows root moves without trusting linked
-source directories. Destination writes stay beneath the new configured root.
-Relative paths are normalized inside the filesystem owner, not in durable
-catalogue keys.
+Ordinary download collision naming, on-disk skip rules and new-download
+destinations are unchanged.
 
-A reconciled media copy receives the same capture mtime as a normal download.
-If the retained source and destination paths resolve to the same pathname,
-reconciliation only updates the catalogue path spelling. It preserves media
-mtime and existing or absent sidecars, then validates media before finalization.
-This permits changes between relative and absolute download roots.
-Before changing timestamps, reconciliation rejects a distinct destination that
-shares the source file's identity, including a hard link. The source mtime and
-catalogue path stay unchanged until the conflicting entry is resolved.
-When XMP sidecars are enabled, an existing source packet is validated and
-copied byte-for-byte, including custom properties and ownership markers. Path
-migration does not upgrade or regenerate an existing packet. If no source
-sidecar exists, the normal metadata planner generates one from the current
-payload and source GPS facts. A source read failure stops before publication;
-it cannot leave an incomplete packet that blocks the next attempt. Generated
-packets do not infer native accuracy provenance from a local checksum.
-
-Reconciliation reserves recorded and planned paths by asset and rendition. Keys
-use the filesystem owner's checked absolute paths, so equivalent relative and
-absolute roots share ownership. These keys do not change task or catalogue path
-spellings. Invalid reservation paths leave reconciliation incomplete and block
-file finalization. A collision with another asset or rendition selects a stable
-identity-suffixed path. Each rendition can reuse its own reservation across
-passes and retries, including after a
-partial state-write failure. Existing files alone do not select another name;
-the confined copy owner checks their bytes and rejects conflicts.
-
-Sidecar publication uses the same retained directory capabilities and refuses
-conflicting destination bytes. Reconciliation records the new catalogue path
-only after capture mtime, sidecar work, and final input checks succeed. It
-retains the old files and keeps failed work pending. Reconciliation planning
-includes existing media destinations so a retry after a metadata or state-write
-failure can finish without downloading or creating a second media copy.
-Reconciliation retries the selected destination and leaves conflicting media
-or sidecars untouched; it does not allocate another collision filename on each
-attempt. Ordinary download collision naming and on-disk skip rules are unchanged.
 Ordinary download planning also treats a state-protected legacy original or exact
 sidecar as occupied when the directory cache cannot see that spelling, and selects
 an independent identity suffix instead of targeting the protected identity.
@@ -1726,6 +1699,25 @@ metadata drain cannot retire it. If ordinary embedded metadata would change the
 same media while capture debt is pending, that embed waits for the explicit
 repair; verified no-write and sidecar-only work may complete independently.
 
+An authorized repair that changes published bytes advances the one existing
+source-backed compact receipt that already completed that asset, rendition,
+native path and provider resource. The receipt keeps its account and scope,
+child, master, state identity, provider checksum and size, original source
+checksum and native path; only its local checksum moves to the verified output.
+That update shares the Immediate transaction with the exact asset/path checksum
+compare-and-swap, and existing completed retained owners advance through the
+existing receipt owner with their seals validated. The checked finish holds the
+verified output file's bytes and namespace across that transaction through
+`retain_pending_file` and `validate_blocking`; a replaced or missing output
+leaves the rewrite as durable debt. No source-backed receipt, or an ambiguous
+match, leaves the receipt unchanged rather than inventing proof. Repair evidence
+is local bytes only: it does not claim a fresh provider observation, generation
+or checkpoint coverage. A physical repair that completes without a matching
+source-backed compact receipt still retires the capture marker, but advances no
+receipt proof; the next baseline therefore reports the repaired bytes as
+uncertain. That is a known limitation, not durable capture debt, and it does not
+make historical capture-repair debt reusable.
+
 ### Durable pending retry
 
 Failed and pending rows are not recovered by replaying the entire provider
@@ -1943,6 +1935,127 @@ Preserve the zone checkpoint on:
 Transfer and metadata failures may use a newer checkpoint only when the
 recovery work needed after that checkpoint is durable.
 
+The schema 43 migration creates one durable database sync epoch
+(`sync_epoch:v1`) inside the versioned savepoint. The epoch is bound to
+`account_owner` and is never changed by ordinary sync. It also quarantines every
+historical source-revalidation round as `abandoned` and retains all debt rows.
+It does not remove per-library checkpoints or any user state.
+
+Fresh-install detection uses the file-creation origin and the schema version
+captured before migration. A file created by this open with version 0 is fresh.
+Any pre-existing file, including an owned schema 0 file, is existing. An
+unowned schema 0 file fails before migration. A crash after ownership binding
+is treated as existing on the next open. The epoch records the origin. A crash
+after the epoch but before the first sync still enrolls a fresh install clean.
+
+Every owned open at schema 43 validates the epoch before WAL setup, migration
+or any substantive write. A same-number schema 43 database without a valid
+epoch fails closed. Schema 44 and newer are refused. Older binaries refuse
+schema 43, and stopping every writer before the upgrade remains an operator
+prerequisite for already-running processes.
+
+Schema 42 is a no-op. New work never creates the retired metadata-activity
+prerequisite tables and does not import their rows. A populated
+`metadata_activity_prerequisite` or `metadata_activity_prepared_prerequisite`
+table refuses an owned open after ownership validation and before WAL setup or
+migration, leaving the evidence intact; empty or absent tables are inert.
+Account adoption refuses a populated legacy source before it copies that source,
+leaving the source unchanged.
+
+Selected libraries enroll lazily after plans resolve and before the watch
+precheck can skip the cycle. Every existing selected library gets one fresh
+full baseline, including libraries with no stored token and no historical
+rounds. Fresh installs enroll clean and are exempt. A library first selected
+after the upgrade enrolls pending. Enrollment removes only the exact active,
+legacy, staged and observation keys for that zone. It preserves old baseline
+cursors, retained checkpoint holds and status, scoped database tokens,
+indexing, sparse and identity evidence, receipts, recorded paths, assets,
+metadata and sidecar state, pending recovery, provider generations, temp files,
+layouts, retry rows and unknown metadata.
+
+The first epoch baseline uses a fresh epoch-scoped boundary
+(`baseline_cursor:v27:<epoch>:...`). Pre-epoch cursor keys are never reused or
+deleted. Each selected library has one durable record at
+`sync_epoch_library:v1:<library>` (payload version 2) that owns its phase,
+attempt nonce, retry deadline and outcome. While a baseline is ready, that same
+record holds one small binding: the exact staged token key and SHA-256, the
+observation descriptor key and its proof hash, and the fresh boundary key and
+SHA-256. Observation policy, plans, admission and round stay owned by the
+descriptor; the binding points at it by hash instead of copying it. A prior
+attempt cannot replay the binding because rotation replaces it.
+
+Baseline staging and direct checkpoint completion also carry the attempt
+returned by the gate as ephemeral observation evidence. The commit requires that
+attempt to equal the record's current attempt before writing the binding or
+completion, so an atomic token reset or any other rotation invalidates an older
+in-flight baseline. The value is in memory only and is not a durable proof
+field.
+
+A per-library record with an earlier payload version, or candidate-era marker or
+proof evidence for that exact library, is refused before enrollment can clear
+checkpoints or write state. Library matching uses the whole zone name, including
+names that contain colons. Unrelated libraries are not scanned or rewritten.
+
+Promotion revalidates the epoch, attempt, exact staged key and token digest, the
+descriptor's owner and current-policy validation, and the exact fresh boundary
+still present with a matching SHA-256. A missing, changed, stale or malformed
+binding, descriptor or boundary fails closed and keeps the staged evidence.
+Successful promotion writes the active token, deletes the pending token,
+activates the round, removes the boundary and binding, and marks the library
+complete in one transaction. Non-epoch zones are not inspected. The existing
+shared all-zone promotion gate remains unchanged.
+
+Config cleanup purges only pending zone tokens that are not the exact token
+referenced by a current ready epoch binding. It parses the zone after the first
+colon, runs in one transaction, and never deletes epoch records or unrelated
+metadata. Reverting to the same effective policy may promote the ready binding. A
+genuinely changed policy keeps the superseded staged token as audit evidence and
+rotates the attempt nonce for a new bounded baseline instead of promoting stale
+evidence.
+
+`reset sync-token --yes` owns one IMMEDIATE transaction that clears the database
+token, every active and legacy zone token, and scoped database tokens, then
+rotates every enrolled library to a fresh due baseline attempt. Staged tokens
+and staged descriptors are removed only for enrolled libraries. Unenrolled or
+legacy staged keys are inert and remain as evidence. For each library it quarantines the removed binding and its descriptor
+under non-authorizing evidence keys, deletes the old baseline boundary, and
+writes one new pending record with a distinct attempt nonce. Exact per-zone keys
+remain correct when a library name contains colons and when multiple libraries
+are enrolled. The transaction never deletes or rewrites provider generations,
+destinations, decisions, receipts, recorded paths, assets, metadata, sidecars or
+media. The command prints success only after commit; any failure rolls back the
+token purge and the epoch rotation together.
+
+An epoch baseline takes precedence over pending zone-token reconciliation. A
+stale ready binding rotates the attempt to a new baseline even when a pending
+config-reconciliation token is present, so the next run cannot silently choose
+incremental mode and strand the epoch in backoff.
+
+Checkpoint deletion preserves a fresh epoch baseline boundary only when it is
+the exact boundary bound by a currently ready epoch binding. A completed epoch,
+an unrelated baseline key, or a boundary without that ready binding is deleted.
+
+Explicit capture timestamp repair does not create a selection observation proof.
+The run performs only the explicitly requested repair, leaves the epoch pending
+for a later normal baseline, and never reports baseline or backup completion.
+When repaired bytes no longer match the provider checksum, the later full
+baseline currently reports uncertain destinations and leaves the epoch pending.
+Accepting the durable capture-repair output as baseline evidence requires a
+separate approved invariant and is not implemented.
+
+A claimed baseline uses the next eligible service opportunity. Failed attempts
+use a floor of `max(1h, watch interval)` and a cap of `max(24h, watch interval)`,
+with automatic bounded backoff and no terminal exhaustion. Authentication,
+cancellation and shutdown preserve the claim's crash-guard deadline or raise it
+to that floor; they never rearm immediately and never count a provider failure.
+A retained checkpoint hold keeps its key and status but cannot wake a zone while
+the epoch is in backoff. Scheduled cycles gate the epoch baseline directly, while
+indexing and eligible local path, layout, and metadata recovery continue.
+Print-only and retry-failed runs never run historical local recovery or the
+metadata rewrite drain while the epoch waits; retry-failed may replay durable
+pending transfers without enumeration. Creating Hidden rounds remains a separate,
+disabled lifecycle.
+
 ### Metadata
 
 Provider metadata may be captured in SQLite without changing local media.
@@ -2041,10 +2154,10 @@ an existing destination. The final path can be absent between displacement and
 installation. Directory syncs precede the durable commit marker. Normal
 completion removes only byte-verified recovery entries.
 
-Before download discovery or catalog path reconciliation, Linux walks the
+Before download discovery or recorded-source recovery, Linux walks the
 download tree through retained directory handles and recovers these journals.
 The configured root may be a symlink alias; recovery resolves that trusted
-anchor while refusing links beneath it. Reconciliation also recovers each
+anchor while refusing links beneath it. Recovery also recovers each
 recorded source media and sidecar before planning, including old roots after
 a directory change. Missing parent namespaces fail verification rather than
 being treated as missing journal entries.
@@ -2152,7 +2265,7 @@ remain insufficient. A new unverified publication that changes local bytes
 clears prior source provenance; verified metadata rewrites retain their source
 receipt. Exact-byte relocation can reuse an unambiguous source receipt bound
 to the same library, child, rendition and provider generation. Pending
-rewrite, capture-repair or path-reconciliation debt keeps this conservative
+rewrite, capture-repair or recorded-source recovery debt keeps this conservative
 qualification blocked. Retained reconciliation destination choices are naming
 evidence, not pending work, and remain part of the dependency comparison. No metadata writer is enabled automatically. A replay
 that creates debt holds the cursor; a later cycle may qualify after configured
@@ -2192,7 +2305,7 @@ recovery. Current child files and sidecar presence are also bound
 into the receipt. The preservation owner never moves, rewrites, adopts or deletes
 original paths. With the hardlink opt-in, that path protection cannot prevent
 changes made through another alias by an unchanged write path.
-Normal downloads, metadata repair, local path reconciliation, imports and source
+Normal downloads, metadata repair, recorded-source recovery, imports and source
 tombstones respect the protection before byte writes; SQL guards provide defense
 in depth. `reconcile` reports drift in protected originals without converting
 them into download retries. Verification and manifest export retain the original
@@ -2238,7 +2351,7 @@ after refusal, not acceptance evidence. A newly eligible snapshot reports
 `diagnostic_unavailable`. Both retain the original `child_receipt_missing` hold.
 The lookup cannot grant qualification, retry work, write state or inspect media.
 It emits no child/library identifiers, paths, hashes or private database errors;
-support history retains only the enumerated prerequisite. One refusal does not
+support diagnostics retain only the enumerated prerequisite. One refusal does not
 establish how many families lack proof. Primary sparse-identity recovery remains
 independent.
 
@@ -2465,7 +2578,7 @@ Change-impact checklist to choose verification.
 | Paths and import parity | `src/config/templates.rs`; `DownloadConfig::with_pass` in `src/download/orchestration/config.rs`; `src/download/paths.rs`; `expected_paths_for` in `src/download/filter/expected_paths.rs`; callers in `src/commands/import.rs`; local reconciliation in `src/download/orchestration/reconciliation.rs` | [Import-existing](#import-existing), [File landing](#file-landing) |
 | Metadata refresh and writes | `Config::runtime.refresh_metadata` reads in `src/sync_loop/runner.rs` and `src/sync_cycle.rs`; capture repair in `src/download/orchestration/maintenance.rs`; immediate and queued owners in `src/download/metadata_rewrite/`; format and publication owners in `src/download/metadata/` | [Metadata](#metadata) |
 | Import adoption | `run_import_existing`, `import_assets`, and `StrictImportVerifier` in `src/commands/import.rs`; `ImportStateStore::import_adopt` and its SQLite implementation in `src/state/db/import.rs` | [Import-existing](#import-existing), [State and serialization](#state-and-serialization) |
-| Service execution | dispatch in `src/lib.rs`; install, status, uninstall, and platform owners in `src/service/`; `src/service/run.rs` enters `src/sync_loop.rs::run_sync` | [Command dispatch](#command-dispatch), [Container startup](#container-startup) |
+| Service execution | dispatch in `src/lib.rs`; status, run, and platform owners in `src/service/`; `src/service/run.rs` enters `src/sync_loop.rs::run_sync` | [Command dispatch](#command-dispatch), [Container startup](#container-startup) |
 
 For schema, durable-key, sentinel, serialization, and shared-type changes,
 follow [State and serialization](#state-and-serialization). Use
@@ -2489,7 +2602,7 @@ to read first.
 | Provider record parsing | missing/malformed fields, shared zones, identity mapping, metadata capture, fixtures |
 | File or path behavior | `.part`, checksum, no-overwrite publish, fsync, import compatibility, collision handling |
 | Metadata writes | opt-in gate, pre-publish mutation, sidecars, retry markers, feature combinations |
-| Service behavior | Linux, macOS, Windows, container defaults, status, install/uninstall renderers |
+| Service behavior | Linux, macOS, Windows, container defaults, status, execution, host supervisor compatibility |
 | Credentials or logging | secret wrappers, source lifetime, redaction, core-dump hardening, diagnostics, error paths |
 | Machine output | JSON/CSV shape, redaction, reports, health, metrics, downstream compatibility |
 
@@ -2518,12 +2631,11 @@ to read first.
 - `ci.yml` defers draft PR work and keeps the required `CI` marker failing until
   ready-for-review validation succeeds. Ignored PR metadata has a separate
   concurrency key and check name; base retargets and full-label transitions
-  revalidate. `scripts/ci/policy.py` owns path and native-service routing.
-  `ci.yml` requires selected native smoke once, or delegates it to qualification.
+  revalidate. `scripts/ci/policy.py` owns path routing.
   `checks.yml` owns shared quality and always-on safety-contract validation;
   `qualification.yml` composes heavy checks and tested artifacts.
   `scripts/ci/artifact.py` binds archive/container evidence to one commit.
-  `local_release.py` validates local live/host-service attestations.
+  `local_release.py` validates local live attestations.
   Release publication depends on both local evidence and hosted qualification;
   nightly runs cannot publish. See [CI qualification](ci.md).
 - `scripts/ci/opencode_review.py` owns the data-only advisory review client. PR review requires a new standalone `/opencode review` comment from a human with API-verified repository write access, or explicit default-branch dispatch. Requests pin the current PR head; per-PR publication serialization and head markers suppress duplicates. `opencode-review.yml` executes trusted default-branch code and separates read-only inference from deterministic COMMENT publication. Issue-open intake pins main and issue content, runs independent product/code reviews, and publishes separate advisory comments with stale-state and dedup checks. Code validation is static inspection only. PR reviews submit the complete diff without local usage caps; model capacity and Go allowance govern inference. Transport/job safeguards and publication validation remain. GitHub 403/429 responses stop the operation without automatic retry. See [review security and setup](opencode-review.md).
@@ -2580,84 +2692,37 @@ local files; `src/state/db/support.rs` owns immutable SQLite inspection without
 normal `open_owned` or schema migration. Unsupported schemas and nonempty WAL or
 journal snapshots degrade explicitly. Export output uses exclusive creation.
 
-Normal sync, import and service operations publish typed evidence from their
-existing owners through a bounded optional worker. The worker groups only
-allowlisted fields, persists account-scoped history with private atomic writes
-and a single-writer lock, and never feeds decisions back to provider, checkpoint,
-state or publication policy. Its tracing layer is independent of log verbosity.
-Stored history is revalidated against the same contract before export. Unknown
-fields, labels, arbitrary errors and provider identifiers cannot broaden it.
-The Photos owner projects only fixed owner morphology and JSON types for rejected
-inventory scopes. Private discovery records identify primary versus other zones
-and validated primary eligibility. A primary-publication observation follows the
-actual qualified-primary assignment; selected indexing alone does not imply it.
-Owner categories are revalidated as strings, so a malformed numeric owner cannot
-escape through an aggregate-count allowance. Missing older fields remain missing.
+Normal sync, import and service operations do not keep a persistent support
+recorder. Their existing owners still emit typed, allowlisted diagnostics through
+ordinary tracing. `src/support/mod.rs::observe` applies the same contract before
+emitting, so unknown fields, labels, arbitrary errors and provider identifiers
+cannot broaden the diagnostic surface. This output is not retained, does not
+survive a restart and does not feed decisions back to provider, checkpoint, state
+or publication policy. The Photos owner projects only fixed owner morphology and
+JSON types for rejected inventory scopes. Private discovery records identify
+primary versus other zones and validated primary eligibility. A primary-publication
+observation follows the actual qualified-primary assignment; selected indexing
+alone does not imply it. Owner categories are revalidated as strings, so a
+malformed numeric owner cannot escape through an aggregate-count allowance.
 
-Full enumeration also emits `support_token_equivalence_v1` from
-`full/token_diagnostics.rs`. Each self-contained snapshot relates initial and
-same-cycle recovery token groups for at most 64 selected passes. Tokens are
-compared only in a bounded invocation-local table (128 values, at most 4096 bytes
-per value); only assigned ordinals reach the support boundary. The provider owner
-supplies fixed query and scope-comparison categories. A passive stream wrapper
-records drainage order without extra polling or tasks. Missing drainage is null;
-this order is not token-arrival, HTTP-completion or media-publication order.
-`support/token_equivalence.rs` revalidates nested rows at capture and export,
-rejects malformed or duplicate rows, and preserves explicit omission markers.
-Group numbers have meaning only within one snapshot, never across invocations,
-cycles or accounts. The recovery snapshot repeats the initial evidence so history
-retention cannot silently sever cross-round relationships. This evidence has no
-consumer in enumeration, recovery or checkpoint policy.
-
-`photos/album/preservation_proof/missing_reference.rs` owns observation-only
-lookup at the first missing-parent inventory refusal. Four byte-sized typed
-pre-compaction categories live alongside every latest inventory record and count toward its
-retained-byte budget, without a separate identity/count sampling cap. Lookup
-payload shape is separate from scope availability. Scope `matched` means the
-child scope matched; reference scope is also required and checked for a
-`live_reference` payload before family classification.
-`PhotosSession::post_diagnostic` uses a dedicated 64 KiB transport with fixed errors,
-no request dumps, error-body logging or retries. The caller owns cancellation and
-a five-second deadline. Its response never enters inventory or proof construction;
-only fixed categories enter support history and export.
-
-Random process-local aliases are bounded and renumbered at collection time.
 Counts are scoped observations and must not be added as unique asset counts.
 SQL observations before transaction commit are explicitly identified as attempts.
 `src/support/mod.rs::classify_support_error` owns diagnostic typed-error
 projection. It exports fixed classes and numeric status codes from the cause
 chain, never messages or provider payloads, and does not decide retry policy.
 
-The inbox, catalogue, selection and work owners publish fixed storage counters
-after successful transaction commit and at existing capacity refusal branches.
-The history worker retains a fixed summary per cycle, not response rows.
-Budgets reuse existing admission accounting and are labeled last observed,
-pre-admission logical charges. Migration returns its compaction summary to the
-schema owner, which publishes it only after the migration savepoint commits;
-failed migration reports no committed reclaim. Optional charge observations
-cannot fail migration. Retained reasons and counters contain no source identity,
-URL or arbitrary error text, and remain subject to queue loss and bounded
-history retention. Unknown observations stay explicitly unavailable.
+The inbox, catalogue, selection and work owners keep their capacity, charge and
+admission decisions unchanged. Migration still returns its compaction summary to
+the schema owner; `CompactionSummary` lives with `provider_inbox` and remains
+state evidence for the migration that ran. It is not recorded by a support
+worker, is not checkpoint authority and is not exported as history.
 
-History and export schema version 1 are separate from report version 3 and state
-schema 36. Raw reports and databases are never packaged. Interrupted writes
-preserve the previous history; read errors and limits appear as partial evidence.
-See [the operator guide](support-export.md) for limits and unavailable evidence.
-
-### Explicit missing-reference inventory diagnostic
-
-The opt-in `doctor --live --json --missing-reference-inventory` command branches
-before normal startup, logging, service hooks and ordinary doctor filesystem
-checks. `inventory_diagnostic.rs` reads bounded configuration and copied cached
-auth only. It does not open a catalogue or construct a download/state owner.
-`photos/diagnostic.rs` adapts the existing PhotosSession interface to privacy-safe
-streamed requests with shared limits and no redirect/retry/auth fallback.
-The existing PhotosService qualifies the private PrimarySync scope before the
-preservation scanner's raw latest-record helper supplies fixed missing-reference
-observations. The diagnostic performs no family hydration and returns no cursor
-or CompleteLegacyInventory proof. At most one later lookup is observational.
-Ordinary preservation retains its candidate, scope, date and completeness gates.
-See `docs/missing-reference-inventory.md` for bounds and supervision requirements.
+Support export schema version 1 is separate from report version 3 and the state
+schema. Raw reports and databases are never packaged. A current-state snapshot
+with unavailable support history is not partial unless current configuration,
+state or health evidence is missing. Old support history, lock and staging files
+are never read, merged, renamed, deleted or recreated by this build. See
+[the operator guide](support-export.md) for limits and unavailable evidence.
 
 ### Explicit trusted local bytes for legacy migration
 

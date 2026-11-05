@@ -92,6 +92,7 @@ async fn validate_reserved_pending_destination(
             planner.retry_path_allowed(
                 library,
                 asset.state_id(),
+                asset.asset_record_name(),
                 derived.version_size,
                 &derived.checksum,
                 derived.size,

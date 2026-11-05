@@ -26,252 +26,6 @@ use tokio_util::sync::CancellationToken;
 use xmp_toolkit::{XmpMeta, xmp_ns};
 
 #[cfg(feature = "xmp")]
-#[tokio::test]
-async fn activity_preflight_rejects_competitors_and_accepts_only_live_admission() {
-    use crate::state::SqliteStateDb;
-    use crate::state::db::account::AccountOwner;
-    use crate::state::db::metadata_activity::MetadataActivityOwner;
-    use crate::test_helpers::TestAssetRecord;
-
-    async fn observe(
-        db: &SqliteStateDb,
-        flags: MetadataFlags,
-        pending: crate::state::db::PendingMetadataRewrite,
-        root: &std::path::Path,
-        media: &std::path::Path,
-    ) -> bool {
-        let mut attempts = super::TailAttempts::default();
-        super::test_arm_after_activity_stop(media);
-        let result = super::run_pending_rows_tracked(
-            db,
-            flags,
-            CaptureTimestampRepair::Preserve,
-            Arc::from(".part"),
-            &CancellationToken::new(),
-            vec![pending],
-            (Some(root), &mut attempts),
-        )
-        .await;
-        assert_eq!(result.fetched, 1);
-        !super::test_take_after_activity_stop(media)
-    }
-
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("state.db");
-    let owner = AccountOwner::authenticated(
-        "synthetic@example.invalid",
-        "com",
-        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"synthetic-provider"}}))
-            .unwrap(),
-    )
-    .unwrap();
-    let db = SqliteStateDb::open_owned(&db_path, &owner).await.unwrap();
-    let media = dir.path().join("photo.jpg");
-    let original = minimal_jpeg_bytes();
-    std::fs::write(&media, &original).unwrap();
-    let checksum = crate::download::file::compute_sha256(&media).await.unwrap();
-    let record = TestAssetRecord::new("activity-test")
-        .checksum("provider-checksum")
-        .build();
-    db.upsert_seen(&record).await.unwrap();
-    db.mark_downloaded(
-        "PrimarySync",
-        "activity-test",
-        "original",
-        &media,
-        &checksum,
-        None,
-    )
-    .await
-    .unwrap();
-    db.record_metadata_write_failure("PrimarySync", "activity-test", "original")
-        .await
-        .unwrap();
-    let pending = db
-        .get_pending_metadata_rewrites_page_for_queue(
-            MetadataRewriteQueue::Ordinary,
-            Some(&["PrimarySync"]),
-            0,
-            10,
-        )
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    let flags = MetadataFlags::RATING | MetadataFlags::EMBED_XMP;
-    assert!(observe(&db, flags, pending.clone(), dir.path(), &media).await);
-    assert!(
-        db.admit_activity(
-            &pending,
-            MetadataRewriteQueue::Ordinary,
-            (flags | MetadataFlags::XMP_SIDECAR).bits()
-        )
-        .await
-        .is_err()
-    );
-    assert!(
-        db.admit_activity(
-            &pending,
-            MetadataRewriteQueue::Ordinary,
-            MetadataFlags::XMP_SIDECAR.bits()
-        )
-        .await
-        .is_err()
-    );
-    let admission = Arc::new(
-        db.admit_activity(&pending, MetadataRewriteQueue::Ordinary, flags.bits())
-            .await
-            .unwrap(),
-    );
-    assert!(!observe(&db, flags, pending.clone(), dir.path(), &media).await);
-    let mut own = pending.clone();
-    own.activity_admission = Some(Arc::clone(&admission));
-    assert!(observe(&db, flags, own.clone(), dir.path(), &media).await);
-    // Sidecar-only work is independent if its target is absent. A hard link
-    // to the active media is a real same-file conflict.
-    assert!(
-        observe(
-            &db,
-            MetadataFlags::XMP_SIDECAR,
-            pending.clone(),
-            dir.path(),
-            &media
-        )
-        .await
-    );
-    #[cfg(unix)]
-    {
-        let mut name = media.as_os_str().to_os_string();
-        name.push(".xmp");
-        std::fs::hard_link(&media, std::path::PathBuf::from(name)).unwrap();
-        assert!(
-            !observe(
-                &db,
-                MetadataFlags::XMP_SIDECAR,
-                pending.clone(),
-                dir.path(),
-                &media
-            )
-            .await
-        );
-    }
-    let other = db
-        .admit_activity(&pending, MetadataRewriteQueue::Ordinary, flags.bits())
-        .await
-        .unwrap();
-    assert!(!observe(&db, flags, own.clone(), dir.path(), &media).await);
-    drop(other);
-    drop(db);
-    let reopened = SqliteStateDb::open_owned(&db_path, &owner).await.unwrap();
-    assert!(!observe(&reopened, flags, own, dir.path(), &media).await);
-    assert_eq!(
-        reopened
-            .get_pending_metadata_rewrites_page_for_queue(
-                MetadataRewriteQueue::Ordinary,
-                Some(&["PrimarySync"]),
-                0,
-                10
-            )
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
-
-    // A separate owner database isolates the unknown-prepared case from the
-    // competing activity above. Neither record is adopted or retired.
-    let db2 = SqliteStateDb::open_owned(&dir.path().join("prepared.db"), &owner)
-        .await
-        .unwrap();
-    db2.upsert_seen(&record).await.unwrap();
-    db2.mark_downloaded(
-        "PrimarySync",
-        "activity-test",
-        "original",
-        &media,
-        &checksum,
-        None,
-    )
-    .await
-    .unwrap();
-    db2.record_metadata_write_failure("PrimarySync", "activity-test", "original")
-        .await
-        .unwrap();
-    let pending2 = db2
-        .get_pending_metadata_rewrites_page_for_queue(
-            MetadataRewriteQueue::Ordinary,
-            Some(&["PrimarySync"]),
-            0,
-            10,
-        )
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    let admission2 = Arc::new(
-        db2.admit_activity(&pending2, MetadataRewriteQueue::Ordinary, flags.bits())
-            .await
-            .unwrap(),
-    );
-    let stage = dir.path().join("prepared.stage");
-    std::fs::write(&stage, b"synthetic prepared").unwrap();
-    db2.bind_prepared(&admission2, &pending2, flags.bits(), dir.path(), &stage)
-        .await
-        .unwrap();
-    assert!(!observe(&db2, flags, pending2.clone(), dir.path(), &media).await);
-    let mut own2 = pending2;
-    own2.activity_admission = Some(admission2);
-    assert!(!observe(&db2, flags, own2, dir.path(), &media).await);
-    assert_eq!(std::fs::read(&media).unwrap(), original);
-    assert_eq!(std::fs::read(&stage).unwrap(), b"synthetic prepared");
-    assert_eq!(
-        db2.get_pending_metadata_rewrites_page_for_queue(
-            MetadataRewriteQueue::Ordinary,
-            Some(&["PrimarySync"]),
-            0,
-            10
-        )
-        .await
-        .unwrap()
-        .len(),
-        1
-    );
-    let before:(Vec<u8>,Vec<u8>)=db2.acquire_lock("prepared evidence before reopen").unwrap().query_row(
-        "SELECT a.binding,p.binding FROM metadata_activity_prerequisite a JOIN metadata_activity_prepared_prerequisite p USING(operation_id)",[],|row|Ok((row.get(0)?,row.get(1)?)),
-    ).unwrap();
-    drop(db2);
-    let reopened2 = SqliteStateDb::open_owned(&dir.path().join("prepared.db"), &owner)
-        .await
-        .unwrap();
-    let after:(Vec<u8>,Vec<u8>)=reopened2.acquire_lock("prepared evidence after reopen").unwrap().query_row(
-        "SELECT a.binding,p.binding FROM metadata_activity_prerequisite a JOIN metadata_activity_prepared_prerequisite p USING(operation_id)",[],|row|Ok((row.get(0)?,row.get(1)?)),
-    ).unwrap();
-    assert_eq!(after, before);
-    let reopened_pending = reopened2
-        .get_pending_metadata_rewrites_page_for_queue(
-            MetadataRewriteQueue::Ordinary,
-            Some(&["PrimarySync"]),
-            0,
-            10,
-        )
-        .await
-        .unwrap();
-    assert_eq!(reopened_pending.len(), 1);
-    assert!(
-        !observe(
-            &reopened2,
-            flags,
-            reopened_pending.into_iter().next().unwrap(),
-            dir.path(),
-            &media
-        )
-        .await
-    );
-    assert_eq!(std::fs::read(&media).unwrap(), original);
-    assert_eq!(std::fs::read(&stage).unwrap(), b"synthetic prepared");
-}
-
-#[cfg(feature = "xmp")]
 async fn stored_checksums(db: &crate::state::SqliteStateDb) -> (Option<String>, Option<String>) {
     let row = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
     (row.local_checksum, row.download_checksum)
@@ -598,6 +352,7 @@ async fn refresh_drain_repairs_a_state_recorded_host_local_timestamp() {
 
     let residual = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,
+        dir.path(),
         &MetadataConfig {
             set_exif_datetime: true,
             ..MetadataConfig::default()
@@ -678,6 +433,7 @@ async fn capture_repair_recovers_publication_after_state_finalisation_failure() 
     };
     let first = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,
+        dir.path(),
         &config,
         CaptureTimestampRepair::ReplaceWithCaptureLocal,
         &["PrimarySync"],
@@ -718,6 +474,7 @@ async fn capture_repair_recovers_publication_after_state_finalisation_failure() 
     let reopened = SqliteStateDb::open(&db_path).await.unwrap();
     let second = crate::download::drain_pending_metadata_rewrites(
         &reopened as &dyn DownloadStore,
+        dir.path(),
         &config,
         CaptureTimestampRepair::ReplaceWithCaptureLocal,
         &["PrimarySync"],
@@ -759,6 +516,7 @@ async fn capture_repair_recovers_publication_after_state_finalisation_failure() 
     assert_eq!(
         crate::download::drain_pending_metadata_rewrites(
             &reopened as &dyn DownloadStore,
+            dir.path(),
             &config,
             CaptureTimestampRepair::Preserve,
             &["PrimarySync"],
@@ -849,6 +607,7 @@ async fn capture_repair_reprepares_an_unpublished_receipt() {
 
     let residual = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,
+        dir.path(),
         &MetadataConfig {
             set_exif_datetime: true,
             ..MetadataConfig::default()
@@ -929,6 +688,7 @@ async fn capture_timestamp_repair_requires_a_recorded_local_checksum() {
 
     let residual = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,
+        dir.path(),
         &MetadataConfig {
             set_exif_datetime: true,
             ..MetadataConfig::default()
@@ -993,6 +753,7 @@ async fn capture_timestamp_repair_without_offset_keeps_marker_pending() {
 
     let residual = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,
+        dir.path(),
         &MetadataConfig {
             set_exif_datetime: true,
             ..MetadataConfig::default()
@@ -1021,6 +782,7 @@ async fn capture_timestamp_repair_without_offset_keeps_marker_pending() {
 
     let ordinary_residual = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,
+        dir.path(),
         &MetadataConfig {
             set_exif_datetime: true,
             ..MetadataConfig::default()
@@ -1097,6 +859,7 @@ async fn ordinary_embed_waits_for_pending_capture_repair() {
 
     let residual = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,
+        dir.path(),
         &MetadataConfig {
             set_exif_rating: true,
             ..MetadataConfig::default()
@@ -1166,6 +929,7 @@ async fn capture_timestamp_repair_defers_unsupported_heif_without_xmp() {
 
     let residual = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,
+        dir.path(),
         &MetadataConfig {
             set_exif_datetime: true,
             ..MetadataConfig::default()
@@ -1231,6 +995,7 @@ async fn refresh_drain_repairs_native_heif_capture_time_before_retiring_marker()
 
         let residual = crate::download::drain_pending_metadata_rewrites(
             &db as &dyn DownloadStore,
+            dir.path(),
             &MetadataConfig {
                 set_exif_datetime: true,
                 ..MetadataConfig::default()
@@ -1339,6 +1104,7 @@ async fn heif_capture_repair_writes_missing_xmp_before_retiring_marker() {
 
     let residual = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,
+        dir.path(),
         &MetadataConfig {
             set_exif_datetime: true,
             ..MetadataConfig::default()
@@ -1425,6 +1191,7 @@ async fn heif_capture_repair_without_native_exif_keeps_marker_pending() {
 
         let residual = crate::download::drain_pending_metadata_rewrites(
             &db as &dyn DownloadStore,
+            dir.path(),
             &MetadataConfig {
                 set_exif_datetime: true,
                 ..MetadataConfig::default()
@@ -2745,20 +2512,15 @@ async fn drain_scope_skips_unselected_and_soft_deleted_failures() {
     use crate::state::SqliteStateDb;
 
     let db = SqliteStateDb::open_in_memory().unwrap();
+    let missing_dir = tempfile::tempdir().unwrap();
     for i in 0..3 {
         let id = format!("M{i}");
         let record = crate::test_helpers::TestAssetRecord::new(&id).build();
         db.upsert_seen(&record).await.unwrap();
-        db.mark_downloaded(
-            "PrimarySync",
-            &id,
-            "original",
-            std::path::Path::new("/nonexistent/missing.jpg"),
-            "ck",
-            None,
-        )
-        .await
-        .unwrap();
+        let missing_path = missing_dir.path().join(format!("missing-{i}.jpg"));
+        db.mark_downloaded("PrimarySync", &id, "original", &missing_path, "ck", None)
+            .await
+            .unwrap();
         db.record_metadata_write_failure("PrimarySync", &id, "original")
             .await
             .unwrap();
@@ -2793,6 +2555,7 @@ async fn drain_scope_skips_unselected_and_soft_deleted_failures() {
     let token = CancellationToken::new();
     let residual = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,
+        missing_dir.path(),
         &cfg,
         CaptureTimestampRepair::Preserve,
         &["PrimarySync"],
@@ -2827,6 +2590,7 @@ async fn drain_reports_residual_on_cancellation() {
     use crate::download::DownloadStore;
     use crate::state::SqliteStateDb;
 
+    let dir = tempfile::tempdir().unwrap();
     let db = SqliteStateDb::open_in_memory().unwrap();
     let record = crate::test_helpers::TestAssetRecord::new("C1").build();
     db.upsert_seen(&record).await.unwrap();
@@ -2852,6 +2616,7 @@ async fn drain_reports_residual_on_cancellation() {
     token.cancel();
     let residual = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,
+        dir.path(),
         &cfg,
         CaptureTimestampRepair::Preserve,
         &["PrimarySync"],
@@ -2902,6 +2667,7 @@ async fn drain_stops_when_rewrite_marker_cannot_be_cleared() {
 
     let residual = crate::download::drain_pending_metadata_rewrites(
         &db,
+        dir.path(),
         &MetadataConfig {
             set_exif_rating: true,
             embed_xmp: true,
@@ -2938,6 +2704,7 @@ async fn drain_refuses_to_rewrite_a_file_that_drifted_from_its_checksum() {
         CaptureTimestampRepair::Preserve,
         Arc::from(".meta-tmp"),
         &CancellationToken::new(),
+        Some(dir.path()),
         None,
         0,
     )
@@ -3473,6 +3240,7 @@ async fn capture_queue_pagination_counts_retired_capture_debt() {
 
     let residual = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,
+        dir.path(),
         &MetadataConfig {
             set_exif_datetime: true,
             xmp_sidecar: true,
@@ -3673,6 +3441,7 @@ async fn drain_reaches_newer_marker_after_retained_batch() {
     let token = CancellationToken::new();
     let residual = crate::download::drain_pending_metadata_rewrites(
         &db as &dyn DownloadStore,
+        dir.path(),
         &cfg,
         CaptureTimestampRepair::Preserve,
         &["PrimarySync"],
@@ -3973,4 +3742,143 @@ fn blocking_target_replacement_is_not_the_same_attempt() {
     std::fs::create_dir(&sidecar).unwrap();
     assert!(!target.unchanged());
     assert!(!file.unchanged());
+}
+
+/// Prebridge Ordinary drains had no archive root; capture repair needs one to
+/// hold its verified output. Selected metadata tails keep their existing root.
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn legacy_ordinary_drain_restores_root_none_while_capture_and_selected_stay_confined() {
+    use crate::config::MetadataConfig;
+    use crate::download::DownloadStore;
+    use crate::state::SqliteStateDb;
+
+    let current_root = tempfile::tempdir().unwrap();
+
+    // 1. Legacy Ordinary drain: the configured archive root is not applied.
+    let legacy_media = tempfile::tempdir().unwrap();
+    let (db, path, _) = seed_marked_jpeg(legacy_media.path(), "OUTSIDE_ROOT", Some(3)).await;
+    let before = std::fs::read(&path).unwrap();
+    let residual = crate::download::drain_pending_metadata_rewrites(
+        &db as &dyn DownloadStore,
+        current_root.path(),
+        &MetadataConfig {
+            set_exif_rating: true,
+            ..MetadataConfig::default()
+        },
+        CaptureTimestampRepair::Preserve,
+        &["PrimarySync"],
+        Arc::from(".metadata-test"),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(residual, 0);
+    assert!(
+        db.get_pending_metadata_rewrites(1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_ne!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "legacy ordinary drains rewrite recorded paths outside the current root"
+    );
+    drop(db);
+
+    // 2. A selected tail keeps its supplied root, so an outside path is refused.
+    let selected_media = tempfile::tempdir().unwrap();
+    let (db, path, _) =
+        seed_marked_jpeg(selected_media.path(), "SELECTED_OUTSIDE_ROOT", Some(4)).await;
+    let before = std::fs::read(&path).unwrap();
+    let pass = run_pending_page(
+        &db,
+        embedded_rating_flags(),
+        CaptureTimestampRepair::Preserve,
+        Arc::from(".metadata-test"),
+        &CancellationToken::new(),
+        Some(current_root.path()),
+        None,
+        0,
+    )
+    .await;
+    assert_eq!(pass.failed, 1);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        db.get_pending_metadata_rewrites(1).await.unwrap().len(),
+        1,
+        "selected writer confinement must stay in force"
+    );
+    drop(db);
+
+    // 3. Capture repair fails closed when its held output is outside the root.
+    let capture_media = tempfile::tempdir().unwrap();
+    let photo_path = capture_media.path().join("capture-outside.jpg");
+    std::fs::write(&photo_path, minimal_jpeg_bytes()).unwrap();
+    let created_local = now_local() + chrono::Duration::milliseconds(629);
+    crate::download::metadata::apply_metadata(
+        &photo_path,
+        &crate::download::metadata::MetadataWrite {
+            datetime: Some("2024:06:14 23:00:00".into()),
+            offset_time_original: Some("+05:00".into()),
+            ..crate::download::metadata::MetadataWrite::default()
+        },
+        ".seed-tmp",
+    )
+    .unwrap();
+    let checksum = crate::download::file::compute_sha256(&photo_path)
+        .await
+        .unwrap();
+    let record = crate::test_helpers::TestAssetRecord::new("CAPTURE_OUTSIDE_ROOT")
+        .filename("capture-outside.jpg")
+        .checksum("provider-checksum")
+        .created_at(created_local.with_timezone(&chrono::Utc))
+        .metadata(crate::state::types::AssetMetadata {
+            timezone_offset: Some(39_600),
+            ..crate::state::types::AssetMetadata::default()
+        })
+        .build();
+    let db = SqliteStateDb::open(&capture_media.path().join("state.db"))
+        .await
+        .unwrap();
+    db.upsert_seen(&record).await.unwrap();
+    db.mark_downloaded(
+        "PrimarySync",
+        "CAPTURE_OUTSIDE_ROOT",
+        "original",
+        &photo_path,
+        &checksum,
+        None,
+    )
+    .await
+    .unwrap();
+    queue_capture_repair(&db, &record).await;
+    let before = std::fs::read(&photo_path).unwrap();
+    let residual = crate::download::drain_pending_metadata_rewrites(
+        &db as &dyn DownloadStore,
+        current_root.path(),
+        &MetadataConfig {
+            set_exif_datetime: true,
+            ..MetadataConfig::default()
+        },
+        CaptureTimestampRepair::ReplaceWithCaptureLocal,
+        &["PrimarySync"],
+        Arc::from(".metadata-test"),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(residual, 1);
+    assert_eq!(std::fs::read(&photo_path).unwrap(), before);
+    assert_eq!(
+        db.get_pending_metadata_rewrites_page_for_queue(
+            MetadataRewriteQueue::CaptureRepair,
+            None,
+            0,
+            1,
+        )
+        .await
+        .unwrap()
+        .len(),
+        1
+    );
 }

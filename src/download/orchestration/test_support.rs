@@ -36,6 +36,7 @@ pub(super) fn retry_test_task(
         replacement_fingerprint: None,
         publication_binding: None,
         pending_cross_parent_root: None,
+        superseded_requested_path: None,
         checksum: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
         asset_id: Arc::from(asset_id),
         asset_record_name: Arc::from(asset_id),

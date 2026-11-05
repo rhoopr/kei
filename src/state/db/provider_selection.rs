@@ -16,8 +16,6 @@ use super::{SqliteStateDb, account};
 #[cfg(test)]
 use crate::state::VersionSizeKey;
 use crate::state::error::StateError;
-#[cfg(test)]
-use crate::support::{StorageComponent, StorageOutcome};
 
 #[cfg(test)]
 pub(crate) const MAX_SELECTION_BYTES: u64 = 512 * 1024 * 1024;
@@ -415,11 +413,6 @@ impl SqliteStateDb {
             let bytes = serde_json::to_vec(&manifest)
                 .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
             if bytes.len() > MAX_MANIFEST_BYTES {
-                crate::support::record_storage(
-                    StorageComponent::Selection,
-                    StorageOutcome::SingleItemLimit,
-                    None,
-                );
                 return Err(StateError::ProviderSelectionFull);
             }
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -439,22 +432,12 @@ impl SqliteStateDb {
                 if existing != (account_key, provider_key, MANIFEST_VERSION, bytes) { return invalid() }
                 validate_rows(&tx, &id, &manifest)?;
                 tx.commit()?;
-                crate::support::record_storage(
-                    StorageComponent::Selection,
-                    StorageOutcome::Exact,
-                    None,
-                );
                 return Ok(id);
             }
             if let Some(equivalent) =
                 equivalent_generation(&tx, &manifest, &account_key, &provider_key)?
             {
                 tx.commit()?;
-                crate::support::record_storage(
-                    StorageComponent::Selection,
-                    StorageOutcome::Equivalent,
-                    None,
-                );
                 return Ok(equivalent);
             }
             let mut charge = bytes.len() + id.len() + account_key.len() + provider_key.len()
@@ -474,11 +457,6 @@ impl SqliteStateDb {
             let used = u64::try_from(used)
                 .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
             if charge > capacity.saturating_sub(used) {
-                crate::support::record_storage(
-                    StorageComponent::Selection,
-                    StorageOutcome::CapacityRejected,
-                    Some((used, capacity)),
-                );
                 return Err(StateError::ProviderSelectionFull);
             }
             tx.execute("INSERT INTO provider_selection_generations(id,account_key,provider_key,format,scope,config_hash,manifest,charged_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -494,11 +472,6 @@ impl SqliteStateDb {
                 }
             }
             tx.commit()?;
-            crate::support::record_storage(
-                StorageComponent::Selection,
-                StorageOutcome::New,
-                Some((used, capacity)),
-            );
             Ok(id)
         }).await
     }

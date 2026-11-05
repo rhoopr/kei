@@ -289,6 +289,7 @@ impl crate::state::ReconciliationStateStore for FailingDownloadStore {
     async fn reserve_reconciliation_paths(
         &self,
         _reservations: &[crate::state::ReconciliationReservation],
+        _actual_child: Option<&str>,
     ) -> Result<(), crate::state::error::StateError> {
         Err(StateError::Invariant {
             operation: "reserve_reconciliation_paths",

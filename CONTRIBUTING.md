@@ -75,8 +75,8 @@ must cover interruption, retry, partial completion, and stale configuration.
    Use `just gate` when diagnosing a failure or working without hosted CI.
    The [recipes](justfile) define the commands. See the
    [test entry points](tests/README.md#running) for focused checks.
-   Live-provider and real host-service tests belong on an explicitly approved,
-   isolated local fixture when the change needs them, not on every PR.
+   Live-provider tests belong on an explicitly approved, isolated local fixture
+   when the change needs them, not on every PR.
    Read [CI qualification](docs/ci.md) for routing and release prerequisites.
    Tool versions are pinned in [.github/workflows/checks.yml](.github/workflows/checks.yml).
 

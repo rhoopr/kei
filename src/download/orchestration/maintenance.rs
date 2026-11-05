@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 /// of markers left failing when the drain stops.
 pub(crate) async fn drain_pending_metadata_rewrites(
     db: &dyn DownloadStore,
+    root: &std::path::Path,
     metadata: &crate::config::MetadataConfig,
     capture_timestamp_repair: CaptureTimestampRepair,
     library_scope: &[&str],
@@ -22,6 +23,11 @@ pub(crate) async fn drain_pending_metadata_rewrites(
     }
     let mut offset = 0usize;
     let mut failed = 0usize;
+    let repair_root = matches!(
+        capture_timestamp_repair,
+        CaptureTimestampRepair::ReplaceWithCaptureLocal
+    )
+    .then_some(root);
     loop {
         let pass = metadata_rewrite::run_pending_page(
             db,
@@ -29,6 +35,7 @@ pub(crate) async fn drain_pending_metadata_rewrites(
             capture_timestamp_repair,
             Arc::clone(&temp_suffix),
             shutdown_token,
+            repair_root,
             Some(library_scope),
             offset,
         )

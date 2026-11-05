@@ -385,6 +385,7 @@ impl PendingRetryPlanning<'_> {
                                 if (!self.task_planner.has_durable_destination(task) || task.download_path==local_path)
                                     && (!evidence.matches_provider_version(task)
                                         || self.task_planner.retry_path_allowed(&task.library,&task.asset_id,
+                                            task.asset_record_name.as_ref(),
                                             task.version_size,&task.checksum,task.size,local_path)) {
                                     evidence.truncated_repair_fingerprint(pass_config.repair_truncated).await?
                                 } else { None }
@@ -519,6 +520,7 @@ impl PendingRetryPlanning<'_> {
                         || self.task_planner.retry_path_allowed(
                             &task.library,
                             &task.asset_id,
+                            task.asset_record_name.as_ref(),
                             task.version_size,
                             &task.checksum,
                             task.size,
@@ -1459,31 +1461,41 @@ mod tests {
             TestAssetRecord::new("PAIR")
                 .checksum("still")
                 .size(100)
+                .added_at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap())
                 .build(),
             TestAssetRecord::new("PAIR")
                 .version_size(VersionSizeKey::LiveOriginal)
                 .checksum("motion")
                 .size(200)
+                .added_at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap())
                 .build(),
             TestAssetRecord::new("OTHER").build(),
         ];
         for record in &records {
             db.upsert_seen(record).await.unwrap();
         }
+        assert!(
+            db.claim_legacy_master_state_owner("PrimarySync", "PAIR", "asset-PAIR")
+                .await
+                .unwrap()
+        );
         let held = root.path().join("held.jpg");
         let key = crate::fs_util::confined_path_key(&held).unwrap();
-        db.reserve_reconciliation_paths(&[crate::state::ReconciliationReservation {
-            library: Arc::from("PrimarySync"),
-            asset_id: "HELD".into(),
-            version_size: VersionSizeKey::Original,
-            content: Some(crate::state::ReconciliationContent {
-                checksum: "held".into(),
-                size: 1,
-            }),
-            requested_path_key: crate::state::ReconciliationPathKey(key.clone()),
-            destination_path_key: crate::state::ReconciliationPathKey(key),
-            destination_path: held,
-        }])
+        db.reserve_reconciliation_paths(
+            &[crate::state::ReconciliationReservation {
+                library: Arc::from("PrimarySync"),
+                asset_id: "HELD".into(),
+                version_size: VersionSizeKey::Original,
+                content: Some(crate::state::ReconciliationContent {
+                    checksum: "held".into(),
+                    size: 1,
+                }),
+                requested_path_key: crate::state::ReconciliationPathKey(key.clone()),
+                destination_path_key: crate::state::ReconciliationPathKey(key),
+                destination_path: held,
+            }],
+            None,
+        )
         .await
         .unwrap();
         let asset = PhotoAsset::new(

@@ -33,8 +33,6 @@ use super::selection::{
     deferred_unfiled_index, should_record_album_snapshots,
 };
 
-mod token_diagnostics;
-
 const MAX_SAME_CYCLE_CHECKPOINT_RECOVERY_ROUNDS: usize = 1;
 
 /// Reuse full-query scope, bounds, EOF and pass-token ownership while keeping
@@ -145,7 +143,6 @@ enum ZoneTokenEvidence {
 }
 
 fn observe_token_evidence(
-    zone: &str,
     phase: &'static str,
     observations: &[PassTokenObservation],
     evidence: &ZoneTokenEvidence,
@@ -171,9 +168,7 @@ fn observe_token_evidence(
             _ => None,
         })
         .collect::<Vec<_>>();
-    crate::support::observe_scoped(
-        zone,
-        None,
+    crate::support::observe(
         "support_token_evidence_v1",
         serde_json::json!({
             "phase":phase, "completion":completion, "reason":reason,
@@ -1085,8 +1080,6 @@ pub(super) async fn download_photos_full_with_token_policy(
     // instead of serializing round trips across albums. Download workers are
     // divided across active pass pipelines so real downloads do not multiply
     // the user-selected `[download].threads` by the number of albums.
-    let mut token_diagnostics = token_diagnostics::TokenDiagnostics::new(passes, &config.library);
-    let initial_order = token_diagnostics.initial_order.clone();
     let (mut streaming_result, token_receivers) = if needs_per_pass {
         let mut combined_result = StreamingResult {
             // Enumeration is "complete" only when every pass finished
@@ -1152,7 +1145,6 @@ pub(super) async fn download_photos_full_with_token_policy(
                 let recent_frontier = recent_frontier.as_ref();
                 let download_ctx = shared_download_ctx.clone();
                 let bounds_truncated = Arc::clone(&bounds_truncated);
-                let initial_order = initial_order.clone();
                 let recent_observed = Arc::clone(&recent_observed);
                 async move {
                     let album_snapshot = if record_album_snapshots {
@@ -1182,7 +1174,6 @@ pub(super) async fn download_photos_full_with_token_policy(
                         shutdown_token.clone(),
                     );
 
-                    let stream = initial_order.wrap(stream, pass_index);
                     if pass.kind == crate::commands::PassKind::Album
                         && let Some(deferred_ids) = deferred_ids
                     {
@@ -1326,7 +1317,7 @@ pub(super) async fn download_photos_full_with_token_policy(
                                 });
                                 std::future::ready(keep)
                             });
-                    let stream = initial_order.wrap(Box::pin(stream), index);
+                    let stream: DownloadPhotoStream = Box::pin(stream);
                     let pass_result = run_full_pass_stream(
                         download_client.clone(),
                         stream,
@@ -1413,20 +1404,17 @@ pub(super) async fn download_photos_full_with_token_policy(
                     receiver: token_rx,
                     enumeration_complete: true,
                 });
-                initial_order.wrap(
-                    filter_stream_to_enumeration_bounds(
-                        observe_recent_prefix(
-                            stream,
-                            Arc::clone(&recent_observed),
-                            pass_index,
-                            config.recent,
-                        ),
-                        config,
-                        recent_frontier.as_ref(),
-                        Arc::clone(&bounds_truncated),
-                        shutdown_token.clone(),
+                filter_stream_to_enumeration_bounds(
+                    observe_recent_prefix(
+                        stream,
+                        Arc::clone(&recent_observed),
+                        pass_index,
+                        config.recent,
                     ),
-                    pass_index,
+                    config,
+                    recent_frontier.as_ref(),
+                    Arc::clone(&bounds_truncated),
+                    shutdown_token.clone(),
                 )
             })
             .collect();
@@ -1642,12 +1630,7 @@ pub(super) async fn download_photos_full_with_token_policy(
         } else {
             classify_zone_token_evidence(&observations)
         };
-        for observation in &observations {
-            token_diagnostics.record(observation, false);
-        }
-        token_diagnostics.emit(&config.library, "initial");
         observe_token_evidence(
-            &config.library,
             "initial",
             &observations,
             &initial_evidence,
@@ -1695,7 +1678,6 @@ pub(super) async fn download_photos_full_with_token_policy(
                 let expected_recovery_passes = recovery_action.retry_passes().len();
                 let mut completed_recovery_passes = 0usize;
                 for pass_key in recovery_action.retry_passes().iter().cloned() {
-                    token_diagnostics.recovery_requested(pass_key.index);
                     let Some(pass) = passes.get(pass_key.index) else {
                         recovery_enumeration_complete = false;
                         continue;
@@ -1721,9 +1703,6 @@ pub(super) async fn download_photos_full_with_token_policy(
                         Arc::clone(&bounds_truncated),
                         shutdown_token.clone(),
                     );
-                    let stream = token_diagnostics
-                        .recovery_order
-                        .wrap(stream, pass_key.index);
                     let recovered = run_full_pass_stream(
                         download_client.clone(),
                         stream,
@@ -1751,7 +1730,6 @@ pub(super) async fn download_photos_full_with_token_policy(
                                 .find(|observation| observation.pass.index == pass_key.index)
                             {
                                 observation.result = PassTokenResult::EnumerationIncomplete;
-                                token_diagnostics.record(observation, true);
                             }
                             tracing::warn!(
                                 pass = ?pass_key,
@@ -1784,7 +1762,6 @@ pub(super) async fn download_photos_full_with_token_policy(
                         .find(|observation| observation.pass.index == pass_key.index)
                     {
                         observation.result = recovered_result;
-                        token_diagnostics.record(observation, true);
                     }
                     merge_token_recovery_result(&mut streaming_result, recovered.result);
                 }
@@ -1834,10 +1811,8 @@ pub(super) async fn download_photos_full_with_token_policy(
                 token_unique_values =
                     Some(final_tokens.iter().copied().collect::<FxHashSet<_>>().len());
 
-                token_diagnostics.emit(&config.library, "same_cycle_recovery");
                 let recovery_evidence = classify_zone_token_evidence(&observations);
                 observe_token_evidence(
-                    &config.library,
                     "same_cycle_recovery",
                     &observations,
                     &recovery_evidence,

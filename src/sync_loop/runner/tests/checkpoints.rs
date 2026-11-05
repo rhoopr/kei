@@ -2177,6 +2177,66 @@ async fn run_cycle_rejected_page_replays_downloads_exactly_once_across_restart()
     }
 }
 
+#[derive(Clone)]
+struct AdoptionEpochSession;
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for AdoptionEpochSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        let request: serde_json::Value = serde_json::from_str(&body)?;
+        if url.contains("/zones/list") {
+            return Ok(serde_json::json!({
+                "zones": [{
+                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                    "syncToken": "adopted-cursor",
+                    "deleted": false
+                }]
+            }));
+        }
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(serde_json::json!({
+                "records": [{
+                    "recordName": "index-state",
+                    "recordType": "CheckIndexingState",
+                    "fields": {"state": {"value": "FINISHED"}}
+                }]
+            }));
+        }
+        if url.contains("/internal/records/query/batch") {
+            return Ok(album_count_response(0));
+        }
+        if url.contains("/records/query?") {
+            return Ok(serde_json::json!({
+                "records": [],
+                "syncToken": "adopted-cursor"
+            }));
+        }
+        if url.contains("/changes/zone?") {
+            return Ok(serde_json::json!({
+                "zones": [{
+                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                    "records": [],
+                    "syncToken": "adopted-cursor",
+                    "moreComing": false
+                }]
+            }));
+        }
+        if url.contains("/records/lookup?") {
+            return Ok(serde_json::json!({"records": []}));
+        }
+        anyhow::bail!("unexpected adoption epoch endpoint: {url}")
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
 #[tokio::test]
 async fn account_adoption_reopens_owned_state_and_runs_two_production_quiet_cycles() {
     use base64::Engine as _;
@@ -2264,11 +2324,13 @@ async fn account_adoption_reopens_owned_state_and_runs_two_production_quiet_cycl
                 .unwrap(),
         );
         let db: Arc<dyn download::DownloadStore> = inner.clone();
-        // The quiet synthetic source reports the retained cursor, rather than
-        // creating an artificial full-scan anchor or replacing historical work.
-        let library=make_run_cycle_library_state_with_album("PrimarySync","sync_token:PrimarySync",
-            make_full_album_with_session("PrimarySync",crate::test_helpers::MockPhotosSession::new()
-                .ok(serde_json::json!({"zones":[{"zoneID":{"zoneName":"PrimarySync"},"records":[],"syncToken":"adopted-cursor","moreComing":false}]}))));
+        // The first cycle must run the approved one-time epoch baseline with a
+        // realistic inventory response. The second cycle must then be quiet.
+        let library = make_run_cycle_library_state_with_album(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            make_full_album_with_boxed_session("PrimarySync", Box::new(AdoptionEpochSession)),
+        );
         let builder = make_run_cycle_download_config_builder(directory.path(), db.clone());
         let result = run_cycle(
             &[&library],
@@ -2284,10 +2346,18 @@ async fn account_adoption_reopens_owned_state_and_runs_two_production_quiet_cycl
         .unwrap();
         assert_eq!(result.stats.downloaded, 0, "cycle {cycle}");
         assert_eq!(result.failed_count, 0, "cycle {cycle}");
-        assert!(
-            result.stats.full_enumeration_reason.is_none(),
-            "cycle {cycle}: {result:?}"
-        );
+        if cycle == 0 {
+            assert_eq!(
+                result.stats.full_enumeration_reason,
+                Some(download::FullEnumerationReason::SyncEpochEnrollment),
+                "the approved first full must be the epoch enrollment baseline"
+            );
+        } else {
+            assert!(
+                result.stats.full_enumeration_reason.is_none(),
+                "cycle {cycle}: {result:?}"
+            );
+        }
         assert!(
             result.db_sync_token_advance_safe,
             "cycle {cycle}: {result:?}"

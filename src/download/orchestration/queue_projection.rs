@@ -176,7 +176,7 @@ pub(super) async fn admit_retained_work(
             ()=cancel.cancelled()=>break,
             confirmation=pass.album.confirm_catalog_asset(&identity.name)=>confirmation,
         };
-        let (body, master, records, reason) = match confirmation {
+        let (body, master, records, reason, bookmarked) = match confirmation {
             Ok(current) => {
                 let plan = planner
                     .plan_download_asset(&current.asset, &effective)
@@ -191,6 +191,20 @@ pub(super) async fn admit_retained_work(
                     } else {
                         ""
                     };
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let bookmarked = if reason.is_empty() {
+                    planner
+                        .persist_execution_publication_choices(
+                            &current.asset,
+                            &effective,
+                            &plan.tasks,
+                        )
+                        .await?
+                } else {
+                    false
+                };
                 let records = if reason.is_empty() {
                     plan.tasks
                         .iter()
@@ -204,9 +218,10 @@ pub(super) async fn admit_retained_work(
                     Some(current.asset.id().to_owned()),
                     records,
                     reason,
+                    bookmarked,
                 )
             }
-            Err(_unresolved) => (None, None, Vec::new(), "current_lookup_unresolved"),
+            Err(_unresolved) => (None, None, Vec::new(), "current_lookup_unresolved", false),
         };
         if cancel.is_cancelled() {
             break;
@@ -232,7 +247,13 @@ pub(super) async fn admit_retained_work(
             .await?;
         match admission {
             crate::state::db::provider_work::WorkAdmission::Admitted => admitted += 1,
-            crate::state::db::provider_work::WorkAdmission::Deferred => deferred += 1,
+            crate::state::db::provider_work::WorkAdmission::Deferred => {
+                anyhow::ensure!(
+                    !bookmarked,
+                    "Bookmarked storage choice admission was deferred"
+                );
+                deferred += 1;
+            }
         }
     }
     if admitted + deferred > 0 {

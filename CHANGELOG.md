@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- Removed `kei install` and `kei uninstall` together with service and host-service installer qualification. `kei service run`, `kei service status`, runtime configuration, notifications, watchdog, PID, metrics and platform service adapters remain.
+- Removed the dedicated missing-reference inventory diagnostic surface. Ordinary `kei doctor --json` and `--live` remain, and normal sync identity recovery is unchanged.
+- `support-export` now writes a one-shot current-state snapshot of build, configuration, immutable state, health and filesystem evidence. Support history is reported unavailable even when older support-history files exist; those files are never read, merged, renamed, deleted or recreated.
+- Existing recorded paths, layout journals and reservations keep their recorded destinations. Naming and path configuration affect new downloads only; no copy or reorganizer is introduced.
+
+### Fixed
+
+- Reset during an in-flight epoch baseline now refuses the older attempt and leaves the library pending. The next due baseline completes with a fresh attempt while retaining local receipts and pending obligations.
+- Different provider assets no longer share a path solely because their bytes match. Proven same-asset reuse and existing files are preserved; an unproved match may download a separate copy once.
+
 ## [0.26.0] - 2026-10-22
 
 ### Added

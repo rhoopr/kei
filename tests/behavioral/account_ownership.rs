@@ -44,11 +44,7 @@ fn seed(root: &Path, username: &'static str, label: &'static str, server: &str) 
     let provider_checksum =
         base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes));
     let conn = create_state_db(root, username);
-    conn.execute(
-        "UPDATE account_owner SET provider_key=?1",
-        [provider(label)],
-    )
-    .unwrap();
+    super::support::rebind_synthetic_provider(&conn, &provider(label));
     insert_asset(
         &conn,
         "overlap",
@@ -377,10 +373,8 @@ fn account_ownership_exact_alias_spellings_remain_separate_with_same_provider_pi
     let root = directory.path();
     let a = seed(root, ACCOUNTS[0], "A", "http://127.0.0.1:1");
     let b = seed(root, ACCOUNTS[1], "B", "http://127.0.0.1:1");
-    Connection::open(&b.path)
-        .unwrap()
-        .execute("UPDATE account_owner SET provider_key=?1", [provider("A")])
-        .unwrap();
+    let conn = Connection::open(&b.path).unwrap();
+    super::support::rebind_synthetic_provider(&conn, &provider("A"));
     let a_state = state(&a.path);
     let b_state = state(&b.path);
     for _ in 0..2 {
@@ -1821,4 +1815,96 @@ async fn private_selection_actual_cli_and_watch_reopen_independent_destination_d
         );
     }
     assert_eq!(std::fs::read(&account.media).unwrap(), old_bytes);
+}
+
+async fn epoch_ineligible_run_preserves_checkpoint(args: &[&str]) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(OfflinePhotos)
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let account = seed(root, ACCOUNTS[0], "A", &server.uri());
+    {
+        let conn = Connection::open(&account.path).unwrap();
+        conn.execute(
+            "DELETE FROM metadata WHERE key='sync_epoch_library:v1:PrimarySync'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata(key,value) VALUES('sync_token:PrimarySync','A-cursor')",
+            [],
+        )
+        .unwrap();
+    }
+    let out = command(root, &account, args);
+    success(&out);
+    let token_after_print = rows(
+        &account.path,
+        "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+    );
+    let record_after_print = rows(
+        &account.path,
+        "SELECT value FROM metadata WHERE key='sync_epoch_library:v1:PrimarySync'",
+    );
+    let before_real = server.received_requests().await.unwrap().len();
+    let out = command(root, &account, &["sync", "--no-progress-bar"]);
+    success(&out);
+    let real_requests = server.received_requests().await.unwrap();
+    let after_real = real_requests.len();
+    let real_paths = real_requests
+        .iter()
+        .skip(before_real)
+        .map(|request| request.url.path().to_owned())
+        .collect::<Vec<_>>();
+    let token_after_real = rows(
+        &account.path,
+        "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+    );
+    let record_after_real = rows(
+        &account.path,
+        "SELECT value FROM metadata WHERE key='sync_epoch_library:v1:PrimarySync'",
+    );
+    eprintln!(
+        "P2 args={args:?} token_after_print={token_after_print:?} record_after_print={record_after_print:?} \
+         before_real={before_real} after_real={after_real} real_paths={real_paths:?} token_after_real={token_after_real:?} record_after_real={record_after_real:?}"
+    );
+    assert_eq!(
+        token_after_print,
+        vec![vec![rusqlite::types::Value::Text("A-cursor".into())]],
+        "ineligible print-only sync must not clear the checkpoint"
+    );
+    assert!(
+        after_real > before_real,
+        "an immediate real sync must contact the provider after print-only"
+    );
+    let deferred_by_print = record_after_real.iter().any(|row| {
+        row.iter().any(|value| {
+            matches!(
+                value,
+                rusqlite::types::Value::Text(text)
+                    if text.contains("epoch_waiting_for_eligible_run")
+            )
+        })
+    });
+    assert!(
+        !deferred_by_print,
+        "an immediate real sync must not remain deferred by an ineligible print run"
+    );
+    assert!(
+        !token_after_real.is_empty() || !record_after_real.is_empty(),
+        "an immediate real sync must either checkpoint or retain due epoch work"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn epoch_only_print_must_not_clear_checkpoint_or_delay_real_sync() {
+    epoch_ineligible_run_preserves_checkpoint(&["sync", "--only-print-filenames"]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn epoch_retry_failed_must_not_clear_checkpoint_or_delay_real_sync() {
+    epoch_ineligible_run_preserves_checkpoint(&["sync", "--retry-failed"]).await;
 }

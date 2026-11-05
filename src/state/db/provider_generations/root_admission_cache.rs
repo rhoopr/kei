@@ -366,8 +366,10 @@ fn refresh_pending(conn: &Connection) -> Result<(), StateError> {
                 continue;
             }
             let manifest = super::load_decision(conn, &root, &pass, &child)?;
+            // Retained metadata writers are candidates too. Media consumers
+            // still recheck verified_media=0 in pending_reservations_for_keys.
             let eligible: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND admitted=1 AND verified_media=0)",
+                "SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND admitted=1 AND (verified_media=0 OR prepared_hash IS NOT NULL OR frozen_metadata IS NOT NULL))",
                 params![generation,pass,child], |r| r.get(0))?;
             if !eligible {
                 conn.execute("DELETE FROM temp.root_decision_dirty WHERE generation=?1 AND pass=?2 AND child=?3", params![generation,pass,child])?;
@@ -385,7 +387,7 @@ fn refresh_pending(conn: &Connection) -> Result<(), StateError> {
             super::guard_library_scope(conn, &root.spec.scope, library)?;
             for destination in &manifest.decision.destinations {
                 let pending: bool = conn.query_row(
-                    "SELECT admitted=1 AND verified_media=0 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
+                    "SELECT admitted=1 AND (verified_media=0 OR prepared_hash IS NOT NULL OR frozen_metadata IS NOT NULL) FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5",
                     params![generation,pass,child,destination.version_size,destination.path.key()?], |r| r.get(0))?;
                 if pending {
                     let path = super::super::primary_layout::path_key(&destination.path.to_path())?;
@@ -484,20 +486,19 @@ fn ensure(conn: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
-pub(super) fn guard_owners(
+fn owner_candidates(
     conn: &Connection,
-    receipt: &super::super::download_receipts::DownloadReceipt,
-) -> Result<(), StateError> {
+    path: &std::path::Path,
+) -> Result<Vec<OwnerKey>, StateError> {
     ensure(conn)?;
-    let key = super::super::primary_layout::path_key(&receipt.native_path.to_path())?;
-    let own = receipt.id()?;
+    let key = super::super::primary_layout::path_key(path)?;
     let candidates: Vec<OwnerKey> = conn
         .prepare("SELECT kind,a,b,c,d FROM temp.root_owner_candidates WHERE path=?1")?
         .query_map([&key], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
         .collect::<Result<_, _>>()?;
-    for (kind, a, b, c, d) in candidates {
+    for (kind, a, b, c, d) in &candidates {
         let native: Option<String> = match kind.as_str() {
             "asset" => conn.query_row(
                 "SELECT local_path FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path IS NOT NULL",
@@ -506,7 +507,7 @@ pub(super) fn guard_owners(
                 "SELECT local_path FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4",
                 params![a,b,c,d], |r| r.get(0)).optional()?,
             "receipt" => conn.query_row(
-                "SELECT native_path FROM download_receipts WHERE id=?1", [&a], |r| r.get(0)).optional()?,
+                "SELECT native_path FROM download_receipts WHERE id=?1", [a], |r| r.get(0)).optional()?,
             _ => return Err(invalid()),
         };
         let native = native.ok_or_else(invalid)?;
@@ -525,11 +526,177 @@ pub(super) fn guard_owners(
         if super::super::primary_layout::path_key(&path)? != key {
             return Err(invalid());
         }
+    }
+    Ok(candidates)
+}
+
+pub(super) fn guard_owners(
+    conn: &Connection,
+    receipt: &super::super::download_receipts::DownloadReceipt,
+) -> Result<(), StateError> {
+    let candidates = owner_candidates(conn, &receipt.native_path.to_path())?;
+    let own = receipt.id()?;
+    for (kind, a, b, c, _d) in candidates {
         if (kind == "receipt" && a != own)
             || (kind != "receipt"
                 && (a != receipt.library || b != receipt.state_id || c != receipt.version_size))
         {
             return Err(StateError::ProviderWorkConflict);
+        }
+    }
+    Ok(())
+}
+
+/// Storage intent only; final generation and held-file validation remain independent.
+pub(in crate::state::db) fn guard_publication_choice(
+    conn: &Connection,
+    binding: &super::super::PublicationBinding,
+    reservation: &super::super::ReconciliationReservation,
+    requested: &std::path::Path,
+) -> Result<(), StateError> {
+    use super::super::{download_receipts, identity, primary_layout};
+    binding.validate(conn)?;
+    let logical = |library: &str, state: &str| -> Result<bool, StateError> {
+        let mut statement = conn.prepare("SELECT library,master_record_name,asset_record_name FROM legacy_master_state_owners WHERE library=?1 AND master_record_name IN (?2,?3)")?;
+        let claims = statement
+            .query_map(params![binding.library, binding.state_id, state], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+        Ok(identity::same_logical_asset(
+            &binding.library,
+            &binding.state_id,
+            &binding.child,
+            library,
+            state,
+            &identity::LegacyOwnersByLibrary::from_rows(claims),
+        ))
+    };
+    let content = reservation.content.as_ref().ok_or_else(invalid)?;
+    let destination = &reservation.destination_path;
+    let p = primary_layout::path_key(requested)?;
+    let s = primary_layout::path_key(destination)?;
+    if p == s
+        || !logical(&binding.library, &binding.state_id)?
+        || reservation.library.as_ref() != binding.library
+        || reservation.asset_id.as_ref() != binding.state_id
+        || crate::fs_util::confined_path_key(requested).map_err(|_error| invalid())?
+            != reservation.requested_path_key.0
+        || crate::fs_util::confined_path_key(destination).map_err(|_error| invalid())?
+            != reservation.destination_path_key.0
+    {
+        return Err(invalid());
+    }
+    let version = reservation.version_size.as_str();
+    let mut source = Vec::new();
+    for rendition in std::iter::once(version).chain((version == "adjusted").then_some("original")) {
+        for receipt in download_receipts::historical(
+            conn,
+            &binding.scope,
+            &binding.child,
+            &binding.master,
+            rendition,
+        )? {
+            if primary_layout::path_key(&receipt.native_path.to_path())? == p
+                && receipt.account_key == binding.account_key
+                && receipt.provider_key == binding.provider_key
+                && logical(&receipt.library, &receipt.state_id)?
+                && receipt.fulfills_pass(&binding.origin_pass)
+                && (receipt.version_size != version
+                    || receipt.provider_checksum != content.checksum.as_ref()
+                    || receipt.provider_size != content.size)
+            {
+                source.push(receipt);
+            }
+        }
+    }
+    if source.is_empty() {
+        return Err(StateError::ProviderWorkConflict);
+    }
+    let compatible = |rendition: &str, checksum: &str, size: Option<u64>, is_source| {
+        if is_source {
+            source.iter().any(|r| {
+                r.version_size == rendition
+                    && r.provider_checksum == checksum
+                    && size.is_none_or(|s| s == r.provider_size)
+            })
+        } else {
+            rendition == version
+                && checksum == content.checksum.as_ref()
+                && size.is_none_or(|s| s == content.size)
+        }
+    };
+    for (path, is_source) in [(requested, true), (destination.as_path(), false)] {
+        for (kind, a, b, c, d) in owner_candidates(conn, path)? {
+            if kind == "receipt" {
+                let receipt = download_receipts::load(conn, &a)?.ok_or_else(invalid)?;
+                if receipt.account_key != binding.account_key
+                    || receipt.provider_key != binding.provider_key
+                    || receipt.scope != binding.scope
+                    || receipt.child != binding.child
+                    || receipt.master != binding.master
+                    || !logical(&receipt.library, &receipt.state_id)?
+                    || !receipt.fulfills_pass(&binding.origin_pass)
+                    || !compatible(
+                        &receipt.version_size,
+                        &receipt.provider_checksum,
+                        Some(receipt.provider_size),
+                        is_source,
+                    )
+                {
+                    return Err(StateError::ProviderWorkConflict);
+                }
+            } else {
+                if !logical(&a, &b)? {
+                    return Err(StateError::ProviderWorkConflict);
+                }
+                let (checksum, size, valid): (String, Option<i64>, bool) = if kind == "asset" {
+                    conn.query_row("SELECT checksum,size_bytes,is_deleted=0 AND capture_repair_output_checksum IS NULL AND (status IN ('pending','downloaded') OR (?4 AND status='failed')) FROM assets WHERE library=?1 AND id=?2 AND version_size=?3", params![a,b,c,!is_source], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?
+                } else {
+                    conn.query_row("SELECT provider_checksum,NULL,capture_repair_output_checksum IS NULL FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4", params![a,b,c,d], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?
+                };
+                let size = size
+                    .map(u64::try_from)
+                    .transpose()
+                    .map_err(|_error| invalid())?;
+                if !valid || !compatible(&c, &checksum, size, is_source) {
+                    return Err(StateError::ProviderWorkConflict);
+                }
+            }
+        }
+        let chosen = primary_layout::path_key(path)?;
+        for pending in super::pending_destination_reservations_for_path(conn, path)? {
+            if primary_layout::path_key(&pending.destination_path)? != chosen {
+                continue;
+            }
+            if !logical(&pending.library, &pending.asset_id)?
+                || !pending.content.as_ref().is_some_and(|v| {
+                    compatible(
+                        pending.version_size.as_str(),
+                        &v.checksum,
+                        Some(v.size),
+                        is_source,
+                    )
+                })
+            {
+                return Err(StateError::ProviderWorkConflict);
+            }
+        }
+    }
+    if primary_layout::path_is_readonly(conn, destination)? {
+        return Err(StateError::ProviderWorkConflict);
+    }
+    primary_layout::guard_writer(conn, destination)?;
+    super::super::legacy_preservation::guard_writer(conn, destination)?;
+    for (generation, pass, child) in pending_keys_for_path(conn, destination)? {
+        let protected: Vec<String> = conn.prepare("SELECT path FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND (prepared_hash IS NOT NULL OR frozen_metadata IS NOT NULL)")?
+            .query_map(params![generation,pass,child], |r| r.get(0))?.collect::<Result<_,_>>()?;
+        for native in protected {
+            let path: super::super::provider_selection::SelectionPath =
+                serde_json::from_str(&native).map_err(|_error| invalid())?;
+            if primary_layout::path_key(&path.to_path())? == s {
+                return Err(StateError::ProviderWorkConflict);
+            }
         }
     }
     Ok(())
@@ -572,7 +739,7 @@ mod tests {
              CREATE TABLE download_receipts(id TEXT PRIMARY KEY,native_path TEXT NOT NULL);
              CREATE TABLE provider_active_generations(id TEXT PRIMARY KEY,specification BLOB);
              CREATE TABLE provider_active_decisions(generation TEXT NOT NULL,pass_key TEXT NOT NULL,child TEXT NOT NULL,manifest_hash TEXT,PRIMARY KEY(generation,pass_key,child));
-             CREATE TABLE provider_active_destinations(generation TEXT NOT NULL,pass_key TEXT NOT NULL,child TEXT NOT NULL,path TEXT,grouping_hash TEXT,admitted INTEGER,verified_media INTEGER);
+              CREATE TABLE provider_active_destinations(generation TEXT NOT NULL,pass_key TEXT NOT NULL,child TEXT NOT NULL,path TEXT,grouping_hash TEXT,admitted INTEGER,verified_media INTEGER,prepared_hash TEXT,frozen_metadata BLOB);
              CREATE TABLE provider_active_sources(generation TEXT NOT NULL,pass_key TEXT NOT NULL,child TEXT NOT NULL);
              CREATE TABLE provider_selection_rank_pages(id TEXT PRIMARY KEY,generation TEXT NOT NULL);
              CREATE TABLE provider_selection_rank_records(page_id TEXT NOT NULL);",
@@ -587,6 +754,155 @@ mod tests {
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn publication_choice_live_payloads_reject_foreign_aliases_and_rollback() {
+        use super::super::super::{
+            PublicationBinding, ReconciliationContent, ReconciliationPathKey,
+            ReconciliationReservation, download_receipts::DownloadReceipt,
+            provider_selection::SelectionPath,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("choice.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        crate::state::schema::migrate(&conn).unwrap();
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS account_owner(singleton INTEGER PRIMARY KEY,version INTEGER,account_key TEXT,provider_key TEXT); INSERT INTO account_owner VALUES(1,1,'account','provider'); BEGIN IMMEDIATE;").unwrap();
+        let binding = PublicationBinding { account_key:"account".into(), provider_key:"provider".into(),
+            scope:r#"{"database":"private","zone":{"zoneName":"L","ownerRecordName":"_defaultOwner"}}"#.into(),
+            library:"L".into(), child:"child".into(), master:"master".into(),state_id:"child".into(),origin_pass:"pass".into() };
+        let p = dir.path().join("Photo 10 AM.JPG");
+        let s = dir.path().join("Sibling 10 AM.JPG");
+        let source = DownloadReceipt {
+            account_key: binding.account_key.clone(),
+            provider_key: binding.provider_key.clone(),
+            scope: binding.scope.clone(),
+            library: "L".into(),
+            child: "child".into(),
+            master: "master".into(),
+            state_id: "child".into(),
+            origin_pass: "pass".into(),
+            version_size: "original".into(),
+            provider_checksum: "old".into(),
+            provider_size: 3,
+            native_path: SelectionPath::from_path(&p),
+            source_checksum: "a".repeat(64),
+            local_checksum: "a".repeat(64),
+        };
+        source.save(&conn).unwrap();
+        let reservation = ReconciliationReservation {
+            library: "L".into(),
+            asset_id: "child".into(),
+            version_size: crate::state::VersionSizeKey::Adjusted,
+            requested_path_key: ReconciliationPathKey(
+                crate::fs_util::confined_path_key(&p).unwrap(),
+            ),
+            destination_path_key: ReconciliationPathKey(
+                crate::fs_util::confined_path_key(&s).unwrap(),
+            ),
+            destination_path: s.clone(),
+            content: Some(ReconciliationContent {
+                checksum: "new".into(),
+                size: 4,
+            }),
+        };
+        let check = || guard_publication_choice(&conn, &binding, &reservation, &p);
+        check().unwrap();
+        for path in [&p, &s] {
+            for alias in [false, true] {
+                let path = if alias {
+                    path.with_file_name(
+                        path.file_name()
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .replace(" AM", "AM")
+                            .to_lowercase(),
+                    )
+                } else {
+                    path.to_path_buf()
+                };
+                for kind in ["asset", "metadata", "receipt"] {
+                    conn.execute_batch("SAVEPOINT foreign_owner").unwrap();
+                    match kind {
+                        "asset" => {
+                            conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,last_seen_at,local_path) VALUES('L','foreign','original','old','photo',0,3,'photo',0,?1)",[path.to_str().unwrap()]).unwrap();
+                        }
+                        "metadata" => {
+                            conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum) VALUES('L','foreign','original',?1,'old')",[path.to_str().unwrap()]).unwrap();
+                        }
+                        "receipt" => {
+                            let mut foreign = source.clone();
+                            foreign.child = "foreign".into();
+                            foreign.state_id = "foreign".into();
+                            foreign.native_path = SelectionPath::from_path(&path);
+                            foreign.save(&conn).unwrap();
+                        }
+                        _ => panic!("unexpected owner fixture kind: {kind}"),
+                    }
+                    assert!(check().is_err(), "{kind} at {path:?}");
+                    conn.execute_batch("ROLLBACK TO foreign_owner; RELEASE foreign_owner")
+                        .unwrap();
+                    check().unwrap();
+                }
+            }
+        }
+        conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,last_seen_at,local_path,status) VALUES('L','child','original','old','photo',0,3,'photo',0,?1,'downloaded')",[p.to_str().unwrap()]).unwrap();
+        conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,preserved_path_key) VALUES('L','child','original',?1,'old',?2)",params![p.to_str().unwrap(),super::super::super::primary_layout::path_key(&p).unwrap()]).unwrap();
+        check().unwrap();
+        for mutation in [
+            "UPDATE assets SET checksum='mutated' WHERE id='child'",
+            "UPDATE assets SET status='failed' WHERE id='child'",
+            "UPDATE asset_metadata_paths SET provider_checksum='mutated' WHERE id='child'",
+            "UPDATE download_receipts SET provider_checksum='mutated' WHERE state_id='child'",
+        ] {
+            conn.execute_batch("SAVEPOINT payload").unwrap();
+            conn.execute_batch(mutation).unwrap();
+            assert!(check().is_err(), "{mutation}");
+            conn.execute_batch("ROLLBACK TO payload; RELEASE payload")
+                .unwrap();
+            check().unwrap();
+        }
+        conn.execute_batch("SAVEPOINT read_error; DROP TABLE asset_metadata_paths")
+            .unwrap();
+        assert!(check().is_err());
+        conn.execute_batch("ROLLBACK TO read_error; RELEASE read_error")
+            .unwrap();
+        check().unwrap();
+        conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,last_seen_at,local_path,status) VALUES('L','legacy','adjusted','new','photo',0,4,'photo',0,?1,'pending')",[s.to_str().unwrap()]).unwrap();
+        assert!(check().is_err());
+        conn.execute_batch("INSERT INTO legacy_master_state_owners(library,master_record_name,asset_record_name,claimed_at) VALUES('L','legacy','child',0)").unwrap();
+        check().unwrap();
+        for mutation in [
+            "UPDATE legacy_master_state_owners SET asset_record_name='foreign'",
+            "UPDATE assets SET checksum='wrong' WHERE id='legacy'",
+            "UPDATE assets SET is_deleted=1 WHERE id='legacy'",
+            "UPDATE assets SET capture_repair_output_checksum='prepared' WHERE id='legacy'",
+        ] {
+            conn.execute_batch("SAVEPOINT destination").unwrap();
+            conn.execute_batch(mutation).unwrap();
+            assert!(check().is_err(), "{mutation}");
+            conn.execute_batch("ROLLBACK TO destination; RELEASE destination")
+                .unwrap();
+            check().unwrap();
+        }
+        conn.execute_batch("SAVEPOINT readonly").unwrap();
+        conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,preserved_path_key) VALUES('L','legacy','adjusted',?1,'new',?2)",params![s.to_str().unwrap(),super::super::super::primary_layout::path_key(&s).unwrap()]).unwrap();
+        assert!(check().is_err());
+        conn.execute_batch("ROLLBACK TO readonly; RELEASE readonly; COMMIT")
+            .unwrap();
+        let other = Connection::open(&path).unwrap();
+        other.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,last_seen_at,local_path) VALUES('L','foreign','adjusted','new','photo',0,4,'photo',0,?1)",[s.to_str().unwrap()]).unwrap();
+        conn.execute_batch("BEGIN").unwrap();
+        assert!(check().is_err());
+        conn.execute_batch("ROLLBACK").unwrap();
+        other
+            .execute("DELETE FROM assets WHERE id='foreign'", [])
+            .unwrap();
+        let reopened = Connection::open(&path).unwrap();
+        reopened.execute_batch("BEGIN").unwrap();
+        guard_publication_choice(&reopened, &binding, &reservation, &p).unwrap();
+        reopened.execute_batch("COMMIT").unwrap();
     }
 
     #[test]

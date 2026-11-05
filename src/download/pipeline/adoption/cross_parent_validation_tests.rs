@@ -77,22 +77,25 @@ async fn v027_cross_parent_validation_defers_content_proof_to_atomic_matcher() {
                 rusqlite::params![record.library.as_ref(), record.id.as_ref()],
             )
             .unwrap();
-        db.reserve_reconciliation_paths(&[ReconciliationReservation {
-            library: record.library.clone(),
-            asset_id: record.id.clone(),
-            version_size: record.version_size,
-            requested_path_key: ReconciliationPathKey(
-                crate::fs_util::confined_path_key(&derived.path).unwrap(),
-            ),
-            destination_path_key: ReconciliationPathKey(
-                crate::fs_util::confined_path_key(&old).unwrap(),
-            ),
-            destination_path: old.clone(),
-            content: Some(ReconciliationContent {
-                checksum: record.checksum.clone(),
-                size: record.size_bytes,
-            }),
-        }])
+        db.reserve_reconciliation_paths(
+            &[ReconciliationReservation {
+                library: record.library.clone(),
+                asset_id: record.id.clone(),
+                version_size: record.version_size,
+                requested_path_key: ReconciliationPathKey(
+                    crate::fs_util::confined_path_key(&derived.path).unwrap(),
+                ),
+                destination_path_key: ReconciliationPathKey(
+                    crate::fs_util::confined_path_key(&old).unwrap(),
+                ),
+                destination_path: old.clone(),
+                content: Some(ReconciliationContent {
+                    checksum: record.checksum.clone(),
+                    size: record.size_bytes,
+                }),
+            }],
+            None,
+        )
         .await
         .unwrap();
         let before = std::fs::read(&old).unwrap();

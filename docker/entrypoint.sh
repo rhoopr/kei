@@ -2,8 +2,8 @@
 # kei container entrypoint.
 #
 # When PUID and PGID are set, drops to that UID:GID via gosu after
-# fixing ownership of /config and /photos, except for support-export and missing-reference inventory.
-# These diagnostic commands never traverse or repair either volume. KEI_CHOWN_PHOTOS=0 skips
+# fixing ownership of /config and /photos, except for support-export.
+# That command never traverses or repairs either volume. KEI_CHOWN_PHOTOS=0 skips
 # /photos repair. Without PUID/PGID, runs as root without changing ownership.
 #
 # `kei` subcommand list is hard-coded to avoid colliding with debian
@@ -18,7 +18,7 @@ elif [ "${1#-}" != "$1" ]; then
     set -- kei "$@"
 else
     case "$1" in
-        sync | login | list | password | reset | config | status | doctor | support-export | manifest | verify | reconcile | import-existing | migrate-state | install | uninstall | service | help)
+        sync | login | list | password | reset | config | status | doctor | support-export | manifest | verify | reconcile | import-existing | migrate-state | service | help)
             set -- kei "$@"
             ;;
         *)

@@ -41,9 +41,7 @@ pub(super) async fn capture_repair_is_verified(
         let Ok(probe) = crate::download::metadata::probe_exif(&path) else {
             return false;
         };
-        if !probe.denotes_capture_time(&created_local)
-            || probe.offset_time_original.as_deref() != Some(expected_offset.as_str())
-        {
+        if !probe.denotes_capture_time_with_offset(&created_local, &expected_offset) {
             return false;
         }
         matches!(

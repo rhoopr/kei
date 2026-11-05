@@ -25,7 +25,7 @@ def field(body: str, name: str) -> str:
 
 
 def evaluate(expression: str, *, event='pull_request', action='synchronize', draft=False,
-             label='', base_changed=False, mode='', service='', run_id=91):
+             label='', base_changed=False, mode='', run_id=91):
     # Evaluate only expressions used by ci.yml. actionlint checks GitHub syntax;
     # these tests exercise the actual checked-in strings against the event matrix.
     if '${{' in expression:
@@ -40,7 +40,6 @@ def evaluate(expression: str, *, event='pull_request', action='synchronize', dra
         'github.run_id': run_id,
         'github.ref': 'refs/heads/main',
         'needs.plan.outputs.qualification': mode,
-        'needs.plan.outputs.service': service,
     }
     for key, value in values.items():
         expression = expression.replace(key, repr(value))
@@ -56,10 +55,8 @@ class DraftPRTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.ci = (ROOT / '.github/workflows/ci.yml').read_text()
-        cls.reusable = (ROOT / '.github/workflows/service-smoke.yml').read_text()
         cls.plan = job('ci.yml', 'plan')
         cls.checks = job('ci.yml', 'checks')
-        cls.service = job('ci.yml', 'service')
         cls.qualification = job('ci.yml', 'qualification')
         cls.aggregate = job('ci.yml', 'ci')
         cls.ignored = re.search(r'^  CI_IGNORED: (.+)$', cls.ci, re.MULTILINE)[1]
@@ -67,16 +64,16 @@ class DraftPRTests(unittest.TestCase):
         cls.scripts = [textwrap.dedent(body) for body in re.findall(
             r'^        run: \|\n((?:^          .*\n|^\n)+)', cls.aggregate, re.MULTILINE)]
 
-    def run_gate(self, draft: bool, mode: str, results: dict, service='false'):
+    def run_gate(self, draft: bool, mode: str, results: dict):
         script = self.scripts[0] if draft else self.scripts[1]
         return subprocess.run(['bash', '-e', '-c', script], cwd=ROOT,
-                              env={**os.environ, 'QUALIFICATION': mode, 'SERVICE': service,
+                              env={**os.environ, 'QUALIFICATION': mode,
                                    'NEEDS': json.dumps(results)},
                               capture_output=True, text=True, check=False)
 
     def test_entry_points_and_required_marker(self):
         self.assertEqual(field(self.aggregate, 'if'), 'always()')
-        self.assertIn('needs: [plan, checks, service, qualification]', self.aggregate)
+        self.assertIn('needs: [plan, checks, qualification]', self.aggregate)
         self.assertEqual(len(self.scripts), 2)
         self.assertIn("if: env.CI_IGNORED != 'true' && github.event_name == 'pull_request' && github.event.pull_request.draft", self.aggregate)
         self.assertLess(self.aggregate.index('name: Defer validation for draft PRs'),
@@ -92,8 +89,6 @@ class DraftPRTests(unittest.TestCase):
         # Metadata has no checkout or gate and cannot emit a check named CI.
         self.assertIn("if: env.CI_IGNORED != 'true'\n        with:", self.aggregate)
         self.assertIn("routed work\n        if: env.CI_IGNORED != 'true'", self.aggregate)
-        self.assertNotIn('  pull_request:', self.reusable)
-        self.assertIn('  workflow_call:', self.reusable)
 
     def test_actual_event_expressions_isolate_metadata_and_admit_retargets(self):
         cases = [(a, '', False, False) for a in ('opened', 'synchronize', 'reopened',
@@ -126,8 +121,7 @@ class DraftPRTests(unittest.TestCase):
                                       ('true', 'qualification', 'checks')):
             for draft in (True, False, True, False):
                 needs = {'plan': {'result': 'skipped' if draft else 'success'},
-                         selected: {'result': 'skipped'}, other: {'result': 'skipped'},
-                         'service': {'result': 'skipped'}}
+                         selected: {'result': 'skipped'}, other: {'result': 'skipped'}}
                 result = self.run_gate(draft, mode, needs)
                 self.assertNotEqual(result.returncode, 0)
                 if draft:
@@ -136,33 +130,30 @@ class DraftPRTests(unittest.TestCase):
                     needs[selected]['result'] = 'success'
                     self.assertEqual(self.run_gate(False, mode, needs).returncode, 0)
 
-    def test_gate_rejects_each_selected_service_or_quality_failure(self):
-        for mode, service, selected in [('false', 'false', ['plan', 'checks']),
-                                        ('false', 'true', ['plan', 'checks', 'service']),
-                                        ('true', 'true', ['plan', 'qualification'])]:
+    def test_gate_rejects_each_selected_quality_failure(self):
+        for mode, selected in [('false', ['plan', 'checks']), ('true', ['plan', 'qualification'])]:
             needs = {name: {'result': 'success' if name in selected else 'skipped'}
-                     for name in ('plan', 'checks', 'service', 'qualification')}
-            self.assertEqual(self.run_gate(False, mode, needs, service).returncode, 0)
+                     for name in ('plan', 'checks', 'qualification')}
+            self.assertEqual(self.run_gate(False, mode, needs).returncode, 0)
             for name in selected:
                 for outcome in (None, 'failure', 'cancelled', 'skipped', 'timed_out'):
-                    with self.subTest(mode=mode, service=service, failed=name, outcome=outcome):
+                    with self.subTest(mode=mode, failed=name, outcome=outcome):
                         changed = {key: dict(value) for key, value in needs.items()}
                         if outcome is None:
                             del changed[name]
                         else:
                             changed[name]['result'] = outcome
-                        self.assertNotEqual(self.run_gate(False, mode, changed, service).returncode, 0)
+                        self.assertNotEqual(self.run_gate(False, mode, changed).returncode, 0)
             # Unexpected optional failures also fail closed.
             for name in set(needs) - set(selected):
                 self.assertNotEqual(self.run_gate(False, mode,
-                    {**needs, name: {'result': 'failure'}}, service).returncode, 0)
-        for mode, service in [('', 'false'), ('false', ''), ('false', 'invalid')]:
-            self.assertNotEqual(self.run_gate(False, mode, {}, service).returncode, 0)
+                    {**needs, name: {'result': 'failure'}}).returncode, 0)
+        self.assertNotEqual(self.run_gate(False, '', {}).returncode, 0)
 
-    def test_event_change_matrix_keeps_service_once_and_heavy_stages(self):
+    def test_event_change_matrix_keeps_heavy_stages_once(self):
         paths = ['README.md', 'docs/architecture.md', 'scripts/check-contracts',
                  'src/auth/session.rs', 'src/download/file/publication.rs', 'src/service/linux.rs',
-                 'src/commands/service/types.rs', 'src/inventory_diagnostic/tests.rs',
+                 'src/commands/service/types.rs', 'src/state/db/checkpoints/tests.rs',
                  'tests/cli.rs', 'tests/data/media-manifest.json', 'Cargo.toml', 'build.rs',
                  'Dockerfile', '.github/workflows/release.yml', '.github/workflows/ci.yml',
                  '.github/workflows/checks.yml', 'scripts/ci/nightly.py',
@@ -188,22 +179,18 @@ class DraftPRTests(unittest.TestCase):
                         plan_runs = bool(evaluate(field(self.plan, 'if'), **args))
                         full = action == 'labeled' and label == 'ci:full'
                         result = route([path] if event == 'pull_request' else [], event, False, light, full)
-                        outputs = dict(args, mode=json.dumps(result['qualification']),
-                                       service=json.dumps(result['service']))
+                        outputs = dict(args, mode=json.dumps(result['qualification']))
                         quality = plan_runs and bool(evaluate(field(self.checks, 'if'), **outputs))
                         heavy = plan_runs and bool(evaluate(field(self.qualification, 'if'), **outputs))
-                        native = plan_runs and bool(evaluate(field(self.service, 'if'), **outputs))
                         with self.subTest(path=path, **args, light=light):
                             self.assertEqual(int(quality) + int(heavy), int(plan_runs))
-                            self.assertEqual(int(native) + int(heavy), int(plan_runs and (result['service'] or heavy)))
-                            self.assertFalse(native and heavy)
                             if event != 'pull_request':
                                 self.assertTrue(plan_runs)
                                 for key in ('code', 'platform', 'stress'):
                                     self.assertTrue(result[key])
                             if heavy:
                                 checks = route([path], event, True, light, full)
-                                for key in ('code', 'platform', 'stress', 'coverage', 'unused', 'service'):
+                                for key in ('code', 'platform', 'stress', 'coverage', 'unused'):
                                     self.assertTrue(checks[key])
         for event in ('schedule', 'push', 'workflow_dispatch'):
             self.assertTrue(route([], event, True, True, False)['qualification'])

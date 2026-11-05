@@ -72,18 +72,21 @@ async fn collision_fixture(
     .await
     .unwrap();
     let key = crate::fs_util::confined_path_key(&unsuffixed).unwrap();
-    db.reserve_reconciliation_paths(&[ReconciliationReservation {
-        library: Arc::from("PrimarySync"),
-        asset_id: "FOREIGN".into(),
-        version_size: VersionSizeKey::Original,
-        content: Some(ReconciliationContent {
-            checksum: "foreign-provider-generation".into(),
-            size: bytes.len() as u64,
-        }),
-        requested_path_key: ReconciliationPathKey(key.clone()),
-        destination_path_key: ReconciliationPathKey(key),
-        destination_path: unsuffixed.clone(),
-    }])
+    db.reserve_reconciliation_paths(
+        &[ReconciliationReservation {
+            library: Arc::from("PrimarySync"),
+            asset_id: "FOREIGN".into(),
+            version_size: VersionSizeKey::Original,
+            content: Some(ReconciliationContent {
+                checksum: "foreign-provider-generation".into(),
+                size: bytes.len() as u64,
+            }),
+            requested_path_key: ReconciliationPathKey(key.clone()),
+            destination_path_key: ReconciliationPathKey(key),
+            destination_path: unsuffixed.clone(),
+        }],
+        None,
+    )
     .await
     .unwrap();
     config.state_db = Some(db.clone());
@@ -365,18 +368,21 @@ async fn v027_full_and_collecting_reservation_write_failure_precedes_get_and_ret
             json!(data_encoding::BASE64.encode(&[0xa7_u8; 32]));
         let held = root.path().join("media/held.jpg");
         let key = crate::fs_util::confined_path_key(&held).unwrap();
-        db.reserve_reconciliation_paths(&[ReconciliationReservation {
-            library: Arc::from("PrimarySync"),
-            asset_id: "UNRELATED".into(),
-            version_size: VersionSizeKey::Original,
-            content: Some(ReconciliationContent {
-                checksum: "held".into(),
-                size: 1,
-            }),
-            requested_path_key: ReconciliationPathKey(key.clone()),
-            destination_path_key: ReconciliationPathKey(key),
-            destination_path: held,
-        }])
+        db.reserve_reconciliation_paths(
+            &[ReconciliationReservation {
+                library: Arc::from("PrimarySync"),
+                asset_id: "UNRELATED".into(),
+                version_size: VersionSizeKey::Original,
+                content: Some(ReconciliationContent {
+                    checksum: "held".into(),
+                    size: 1,
+                }),
+                requested_path_key: ReconciliationPathKey(key.clone()),
+                destination_path_key: ReconciliationPathKey(key),
+                destination_path: held,
+            }],
+            None,
+        )
         .await
         .unwrap();
         let before = db.get_reconciliation_reservations().await.unwrap();

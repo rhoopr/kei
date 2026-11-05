@@ -25,10 +25,10 @@ async fn reconciliation_reservations_round_trip_and_reject_conflicts_atomically(
         destination_path_key: ReconciliationPathKey(destination.to_str().unwrap().into()),
         destination_path: destination,
     };
-    db.reserve_reconciliation_paths(std::slice::from_ref(&reservation))
+    db.reserve_reconciliation_paths(std::slice::from_ref(&reservation), None)
         .await
         .unwrap();
-    db.reserve_reconciliation_paths(std::slice::from_ref(&reservation))
+    db.reserve_reconciliation_paths(std::slice::from_ref(&reservation), None)
         .await
         .unwrap();
     drop(db);
@@ -45,7 +45,7 @@ async fn reconciliation_reservations_round_trip_and_reject_conflicts_atomically(
     let mut foreign = reservation.clone();
     foreign.library = Arc::from("SharedSync");
     assert!(
-        db.reserve_reconciliation_paths(&[new_choice.clone(), foreign])
+        db.reserve_reconciliation_paths(&[new_choice.clone(), foreign], None)
             .await
             .is_err()
     );
@@ -58,14 +58,14 @@ async fn reconciliation_reservations_round_trip_and_reject_conflicts_atomically(
     let mut changed_choice = new_choice;
     changed_choice.requested_path_key = reservation.requested_path_key.clone();
     assert!(
-        db.reserve_reconciliation_paths(&[changed_choice])
+        db.reserve_reconciliation_paths(&[changed_choice], None)
             .await
             .is_err()
     );
     let mut foreign_version = reservation.clone();
     foreign_version.version_size = VersionSizeKey::Medium;
     assert!(
-        db.reserve_reconciliation_paths(&[foreign_version])
+        db.reserve_reconciliation_paths(&[foreign_version], None)
             .await
             .is_err()
     );
@@ -78,7 +78,7 @@ async fn reconciliation_reservations_round_trip_and_reject_conflicts_atomically(
     // Retain both request mappings without weakening foreign-owner checks.
     let mut changed_template = reservation;
     changed_template.requested_path_key = ReconciliationPathKey("changed-template".into());
-    db.reserve_reconciliation_paths(&[changed_template])
+    db.reserve_reconciliation_paths(&[changed_template], None)
         .await
         .unwrap();
     assert_eq!(db.get_reconciliation_reservations().await.unwrap().len(), 2);
@@ -98,7 +98,7 @@ async fn reconciliation_reservations_keep_each_content_generation_immutable() {
         destination_path_key: ReconciliationPathKey("legacy".into()),
         destination_path: root.path().join("legacy.jpg"),
     };
-    db.reserve_reconciliation_paths(std::slice::from_ref(&legacy))
+    db.reserve_reconciliation_paths(std::slice::from_ref(&legacy), None)
         .await
         .unwrap();
     let mut choices = vec![legacy.clone()];
@@ -113,7 +113,7 @@ async fn reconciliation_reservations_keep_each_content_generation_immutable() {
             choice.destination_path_key = old.destination_path_key.clone();
             choice.destination_path = old.destination_path.clone();
             assert!(
-                db.reserve_reconciliation_paths(std::slice::from_ref(&choice))
+                db.reserve_reconciliation_paths(std::slice::from_ref(&choice), None)
                     .await
                     .is_err()
             );
@@ -121,16 +121,20 @@ async fn reconciliation_reservations_keep_each_content_generation_immutable() {
         choice.destination_path = root.path().join(format!("{checksum}-{size}.jpg"));
         choice.destination_path_key =
             ReconciliationPathKey(choice.destination_path.to_str().unwrap().into());
-        db.reserve_reconciliation_paths(std::slice::from_ref(&choice))
+        db.reserve_reconciliation_paths(std::slice::from_ref(&choice), None)
             .await
             .unwrap();
-        db.reserve_reconciliation_paths(std::slice::from_ref(&choice))
+        db.reserve_reconciliation_paths(std::slice::from_ref(&choice), None)
             .await
             .unwrap();
         let mut moved = choice.clone();
         moved.destination_path_key = ReconciliationPathKey("different".into());
         moved.destination_path = root.path().join("different.jpg");
-        assert!(db.reserve_reconciliation_paths(&[moved]).await.is_err());
+        assert!(
+            db.reserve_reconciliation_paths(&[moved], None)
+                .await
+                .is_err()
+        );
         choices.push(choice);
     }
     let mut oversized = legacy;
@@ -138,7 +142,11 @@ async fn reconciliation_reservations_keep_each_content_generation_immutable() {
         checksum: "oversized".into(),
         size: u64::MAX,
     });
-    assert!(db.reserve_reconciliation_paths(&[oversized]).await.is_err());
+    assert!(
+        db.reserve_reconciliation_paths(&[oversized], None)
+            .await
+            .is_err()
+    );
     drop(db);
     let db = SqliteStateDb::open(&path).await.unwrap();
     let saved = db.get_reconciliation_reservations().await.unwrap();

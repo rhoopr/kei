@@ -365,10 +365,6 @@ pub struct StatusArgs {
 /// Arguments for local diagnostics.
 #[derive(Parser, Debug, Clone)]
 pub struct DoctorArgs {
-    /// Inventory missing parent references using cached auth only; no media or catalogue access
-    #[arg(long, requires_all = ["live", "json"])]
-    pub missing_reference_inventory: bool,
-
     /// Emit a redacted JSON diagnostics report
     #[arg(long)]
     pub json: bool,
@@ -551,40 +547,6 @@ pub enum ConfigAction {
     },
 }
 
-/// Arguments for `kei install`.
-///
-/// Per-platform defaults: Linux installs a per-user systemd unit unless
-/// `--system` is passed; macOS installs a per-user launchd agent; Windows
-/// registers the service with the Service Control Manager under the
-/// current user's account.
-#[derive(Args, Debug, Clone)]
-pub struct InstallArgs {
-    /// Install per-user (Linux/macOS default; ignored on Windows).
-    #[arg(long, conflicts_with = "system")]
-    pub user: bool,
-
-    /// Install system-wide (Linux only; requires root). On macOS and
-    /// Windows this is rejected with a pointer to the per-user install.
-    #[arg(long, conflicts_with = "user")]
-    pub system: bool,
-
-    /// Render the service artifact and report what would happen, without
-    /// writing files or invoking the platform service manager (no
-    /// `systemctl daemon-reload`, no `launchctl bootstrap`, no SCM
-    /// `CreateService`).
-    #[arg(long)]
-    pub dry_run: bool,
-}
-
-/// Arguments for `kei uninstall`.
-#[derive(Args, Debug, Clone)]
-pub struct UninstallArgs {
-    /// Also remove the state database, configuration, and stored
-    /// credentials. Default off: data is sacred, removal is opt-in.
-    #[arg(long)]
-    pub purge: bool,
-}
-
 /// Arguments for `kei service run`.
 ///
 /// Shares the reduced runtime [`SyncArgs`] with `kei sync`, but omits
@@ -702,9 +664,9 @@ pub enum Command {
     #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Doctor")]
     Doctor(DoctorArgs),
 
-    /// Export privacy-safe saved diagnostics without login, network, scans or repairs
+    /// Export a privacy-safe current-state snapshot without login, network, scans or repairs
     #[command(
-        after_help = "Review the JSON file locally before attaching it to a bug report. No automatic upload. Missing evidence is reported explicitly; no new sync is required.\n\nDocumentation: https://github.com/rhoopr/kei/blob/main/docs/support-export.md"
+        after_help = "Review the JSON file locally before attaching it to a bug report. No automatic upload. Operation history is not retained; missing current evidence is reported explicitly and no new sync is required.\n\nDocumentation: https://github.com/rhoopr/kei/blob/main/docs/support-export.md"
     )]
     SupportExport(SupportExportArgs),
 
@@ -725,19 +687,6 @@ pub enum Command {
     /// next sync re-downloads them.
     #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Reconcile")]
     Reconcile(ReconcileArgs),
-
-    /// Register kei as a system service (launchd on macOS, systemd on
-    /// Linux, Service Control Manager on Windows). Inside a Docker
-    /// container the command logs that compose-managed deployments are
-    /// already supervised and exits without writing anything.
-    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Install")]
-    Install(InstallArgs),
-
-    /// Remove the kei service registered by `kei install`. Pass `--purge`
-    /// to also delete the state database, configuration, and stored
-    /// credentials.
-    #[command(after_help = "Documentation: https://github.com/rhoopr/kei/wiki/Service")]
-    Uninstall(UninstallArgs),
 
     /// Service-mode operations: run the long-lived worker, or query
     /// service registration status.
@@ -763,7 +712,6 @@ pub enum Command {
         kei login           Sign in to iCloud\n  \
         kei list albums     Browse albums and libraries\n\n  \
         Advanced:\n  \
-        kei install         Register as a background service\n  \
         kei verify          Verify downloaded files\n  \
         kei import-existing  Adopt an existing local photo tree\n\n  \
         Documentation: https://github.com/rhoopr/kei/wiki\n  \
@@ -933,9 +881,6 @@ where
         .is_ok_and(|matches| {
             matches.subcommand_name() == Some("support-export")
                 || matches
-                    .subcommand_matches("doctor")
-                    .is_some_and(|doctor| doctor.get_flag("missing_reference_inventory"))
-                || matches
                     .subcommand_matches("help")
                     .is_some_and(|help| help.subcommand_name() == Some("support-export"))
         })
@@ -1004,8 +949,6 @@ impl Command {
             | Self::Manifest(_)
             | Self::Verify(_)
             | Self::Reconcile(_)
-            | Self::Install(_)
-            | Self::Uninstall(_)
             | Self::Service {
                 action: ServiceAction::Status,
             } => None,
@@ -1110,7 +1053,7 @@ mod tests {
         for argv in [
             &["kei", "doctor", "--download-dir", "/photos"][..],
             &["kei", "manifest", "--download-dir", "/photos"][..],
-            &["kei", "install", "--download-dir", "/photos"][..],
+            &["kei", "verify", "--download-dir", "/photos"][..],
             &["kei", "service", "status", "--download-dir", "/photos"][..],
         ] {
             let err = parse_cli_with_sources(argv).expect_err("removed flag must fail");
@@ -1470,35 +1413,6 @@ mod tests {
             } => assert!(yes),
             _ => panic!("Expected Reset State"),
         }
-    }
-
-    #[test]
-    fn install_dry_run_parses_with_user_flag() {
-        let cli = Cli::try_parse_from(["kei", "install", "--user", "--dry-run"]).unwrap();
-        let args = match cli.command {
-            Command::Install(a) => a.clone(),
-            other => panic!("expected Install, got {other:?}"),
-        };
-        assert!(args.user);
-        assert!(args.dry_run);
-        assert!(!args.system);
-    }
-
-    #[test]
-    fn install_user_and_system_conflict_at_parse_time() {
-        // clap rejects mutually exclusive flags during parse; this guards
-        // the `conflicts_with` annotation on InstallArgs.
-        let err = Cli::try_parse_from(["kei", "install", "--user", "--system"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn uninstall_purge_parses_to_struct_field() {
-        let cli = Cli::try_parse_from(["kei", "uninstall", "--purge"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Uninstall(UninstallArgs { purge: true })
-        ));
     }
 
     #[test]
@@ -2775,34 +2689,6 @@ mod tests {
             Some(true),
             "--friendly after --no-friendly must win via overrides_with"
         );
-    }
-}
-
-#[cfg(test)]
-mod read_only_entrypoint_tests {
-    #[test]
-    fn missing_reference_inventory_query_handles_partial_and_help_arguments() {
-        for arguments in [
-            vec![
-                "kei",
-                "doctor",
-                "--live",
-                "--json",
-                "--missing-reference-inventory",
-            ],
-            vec!["kei", "doctor", "--missing-reference-inventory"],
-            vec!["kei", "doctor", "--missing-reference-inventory", "--help"],
-            vec!["kei", "doctor", "--help", "--missing-reference-inventory"],
-        ] {
-            assert!(super::is_early_read_only_invocation(arguments));
-        }
-        for arguments in [
-            vec!["kei", "doctor", "--live", "--json"],
-            vec!["kei", "--config", "doctor", "status"],
-            vec!["kei", "sync"],
-        ] {
-            assert!(!super::is_early_read_only_invocation(arguments));
-        }
     }
 }
 

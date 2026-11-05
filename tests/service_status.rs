@@ -14,8 +14,8 @@
 //! - `kei status` against a host with no kei service registered
 //!   (the test harness's CI runner) prints a `Service:` line and exits
 //!   successfully.
-//! - The Service line is emitted even when no state DB exists, so
-//!   `kei install` followed by `kei status` works on a fresh host.
+//! - The Service line is emitted even when no state DB exists, so a
+//!   fresh host gets a status summary before any supervisor registration.
 
 // `mod common` pulls in tests/common/mod.rs which uses eprintln!, unwrap,
 // expect, and panic; the file-level allow propagates into that module so
@@ -53,8 +53,7 @@ fn status_cmd(tmp: &TempDir) -> assert_cmd::Command {
 #[test]
 fn status_prints_service_line_with_no_state_db() {
     // Fresh tempdir = no state.db. Status must still succeed and lead
-    // with a Service: line, since the user just ran `kei install` and
-    // is checking whether the service registered.
+    // with a Service: line before any supervisor registration exists.
     let tmp = TempDir::new().expect("tempdir");
     status_cmd(&tmp)
         .assert()

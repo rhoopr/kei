@@ -347,8 +347,11 @@ pub(crate) fn run_setup(
     if answers.watch_interval.is_some() {
         println!();
         println!(
-            "  {} to run continuously in the background.",
-            bold.apply_to(format!("kei install --config {}", config_path.display()))
+            "  {} to run continuously. Use systemd, launchd, Windows SCM, or Docker to start it at boot.",
+            bold.apply_to(format!(
+                "kei service run --config {}",
+                config_path.display()
+            ))
         );
     }
     println!();

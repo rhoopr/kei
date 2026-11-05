@@ -543,8 +543,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             live_photo_mov_filename_policy: config.photos.live_photo_mov_filename_policy,
             edited: config.photos.edited,
             edited_naming: config.photos.edited_naming,
-            primary_layout_active: false,
-            primary_layout_preview: false,
             primary_layout_source: None,
             primary_layout_pass: None,
             primary_layout_pass_kind: None,
@@ -708,6 +706,20 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         )
         .await?;
 
+        // Enroll every selected library in the database epoch after plans
+        // resolve but before the watch precheck can skip the cycle. Existing
+        // users get one fresh baseline; fresh installs enroll clean.
+        if let Some(db) = state_db.as_deref()
+            && !config.runtime.only_print_filenames
+            && !is_retry_failed
+        {
+            let epoch_libraries = library_states
+                .iter()
+                .map(|state| (state.zone_name.clone(), state.library.baseline_scope()))
+                .collect();
+            db.sync_epoch_enroll(epoch_libraries).await?;
+        }
+
         // In watch mode with incremental sync, use changes/database as a
         // cheap pre-check before refreshing album plans or running a sync.
         // After the readiness probes, quiet cycles avoid full album/pass
@@ -784,7 +796,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
             let cycle_started_at = std::time::Instant::now();
             let cycle_wall_started_at = chrono::Utc::now();
-            crate::support::begin(crate::support::runtime_configuration(&config));
             let mut cycle_result = run_cycle(
                 &cycle_library_states,
                 &config,
@@ -805,6 +816,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         .collect();
                     download::drain_pending_metadata_rewrites(
                         db,
+                        &config.download.directory,
                         &config.metadata,
                         capture_timestamp_repair,
                         &library_scope,

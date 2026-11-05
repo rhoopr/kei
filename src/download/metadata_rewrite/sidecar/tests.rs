@@ -348,9 +348,7 @@ async fn production_sidecar_io_error_is_typed_support_evidence() {
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::layer::SubscriberExt;
     let dir = tempfile::tempdir().unwrap();
-    let history = dir.path().join("retained.support.json");
-    let (layer, guard) =
-        crate::support::history::start(history.clone(), serde_json::json!({})).unwrap();
+    let (layer, drain) = crate::support::test_capture::test_layer();
     let path = dir.path().join("absent").join("PRIVATE_MEDIA.jpg");
     let ok = write_sidecar_metadata(
         &path,
@@ -364,8 +362,7 @@ async fn production_sidecar_io_error_is_typed_support_evidence() {
     .with_subscriber(tracing_subscriber::registry().with(layer))
     .await;
     assert!(!ok);
-    guard.finish().await;
-    let evidence = crate::support::history::test_retained_events(&history);
+    let evidence = drain();
     assert!(evidence.iter().any(|v| v["kind"] == "support_task_error_v1"
         && v["fields"]["stage"] == "sidecar_write"
         && v["fields"]["errno"].is_number()));

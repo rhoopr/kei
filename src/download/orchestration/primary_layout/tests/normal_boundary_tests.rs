@@ -29,8 +29,6 @@ async fn v027_absent_managed_claim_is_uncertain_for_same_and_other_identity_afte
             directory: Arc::from(root.as_path()),
             folder_structure: String::new(),
             edited_naming: EditedNaming::Primary,
-            primary_layout_active: false,
-            primary_layout_preview: false,
             state_db: Some(db.clone()),
             ..DownloadConfig::test_default()
         };
@@ -634,7 +632,6 @@ async fn v027_recorded_prepared_refresh_replays_metadata_and_preserves_sidecar()
         None,
         super::family(&asset, &config).unwrap(),
         super::decision(&asset, &config).unwrap(),
-        true,
     )
     .await
     .unwrap();
@@ -646,7 +643,6 @@ async fn v027_recorded_prepared_refresh_replays_metadata_and_preserves_sidecar()
         &session,
         &mut op,
         &CancellationToken::new(),
-        &mut super::LayoutOutcome::default(),
     )
     .await
     .unwrap();
@@ -1545,7 +1541,6 @@ async fn recorded_owned_refresh_holds_modified_or_foreign_destination_then_recov
             None,
             super::family(&asset, &config).unwrap(),
             super::decision(&asset, &config).unwrap(),
-            true,
         )
         .await
         .unwrap();
@@ -1558,7 +1553,6 @@ async fn recorded_owned_refresh_holds_modified_or_foreign_destination_then_recov
             &session,
             &mut op,
             &CancellationToken::new(),
-            &mut super::LayoutOutcome::default(),
         )
         .await
         .unwrap();

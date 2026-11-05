@@ -99,6 +99,10 @@ pub(crate) struct ChangesZoneResponse {
 /// Result for a single zone in a `/changes/zone` response.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(
+    dead_code,
+    reason = "parsed provider zone fields are read by provider-shape tests"
+)]
 pub(crate) struct ChangesZoneResult {
     #[serde(rename = "zoneID")]
     pub zone_id: ZoneId,

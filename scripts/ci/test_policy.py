@@ -41,11 +41,10 @@ class PolicyTests(unittest.TestCase):
                 self.assertEqual("test_no_default" in result["required"], code)
 
     def test_notification_and_advisory_prs_keep_only_relevant_checks(self):
-        # Exact GitHub file sets at 6e32a20 (#1000), 4f1dbc8 (#997),
-        # f555e9a (#991) and fbda631 (#1001).
+        # Representative GitHub file sets from #1000, #997, #991 and #1001.
         cases = [
             (1000, ["docs/ci.md", "scripts/ci/nightly.py", "scripts/ci/test_nightly.py",
-                    "src/inventory_diagnostic/tests.rs"], True),
+                    "src/state/db/checkpoints/tests.rs"], True),
             (997, ["docs/opencode-review.md", "scripts/ci/opencode_review.py",
                    "scripts/ci/test_opencode_review.py"], False),
             (1001, [".github/workflows/opencode-review.yml", "docs/architecture.md",
@@ -127,7 +126,7 @@ class PolicyTests(unittest.TestCase):
                      ".github/scripts/patch_coverage.py",
                      ".github/workflows/qualification.yml", ".github/workflows/artifacts.yml",
                      ".github/workflows/release.yml", ".github/workflows/nightly.yml",
-                     ".github/workflows/service-smoke.yml", ".github/workflows/new-build.yml",
+                     ".github/workflows/new-build.yml",
                      "scripts/new-build-helper", "unrecognized-input"):
             with self.subTest(path=path):
                 result = route([path], "pull_request", False, True, False)
@@ -138,34 +137,11 @@ class PolicyTests(unittest.TestCase):
                       "pull_request", False, True, False)
         self.assertTrue(mixed["stress"])
         self.assertFalse(mixed["qualification"])
-        for files in (["scripts/ci/nightly.py"], ["src/inventory_diagnostic/tests.rs"], ["README.md"]):
+        for files in (["scripts/ci/nightly.py"], ["src/state/db/checkpoints/tests.rs"], ["README.md"]):
             for heavy, full in ((True, False), (False, True)):
                 result = route(files, "pull_request", heavy, True, full)
                 for key in ("code", "cargo", "stress", "platform", "coverage", "unused", "qualification"):
                     self.assertTrue(result[key], (files, key))
-
-    def test_native_service_routes_cover_dispatch_and_skip_unrelated_changes(self):
-        selected = ["src/service/linux.rs", "src/service/new_platform.rs",
-                    "src/commands/service.rs", "src/commands/service/types.rs",
-                    "src/commands/status.rs", "src/commands/status/display.rs",
-                    "src/cli.rs", "src/config.rs", "src/config/new_owner.rs", "src/lib.rs"]
-        for path in selected:
-            with self.subTest(path=path):
-                result = route([path], "pull_request", False, True, False)
-                self.assertTrue(result["service"])
-                self.assertFalse(result["qualification"])
-        for path in ["README.md", "docs/architecture.md", "scripts/check-contracts",
-                     "src/auth/session.rs", "src/download/file/publication.rs",
-                     "src/inventory_diagnostic/tests.rs", "scripts/ci/nightly.py"]:
-            self.assertFalse(route([path], "pull_request", False, True, False)["service"], path)
-        for path in ["Cargo.toml", ".github/workflows/service-smoke.yml", "unknown-input"]:
-            result = route([path], "pull_request", False, True, False)
-            self.assertTrue(result["service"])
-            self.assertTrue(result["qualification"])
-        # Main push keeps its existing broad quality route; full/native service
-        # qualification remains independently required by nightly and release.
-        self.assertFalse(route([], "push", False, True, False)["service"])
-        self.assertTrue(route([], "push", True, True, False)["service"])
 
     def test_actual_pr_file_sets_keep_required_checks(self):
         # Exact GitHub file lists at heads 88ea35d (#984) and 30fe0e4 (#985).

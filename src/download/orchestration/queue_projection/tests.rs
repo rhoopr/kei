@@ -3482,6 +3482,8 @@ async fn destination_reopen_fixture_with_signature(
     let a = f.config.directory.join("A/changed.JPG");
     assert_eq!(std::fs::read(&a).unwrap(), media);
     let original_time = std::fs::metadata(&a).unwrap().modified().unwrap();
+    #[cfg(unix)]
+    let original_inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&a).unwrap());
     let backlog_tail = f.config.directory.join("backlog-tail.JPG");
     if backlog {
         std::fs::write(&backlog_tail, media).unwrap();
@@ -3591,6 +3593,11 @@ async fn destination_reopen_fixture_with_signature(
     );
     assert_eq!(std::fs::read(&a).unwrap(), media);
     let requests = f.session.calls.load(Ordering::SeqCst);
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&a).unwrap()),
+        original_inode
+    );
     let roots =
         f.db.acquire_lock("sealed active roots")
             .unwrap()
@@ -4051,6 +4058,7 @@ async fn private_metadata_recovery_fixture_with_signature(
             crate::download::metadata_rewrite::CaptureTimestampRepair::Preserve,
             f.config.temp_suffix.clone(),
             &CancellationToken::new(),
+            Some(&f.config.directory),
             None,
             (0, 500),
         )
@@ -4600,6 +4608,7 @@ async fn private_metadata_recovery_fixture_with_signature(
         // and owns this separate bounded refresh tail after all passes finish.
         let failed = crate::download::orchestration::maintenance::drain_pending_metadata_rewrites(
             f.db.as_ref(),
+            &f.config.directory,
             &f.config.metadata,
             crate::download::metadata_rewrite::CaptureTimestampRepair::Preserve,
             &["PrimarySync"],
@@ -7881,6 +7890,7 @@ async fn readonly_adoption_prepared_metadata_fixture(freeze_and_drift: bool, nat
         f.db.adopt_baseline_receipt(
             &pending.asset,
             &receipt,
+            pending.asset.id.as_ref(),
             Box::new(move || {
                 file.validate_blocking().map_err(|_file_changed| {
                     crate::state::error::StateError::Invariant {
@@ -8155,6 +8165,77 @@ async fn v027_config_drift_quiet_provider_retries_original_selected_b_destinatio
             .to_path(),
         b
     );
+    // A valid B completion elsewhere must not replace its frozen pending copy.
+    let elsewhere = f.config.directory.join("otherwise-fulfilled-B.JPG");
+    std::fs::write(&elsewhere, bytes).unwrap();
+    let principal = owner();
+    let (account, provider) = principal.authenticated_keys().unwrap();
+    let (_, scope, _) = passes[0]
+        .album
+        .publication_scope("PrimarySync")
+        .unwrap()
+        .unwrap();
+    let receipt = crate::state::db::download_receipts::DownloadReceipt {
+        account_key: account.into(),
+        provider_key: provider.into(),
+        scope,
+        library: "PrimarySync".into(),
+        child: "asset-m".into(),
+        master: "m".into(),
+        state_id: "asset-m".into(),
+        origin_pass: original_b.1.clone(),
+        version_size: "original".into(),
+        provider_checksum: data_encoding::BASE64.encode(&Sha256::digest(bytes)),
+        provider_size: bytes.len() as u64,
+        native_path: SelectionPath::from_path(&elsewhere),
+        source_checksum: digest.clone(),
+        local_checksum: digest.clone(),
+    };
+    let other_id = receipt
+        .save(&f.db.acquire_lock("seed other fulfilled B path").unwrap())
+        .unwrap();
+    let mut healthy = records("healthy", &receipt.provider_checksum, "healthy");
+    healthy[0]["fields"]["filenameEnc"]["value"] = json!("healthy.JPG");
+    healthy[0]["fields"]["resOriginalRes"]["value"] =
+        f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"].clone();
+    f.session.records.lock().unwrap().extend(healthy);
+    ready.store(true, Ordering::SeqCst);
+    f.db.make_selection_retry_due(owner(), "asset-m".into())
+        .await
+        .unwrap();
+    let held = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        &passes,
+        Arc::new(f.config.clone()),
+        controls(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        held.stats.downloaded, 2,
+        "healthy album peers must progress: {held:?}"
+    );
+    assert!(!b.exists(), "other fulfilled B must not relocate pending B");
+    assert_eq!(
+        std::fs::read(f.config.directory.join("A/healthy.JPG")).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        std::fs::read(f.config.directory.join("B/healthy.JPG")).unwrap(),
+        bytes
+    );
+    assert_eq!(f.db.acquire_lock("frozen B still pending").unwrap().query_row::<i64,_,_>(
+        "SELECT admitted=1 AND verified_media=0 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child='asset-m' AND path=?3",
+        rusqlite::params![original_b.0,original_b.1,original_b.2], |row| row.get(0)).unwrap(), 1);
+    assert_eq!(std::fs::read(&a).unwrap(), bytes);
+    assert_eq!(std::fs::metadata(&a).unwrap().modified().unwrap(), a_mtime);
+    f.db.acquire_lock("remove only synthetic alternative B proof")
+        .unwrap()
+        .execute("DELETE FROM download_receipts WHERE id=?1", [other_id])
+        .unwrap();
+    std::fs::remove_file(elsewhere).unwrap();
+    f.session.records.lock().unwrap().truncate(2);
     f.db.make_selection_retry_due(owner(), "asset-m".into())
         .await
         .unwrap();

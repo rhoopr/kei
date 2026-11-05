@@ -1244,7 +1244,7 @@ async fn metadata_refresh_accepts_missing_but_rejects_unknown_renditions_without
                     medium.metadata.height,
                     medium.metadata.duration_secs
                 ),
-                (None, None, None)
+                (Some(1920), Some(1080), Some(3.0))
             );
             assert_eq!(medium.metadata.title.as_deref(), Some("shared edit"));
             assert_eq!(

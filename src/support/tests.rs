@@ -11,12 +11,9 @@ fn malicious_reports_configurations_and_errors_are_allowlisted() {
         "bytes_downloaded": 123, "disk_bytes_written": 456, "threads": 2,
         "primary_layout": {"bound_families": 4, "private": "private-id"},
     });
-    let stats = privacy::stats(&malicious);
     let configuration = privacy::configuration(&malicious);
-    assert_eq!(stats["bytes_downloaded"], 123);
-    assert_eq!(stats["disk_bytes_written"], 456);
     assert_eq!(configuration["threads"], 2);
-    assert!(!format!("{stats}{configuration}").contains("private"));
+    assert!(!configuration.to_string().contains("private"));
     let error = anyhow::anyhow!(
         "https://private-url /private-path password=private-token AppleID=private-apple-id"
     );
@@ -123,23 +120,6 @@ fn historical_support_questions_have_safe_structured_answers() {
 }
 
 #[test]
-fn tim_paired_counts_remain_overlapping_observations() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("history.json");
-    // Export never sums 604/17/604 into a unique asset count.
-    let mut cycle = json!({"id":uuid::Uuid::new_v4().to_string(),"started_at":"2026-10-10T16:00:00Z","completed_at":null,
-        "outcome":"running","build_version":"0.25.1-dev","configuration":{},"stats":{},"diagnostics":[]});
-    cycle["diagnostics"] = json!([604,17,604].into_iter().map(|n| json!({"kind":"exact_lookup_rejection_v1",
-        "fields":{"target":"paired","stage":"master_reference_scope","reason":"owner_unqualified","rejected_requests":n},
-        "observations":1,"first_at":"2026-10-10T16:01:00Z","last_at":"2026-10-10T16:01:00Z"})).collect::<Vec<_>>());
-    std::fs::write(&path, serde_json::to_vec(&json!({"schema_version":1,"cycles_evicted":0,"queue_dropped":0,"groups_omitted":0,"previous_history_unavailable":false,"cycles":[cycle]})).unwrap()).unwrap();
-    let (h, status) = super::history::read(&path);
-    assert_eq!(status, "available");
-    assert_eq!(h.cycles[0].diagnostics.len(), 3);
-    assert_eq!(h.cycles[0].diagnostics[1].fields["rejected_requests"], 17);
-}
-
-#[test]
 fn owning_checkpoint_decisions_survive_support_allowlist_without_tokens() {
     use crate::download::RecoveryAction;
     use crate::sync_cycle::{
@@ -196,21 +176,12 @@ fn owning_checkpoint_decisions_survive_support_allowlist_without_tokens() {
             fields
         );
     }
-    for reason in [
-        "inventory_delta_bridge_failed",
-        "icloud_changes_successor_missing",
-    ] {
-        assert_eq!(
-            super::privacy::stats(&serde_json::json!({"sync_token_blocked_reason":reason}))["sync_token_blocked_reason"],
-            reason
-        );
-    }
 }
 
 #[test]
 fn existing_refresh_hold_and_hardlink_fixed_fields_survive_production_layer() {
     use tracing_subscriber::layer::SubscriberExt;
-    let (layer, drain) = super::history::test_layer();
+    let (layer, drain) = super::test_capture::test_layer();
     tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
         tracing::warn!(
             diagnostic = "expired_url_refresh_failed",
@@ -251,57 +222,26 @@ fn existing_refresh_hold_and_hardlink_fixed_fields_survive_production_layer() {
 
 #[test]
 fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
-    use crate::types::{FileMatchPolicy, LivePhotoMode, RawPolicy};
-    let dir = tempfile::tempdir().unwrap();
-    let globals = crate::config::GlobalArgs {
-        username: Some("PRIVATE_USER".into()),
-        domain: None,
-        data_dir: Some(dir.path().to_string_lossy().into_owned()),
-    };
-    let toml: crate::config::TomlConfig = toml::from_str(&format!(
-        "[download]\ndirectory={:?}",
-        dir.path().to_string_lossy()
-    ))
-    .unwrap();
-    let mut config = crate::config::Config::build(
-        &globals,
-        &crate::cli::PasswordArgs::default(),
-        crate::cli::SyncArgs::default(),
-        Some(&toml),
-    )
-    .unwrap();
-    for (variant, label) in [
-        (
-            FileMatchPolicy::NameSizeDedupWithSuffix,
-            "name-size-dedup-with-suffix",
-        ),
-        (FileMatchPolicy::NameId7, "name-id7"),
+    for (label, expected) in [
+        ("name-size-dedup-with-suffix", "name-size-dedup-with-suffix"),
+        ("name-id7", "name-id7"),
     ] {
-        config.photos.file_match_policy = variant;
+        let input: crate::config::TomlConfig =
+            toml::from_str(&format!("[photos]\nfile_match_policy={label:?}")).unwrap();
         assert_eq!(
-            super::runtime_configuration(&config)["file_match_policy"],
+            super::configuration(Some(&input), true)["file_match_policy"],
+            expected
+        );
+    }
+    for label in ["as-is", "prefer-raw", "prefer-jpeg"] {
+        let input: crate::config::TomlConfig =
+            toml::from_str(&format!("[photos]\nraw_policy={label:?}")).unwrap();
+        assert_eq!(
+            super::configuration(Some(&input), true)["raw_policy"],
             label
         );
     }
-    for (variant, label) in [
-        (RawPolicy::AsIs, "as-is"),
-        (RawPolicy::PreferRaw, "prefer-raw"),
-        (RawPolicy::PreferJpeg, "prefer-jpeg"),
-    ] {
-        config.photos.raw_policy = variant;
-        assert_eq!(super::runtime_configuration(&config)["raw_policy"], label);
-    }
-    for (variant, label) in [
-        (LivePhotoMode::Both, "both"),
-        (LivePhotoMode::ImageOnly, "image-only"),
-        (LivePhotoMode::VideoOnly, "video-only"),
-        (LivePhotoMode::Skip, "skip"),
-    ] {
-        config.photos.live_photo_mode = variant;
-        assert_eq!(
-            super::runtime_configuration(&config)["live_photo_mode"],
-            label
-        );
+    for label in ["both", "image-only", "video-only", "skip"] {
         let input: crate::config::TomlConfig =
             toml::from_str(&format!("[photos]\nlive_photo_mode={label:?}")).unwrap();
         assert_eq!(
@@ -309,8 +249,10 @@ fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
             label
         );
     }
+    let input: crate::config::TomlConfig =
+        toml::from_str("[auth]\nusername=\"PRIVATE_USER\"").unwrap();
     assert!(
-        !super::runtime_configuration(&config)
+        !super::configuration(Some(&input), true)
             .to_string()
             .contains("PRIVATE")
     );
@@ -415,7 +357,7 @@ fn issue956_lookup_record_status_contract_is_closed_and_optional() {
                 .clone()
         );
     }
-    // Older retained history carries no newly invented response evidence.
+    // Older diagnostic records carry no newly invented response evidence.
     let fields = json!({"target":"paired","reason":"record_provider_error"});
     assert_eq!(
         privacy::diagnostic("exact_lookup_rejection_v1", fields.as_object().unwrap()).unwrap(),
@@ -465,7 +407,7 @@ fn issue956_child_reference_status_is_a_field_specific_allowlist() {
     assert_eq!(
         clean,
         *old.as_object().unwrap(),
-        "old history cannot invent reference evidence"
+        "old diagnostic records cannot invent reference evidence"
     );
 }
 
@@ -493,6 +435,6 @@ fn recovery_decisions_preserve_only_fixed_evidence_outcomes() {
         privacy::diagnostic("recovery_decision_v1", fields.as_object().unwrap()).unwrap();
     assert!(
         projected.is_empty(),
-        "saved history must not authorize arbitrary labels"
+        "untrusted diagnostic fields must not authorize arbitrary labels"
     );
 }

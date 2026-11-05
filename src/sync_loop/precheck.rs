@@ -106,20 +106,42 @@ pub(super) async fn include_pending_local_work(
             .primary_layout_operations(zone.to_owned())
             .await
             .map_or(true, |rows| !rows.is_empty());
-        let retained_checkpoint_pending = match db
-            .get_metadata(&format!(
-                "{}{zone}",
-                crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
-            ))
+        // A backed-off epoch owns its next attempt. The retained hold is
+        // preserved, but it must not independently wake the zone before the
+        // record is due. Indexing, layout and transfer work still wake normally.
+        let epoch_backoff = db
+            .sync_epoch_backoff(zone.to_owned())
             .await
-        {
-            Ok(marker) => marker.is_some(),
-            Err(_error) => {
-                tracing::warn!("Could not inspect retained checkpoint hold before watch pre-check");
-                true
+            .unwrap_or(false);
+        let epoch_wake = db
+            .sync_epoch_should_wake(zone.to_owned())
+            .await
+            .unwrap_or(true);
+        let retained_checkpoint_pending = if epoch_backoff {
+            false
+        } else {
+            match db
+                .get_metadata(&format!(
+                    "{}{zone}",
+                    crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
+                ))
+                .await
+            {
+                Ok(marker) => marker.is_some(),
+                Err(_error) => {
+                    tracing::warn!(
+                        "Could not inspect retained checkpoint hold before watch pre-check"
+                    );
+                    true
+                }
             }
         };
-        if download_pending || identity_pending || layout_pending || retained_checkpoint_pending {
+        if download_pending
+            || identity_pending
+            || layout_pending
+            || retained_checkpoint_pending
+            || epoch_wake
+        {
             local_work_zones.insert(library.zone_name.clone());
         }
     }

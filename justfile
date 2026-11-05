@@ -76,7 +76,7 @@ lint-scripts:
         echo "lint-scripts: ruff not installed; skipping optional Python lint" >&2
     fi
 
-# Live provider and real host-service evidence. Requires explicit service authorization.
+# Live provider evidence. Invoke explicitly on an isolated fixture.
 release-local:
     bash scripts/full-test/run_local_release.sh
 
@@ -190,7 +190,7 @@ check-contracts:
 release-smoke:
     scripts/full-test/run_release_regression_smoke.sh
 
-# Test dispatcher: offline | fast | stress | scenario NAME | scenarios | live | live-smoke | live-shell | packaging | docker-full | service | host-service | PATTERN.
+# Test dispatcher: offline | fast | stress | scenario NAME | scenarios | live | live-smoke | live-shell | packaging | docker-full | PATTERN.
 test MODE="" *ARGS="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -298,12 +298,6 @@ test MODE="" *ARGS="":
             ;;
         docker-full)
             run_docker_full
-            ;;
-        service)
-            just service-smoke
-            ;;
-        host-service)
-            KEI_FULL_TEST_REAL_SERVICE=1 scripts/full-test/run_real_service_lifecycle.sh
             ;;
         nightly-tools)
             if rustup toolchain list 2>/dev/null | grep -q '^nightly' && command -v cargo-fuzz >/dev/null 2>&1; then
@@ -592,11 +586,6 @@ doctor:
     else
         fail "docker buildx not available"
     fi
-    if command -v systemd-analyze >/dev/null 2>&1 || command -v plutil >/dev/null 2>&1; then
-        ok "service-smoke verifier available"
-    else
-        note "service-smoke verifier not found; service-smoke is Linux/macOS only"
-    fi
     if [ -f .env ]; then
         ok ".env present for live recipes"
     else
@@ -608,57 +597,6 @@ doctor:
         note ".test-cookies missing; live auth may need a fresh login"
     fi
     exit "$status"
-
-# Service-install smoke: builds release, dry-run install, validates artifact, uninstall, asserts clean.
-# Mirrors .github/workflows/service-smoke.yml. Linux + macOS only.
-service-smoke:
-    #!/usr/bin/env bash
-    set -euxo pipefail
-    cargo build --release
-    KEI="$(scripts/full-test/cargo_target_dir.sh)/release/kei"
-    # `kei status` derives its state-DB path from the username; pin a
-    # placeholder so the smoke does not depend on the operator's .env
-    # or saved config.
-    export ICLOUD_USERNAME="service-smoke@example.invalid"
-    assert_service_not_installed() {
-        local status
-        status=$("$KEI" status)
-        printf '%s\n' "$status" | grep -q '^Service: not installed'
-    }
-    case "$(uname -s)" in
-        Linux)
-            UNIT="$HOME/.config/systemd/user/kei.service"
-            UNIT_PREVIEW="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/kei.service"
-            # Clean any leftover from a previous failed run so the
-            # pre-state assertion is meaningful.
-            rm -f "$UNIT" "$UNIT_PREVIEW"
-            test ! -e "$UNIT"
-            assert_service_not_installed
-            "$KEI" install --user --dry-run > "$UNIT_PREVIEW"
-            test ! -e "$UNIT"
-            systemd-analyze --user verify "$UNIT_PREVIEW"
-            "$KEI" uninstall
-            test ! -e "$UNIT"
-            assert_service_not_installed
-            ;;
-        Darwin)
-            PLIST="$HOME/Library/LaunchAgents/com.rhoopr.kei.plist"
-            PLIST_PREVIEW="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/com.rhoopr.kei.plist"
-            rm -f "$PLIST" "$PLIST_PREVIEW"
-            test ! -e "$PLIST"
-            assert_service_not_installed
-            "$KEI" install --dry-run > "$PLIST_PREVIEW"
-            test ! -e "$PLIST"
-            plutil -lint "$PLIST_PREVIEW"
-            "$KEI" uninstall
-            test ! -e "$PLIST"
-            assert_service_not_installed
-            ;;
-        *)
-            echo "service-smoke is Linux/macOS only; Windows runs in CI" >&2
-            exit 2
-            ;;
-    esac
 
 # Disabled: not part of the active workflow.
 # Create branch NAME off a freshly fetched origin/main (AGENTS.md branch-from-fresh-main rule).

@@ -251,6 +251,33 @@ pub struct MetadataCapture {
 }
 
 impl MetadataCapture {
+    /// Missing retained evidence is uncertainty, not an all-None quiet snapshot.
+    #[must_use]
+    pub(crate) fn resolve_retained(
+        &self,
+        version: VersionSizeKey,
+        checksum: &str,
+        retained: Option<&RenditionMetadata>,
+    ) -> Option<AssetMetadata> {
+        let mut metadata = self.resolve(version, checksum);
+        if !checksum.trim().is_empty()
+            && self
+                .renditions
+                .iter()
+                .any(|(key, facts)| *key == version && facts.checksum.as_deref() == Some(checksum))
+        {
+            return Some(metadata);
+        }
+        let retained = retained.filter(|facts| {
+            !checksum.trim().is_empty() && facts.checksum.as_deref() == Some(checksum)
+        })?;
+        metadata.width = retained.width;
+        metadata.height = retained.height;
+        metadata.duration_secs = retained.duration_secs;
+        metadata.refresh_hash();
+        Some(metadata)
+    }
+
     /// Resolve only exact, nonblank resource identities with unanimous measurements.
     #[must_use]
     pub(crate) fn resolve(&self, version: VersionSizeKey, checksum: &str) -> AssetMetadata {

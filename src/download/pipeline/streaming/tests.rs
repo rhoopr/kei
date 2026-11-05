@@ -55,8 +55,6 @@ async fn test_producer_panic_propagates_as_error() {
         live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
         edited: false,
         edited_naming: crate::types::EditedNaming::Suffix,
-        primary_layout_active: false,
-        primary_layout_preview: false,
         primary_layout_source: None,
         primary_layout_pass: None,
         primary_layout_pass_kind: None,

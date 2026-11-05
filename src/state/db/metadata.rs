@@ -23,7 +23,9 @@ use super::{
 use crate::state::error::StateError;
 #[cfg(test)]
 use crate::state::types::{AssetRecord, MetadataCaptureCandidate};
-use crate::state::types::{MetadataCapture, MetadataCaptureStatus, VersionSizeKey};
+use crate::state::types::{
+    MetadataCapture, MetadataCaptureStatus, RenditionMetadata, VersionSizeKey,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetadataRewriteTarget {
@@ -389,52 +391,9 @@ fn row_to_pending_metadata_rewrite(
     Ok(PendingMetadataRewrite {
         asset: row_to_asset_record(row)?,
         selection_receipt: None,
-        activity_admission: None,
         capture_repair_receipt,
         source_checksum: row.get(ASSET_COLUMN_COUNT + 3)?,
     })
-}
-
-pub(super) fn validate_activity_selected_work(
-    conn: &Connection,
-    pending: &PendingMetadataRewrite,
-) -> Result<(), StateError> {
-    let Some(receipt) = &pending.selection_receipt else {
-        return Ok(());
-    };
-    let path = super::provider_selection::SelectionPath::from_path(
-        pending
-            .asset
-            .local_path
-            .as_deref()
-            .ok_or(StateError::ProviderSelectionInvalid)?,
-    )
-    .key()?;
-    let current = super::provider_generations::metadata_receipt(
-        conn,
-        &receipt.generation,
-        &receipt.pass_key,
-        &receipt.child,
-        pending.asset.version_size.as_str(),
-        &path,
-    )?;
-    if current.selection_receipt != pending.selection_receipt
-        || current.source_checksum != pending.source_checksum
-        || current.asset.local_path != pending.asset.local_path
-    {
-        return Err(StateError::ProviderWorkConflict);
-    }
-    let mut actual = current.asset;
-    let mut expected = pending.asset.clone();
-    actual.local_path = None;
-    expected.local_path = None;
-    if serde_json::to_value(actual).map_err(|_invalid| StateError::ProviderSelectionInvalid)?
-        != serde_json::to_value(expected)
-            .map_err(|_invalid| StateError::ProviderSelectionInvalid)?
-    {
-        return Err(StateError::ProviderWorkConflict);
-    }
-    Ok(())
 }
 
 impl SqliteStateDb {
@@ -602,13 +561,22 @@ impl SqliteStateDb {
             let tx = connection.transaction().map_err(|e| StateError::query("refresh_downloaded_asset_metadata::begin", e))?;
             let conn = &tx;
             let source = metadata_rewrite_source_sql();
+            let mut retained = HashMap::new();
             let mut rows = conn.prepare(
                 "SELECT version_size, status = 'downloaded', metadata_hash, checksum, \
-                        created_at IS ?3 AND added_at IS ?4 FROM assets \
+                         created_at IS ?3 AND added_at IS ?4, width, height, duration_secs FROM assets \
                  WHERE library = ?1 AND id = ?2 AND is_deleted = 0",
             ).and_then(|mut stmt| {
                 stmt.query_map(rusqlite::params![&library, &asset_id, created_at, added_at], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?, row.get::<_, bool>(4)?))
+                    let version = row.get::<_, String>(0)?;
+                    let checksum = row.get::<_, String>(3)?;
+                    if row.get::<_, bool>(1)? {
+                        retained.insert(version.clone(), RenditionMetadata {
+                            checksum: Some(checksum.clone().into()),
+                            width: row.get(5)?, height: row.get(6)?, duration_secs: row.get(7)?,
+                        });
+                    }
+                    Ok((version, row.get::<_, bool>(1)?, row.get::<_, Option<String>>(2)?, checksum, row.get::<_, bool>(4)?))
                 })?.collect::<Result<Vec<_>, _>>()
             }).map_err(|e| StateError::query("refresh_downloaded_asset_metadata::versions", e))?;
             if rows.iter().any(|(version, _, _, _, _)| VersionSizeKey::from_str(version).is_none()) {
@@ -625,7 +593,9 @@ impl SqliteStateDb {
                     operation: "refresh_downloaded_asset_metadata",
                     detail: "unknown stored rendition".into(),
                 })?;
-                snapshots.insert(version.as_str(), capture.resolve(key, checksum));
+                let metadata = capture.resolve_retained(key, checksum, retained.get(version))
+                    .unwrap_or_else(|| capture.resolve(key, checksum));
+                snapshots.insert(version.as_str(), metadata);
             }
             let snapshot = |version: &str| {
                 snapshots.get(version)
@@ -1138,6 +1108,27 @@ impl SqliteStateDb {
                         MetadataPathWrite::Rewritten,
                     )?;
                 }
+                // The asset CAS above proved this exact path was rewritten with
+                // the prepared output. Advance at most one compact completion
+                // that already owned the same provider resource and input
+                // bytes; local-byte proof never becomes provider observation.
+                if updated > 0
+                    && completion.clears(MetadataRewriteQueue::CaptureRepair)
+                    && let Some(output) = capture_output_checksum.as_deref()
+                    && local_checksum.as_deref() == Some(output)
+                    && input_checksum.as_deref().is_some_and(|input| input != output)
+                    && !super::download_receipts::save_capture_repair_rewrite(
+                        &tx,
+                        &selection_pending,
+                        output,
+                    )?
+                {
+                    tracing::debug!(
+                        library = %library,
+                        state_id = %asset_id,
+                        "No single source-backed compact receipt matched the repaired bytes; leaving its proof unchanged"
+                    );
+                }
                 updated
             } else {
                 0
@@ -1480,12 +1471,6 @@ impl SqliteStateDb {
 
 #[async_trait]
 impl MetadataRewriteStore for SqliteStateDb {
-    fn metadata_activity_owner(
-        &self,
-    ) -> Option<&dyn super::metadata_activity::MetadataActivityOwner> {
-        Some(self)
-    }
-
     async fn validate_metadata_writer(
         &self,
         pending: &PendingMetadataRewrite,
@@ -1707,6 +1692,27 @@ impl MetadataRewriteStore for SqliteStateDb {
             local_checksum,
             pre_rewrite_checksum,
             completion,
+        )
+        .await
+    }
+
+    async fn finish_metadata_rewrite_checked(
+        &self,
+        pending: &PendingMetadataRewrite,
+        selected_queue: MetadataRewriteQueue,
+        local_checksum: Option<&str>,
+        pre_rewrite_checksum: Option<&str>,
+        completion: MetadataRewriteCompletion,
+        validate_file: Option<Box<dyn FnOnce() -> Result<(), StateError> + Send>>,
+    ) -> Result<bool, StateError> {
+        SqliteStateDb::finish_metadata_rewrite_checked(
+            self,
+            pending,
+            selected_queue,
+            local_checksum,
+            pre_rewrite_checksum,
+            completion,
+            validate_file,
         )
         .await
     }

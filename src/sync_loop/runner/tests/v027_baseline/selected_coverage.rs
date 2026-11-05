@@ -902,22 +902,22 @@ enum FrozenCase {
 #[cfg(unix)]
 #[tokio::test]
 async fn composed_frozen_retry_absent() {
-    composed_frozen_retry(FrozenCase::Absent).await;
+    Box::pin(composed_frozen_retry(FrozenCase::Absent)).await;
 }
 #[cfg(unix)]
 #[tokio::test]
 async fn composed_frozen_retry_regular() {
-    composed_frozen_retry(FrozenCase::Regular).await;
+    Box::pin(composed_frozen_retry(FrozenCase::Regular)).await;
 }
 #[cfg(unix)]
 #[tokio::test]
 async fn composed_frozen_retry_leaf_symlink() {
-    composed_frozen_retry(FrozenCase::LeafLink).await;
+    Box::pin(composed_frozen_retry(FrozenCase::LeafLink)).await;
 }
 #[cfg(unix)]
 #[tokio::test]
 async fn composed_frozen_retry_parent_symlink() {
-    composed_frozen_retry(FrozenCase::ParentLink).await;
+    Box::pin(composed_frozen_retry(FrozenCase::ParentLink)).await;
 }
 
 #[cfg(unix)]

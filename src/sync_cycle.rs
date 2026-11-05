@@ -47,7 +47,7 @@ pub(crate) struct LibraryState {
 pub(crate) const ENUM_CONFIG_HASH_KEY: &str = "enum_config_hash";
 pub(crate) const PENDING_ENUM_CONFIG_HASH_KEY: &str = "pending_enum_config_hash";
 pub(crate) const PENDING_DOWNLOAD_CONFIG_HASH_KEY: &str = "pending_download_config_hash";
-const PENDING_ZONE_TOKEN_PREFIX: &str = "pending_sync_token:v27:";
+pub(crate) const PENDING_ZONE_TOKEN_PREFIX: &str = "pending_sync_token:v27:";
 const LAST_CHECKPOINT_STATUS_KEY: &str = "last_checkpoint_status";
 const LAST_RECOVERY_ACTION_KEY: &str = "last_recovery_action";
 const LAST_FULL_ENUMERATION_REASON_KEY: &str = "last_full_enumeration_reason";
@@ -422,15 +422,8 @@ pub(crate) fn checkpoint_support_fields(decision: &SourceCheckpointDecision) -> 
     }
 }
 
-fn observe_sync_component(
-    zone: &str,
-    component: &'static str,
-    result: &download::SyncResult,
-    passes: usize,
-) {
-    crate::support::observe_scoped(
-        zone,
-        None,
+fn observe_sync_component(component: &'static str, result: &download::SyncResult, passes: usize) {
+    crate::support::observe(
         "support_pass_completion_v1",
         serde_json::json!({
             "component":component, "count_scope":"selected_invocation", "passes":passes,
@@ -814,10 +807,7 @@ where
             {
                 tracing::debug!(error = %e, "Failed to clear reverted pending enum config hash");
             }
-            if let Err(e) = db
-                .delete_metadata_by_prefix(PENDING_ZONE_TOKEN_PREFIX)
-                .await
-            {
+            if let Err(e) = db.purge_superseded_pending_tokens().await {
                 tracing::debug!(error = %e, "Failed to clear reverted pending zone checkpoints");
             }
             return EnumConfigHashOutcome::Unchanged;
@@ -833,10 +823,7 @@ where
         match db.get_metadata(PENDING_ENUM_CONFIG_HASH_KEY).await {
             Ok(Some(pending_hash)) if pending_hash == current_hash => {}
             Ok(_) => {
-                if let Err(e) = db
-                    .delete_metadata_by_prefix(PENDING_ZONE_TOKEN_PREFIX)
-                    .await
-                {
+                if let Err(e) = db.purge_superseded_pending_tokens().await {
                     tracing::warn!(error = %e, "Failed to clear checkpoints from superseded config reconciliation");
                     return EnumConfigHashOutcome::ChangedTokenPurgeFailed;
                 }
@@ -943,6 +930,106 @@ where
 }
 
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.
+struct EpochLocalRecovery {
+    failures: usize,
+    reconciliation_stats: Option<download::SyncStats>,
+    path_complete: bool,
+    path_safe: bool,
+    config: Arc<download::DownloadConfig>,
+}
+
+/// Replay durable pending work with the retry-only contract. This never
+/// enumerates source inventory and never drains the historical metadata queue.
+async fn run_epoch_pending_retry(
+    download_client: &reqwest::Client,
+    lib_state: &LibraryState,
+    config: &download::DownloadConfig,
+    download_controls: download::DownloadControls,
+    shutdown_token: &CancellationToken,
+) -> anyhow::Result<Option<download::SyncResult>> {
+    let mut retry_config = config.clone();
+    retry_config.retry_only = true;
+    let retry_config = Arc::new(retry_config);
+    // The legacy pending asset owner is the only retry authority reachable under
+    // retry-only. Admitted generation destinations stay pending and untouched
+    // while an epoch is held. Build no selection context here: that is why the
+    // previous has_due_selection_work/has_due_retained_work prechecks were always
+    // None/false under retry_only. replay_pending_work returns a no-work result
+    // without source enumeration when no legacy asset is due.
+    download::replay_pending_work(
+        download_client,
+        &lib_state.plan.passes,
+        &retry_config,
+        download_controls,
+        shutdown_token.clone(),
+    )
+    .await
+    .map(Some)
+}
+
+async fn run_epoch_local_recovery(
+    download_client: &reqwest::Client,
+    db: &dyn download::DownloadStore,
+    lib_state: &LibraryState,
+    config: &config::Config,
+    build_download_config: &BuildDownloadConfigFn<'_>,
+    shutdown_token: &CancellationToken,
+    run_path_reconciliation: bool,
+) -> anyhow::Result<EpochLocalRecovery> {
+    let local_config = build_download_config(
+        download::SyncMode::Full,
+        Arc::new(rustc_hash::FxHashSet::default()),
+        Arc::new(download::AssetGroupings::default()),
+        Arc::from(lib_state.zone_name.as_str()),
+    );
+    let local_config = Arc::new(local_config.check_ownership().await?);
+    let mut failures = 0usize;
+    let mut reconciliation_stats = None;
+    let mut path_complete = true;
+    let mut path_safe = true;
+    if run_path_reconciliation {
+        let reconciliation = Box::pin(download::recover_recorded_sources(
+            download_client,
+            &lib_state.plan.passes,
+            Arc::clone(&local_config),
+            shutdown_token.clone(),
+        ))
+        .await?;
+        let reconciliation_failures = reconciliation
+            .stats
+            .failed
+            .saturating_add(reconciliation.stats.exif_failures)
+            .saturating_add(reconciliation.stats.state_write_failures);
+        failures = failures.saturating_add(reconciliation_failures);
+        reconciliation_stats = Some(reconciliation.stats);
+        path_complete = reconciliation.complete || reconciliation.complete_after_smart_query;
+        if reconciliation_failures > 0 {
+            path_safe = false;
+        }
+    }
+    let metadata_failures = Box::pin(download::drain_pending_metadata_rewrites(
+        db,
+        &local_config.directory,
+        &config.metadata,
+        local_config.capture_timestamp_repair,
+        &[lib_state.zone_name.as_str()],
+        Arc::clone(&local_config.temp_suffix),
+        shutdown_token,
+    ))
+    .await;
+    if metadata_failures > 0 {
+        failures = failures.saturating_add(metadata_failures);
+        path_safe = false;
+    }
+    Ok(EpochLocalRecovery {
+        failures,
+        reconciliation_stats,
+        path_complete,
+        path_safe,
+        config: local_config,
+    })
+}
+
 pub(crate) async fn run_cycle(
     library_states: &[&LibraryState],
     config: &config::Config,
@@ -953,6 +1040,10 @@ pub(crate) async fn run_cycle(
     shared_session: &auth::SharedSession,
     shutdown_token: &CancellationToken,
 ) -> anyhow::Result<CycleResult> {
+    let sync_epoch = match state_db {
+        Some(db) => db.sync_epoch_id().await?,
+        None => None,
+    };
     let mut cycle_failed_count = 0usize;
     let mut cycle_session_expired = false;
     let mut cycle_stats = download::SyncStats::default();
@@ -1122,11 +1213,35 @@ pub(crate) async fn run_cycle(
             break;
         }
 
+        if let Some(db) = state_db
+            && !config.runtime.dry_run
+            && !config.runtime.only_print_filenames
+            && !is_retry_failed
+        {
+            db.sync_epoch_enroll(vec![(
+                lib_state.zone_name.clone(),
+                lib_state.library.baseline_scope(),
+            )])
+            .await?;
+        }
+
         let indexing_key = indexing_reconciliation_key(&lib_state.zone_name);
         let (indexing_finished, indexing_hold_at_start) =
             prepare_library_indexing(lib_state, state_db, config.runtime.dry_run).await?;
         let indexing_reconciliation = indexing_hold_at_start.is_some() || !indexing_finished;
         if !has_active_passes(lib_state) {
+            if let Some(db) = state_db
+                && !config.runtime.dry_run
+                && !config.runtime.only_print_filenames
+                && !is_retry_failed
+            {
+                db.defer_sync_epoch(
+                    lib_state.zone_name.clone(),
+                    config.watch.interval,
+                    "no_active_passes",
+                )
+                .await?;
+            }
             db_sync_token_advance_safe &= !indexing_reconciliation;
             continue;
         }
@@ -1136,6 +1251,154 @@ pub(crate) async fn run_cycle(
             tracing::warn!(
                 "Photo library indexing is RUNNING; downloads are provisional, deletions and checkpoint promotion are disabled"
             );
+        }
+        let epoch_ready = indexing_finished
+            && !indexing_reconciliation
+            && !is_retry_failed
+            && download_controls.run_mode.downloads_files();
+        let mut force_epoch_baseline = false;
+        let mut promote_only = false;
+        let mut epoch_attempt: Option<String> = None;
+        if let Some(db) = state_db
+            && !config.runtime.dry_run
+        {
+            let ineligible_without_defer = config.runtime.only_print_filenames || is_retry_failed;
+            let epoch_gate = if !epoch_ready {
+                if db
+                    .sync_epoch_has_pending(lib_state.zone_name.clone())
+                    .await?
+                {
+                    if !ineligible_without_defer {
+                        db.defer_sync_epoch(
+                            lib_state.zone_name.clone(),
+                            config.watch.interval,
+                            "epoch_waiting_for_eligible_run",
+                        )
+                        .await?;
+                    }
+                    state::SyncEpochGate::Defer {
+                        reason: "epoch_waiting_for_eligible_run",
+                    }
+                } else {
+                    state::SyncEpochGate::Open
+                }
+            } else {
+                db.sync_epoch_gate(
+                    lib_state.zone_name.clone(),
+                    lib_state.library.baseline_scope(),
+                    config.watch.interval,
+                )
+                .await?
+            };
+            match epoch_gate {
+                state::SyncEpochGate::Open => {}
+                state::SyncEpochGate::Baseline { attempt } => {
+                    force_epoch_baseline = true;
+                    epoch_attempt = Some(attempt);
+                }
+                state::SyncEpochGate::Promote { .. } => {
+                    promote_only = true;
+                }
+                state::SyncEpochGate::Defer { reason }
+                | state::SyncEpochGate::Blocked { reason } => {
+                    if config.runtime.only_print_filenames || is_retry_failed {
+                        // Ineligible runs must not drain queued metadata or run
+                        // historical path reconciliation. Retry-only still
+                        // replays durable pending transfers without enumeration.
+                        if is_retry_failed && download_controls.run_mode.downloads_files() {
+                            let download_client =
+                                shared_session.read().await.download_client().clone();
+                            let retry_config = build_download_config(
+                                download::SyncMode::Full,
+                                Arc::new(rustc_hash::FxHashSet::default()),
+                                Arc::new(download::AssetGroupings::default()),
+                                Arc::from(lib_state.zone_name.as_str()),
+                            );
+                            let retry_config = Arc::new(retry_config.check_ownership().await?);
+                            match Box::pin(run_epoch_pending_retry(
+                                &download_client,
+                                lib_state,
+                                &retry_config,
+                                download_controls,
+                                shutdown_token,
+                            ))
+                            .await
+                            {
+                                Ok(Some(result)) => {
+                                    cycle_stats.accumulate(&result.stats);
+                                    match result.outcome {
+                                        download::DownloadOutcome::Success => {}
+                                        download::DownloadOutcome::SessionExpired { .. } => {
+                                            cycle_session_expired = true;
+                                            db_sync_token_advance_safe = false;
+                                        }
+                                        download::DownloadOutcome::PartialFailure {
+                                            failed_count,
+                                        } => {
+                                            cycle_failed_count =
+                                                cycle_failed_count.saturating_add(failed_count);
+                                            db_sync_token_advance_safe = false;
+                                        }
+                                    }
+                                    if result.stats.state_write_failures > 0
+                                        || result.stats.interrupted
+                                    {
+                                        db_sync_token_advance_safe = false;
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    cycle_failed_count = cycle_failed_count.saturating_add(1);
+                                    db_sync_token_advance_safe = false;
+                                    tracing::warn!(
+                                        error = %error,
+                                        "Retry-only replay failed while the epoch baseline waits"
+                                    );
+                                }
+                            }
+                        }
+                        tracing::info!(
+                            reason,
+                            only_print_filenames = config.runtime.only_print_filenames,
+                            retry_failed = is_retry_failed,
+                            "Sync epoch deferred; ineligible run preserved local metadata and recovery state"
+                        );
+                        continue;
+                    }
+                    // Indexing already ran. Keep local path, layout and metadata
+                    // recovery moving even while the provider baseline waits.
+                    let download_client = shared_session.read().await.download_client().clone();
+                    let local = run_epoch_local_recovery(
+                        &download_client,
+                        db,
+                        lib_state,
+                        config,
+                        build_download_config,
+                        shutdown_token,
+                        indexing_finished
+                            && !indexing_reconciliation
+                            && pending_download_config_hash.is_some()
+                            && download_controls.run_mode.downloads_files(),
+                    )
+                    .await?;
+                    cycle_failed_count = cycle_failed_count.saturating_add(local.failures);
+                    if let Some(stats) = local.reconciliation_stats {
+                        cycle_stats.accumulate(&stats);
+                    }
+                    path_reconciliation_complete &= local.path_complete;
+                    path_reconciliation_cycle_safe &= local.path_safe;
+                    if local.failures > 0 {
+                        db_sync_token_advance_safe = false;
+                    }
+                    db.set_metadata(LAST_RECOVERY_ACTION_KEY, "source_epoch_deferred")
+                        .await?;
+                    tracing::info!(
+                        reason,
+                        "Sync epoch library deferred; indexing and local recovery retained"
+                    );
+                    continue;
+                }
+            }
         }
         let retained_cursor_at_start = if let Some(db) = state_db {
             db.get_metadata(&lib_state.sync_token_key).await?
@@ -1277,6 +1540,93 @@ pub(crate) async fn run_cycle(
         // Historical attribution remains retained evidence. The v27 cursor
         // accounts for current observations and does not activate old proofs.
 
+        if promote_only {
+            let Some(db) = state_db else {
+                continue;
+            };
+            let download_client = shared_session.read().await.download_client().clone();
+            let local = run_epoch_local_recovery(
+                &download_client,
+                db,
+                lib_state,
+                config,
+                build_download_config,
+                shutdown_token,
+                indexing_finished
+                    && !indexing_reconciliation
+                    && pending_download_config_hash.is_some()
+                    && download_controls.run_mode.downloads_files(),
+            )
+            .await?;
+            cycle_failed_count = cycle_failed_count.saturating_add(local.failures);
+            if let Some(stats) = local.reconciliation_stats {
+                cycle_stats.accumulate(&stats);
+            }
+            path_reconciliation_complete &= local.path_complete;
+            path_reconciliation_cycle_safe &= local.path_safe;
+            if local.failures > 0 {
+                db_sync_token_advance_safe = false;
+            }
+            if local.failures == 0
+                && !cycle_session_expired
+                && !shutdown_token.is_cancelled()
+                && download_controls.run_mode.downloads_files()
+            {
+                match Box::pin(run_epoch_pending_retry(
+                    &download_client,
+                    lib_state,
+                    &local.config,
+                    download_controls,
+                    shutdown_token,
+                ))
+                .await
+                {
+                    Ok(Some(result)) => {
+                        cycle_stats.accumulate(&result.stats);
+                        match result.outcome {
+                            download::DownloadOutcome::Success => {}
+                            download::DownloadOutcome::SessionExpired { .. } => {
+                                cycle_session_expired = true;
+                                db_sync_token_advance_safe = false;
+                            }
+                            download::DownloadOutcome::PartialFailure { failed_count } => {
+                                cycle_failed_count =
+                                    cycle_failed_count.saturating_add(failed_count);
+                                db_sync_token_advance_safe = false;
+                            }
+                        }
+                        if result.stats.state_write_failures > 0 || result.stats.interrupted {
+                            db_sync_token_advance_safe = false;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        cycle_failed_count = cycle_failed_count.saturating_add(1);
+                        db_sync_token_advance_safe = false;
+                        tracing::warn!(
+                            error = %error,
+                            "Pending generation replay failed while an epoch proof waits"
+                        );
+                    }
+                }
+            }
+            let unresolved = sparse_identity_holds_current(
+                db,
+                &lib_state.zone_name,
+                is_current_zone_checkpoint(&lib_state.sync_token_key),
+            )
+            .await?;
+            if unresolved {
+                download::block_sync_token_for_unresolved_identity(&mut cycle_stats);
+                cycle_failed_count = cycle_failed_count.max(1);
+                db_sync_token_advance_safe = false;
+            }
+            // Keep the exact staged token, descriptor and proof in place. The
+            // all-zone aggregate promotion at the end of the cycle is the only
+            // writer of the active token.
+            continue;
+        }
+
         // Determine source-enumeration mode per library. Failed transfers are
         // rehydrated from durable pending state by the download engine and do
         // not require replaying the provider inventory.
@@ -1324,6 +1674,16 @@ pub(crate) async fn run_cycle(
             metadata_refresh_mode_decision(config.runtime.refresh_metadata)
         {
             refresh_decision
+        } else if force_epoch_baseline {
+            let reason = download::FullEnumerationReason::SyncEpochEnrollment;
+            tracing::info!(
+                full_enumeration_reason = reason.as_str(),
+                "Starting the one-time sync epoch baseline"
+            );
+            SyncModeDecision {
+                mode: download::SyncMode::Full,
+                full_enumeration_reason: Some(reason),
+            }
         } else if let Some(zone_sync_token) = pending_zone_token {
             tracing::debug!(
                 zone = %lib_state.zone_name,
@@ -1432,12 +1792,21 @@ pub(crate) async fn run_cycle(
                 "Selected library retains its cursor because due historical source evidence is invalid");
             continue;
         }
-        let baseline_key = format!(
-            "baseline_cursor:v27:{}:{}:{}",
-            lib_state.library.baseline_scope(),
-            enum_config_hash,
-            preservation_config_hash.as_deref().unwrap_or(""),
-        );
+        let baseline_key = match sync_epoch.as_deref() {
+            Some(epoch) => format!(
+                "baseline_cursor:v27:{}:{}:{}:{}",
+                epoch,
+                lib_state.library.baseline_scope(),
+                enum_config_hash,
+                preservation_config_hash.as_deref().unwrap_or(""),
+            ),
+            None => format!(
+                "baseline_cursor:v27:{}:{}:{}",
+                lib_state.library.baseline_scope(),
+                enum_config_hash,
+                preservation_config_hash.as_deref().unwrap_or(""),
+            ),
+        };
         let baseline_cursor_at_start = if retained_cursor_at_start.is_none()
             && matches!(download_config.sync_mode, download::SyncMode::Full)
             && download_controls.run_mode.downloads_files()
@@ -1614,12 +1983,7 @@ pub(crate) async fn run_cycle(
             measurement.scope == download::inventory_scope(&lib_state.plan.passes, &download_config)
         });
 
-        observe_sync_component(
-            &lib_state.zone_name,
-            "initial",
-            &sync_result,
-            lib_state.plan.passes.len(),
-        );
+        observe_sync_component("initial", &sync_result, lib_state.plan.passes.len());
 
         let mut retained_checkpoint_expired = false;
         let mut checkpoint_basis =
@@ -1715,7 +2079,6 @@ pub(crate) async fn run_cycle(
                         )
                         .await?;
                         observe_sync_component(
-                            &lib_state.zone_name,
                             "delta_bridge",
                             &bridge_result,
                             lib_state.plan.passes.len(),
@@ -2198,7 +2561,11 @@ pub(crate) async fn run_cycle(
                                         baseline_key.clone(),
                                     ],
                                 },
-                                sync_result.checkpoint.observation.clone(),
+                                sync_result
+                                    .checkpoint
+                                    .observation
+                                    .clone()
+                                    .map(|proof| proof.with_epoch_attempt(epoch_attempt.clone())),
                                 false,
                             )
                             .await
@@ -2265,7 +2632,11 @@ pub(crate) async fn run_cycle(
                                     ])
                                     .collect(),
                                 },
-                                sync_result.checkpoint.observation.clone(),
+                                sync_result
+                                    .checkpoint
+                                    .observation
+                                    .clone()
+                                    .map(|proof| proof.with_epoch_attempt(epoch_attempt.clone())),
                                 false,
                             )
                             .await
@@ -2399,18 +2770,8 @@ pub(crate) async fn run_cycle(
                 );
             }
         }
-        crate::support::observe_scoped(
-            &lib_state.zone_name,
-            None,
-            "support_checkpoint_v1",
-            checkpoint_evidence,
-        );
-        observe_sync_component(
-            &lib_state.zone_name,
-            "combined",
-            &sync_result,
-            lib_state.plan.passes.len(),
-        );
+        crate::support::observe("support_checkpoint_v1", checkpoint_evidence);
+        observe_sync_component("combined", &sync_result, lib_state.plan.passes.len());
         if sync_result.stats.sync_token_blocked
             && sync_result.stats.sync_token_blocked_zone.is_none()
         {
@@ -2437,6 +2798,17 @@ pub(crate) async fn run_cycle(
         // Accumulate stats across libraries.
         cycle_stats.accumulate(&sync_result.stats);
 
+        if shutdown_token.is_cancelled()
+            && let Some(db) = state_db
+            && !config.runtime.dry_run
+        {
+            db.recover_sync_epoch_attempt(
+                lib_state.zone_name.clone(),
+                false,
+                config.watch.interval,
+            )
+            .await?;
+        }
         match sync_result.outcome {
             download::DownloadOutcome::Success => {}
             download::DownloadOutcome::SessionExpired { auth_error_count } => {
@@ -2445,10 +2817,39 @@ pub(crate) async fn run_cycle(
                     zone = %lib_state.zone_name,
                     "Session expired during library sync"
                 );
+                if let Some(db) = state_db
+                    && !config.runtime.dry_run
+                {
+                    db.recover_sync_epoch_attempt(
+                        lib_state.zone_name.clone(),
+                        false,
+                        config.watch.interval,
+                    )
+                    .await?;
+                }
                 cycle_session_expired = true;
                 break; // Stop iterating libraries -- need re-auth
             }
             download::DownloadOutcome::PartialFailure { failed_count } => {
+                if let Some(db) = state_db
+                    && !config.runtime.dry_run
+                {
+                    if sync_result.stats.state_write_failures > 0 {
+                        db.defer_sync_epoch(
+                            lib_state.zone_name.clone(),
+                            config.watch.interval,
+                            "state_write_failure",
+                        )
+                        .await?;
+                    } else {
+                        db.recover_sync_epoch_attempt(
+                            lib_state.zone_name.clone(),
+                            !shutdown_token.is_cancelled(),
+                            config.watch.interval,
+                        )
+                        .await?;
+                    }
+                }
                 cycle_failed_count += failed_count;
             }
         }
@@ -2501,15 +2902,28 @@ pub(crate) async fn run_cycle(
         if db_sync_token_advance_safe {
             metadata_updates.push((LAST_CHECKPOINT_STATUS_KEY.to_owned(), "current".to_owned()));
             metadata_updates.push((LAST_RECOVERY_ACTION_KEY.to_owned(), "none".to_owned()));
+            let mut expected_metadata = enum_metadata_at_start
+                .iter()
+                .cloned()
+                .chain(active_cursor_fences)
+                .chain(path_metadata_at_start.iter().cloned())
+                .collect::<Vec<_>>();
+            for lib_state in library_states
+                .iter()
+                .copied()
+                .filter(|state| has_active_passes(state))
+            {
+                if let Some(evidence) = db
+                    .sync_epoch_baseline_evidence(lib_state.zone_name.clone())
+                    .await?
+                {
+                    expected_metadata.push(evidence);
+                }
+            }
             if let Err(e) = db
                 .commit_observation_transition(
                     state::CheckpointTransition {
-                        expected_metadata: enum_metadata_at_start
-                            .iter()
-                            .cloned()
-                            .chain(active_cursor_fences)
-                            .chain(path_metadata_at_start.iter().cloned())
-                            .collect(),
+                        expected_metadata,
                         legacy_preservation_proofs: Vec::new(),
                         legacy_config_hash: preservation_config_hash.clone(),
                         sparse_identity_proofs,
@@ -2754,7 +3168,7 @@ mod tests {
     #[test]
     fn support_component_totals_keep_inventory_and_bridge_separate() {
         use tracing_subscriber::layer::SubscriberExt;
-        let (layer, drain) = crate::support::history::test_layer();
+        let (layer, drain) = crate::support::test_capture::test_layer();
         tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
             let mut inventory = download::SyncResult::from_execution(
                 download::DownloadOutcome::Success,
@@ -2775,10 +3189,10 @@ mod tests {
                     ..Default::default()
                 },
             );
-            observe_sync_component("PRIVATE_ZONE", "initial", &inventory, 1);
-            observe_sync_component("PRIVATE_ZONE", "delta_bridge", &bridge, 1);
+            observe_sync_component("initial", &inventory, 1);
+            observe_sync_component("delta_bridge", &bridge, 1);
             inventory.accumulate(&bridge);
-            observe_sync_component("PRIVATE_ZONE", "combined", &inventory, 1);
+            observe_sync_component("combined", &inventory, 1);
         });
         let evidence = drain();
         assert_eq!(evidence.len(), 3);

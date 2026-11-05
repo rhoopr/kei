@@ -574,8 +574,6 @@ pub(crate) struct DownloadConfig {
     pub(crate) live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy,
     pub(crate) edited: bool,
     pub(crate) edited_naming: crate::types::EditedNaming,
-    pub(crate) primary_layout_active: bool,
-    pub(crate) primary_layout_preview: bool,
     pub(crate) primary_layout_source: Option<Arc<crate::icloud::photos::PhotoAlbum>>,
     pub(crate) primary_layout_pass: Option<String>,
     pub(crate) primary_layout_pass_kind: Option<crate::commands::PassKind>,
@@ -679,9 +677,7 @@ impl DownloadConfig {
             paths::TOKEN_LIBRARY,
         ];
         let any_token = |s: &str| PER_PASS_TOKENS.iter().any(|t| s.contains(t));
-        self.primary_layout_active
-            || self.primary_layout_preview
-            || self.selection_run.is_some()
+        self.selection_run.is_some()
             || any_token(&self.folder_structure)
             || any_token(&self.folder_structure_albums)
             || any_token(&self.folder_structure_smart_folders)
@@ -828,8 +824,6 @@ impl DownloadConfig {
             live_photo_mov_filename_policy: crate::types::LivePhotoMovFilenamePolicy::Suffix,
             edited: false,
             edited_naming: crate::types::EditedNaming::Suffix,
-            primary_layout_active: false,
-            primary_layout_preview: false,
             primary_layout_source: None,
             primary_layout_pass: None,
             primary_layout_pass_kind: None,

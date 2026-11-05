@@ -1,12 +1,7 @@
-//! Cross-platform CLI parsing tests for `kei install`, `kei uninstall`,
-//! and `kei service {run,status}`.
+//! Cross-platform CLI parsing tests for `kei service {run,status}`.
 //!
-//! Tests in this file must hold on every target. Platform-specific
-//! behavior (actually writing a unit file or invoking systemctl) lives
-//! in `tests/service_linux.rs` and analogous suites for the other
-//! platforms. The "not yet implemented" assertions are gated to
-//! targets without a backend so they auto-deactivate as each platform
-//! ships.
+//! Platform-specific status behavior lives in `tests/service_linux.rs`
+//! and analogous suites for macOS and Windows.
 
 #![allow(
     clippy::unwrap_used,
@@ -30,24 +25,6 @@ fn cmd() -> assert_cmd::Command {
 }
 
 // ── Help output ─────────────────────────────────────────────────────────
-
-#[test]
-fn install_help_lists_user_and_system_flags() {
-    cmd()
-        .args(["install", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--user").and(predicate::str::contains("--system")));
-}
-
-#[test]
-fn uninstall_help_lists_purge_flag() {
-    cmd()
-        .args(["uninstall", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--purge"));
-}
 
 #[test]
 fn service_help_lists_run_and_status() {
@@ -83,57 +60,21 @@ fn service_status_help_renders_without_panic() {
 }
 
 #[test]
-fn top_level_help_lists_install_uninstall_service() {
+fn top_level_help_keeps_service_and_drops_install_commands() {
     cmd().arg("--help").assert().success().stdout(
-        predicate::str::contains("install")
-            .and(predicate::str::contains("uninstall"))
-            .and(predicate::str::contains("service")),
+        predicate::str::contains("service")
+            .and(predicate::str::contains("install").not())
+            .and(predicate::str::contains("uninstall").not()),
     );
 }
 
-// ── Argument parsing ────────────────────────────────────────────────────
-
 #[test]
-fn install_user_and_system_are_mutually_exclusive() {
-    cmd()
-        .args(["install", "--user", "--system"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be used with"));
-}
-
-// ── Stub error contract (non-Linux only) ────────────────────────────────
-//
-// On targets where the platform backend has shipped, these tests
-// auto-deactivate via cfg. They guard the macOS / Windows stubs until
-// those backends land.
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-#[test]
-fn install_returns_clean_not_implemented_error() {
-    cmd()
-        .arg("install")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("not yet implemented"));
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-#[test]
-fn uninstall_returns_clean_not_implemented_error() {
-    cmd()
-        .arg("uninstall")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("not yet implemented"));
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-#[test]
-fn service_status_returns_clean_not_implemented_error() {
-    cmd()
-        .args(["service", "status"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("not yet implemented"));
+fn removed_install_commands_do_not_parse() {
+    for command in ["install", "uninstall"] {
+        cmd()
+            .arg(command)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unrecognized subcommand"));
+    }
 }

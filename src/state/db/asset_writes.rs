@@ -452,9 +452,7 @@ pub(super) fn update_status_to_downloaded(
             remaining_diagnostics
         ])
         .map_err(|e| StateError::query("mark_downloaded", e))?;
-    crate::support::observe_scoped(
-        library,
-        Some((id, version_size)),
+    crate::support::observe(
         "support_publication_v1",
         serde_json::json!({
             "operation": "publication", "transaction_committed": false, "source_status": prior.as_ref().map(|p| p.1.as_str()),

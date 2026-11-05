@@ -1028,27 +1028,6 @@ impl Session {
         Ok(())
     }
 
-    /// Same cached cookies and origin headers, with no redirect or protocol retry.
-    pub(crate) fn diagnostic_client(&self) -> Result<Client> {
-        Client::builder()
-            .cookie_provider(Arc::clone(&self.cookie_jar))
-            .default_headers({
-                let mut headers = HeaderMap::new();
-                headers.insert(ORIGIN, HeaderValue::from_str(&self.home_endpoint)?);
-                headers.insert(
-                    REFERER,
-                    HeaderValue::from_str(&format!("{}/", self.home_endpoint))?,
-                );
-                headers
-            })
-            .user_agent(DEFAULT_USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(Into::into)
-    }
-
     pub fn home_endpoint(&self) -> &str {
         &self.home_endpoint
     }

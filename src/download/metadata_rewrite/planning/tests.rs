@@ -234,6 +234,183 @@ fn capture_timestamp_repair_requires_an_offset_and_replaces_the_pair() {
     assert!(!write_without_offset.clear_datetime_offsets);
 }
 
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn capture_repair_accepts_an_embedded_zone_and_second_plan_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata.jpg");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/media/metadata.jpg"),
+        &path,
+    )
+    .unwrap();
+    crate::download::metadata::apply_metadata(
+        &path,
+        &crate::download::metadata::MetadataWrite {
+            datetime: Some("2023:11:14 14:13:20".into()),
+            offset_time_original: Some("-08:00".into()),
+            clear_datetime_offsets: true,
+            ..crate::download::metadata::MetadataWrite::default()
+        },
+        ".metadata-test",
+    )
+    .unwrap();
+
+    let probe = crate::download::metadata::probe_exif(&path).unwrap();
+    assert_eq!(
+        probe.datetime_original.as_deref(),
+        Some("2023-11-14T14:13:20-08:00")
+    );
+    assert!(
+        probe.offset_time_original.is_none(),
+        "the real embedded fixture must reproduce an empty separate offset tag"
+    );
+    let created_local = chrono::DateTime::parse_from_rfc3339("2023-11-14T14:13:20-08:00").unwrap();
+    let payload = MetadataPayload {
+        timezone_offset: Some(-28_800),
+        ..MetadataPayload::default()
+    };
+    assert!(
+        super::super::capture::capture_repair_is_verified(
+            &path,
+            std::sync::Arc::new(payload.clone()),
+            created_local,
+        )
+        .await,
+        "the embedded zone must verify a completed capture repair"
+    );
+    let write = plan_metadata_write_with_repair(
+        MetadataFlags::DATETIME,
+        &payload,
+        &created_local,
+        CaptureTimestampRepair::ReplaceWithCaptureLocal,
+        &probe,
+    );
+    assert!(
+        write.is_empty(),
+        "a second plan must write nothing: {write:?}"
+    );
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn capture_repair_rejects_wrong_and_missing_original_offsets() {
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/media/metadata.jpg");
+    let dir = tempfile::tempdir().unwrap();
+    let payload = MetadataPayload {
+        timezone_offset: Some(-28_800),
+        ..MetadataPayload::default()
+    };
+    let created_local = chrono::DateTime::parse_from_rfc3339("2023-11-14T14:13:20-08:00").unwrap();
+    let write = |path: &std::path::Path, datetime: &str, offset: Option<&str>, clear: bool| {
+        crate::download::metadata::apply_metadata(
+            path,
+            &crate::download::metadata::MetadataWrite {
+                datetime: Some(datetime.into()),
+                offset_time_original: offset.map(str::to_owned),
+                clear_datetime_offsets: clear,
+                ..crate::download::metadata::MetadataWrite::default()
+            },
+            ".metadata-test",
+        )
+        .unwrap();
+    };
+
+    let wrong = dir.path().join("wrong-zone.jpg");
+    std::fs::copy(&fixture, &wrong).unwrap();
+    write(&wrong, "2023:11:14 14:13:20", Some("-07:00"), true);
+    assert!(
+        !super::super::capture::capture_repair_is_verified(
+            &wrong,
+            std::sync::Arc::new(payload.clone()),
+            created_local,
+        )
+        .await,
+        "an embedded wrong zone is not repaired evidence"
+    );
+
+    let missing = dir.path().join("missing-zone.jpg");
+    std::fs::copy(&fixture, &missing).unwrap();
+    write(&missing, "2023:11:14 14:13:20", None, true);
+    assert!(
+        !super::super::capture::capture_repair_is_verified(
+            &missing,
+            std::sync::Arc::new(payload.clone()),
+            created_local,
+        )
+        .await,
+        "a file with no embedded or separate zone is not repaired evidence"
+    );
+    assert!(
+        !super::super::capture::capture_repair_is_verified(
+            &missing,
+            std::sync::Arc::new(MetadataPayload::default()),
+            created_local,
+        )
+        .await,
+        "a missing requested offset cannot authorize repair"
+    );
+}
+
+#[test]
+fn capture_repair_requires_the_expected_zone_from_embedded_and_separate_values() {
+    let created_local =
+        chrono::DateTime::parse_from_rfc3339("2024-06-15T10:00:00.629+11:00").unwrap();
+    let payload = MetadataPayload {
+        timezone_offset: Some(39_600),
+        ..MetadataPayload::default()
+    };
+    let cases: &[(&str, Option<&str>, bool)] = &[
+        ("2024-06-15T10:00:00.629+11:00", None, true),
+        ("2024:06:15 10:00:00", Some("+11:00"), true),
+        ("2024-06-15T10:00:00.629+11:00", Some("+11:00"), true),
+        ("2024-06-15T10:00:00.000+11:00", None, true),
+        ("2024-06-15T10:00:00.629+11:00", Some("+10:00"), false),
+        ("2024-06-15T10:00:00.629+10:00", Some("+11:00"), false),
+        ("2024-06-15T10:00:00.629+10:00", None, false),
+        ("2024:06:15 10:00:00", Some("+10:00"), false),
+        ("2024:06:15 10:00:00", None, false),
+        ("not a timestamp", Some("+11:00"), false),
+    ];
+    for (datetime, offset, already_repaired) in cases {
+        let probe = crate::download::metadata::ExifProbe {
+            datetime_original: Some((*datetime).to_owned()),
+            offset_time_original: offset.map(str::to_owned),
+            ..crate::download::metadata::ExifProbe::default()
+        };
+        let write = plan_metadata_write_with_repair(
+            MetadataFlags::DATETIME,
+            &payload,
+            &created_local,
+            CaptureTimestampRepair::ReplaceWithCaptureLocal,
+            &probe,
+        );
+        assert_eq!(
+            write.is_empty(),
+            *already_repaired,
+            "datetime={datetime:?} offset={offset:?} write={write:?}"
+        );
+        if !already_repaired {
+            assert_eq!(
+                write.datetime.as_deref(),
+                Some("2024:06:15 10:00:00"),
+                "{datetime:?} {offset:?}"
+            );
+            assert_eq!(
+                write.datetime_subseconds.as_deref(),
+                Some("629"),
+                "{datetime:?} {offset:?}"
+            );
+            assert_eq!(
+                write.offset_time_original.as_deref(),
+                Some("+11:00"),
+                "{datetime:?} {offset:?}"
+            );
+        }
+    }
+}
+
 /// XMP stores capture times as ISO 8601, and kei's own writer appends the
 /// offset. Such a timestamp is already capture-local, so it still accepts
 /// the offset tag.

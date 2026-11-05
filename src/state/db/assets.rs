@@ -22,7 +22,9 @@ use super::{
 use crate::state::error::StateError;
 #[cfg(test)]
 use crate::state::types::AssetStatus;
-use crate::state::types::{AssetRecord, METADATA_CAPTURE_REVISION, VersionSizeKey};
+use crate::state::types::{
+    AssetRecord, METADATA_CAPTURE_REVISION, RenditionMetadata, VersionSizeKey,
+};
 
 impl SqliteStateDb {
     #[cfg(test)]
@@ -304,7 +306,7 @@ impl SqliteStateDb {
                 )
                 .map_err(|e| StateError::query("mark_failed", e))?;
 
-            crate::support::observe_scoped(&library, Some((&id, &version_size)), "support_publication_v1", serde_json::json!({
+            crate::support::observe("support_publication_v1", serde_json::json!({
                 "operation": "download", "destination_status": "failed", "updated": rows,
             }));
             if rows == 0 {
@@ -1140,18 +1142,20 @@ impl DownloadStateStore for SqliteStateDb {
         &self,
         record: &AssetRecord,
         receipt: &super::BaselineReceipt,
+        child: &str,
         validate_file: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
     ) -> Result<(), StateError> {
-        SqliteStateDb::adopt_baseline_receipt(self, record, receipt, validate_file).await
+        SqliteStateDb::adopt_baseline_receipt(self, record, receipt, child, validate_file).await
     }
 
     async fn adopt_provider_signature(
         &self,
         record: &AssetRecord,
         receipt: &super::BaselineReceipt,
+        child: &str,
         validate_file: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
     ) -> Result<(), StateError> {
-        SqliteStateDb::adopt_provider_signature(self, record, receipt, validate_file).await
+        SqliteStateDb::adopt_provider_signature(self, record, receipt, child, validate_file).await
     }
 
     #[cfg(test)]
@@ -1557,6 +1561,24 @@ impl DownloadStateStore for SqliteStateDb {
 
 #[async_trait]
 impl DownloadContextStateStore for SqliteStateDb {
+    async fn get_downloaded_rendition_metadata(
+        &self,
+    ) -> Result<Vec<(String, String, VersionSizeKey, RenditionMetadata)>, StateError> {
+        self.with_conn("get_downloaded_rendition_metadata", |conn| {
+            let mut statement = conn.prepare_cached("SELECT library,id,version_size,checksum,width,height,duration_secs FROM assets WHERE status='downloaded' AND is_deleted=0")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?,
+                    VersionSizeKey::from_str(&row.get::<_, String>(2)?)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                    RenditionMetadata {
+                        checksum: Some(row.get::<_, String>(3)?.into()),
+                        width: row.get(4)?, height: row.get(5)?, duration_secs: row.get(6)?,
+                    }))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(StateError::from)
+        }).await
+    }
+
     async fn get_baseline_receipts(&self) -> Result<Vec<super::BaselineReceipt>, StateError> {
         self.with_conn("get_baseline_receipts", |conn| {
             let mut statement = conn.prepare_cached(
@@ -1604,6 +1626,35 @@ impl DownloadContextStateStore for SqliteStateDb {
             })?;
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(StateError::from)
+        })
+        .await
+    }
+
+    async fn get_compact_native_owners(
+        &self,
+    ) -> Result<Vec<(String, String, VersionSizeKey, PathBuf)>, StateError> {
+        self.with_conn("get_compact_native_owners", |conn| {
+            let mut statement = conn.prepare_cached(
+                "SELECT library,state_id,version_size,native_path FROM download_receipts",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut owners = Vec::new();
+            for row in rows {
+                let (library, state_id, version, native) = row?;
+                let version = VersionSizeKey::from_str(&version)
+                    .ok_or(StateError::ProviderSelectionInvalid)?;
+                let path: super::provider_selection::SelectionPath = serde_json::from_str(&native)
+                    .map_err(|_private_error| StateError::ProviderSelectionInvalid)?;
+                owners.push((library, state_id, version, path.to_path()));
+            }
+            Ok(owners)
         })
         .await
     }

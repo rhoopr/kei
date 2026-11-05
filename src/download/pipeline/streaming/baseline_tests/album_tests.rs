@@ -1,4 +1,4 @@
-use super::{STILL, asset, config, current_rows, mount, old_rows, run, seed};
+use super::{STILL, asset, config, current_rows, old_rows, run, seed};
 use crate::download::pipeline::streaming::{StreamRuntime, stream_and_download_from_stream};
 use crate::download::{DownloadControls, DownloadReporting, DownloadRunMode};
 use crate::state::SqliteStateDb;
@@ -14,12 +14,20 @@ async fn baseline_stream_named_album_does_not_claim_other_parent_as_physical_cop
 
 async fn check_album_copy(same_current_identity: bool) {
     let server = crate::start_wiremock_or_skip!();
-    mount(&server, 0).await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/still"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(STILL))
+        .expect(1)
+        .mount(&server)
+        .await;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("photos");
     let media = root.join("Old Album/renamed.JPG");
     let db_path = dir.path().join("state.db");
     seed(&db_path, &media).await;
+    let before = old_rows(&db_path);
+    let mtime = std::fs::metadata(&media).unwrap().modified().unwrap();
+    let mut own = None;
     if same_current_identity {
         let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
         let previous = run(
@@ -29,10 +37,17 @@ async fn check_album_copy(same_current_identity: bool) {
             DownloadRunMode::Download,
         )
         .await;
-        assert_eq!(previous.skip_summary.on_disk, 1);
+        assert_eq!(previous.downloaded, 1);
+        assert_eq!(previous.skip_summary.on_disk, 0);
+        let rows = current_rows(&db_path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "downloaded");
+        let path = std::path::PathBuf::from(&rows[0].2);
+        assert_ne!(path, media);
+        assert_eq!(std::fs::read(&path).unwrap(), STILL);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        own = Some((path, modified));
     }
-    let before = old_rows(&db_path);
-    let mtime = std::fs::metadata(&media).unwrap().modified().unwrap();
     let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
     let mut cfg = (*config(&root, db)).clone();
     // Effective config produced by with_pass for the default named-album template.
@@ -61,9 +76,17 @@ async fn check_album_copy(same_current_identity: bool) {
     );
     assert_eq!(old_rows(&db_path), before);
     assert_eq!(
-        result.downloaded, 0,
-        "existing bytes must not require a network copy"
+        result.downloaded,
+        usize::from(!same_current_identity),
+        "only foreign-only proof requires a new Trip download"
     );
+    assert_eq!(requested.exists(), !same_current_identity);
+    if let Some((path, modified)) = own {
+        assert_eq!(std::fs::read(&path).unwrap(), STILL);
+        let after = std::fs::metadata(path).unwrap().modified().unwrap();
+        assert_eq!(after, modified);
+    }
+    let rows = current_rows(&db_path);
     if !requested.exists() {
         assert!(
             !current_rows(&db_path).is_empty(),
@@ -79,8 +102,17 @@ async fn check_album_copy(same_current_identity: bool) {
                 .all(|(_, status, _)| status == "pending"),
             "unfulfilled album copy remains pending"
         );
+        let db = SqliteStateDb::open(&db_path).await.unwrap();
+        let pending = db.pending_match_status(1).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].attempt.child, "current-child");
+        assert_eq!(pending[0].attempt.destination.to_path(), requested);
     } else {
         assert_eq!(std::fs::read(&requested).unwrap(), STILL);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "downloaded");
+        assert_eq!(rows[0].2, requested.to_str().unwrap());
     }
+    eprintln!("current={same_current_identity} rows={rows:?}");
     server.verify().await;
 }

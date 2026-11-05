@@ -137,21 +137,18 @@ pub(super) fn plan_metadata_write_with_repair(
     let mut write = crate::download::metadata::MetadataWrite::default();
 
     if flags.contains(MetadataFlags::DATETIME) {
-        let offset_time_original = offset_time_original(payload);
+        let expected_offset = offset_time_original(payload);
         write.require_native_heif_capture_time = matches!(
             capture_timestamp_repair,
             CaptureTimestampRepair::ReplaceWithCaptureLocal
-        ) && offset_time_original.is_some();
+        ) && expected_offset.is_some();
         let replace_existing = matches!(
             capture_timestamp_repair,
             CaptureTimestampRepair::ReplaceWithCaptureLocal
-        ) && offset_time_original.as_deref().is_some_and(
-            |expected_offset| {
-                probe.datetime_original.is_some()
-                    && (!probe.denotes_capture_time(created_local)
-                        || probe.offset_time_original.as_deref() != Some(expected_offset))
-            },
-        );
+        ) && expected_offset.as_deref().is_some_and(|expected_offset| {
+            probe.datetime_original.is_some()
+                && !probe.denotes_capture_time_with_offset(created_local, expected_offset)
+        });
         if probe.datetime_original.is_none() || replace_existing {
             write.datetime = Some(created_local.format("%Y:%m:%d %H:%M:%S").to_string());
             let millis = created_local.timestamp_subsec_millis();
@@ -160,11 +157,19 @@ pub(super) fn plan_metadata_write_with_repair(
         }
         // An offset describes one specific timestamp. Attach it only to a
         // timestamp this pass writes, or to one already proven to render the
-        // capture-local instant.
+        // capture-local instant without already carrying that zone.
+        let repair_zone_already_embedded = matches!(
+            capture_timestamp_repair,
+            CaptureTimestampRepair::ReplaceWithCaptureLocal
+        ) && expected_offset
+            .as_deref()
+            .is_some_and(|expected| probe.capture_time_zone_matches(expected));
         if write.datetime.is_some()
-            || (probe.offset_time_original.is_none() && probe.denotes_capture_time(created_local))
+            || (probe.offset_time_original.is_none()
+                && probe.denotes_capture_time(created_local)
+                && !repair_zone_already_embedded)
         {
-            write.offset_time_original = offset_time_original;
+            write.offset_time_original = expected_offset;
         }
     }
     if flags.contains(MetadataFlags::RATING) {

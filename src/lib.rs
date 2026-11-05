@@ -37,7 +37,6 @@ mod download;
 mod fs_util;
 mod health;
 mod icloud;
-mod inventory_diagnostic;
 mod metrics;
 mod notifications;
 mod password;
@@ -732,11 +731,6 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
     if let cli::Command::SupportExport(args) = &cli.command {
         return support::export(args.clone(), &cli.config).await;
     }
-    if let cli::Command::Doctor(args) = &cli.command
-        && args.missing_reference_inventory
-    {
-        return inventory_diagnostic::run(std::path::Path::new(&cli.config)).await;
-    }
     let config = load_startup_config(&cli)?;
     let output = resolve_startup_output(&cli, config.toml.as_ref());
 
@@ -744,23 +738,7 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
     // BarSuspendingStderr pauses progress rendering around each log write.
     let (make_writer, _writer_guard, redact_password) = build_redacting_writer(BarSuspendingStderr);
     let globals = config::GlobalArgs::from_bootstrap_env();
-    let recording = matches!(
-        &cli.command,
-        cli::Command::Sync { .. }
-            | cli::Command::ImportExisting(_)
-            | cli::Command::Service {
-                action: cli::ServiceAction::Run(_)
-            }
-    );
-    let (recorder, support_guard) = if recording {
-        match support::initialize(&globals, config.toml.as_ref(), config.explicitly_set) {
-            Some((recorder, guard)) => (Some(recorder), Some(guard)),
-            None => (None, None),
-        }
-    } else {
-        (None, None)
-    };
-    initialize_logging(&output, make_writer, recorder);
+    initialize_logging(&output, make_writer);
     support::observe(
         "support_startup_v1",
         serde_json::json!({"phase": "startup", "outcome": "starting"}),
@@ -800,9 +778,6 @@ async fn run(env_password: Option<String>, input_mode: InputMode) -> anyhow::Res
         );
     }
     support::observe("support_startup_v1", end);
-    if let Some(guard) = support_guard {
-        guard.finish().await;
-    }
     result
 }
 
@@ -952,7 +927,6 @@ fn resolve_startup_output(cli: &cli::Cli, toml_config: Option<&TomlConfig>) -> S
 fn initialize_logging(
     output: &StartupOutput,
     make_writer: impl for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
-    recorder: Option<support::history::Recorder>,
 ) {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
@@ -960,7 +934,6 @@ fn initialize_logging(
     let env_filter = personality::tracing::env_filter(&output.default_filter);
     if output.personality_mode.is_friendly() {
         tracing_subscriber::registry()
-            .with(recorder)
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_writer(make_writer)
@@ -973,7 +946,6 @@ fn initialize_logging(
             .init();
     } else {
         tracing_subscriber::registry()
-            .with(recorder)
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_writer(make_writer)
@@ -1101,12 +1073,6 @@ async fn dispatch_command(
                 }
             }
         },
-        Command::Install(args) => {
-            return service::install::run(args, &config_path).await;
-        }
-        Command::Uninstall(args) => {
-            return service::uninstall::run(args).await;
-        }
         Command::Service { action } => match action {
             cli::ServiceAction::Status => return service::status::run().await,
             cli::ServiceAction::Run(args) => {
@@ -1224,7 +1190,6 @@ mod tests {
         let err = load_startup_config(&cli).err().unwrap().to_string();
         assert!(err.contains("Failed to parse config file"));
         cli.command = Command::Doctor(cli::DoctorArgs {
-            missing_reference_inventory: false,
             json: true,
             live: false,
         });

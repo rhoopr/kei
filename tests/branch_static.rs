@@ -598,8 +598,6 @@ fn full_test_reports_include_newer_phase_metadata() {
         "docker_full",
         "live_provider",
         "live_import_rehearsal",
-        "service",
-        "host_service",
     ] {
         assert!(
             render.contains(phase),
@@ -839,13 +837,11 @@ fi
 fn full_test_reporting_executes_grouped_and_legacy_fixtures() {
     let temp = tempfile::tempdir().expect("report fixture tempdir");
     let grouped_phases = serde_json::json!({
-        "service": {"status": "pass", "wall_s": 1.0},
         "scenarios": {"status": "pass", "wall_s": 2.0, "tests": 3},
         "offline_core": {"status": "pass", "wall_s": 3.0, "tests": 4},
         "static_checks": {"status": "pass", "wall_s": 4.0}
     });
     let legacy_phases = serde_json::json!({
-        "service_smoke": {"status": "pass", "wall_s": 1.0},
         "offline_all": {"status": "pass", "wall_s": 2.0, "tests": 5},
         "nodefault": {"status": "pass", "wall_s": 3.0},
         "gate": {"status": "pass", "wall_s": 4.0}
@@ -872,7 +868,7 @@ fn full_test_reporting_executes_grouped_and_legacy_fixtures() {
     assert!(grouped_render.status.success());
     assert_text_order(
         &command_text(&grouped_render),
-        &["static_checks", "offline_core", "scenarios", "service"],
+        &["static_checks", "offline_core", "scenarios"],
     );
 
     let legacy_render = Command::new("python3")
@@ -884,7 +880,7 @@ fn full_test_reporting_executes_grouped_and_legacy_fixtures() {
     assert!(legacy_render.status.success());
     assert_text_order(
         &command_text(&legacy_render),
-        &["gate", "nodefault", "offline_all", "service_smoke"],
+        &["gate", "nodefault", "offline_all"],
     );
 
     let diff = repo_path("scripts/full-test/diff_runs.sh");
@@ -892,12 +888,12 @@ fn full_test_reporting_executes_grouped_and_legacy_fixtures() {
         (
             "grouped",
             grouped_phases,
-            vec!["static_checks", "offline_core", "scenarios", "service"],
+            vec!["static_checks", "offline_core", "scenarios"],
         ),
         (
             "legacy",
             legacy_phases,
-            vec!["gate", "nodefault", "offline_all", "service_smoke"],
+            vec!["gate", "nodefault", "offline_all"],
         ),
     ] {
         let runs = temp.path().join(name);
@@ -1749,17 +1745,6 @@ fn release_homebrew_downloads_fail_fast_and_verify_checksums() {
 }
 
 #[test]
-fn service_smoke_is_routed_once_through_required_ci() {
-    let service_smoke = repo_file(".github/workflows/service-smoke.yml");
-    let ci = repo_file(".github/workflows/ci.yml");
-    assert!(service_smoke.contains("  workflow_call:"));
-    assert!(!service_smoke.contains("  pull_request:"));
-    assert!(ci.contains("needs: [plan, checks, service, qualification]"));
-    assert!(ci.contains("needs.plan.outputs.service == 'true'"));
-    assert!(ci.contains("required += [\"service\"]"));
-}
-
-#[test]
 fn contributor_docs_match_current_gate() {
     let contributing = repo_file("CONTRIBUTING.md");
     assert!(contributing.contains("just gate"));
@@ -2060,14 +2045,12 @@ fn typed_error_downcasts_stay_in_named_classifier_boundaries() {
         "classify_api_error",
         "classify_auth_flow_error",
         "classify_auth_retry_error",
-        "classify_catalog_projection_error",
         "classify_cli_parse_exit",
         "classify_conditional_publish_error",
         "classify_download_task_error",
         "classify_exit_error",
         "classify_heif_metadata_limit",
         "classify_incremental_error",
-        "classify_legacy_inventory_error",
         "classify_missing_changes_successor",
         "classify_provider_lookup_error",
         "classify_rate_limit_error",
@@ -2462,7 +2445,6 @@ fn full_test_phase_fixture() -> String {
         "docker_full",
         "live_provider",
         "live_import_rehearsal",
-        "service",
     ]
     .iter()
     .map(|phase| {
@@ -2554,7 +2536,6 @@ fi
             .env_remove("KEI_TEST_SCRATCH_DIR")
             .env("KEI_DOCKER_IMAGE", "fixture image:dev")
             .env("KEI_FULL_TEST_CROSS_ZONE_ALBUM", "fixture")
-            .env("KEI_FULL_TEST_REAL_SERVICE", "1")
             .env("KEI_FULLTEST_VERBOSE", if cancel { "0" } else { "1" })
             .output()
             .unwrap();
@@ -2578,8 +2559,6 @@ fi
         "run_live_smokes.sh",
         "run_live_import_rehearsal.sh",
         "run_cross_zone_album_hydration.sh",
-        "just\ttest\tservice",
-        "just\ttest\thost-service",
         "diff_runs.sh",
     ];
     let (output, calls) = run("", false);
@@ -2981,20 +2960,6 @@ fn docker_support_export_skips_repairs_and_keeps_numeric_privilege_drop() {
         (&["support-export", "--output"][..], false),
         (&["support-export", "--help"][..], true),
         (&["help", "support-export"][..], true),
-        (&["doctor", "--missing-reference-inventory"][..], false),
-        (
-            &["doctor", "--help", "--missing-reference-inventory"][..],
-            true,
-        ),
-        (
-            &[
-                "doctor",
-                "--live",
-                "--json",
-                "--missing-reference-inventory",
-            ][..],
-            false,
-        ),
     ] {
         let result = run(args);
         assert_eq!(result.status.success(), success, "{args:?}: {result:?}");

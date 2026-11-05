@@ -1,156 +1,15 @@
-//! Privacy-safe offline support export and bounded normal-operation evidence.
+//! Privacy-safe offline support snapshot and ordinary redacted diagnostics.
 #![allow(
     clippy::print_stdout,
     reason = "support-export prints its local result and review instructions"
 )]
 mod collect;
-pub(crate) mod history;
 mod privacy;
-pub(crate) mod token_equivalence;
 
-pub(crate) use history::{
-    CompactionSummary, MigrationFailure, StorageComponent, StorageOutcome, begin, complete,
-    observe, observe_scoped, record_storage, record_transport_compaction,
-    record_transport_compaction_failure,
-};
 pub(crate) use privacy::fixed_label;
 
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-
-pub(crate) fn history_path(directory: &Path, username: &str, realm: &str) -> PathBuf {
-    directory.join(format!(
-        "{}.support.json",
-        crate::account::namespace(username, realm)
-    ))
-}
-
-pub(crate) fn initialize(
-    globals: &crate::config::GlobalArgs,
-    toml: Option<&crate::config::TomlConfig>,
-    explicit: bool,
-) -> Option<(history::Recorder, history::Guard)> {
-    let (username, _, domain, directory) =
-        crate::config::resolve_auth(globals, &crate::cli::PasswordArgs::default(), toml);
-    if username.is_empty() {
-        return None;
-    }
-    let configuration = configuration(toml, explicit);
-    history::start(
-        history_path(&directory, &username, domain.as_str()),
-        configuration,
-    )
-}
-
-pub(crate) fn runtime_configuration(config: &crate::config::Config) -> Value {
-    let mut value =
-        serde_json::to_value(crate::report::RunOptions::from_config(config)).unwrap_or(Value::Null);
-    if let Some(map) = value.as_object_mut() {
-        map.insert(
-            "file_match_policy".into(),
-            json!(match config.photos.file_match_policy {
-                crate::types::FileMatchPolicy::NameSizeDedupWithSuffix =>
-                    "name-size-dedup-with-suffix",
-                crate::types::FileMatchPolicy::NameId7 => "name-id7",
-            }),
-        );
-        map.insert(
-            "raw_policy".into(),
-            json!(match config.photos.raw_policy {
-                crate::types::RawPolicy::AsIs => "as-is",
-                crate::types::RawPolicy::PreferRaw => "prefer-raw",
-                crate::types::RawPolicy::PreferJpeg => "prefer-jpeg",
-            }),
-        );
-        map.insert(
-            "live_photo_mode".into(),
-            json!(match config.photos.live_photo_mode {
-                crate::types::LivePhotoMode::Both => "both",
-                crate::types::LivePhotoMode::ImageOnly => "image-only",
-                crate::types::LivePhotoMode::VideoOnly => "video-only",
-                crate::types::LivePhotoMode::Skip => "skip",
-            }),
-        );
-        map.insert(
-            "filename_exclusions".into(),
-            json!(config.download.filename_exclude.len()),
-        );
-        map.insert("watch_interval_secs".into(), json!(config.watch.interval));
-        map.insert("per_transfer".into(), json!(config.retry.max_retries));
-        map.insert(
-            "per_asset".into(),
-            json!(config.retry.max_download_attempts),
-        );
-        map.insert(
-            "legacy_preservation_allow_hardlinks".into(),
-            json!(config.download.legacy_preservation_allow_hardlinks),
-        );
-        map.insert(
-            "keep_unicode_in_filenames".into(),
-            json!(config.photos.keep_unicode_in_filenames),
-        );
-        map.insert(
-            "date_filter_present".into(),
-            json!(
-                config.filters.skip_created_before.is_some()
-                    || config.filters.skip_created_after.is_some()
-            ),
-        );
-        map.insert(
-            "recent_limit_present".into(),
-            json!(config.filters.recent.is_some()),
-        );
-        map.insert(
-            "report_configured".into(),
-            json!(config.report.json.is_some()),
-        );
-        map.insert("strict".into(), json!(config.import.strict));
-        map.insert("xmp_feature".into(), json!(cfg!(feature = "xmp")));
-        use crate::selection::{AlbumSelector, SmartFolderSelector};
-        let (mode, included, excluded) = match &config.filters.selection.albums {
-            AlbumSelector::None => ("none", 0, 0),
-            AlbumSelector::All { excluded } => ("all", 0, excluded.len()),
-            AlbumSelector::Named { included, excluded } => {
-                ("named", included.len(), excluded.len())
-            }
-        };
-        map.insert("album_mode".into(), json!(mode));
-        map.insert("album_selectors".into(), json!(included));
-        map.insert("album_exclusions".into(), json!(excluded));
-        let (mode, included, excluded, sensitive) = match &config.filters.selection.smart_folders {
-            SmartFolderSelector::None => ("none", 0, 0, false),
-            SmartFolderSelector::All {
-                excluded,
-                include_sensitive,
-            } => ("all", 0, excluded.len(), *include_sensitive),
-            SmartFolderSelector::Named { included, excluded } => {
-                ("named", included.len(), excluded.len(), false)
-            }
-        };
-        map.insert("smart_folder_mode".into(), json!(mode));
-        map.insert("smart_folder_selectors".into(), json!(included));
-        map.insert("smart_folder_exclusions".into(), json!(excluded));
-        map.insert("sensitive_folders".into(), json!(sensitive));
-        map.insert(
-            "library_selectors".into(),
-            json!(config.filters.selection.libraries.named.len()),
-        );
-        map.insert(
-            "library_exclusions".into(),
-            json!(config.filters.selection.libraries.excluded.len()),
-        );
-        map.insert(
-            "primary_library".into(),
-            json!(config.filters.selection.libraries.primary),
-        );
-        map.insert(
-            "shared_libraries".into(),
-            json!(config.filters.selection.libraries.shared_all),
-        );
-        map.insert("unfiled".into(), json!(config.filters.selection.unfiled));
-    }
-    privacy::configuration(&value)
-}
 
 fn configuration(toml: Option<&crate::config::TomlConfig>, explicit: bool) -> Value {
     let filters = toml.and_then(|t| t.filters.as_ref());
@@ -196,6 +55,22 @@ fn configuration(toml: Option<&crate::config::TomlConfig>, explicit: bool) -> Va
     privacy::configuration(&value)
 }
 
+/// Emits only typed, allowlisted diagnostic fields. This is ordinary tracing
+/// output, not retained history, and never feeds sync, state, or checkpoint
+/// decisions.
+pub(crate) fn observe(kind: &'static str, fields: Value) {
+    if let Some(fields) = fields
+        .as_object()
+        .and_then(|v| privacy::diagnostic(kind, v))
+    {
+        let fields = Value::Object(fields);
+        tracing::debug!(diagnostic = kind, support_fields = %fields);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_capture;
+
 pub(crate) async fn export(
     args: crate::cli::SupportExportArgs,
     raw_config: &str,
@@ -214,9 +89,9 @@ pub(crate) async fn export(
     let result =
         tokio::task::spawn_blocking(move || collect::export(&config_path, explicit, &output))
             .await?;
-    let (cycles, partial) = result?;
+    let partial = result?;
     println!(
-        "Support export saved: {cycles} retained operation/cycle records{}.",
+        "Support snapshot saved: current local state only{}.",
         if partial {
             "; some evidence unavailable or truncated"
         } else {
@@ -323,25 +198,15 @@ pub(crate) fn download_error_fields(
     }
 }
 
-pub(crate) fn observe_metadata(path: &Path, kind: &'static str, fields: Value) {
-    observe_scoped(
-        "metadata",
-        Some((&path.to_string_lossy(), "metadata")),
-        kind,
-        fields,
-    );
+pub(crate) fn observe_metadata(kind: &'static str, fields: Value) {
+    observe(kind, fields);
 }
 
-pub(crate) fn metadata_error(
-    path: &Path,
-    stage: &'static str,
-    error: &anyhow::Error,
-    committed: Option<bool>,
-) {
+pub(crate) fn metadata_error(stage: &'static str, error: &anyhow::Error, committed: Option<bool>) {
     let mut fields = classify_support_error("metadata_capture", error);
     if let Some(map) = fields.as_object_mut() {
         map.insert("stage".into(), json!(stage));
         map.insert("publication_committed".into(), json!(committed));
     }
-    observe_metadata(path, "support_task_error_v1", fields);
+    observe_metadata("support_task_error_v1", fields);
 }

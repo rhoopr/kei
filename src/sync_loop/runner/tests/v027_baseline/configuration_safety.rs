@@ -331,6 +331,11 @@ fn seed_stock_history(path: &std::path::Path, history: History, extra: bool) {
     )
     .unwrap();
     conn.execute(
+        "INSERT INTO metadata(key,value) VALUES(?1,'1')",
+        [crate::state::db::sync_epoch::TEST_PREEXISTING_EPOCH_KEY],
+    )
+    .unwrap();
+    conn.execute(
         "INSERT INTO metadata(key,value) VALUES(?1,'opaque original marker')",
         [format!("unresolved_asset_identity:{ZONE}")],
     )

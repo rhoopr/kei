@@ -516,6 +516,9 @@ impl IncrementalDeltaSummary {
                         claimed_legacy_master_states,
                     )
                     .await
+                    // Incremental planning loads its owner snapshots after this
+                    // durable preclaim, so no already-loaded view needs updating.
+                    .map(|(name, _confirmed_claim)| name)
             }
         };
         let state_record_name = match selection {

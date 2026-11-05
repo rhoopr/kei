@@ -625,9 +625,7 @@ impl ImportPreflight {
                     continue;
                 }
             };
-            crate::support::observe_scoped(
-                library_label,
-                Some((&candidate.child, candidate.record.version_size.as_str())),
+            crate::support::observe(
                 "support_import_v1",
                 serde_json::json!({
                     "phase":"adoption", "reason":"candidate", "dry_run":options.dry_run,
@@ -959,9 +957,7 @@ where
                 dir_cache,
             )
             .await;
-            crate::support::observe_scoped(
-                library_label,
-                Some((asset.state_id(), expected_path.version_size.as_str())),
+            crate::support::observe(
                 "support_import_v1",
                 serde_json::json!({
                     "phase":"scan", "reason":if matches.is_empty() {"no_match"} else {"candidate"},
@@ -1886,8 +1882,6 @@ mod wiremock_tests {
             live_photo_mov_filename_policy: LivePhotoMovFilenamePolicy::Suffix,
             edited: false,
             edited_naming: crate::types::EditedNaming::Suffix,
-            primary_layout_active: false,
-            primary_layout_preview: false,
             primary_layout_source: None,
             primary_layout_pass: None,
             primary_layout_pass_kind: None,
@@ -2476,7 +2470,7 @@ mod wiremock_tests {
     async fn import_ambiguous_legacy_family_uses_child_and_preserves_master() {
         use tracing::instrument::WithSubscriber;
         use tracing_subscriber::layer::SubscriberExt;
-        let (layer, drain) = crate::support::history::test_layer();
+        let (layer, drain) = crate::support::test_capture::test_layer();
         let subscriber = tracing_subscriber::registry().with(layer);
         let server = crate::start_wiremock_or_skip!();
         let tmp = TempDir::new().unwrap();
@@ -2609,8 +2603,7 @@ mod wiremock_tests {
             stage_expected(&asset, &config);
             assets.push(Ok(asset));
         }
-        let path = tmp.path().join("support.json");
-        let (layer, guard) = crate::support::history::start(path.clone(), json!({})).unwrap();
+        let (layer, drain) = crate::support::test_capture::test_layer();
         let subscriber = tracing_subscriber::registry().with(layer);
         let verifier = LateRefusal(std::sync::atomic::AtomicUsize::new(0));
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2633,8 +2626,7 @@ mod wiremock_tests {
         assert_eq!(stats.total, 149);
         assert_eq!(stats.matched, 148);
         assert_eq!(stats.strict_refused, 1);
-        guard.finish().await;
-        let evidence = crate::support::history::test_retained_events(&path);
+        let evidence = drain();
         assert!(
             evidence.iter().any(|v| v["kind"] == "support_import_v1"
                 && v["fields"]["phase"] == "complete"
@@ -2648,14 +2640,6 @@ mod wiremock_tests {
                 .any(|v| v["fields"]["reason"] == "strict_refusal")
         );
         assert!(evidence.iter().any(|v| v["fields"]["errno"] == 95));
-        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        let c = &saved["cycles"][0];
-        assert!(c["observations_omitted"].as_u64().unwrap() > 0);
-        assert_eq!(
-            c["observations_total"].as_u64().unwrap(),
-            c["observations_shown"].as_u64().unwrap() + c["observations_omitted"].as_u64().unwrap()
-        );
-        assert!(c["diagnostics"].as_array().unwrap().len() <= 128);
         assert!(
             !serde_json::to_string(&evidence)
                 .unwrap()

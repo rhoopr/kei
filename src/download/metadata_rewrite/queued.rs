@@ -20,26 +20,6 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(all(test, feature = "xmp"))]
-static TEST_AFTER_ACTIVITY_STOPS: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
-    std::sync::OnceLock::new();
-
-#[cfg(all(test, feature = "xmp"))]
-fn test_arm_after_activity_stop(path: &std::path::Path) {
-    TEST_AFTER_ACTIVITY_STOPS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .insert(path.to_owned());
-}
-
-#[cfg(all(test, feature = "xmp"))]
-fn test_take_after_activity_stop(path: &std::path::Path) -> bool {
-    TEST_AFTER_ACTIVITY_STOPS
-        .get()
-        .is_some_and(|paths| paths.lock().unwrap().remove(path))
-}
-
-#[cfg(all(test, feature = "xmp"))]
 static TEST_SUPPRESSIONS: std::sync::OnceLock<
     std::sync::Mutex<
         std::collections::HashMap<PathBuf, std::sync::Weak<std::sync::atomic::AtomicUsize>>,
@@ -294,6 +274,7 @@ where
         temp_suffix,
         shutdown_token,
         None,
+        None,
         0,
     )
     .await
@@ -304,6 +285,7 @@ pub(in crate::download) async fn run_pending_page<D>(
     capture_timestamp_repair: CaptureTimestampRepair,
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
+    root: Option<&std::path::Path>,
     library_scope: Option<&[&str]>,
     offset: usize,
 ) -> super::RewritePass
@@ -316,6 +298,7 @@ where
         capture_timestamp_repair,
         temp_suffix,
         shutdown_token,
+        root,
         library_scope,
         (offset, METADATA_REWRITE_BATCH),
     )
@@ -328,6 +311,7 @@ pub(in crate::download) async fn run_pending_budget<D>(
     capture_timestamp_repair: CaptureTimestampRepair,
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
+    root: Option<&std::path::Path>,
     library_scope: Option<&[&str]>,
     page: (usize, usize),
 ) -> super::RewritePass
@@ -341,6 +325,7 @@ where
         capture_timestamp_repair,
         temp_suffix,
         shutdown_token,
+        root,
         library_scope,
         (page.0, page.1, &mut attempts),
     )
@@ -353,6 +338,7 @@ pub(in crate::download) async fn run_pending_budget_tracked<D>(
     capture_timestamp_repair: CaptureTimestampRepair,
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
+    root: Option<&std::path::Path>,
     library_scope: Option<&[&str]>,
     page: (usize, usize, &mut TailAttempts),
 ) -> super::RewritePass
@@ -392,7 +378,7 @@ where
         temp_suffix,
         shutdown_token,
         pending,
-        (None, page.2),
+        (root, page.2),
     ))
     .await
 }
@@ -546,27 +532,6 @@ where
             continue;
         }
         if db.validate_metadata_writer(&pending_rewrite).await.is_err() {
-            deferred += 1;
-            continue;
-        }
-        let activity_root =
-            archive_root.unwrap_or_else(|| path.ancestors().last().unwrap_or(path.as_path()));
-        if db
-            .validate_metadata_activity_conflicts(
-                &pending_rewrite,
-                selected_queue,
-                metadata_flags.bits(),
-                activity_root,
-            )
-            .await
-            .is_err()
-        {
-            tracing::warn!(target: "kei::download::metadata_rewrite", "Metadata activity could not rule out conflicting unfinished work; retaining the rewrite");
-            deferred += 1;
-            continue;
-        }
-        #[cfg(all(test, feature = "xmp"))]
-        if test_take_after_activity_stop(&path) {
             deferred += 1;
             continue;
         }
@@ -1025,14 +990,83 @@ where
             .as_deref()
             .zip(record.local_checksum.as_deref())
             .and_then(|(after, before)| (after != before).then_some(before));
+        // A capture repair that changes bytes must hold the verified output
+        // across its state transaction, so no receipt advances for bytes that
+        // were replaced after the writer measured them. Without that proof the
+        // rewrite stays durable debt.
+        let validate_output: Option<
+            Box<dyn FnOnce() -> Result<(), crate::state::error::StateError> + Send>,
+        > = if selected_queue == MetadataRewriteQueue::CaptureRepair
+            && completion.clears(MetadataRewriteQueue::CaptureRepair)
+            && media_checksum_changed
+        {
+            let Some((root, expected)) = archive_root.zip(final_fingerprint) else {
+                tracing::warn!(
+                    target: "kei::download::metadata_rewrite",
+                    asset_id = %record.id,
+                    path = %path.display(),
+                    "Capture repair has no confined root for its verified output; retaining the rewrite"
+                );
+                errored += 1;
+                continue;
+            };
+            match crate::download::file::retain_pending_file(root, &path).await {
+                Ok(Some(retained)) => {
+                    if retained.fingerprint != expected {
+                        tracing::warn!(
+                            target: "kei::download::metadata_rewrite",
+                            asset_id = %record.id,
+                            path = %path.display(),
+                            "Capture-repair output changed before finalisation; retaining the rewrite"
+                        );
+                        errored += 1;
+                        continue;
+                    }
+                    Some(Box::new(move || {
+                        retained.validate_blocking().map_err(|_changed| {
+                            crate::state::error::StateError::Invariant {
+                                operation: "finish_metadata_rewrite",
+                                detail:
+                                    "the verified capture-repair output changed before finalisation"
+                                        .into(),
+                            }
+                        })
+                    }))
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        target: "kei::download::metadata_rewrite",
+                        asset_id = %record.id,
+                        path = %path.display(),
+                        "Capture-repair output disappeared before finalisation; retaining the rewrite"
+                    );
+                    errored += 1;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "kei::download::metadata_rewrite",
+                        asset_id = %record.id,
+                        path = %path.display(),
+                        %error,
+                        "Could not retain the capture-repair output; retaining the rewrite"
+                    );
+                    errored += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         if completion != MetadataRewriteCompletion::None || media_checksum_changed {
             match db
-                .finish_metadata_rewrite(
+                .finish_metadata_rewrite_checked(
                     &pending_for_finish,
                     selected_queue,
                     final_checksum.as_deref(),
                     input_checksum_for_download,
                     completion,
+                    validate_output,
                 )
                 .await
             {

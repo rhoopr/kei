@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::icloud::photos::PhotoAsset;
+use crate::state::db::identity::{LegacyOwnersByLibrary, same_logical_asset};
 use crate::state::{
     AssetRecord, DownloadStateStore, MembershipStore, ReconciliationCatalogPath,
     ReconciliationContent, ReconciliationPathKey, ReconciliationReservation, VersionSizeKey,
@@ -80,9 +81,8 @@ pub(super) struct TaskPlanner {
     path_mode: PathPlanningMode,
     reconciliation: Box<ReconciliationPlanning>,
     dir_cache: paths::DirCache,
-    layout_session: Option<Arc<super::orchestration::primary_layout::LayoutSession>>,
-    managed_plan: bool,
     baseline_matcher: super::baseline_matching::BaselineMatcher,
+    legacy_owners: LegacyOwnersByLibrary,
     ownership_incomplete: bool,
 }
 
@@ -346,15 +346,49 @@ async fn distinct_occupant_bytes_match(
 }
 
 impl TaskPlanner {
+    /// Advance both snapshots only with evidence of a successful durable claim.
+    #[must_use = "conflicting owner views must stop the asset before planning"]
+    pub(super) fn remember_confirmed_legacy_owner(
+        &mut self,
+        claim: Option<super::orchestration::context::ConfirmedLegacyOwner>,
+    ) -> std::result::Result<(), crate::state::error::StateError> {
+        if let Some(claim) = claim {
+            let (library, master, child) = claim.parts();
+            self.remember_legacy_owner(library, master, child)?;
+        }
+        Ok(())
+    }
+
+    fn remember_legacy_owner(
+        &mut self,
+        library: &str,
+        master: &str,
+        child: &str,
+    ) -> std::result::Result<(), crate::state::error::StateError> {
+        if !self.legacy_owners.accepts_claim(library, master, child)
+            || !self
+                .baseline_matcher
+                .accepts_legacy_claim(library, master, child)
+        {
+            return Err(crate::state::error::StateError::Invariant {
+                operation: "remember_confirmed_legacy_owner",
+                detail: "durable legacy claim conflicts with an ownership snapshot".into(),
+            });
+        }
+        self.legacy_owners.remember_claim(library, master, child);
+        self.baseline_matcher
+            .remember_legacy_claim(library, master, child);
+        Ok(())
+    }
+
     pub(super) fn new() -> Self {
         Self {
             claimed_paths: FxHashMap::default(),
             path_mode: PathPlanningMode::Download,
             reconciliation: Box::default(),
             dir_cache: paths::DirCache::new(),
-            layout_session: None,
-            managed_plan: false,
             baseline_matcher: super::baseline_matching::BaselineMatcher::default(),
+            legacy_owners: LegacyOwnersByLibrary::default(),
             ownership_incomplete: false,
         }
     }
@@ -458,10 +492,31 @@ impl TaskPlanner {
             planner
         };
         planner.ownership_incomplete |= ownership_incomplete;
+        for (library, asset_id, version_size, path) in db.get_compact_native_owners().await? {
+            let Ok(key) = PathPlanningMode::Reconciliation.key(&path) else {
+                planner.ownership_incomplete = true;
+                continue;
+            };
+            planner
+                .reconciliation
+                .path_owners
+                .entry(key)
+                .or_default()
+                .insert(ReconciliationOwner {
+                    library: library.into(),
+                    asset_id: asset_id.into(),
+                    version_size,
+                });
+        }
         let records = db.get_downloaded_path_records().await?;
         planner.add_downloaded_paths(records);
-        planner.baseline_matcher =
-            super::baseline_matching::BaselineMatcher::new(db.get_baseline_receipts().await?);
+        let legacy_owners =
+            LegacyOwnersByLibrary::from_rows(db.get_legacy_master_state_owners().await?);
+        planner.baseline_matcher = super::baseline_matching::BaselineMatcher::with_legacy_owners(
+            db.get_baseline_receipts().await?,
+            legacy_owners.clone(),
+        );
+        planner.legacy_owners = legacy_owners;
         Ok(planner)
     }
 
@@ -550,6 +605,165 @@ impl TaskPlanner {
         !self.ownership_incomplete && config.allows_existing_mutation()
     }
 
+    /// A completed current publication for this exact asset wins over a newly
+    /// planned suffix. The later matcher and adoption census still revalidate
+    /// the receipt, bytes and ownership; this only restores the recorded path.
+    async fn completed_exact_current_path(
+        &self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        task: &DownloadTask,
+    ) -> Result<Option<std::path::PathBuf>> {
+        let version_size = task.version_size;
+        let owner = ReconciliationOwner {
+            library: Arc::from(asset.source_zone().unwrap_or(&config.library)),
+            asset_id: asset.state_id().into(),
+            version_size,
+        };
+        let Some(records) = self.reconciliation.downloaded_paths.get(&owner) else {
+            return Ok(None);
+        };
+        let derived_paths = super::filter::derive_expected_paths(asset, config);
+        let Some(derived) = derived_paths
+            .iter()
+            .find(|path| path.version_size == version_size)
+        else {
+            return Ok(None);
+        };
+        for record in records {
+            if !record.is_current_path {
+                continue;
+            }
+            let (Some(path), Some(checksum)) = (&record.local_path, &record.local_checksum) else {
+                continue;
+            };
+            if record.checksum != derived.checksum.as_ref() {
+                continue;
+            }
+            if matches!(
+                config.primary_layout_pass_kind,
+                Some(crate::commands::PassKind::Album | crate::commands::PassKind::SmartFolder)
+            ) && !super::filter::stored_path_matches_download_family(
+                asset.state_id(),
+                derived,
+                &derived_paths,
+                config,
+                path,
+            ) {
+                let (Some(binding), Some(album)) =
+                    (&task.publication_binding, &config.primary_layout_source)
+                else {
+                    continue;
+                };
+                let Some((capture, scope, _)) = album.publication_scope(&task.library)? else {
+                    continue;
+                };
+                anyhow::ensure!(scope == binding.scope, "Publication scope changed");
+                let receipts = capture
+                    .db
+                    .bound_download_receipts(
+                        binding.as_ref().clone(),
+                        version_size.as_str().into(),
+                        task.checksum.to_string(),
+                        task.size,
+                    )
+                    .await?;
+                if !receipts.iter().any(|receipt| {
+                    receipt.native_path.to_path() == *path && receipt.local_checksum == *checksum
+                }) {
+                    continue;
+                }
+            }
+            let Ok(fingerprint) =
+                super::file::fingerprint_downloaded_path(&config.directory, path).await
+            else {
+                continue;
+            };
+            if data_encoding::HEXLOWER.encode(&fingerprint.sha256) != *checksum {
+                continue;
+            }
+            let metadata_changed_size = record
+                .download_checksum
+                .as_ref()
+                .is_some_and(|downloaded| downloaded != checksum);
+            if fingerprint.size == derived.size || metadata_changed_size {
+                return Ok(Some(path.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Provider declarations and reconciliation reservations both precede reuse.
+    async fn frozen_task_destination(
+        &self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        task: &DownloadTask,
+    ) -> Result<Option<std::path::PathBuf>> {
+        let reserved = self
+            .has_durable_destination(task)
+            .then(|| task.download_path.clone());
+        if let Some(owner_run) = &config.selection_run {
+            let key = config.selection_pass.as_ref().context("Missing pass")?;
+            let run = owner_run.for_asset(asset)?;
+            if let Some(previous) = run
+                .capture
+                .db
+                .selection_decision(
+                    run.capture.owner.clone(),
+                    run.root.id.clone(),
+                    key.clone(),
+                    task.asset_record_name.to_string(),
+                )
+                .await?
+                && !previous.is_deferred_observation()
+            {
+                anyhow::ensure!(
+                    previous.state_id == task.asset_id.as_ref(),
+                    "Frozen selection identity changed"
+                );
+                let destination = previous
+                    .decision
+                    .destinations
+                    .iter()
+                    .find(|destination| destination.version_size == task.version_size.as_str())
+                    .context("Frozen selection lost a rendition")?
+                    .path
+                    .to_path();
+                anyhow::ensure!(
+                    reserved.as_ref().is_none_or(|path| *path == destination),
+                    "Frozen destination conflicts with reservation"
+                );
+                return Ok(Some(destination));
+            }
+        }
+        Ok(reserved)
+    }
+
+    async fn restore_completed_current_paths(
+        &self,
+        plan: &mut AssetTaskPlan,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+    ) -> Result<()> {
+        for task in &mut plan.tasks {
+            if self
+                .frozen_task_destination(asset, config, task)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            if let Some(path) = self
+                .completed_exact_current_path(asset, config, task)
+                .await?
+            {
+                task.download_path = path;
+            }
+        }
+        Ok(())
+    }
+
     /// Accept only a current-content receipt in this pass's filename family.
     /// Additional copies and legacy numbered companions require exact local hashes.
     pub(super) async fn verified_downloaded_path(
@@ -612,6 +826,7 @@ impl TaskPlanner {
                 || !self.retry_path_allowed(
                     &owner.library,
                     &owner.asset_id,
+                    asset.asset_record_name(),
                     version_size,
                     &derived.checksum,
                     derived.size,
@@ -700,6 +915,7 @@ impl TaskPlanner {
                 || !self.retry_path_allowed(
                     &owner.library,
                     &owner.asset_id,
+                    asset.asset_record_name(),
                     owner.version_size,
                     &derived.checksum,
                     derived.size,
@@ -726,8 +942,13 @@ impl TaskPlanner {
         self.include_existing_comparison_tasks(asset, config, &mut plan);
         self.bind_publication_tasks(asset, config, &mut plan)
             .await?;
-        if matches!(self.path_mode, PathPlanningMode::Download) && !self.managed_plan {
-            self.relocate_protected_tasks(&mut plan, config).await?;
+        if matches!(self.path_mode, PathPlanningMode::Download) {
+            self.restore_completed_current_paths(&mut plan, asset, config)
+                .await?;
+        }
+        if matches!(self.path_mode, PathPlanningMode::Download) {
+            self.relocate_protected_tasks(&mut plan, asset, config)
+                .await?;
             self.reserve_changed_publication_choices(asset, config, &plan)
                 .await?;
         }
@@ -774,11 +995,15 @@ impl TaskPlanner {
                     task.size,
                 )
                 .await?;
-            if !historical.iter().any(|receipt| {
-                PathPlanningMode::Reconciliation
-                    .key(&receipt.native_path.to_path())
-                    .is_ok_and(|key| key == requested_key)
-            }) {
+            if task
+                .superseded_requested(&config.directory, &requested.path)
+                .is_none()
+                && !historical.iter().any(|receipt| {
+                    PathPlanningMode::Reconciliation
+                        .key(&receipt.native_path.to_path())
+                        .is_ok_and(|key| key == requested_key)
+                })
+            {
                 continue;
             }
             self.reconciliation
@@ -799,6 +1024,190 @@ impl TaskPlanner {
                 });
         }
         Ok(())
+    }
+
+    /// Commit only final execution choices, never listing/dry-run nominations.
+    /// True confirms durable intent, whether newly inserted or exactly replayed.
+    /// It never confirms admission, bytes, metadata or checkpoint completion.
+    pub(super) async fn persist_execution_publication_choices(
+        &mut self,
+        asset: &PhotoAsset,
+        config: &DownloadConfig,
+        tasks: &[DownloadTask],
+    ) -> Result<bool> {
+        let Some(album) = &config.primary_layout_source else {
+            return Ok(false);
+        };
+        let library = asset.source_zone().unwrap_or(&config.library);
+        if album.publication_scope(library)?.is_none() {
+            return Ok(false);
+        }
+        config
+            .state_db
+            .as_ref()
+            .context("Missing choice state store")?;
+        let mut checked = AssetTaskPlan {
+            tasks: tasks.to_vec(),
+            filter_reason: None,
+            malformed_resource: None,
+        };
+        self.bind_publication_tasks(asset, config, &mut checked)
+            .await?;
+        let derived = super::filter::derive_expected_paths(asset, config);
+        let mut choices = Vec::new();
+        let mut replayed = Vec::new();
+        let mut consumed = Vec::new();
+        let mut binding = None;
+        let mut store = None;
+        for (index, reservation) in self.reconciliation.reservations.iter().enumerate() {
+            if reservation.library.as_ref() != library
+                || reservation.asset_id.as_ref() != asset.state_id()
+            {
+                continue;
+            }
+            let Some((task, rebound)) = tasks.iter().zip(&checked.tasks).find(|(task, _)| {
+                task.version_size == reservation.version_size
+                    && reservation
+                        .content
+                        .as_ref()
+                        .is_some_and(|c| c.checksum == task.checksum && c.size == task.size)
+            }) else {
+                continue;
+            };
+            if PathPlanningMode::Reconciliation
+                .key(&task.download_path)?
+                .as_ref()
+                != reservation.destination_path_key.0
+            {
+                consumed.push(index);
+                continue;
+            }
+            if reservation.requested_path_key == reservation.destination_path_key {
+                continue;
+            }
+            let original = task
+                .publication_binding
+                .as_deref()
+                .context("Choice lost publication binding")?;
+            anyhow::ensure!(
+                rebound.publication_binding.as_deref() == Some(original),
+                "Publication identity changed before reservation"
+            );
+            let requested = derived
+                .iter()
+                .find(|p| p.version_size == task.version_size)
+                .context("Choice lost its rendition")?;
+            anyhow::ensure!(
+                requested.checksum.as_ref() == task.checksum.as_ref()
+                    && requested.size == task.size
+                    && crate::fs_util::absolute_confined_path(&reservation.destination_path)?
+                        == crate::fs_util::absolute_confined_path(&task.download_path)?
+                    && PathPlanningMode::Reconciliation
+                        .key(&requested.path)?
+                        .as_ref()
+                        == reservation.requested_path_key.0,
+                "Choice no longer matches current requested resource"
+            );
+            anyhow::ensure!(
+                self.frozen_task_destination(asset, config, task)
+                    .await?
+                    .is_none_or(|p| p == task.download_path),
+                "Choice conflicts with frozen destination"
+            );
+            let album = config
+                .primary_layout_source
+                .as_ref()
+                .context("Missing choice source")?;
+            let (capture, scope, _) = album
+                .publication_scope(library)?
+                .context("Missing choice scope")?;
+            anyhow::ensure!(
+                scope == original.scope
+                    && original.origin_pass
+                        == config
+                            .primary_layout_pass
+                            .as_deref()
+                            .context("Missing choice pass")?
+                    && original.master == asset.id(),
+                "Choice source association changed"
+            );
+            if let Some(run) = &config.selection_run {
+                let run = run.for_asset(asset)?;
+                anyhow::ensure!(
+                    Arc::ptr_eq(&run.capture.db, &capture.db)
+                        && run.root.spec.scope == scope
+                        && config.selection_pass.as_deref() == Some(original.origin_pass.as_str()),
+                    "Choice selection source changed"
+                );
+            }
+            let root = crate::fs_util::absolute_confined_path(&config.directory)?;
+            anyhow::ensure!(
+                crate::fs_util::absolute_confined_path(&requested.path)?.starts_with(&root)
+                    && crate::fs_util::absolute_confined_path(&task.download_path)?
+                        .starts_with(&root),
+                "Choice escaped requested root"
+            );
+            // Always authenticate, including zero-history nominations and exact replay.
+            let historical = capture
+                .db
+                .bound_historical_downloads(
+                    original.clone(),
+                    task.version_size.as_str().into(),
+                    task.checksum.to_string(),
+                    task.size,
+                )
+                .await?;
+            if capture
+                .db
+                .publication_choice_is_persisted(
+                    original.clone(),
+                    reservation.clone(),
+                    crate::state::db::provider_selection::SelectionPath::from_path(&requested.path),
+                )
+                .await?
+            {
+                replayed.push(reservation.clone());
+                consumed.push(index);
+                continue;
+            }
+            anyhow::ensure!(
+                task.superseded_requested(&config.directory, &requested.path)
+                    .is_some()
+                    || historical
+                        .iter()
+                        .any(|r| r.native_path.to_path() == requested.path)
+                    || self
+                        .cross_rendition_original(asset, config, task, &requested.path)
+                        .await?
+                        .is_some(),
+                "Choice lost authenticated historical source"
+            );
+            anyhow::ensure!(
+                binding.as_ref().is_none_or(|b| b == original),
+                "Choice batch changed binding"
+            );
+            binding = Some(original.clone());
+            store = Some(capture.db);
+            choices.push((
+                reservation.clone(),
+                crate::state::db::provider_selection::SelectionPath::from_path(&requested.path),
+            ));
+            consumed.push(index);
+        }
+        let confirmed = !choices.is_empty() || !replayed.is_empty();
+        if let (Some(db), Some(binding)) = (store, binding) {
+            db.reserve_bound_publication_choices(binding, choices.clone())
+                .await?;
+            self.remember_download_reservations(choices.into_iter().map(|(r, _)| r).collect());
+        }
+        self.remember_download_reservations(replayed);
+        let mut index = 0;
+        self.reconciliation.reservations.retain(|_| {
+            let keep = !consumed.contains(&index);
+            index += 1;
+            keep
+        });
+        Ok(confirmed)
     }
 
     async fn bind_publication_tasks(
@@ -863,7 +1272,7 @@ impl TaskPlanner {
         config: &DownloadConfig,
         plan: &mut AssetTaskPlan,
     ) {
-        if plan.filter_reason.is_some() || self.managed_plan || !asset.has_valid_id() {
+        if plan.filter_reason.is_some() || !asset.has_valid_id() {
             return;
         }
         // The original task builder applies exclusions to synthesized names too.
@@ -887,6 +1296,7 @@ impl TaskPlanner {
                 replacement_fingerprint: None,
                 publication_binding: None,
                 pending_cross_parent_root: None,
+                superseded_requested_path: None,
                 checksum: derived.checksum,
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
@@ -995,6 +1405,15 @@ impl TaskPlanner {
         config: &DownloadConfig,
         task: &DownloadTask,
     ) -> super::baseline_matching::BaselineMatch {
+        let frozen = match self.frozen_task_destination(asset, config, task).await {
+            Ok(path) => path,
+            Err(_) => {
+                return super::baseline_matching::uncertain(
+                    "scoped_receipt_or_reservation_validation_failed",
+                    Some(&task.download_path),
+                );
+            }
+        };
         // Fresh fallback publications carry an authenticated compact receipt even
         // when no active selection generation was created (for example cross-zone albums).
         if let (Some(binding), Some(album)) =
@@ -1029,8 +1448,9 @@ impl TaskPlanner {
                         {
                             continue;
                         }
-                        if self.has_durable_destination(task)
-                            && task.download_path != receipt.native_path.to_path()
+                        if frozen
+                            .as_ref()
+                            .is_some_and(|path| *path != receipt.native_path.to_path())
                         {
                             return super::baseline_matching::uncertain(
                                 "receipt_destination_differs_from_reserved_destination",
@@ -1294,9 +1714,54 @@ impl TaskPlanner {
                 }
             }
         }
+        let path_owners = &self.reconciliation.path_owners;
+        let downloaded_paths = &self.reconciliation.downloaded_paths;
+        let legacy_owners = &self.legacy_owners;
+        let baseline_matcher = &self.baseline_matcher;
+        let owner_excluded = |path: &Path| {
+            if baseline_matcher.has_exact_current_receipt(task, path) {
+                return false;
+            }
+            let Ok(key) = PathPlanningMode::Reconciliation.key(path) else {
+                return true;
+            };
+            let Some(owners) = path_owners.get(&key) else {
+                return false;
+            };
+            let incompatible = owners.iter().any(|owner| {
+                !same_logical_asset(
+                    task.library.as_ref(),
+                    task.asset_id.as_ref(),
+                    task.asset_record_name.as_ref(),
+                    owner.library.as_ref(),
+                    owner.asset_id.as_ref(),
+                    legacy_owners,
+                )
+            });
+            if !incompatible {
+                return false;
+            }
+            let target = ReconciliationOwner {
+                library: Arc::clone(&task.library),
+                asset_id: task.asset_id.as_ref().into(),
+                version_size: task.version_size,
+            };
+            !downloaded_paths.get(&target).is_some_and(|records| {
+                records.iter().any(|record| {
+                    record.is_current_path
+                        && record.checksum.as_str() == task.checksum.as_ref()
+                        && record.local_checksum.is_some()
+                        && record.local_path.as_ref().is_some_and(|path| {
+                            crate::fs_util::confined_path_key(path)
+                                .ok()
+                                .is_some_and(|path_key| path_key.as_str() == key.as_ref())
+                        })
+                })
+            })
+        };
         let matched = self
             .baseline_matcher
-            .match_task_with_distinct(
+            .match_task_with_distinct_and_exclusions(
                 &config.directory,
                 task,
                 requested,
@@ -1305,6 +1770,7 @@ impl TaskPlanner {
                 &selected_copy_scope,
                 &discovered,
                 (&historical, &distinct),
+                &owner_excluded,
             )
             .await;
         if matches!(matched, super::baseline_matching::BaselineMatch::Missing)
@@ -1341,12 +1807,17 @@ impl TaskPlanner {
             .get(&key)
             .is_some_and(|owners| {
                 owners.iter().any(|owner| {
-                    owner.library != task.library
-                        || owner.asset_id.as_ref() != task.asset_id.as_ref()
-                        || !matches!(
-                            owner.version_size,
-                            VersionSizeKey::Original | VersionSizeKey::Adjusted
-                        )
+                    !same_logical_asset(
+                        task.library.as_ref(),
+                        task.asset_id.as_ref(),
+                        task.asset_record_name.as_ref(),
+                        owner.library.as_ref(),
+                        owner.asset_id.as_ref(),
+                        &self.legacy_owners,
+                    ) || !matches!(
+                        owner.version_size,
+                        VersionSizeKey::Original | VersionSizeKey::Adjusted
+                    )
                 })
             })
         {
@@ -1465,9 +1936,6 @@ impl TaskPlanner {
         config: &DownloadConfig,
         task: &mut DownloadTask,
     ) -> Result<bool> {
-        if self.managed_plan {
-            return Ok(false);
-        }
         let derived = super::filter::derive_expected_paths(asset, config);
         let Some(requested) = derived
             .iter()
@@ -1521,15 +1989,60 @@ impl TaskPlanner {
     async fn relocate_protected_tasks(
         &mut self,
         plan: &mut AssetTaskPlan,
+        asset: &PhotoAsset,
         config: &DownloadConfig,
     ) -> Result<()> {
         let Some(db) = config.state_db.as_deref() else {
             return Ok(());
         };
         for task in &mut plan.tasks {
+            let frozen = self.frozen_task_destination(asset, config, task).await?;
+            if frozen.is_some() {
+                continue;
+            }
+            // Nominate fresh storage, never adopt prior-generation bytes.
+            if !self.path_has_completed_exact_target(task, &task.download_path)
+                && self.path_has_prior_publication(task)
+            {
+                let requested = task.download_path.clone();
+                self.choose_independent_sibling(db, task).await?;
+                task.remember_superseded_requested(&config.directory, requested);
+                continue;
+            }
             self.relocate_protected_task(db, task).await?;
         }
         Ok(())
+    }
+
+    #[must_use]
+    fn path_has_prior_publication(&self, task: &DownloadTask) -> bool {
+        if task.checksum.trim().is_empty()
+            || !self.path_has_compatible_owner(task, &task.download_path)
+        {
+            return false;
+        }
+        let Ok(key) = PathPlanningMode::Reconciliation.key(&task.download_path) else {
+            return false;
+        };
+        let Some(owners) = self.reconciliation.path_owners.get(&key) else {
+            return false;
+        };
+        owners
+            .iter()
+            .filter_map(|owner| self.reconciliation.downloaded_paths.get(owner))
+            .flatten()
+            .any(|record| {
+                record.checksum != task.checksum.as_ref()
+                    && !record.checksum.trim().is_empty()
+                    && record.local_checksum.as_ref().is_some_and(|hash| {
+                        hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                    && record.local_path.as_ref().is_some_and(|path| {
+                        PathPlanningMode::Reconciliation
+                            .key(path)
+                            .is_ok_and(|other| other == key)
+                    })
+            })
     }
 
     async fn relocate_protected_task(
@@ -1537,10 +2050,102 @@ impl TaskPlanner {
         db: &dyn DownloadStore,
         task: &mut DownloadTask,
     ) -> Result<()> {
-        if super::legacy_preservation::current_path_is_independent(db, &task.download_path).await? {
+        let independent =
+            super::legacy_preservation::current_path_is_independent(db, &task.download_path)
+                .await?;
+        let exact_target = self.path_owned_by_exact_target(task, &task.download_path);
+        let compatible_owner = self.path_has_compatible_owner(task, &task.download_path);
+        let exact_completed = self.path_has_completed_exact_target(task, &task.download_path);
+        if exact_completed
+            || compatible_owner
+            || (independent
+                && (exact_target || !self.path_has_incompatible_owner(task, &task.download_path)))
+        {
             return Ok(());
         }
         self.choose_independent_sibling(db, task).await
+    }
+
+    fn path_owned_by_exact_target(&self, task: &DownloadTask, path: &Path) -> bool {
+        PathPlanningMode::Reconciliation
+            .key(path)
+            .ok()
+            .and_then(|key| self.reconciliation.path_owners.get(&key))
+            .is_some_and(|owners| {
+                owners.iter().any(|owner| {
+                    owner.library.as_ref() == task.library.as_ref()
+                        && owner.asset_id.as_ref() == task.asset_id.as_ref()
+                })
+            })
+    }
+
+    fn path_has_compatible_owner(&self, task: &DownloadTask, path: &Path) -> bool {
+        let Ok(key) = PathPlanningMode::Reconciliation.key(path) else {
+            return false;
+        };
+        self.reconciliation
+            .path_owners
+            .get(&key)
+            .is_some_and(|owners| {
+                !owners.is_empty()
+                    && owners.iter().all(|owner| {
+                        same_logical_asset(
+                            task.library.as_ref(),
+                            task.asset_id.as_ref(),
+                            task.asset_record_name.as_ref(),
+                            owner.library.as_ref(),
+                            owner.asset_id.as_ref(),
+                            &self.legacy_owners,
+                        )
+                    })
+            })
+    }
+
+    fn path_has_completed_exact_target(&self, task: &DownloadTask, path: &Path) -> bool {
+        let Ok(key) = PathPlanningMode::Reconciliation.key(path) else {
+            return false;
+        };
+        let owner = ReconciliationOwner {
+            library: Arc::clone(&task.library),
+            asset_id: task.asset_id.as_ref().into(),
+            version_size: task.version_size,
+        };
+        self.reconciliation
+            .downloaded_paths
+            .get(&owner)
+            .is_some_and(|records| {
+                records.iter().any(|record| {
+                    record.is_current_path
+                        && record.checksum.as_str() == task.checksum.as_ref()
+                        && record.local_checksum.is_some()
+                        && record.local_path.as_ref().is_some_and(|record_path| {
+                            crate::fs_util::confined_path_key(record_path)
+                                .ok()
+                                .is_some_and(|record_key| record_key.as_str() == key.as_ref())
+                        })
+                })
+            })
+    }
+
+    fn path_has_incompatible_owner(&self, task: &DownloadTask, path: &Path) -> bool {
+        let Ok(key) = PathPlanningMode::Reconciliation.key(path) else {
+            return true;
+        };
+        self.reconciliation
+            .path_owners
+            .get(&key)
+            .is_some_and(|owners| {
+                owners.iter().any(|owner| {
+                    !same_logical_asset(
+                        task.library.as_ref(),
+                        task.asset_id.as_ref(),
+                        task.asset_record_name.as_ref(),
+                        owner.library.as_ref(),
+                        owner.asset_id.as_ref(),
+                        &self.legacy_owners,
+                    )
+                })
+            })
     }
 
     pub(super) async fn choose_independent_sibling(
@@ -1572,17 +2177,23 @@ impl TaskPlanner {
             };
             let candidate = parent.join(candidate_filename);
             let key = self.path_mode.key(&candidate)?;
-            let foreign_owner = self
-                .reconciliation
-                .path_owners
-                .get(&key)
-                .is_some_and(|owners| {
-                    owners.iter().any(|owner| {
-                        owner.library != task.library
-                            || owner.asset_id.as_ref() != task.asset_id.as_ref()
-                            || owner.version_size != task.version_size
-                    })
-                });
+            let owner_key = PathPlanningMode::Reconciliation.key(&candidate)?;
+            let foreign_owner =
+                self.reconciliation
+                    .path_owners
+                    .get(&owner_key)
+                    .is_some_and(|owners| {
+                        owners.iter().any(|owner| {
+                            !same_logical_asset(
+                                task.library.as_ref(),
+                                task.asset_id.as_ref(),
+                                task.asset_record_name.as_ref(),
+                                owner.library.as_ref(),
+                                owner.asset_id.as_ref(),
+                                &self.legacy_owners,
+                            ) || owner.version_size != task.version_size
+                        })
+                    });
             let available = !foreign_owner
                 && !self.claimed_paths.contains_key(key.as_ref())
                 && !self.dir_cache.exists(&candidate)
@@ -1623,7 +2234,6 @@ impl TaskPlanner {
         config: &DownloadConfig,
         replay: ReservedReplay,
     ) -> Result<AssetTaskPlan> {
-        self.managed_plan = false;
         self.reconciliation.reservations.clear();
         if let Some(filter_reason) = is_asset_filtered(asset, config) {
             return Ok(AssetTaskPlan {
@@ -1631,36 +2241,6 @@ impl TaskPlanner {
                 filter_reason: Some(filter_reason),
                 malformed_resource: None,
             });
-        }
-        if config.primary_layout_active || config.primary_layout_preview {
-            if self.layout_session.is_none() {
-                self.layout_session =
-                    Some(Arc::new(if let Some(db) = config.state_db.as_deref() {
-                        super::orchestration::primary_layout::LayoutSession::load(db).await?
-                    } else {
-                        anyhow::ensure!(
-                            config.primary_layout_preview,
-                            "Primary naming requires an owned database"
-                        );
-                        super::orchestration::primary_layout::LayoutSession::default()
-                    }));
-            }
-            if let Some(session) = &self.layout_session {
-                let tasks = if config.primary_layout_preview {
-                    super::orchestration::primary_layout::preview_asset(asset, config, session)
-                        .await?
-                } else {
-                    super::orchestration::primary_layout::plan_asset(asset, config, session).await?
-                };
-                if let Some(tasks) = tasks {
-                    self.managed_plan = true;
-                    return Ok(AssetTaskPlan {
-                        tasks,
-                        filter_reason: None,
-                        malformed_resource: None,
-                    });
-                }
-            }
         }
         let derived = super::filter::derive_expected_paths(asset, config);
         let primary_path = if derived
@@ -1715,6 +2295,7 @@ impl TaskPlanner {
         &self,
         library: &str,
         asset_id: &str,
+        actual_child: &str,
         version_size: VersionSizeKey,
         checksum: &str,
         size: u64,
@@ -1731,9 +2312,14 @@ impl TaskPlanner {
                     .get(&key)
                     .is_none_or(|owners| {
                         owners.iter().all(|owner| {
-                            owner.library.as_ref() == library
-                                && owner.asset_id.as_ref() == asset_id
-                                && owner.version_size == version_size
+                            same_logical_asset(
+                                library,
+                                asset_id,
+                                actual_child,
+                                owner.library.as_ref(),
+                                owner.asset_id.as_ref(),
+                                &self.legacy_owners,
+                            ) && owner.version_size == version_size
                         })
                     })
         })
@@ -1816,6 +2402,7 @@ impl TaskPlanner {
             && self.retry_path_allowed(
                 &task.library,
                 &task.asset_id,
+                task.asset_record_name.as_ref(),
                 task.version_size,
                 &task.checksum,
                 task.size,
@@ -1876,14 +2463,6 @@ impl TaskPlanner {
         &self.reconciliation.reservations
     }
 
-    pub(super) fn managed_layout_session(
-        &self,
-    ) -> Option<Arc<super::orchestration::primary_layout::LayoutSession>> {
-        self.managed_plan
-            .then(|| self.layout_session.as_ref().map(Arc::clone))
-            .flatten()
-    }
-
     /// Commit final choices, including recorded-path overrides, before dispatch.
     /// Drain each plan once so a streaming pass does not retain a growing write batch.
     pub(super) async fn persist_download_reservations(
@@ -1891,9 +2470,6 @@ impl TaskPlanner {
         db: &dyn DownloadStore,
         tasks: &[DownloadTask],
     ) -> Result<()> {
-        if self.managed_plan {
-            return Ok(());
-        }
         let mut reservations = std::mem::take(&mut self.reconciliation.reservations);
         reservations.retain_mut(|reservation| {
             let Some(task) = tasks.iter().find(|task| {
@@ -1917,36 +2493,54 @@ impl TaskPlanner {
             );
         }
         if !reservations.is_empty() {
-            db.reserve_reconciliation_paths(&reservations).await?;
-            for reservation in reservations {
-                let Some(content) = reservation.content else {
-                    continue;
-                };
-                self.reconciliation
-                    .path_contents
-                    .entry(NormalizedPath::from_key(
-                        reservation.destination_path_key.clone(),
-                    ))
-                    .or_default()
-                    .insert(Some(content.clone()));
-                self.reconciliation
-                    .durable_destinations
-                    .insert(NormalizedPath::from_key(reservation.destination_path_key));
-                self.reconciliation.destinations.insert(
-                    (
-                        ReconciliationOwner {
-                            library: reservation.library,
-                            asset_id: reservation.asset_id,
-                            version_size: reservation.version_size,
-                        },
-                        content,
-                        NormalizedPath::from_key(reservation.requested_path_key),
-                    ),
-                    reservation.destination_path,
-                );
-            }
+            let mut children = reservations.iter().filter_map(|reservation| {
+                tasks
+                    .iter()
+                    .find(|task| {
+                        task.library == reservation.library
+                            && task.asset_id.as_ref() == reservation.asset_id.as_ref()
+                            && task.version_size == reservation.version_size
+                    })
+                    .map(|task| task.asset_record_name.as_ref())
+            });
+            let first_child = children.next().map(str::to_owned);
+            let actual_child =
+                first_child.filter(|child| children.all(|candidate| candidate == child));
+            db.reserve_reconciliation_paths(&reservations, actual_child.as_deref())
+                .await?;
+            self.remember_download_reservations(reservations);
         }
         Ok(())
+    }
+
+    fn remember_download_reservations(&mut self, reservations: Vec<ReconciliationReservation>) {
+        for reservation in reservations {
+            let Some(content) = reservation.content else {
+                continue;
+            };
+            self.reconciliation
+                .path_contents
+                .entry(NormalizedPath::from_key(
+                    reservation.destination_path_key.clone(),
+                ))
+                .or_default()
+                .insert(Some(content.clone()));
+            self.reconciliation
+                .durable_destinations
+                .insert(NormalizedPath::from_key(reservation.destination_path_key));
+            self.reconciliation.destinations.insert(
+                (
+                    ReconciliationOwner {
+                        library: reservation.library,
+                        asset_id: reservation.asset_id,
+                        version_size: reservation.version_size,
+                    },
+                    content,
+                    NormalizedPath::from_key(reservation.requested_path_key),
+                ),
+                reservation.destination_path,
+            );
+        }
     }
 
     /// Convert one asset into download tasks after applying the shared
@@ -2027,18 +2621,44 @@ impl TaskPlanner {
                     };
                     let slot = (owner.clone(), content.clone(), requested_key.clone());
                     let mut destination = self.reconciliation.destinations.get(&slot).cloned();
-                    if destination.is_none() && matches!(replay, ReservedReplay::PendingRetry) {
-                        // A template change must not redirect already recorded work.
-                        // Replay only a unique choice for this exact owner and generation.
-                        let mut choices = self.reconciliation.destinations.iter()
-                            .filter(|((saved_owner, saved_content, _), _)| saved_owner == &owner && saved_content == &content)
-                            .map(|(_, path)| path.clone());
-                        if let Some(first) = choices.next() {
+                    let mut reused_logical_reservation = false;
+                    if destination.is_none() {
+                        // A previously recorded owner may be the same logical
+                        // asset under an explicit legacy claim. Reuse its exact
+                        // saved destination without rewriting the durable row.
+                        let mut choices = self
+                            .reconciliation
+                            .destinations
+                            .iter()
+                            .filter(|((saved_owner, saved_content, _), _)| {
+                                saved_content == &content
+                                    && saved_owner.library.as_ref() == task.library.as_ref()
+                                    && saved_owner.version_size == task.version_size
+                                    && (matches!(replay, ReservedReplay::PendingRetry)
+                                        || saved_owner.asset_id.as_ref()
+                                            != task.asset_id.as_ref())
+                                    && same_logical_asset(
+                                        task.library.as_ref(),
+                                        task.asset_id.as_ref(),
+                                        task.asset_record_name.as_ref(),
+                                        saved_owner.library.as_ref(),
+                                        saved_owner.asset_id.as_ref(),
+                                        &self.legacy_owners,
+                                    )
+                            })
+                            .map(|((saved_owner, _, _), path)| {
+                                (
+                                    path.clone(),
+                                    saved_owner.asset_id.as_ref() != task.asset_id.as_ref(),
+                                )
+                            });
+                        if let Some((first, logical)) = choices.next() {
                             anyhow::ensure!(
-                                choices.all(|path| path == first),
-                                "pending retry has multiple recorded destinations"
+                                choices.all(|(path, _)| path == first),
+                                "logical owner has multiple recorded destinations"
                             );
                             destination = Some(first);
+                            reused_logical_reservation = logical;
                         }
                     }
                     if let Some(destination) = destination.as_ref() {
@@ -2046,6 +2666,25 @@ impl TaskPlanner {
                             PathPlanningMode::Reconciliation.key(&task.download_path)?;
                         self.claimed_paths.remove(&planned_key);
                         let destination_key = PathPlanningMode::Reconciliation.key(destination)?;
+                        if self
+                            .reconciliation
+                            .path_owners
+                            .get(&destination_key)
+                            .is_some_and(|owners| {
+                                owners.iter().all(|owner| {
+                                    same_logical_asset(
+                                        task.library.as_ref(),
+                                        task.asset_id.as_ref(),
+                                        task.asset_record_name.as_ref(),
+                                        owner.library.as_ref(),
+                                        owner.asset_id.as_ref(),
+                                        &self.legacy_owners,
+                                    )
+                                })
+                            })
+                        {
+                            self.claimed_paths.remove(&destination_key);
+                        }
                         anyhow::ensure!(
                             !self.claimed_paths.contains_key(&destination_key),
                             "reserved reconciliation destination has another owner"
@@ -2069,6 +2708,7 @@ impl TaskPlanner {
                                     self.retry_path_allowed(
                                         &task.library,
                                         &task.asset_id,
+                                        task.asset_record_name.as_ref(),
                                         task.version_size,
                                         &task.checksum,
                                         task.size,
@@ -2103,23 +2743,25 @@ impl TaskPlanner {
                     self.reconciliation
                         .destinations
                         .insert(slot, task.download_path.clone());
-                    self.reconciliation
-                        .reservations
-                        .push(ReconciliationReservation {
-                            content: Some(content),
-                            library: Arc::clone(&task.library),
-                            asset_id: task.asset_id.as_ref().into(),
-                            version_size: task.version_size,
-                            requested_path_key: ReconciliationPathKey(
-                                requested_key.as_ref().to_owned(),
-                            ),
-                            destination_path_key: ReconciliationPathKey(
-                                destination_key.as_ref().to_owned(),
-                            ),
-                            destination_path: crate::fs_util::absolute_confined_path(
-                                &task.download_path,
-                            )?,
-                        });
+                    if !reused_logical_reservation {
+                        self.reconciliation
+                            .reservations
+                            .push(ReconciliationReservation {
+                                content: Some(content),
+                                library: Arc::clone(&task.library),
+                                asset_id: task.asset_id.as_ref().into(),
+                                version_size: task.version_size,
+                                requested_path_key: ReconciliationPathKey(
+                                    requested_key.as_ref().to_owned(),
+                                ),
+                                destination_path_key: ReconciliationPathKey(
+                                    destination_key.as_ref().to_owned(),
+                                ),
+                                destination_path: crate::fs_util::absolute_confined_path(
+                                    &task.download_path,
+                                )?,
+                            });
+                    }
                 }
                 Ok(plan)
             });
@@ -2192,6 +2834,7 @@ impl TaskPlanner {
         self.retry_path_allowed(
             &task.library,
             &task.asset_id,
+            task.asset_record_name.as_ref(),
             task.version_size,
             &task.checksum,
             task.size,
@@ -2489,12 +3132,185 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn confirmed_claim_preflights_both_views_and_is_scoped_and_idempotent() {
+        let accepts = |p: &TaskPlanner, child| {
+            (
+                p.legacy_owners.accepts_claim("z", "m", child),
+                p.baseline_matcher.accepts_legacy_claim("z", "m", child),
+            )
+        };
+        for planner_conflict in [true, false] {
+            let mut planner = TaskPlanner::new();
+            if planner_conflict {
+                planner.legacy_owners.remember_claim("z", "m", "b");
+            } else {
+                planner
+                    .baseline_matcher
+                    .remember_legacy_claim("z", "m", "b");
+            }
+            assert!(planner.remember_legacy_owner("z", "m", "a").is_err());
+            assert_eq!(
+                accepts(&planner, "a"),
+                (!planner_conflict, planner_conflict)
+            );
+            // Refusal left the previously empty peer empty, not partially updated.
+            assert_eq!(
+                accepts(&planner, "c"),
+                (!planner_conflict, planner_conflict)
+            );
+        }
+        let mut planner = TaskPlanner::new();
+        for _ in 0..2 {
+            planner.remember_legacy_owner("z", "m", "a").unwrap();
+        }
+        assert_eq!(accepts(&planner, "a"), (true, true));
+        assert_eq!(accepts(&planner, "b"), (false, false));
+        assert!(planner.legacy_owners.accepts_claim("other", "m", "b"));
+        assert!(
+            planner
+                .baseline_matcher
+                .accepts_legacy_claim("other", "m", "b")
+        );
+    }
+
     fn test_config(root: &std::path::Path) -> DownloadConfig {
         let mut config = DownloadConfig::test_default();
         config.directory = Arc::from(root);
         config.folder_structure = "%Y/%m/%d".to_string();
         config.folder_structure_albums = Arc::from("{album}/%Y/%m/%d");
         config
+    }
+
+    #[tokio::test]
+    async fn prior_publication_relocation_respects_current_and_frozen_paths() {
+        use crate::state::{DownloadContextStateStore, ReconciliationStateStore};
+        use crate::test_helpers::TestAssetRecord;
+        use sha2::{Digest, Sha256};
+        for case in [
+            "new", "cross", "current", "frozen", "missing", "unproven", "empty", "blank",
+        ] {
+            let bytes = b"prior publication";
+            let root = TempDir::new().unwrap();
+            let db_path = root.path().join("state.db");
+            let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+            let mut config = test_config(root.path());
+            config.state_db = Some(db.clone());
+            let asset = TestPhotoAsset::new("GENERATION")
+                .filename("photo.JPG")
+                .orig_checksum("selected")
+                .orig_size(bytes.len() as u64)
+                .build();
+            let mut seed = TaskPlanner::for_reconciliation(Vec::new(), Vec::new()).unwrap();
+            let mut plan = seed.plan_download_asset(&asset, &config).await.unwrap();
+            let task = &plan.tasks[0];
+            let path = task.download_path.clone();
+            let version = if case == "cross" {
+                VersionSizeKey::Adjusted
+            } else {
+                task.version_size
+            };
+            let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            let mut downloaded = Vec::new();
+            for checksum in ["prior", "selected"] {
+                if checksum == "selected" && case != "current" {
+                    continue;
+                }
+                db.upsert_seen(
+                    &TestAssetRecord::new(asset.id())
+                        .library(&task.library)
+                        .version_size(version)
+                        .checksum(checksum)
+                        .size(bytes.len() as u64)
+                        .build(),
+                )
+                .await
+                .unwrap();
+                db.mark_verified_download(
+                    &task.library,
+                    asset.id(),
+                    version.as_str(),
+                    &path,
+                    &hash,
+                    Some(&hash),
+                    false,
+                )
+                .await
+                .unwrap();
+                downloaded.extend(db.get_downloaded_path_records().await.unwrap());
+            }
+            if case == "unproven" {
+                downloaded[0].local_checksum = None;
+            }
+            let mut catalog = db.get_reconciliation_catalog_paths().await.unwrap();
+            if case == "missing" {
+                catalog.clear();
+            }
+            let reservations = if matches!(case, "frozen" | "missing") {
+                seed.reconciliation_reservations().to_vec()
+            } else {
+                Vec::new()
+            };
+            db.reserve_reconciliation_paths(&reservations, None)
+                .await
+                .unwrap();
+            let saved = db.get_reconciliation_reservations().await.unwrap();
+            assert_eq!(saved, reservations);
+            let mut planner = TaskPlanner::for_reconciliation(catalog, saved).unwrap();
+            planner.add_downloaded_paths(downloaded);
+            if matches!(case, "empty" | "blank") {
+                plan.tasks[0].checksum = if case == "empty" { "" } else { " \t" }.into();
+            }
+            assert_eq!(
+                planner.path_has_prior_publication(&plan.tasks[0]),
+                !matches!(case, "unproven" | "empty" | "blank")
+            );
+            planner
+                .relocate_protected_tasks(&mut plan, &asset, &config)
+                .await
+                .unwrap();
+            let relocate = matches!(case, "new" | "cross");
+            assert_eq!(plan.tasks[0].download_path != path, relocate, "{case}");
+            assert_eq!(
+                plan.tasks[0].superseded_requested_path.is_some(),
+                relocate,
+                "{case}"
+            );
+            assert_eq!(
+                plan.tasks[0].superseded_requested(&config.directory, &path),
+                relocate.then_some(path.as_path()),
+                "{case}"
+            );
+            if relocate {
+                let sibling = paths::insert_asset_identity_suffix("photo.JPG", asset.id());
+                assert_eq!(
+                    plan.tasks[0].download_path,
+                    path.with_file_name(sibling),
+                    "{case}"
+                );
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{case}");
+            let reopened = SqliteStateDb::open(&db_path).await.unwrap();
+            assert_eq!(
+                reopened.get_reconciliation_reservations().await.unwrap(),
+                reservations
+            );
+            if matches!(case, "frozen" | "missing") {
+                let prior = reopened.get_downloaded_path_records().await.unwrap();
+                assert_eq!(prior.len(), 1);
+                assert_eq!(prior[0].checksum, "prior");
+                assert_eq!(prior[0].local_path.as_ref(), Some(&path));
+                assert_eq!(prior[0].local_checksum.as_deref(), Some(hash.as_str()));
+                assert_eq!(reservations.len(), 1);
+                let current = &reservations[0];
+                assert_eq!(current.destination_path, path);
+                let content = current.content.as_ref().unwrap();
+                assert_eq!(content.checksum.as_ref(), "selected");
+                assert_eq!(content.size, bytes.len() as u64);
+            }
+        }
     }
 
     #[tokio::test]
@@ -2963,7 +3779,7 @@ mod tests {
         let legacy_path = task.download_path.clone();
         let mut legacy = planner.reconciliation_reservations()[0].clone();
         legacy.content = None;
-        db.reserve_reconciliation_paths(std::slice::from_ref(&legacy))
+        db.reserve_reconciliation_paths(std::slice::from_ref(&legacy), None)
             .await
             .unwrap();
         std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
@@ -2972,6 +3788,7 @@ mod tests {
         assert!(!planner.retry_path_allowed(
             &task.library,
             &task.asset_id,
+            task.asset_record_name.as_ref(),
             task.version_size,
             &task.checksum,
             task.size,
@@ -3023,7 +3840,7 @@ mod tests {
         let mut planner = TaskPlanner::for_reconciliation(Vec::new(), Vec::new()).unwrap();
         let initial = planner.plan_download_asset(&shared, &config).await.unwrap();
         let shared_path = initial.tasks[0].download_path.clone();
-        db.reserve_reconciliation_paths(planner.reconciliation_reservations())
+        db.reserve_reconciliation_paths(planner.reconciliation_reservations(), None)
             .await
             .unwrap();
         let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
@@ -3108,6 +3925,249 @@ mod tests {
             albums,
             vec![("CROSS_ZONE".to_string(), "Family".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn mixed_owner_new_adoption_must_progress_to_safe_sibling() {
+        use crate::download::baseline_matching::BaselineMatch;
+        use crate::state::DownloadStateStore;
+        use crate::state::ReconciliationStateStore;
+        use crate::state::{
+            ReconciliationContent, ReconciliationPathKey, ReconciliationReservation, VersionSizeKey,
+        };
+        use crate::test_helpers::TestAssetRecord;
+        use sha2::Digest;
+
+        let root = TempDir::new().unwrap();
+        let db_path = root.path().join("state.db");
+        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        let mut config = test_config(root.path());
+        config.folder_structure = "none".into();
+        config.state_db = Some(db.clone());
+        let asset = TestPhotoAsset::new("current-child")
+            .filename("mixed.JPG")
+            .orig_size(4)
+            .orig_checksum("generation")
+            .build();
+        let old_path = root.path().join("mixed.JPG");
+        std::fs::write(&old_path, b"good").unwrap();
+        let old_mtime = std::fs::metadata(&old_path).unwrap().modified().unwrap();
+        let digest = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(b"good"));
+        db.upsert_seen(
+            &TestAssetRecord::new("old-master")
+                .library("PrimarySync")
+                .filename("mixed.JPG")
+                .checksum("generation")
+                .size(4)
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.mark_verified_download(
+            "PrimarySync",
+            "old-master",
+            "original",
+            &old_path,
+            &digest,
+            Some(&digest),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.claim_legacy_master_state_owner("PrimarySync", "old-master", "current-child")
+                .await
+                .unwrap()
+        );
+        let key = crate::fs_util::confined_path_key(&old_path).unwrap();
+        db.reserve_reconciliation_paths(
+            &[ReconciliationReservation {
+                content: Some(ReconciliationContent {
+                    checksum: "generation".into(),
+                    size: 4,
+                }),
+                library: Arc::from("PrimarySync"),
+                asset_id: "foreign".into(),
+                version_size: VersionSizeKey::Original,
+                requested_path_key: ReconciliationPathKey(key.clone()),
+                destination_path_key: ReconciliationPathKey(key),
+                destination_path: old_path.clone(),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+        let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        let task = &plan.tasks[0];
+        assert_ne!(task.download_path, old_path);
+        let decision = planner.match_existing(&asset, &config, task).await;
+        assert!(
+            matches!(decision, BaselineMatch::Missing),
+            "mixed foreign owner must not return the old completed P: {decision:?}"
+        );
+        assert!(
+            db.get_downloaded_page(0, 100)
+                .await
+                .unwrap()
+                .iter()
+                .all(|row| row.id.as_ref() != "current-child")
+        );
+        assert_eq!(std::fs::read(&old_path).unwrap(), b"good");
+        assert_eq!(
+            std::fs::metadata(&old_path).unwrap().modified().unwrap(),
+            old_mtime
+        );
+
+        drop(planner);
+        drop(db);
+        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
+        config.state_db = Some(db.clone());
+        let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+        let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        assert_ne!(plan.tasks[0].download_path, old_path);
+        let decision = planner
+            .match_existing(&asset, &config, &plan.tasks[0])
+            .await;
+        assert!(matches!(decision, BaselineMatch::Missing));
+    }
+
+    #[tokio::test]
+    async fn exclusive_legacy_receipt_alone_still_reuses_without_download() {
+        use crate::download::baseline_matching::{BaselineMatch, commit_match};
+        use crate::state::DownloadStateStore;
+        use crate::test_helpers::TestAssetRecord;
+        use sha2::Digest;
+        use tokio_util::sync::CancellationToken;
+
+        let root = TempDir::new().unwrap();
+        let db = Arc::new(
+            SqliteStateDb::open(&root.path().join("state.db"))
+                .await
+                .unwrap(),
+        );
+        let mut config = test_config(root.path());
+        config.folder_structure = "none".into();
+        config.state_db = Some(db.clone());
+        let asset = TestPhotoAsset::new("current-child")
+            .filename("mixed.JPG")
+            .orig_size(4)
+            .orig_checksum("generation")
+            .build();
+        let old_path = root.path().join("mixed.JPG");
+        std::fs::write(&old_path, b"good").unwrap();
+        let digest = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(b"good"));
+        db.upsert_seen(
+            &TestAssetRecord::new("old-master")
+                .library("PrimarySync")
+                .filename("mixed.JPG")
+                .checksum("generation")
+                .size(4)
+                .build(),
+        )
+        .await
+        .unwrap();
+        db.mark_verified_download(
+            "PrimarySync",
+            "old-master",
+            "original",
+            &old_path,
+            &digest,
+            Some(&digest),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.claim_legacy_master_state_owner("PrimarySync", "old-master", "current-child")
+                .await
+                .unwrap()
+        );
+        let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+        let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        let task = &plan.tasks[0];
+        let decision = planner.match_existing(&asset, &config, task).await;
+        assert!(matches!(decision, BaselineMatch::Present { .. }));
+        let settled = commit_match(decision, &config, &asset, task, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(settled);
+        let current = db
+            .get_downloaded_page(0, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id.as_ref() == "current-child")
+            .unwrap();
+        assert_eq!(current.local_path.as_ref(), Some(&old_path));
+        assert!(!task.download_path.exists());
+    }
+
+    #[tokio::test]
+    async fn proven_legacy_reservation_reuses_canonical_child_destination() {
+        use crate::state::ReconciliationStateStore;
+        use crate::state::{
+            ReconciliationContent, ReconciliationPathKey, ReconciliationReservation, VersionSizeKey,
+        };
+
+        for file_present in [false, true] {
+            let root = TempDir::new().unwrap();
+            let db = Arc::new(
+                SqliteStateDb::open(&root.path().join("state.db"))
+                    .await
+                    .unwrap(),
+            );
+            let mut config = test_config(root.path());
+            config.folder_structure = "none".into();
+            config.state_db = Some(db.clone());
+            let asset = TestPhotoAsset::new("current-child")
+                .filename("reserved.JPG")
+                .orig_size(4)
+                .orig_checksum("generation")
+                .build();
+            let destination = root.path().join("reserved.JPG");
+            if file_present {
+                std::fs::write(&destination, b"good").unwrap();
+            }
+            assert!(
+                db.claim_legacy_master_state_owner("PrimarySync", "old-master", "current-child")
+                    .await
+                    .unwrap()
+            );
+            let key = crate::fs_util::confined_path_key(&destination).unwrap();
+            db.reserve_reconciliation_paths(
+                &[ReconciliationReservation {
+                    content: Some(ReconciliationContent {
+                        checksum: "generation".into(),
+                        size: 4,
+                    }),
+                    library: Arc::from("PrimarySync"),
+                    asset_id: "old-master".into(),
+                    version_size: VersionSizeKey::Original,
+                    requested_path_key: ReconciliationPathKey(key.clone()),
+                    destination_path_key: ReconciliationPathKey(key),
+                    destination_path: destination.clone(),
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+            let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+            let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+            assert_eq!(
+                plan.tasks[0].download_path, destination,
+                "canonical child must reuse its proof-bearing M reservation"
+            );
+            planner
+                .persist_download_reservations(db.as_ref(), &plan.tasks)
+                .await
+                .unwrap();
+            let reservations = db.get_reconciliation_reservations().await.unwrap();
+            assert_eq!(reservations.len(), 1);
+            assert_eq!(reservations[0].asset_id.as_ref(), "old-master");
+            assert_eq!(reservations[0].destination_path, destination);
+        }
     }
 }
 

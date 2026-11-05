@@ -201,7 +201,10 @@ fn released_v0240_history_preserves_durable_evidence_through_upgrade() {
         owners
     );
     assert_eq!(
-        rows(&db, "SELECT * FROM metadata ORDER BY key"),
+        rows(
+            &db,
+            "SELECT * FROM metadata WHERE key <> 'sync_epoch:v1' ORDER BY key"
+        ),
         checkpoints
     );
     assert_eq!(
@@ -238,7 +241,10 @@ fn released_v0240_history_preserves_durable_evidence_through_upgrade() {
             stable
         );
         assert_eq!(
-            rows(&db, "SELECT * FROM metadata ORDER BY key"),
+            rows(
+                &db,
+                "SELECT * FROM metadata WHERE key <> 'sync_epoch:v1' ORDER BY key"
+            ),
             checkpoints
         );
         assert_eq!(schema_version(&db), super::support::HELPER_SCHEMA_VERSION);

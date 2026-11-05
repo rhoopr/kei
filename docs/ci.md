@@ -21,30 +21,30 @@ refer to one exact commit. A skipped check is not a passing check.
 | Fuzz build and bounded seeded fuzz runs | Not required | Full qualification | Required |
 | Optimized offline regression tests | Not required | Full qualification | Required |
 | Five release archives and extracted-binary smoke | Not required | Full qualification | Required |
-| Both container architectures, entrypoint and service smoke | Relevant smoke only | Full qualification | Required |
-| Live provider, live shell, release-binary import, real host service | Never on untrusted PRs | Protected maintainer qualification only | Separate exact-commit evidence for releases |
+| Both container architectures and entrypoint smoke | Relevant smoke only | Full qualification | Required |
+| Live provider, live shell, release-binary import | Never on untrusted PRs | Protected maintainer qualification only | Separate exact-commit evidence for releases |
 
 Full qualification must enumerate ignored tests. Live tests remain opt-in and
 single-threaded. Do not substitute an unfiltered `--ignored` run for this
 inventory. Cross-zone fixtures and unavailable host platforms need an explicit
 applicability decision, not a silent skip.
 
-The local `just gate` and `just full-test` commands retain their existing
-contracts. CI reuses their owners and test routes; it does not claim that an
-offline workflow performed live provider or real host-service validation.
+The local `just gate` and `just full-test` commands remain available. CI reuses
+their owners and test routes; it does not claim that an offline workflow
+performed live provider validation.
 
 ## Local work
 
 Before opening a PR, run focused tests for the changed behavior plus formatting
 and lint checks. Do not replay the complete offline gate locally. PR CI owns
-that evidence. Use local live-provider and real service checks only when the
-change needs them and the isolated fixtures are approved. `just gate` remains
+that evidence. Use local live-provider checks only when the change needs them
+and the isolated fixtures are approved. `just gate` remains
 available for diagnosis or work without hosted CI.
 
 ## PR routing
 
-Draft validation events skip routing, quality checks, qualification, and native
-service smoke, including when labeled `ci:full`. The required `CI` job still runs
+Draft validation events skip routing, quality checks, and qualification,
+including when labeled `ci:full`. The required `CI` job still runs
 as a small failing marker: skipped required checks count as success on GitHub.
 Marking the PR ready for review starts validation for that event's exact merge
 commit, even if the head has not changed. A new head starts a new run.
@@ -76,8 +76,8 @@ New unclassified helpers still select full qualification.
 
 Recognized Rust test files keep the Linux all-feature and no-default suites
 and full Windows/macOS offline suites. Other code changes keep Linux suites with
-macOS/Windows build and CLI/media/service smoke; filesystem, state,
-configuration, and service changes select full platform tests. Narrow
+macOS/Windows build and CLI/media smoke; filesystem, state, configuration, and
+service changes select full platform tests. Narrow
 scenario/roundtrip/stress runners keep the ordinary Rust matrix without
 selecting release artifacts or fuzzing. The contract checker itself runs in the
 always-on workflow-hardening job.
@@ -100,13 +100,6 @@ Rust check orchestration also select stress. The broad-PR rollout fallback adds
 platform suites, coverage and unused-dependency checks for Rust changes, but
 cannot make an unrelated unit-test module or notification script select stress.
 Docs-only PRs retain workflow/script lint, safety-contract validation and typos.
-
-Native release-binary service smoke is routed through the required `CI` graph
-for service, service/status command, CLI, config and shared entrypoint changes.
-A selected missing, skipped, cancelled or failed smoke fails `CI`. Heavy
-qualification owns the same smoke internally; ordinary CI calls it only when
-qualification is off. The reusable service workflow has no independent PR
-trigger, so each validation runs its native smoke matrix at most once.
 
 For the exact file sets in #1000, #997, #991 and #1001, routing now selects
 ordinary Rust checks for #1000's Rust tests and only the always-on checks for the
@@ -131,23 +124,21 @@ on that result. Nightly and manual rehearsals have no publishing permissions.
 ## Local release prerequisites
 
 When a maintainer explicitly requests a release, run these local prerequisites
-before starting release CI. Verify the configured isolated test account, selected
-fixtures, and an unused host-service slot. Ask for input if those prerequisites
-are unavailable or ambiguous. Never use an existing media/state tree as
-disposable test data, and never replace an existing service. An ordinary PR or
-CI rehearsal does not authorize credential-bearing checks.
+before starting release CI. Verify the configured isolated test account and
+selected fixtures. Ask for input if those prerequisites are unavailable or
+ambiguous. Never use an existing media/state tree as disposable test data. An
+ordinary PR or CI rehearsal does not authorize credential-bearing checks.
 
 1. Check out the final release commit with a clean worktree. Do not change it
    after qualification starts.
-2. Run `KEI_FULL_TEST_REAL_SERVICE=1 just release-local` on the prepared Linux host.
-   This builds the live CLI/container fixtures, then runs provider, shell,
-   release-binary, import, and real service checks. It does not repeat the
-   hosted offline suite. It requires working credentials, Docker, and an unused
-   user-service slot. Retain the finalized report and private logs.
+2. Run `just release-local` on the prepared Linux host. This builds the live
+   CLI/container fixtures, then runs provider, shell, release-binary, and import
+   checks. It does not repeat the hosted offline suite. It requires working
+   credentials and Docker. Retain the finalized report and private logs.
 3. Run `python3 scripts/ci/local_release.py record --repo rhoopr/kei --sha COMMIT --report REPORT`.
    The validator rejects missing, skipped, rate-limited, failed, or dirty-head
-   evidence. All discovered shell suites and the real host-service phase must
-   pass. Cross-zone testing remains an explicit fixture-dependent extension.
+   evidence. All discovered shell suites must pass. Cross-zone testing remains
+   an explicit fixture-dependent extension.
 4. Post only the redacted summary and report digest to the release PR. Do not
    upload private logs, credentials, provider identifiers, or local account paths.
 5. As part of the authorized release, repeat the record command with

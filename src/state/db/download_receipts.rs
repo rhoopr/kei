@@ -269,7 +269,7 @@ impl DownloadReceipt {
             &self.native_path,
         ))
     }
-    pub(super) fn save(&self, conn: &Connection) -> Result<String, StateError> {
+    pub(crate) fn save(&self, conn: &Connection) -> Result<String, StateError> {
         self.validate(conn)?;
         let id = self.id()?;
         if let Some(previous) = load(conn, &id)? {
@@ -323,6 +323,55 @@ pub(super) fn save_prepared_rewrite(
     }
     completed.save(conn)?;
     Ok(())
+}
+
+/// An explicit capture repair changed local bytes. Only one exact existing
+/// source-backed completion may advance, and only its local byte checksum
+/// changes: provider resource, source checksum, path and receipt identity stay
+/// as they were. Zero or ambiguous matches invent no proof.
+pub(super) fn save_capture_repair_rewrite(
+    conn: &Connection,
+    pending: &super::PendingMetadataRewrite,
+    output_checksum: &str,
+) -> Result<bool, StateError> {
+    let Some(path) = pending.asset.local_path.as_deref() else {
+        return Ok(false);
+    };
+    let Some(input_checksum) = pending.asset.local_checksum.as_deref() else {
+        return Ok(false);
+    };
+    let Some(source_checksum) = pending.source_checksum.as_deref() else {
+        return Ok(false);
+    };
+    let native_path = SelectionPath::from_path(path);
+    let ids: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM download_receipts WHERE library=?1 AND state_id=?2 \
+             AND version_size=?3 AND native_path=?4 AND provider_checksum=?5 \
+             AND provider_size=?6 AND source_checksum=?7 AND local_checksum=?8 \
+             AND source_checksum IS NOT NULL ORDER BY id",
+        )?
+        .query_map(
+            params![
+                pending.asset.library.as_ref(),
+                pending.asset.id.as_ref(),
+                pending.asset.version_size.as_str(),
+                native_path.key()?,
+                pending.asset.checksum,
+                i64::try_from(pending.asset.size_bytes).map_err(|_invalid| invalid())?,
+                source_checksum,
+                input_checksum
+            ],
+            |row| row.get(0),
+        )?
+        .collect::<Result<_, _>>()?;
+    let [id] = ids.as_slice() else {
+        return Ok(false);
+    };
+    let mut completed = load(conn, id)?.ok_or_else(invalid)?;
+    completed.local_checksum = output_checksum.to_owned();
+    save_prepared_rewrite(conn, &completed, input_checksum)?;
+    Ok(true)
 }
 
 pub(super) fn replace_validated_local(
@@ -398,6 +447,168 @@ pub(super) fn matching_local(
     ids.into_iter()
         .map(|id| load(conn, &id)?.ok_or_else(invalid))
         .collect()
+}
+
+#[cfg(test)]
+mod capture_repair_tests {
+    use super::{DownloadReceipt, load, save_capture_repair_rewrite};
+    use crate::state::SqliteStateDb;
+    use crate::state::db::PendingMetadataRewrite;
+    use crate::state::db::account::AccountOwner;
+    use crate::state::db::provider_selection::SelectionPath;
+    use rusqlite::params;
+
+    fn owner() -> AccountOwner {
+        AccountOwner::authenticated(
+            "repaired@example.invalid",
+            "com",
+            &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"repair-provider"}}))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn receipt(owner: &AccountOwner, source: &str, local: &str) -> DownloadReceipt {
+        let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+        DownloadReceipt {
+            account_key: account_key.into(),
+            provider_key: provider_key.into(),
+            scope: serde_json::json!({
+                "database": "private",
+                "zone": {"zoneName": "PrimarySync", "ownerRecordName": "owner"}
+            })
+            .to_string(),
+            library: "PrimarySync".into(),
+            child: "child-ok".into(),
+            master: "master-ok".into(),
+            state_id: "asset-ok".into(),
+            origin_pass: "pass-key".into(),
+            version_size: "original".into(),
+            provider_checksum: "provider-checksum".into(),
+            provider_size: 9,
+            native_path: SelectionPath::from_path(std::path::Path::new("/photos/repaired.jpg")),
+            source_checksum: source.into(),
+            local_checksum: local.into(),
+        }
+    }
+
+    fn pending(source: &str, local: &str) -> PendingMetadataRewrite {
+        let mut asset = crate::test_helpers::TestAssetRecord::new("asset-ok")
+            .library("PrimarySync")
+            .checksum("provider-checksum")
+            .filename("repaired.jpg")
+            .size(9)
+            .build();
+        asset.local_path = Some(std::path::PathBuf::from("/photos/repaired.jpg"));
+        asset.local_checksum = Some(local.to_owned());
+        PendingMetadataRewrite {
+            asset,
+            selection_receipt: None,
+            capture_repair_receipt: None,
+            source_checksum: Some(source.to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_repair_advances_only_one_exact_source_backed_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        let mut guard = db.acquire_lock("seed compact receipt").unwrap();
+        let tx = guard.transaction().unwrap();
+        let source = "a".repeat(64);
+        let input = "b".repeat(64);
+        let output = "c".repeat(64);
+        let exact = pending(&source, &input);
+        let id = receipt(&owner(), &source, &input).save(&tx).unwrap();
+        let advance = |candidate: &PendingMetadataRewrite| {
+            save_capture_repair_rewrite(&tx, candidate, &output).unwrap()
+        };
+
+        // No exact owner invents no proof.
+        for wrong in [
+            {
+                let mut candidate = exact.clone();
+                candidate.asset.library = "OtherSync".into();
+                candidate
+            },
+            {
+                let mut candidate = exact.clone();
+                candidate.asset.id = "other-asset".into();
+                candidate
+            },
+            {
+                let mut candidate = exact.clone();
+                candidate.asset.version_size = crate::state::VersionSizeKey::Medium;
+                candidate
+            },
+            {
+                let mut candidate = exact.clone();
+                candidate.asset.local_path = Some("/photos/sibling.jpg".into());
+                candidate
+            },
+            {
+                let mut candidate = exact.clone();
+                candidate.asset.checksum = "other-provider".into();
+                candidate
+            },
+            {
+                let mut candidate = exact.clone();
+                candidate.asset.size_bytes = 10;
+                candidate
+            },
+            {
+                let mut candidate = exact.clone();
+                candidate.source_checksum = Some(output.clone());
+                candidate
+            },
+            {
+                let mut candidate = exact.clone();
+                candidate.asset.local_checksum = Some(output.clone());
+                candidate
+            },
+        ] {
+            assert!(
+                !advance(&wrong),
+                "no exact receipt may advance for {:?} {:?}",
+                wrong.asset.library,
+                wrong.asset.local_path
+            );
+        }
+        let original = load(&tx, &id).unwrap().unwrap();
+        assert_eq!(original.local_checksum, input);
+
+        // An ambiguous match is refused rather than guessed.
+        tx.execute(
+            "INSERT INTO download_receipts(id,account_key,provider_key,scope,library,child,master,\
+             state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,\
+             source_checksum,local_checksum,proof_hash) \
+             SELECT 'ambiguous-extra',account_key,provider_key,scope,library,child,master,state_id,\
+             origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,\
+             local_checksum,'not-a-valid-proof' FROM download_receipts WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        assert!(!advance(&exact));
+        assert_eq!(load(&tx, &id).unwrap(), Some(original.clone()));
+        tx.execute(
+            "DELETE FROM download_receipts WHERE id='ambiguous-extra'",
+            [],
+        )
+        .unwrap();
+
+        // The one exact owner advances only its local bytes.
+        assert!(advance(&exact));
+        tx.commit().unwrap();
+        drop(guard);
+        let conn = db.acquire_lock("verify compact receipt").unwrap();
+        let advanced = load(&conn, &id).unwrap().unwrap();
+        let mut expected = original;
+        expected.local_checksum = output;
+        assert_eq!(advanced, expected);
+        assert_eq!(advanced.id().unwrap(), id);
+    }
 }
 
 #[cfg(test)]

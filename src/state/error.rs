@@ -127,6 +127,20 @@ pub enum StateError {
         "This state database is from a newer kei version (schema {found}); this kei supports schema {expected}"
     )]
     UnsupportedSchemaVersion { found: i32, expected: i32 },
+    #[error(
+        "State database contains metadata activity prerequisite evidence from an unsupported development build; the database was left unchanged."
+    )]
+    UnsupportedMetadataActivityEvidence,
+
+    #[error(
+        "This state database uses schema {schema} without a verified sync epoch; refusing state access before any migration or write."
+    )]
+    SyncEpochMissing { schema: i32 },
+
+    #[error(
+        "This state database sync epoch is malformed or does not match the authenticated account; refusing state access."
+    )]
+    SyncEpochMismatch,
 
     /// The database schema must be migrated before a read-only command can
     /// inspect it.

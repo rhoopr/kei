@@ -22,7 +22,8 @@ pub(crate) use db::{
     AssetVerificationState, CheckpointTransition, DownloadContextStateStore, DownloadedFileRecord,
     LegacyFileEvidence, OwnedTempFile, PendingPublicationRecord, ReconciliationCatalogPath,
     ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
-    ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken, TempFileOwnershipStore,
+    ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken, SyncEpochGate,
+    TempFileOwnershipStore,
 };
 pub use db::{
     DownloadStateStore, ImportStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore,

@@ -571,3 +571,107 @@ async fn v0252_owned_writer_current_reader() {
         "V0252_READER_REACHED legacy_refused=1 wrong_owner_refused=1 preserved_snapshot=1 pending=1 reopens=2"
     );
 }
+
+#[tokio::test]
+async fn populated_metadata_activity_evidence_refuses_owned_open_intact() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    let expected = owner("activity@example.invalid", "com", "synthetic-activity");
+    SqliteStateDb::open_owned(&path, &expected).await.unwrap();
+
+    for (table, ddl, insert) in [
+        (
+            "metadata_activity_prerequisite",
+            "CREATE TABLE metadata_activity_prerequisite(operation_id TEXT PRIMARY KEY, account_key TEXT NOT NULL, provider_key TEXT NOT NULL, library TEXT NOT NULL, binding BLOB NOT NULL)",
+            "INSERT INTO metadata_activity_prerequisite VALUES('op','account','provider','PrimarySync',X'00')",
+        ),
+        (
+            "metadata_activity_prepared_prerequisite",
+            "CREATE TABLE metadata_activity_prepared_prerequisite(operation_id TEXT PRIMARY KEY, binding BLOB NOT NULL)",
+            "INSERT INTO metadata_activity_prepared_prerequisite VALUES('op',X'00')",
+        ),
+    ] {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(&format!("{ddl}; {insert};")).unwrap();
+        drop(conn);
+        let before_bytes = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            SqliteStateDb::open_owned(&path, &expected).await,
+            Err(StateError::UnsupportedMetadataActivityEvidence)
+        ));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before_bytes,
+            "refusal must not write or checkpoint the database"
+        );
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                .unwrap(),
+            crate::state::schema::SCHEMA_VERSION
+        );
+        assert_eq!(
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "refusal must preserve the unknown rows"
+        );
+        conn.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+    }
+
+    // Absent and empty legacy tables do not block ordinary state access.
+    SqliteStateDb::open_owned(&path, &expected).await.unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE metadata_activity_prerequisite(operation_id TEXT PRIMARY KEY, account_key TEXT NOT NULL, provider_key TEXT NOT NULL, library TEXT NOT NULL, binding BLOB NOT NULL);",
+    )
+    .unwrap();
+    drop(conn);
+    SqliteStateDb::open_owned(&path, &expected).await.unwrap();
+}
+
+#[tokio::test]
+async fn populated_activity_evidence_blocks_unowned_legacy_adoption() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let destination = directory.path().join("adopted.db");
+    {
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        crate::state::schema::migrate(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE metadata_activity_prerequisite(operation_id TEXT PRIMARY KEY, account_key TEXT NOT NULL, provider_key TEXT NOT NULL, library TEXT NOT NULL, binding BLOB NOT NULL);
+             INSERT INTO metadata_activity_prerequisite VALUES('op','account','provider','PrimarySync',X'00');",
+        )
+        .unwrap();
+    }
+    let before = std::fs::read(&source).unwrap();
+    let expected = owner("adopt-activity@example.invalid", "com", "synthetic-adopt");
+    assert!(matches!(
+        adopt_legacy(
+            &source,
+            &destination,
+            &expected,
+            "adopt-activity@example.invalid",
+            "com"
+        )
+        .await,
+        Err(StateError::UnsupportedMetadataActivityEvidence)
+    ));
+    assert!(!destination.exists(), "no populated copy may be published");
+    assert_eq!(
+        std::fs::read(&source).unwrap(),
+        before,
+        "source stays intact"
+    );
+    let conn = rusqlite::Connection::open(&source).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM metadata_activity_prerequisite",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+}

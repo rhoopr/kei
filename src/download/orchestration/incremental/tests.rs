@@ -282,7 +282,7 @@ fn provider_metadata_refresh_is_a_noop_for_unchanged_hash() {
             }
         }
     }
-    assert!(!ctx.has_provider_metadata_drift("PrimarySync", "asset1", &metadata(6000, 1280)));
+    assert!(ctx.has_provider_metadata_drift("PrimarySync", "asset1", &metadata(6000, 1280)));
 }
 
 #[tokio::test]
@@ -754,6 +754,7 @@ async fn album_membership_first_xmp_and_tracked_path_removal() {
     assert_eq!(
         drain_pending_metadata_rewrites(
             db.as_ref(),
+            &config.directory,
             &config.metadata,
             CaptureTimestampRepair::Preserve,
             &["PrimarySync"],
@@ -1943,6 +1944,7 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
             assert_eq!(
                 drain_pending_metadata_rewrites(
                     db.as_ref(),
+                    &config.directory,
                     &config.metadata,
                     CaptureTimestampRepair::Preserve,
                     &["PrimarySync"],

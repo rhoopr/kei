@@ -10,11 +10,25 @@ use crate::download::filter::{FilterReason, is_asset_filtered};
 use crate::icloud::photos::PhotoAsset;
 use crate::state::types::legacy_added_date_matches;
 use crate::state::{
-    DownloadContextStateStore, DownloadStateStore, MetadataRewriteStore, VersionSizeKey,
+    DownloadContextStateStore, DownloadStateStore, MetadataRewriteStore, RenditionMetadata,
+    VersionSizeKey,
 };
 
 use super::config::DownloadConfig;
 use super::models::DownloadStore;
+
+/// Evidence minted only after the durable exclusive-owner claim returns true.
+pub(in crate::download) struct ConfirmedLegacyOwner {
+    library: String,
+    master: String,
+    child: String,
+}
+
+impl ConfirmedLegacyOwner {
+    pub(in crate::download) fn parts(&self) -> (&str, &str, &str) {
+        (&self.library, &self.master, &self.child)
+    }
+}
 
 /// Look up an owned `String` id in a shared `Arc<str>` interner,
 /// inserting a fresh `Arc` if absent. Returns the shared handle.
@@ -58,6 +72,9 @@ type LibraryAssetAttemptCounts = FxHashMap<Arc<str>, FxHashMap<Arc<str>, u32>>;
 /// `downloaded_metadata_hashes`.
 type LibraryAssetVersionValueMap =
     FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashMap<Box<str>, Box<str>>>>;
+
+type LibraryAssetRenditions =
+    FxHashMap<Arc<str>, FxHashMap<Arc<str>, FxHashMap<VersionSizeKey, RenditionMetadata>>>;
 
 /// Durable local-file evidence for a state-backed skip or pending adoption.
 #[derive(Debug)]
@@ -128,6 +145,7 @@ pub(crate) struct DownloadContext {
     /// metadata.
     #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
     pub(in crate::download) downloaded_metadata_hashes: LibraryAssetVersionValueMap,
+    downloaded_renditions: LibraryAssetRenditions,
     /// Nested map: `library` -> `asset_id` -> set of `version_sizes` with a
     /// non-null `metadata_write_failed_at` from a prior sync. These always
     /// route to the metadata-rewrite path regardless of whether the hash
@@ -213,6 +231,7 @@ impl DownloadContext {
             downloaded_records,
             soft_deleted,
             hashes,
+            renditions,
             markers,
             pending,
             attempts,
@@ -238,6 +257,14 @@ impl DownloadContext {
                     .await
                     .unwrap_or_else(|e| {
                         tracing::warn!(error = %e, "Failed to load metadata hashes from state DB");
+                        Default::default()
+                    })
+            },
+            async {
+                db.get_downloaded_rendition_metadata()
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Failed to load retained rendition metadata");
                         Default::default()
                     })
             },
@@ -341,6 +368,15 @@ impl DownloadContext {
                 );
         }
 
+        let mut downloaded_renditions = LibraryAssetRenditions::default();
+        for (library, asset, version, facts) in renditions {
+            downloaded_renditions
+                .entry(intern_id(&mut interner, library))
+                .or_default()
+                .entry(intern_id(&mut interner, asset))
+                .or_default()
+                .insert(version, facts);
+        }
         let mut metadata_retry_markers: LibraryAssetVersionSet = FxHashMap::default();
         for (library, asset_id, version_size) in markers {
             let lib = intern_id(&mut interner, library);
@@ -472,6 +508,7 @@ impl DownloadContext {
             downloaded_ids,
             downloaded_checksums,
             downloaded_metadata_hashes,
+            downloaded_renditions,
             metadata_retry_markers,
             soft_deleted_ids,
             pending_ids,
@@ -541,7 +578,14 @@ impl DownloadContext {
                 .and_then(|assets| assets.get(asset_id))
                 .and_then(|versions| versions.get(version_size.as_ref()))
                 .map_or("", AsRef::as_ref);
-            let metadata = capture.resolve(key, checksum);
+            let retained = self
+                .downloaded_renditions
+                .get(library)
+                .and_then(|assets| assets.get(asset_id))
+                .and_then(|versions| versions.get(&key));
+            let Some(metadata) = capture.resolve_retained(key, checksum, retained) else {
+                return true;
+            };
             stored_hashes
                 .and_then(|hashes| hashes.get(version_size.as_ref()))
                 .is_none_or(|stored| Some(stored.as_ref()) != metadata.metadata_hash.as_deref())
@@ -765,13 +809,17 @@ impl DownloadContext {
         library: &str,
         asset: &PhotoAsset,
         claimed_legacy_master_states: &mut ClaimedLegacyMasterStates,
-    ) -> std::result::Result<Arc<str>, crate::state::error::StateError> {
+    ) -> std::result::Result<
+        (Arc<str>, Option<ConfirmedLegacyOwner>),
+        crate::state::error::StateError,
+    > {
         let state_record_name = self.select_asset_state_record_name_checked(
             library,
             asset,
             claimed_legacy_master_states,
         )?;
-        if state_record_name.as_ref() != asset.id()
+        if asset.asset_record_name() == asset.id()
+            || state_record_name.as_ref() != asset.id()
             || self
                 .legacy_master_state_owners
                 .as_ref()
@@ -779,11 +827,11 @@ impl DownloadContext {
                 .and_then(|masters| masters.get(asset.id()))
                 .is_some()
         {
-            return Ok(state_record_name);
+            return Ok((state_record_name, None));
         }
 
         let Some(db) = db else {
-            return Ok(asset.asset_record_name_arc());
+            return Ok((asset.asset_record_name_arc(), None));
         };
 
         for attempt in 1..=LEGACY_OWNER_CLAIM_MAX_ATTEMPTS {
@@ -791,8 +839,17 @@ impl DownloadContext {
                 .claim_legacy_master_state_owner(library, asset.id(), asset.asset_record_name())
                 .await
             {
-                Ok(true) => return Ok(state_record_name),
-                Ok(false) => return Ok(asset.asset_record_name_arc()),
+                Ok(true) => {
+                    return Ok((
+                        state_record_name,
+                        Some(ConfirmedLegacyOwner {
+                            library: library.to_owned(),
+                            master: asset.id().to_owned(),
+                            child: asset.asset_record_name().to_owned(),
+                        }),
+                    ));
+                }
+                Ok(false) => return Ok((asset.asset_record_name_arc(), None)),
                 Err(error) if attempt < LEGACY_OWNER_CLAIM_MAX_ATTEMPTS => {
                     tracing::debug!(
                         library,

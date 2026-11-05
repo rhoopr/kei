@@ -382,4 +382,306 @@ async fn retained_checkpoint_metadata_fence_rolls_back_stale_plans() {
     );
 }
 
+#[tokio::test]
+async fn epoch_promotion_failure_is_all_or_none_across_zones() {
+    let db = SqliteStateDb::open_in_memory().unwrap();
+    let valid = "PrimarySync";
+    let invalid = "SharedSync-epoch-peer";
+    let zones = [valid, invalid];
+    {
+        let conn = db
+            .acquire_lock("seed valid and invalid epoch proofs")
+            .unwrap();
+        // The in-memory test schema has no account owner; the epoch was
+        // established with the generic test identity. Bind the same identity so
+        // the staged proof helper can read it.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS account_owner(\
+             singleton INTEGER PRIMARY KEY CHECK(singleton=1), \
+             version INTEGER NOT NULL, account_key TEXT NOT NULL, \
+             provider_key TEXT NOT NULL);\
+             INSERT OR REPLACE INTO account_owner VALUES(1,1,'test-account','test-provider');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata(key,value) VALUES(?1,'enum-valid'),(?2,'download-valid')",
+            rusqlite::params![
+                crate::sync_cycle::ENUM_CONFIG_HASH_KEY,
+                crate::download::DOWNLOAD_CONFIG_HASH_KEY
+            ],
+        )
+        .unwrap();
+        crate::state::db::provider_generations::observation::seed_valid_staged_epoch_for_test(
+            &conn,
+            valid,
+            "valid-token",
+        )
+        .unwrap();
+        // The peer starts with a structurally valid staged binding and
+        // descriptor, then only its token hash is corrupted. This is a present
+        // but invalid binding, not an absent one.
+        crate::state::db::provider_generations::observation::seed_valid_staged_epoch_for_test(
+            &conn,
+            invalid,
+            "peer-token",
+        )
+        .unwrap();
+        let peer_attempt = format!("attempt-{invalid}");
+        let record_key = crate::state::db::sync_epoch::library_key(invalid);
+        let record: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [&record_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut record: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(record["attempt"], serde_json::json!(peer_attempt));
+        record["binding"]["token_sha256"] = serde_json::json!("corrupted-token-hash");
+        conn.execute(
+            "UPDATE metadata SET value=?2 WHERE key=?1",
+            rusqlite::params![record_key, record.to_string()],
+        )
+        .unwrap();
+    }
+    let result = db
+        .commit_observation_transition(
+            CheckpointTransition {
+                expected_metadata: vec![
+                    (
+                        crate::sync_cycle::ENUM_CONFIG_HASH_KEY.to_owned(),
+                        Some("enum-valid".to_owned()),
+                    ),
+                    (
+                        crate::sync_cycle::PENDING_ENUM_CONFIG_HASH_KEY.to_owned(),
+                        None,
+                    ),
+                    (
+                        crate::download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+                        Some("download-valid".to_owned()),
+                    ),
+                    (
+                        crate::sync_cycle::PENDING_DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+                        None,
+                    ),
+                ],
+                legacy_preservation_proofs: Vec::new(),
+                legacy_config_hash: None,
+                sparse_identity_proofs: Vec::new(),
+                metadata_updates: vec![
+                    (
+                        crate::sync_cycle::ENUM_CONFIG_HASH_KEY.to_owned(),
+                        "enum-valid".to_owned(),
+                    ),
+                    (format!("sync_token:v27:{valid}"), "valid-token".to_owned()),
+                    (format!("sync_token:v27:{invalid}"), "peer-token".to_owned()),
+                ],
+                metadata_deletes: Vec::new(),
+            },
+            None,
+            true,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "one present but invalid epoch proof must abort both zones"
+    );
+    {
+        let conn = db.acquire_lock("inspect all-or-none refusal").unwrap();
+        for zone in zones {
+            let active: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM metadata WHERE key=?1)",
+                    [format!("sync_token:v27:{zone}")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!active, "no active token may commit for {zone}");
+            let ready = crate::state::db::sync_epoch::read_library(&conn, zone)
+                .unwrap()
+                .expect("epoch record must be retained");
+            assert_eq!(ready.state, "ready", "the epoch must stay ready for {zone}");
+            assert!(
+                ready.binding.is_some(),
+                "the epoch binding must be retained for {zone}"
+            );
+        }
+    }
+
+    // The valid zone alone must promote. This proves the first failure was the
+    // peer's present-but-invalid proof, not an invalid fixture on both sides.
+    db.commit_observation_transition(
+        CheckpointTransition {
+            expected_metadata: vec![
+                (
+                    crate::sync_cycle::ENUM_CONFIG_HASH_KEY.to_owned(),
+                    Some("enum-valid".to_owned()),
+                ),
+                (
+                    crate::sync_cycle::PENDING_ENUM_CONFIG_HASH_KEY.to_owned(),
+                    None,
+                ),
+                (
+                    crate::download::DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+                    Some("download-valid".to_owned()),
+                ),
+                (
+                    crate::sync_cycle::PENDING_DOWNLOAD_CONFIG_HASH_KEY.to_owned(),
+                    None,
+                ),
+            ],
+            legacy_preservation_proofs: Vec::new(),
+            legacy_config_hash: None,
+            sparse_identity_proofs: Vec::new(),
+            metadata_updates: vec![
+                (
+                    crate::sync_cycle::ENUM_CONFIG_HASH_KEY.to_owned(),
+                    "enum-valid".to_owned(),
+                ),
+                (format!("sync_token:v27:{valid}"), "valid-token".to_owned()),
+            ],
+            metadata_deletes: Vec::new(),
+        },
+        None,
+        true,
+    )
+    .await
+    .expect("the valid zone must promote on its own");
+    let conn = db.acquire_lock("inspect valid-only promotion").unwrap();
+    let valid_active: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key=?1)",
+            [format!("sync_token:v27:{valid}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(valid_active, "the valid zone must commit on its own");
+    let invalid_active: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key=?1)",
+            [format!("sync_token:v27:{invalid}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!invalid_active, "the invalid peer must remain uncommitted");
+}
+
+#[tokio::test]
+async fn pending_token_purge_preserves_ready_epoch_evidence_and_unrelated_metadata() {
+    let db = SqliteStateDb::open_in_memory().unwrap();
+    {
+        let conn = db.acquire_lock("seed purge guard state").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS account_owner(\
+             singleton INTEGER PRIMARY KEY CHECK(singleton=1), \
+             version INTEGER NOT NULL, account_key TEXT NOT NULL, \
+             provider_key TEXT NOT NULL);\
+             INSERT OR REPLACE INTO account_owner VALUES(1,1,'test-account','test-provider');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata(key,value) VALUES(?1,'enum-valid'),(?2,'download-valid')",
+            rusqlite::params![
+                crate::sync_cycle::ENUM_CONFIG_HASH_KEY,
+                crate::download::DOWNLOAD_CONFIG_HASH_KEY
+            ],
+        )
+        .unwrap();
+        crate::state::db::provider_generations::observation::seed_valid_staged_epoch_for_test(
+            &conn,
+            "PrimarySync",
+            "ready-token",
+        )
+        .unwrap();
+        crate::state::db::provider_generations::observation::seed_valid_staged_epoch_for_test(
+            &conn,
+            "SharedSync:with:colon",
+            "colon-ready-token",
+        )
+        .unwrap();
+        for (key, value) in [
+            (
+                "pending_sync_token:v27:old-enum:PrimarySync",
+                "superseded-same-zone",
+            ),
+            (
+                "pending_sync_token:v27:enum-valid:StaleZone",
+                "stale-other-zone",
+            ),
+            (
+                "pending_sync_token:v27:old-enum:SharedSync:with:colon",
+                "superseded-colon-zone",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO metadata(key,value) VALUES(?1,?2)",
+                rusqlite::params![key, value],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO metadata(key,value) VALUES('unrelated','kept')",
+            [],
+        )
+        .unwrap();
+    }
+    let deleted = db.purge_superseded_pending_tokens().await.unwrap();
+    assert_eq!(
+        deleted, 3,
+        "only the three superseded tokens may be removed"
+    );
+    let conn = db.acquire_lock("inspect purge guard state").unwrap();
+    let present = |key: &str| -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key=?1)",
+            [key],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert!(
+        present("pending_sync_token:v27:enum-valid:PrimarySync"),
+        "the exact ready staged token must be preserved"
+    );
+    assert!(
+        present("pending_sync_token:v27:enum-valid:SharedSync:with:colon"),
+        "a ready token for a zone containing ':' must be preserved"
+    );
+    let ready = crate::state::db::sync_epoch::read_library(&conn, "PrimarySync")
+        .unwrap()
+        .expect("ready record must be preserved");
+    assert_eq!(
+        ready
+            .binding
+            .as_ref()
+            .map(|binding| binding.token_key.as_str()),
+        Some("pending_sync_token:v27:enum-valid:PrimarySync"),
+        "the ready binding must be preserved"
+    );
+    let colon = crate::state::db::sync_epoch::read_library(&conn, "SharedSync:with:colon")
+        .unwrap()
+        .expect("ready colon record must be preserved");
+    assert_eq!(
+        colon
+            .binding
+            .as_ref()
+            .map(|binding| binding.token_key.as_str()),
+        Some("pending_sync_token:v27:enum-valid:SharedSync:with:colon"),
+        "the ready colon binding must be preserved"
+    );
+    assert!(
+        !present("pending_sync_token:v27:old-enum:PrimarySync"),
+        "a superseded token for the same zone must be removed"
+    );
+    assert!(
+        !present("pending_sync_token:v27:enum-valid:StaleZone"),
+        "a pending token without ready proof evidence must be removed"
+    );
+    assert!(
+        !present("pending_sync_token:v27:old-enum:SharedSync:with:colon"),
+        "a superseded token for a zone containing ':' must be removed"
+    );
+    assert!(present("unrelated"), "unrelated metadata must be preserved");
+}
+
 mod v027_historical;

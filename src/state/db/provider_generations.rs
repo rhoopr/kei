@@ -28,6 +28,7 @@ mod pending_path_cache;
 mod reference_refresh;
 mod retirement;
 mod root_admission_cache;
+pub(super) use root_admission_cache::guard_publication_choice;
 mod selector_binding;
 pub(super) use retirement::advance_completed_receipt;
 
@@ -3355,7 +3356,6 @@ pub(super) fn metadata_receipt(
     asset.download_checksum = Some(source.clone());
     asset.status = crate::state::AssetStatus::Downloaded;
     Ok(super::PendingMetadataRewrite {
-        activity_admission: None,
         asset,
         capture_repair_receipt: None,
         source_checksum: Some(source),

@@ -111,7 +111,20 @@ fn bind(conn: &Connection, owner: &AccountOwner) -> Result<(), StateError> {
     Ok(())
 }
 
+pub(super) struct OpenedConnection {
+    pub(super) conn: Connection,
+    pub(super) created: bool,
+}
+
+#[cfg(test)]
 pub(super) fn open(path: &Path, owner: &AccountOwner) -> Result<Connection, StateError> {
+    Ok(open_with_origin(path, owner)?.conn)
+}
+
+pub(super) fn open_with_origin(
+    path: &Path,
+    owner: &AccountOwner,
+) -> Result<OpenedConnection, StateError> {
     // Reserve the new file exclusively. A pre-existing empty/unowned file is
     // never silently claimed, including one left by an interrupted creation.
     if owner.provider.is_none()
@@ -165,7 +178,7 @@ pub(super) fn open(path: &Path, owner: &AccountOwner) -> Result<Connection, Stat
         rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
         false,
     )?;
-    Ok(conn)
+    Ok(OpenedConnection { conn, created })
 }
 
 pub(super) fn open_read_only(path: &Path) -> Result<Connection, StateError> {
@@ -279,6 +292,7 @@ fn copy_and_bind_legacy(
     if owner_row(&input)?.is_some() {
         return Err(StateError::AccountOwnerMismatch);
     }
+    schema::validate_metadata_activity_evidence(&input)?;
     let scoped: bool = input.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='scoped_db_sync_tokens')",
         [],
@@ -339,6 +353,17 @@ fn copy_and_bind_legacy(
     output.pragma_update(None, "synchronous", "FULL")?;
     bind(&output, owner)?;
     schema::migrate(&output)?;
+    // An unowned legacy source cannot carry a verified sync epoch. Drop any
+    // copied epoch state, including candidate-era per-attempt records, and
+    // establish one for the adopted owner.
+    output.execute(
+        "DELETE FROM metadata WHERE key=?1 \
+         OR key LIKE 'sync_epoch_library:v1:%' \
+         OR key LIKE 'source_revalidation_reset_pending:v1:%' \
+         OR key LIKE 'source_revalidation_reset_proof:v1:%'",
+        [super::sync_epoch::SYNC_EPOCH_KEY],
+    )?;
+    super::sync_epoch::establish_epoch(&output, super::sync_epoch::EpochOrigin::ExistingUpgrade)?;
     validate(&output, owner)?;
     let integrity: String = output.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {

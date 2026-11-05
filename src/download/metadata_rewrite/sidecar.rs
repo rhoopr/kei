@@ -140,10 +140,9 @@ pub(super) async fn write_sidecar_metadata_observed(
         }
     };
     if let Some(error) = source_error.as_ref() {
-        crate::support::metadata_error(path, "source_gps", error, Some(false));
+        crate::support::metadata_error("source_gps", error, Some(false));
     }
     crate::support::observe_metadata(
-        path,
         "support_metadata_v1",
         serde_json::json!({
             "operation":"sidecar", "source_fractional":created_local.timestamp_subsec_nanos()!=0,
@@ -170,7 +169,6 @@ pub(super) async fn write_sidecar_metadata_observed(
             #[cfg(test)]
             record_test_sidecar_success(path);
             crate::support::observe_metadata(
-                path,
                 "support_metadata_v1",
                 serde_json::json!({"operation":"sidecar","applied":true}),
             );
@@ -180,7 +178,7 @@ pub(super) async fn write_sidecar_metadata_observed(
                     failed_sidecar_attempt: None,
                 };
             };
-            crate::support::metadata_error(path, "source_gps", &error, Some(true));
+            crate::support::metadata_error("source_gps", &error, Some(true));
             tracing::warn!(
                 target: "kei::download::metadata_rewrite",
                 path = %log_path.display(),
@@ -193,7 +191,7 @@ pub(super) async fn write_sidecar_metadata_observed(
             }
         }
         Err(e) => {
-            crate::support::metadata_error(path, "sidecar_write", &e, None);
+            crate::support::metadata_error("sidecar_write", &e, None);
             tracing::warn!(
                 target: "kei::download::metadata_rewrite",
                 path = %log_path.display(), error = %format!("{e:#}"), "Failed to write XMP sidecar");

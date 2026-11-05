@@ -5,7 +5,6 @@ mod album;
 pub(crate) mod asset;
 mod changes_json;
 pub mod cloudkit;
-pub(crate) mod diagnostic;
 pub(crate) mod enc;
 pub mod error;
 mod hydration_progress;

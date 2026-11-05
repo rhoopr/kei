@@ -12,6 +12,585 @@ use serde_json::json;
 use std::sync::Arc;
 
 #[tokio::test]
+async fn publication_choice_pending_companions_are_path_local() {
+    use crate::state::error::StateError;
+    for (companion, allowed) in [
+        ("companion.JPG", true),
+        ("Photo 10 AM.JPG", false),
+        ("photo 10AM.jpg", false),
+        ("Sibling 10 AM.JPG", false),
+        ("sibling 10AM.jpg", false),
+    ] {
+        let f = publication_choice_fixture(companion, false).await;
+        let result = f
+            .fixture
+            .db
+            .reserve_bound_publication_choices(f.binding, vec![(f.reservation, f.requested)])
+            .await;
+        if allowed {
+            result.unwrap();
+        } else {
+            assert!(
+                matches!(result, Err(StateError::ProviderWorkConflict)),
+                "{companion}: {result:?}"
+            );
+        }
+        let conn = f
+            .fixture
+            .db
+            .acquire_lock("assert path-local pending branch")
+            .unwrap();
+        let counts: (i64, i64) = conn.query_row("SELECT (SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND verified_media=0),(SELECT count(*) FROM reconciliation_paths)", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(counts, (2, i64::from(allowed)), "{companion}");
+    }
+}
+
+struct PublicationChoiceFixture {
+    fixture: Fixture,
+    binding: crate::state::db::PublicationBinding,
+    reservation: crate::state::db::ReconciliationReservation,
+    requested: SelectionPath,
+    generation: String,
+    asset: crate::icloud::photos::PhotoAsset,
+    config: crate::download::DownloadConfig,
+    rows: Vec<crate::state::AssetRecord>,
+}
+
+async fn publication_choice_fixture(
+    companion: &str,
+    metadata_enabled: bool,
+) -> PublicationChoiceFixture {
+    use crate::state::VersionSizeKey;
+    use crate::state::db::{
+        DownloadStateStore, PreparedPublication, ReconciliationContent, ReconciliationPathKey,
+        ReconciliationReservation, TempFileOwnershipStore,
+    };
+    use sha2::{Digest, Sha256};
+    let f = Fixture::new().await;
+    let db = &f.db;
+    let p = f.config.directory.join("Photo 10 AM.JPG");
+    let s = f.config.directory.join("Sibling 10 AM.JPG");
+    let q = f.config.directory.join(companion);
+    let digest = Sha256::digest(b"old");
+    let checksum = data_encoding::BASE64.encode(&digest);
+    let mut values = records("m", &checksum, "current");
+    values[0]["fields"]["filenameEnc"]["value"] = json!("Photo 10 AM.JPG");
+    values[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(3);
+    values[1]["fields"]["resJPEGFullRes"] = json!({"value":{"size":4,"downloadURL":"https://p01.icloud-content.com/edit","fileChecksum":CURRENT}});
+    values[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+    values[0]["fields"]["adjustmentRenderType"] = json!({"value":1});
+    let (_, scope, zone) = f.pass.album.private_selection_scope().unwrap().unwrap();
+    let key = crate::download::orchestration::generation::pass_key(&f.pass);
+    let body = serde_json::to_vec(&json!({"records":values})).unwrap();
+    let asset = crate::icloud::photos::current_asset(&body, "asset-m", "m", &zone).unwrap();
+    let mut config = f.config.with_pass(&f.pass);
+    config.edited = true;
+    config.metadata.set_exif_datetime = metadata_enabled;
+    let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+        .await
+        .unwrap();
+    let mut plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+    assert_eq!(plan.tasks.len(), 2);
+    for task in &mut plan.tasks {
+        task.download_path = if task.version_size == VersionSizeKey::Original {
+            p.clone()
+        } else {
+            q.clone()
+        };
+    }
+    let original = &plan.tasks[0];
+    assert_eq!(original.version_size, VersionSizeKey::Original);
+    let binding = original.publication_binding.as_deref().unwrap().clone();
+    db.upsert_seen(&pending_record_for_task(&config, &asset, original))
+        .await
+        .unwrap();
+    let part = f.config.directory.join("source.part");
+    std::fs::write(&part, b"old").unwrap();
+    let sha = data_encoding::HEXLOWER.encode(&digest);
+    db.claim_temp_file(&part).await.unwrap();
+    db.prepare_temp_publication(
+        &part,
+        &PreparedPublication {
+            binding: Some(binding.clone()),
+            library: "PrimarySync".into(),
+            id: "asset-m".into(),
+            version: "original".into(),
+            provider_checksum: original.checksum.to_string(),
+            provider_size: 3,
+            temporary: SelectionPath::from_path(&part),
+            destination: SelectionPath::from_path(&p),
+            local_checksum: sha.clone(),
+            source_checksum: sha.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    std::fs::rename(&part, &p).unwrap();
+    db.mark_verified_download(
+        "PrimarySync",
+        "asset-m",
+        "original",
+        &p,
+        &sha,
+        Some(&sha),
+        false,
+    )
+    .await
+    .unwrap();
+    let root = db.begin_selection_generation(owner(), GenerationSpec {
+            format: 2, scope, zone, config_hash: "a".repeat(64), basis: "b".repeat(64),
+            profile: json!({"coverage":"selected_downloads","passes":[{"key":key,"scope":f.pass.album.selection_scope()}]}),
+            metadata_enabled, metadata_flags: crate::download::pipeline::MetadataFlags::from(&config).bits(),
+        }, MAX_GENERATION_BYTES).await.unwrap();
+    let rows: Vec<_> = plan
+        .tasks
+        .iter()
+        .map(|t| pending_record_for_task(&config, &asset, t))
+        .collect();
+    let destinations = plan
+        .tasks
+        .iter()
+        .zip(&rows)
+        .map(|(t, r)| SelectionDestination {
+            version_size: t.version_size.as_str().into(),
+            path: SelectionPath::from_path(&t.download_path),
+            checksum: t.checksum.to_string(),
+            size: t.size,
+            metadata_hash: r.metadata.metadata_hash.clone().unwrap(),
+        })
+        .collect();
+    let decision = ActiveDecision {
+        state_id: "asset-m".into(),
+        sources: Vec::new(),
+        decision: SelectionDecision {
+            pass_key: key,
+            child: "asset-m".into(),
+            master: Some("m".into()),
+            confirmation: Some(body),
+            outcome: SelectionOutcome::Selected,
+            reason: String::new(),
+            destinations,
+        },
+    };
+    assert!(
+        db.project_selection_decision(
+            owner(),
+            root.id.clone(),
+            decision,
+            rows.clone(),
+            MAX_GENERATION_BYTES
+        )
+        .await
+        .unwrap()
+        .admitted
+    );
+    let reservation = ReconciliationReservation {
+        library: "PrimarySync".into(),
+        asset_id: "asset-m".into(),
+        version_size: VersionSizeKey::Original,
+        requested_path_key: ReconciliationPathKey(crate::fs_util::confined_path_key(&p).unwrap()),
+        destination_path_key: ReconciliationPathKey(crate::fs_util::confined_path_key(&s).unwrap()),
+        destination_path: s,
+        content: Some(ReconciliationContent {
+            checksum: super::OLD.into(),
+            size: 5,
+        }),
+    };
+    PublicationChoiceFixture {
+        fixture: f,
+        binding,
+        reservation,
+        requested: SelectionPath::from_path(&p),
+        generation: root.id,
+        asset,
+        config,
+        rows,
+    }
+}
+
+#[tokio::test]
+async fn publication_choice_exact_replay_is_intent_not_historical_byte_proof() {
+    use crate::download::baseline_matching::BaselineMatch;
+    use crate::state::VersionSizeKey;
+    use crate::state::db::{
+        DownloadStateStore, PreparedPublication, ReconciliationContent, TempFileOwnershipStore,
+    };
+    use sha2::{Digest, Sha256};
+    let mut f = publication_choice_fixture("Sibling 10 AM.JPG", false).await;
+    let mut db = f.fixture.db.clone();
+    let p = f.requested.to_path();
+    let s = f.reservation.destination_path.clone();
+    f.reservation.version_size = VersionSizeKey::Adjusted;
+    f.reservation.content = Some(ReconciliationContent {
+        checksum: CURRENT.into(),
+        size: 4,
+    });
+    db.reserve_bound_publication_choices(
+        f.binding.clone(),
+        vec![(f.reservation.clone(), f.requested.clone())],
+    )
+    .await
+    .unwrap();
+    let part = s.with_extension("part");
+    std::fs::write(&part, b"edit").unwrap();
+    let sha = data_encoding::HEXLOWER.encode(&Sha256::digest(b"edit"));
+    db.claim_temp_file(&part).await.unwrap();
+    db.prepare_temp_publication(
+        &part,
+        &PreparedPublication {
+            binding: Some(f.binding.clone()),
+            library: "PrimarySync".into(),
+            id: "asset-m".into(),
+            version: "adjusted".into(),
+            provider_checksum: CURRENT.into(),
+            provider_size: 4,
+            temporary: SelectionPath::from_path(&part),
+            destination: SelectionPath::from_path(&s),
+            local_checksum: sha.clone(),
+            source_checksum: sha.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    std::fs::rename(&part, &s).unwrap();
+    db.mark_verified_download(
+        "PrimarySync",
+        "asset-m",
+        "adjusted",
+        &s,
+        &sha,
+        Some(&sha),
+        false,
+    )
+    .await
+    .unwrap();
+    std::fs::write(&p, b"changed original after S completion").unwrap();
+    assert!(
+        db.bound_historical_downloads(f.binding.clone(), "adjusted".into(), CURRENT.into(), 4)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let original: String = db.acquire_lock("exact persisted choice snapshot").unwrap()
+        .query_row("SELECT json_array(library,id,version_size,requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size) FROM reconciliation_paths", [], |r| r.get(0)).unwrap();
+    db.acquire_lock("reject replay writes").unwrap().execute_batch("CREATE TRIGGER no_replay_insert BEFORE INSERT ON reconciliation_paths BEGIN SELECT RAISE(ABORT,'replay rewrote intent'); END; CREATE TRIGGER no_replay_update BEFORE UPDATE ON reconciliation_paths BEGIN SELECT RAISE(ABORT,'replay rewrote intent'); END;").unwrap();
+    let mut config = f.config.clone();
+    config.resolution = crate::types::PhotoResolution::None;
+    config.edited_naming = crate::types::EditedNaming::Primary;
+    config.folder_structure = "none".into();
+    for round in 0..3 {
+        if round == 2 {
+            db = Arc::new(
+                SqliteStateDb::open_owned(&f.fixture.dir.path().join("state.db"), &owner())
+                    .await
+                    .unwrap(),
+            );
+            config.state_db = Some(db.clone());
+            let mut album = config.primary_layout_source.as_deref().unwrap().clone();
+            album.set_shadow_capture(
+                crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner(), "com"),
+                "private".into(),
+            );
+            config.primary_layout_source = Some(Arc::new(album));
+        }
+        let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+            .await
+            .unwrap();
+        let plan = planner
+            .plan_download_asset(&f.asset, &config)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].download_path, s);
+        assert!(plan.tasks[0].superseded_requested_path.is_none());
+        assert!(
+            planner
+                .persist_execution_publication_choices(&f.asset, &config, &plan.tasks)
+                .await
+                .unwrap()
+        );
+        assert!(
+            matches!(planner.match_existing(&f.asset, &config, &plan.tasks[0]).await,
+            BaselineMatch::RecordedPresent { receipt, .. } if receipt.native_path.to_path() == s)
+        );
+        let manifest = db
+            .selection_decision(
+                owner(),
+                f.generation.clone(),
+                f.binding.origin_pass.clone(),
+                "asset-m".into(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            db.project_selection_decision(
+                owner(),
+                f.generation.clone(),
+                manifest,
+                f.rows.clone(),
+                MAX_GENERATION_BYTES
+            )
+            .await
+            .unwrap()
+            .admitted
+        );
+        assert_eq!(db.acquire_lock("unchanged replay row").unwrap().query_row("SELECT json_array(library,id,version_size,requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size) FROM reconciliation_paths", [], |r| r.get::<_,String>(0)).unwrap(), original);
+    }
+    db.acquire_lock("allow synthetic negative mutations")
+        .unwrap()
+        .execute_batch("DROP TRIGGER no_replay_insert; DROP TRIGGER no_replay_update")
+        .unwrap();
+    for case in [
+        "binding",
+        "pass",
+        "source",
+        "resource",
+        "requested",
+        "destination",
+        "missing",
+        "conflict",
+        "incomplete",
+        "malformed",
+        "read_error",
+    ] {
+        let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+            .await
+            .unwrap();
+        let mut plan = planner
+            .plan_download_asset(&f.asset, &config)
+            .await
+            .unwrap();
+        let mut current = config.clone();
+        db.acquire_lock("begin replay negative")
+            .unwrap()
+            .execute_batch("SAVEPOINT replay_negative")
+            .unwrap();
+        match case {
+            "binding" => {
+                Arc::make_mut(plan.tasks[0].publication_binding.as_mut().unwrap()).account_key =
+                    "foreign".into()
+            }
+            "pass" => current.primary_layout_pass = Some("wrong-pass".into()),
+            "source" => current.state_db = None,
+            "resource" => plan.tasks[0].checksum = "different-resource".into(),
+            "requested" => current.folder_structure = "different-request".into(),
+            "destination" => plan.tasks[0].download_path = s.with_file_name("different-final.JPG"),
+            "missing" => {
+                db.acquire_lock("missing persisted row")
+                    .unwrap()
+                    .execute("DELETE FROM reconciliation_paths", [])
+                    .unwrap();
+            }
+            "conflict" => {
+                db.acquire_lock("conflicting saved S").unwrap().execute("UPDATE reconciliation_paths SET destination_path_key='other',destination_path='other'", []).unwrap();
+            }
+            "incomplete" => {
+                db.acquire_lock("incomplete saved content")
+                    .unwrap()
+                    .execute(
+                        "UPDATE reconciliation_paths SET provider_checksum='',provider_size=-1",
+                        [],
+                    )
+                    .unwrap();
+            }
+            "malformed" => {
+                db.acquire_lock("inconsistent native S")
+                    .unwrap()
+                    .execute(
+                        "UPDATE reconciliation_paths SET destination_path='other'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            "read_error" => {
+                db.acquire_lock("missing choice table")
+                    .unwrap()
+                    .execute_batch(
+                        "ALTER TABLE reconciliation_paths RENAME TO hidden_reconciliation_paths",
+                    )
+                    .unwrap();
+            }
+            _ => panic!("unexpected replay case {case}"),
+        }
+        let result = planner
+            .persist_execution_publication_choices(&f.asset, &current, &plan.tasks)
+            .await;
+        assert!(!result.unwrap_or(false), "{case} received replay exemption");
+        db.acquire_lock("restore replay negative")
+            .unwrap()
+            .execute_batch("ROLLBACK TO replay_negative; RELEASE replay_negative")
+            .unwrap();
+    }
+    // Storage intent cannot certify S bytes either.
+    std::fs::write(&s, b"changed current S").unwrap();
+    let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+        .await
+        .unwrap();
+    let plan = planner
+        .plan_download_asset(&f.asset, &config)
+        .await
+        .unwrap();
+    assert!(
+        planner
+            .persist_execution_publication_choices(&f.asset, &config, &plan.tasks)
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        planner
+            .match_existing(&f.asset, &config, &plan.tasks[0])
+            .await,
+        BaselineMatch::Uncertain(_)
+    ));
+}
+
+#[tokio::test]
+async fn publication_choice_media_complete_metadata_owners_are_path_local() {
+    use crate::state::db::{DownloadStateStore, ReconciliationContent};
+    use crate::state::{VersionSizeKey, error::StateError};
+    use sha2::{Digest, Sha256};
+    #[derive(Clone, Copy, Debug)]
+    enum Protection {
+        None,
+        Frozen,
+        Prepared,
+        SourceOnly,
+    }
+    for (protection, disjoint) in [
+        (Protection::None, false),
+        (Protection::Frozen, false),
+        (Protection::Prepared, false),
+        (Protection::Frozen, true),
+        (Protection::Prepared, true),
+        (Protection::SourceOnly, false),
+    ] {
+        let companion = match (protection, disjoint) {
+            (_, true) => "companion.JPG",
+            (Protection::Frozen, false) => "sibling 10AM.jpg",
+            _ => "Sibling 10 AM.JPG",
+        };
+        let metadata = !matches!(protection, Protection::None);
+        let mut f = publication_choice_fixture(companion, metadata).await;
+        let db = &f.fixture.db;
+        let p = f.requested.to_path();
+        let source = data_encoding::HEXLOWER.encode(&Sha256::digest(b"old"));
+        db.mark_verified_download(
+            "PrimarySync",
+            "asset-m",
+            "original",
+            &p,
+            &source,
+            Some(&source),
+            false,
+        )
+        .await
+        .unwrap();
+        let q = f.fixture.config.directory.join(companion);
+        if !matches!(protection, Protection::SourceOnly) {
+            std::fs::write(&q, b"edit").unwrap();
+            let sha = data_encoding::HEXLOWER.encode(&Sha256::digest(b"edit"));
+            db.mark_verified_download(
+                "PrimarySync",
+                "asset-m",
+                "adjusted",
+                &q,
+                &sha,
+                Some(&sha),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        if matches!(protection, Protection::Prepared) {
+            let pending = db
+                .pending_selection_metadata(owner(), f.generation.clone(), 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|p| p.asset.version_size == VersionSizeKey::Adjusted)
+                .unwrap();
+            let output = data_encoding::HEXLOWER.encode(&Sha256::digest(b"prepared metadata"));
+            assert!(
+                db.record_selection_metadata_prepared(&pending, &output, 17)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        {
+            let mut conn = db
+                .acquire_lock("assert real metadata owner and media-only readers")
+                .unwrap();
+            let tx = conn.transaction().unwrap();
+            let bits: (bool,bool,bool,bool) = tx.query_row("SELECT verified_media,verified_metadata,frozen_metadata IS NOT NULL,prepared_hash IS NOT NULL FROM provider_active_destinations WHERE generation=?1 AND version_size='adjusted'", [&f.generation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            let complete = !matches!(protection, Protection::SourceOnly);
+            assert_eq!(
+                bits,
+                (
+                    complete,
+                    false,
+                    complete && metadata,
+                    matches!(protection, Protection::Prepared)
+                ),
+                "{protection:?} disjoint={disjoint}"
+            );
+            if complete {
+                assert!(
+                    crate::state::db::provider_generations::root_test_pending_path(&tx, &q)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    crate::state::db::provider_generations::root_test_pending_resource(
+                        &tx,
+                        "PrimarySync",
+                        "asset-m",
+                        "adjusted"
+                    )
+                    .unwrap()
+                    .is_empty()
+                );
+                crate::state::db::provider_generations::root_test_guard_pending_resource(
+                    &tx,
+                    "PrimarySync",
+                    "asset-m",
+                    "adjusted",
+                    &f.reservation.destination_path,
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        f.reservation.version_size = VersionSizeKey::Adjusted;
+        f.reservation.content = Some(ReconciliationContent {
+            checksum: CURRENT.into(),
+            size: 4,
+        });
+        let result = db
+            .reserve_bound_publication_choices(f.binding, vec![(f.reservation, f.requested)])
+            .await;
+        let allowed = disjoint || matches!(protection, Protection::None | Protection::SourceOnly);
+        if allowed {
+            result.unwrap();
+        } else {
+            assert!(
+                matches!(result, Err(StateError::ProviderWorkConflict)),
+                "{protection:?}: {result:?}"
+            );
+        }
+        assert_eq!(
+            db.acquire_lock("assert metadata refusal is not publication")
+                .unwrap()
+                .query_row("SELECT count(*) FROM reconciliation_paths", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            i64::from(allowed)
+        );
+    }
+}
+
+#[tokio::test]
 async fn v027_format_two_admits_scoped_outcomes_without_shadow_catalog_or_rank() {
     let f = Fixture::new().await;
     let tables: Vec<String> = f.db.acquire_lock("find historical owners to forbid").unwrap()

@@ -27,9 +27,9 @@ pub(crate) use reconcile::run_reconcile;
 pub(crate) use reset::{run_reset_session, run_reset_state, run_reset_sync_token};
 pub(crate) use service::{
     AlbumPass, AlbumPlan, CollectionContext, MAX_REAUTH_ATTEMPTS, PassKind, PassScope,
-    attempt_reauth, build_collection_context, build_photos_params, collection_libraries,
-    init_photos_service, pass_scope_for_zone, resolve_cross_zone_libraries_for_album_hydration,
-    resolve_libraries, resolve_passes_for_scope, wait_and_retry_2fa, zone_name_set,
+    attempt_reauth, build_collection_context, collection_libraries, init_photos_service,
+    pass_scope_for_zone, resolve_cross_zone_libraries_for_album_hydration, resolve_libraries,
+    resolve_passes_for_scope, wait_and_retry_2fa, zone_name_set,
 };
 #[cfg(test)]
 pub(crate) use status::backup_status_line;

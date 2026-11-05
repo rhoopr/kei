@@ -2,12 +2,13 @@
 
 use rusqlite::Connection;
 
+use super::db::provider_inbox::CompactionSummary;
 use super::error::StateError;
 
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 42;
+pub(crate) const SCHEMA_VERSION: i32 = 43;
 
 fn migrate_active_selection(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(r"CREATE TABLE IF NOT EXISTS provider_active_generations (
@@ -262,9 +263,7 @@ CREATE TABLE IF NOT EXISTS provider_shadow_receipts (
 /// `provider_shadow_pages.body_hash` remains the historical observation hash.
 /// For a legacy alias it is the original transport hash of bytes removed by
 /// this migration, never a digest of the representative body.
-fn migrate_provider_transport_index(
-    conn: &Connection,
-) -> Result<crate::support::CompactionSummary, StateError> {
+fn migrate_provider_transport_index(conn: &Connection) -> Result<CompactionSummary, StateError> {
     conn.execute_batch(
         r"
 CREATE TABLE IF NOT EXISTS provider_transport_canonical (
@@ -658,12 +657,29 @@ fn set_schema_version(conn: &Connection, version: i32) -> Result<(), StateError>
     Ok(())
 }
 
+/// Require the durable sync epoch for the current application schema.
+pub(crate) fn validate_sync_epoch(conn: &Connection) -> Result<(), StateError> {
+    if get_schema_version(conn)? >= 43 {
+        super::db::sync_epoch::validate(conn)?;
+    }
+    Ok(())
+}
+
 /// Initialize or migrate the database schema.
 ///
 /// This function is idempotent and safe to call on both new and existing databases.
 /// Each migration step is wrapped in a SAVEPOINT so that a failure rolls back
 /// only the current step, leaving the database at the last successfully applied version.
 pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
+    // Generic/test migration entry. Production owned opens pass the real
+    // creation origin through `migrate_with_origin`.
+    migrate_with_origin(conn, super::db::sync_epoch::EpochOrigin::FreshInstall)
+}
+
+pub(crate) fn migrate_with_origin(
+    conn: &Connection,
+    origin: super::db::sync_epoch::EpochOrigin,
+) -> Result<(), StateError> {
     let current_version = get_schema_version(conn)?;
 
     if current_version > SCHEMA_VERSION {
@@ -679,43 +695,19 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), StateError> {
             continue;
         }
         conn.execute_batch("SAVEPOINT migration")?;
-        let summary = match migrate_to_version(conn, current_version, version) {
-            Ok(summary) => summary,
-            Err(error) => {
-                let rolled_back = match conn.execute_batch("ROLLBACK TO migration") {
-                    Ok(()) => true,
-                    Err(rollback_err) => {
-                        tracing::error!(
-                            version,
-                            migration_error = %error,
-                            rollback_error = %rollback_err,
-                            "Migration rollback failed — database may be inconsistent"
-                        );
-                        false
-                    }
-                };
-                if version == 36 {
-                    crate::support::record_transport_compaction_failure(if rolled_back {
-                        crate::support::MigrationFailure::MigrationFailed
-                    } else {
-                        crate::support::MigrationFailure::RollbackFailed
-                    });
-                }
-                return Err(error);
-            }
-        };
-        if let Err(error) = conn.execute_batch("RELEASE migration") {
-            if version == 36 {
-                crate::support::record_transport_compaction_failure(
-                    crate::support::MigrationFailure::MigrationFailed,
+        if let Err(error) = migrate_to_version_with_origin(conn, current_version, version, origin) {
+            if let Err(rollback_err) = conn.execute_batch("ROLLBACK TO migration") {
+                tracing::error!(
+                    version,
+                    migration_error = %error,
+                    rollback_error = %rollback_err,
+                    "Migration rollback failed — database may be inconsistent"
                 );
             }
-            return Err(error.into());
+            return Err(error);
         }
-        if version == 36
-            && let Some(summary) = summary
-        {
-            crate::support::record_transport_compaction(summary);
+        if let Err(error) = conn.execute_batch("RELEASE migration") {
+            return Err(error.into());
         }
     }
 
@@ -1244,7 +1236,21 @@ pub(crate) fn migrate_to_version(
     conn: &Connection,
     start_version: i32,
     version: i32,
-) -> Result<Option<crate::support::CompactionSummary>, StateError> {
+) -> Result<Option<CompactionSummary>, StateError> {
+    migrate_to_version_with_origin(
+        conn,
+        start_version,
+        version,
+        super::db::sync_epoch::EpochOrigin::ExistingUpgrade,
+    )
+}
+
+fn migrate_to_version_with_origin(
+    conn: &Connection,
+    start_version: i32,
+    version: i32,
+    origin: super::db::sync_epoch::EpochOrigin,
+) -> Result<Option<CompactionSummary>, StateError> {
     let mut summary = None;
     match version {
         1 => conn.execute_batch(SCHEMA_V1)?,
@@ -1487,7 +1493,8 @@ pub(crate) fn migrate_to_version(
             }
         }
         40 => conn.execute_batch(super::db::source_revalidation::DDL)?,
-        42 => conn.execute_batch(super::db::metadata_activity::DDL)?,
+        43 => super::db::sync_epoch::establish_epoch(conn, origin)?,
+        42 => {}
         41 => {
             if !column_exists(conn, "download_receipts", "trust_receipt")? {
                 conn.execute_batch(super::db::download_receipts::LOCAL_TRUST_MIGRATION)?;
@@ -1525,6 +1532,38 @@ pub(crate) fn migrate_genuine_v28(conn: &Connection) -> Result<(), StateError> {
 pub(crate) fn migrate_genuine_v36(conn: &Connection) -> Result<(), StateError> {
     for version in 1..=36 {
         migrate_to_version(conn, 36, version)?;
+    }
+    Ok(())
+}
+
+/// Retired development tables may exist in unqualified databases. Refuse any
+/// retained rows before this build migrates or writes, without importing,
+/// deleting, or reinterpreting that evidence.
+pub(crate) fn validate_metadata_activity_evidence(conn: &Connection) -> Result<(), StateError> {
+    for table in [
+        "metadata_activity_prerequisite",
+        "metadata_activity_prepared_prerequisite",
+    ] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(StateError::Migration)?;
+        if !exists {
+            continue;
+        }
+        let populated: bool = conn
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StateError::Migration)?;
+        if populated {
+            return Err(StateError::UnsupportedMetadataActivityEvidence);
+        }
     }
     Ok(())
 }
@@ -1758,9 +1797,12 @@ mod tests {
             INSERT INTO metadata_capture_retries VALUES ('PrimarySync','legacy',1,'[1,2,3]',8,4,10,20);
             INSERT INTO asset_master_mappings VALUES ('PrimarySync','child-a','legacy',1),('PrimarySync','child-b','legacy',2);").unwrap();
         fn rows(conn: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
-            let mut stmt = conn
-                .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
-                .unwrap();
+            let query = if table == "metadata" {
+                "SELECT * FROM metadata WHERE key <> 'sync_epoch:v1' ORDER BY 1,2".to_owned()
+            } else {
+                format!("SELECT * FROM {table} ORDER BY 1,2")
+            };
+            let mut stmt = conn.prepare(&query).unwrap();
             let columns = stmt.column_count();
             stmt.query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
                 .unwrap()
@@ -2058,67 +2100,6 @@ mod tests {
     }
 
     #[test]
-    fn v42_activity_migration_rolls_back_then_reopens_without_losing_checkpoint() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("schema.db");
-        let conn = Connection::open(&path).unwrap();
-        while get_schema_version(&conn).unwrap() < 41 {
-            let current = get_schema_version(&conn).unwrap();
-            migrate_to_version(&conn, current, current + 1).unwrap();
-        }
-        conn.execute(
-            "INSERT INTO metadata(key,value) VALUES('sync_token:PrimarySync','retained')",
-            [],
-        )
-        .unwrap();
-        conn.execute_batch(
-            "CREATE VIEW metadata_activity_prepared_prerequisite AS SELECT 1 AS marker;",
-        )
-        .unwrap();
-        assert!(migrate(&conn).is_err());
-        assert_eq!(get_schema_version(&conn).unwrap(), 41);
-        let first_exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='metadata_activity_prerequisite')",[],|row|row.get(0)).unwrap();
-        assert!(!first_exists);
-        let checkpoint: String = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(checkpoint, "retained");
-        drop(conn);
-        let conn = Connection::open(&path).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 41);
-        let checkpoint: String = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(checkpoint, "retained");
-        conn.execute_batch("DROP VIEW metadata_activity_prepared_prerequisite;")
-            .unwrap();
-        migrate(&conn).unwrap();
-        migrate(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 42);
-        let count:i64=conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('metadata_activity_prerequisite','metadata_activity_prepared_prerequisite')",[],|row|row.get(0)).unwrap();
-        assert_eq!(count, 2);
-        drop(conn);
-        let conn = Connection::open(&path).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 42);
-        let checkpoint: String = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(checkpoint, "retained");
-    }
-
-    #[test]
     fn test_fresh_db_migration() {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
@@ -2230,11 +2211,19 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
 
-        // Verify metadata table exists
+        // The durable sync epoch is the only metadata row on a fresh schema.
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(count, 1);
+        let epoch: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='sync_epoch:v1')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(epoch);
     }
 
     #[test]
@@ -2249,11 +2238,11 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
 
-        // Metadata table should exist
+        // Metadata table should exist and contain the durable sync epoch.
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -2311,11 +2300,11 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), SCHEMA_VERSION);
 
-        // All migration artifacts should be present
+        // All migration artifacts should be present, including the epoch.
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(count, 1);
 
         let has_column: bool = conn
             .prepare("SELECT local_checksum FROM assets LIMIT 0")

@@ -27,8 +27,6 @@ PHASE_ORDER = {
     "live_import_dryrun": 78,
     "live_import_rehearsal": 79,
     "live_cross_zone_album": 80,
-    "service": 90,
-    "host_service": 91,
     # Legacy phase names from earlier full-test layouts.
     "gate": 10,
     "nodefault": 15,
@@ -45,8 +43,6 @@ PHASE_ORDER = {
     "docker_help": 34,
     "docker_default_cmd": 35,
     "test_live": 60,
-    "service_smoke": 90,
-    "real_service_lifecycle": 91,
 }
 
 

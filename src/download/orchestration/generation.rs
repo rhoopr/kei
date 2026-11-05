@@ -1093,6 +1093,7 @@ impl SelectionRun {
             replacement_fingerprint: None,
             publication_binding: None,
             pending_cross_parent_root: None,
+            superseded_requested_path: None,
             checksum: derived.checksum,
             asset_id: decision.state_id.clone().into(),
             asset_record_name: asset.asset_record_name_arc(),
@@ -1584,9 +1585,6 @@ impl SelectionRun {
             })
         {
             for task in &mut plan.tasks {
-                if planner.managed_layout_session().is_some() {
-                    continue;
-                }
                 let matched = planner.match_existing(asset, config, task).await;
                 if let crate::download::baseline_matching::BaselineMatch::RecordedPresent {
                     receipt,
@@ -1598,6 +1596,7 @@ impl SelectionRun {
                         && planner.retry_path_allowed(
                             &task.library,
                             &task.asset_id,
+                            task.asset_record_name.as_ref(),
                             task.version_size,
                             &task.checksum,
                             task.size,
@@ -1701,6 +1700,7 @@ impl SelectionRun {
                         && planner.retry_path_allowed(
                             &task.library,
                             &task.asset_id,
+                            task.asset_record_name.as_ref(),
                             task.version_size,
                             &task.checksum,
                             task.size,
@@ -1869,13 +1869,6 @@ impl SelectionRun {
                         .context("Redirected selection lost its rendition")?
                         .download_path
                         .clone()
-                } else if planner.managed_layout_session().is_some() {
-                    plan.tasks
-                        .iter()
-                        .find(|task| task.version_size == derived.version_size)
-                        .context("Managed layout lost its pinned rendition path")?
-                        .download_path
-                        .clone()
                 } else if let Some(previous) = &previous
                     && !previous.is_deferred_observation()
                     && (previous.decision.confirmation.is_some()
@@ -1975,6 +1968,49 @@ impl SelectionRun {
                 destinations,
             },
         };
+        let final_tasks: Vec<_> = plan
+            .tasks
+            .iter()
+            .filter_map(|task| {
+                manifest
+                    .decision
+                    .destinations
+                    .iter()
+                    .find(|d| {
+                        d.version_size == task.version_size.as_str()
+                            && d.checksum == task.checksum.as_ref()
+                            && d.size == task.size
+                    })
+                    .map(|d| {
+                        let mut task = task.clone();
+                        task.download_path = d.path.to_path();
+                        task
+                    })
+            })
+            .collect();
+        if let Some(run) = &config.selection_run {
+            anyhow::ensure!(
+                run.for_asset(asset)?.root.id == self.root.id,
+                "Choice belongs to a different selection root"
+            );
+        }
+        let bookmarked = if manifest.decision.outcome == SelectionOutcome::Selected {
+            anyhow::ensure!(
+                !cancel.is_cancelled(),
+                "Selection cancelled before storage choice"
+            );
+            planner
+                .persist_execution_publication_choices(asset, config, &final_tasks)
+                .await?
+        } else {
+            false
+        };
+        if bookmarked {
+            anyhow::ensure!(
+                !cancel.is_cancelled(),
+                "Selection cancelled after storage choice"
+            );
+        }
         let freshly_confirmed = fresh.is_some();
         let fresh_for_trust = fresh.clone();
         let mut projection = self
@@ -2088,7 +2124,7 @@ impl SelectionRun {
         }
         if !projection.admitted && manifest.decision.outcome != SelectionOutcome::Excluded {
             tracing::debug!(reason = %projection.reason, "Selection destination admission deferred");
-            if self.root.spec.format == 1 {
+            if self.root.spec.format == 1 || bookmarked {
                 self.held.store(true, Ordering::Relaxed);
             }
             tracing::warn!(reason = %projection.reason, "Selected work remains in the download ledger for retry");
@@ -2599,6 +2635,7 @@ async fn metadata_tail(
         config.temp_suffix.clone(),
         cancel,
         None,
+        None,
         (offset, remaining, &mut attempts),
     )
     .await;
@@ -2610,6 +2647,7 @@ async fn metadata_tail(
             crate::download::metadata_rewrite::CaptureTimestampRepair::Preserve,
             config.temp_suffix.clone(),
             cancel,
+            None,
             None,
             (0, remaining, &mut attempts),
         )

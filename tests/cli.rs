@@ -81,8 +81,6 @@ fn subcommand_help_links_to_relevant_documentation() {
         ("import-existing", "Import-Existing"),
         ("verify", "Verify"),
         ("reconcile", "Reconcile"),
-        ("install", "Install"),
-        ("uninstall", "Service"),
         ("service", "Service"),
     ] {
         common::cmd()
@@ -192,7 +190,8 @@ fn doctor_help_succeeds() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--json"))
-        .stdout(predicate::str::contains("--live"));
+        .stdout(predicate::str::contains("--live"))
+        .stdout(predicate::str::contains("--missing-reference-inventory").not());
 }
 
 #[test]
@@ -1586,88 +1585,20 @@ fn support_export_help_explains_offline_review_and_partial_evidence() {
 }
 
 #[test]
-fn missing_reference_inventory_requires_explicit_live_json_opt_in() {
+fn missing_reference_inventory_flag_is_removed() {
     for args in [
         vec!["doctor", "--missing-reference-inventory"],
-        vec!["doctor", "--live", "--missing-reference-inventory"],
-    ] {
-        common::cmd()
-            .args(args)
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains("required"));
-    }
-    common::cmd()
-        .args(["doctor", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--missing-reference-inventory"));
-}
-
-#[test]
-fn missing_reference_inventory_actual_cli_bypasses_sync_doctor_and_credentials() {
-    let dir = tempfile::tempdir().unwrap();
-    let media = dir.path().join("media");
-    std::fs::create_dir(&media).unwrap();
-    let original = media.join("retained.jpg");
-    std::fs::write(&original, b"unchanged-media").unwrap();
-    let state = dir.path().join("retained.db");
-    std::fs::write(&state, b"old-schema-checkpoint-canary").unwrap();
-    let config = dir.path().join("config.toml");
-    let credential_canary = dir.path().join("credential-command-ran");
-    std::fs::write(&config,format!("data_dir = {:?}\n[auth]\nusername = 'synthetic-command@example.invalid'\npassword_command = {:?}\n[download]\ndirectory = {:?}\nthreads = 0\n", dir.path().to_str().unwrap(), format!("touch {}",credential_canary.display()), media.to_str().unwrap())).unwrap();
-    let before_media = std::fs::metadata(&original).unwrap();
-    let before_state = std::fs::metadata(&state).unwrap();
-    let before_names: Vec<_> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
-    let output = common::cmd()
-        .env_remove("ICLOUD_USERNAME")
-        .env_remove("ICLOUD_PASSWORD")
-        .env("KEI_DATA_DIR", dir.path())
-        .env("KEI_REQUEST_DUMP_DIR", dir.path().join("dumps"))
-        .args([
-            "--config",
-            config.to_str().unwrap(),
+        vec![
             "doctor",
             "--live",
             "--json",
             "--missing-reference-inventory",
-        ])
-        .timeout(std::time::Duration::from_secs(10))
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["scan"], "incomplete");
-    assert_eq!(report["reason"], "cached_input_unavailable");
-    let output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!output.contains("example.invalid"));
-    assert!(!output.contains(&dir.path().display().to_string()));
-    assert_eq!(std::fs::read(&original).unwrap(), b"unchanged-media");
-    assert_eq!(
-        std::fs::read(&state).unwrap(),
-        b"old-schema-checkpoint-canary"
-    );
-    assert_eq!(
-        std::fs::metadata(&original).unwrap().modified().unwrap(),
-        before_media.modified().unwrap()
-    );
-    assert_eq!(
-        std::fs::metadata(&state).unwrap().modified().unwrap(),
-        before_state.modified().unwrap()
-    );
-    assert!(!credential_canary.exists());
-    assert_eq!(std::fs::read_dir(&media).unwrap().count(), 1);
-    let after_names: Vec<_> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
-    assert_eq!(before_names, after_names);
+        ],
+    ] {
+        common::cmd()
+            .args(args)
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("--missing-reference-inventory"));
+    }
 }

@@ -10,6 +10,177 @@ use super::super::test_support::{
 use super::retain_legacy_added_date;
 use super::{DownloadContext, count_value_map_entries, count_version_set_entries};
 
+#[tokio::test]
+async fn retained_rendition_refresh_keeps_measurements_and_quiet_drift() {
+    use crate::state::{
+        AssetMetadata, DownloadContextStateStore, DownloadStateStore, MetadataCapture,
+        RenditionMetadata, SqliteStateDb, VersionSizeKey,
+    };
+    use crate::test_helpers::TestAssetRecord;
+    use sha2::{Digest, Sha256};
+    let key = VersionSizeKey::Adjusted;
+    for case in [
+        "absent",
+        "none",
+        "known",
+        "conflict",
+        "new-generation",
+        "blank",
+        "invalid",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let file = dir.path().join("retained.jpg");
+        std::fs::write(&file, b"retained media").unwrap();
+        let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(b"retained media"));
+        let checksum = if case == "blank" { " \t" } else { "a" };
+        let old = AssetMetadata {
+            width: Some(640),
+            height: Some(480),
+            duration_secs: Some(1.25),
+            title: Some("old".into()),
+            ..Default::default()
+        };
+        let db = SqliteStateDb::open(&path).await.unwrap();
+        let record = TestAssetRecord::new("retained")
+            .version_size(key)
+            .checksum(checksum)
+            .size(b"retained media".len() as u64)
+            .metadata(old)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_verified_download(
+            "PrimarySync",
+            "retained",
+            key.as_str(),
+            &file,
+            &hash,
+            Some(&hash),
+            false,
+        )
+        .await
+        .unwrap();
+        let facts = |checksum: &str, width| RenditionMetadata {
+            checksum: Some(Arc::from(checksum)),
+            width,
+            height: None,
+            duration_secs: None,
+        };
+        let renditions = match case {
+            "none" => vec![(key, facts("a", None))],
+            "known" => vec![(key, facts("a", Some(800)))],
+            "conflict" => vec![(key, facts("a", None)), (key, facts("a", Some(800)))],
+            "new-generation" => vec![(key, facts("b", None))],
+            _ => Vec::new(),
+        };
+        let capture = MetadataCapture {
+            shared: Arc::new(AssetMetadata {
+                title: Some("new".into()),
+                ..Default::default()
+            }),
+            renditions: renditions.into(),
+        };
+        if case == "invalid" {
+            db.acquire_lock("invalid measurement")
+                .unwrap()
+                .execute_batch("UPDATE assets SET width=-1")
+                .unwrap();
+        }
+        let result = db
+            .refresh_downloaded_asset_metadata(
+                "PrimarySync",
+                "retained",
+                (&capture, record.created_at, record.added_at),
+                false,
+                false,
+                1,
+            )
+            .await;
+        if case == "invalid" {
+            assert!(result.is_err());
+            assert_eq!(
+                db.get_downloaded_page(0, 10).await.unwrap()[0]
+                    .metadata
+                    .title
+                    .as_deref(),
+                Some("old")
+            );
+            eprintln!("retention case passed: {case}");
+            continue;
+        }
+        assert_eq!(result.unwrap(), 1);
+        drop(db);
+        let db = SqliteStateDb::open(&path).await.unwrap();
+        let rows = db.get_downloaded_page(0, 10).await.unwrap();
+        let metadata = &rows[0].metadata;
+        let expected = match case {
+            "absent" | "new-generation" => (Some(640), Some(480), Some(1.25)),
+            "known" => (Some(800), None, None),
+            _ => (None, None, None),
+        };
+        assert_eq!(
+            (metadata.width, metadata.height, metadata.duration_secs),
+            expected,
+            "{case}"
+        );
+        assert_eq!(
+            metadata.duration_secs.map(f64::to_bits),
+            expected.2.map(f64::to_bits)
+        );
+        assert_eq!(metadata.title.as_deref(), Some("new"));
+        assert_eq!(metadata.metadata_hash, Some(metadata.compute_hash()));
+        let proof = db.get_baseline_receipts().await.unwrap();
+        assert_eq!(proof.len(), 1);
+        assert_eq!(proof[0].provider_checksum, checksum);
+        assert_eq!(proof[0].local_path, file);
+        assert_eq!(proof[0].local_checksum.as_deref(), Some(hash.as_str()));
+        assert_eq!(proof[0].source_checksum.as_deref(), Some(hash.as_str()));
+        assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+        assert_eq!(std::fs::read(&file).unwrap(), b"retained media");
+        let mut ctx = DownloadContext::load(&db, false).await;
+        assert_eq!(
+            ctx.has_provider_metadata_drift("PrimarySync", "retained", &capture),
+            case == "blank"
+        );
+        let mut caption = capture.clone();
+        Arc::make_mut(&mut caption.shared).title = Some("later".into());
+        assert!(ctx.has_provider_metadata_drift("PrimarySync", "retained", &caption));
+        if case == "absent" {
+            let saved = ctx.downloaded_renditions.remove("PrimarySync").unwrap();
+            assert!(ctx.has_provider_metadata_drift("PrimarySync", "retained", &capture));
+            ctx.downloaded_renditions
+                .insert("PrimarySync".into(), saved);
+        }
+        let versions = ctx.downloaded_checksums.get_mut("PrimarySync").unwrap();
+        *versions
+            .get_mut("retained")
+            .unwrap()
+            .get_mut("adjusted")
+            .unwrap() = "mismatch".into();
+        assert!(ctx.has_provider_metadata_drift("PrimarySync", "retained", &capture));
+        if case == "new-generation" {
+            let next = TestAssetRecord::new("retained")
+                .version_size(key)
+                .checksum("b")
+                .metadata(capture.resolve(key, "b"))
+                .build();
+            db.upsert_seen(&next).await.unwrap();
+            let pending = db.get_pending().await.unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].checksum.as_ref(), "b");
+            assert_eq!(
+                (
+                    pending[0].metadata.width,
+                    pending[0].metadata.height,
+                    pending[0].metadata.duration_secs
+                ),
+                (None, None, None)
+            );
+        }
+        eprintln!("retention case passed: {case}");
+    }
+}
+
 /// A tombstoned row cannot be refreshed, so no staleness check may
 /// report it as needing one.
 #[test]

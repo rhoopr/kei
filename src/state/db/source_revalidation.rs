@@ -1,7 +1,7 @@
 //! Additive, baseline-bound source verification debt. It never owns media.
 use super::{SqliteStateDb, account};
 use crate::state::error::StateError;
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 pub(crate) const DDL: &str = r"
 CREATE TABLE IF NOT EXISTS source_revalidation_rounds (
@@ -16,6 +16,21 @@ CREATE TABLE IF NOT EXISTS source_revalidation_debt (
 );
 CREATE INDEX IF NOT EXISTS source_revalidation_due ON source_revalidation_debt(next_retry_at,round,id);
 ";
+
+/// Quarantine every historical source-revalidation round while retaining its
+/// debt rows. This runs once at epoch creation, before any baseline guard.
+/// Media, receipts, paths and all non-revalidation state are untouched.
+pub(crate) fn quarantine_all_rounds(conn: &Connection) -> Result<(u64, i64), StateError> {
+    let rounds = conn.execute(
+        "UPDATE source_revalidation_rounds SET phase='abandoned' WHERE phase <> 'abandoned'",
+        [],
+    )? as u64;
+    let debts: i64 =
+        conn.query_row("SELECT COUNT(*) FROM source_revalidation_debt", [], |row| {
+            row.get(0)
+        })?;
+    Ok((rounds, debts))
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct SourceCandidate {

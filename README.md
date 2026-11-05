@@ -113,7 +113,54 @@ For a daily unattended run, add this table to your existing config:
 interval = 86400
 ```
 
-`kei service run` keeps running in your terminal; `kei install` sets up a background service on your computer. Follow [Service mode](https://github.com/rhoopr/kei/wiki/Service) and [Authentication](https://github.com/rhoopr/kei/wiki/Authentication) for startup, saved login details and what to do when Apple asks you to sign in again. Docker users should finish the [container guide](docs/docker-first-backup.md#run-unattended).
+`kei service run` keeps running in your terminal. kei does not register itself as a system service; use systemd, launchd, Windows SCM, or Docker to start it at boot. Follow [Service mode](https://github.com/rhoopr/kei/wiki/Service) and [Authentication](https://github.com/rhoopr/kei/wiki/Authentication) for startup, saved login details and what to do when Apple asks you to sign in again. Docker users should finish the [container guide](docs/docker-first-backup.md#run-unattended).
+
+A minimal systemd user unit looks like this. Set `notify_systemd = true` under `[watch]` when using `Type=notify`.
+
+```ini
+[Unit]
+Description=kei Media Sync Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/kei service run --config %h/.config/kei/config.toml
+Restart=on-failure
+RestartSec=10s
+WatchdogSec=120
+NotifyAccess=main
+
+[Install]
+WantedBy=default.target
+```
+
+### Stop or remove an existing kei service
+
+A service registered by an earlier kei version still works. Stop and remove it with the same manager that started it. These commands remove only the registration. They do not delete your photos, videos, configuration, credentials, kei state, or logs.
+
+```sh
+# Linux, per-user
+systemctl --user disable --now kei.service
+rm ~/.config/systemd/user/kei.service
+systemctl --user daemon-reload
+
+# Linux, system-wide (as root)
+sudo systemctl disable --now kei.service
+sudo rm /etc/systemd/system/kei.service
+sudo systemctl daemon-reload
+
+# macOS
+launchctl bootout gui/$(id -u)/com.rhoopr.kei
+rm ~/Library/LaunchAgents/com.rhoopr.kei.plist
+```
+
+On Windows, run an elevated prompt:
+
+```powershell
+sc.exe stop com.rhoopr.kei
+sc.exe delete com.rhoopr.kei
+```
 
 <a id="get-help-or-maintain-a-backup"></a>
 
@@ -121,7 +168,7 @@ interval = 86400
 
 If a sync fails, check that kei can write to the destination, that there is enough free space, and that you selected the library and albums you intended. Check the [sign-in requirements](https://github.com/rhoopr/kei/wiki/Authentication) too. The [Status](https://github.com/rhoopr/kei/wiki/Status) and [Doctor](https://github.com/rhoopr/kei/wiki/Doctor) guides explain how to check your setup.
 
-For a bug or confusing result, open an [issue](https://github.com/rhoopr/kei/issues) with your kei version, what you expected and what happened. When available, run `kei support-export --output kei-support.json` with the same configuration and data directory. It collects details already saved by kei without another sync and uploads nothing automatically. Review the file before attaching it. You can still report a problem if you're using an older version or the export is incomplete. See [Support export](docs/support-export.md) for details and Docker instructions.
+For a bug or confusing result, open an [issue](https://github.com/rhoopr/kei/issues) with your kei version, what you expected and what happened. When available, run `kei support-export --output kei-support.json` with the same configuration and data directory. It writes a redacted snapshot of current config, state and health without another sync and uploads nothing automatically. It does not keep or read prior operation history. Review the file before attaching it. You can still report a problem if you're using an older version or the export is incomplete. See [Support snapshot](docs/support-export.md) for details and Docker instructions.
 
 Some repair commands change kei's saved state or replace files. Read [Backup maintenance](docs/backup-maintenance.md) first. Don't delete state or conflicting files just to clear a warning. When preserving older files, kei normally refuses files with hardlinks, where several paths refer to the same file. The [hardlink waiver](docs/backup-maintenance.md#legacy-preservation-and-hardlinks) allows this case, but a change through one path can affect the others. It does not prevent kei from writing to files.
 

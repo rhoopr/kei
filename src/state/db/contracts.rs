@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use super::SparseIdentityProof;
 use crate::state::error::StateError;
 use crate::state::types::{
-    AssetRecord, MetadataCapture, SyncRunStats, SyncSummary, VersionSizeKey,
+    AssetRecord, MetadataCapture, RenditionMetadata, SyncRunStats, SyncSummary, VersionSizeKey,
 };
 
 fn unsupported_album_membership_api(operation: &'static str) -> StateError {
@@ -57,6 +57,10 @@ pub(crate) struct DownloadedFileRecord {
     pub(crate) added_at: Option<DateTime<Utc>>,
     /// Immutable preserved history is a reuse source, never a legacy alias
     /// eligible for relocation or retirement, even if config targets its parent.
+    #[allow(
+        dead_code,
+        reason = "retained for recorded-layout recovery tests; new layout creation is disabled"
+    )]
     pub(crate) is_preserved_history: bool,
     /// This receipt is also the catalog's current path, not an additional copy.
     pub(crate) is_current_path: bool,
@@ -141,8 +145,6 @@ pub(crate) struct SelectionMetadataReceipt {
 pub struct PendingMetadataRewrite {
     pub asset: AssetRecord,
     pub(crate) selection_receipt: Option<SelectionMetadataReceipt>,
-    /// In-memory owner-issued continuation; never reconstructed from a listed row.
-    pub(crate) activity_admission: Option<Arc<super::metadata_activity::ActivityAdmission>>,
     pub capture_repair_receipt: Option<CaptureRepairReceipt>,
     /// SHA-256 captured from a verified download before embedding, for this
     /// exact path and provider rendition. Never inferred from local checksums.
@@ -166,7 +168,7 @@ pub enum MetadataRewriteCompletion {
 }
 
 impl MetadataRewriteCompletion {
-    pub(super) const fn clears(self, queue: MetadataRewriteQueue) -> bool {
+    pub(crate) const fn clears(self, queue: MetadataRewriteQueue) -> bool {
         matches!(
             (self, queue),
             (Self::Ordinary | Self::Both, MetadataRewriteQueue::Ordinary)
@@ -221,6 +223,7 @@ pub(crate) struct ReconciliationCatalogPath {
 /// Durable destination ownership for local catalog reconciliation.
 #[async_trait]
 pub(crate) trait ReconciliationStateStore: Send + Sync {
+    #[cfg(test)]
     async fn primary_layout_binding(
         &self,
         _family: String,
@@ -233,22 +236,11 @@ pub(crate) trait ReconciliationStateStore: Send + Sync {
     ) -> Result<Vec<super::primary_layout::LayoutOperation>, StateError> {
         Ok(Vec::new())
     }
+    #[cfg(test)]
     async fn begin_primary_layout(
         &self,
         _op: super::primary_layout::LayoutOperation,
     ) -> Result<(), StateError> {
-        Err(StateError::Invariant {
-            operation: "primary_layout",
-            detail: "state store does not support primary layouts".into(),
-        })
-    }
-    async fn cancel_primary_layout(&self, _operation: String) -> Result<(), StateError> {
-        Err(StateError::Invariant {
-            operation: "primary_layout",
-            detail: "state store does not support primary layouts".into(),
-        })
-    }
-    async fn hold_primary_layout(&self, _operation: String) -> Result<(), StateError> {
         Err(StateError::Invariant {
             operation: "primary_layout",
             detail: "state store does not support primary layouts".into(),
@@ -277,6 +269,7 @@ pub(crate) trait ReconciliationStateStore: Send + Sync {
         &self,
         _op: super::primary_layout::LayoutOperation,
         _proof: super::primary_layout::LayoutRecoverySnapshot,
+        _validate_files: Option<Box<dyn FnOnce() -> Result<(), StateError> + Send>>,
     ) -> Result<(), StateError> {
         Err(StateError::Invariant {
             operation: "primary_layout",
@@ -304,17 +297,6 @@ pub(crate) trait ReconciliationStateStore: Send + Sync {
     async fn has_primary_layouts(&self, _library: &str) -> Result<bool, StateError> {
         Ok(false)
     }
-    /// Whole-asset metadata refresh must resolve ownership across all passes.
-    async fn primary_layout_owns_asset(
-        &self,
-        _library: &str,
-        _child: &str,
-    ) -> Result<bool, StateError> {
-        Err(StateError::Invariant {
-            operation: "primary_layout_owns_asset",
-            detail: "state store does not support managed metadata ownership".into(),
-        })
-    }
     async fn guard_primary_slot(
         &self,
         _library: &str,
@@ -339,14 +321,30 @@ pub(crate) trait ReconciliationStateStore: Send + Sync {
     async fn reserve_reconciliation_paths(
         &self,
         reservations: &[ReconciliationReservation],
+        actual_child: Option<&str>,
     ) -> Result<(), StateError>;
 }
 
 /// State projections used to preload download decisions and publication receipts.
 #[async_trait]
 pub(crate) trait DownloadContextStateStore: Send + Sync {
+    /// Optional catalog metadata for drift checks, never publication authority.
+    async fn get_downloaded_rendition_metadata(
+        &self,
+    ) -> Result<Vec<(String, String, VersionSizeKey, RenditionMetadata)>, StateError> {
+        Ok(Vec::new())
+    }
+
     /// Account-owned receipt candidates. Missing provenance remains explicit.
     async fn get_baseline_receipts(&self) -> Result<Vec<BaselineReceipt>, StateError> {
+        Ok(Vec::new())
+    }
+
+    /// Compact native paths retain ownership only. They are not positive byte
+    /// provenance for matcher reuse.
+    async fn get_compact_native_owners(
+        &self,
+    ) -> Result<Vec<(String, String, VersionSizeKey, PathBuf)>, StateError> {
         Ok(Vec::new())
     }
 
@@ -516,6 +514,7 @@ pub trait DownloadStateStore: Send + Sync {
         &self,
         _record: &AssetRecord,
         _receipt: &BaselineReceipt,
+        _child: &str,
         _validate_file: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
     ) -> Result<(), StateError> {
         Err(StateError::Invariant {
@@ -529,6 +528,7 @@ pub trait DownloadStateStore: Send + Sync {
         &self,
         _record: &AssetRecord,
         _receipt: &BaselineReceipt,
+        _child: &str,
         _validate_file: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
     ) -> Result<(), StateError> {
         Err(StateError::Invariant {
@@ -909,6 +909,12 @@ pub trait SyncTokenStore: Send + Sync {
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError>;
     async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError>;
     async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError>;
+    /// Remove pending zone tokens that are not the exact token referenced by a
+    /// current ready epoch proof. Stores without epoch state must not broadly
+    /// purge the prefix.
+    async fn purge_superseded_pending_tokens(&self) -> Result<u64, StateError> {
+        Ok(0)
+    }
     async fn commit_checkpoint_transition(
         &self,
         _transition: CheckpointTransition,
@@ -952,6 +958,60 @@ pub trait SyncTokenStore: Send + Sync {
     async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError>;
     async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError>;
     async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError>;
+
+    async fn sync_epoch_enroll(&self, _libraries: Vec<(String, String)>) -> Result<(), StateError> {
+        Ok(())
+    }
+
+    async fn sync_epoch_gate(
+        &self,
+        _library: String,
+        _baseline_scope: String,
+        _watch_interval: Option<u64>,
+    ) -> Result<super::SyncEpochGate, StateError> {
+        Ok(super::SyncEpochGate::Open)
+    }
+
+    async fn sync_epoch_should_wake(&self, _library: String) -> Result<bool, StateError> {
+        Ok(false)
+    }
+
+    async fn sync_epoch_has_pending(&self, _library: String) -> Result<bool, StateError> {
+        Ok(false)
+    }
+
+    async fn sync_epoch_backoff(&self, _library: String) -> Result<bool, StateError> {
+        Ok(false)
+    }
+
+    async fn defer_sync_epoch(
+        &self,
+        _library: String,
+        _watch_interval: Option<u64>,
+        _outcome: &'static str,
+    ) -> Result<(), StateError> {
+        Ok(())
+    }
+
+    async fn recover_sync_epoch_attempt(
+        &self,
+        _library: String,
+        _provider_failure: bool,
+        _watch_interval: Option<u64>,
+    ) -> Result<(), StateError> {
+        Ok(())
+    }
+
+    async fn sync_epoch_baseline_evidence(
+        &self,
+        _library: String,
+    ) -> Result<Option<(String, Option<String>)>, StateError> {
+        Ok(None)
+    }
+
+    async fn sync_epoch_id(&self) -> Result<Option<String>, StateError> {
+        Ok(None)
+    }
 }
 
 /// Album and people membership reads/writes.
@@ -1111,39 +1171,6 @@ pub enum SourceMetadataRecovery {
 /// Metadata rewrite markers and hashes.
 #[async_trait]
 pub trait MetadataRewriteStore: Send + Sync {
-    /// Returns the optional owner for non-activating metadata activity evidence.
-    fn metadata_activity_owner(
-        &self,
-    ) -> Option<&dyn super::metadata_activity::MetadataActivityOwner> {
-        None
-    }
-
-    /// Reject unfinished authenticated activity on the relevant target. This is
-    /// a preflight, not authority to publish or a filesystem race fence.
-    async fn validate_metadata_activity_conflicts(
-        &self,
-        pending: &PendingMetadataRewrite,
-        queue: MetadataRewriteQueue,
-        flags: u8,
-        root: &Path,
-    ) -> Result<(), StateError> {
-        match self.metadata_activity_owner() {
-            Some(owner) => {
-                owner
-                    .validate_conflicts(
-                        pending,
-                        queue,
-                        flags,
-                        root,
-                        pending.activity_admission.as_deref(),
-                    )
-                    .await
-            }
-            None if pending.activity_admission.is_some() => Err(StateError::ProviderWorkConflict),
-            None => Ok(()),
-        }
-    }
-
     /// Called under the destination lock before any selected metadata write.
     async fn validate_metadata_writer(
         &self,
@@ -1248,6 +1275,33 @@ pub trait MetadataRewriteStore: Send + Sync {
         pre_rewrite_checksum: Option<&str>,
         completion: MetadataRewriteCompletion,
     ) -> Result<bool, StateError>;
+    /// Carries an operation-owned file proof into the same transaction as the
+    /// marker retirement. Stores without a physical writer keep the plain
+    /// completion contract.
+    async fn finish_metadata_rewrite_checked(
+        &self,
+        pending: &PendingMetadataRewrite,
+        selected_queue: MetadataRewriteQueue,
+        local_checksum: Option<&str>,
+        pre_rewrite_checksum: Option<&str>,
+        completion: MetadataRewriteCompletion,
+        validate_file: Option<Box<dyn FnOnce() -> Result<(), StateError> + Send>>,
+    ) -> Result<bool, StateError> {
+        if validate_file.is_some() {
+            return Err(StateError::Invariant {
+                operation: "finish_metadata_rewrite_checked",
+                detail: "store cannot validate retained file proof".into(),
+            });
+        }
+        self.finish_metadata_rewrite(
+            pending,
+            selected_queue,
+            local_checksum,
+            pre_rewrite_checksum,
+            completion,
+        )
+        .await
+    }
 }
 
 /// One row from the read-only local manifest export.

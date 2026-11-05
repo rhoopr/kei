@@ -197,18 +197,7 @@ where
                     if is_asset_filtered(&asset, config.as_ref()).is_some() {
                         continue;
                     }
-                    let plan = match task_planner.plan_download_asset(&asset, config).await {
-                        Ok(plan) => plan,
-                        Err(error) if config.primary_layout_preview => {
-                            enum_errors += 1;
-                            if is_provider_session_error(&error) {
-                                provider_auth_errors += 1;
-                            }
-                            tracing::error!(%error,"[PLAN] Managed primary conflict; files and ownership retained");
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
+                    let plan = task_planner.plan_download_asset(&asset, config).await?;
                     if let Some(resource) = &plan.malformed_resource {
                         enum_errors += 1;
                         tracing::error!(target: "kei::download::pipeline",
@@ -278,18 +267,7 @@ where
             }
             match result {
                 Ok(asset) => {
-                    let plan = match task_planner.plan_download_asset(&asset, config).await {
-                        Ok(plan) => plan,
-                        Err(error) if config.primary_layout_preview => {
-                            enum_errors += 1;
-                            if is_provider_session_error(&error) {
-                                provider_auth_errors += 1;
-                            }
-                            tracing::error!(%error,"[PLAN] Managed primary conflict; files and ownership retained");
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
+                    let plan = task_planner.plan_download_asset(&asset, config).await?;
                     if plan.filter_reason.is_some() {
                         continue;
                     }
@@ -411,7 +389,6 @@ where
         pipeline_shutdown: pipeline_shutdown.clone(),
     };
     let producer = spawn_stream_download_producer(
-        download_client.clone(),
         combined,
         Arc::clone(&download_ctx),
         task_tx,

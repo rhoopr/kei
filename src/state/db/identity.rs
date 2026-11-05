@@ -1,6 +1,6 @@
 //! Library-scoped provider asset/master mappings and legacy state ownership.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
 use rusqlite::OptionalExtension;
@@ -219,6 +219,73 @@ impl SqliteStateDb {
         )
         .await
     }
+}
+
+/// Explicit exclusive legacy owner rows, indexed by library and master.
+/// Only `legacy_master_state_owners` proves an old master row's child owner.
+/// `asset_master_mappings` is family history, never identity by itself.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LegacyOwnersByLibrary {
+    children: HashMap<String, HashMap<String, String>>,
+}
+
+impl LegacyOwnersByLibrary {
+    pub(crate) fn from_rows(rows: HashSet<(String, String, String)>) -> Self {
+        let mut children: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for (library, master, child) in rows {
+            children.entry(library).or_default().insert(master, child);
+        }
+        Self { children }
+    }
+
+    fn child<'a>(&'a self, library: &str, master: &str) -> Option<&'a str> {
+        self.children
+            .get(library)
+            .and_then(|masters| masters.get(master))
+            .map(String::as_str)
+    }
+
+    #[must_use]
+    pub(crate) fn accepts_claim(&self, library: &str, master: &str, child: &str) -> bool {
+        self.child(library, master)
+            .is_none_or(|owner| owner == child)
+    }
+
+    /// Call only after all participating views accept the durable direct claim.
+    pub(crate) fn remember_claim(&mut self, library: &str, master: &str, child: &str) {
+        self.children
+            .entry(library.to_owned())
+            .or_default()
+            .entry(master.to_owned())
+            .or_insert_with(|| child.to_owned());
+    }
+}
+
+/// One identity rule for baseline matching, planning, and adoption.
+///
+/// A target is usable only when its state id is its actual child or an explicit
+/// legacy owner names that child. An owner is the same logical asset when it is
+/// that child, the target's exact state id, or an explicit legacy owner naming
+/// the same actual child. Raw master mappings and shared master names never
+/// participate.
+#[must_use]
+pub(crate) fn same_logical_asset(
+    library: &str,
+    target_state_id: &str,
+    actual_child: &str,
+    owner_library: &str,
+    owner_state_id: &str,
+    owners: &LegacyOwnersByLibrary,
+) -> bool {
+    if library != owner_library {
+        return false;
+    }
+    let target_is_canonical = target_state_id == actual_child
+        || owners.child(library, target_state_id) == Some(actual_child);
+    target_is_canonical
+        && (owner_state_id == actual_child
+            || owner_state_id == target_state_id
+            || owners.child(library, owner_state_id) == Some(actual_child))
 }
 
 #[cfg(test)]

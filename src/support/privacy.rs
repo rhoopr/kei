@@ -1,53 +1,6 @@
 //! Export allowlist. Raw input, log messages and error text never enter the wire format.
 use serde_json::{Map, Value};
 
-pub(super) const NUMERIC_STATS: &[&str] = &[
-    "assets_seen",
-    "api_total_at_start",
-    "api_total_at_start_partial",
-    "downloaded",
-    "failed",
-    "bytes_downloaded",
-    "disk_bytes_written",
-    "exif_failures",
-    "metadata_capture_revision",
-    "metadata_capture_refreshed",
-    "metadata_capture_failures",
-    "metadata_capture_remaining",
-    "metadata_capture_unresolved",
-    "metadata_capture_deferred",
-    "unattributed_legacy_assets",
-    "unattributed_legacy_pending",
-    "state_write_failures",
-    "enumeration_errors",
-    "count_probe_failures",
-    "stale_pending_pruned",
-    "pagination_shortfall_warnings",
-    "pagination_shortfall_assets",
-    "tail_probes",
-    "count_undercount_assets",
-    "enumeration_incomplete",
-    "inventory_drop_warnings",
-    "inventory_drop_assets",
-    "inventory_drop_percent",
-    "inventory_drop_previous_total",
-    "inventory_drop_current_total",
-    "sync_token_blocked",
-    "sync_token_expected_receivers",
-    "sync_token_receivers_with_token",
-    "sync_token_receivers_missing",
-    "sync_token_receivers_blank",
-    "sync_token_receivers_dropped",
-    "sync_token_unique_values",
-    "same_cycle_recovery_attempts",
-    "same_cycle_recovery_successes",
-    "elapsed_secs",
-    "interrupted",
-    "rate_limited",
-    "photos_downloaded",
-    "videos_downloaded",
-];
-
 const CONFIG_NUMBERS: &[&str] = &[
     "threads",
     "dry_run",
@@ -112,77 +65,6 @@ pub(super) fn numbers(value: &Value, fields: &[&str]) -> Value {
             })
             .collect(),
     )
-}
-
-pub(super) fn stats(value: &Value) -> Value {
-    let mut out = numbers(value, NUMERIC_STATS);
-    if let Some(map) = out.as_object_mut() {
-        for key in [
-            "sync_token_blocked_reason",
-            "sync_token_blocked_source",
-            "full_enumeration_reason",
-        ] {
-            if let Some(v) = value
-                .get(key)
-                .and_then(Value::as_str)
-                .filter(|v| fixed_label(v))
-            {
-                map.insert(key.to_owned(), Value::String(v.to_owned()));
-            }
-        }
-        if let Some(v) = value.get("skipped") {
-            map.insert(
-                "skipped".into(),
-                numbers(
-                    v,
-                    &[
-                        "on_disk",
-                        "by_media_type",
-                        "by_date_range",
-                        "by_live_photo",
-                        "by_filename",
-                        "by_excluded_album",
-                        "ampm_variant",
-                        "retry_only",
-                        "by_state",
-                        "by_filter",
-                        "duplicates",
-                        "retry_exhausted",
-                        "by_existing",
-                        "by_policy",
-                        "filtered",
-                        "already_downloaded",
-                        "filename",
-                        "date",
-                        "media",
-                        "size",
-                        "live_photo",
-                    ],
-                ),
-            );
-        }
-        if let Some(v) = value.get("primary_layout").filter(|v| !v.is_null()) {
-            map.insert(
-                "primary_layout".into(),
-                numbers(
-                    v,
-                    &[
-                        "active_revision",
-                        "pending_revision",
-                        "managed_assets",
-                        "legacy_assets",
-                        "managed_files",
-                        "legacy_files",
-                        "pending_operations",
-                        "held_operations",
-                        "bound_families",
-                        "preserved_files",
-                    ],
-                ),
-            );
-        }
-    }
-    out
 }
 
 pub(super) fn configuration(value: &Value) -> Value {
@@ -395,7 +277,6 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
             "verified",
             "applied",
         ]),
-        "support_token_equivalence_v1" => Some(&["phase", "passes_total", "passes_omitted"]),
         "support_token_evidence_v1" => Some(&[
             "phase",
             "completion",
@@ -497,7 +378,7 @@ pub(super) fn contract(kind: &str) -> Option<&'static [&'static str]> {
 }
 
 // Owner morphology is a fixed string category, never a numeric provider value.
-// Revalidate saved history as strictly as current producer observations.
+// Revalidate diagnostic fields as strictly as current producer observations.
 fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
     let label = value.as_str();
     if kind == "recovery_decision_v1" {
@@ -623,13 +504,6 @@ fn diagnostic_value(kind: &str, key: &str, value: &Value) -> bool {
             _ => false,
         };
     }
-    if kind == "support_token_equivalence_v1" {
-        return match key {
-            "phase" => matches!(label, Some("initial" | "same_cycle_recovery")),
-            "passes_total" | "passes_omitted" => value.as_u64().is_some(),
-            _ => false,
-        };
-    }
     match key {
         "child_reference_status" if kind == "exact_lookup_rejection_v1" => {
             label.is_some_and(is_child_reference_status)
@@ -727,19 +601,11 @@ pub(super) fn is_child_reference_status(value: &str) -> bool {
 
 pub(super) fn diagnostic(kind: &str, fields: &Map<String, Value>) -> Option<Map<String, Value>> {
     let allowed = contract(kind)?;
-    let mut out: Map<String, Value> = fields
+    let out: Map<String, Value> = fields
         .iter()
-        .filter(|(k, v)| {
-            (allowed.contains(&k.as_str()) && diagnostic_value(kind, k, v))
-                || (matches!(k.as_str(), "item_alias" | "scope_alias")
-                    && v.as_str().is_some_and(valid_alias))
-                || (k.as_str() == "correlation_unavailable" && v.is_boolean())
-        })
+        .filter(|(k, v)| allowed.contains(&k.as_str()) && diagnostic_value(kind, k, v))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    if kind == "support_token_equivalence_v1" {
-        super::token_equivalence::retain_rows(fields, &mut out);
-    }
     Some(out)
 }
 
@@ -1106,13 +972,3 @@ const LABELS: &[&str] = &[
     "unbounded",
     "rejected",
 ];
-
-fn valid_alias(value: &str) -> bool {
-    if let Some(n) = value.strip_prefix("alias-") {
-        return n.parse::<u32>().is_ok_and(|n| n > 0 && n <= 4096);
-    }
-    value.split_once('/').is_some_and(|(namespace, ordinal)| {
-        uuid::Uuid::parse_str(namespace).is_ok()
-            && ordinal.parse::<usize>().is_ok_and(|n| n > 0 && n <= 128)
-    })
-}

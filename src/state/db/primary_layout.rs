@@ -132,6 +132,7 @@ enum SnapshotValue {
 
 #[derive(Debug, Clone)]
 pub(crate) struct LayoutRecoverySnapshot {
+    publication: Option<super::PublicationBinding>,
     operation: LayoutOperation,
     catalogue: Vec<Vec<SnapshotValue>>,
     metadata_paths: Vec<Vec<SnapshotValue>>,
@@ -142,6 +143,13 @@ pub(crate) struct LayoutRecoverySnapshot {
 }
 
 impl LayoutRecoverySnapshot {
+    /// Attach only the authenticated source whose fresh lookup reconfirmed this operation.
+    #[must_use]
+    pub(crate) fn with_publication(mut self, binding: super::PublicationBinding) -> Self {
+        self.publication = Some(binding);
+        self
+    }
+
     pub(crate) fn matches_master(&self, master: &str) -> bool {
         self.mappings.iter().filter(|row| matches!(row.as_slice(),
             [SnapshotValue::Text(library), SnapshotValue::Text(child), SnapshotValue::Text(recorded_master), ..]
@@ -380,6 +388,7 @@ fn recovery_snapshot(
         return Err(invalid("layout recovery member changed"));
     }
     Ok(LayoutRecoverySnapshot {
+        publication: None,
         operation: op.clone(),
         catalogue,
         metadata_paths,
@@ -390,11 +399,147 @@ fn recovery_snapshot(
     })
 }
 
+fn guard_publication_owners(
+    conn: &Connection,
+    op: &LayoutOperation,
+    binding: &super::PublicationBinding,
+) -> Result<(), StateError> {
+    let master: String = conn.query_row("SELECT master_record_name FROM asset_master_mappings WHERE library=?1 AND asset_record_name=?2", params![op.library,op.asset_record_name], |r|r.get(0))?;
+    if master != binding.master {
+        return Err(invalid("recovery publication master changed"));
+    }
+    // Only these exact recorded files permit same-child cross-rendition history.
+    let files: Vec<_> = op
+        .members
+        .iter()
+        .flat_map(|m| {
+            [
+                &m.old,
+                &m.archive_source,
+                &m.prepared,
+                &m.preserved,
+                &m.installed,
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .collect();
+    let mut keys = std::collections::HashSet::new();
+    for file in &files {
+        let path = file.path.to_path();
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(".xmp");
+        keys.insert(path_key(&path)?);
+        keys.insert(path_key(&std::path::PathBuf::from(sidecar))?);
+    }
+    let matches = |path: &std::path::Path, version: &str, checksum: &str, local: Option<&str>| {
+        let cross_rendition = op.members.iter().any(|member| {
+            member
+                .installed
+                .as_ref()
+                .is_some_and(|file| file.path.to_path() == path && file.version != version)
+        });
+        files.iter().any(|file| {
+            file.path.to_path() == path
+                && file.version == version
+                && file.provider_checksum == checksum
+                && (!cross_rendition
+                    || op.members.iter().any(|member| {
+                        [&member.old, &member.preserved]
+                            .into_iter()
+                            .flatten()
+                            .any(|old| {
+                                old.path == file.path
+                                    && old.version == file.version
+                                    && old.provider_checksum == file.provider_checksum
+                                    && old.fingerprint == file.fingerprint
+                            })
+                    }))
+                && local
+                    == Some(
+                        data_encoding::HEXLOWER
+                            .encode(&file.fingerprint.sha256)
+                            .as_str(),
+                    )
+        })
+    };
+    let mut statement=conn.prepare("SELECT library,id,version_size,local_path,checksum,local_checksum FROM assets WHERE local_path IS NOT NULL UNION ALL SELECT library,id,version_size,local_path,provider_checksum,local_checksum FROM asset_metadata_paths")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let path = std::path::PathBuf::from(row.get::<_, String>(3)?);
+        if !keys.contains(&path_key(&path)?) {
+            continue;
+        }
+        if row.get::<_, String>(0)? != op.library
+            || row.get::<_, String>(1)? != op.child
+            || !matches(
+                &path,
+                &row.get::<_, String>(2)?,
+                &row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?.as_deref(),
+            )
+        {
+            return Err(invalid("foreign owner occupies recovery publication"));
+        }
+    }
+    let mut statement = conn.prepare("SELECT id,native_path FROM download_receipts")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let path: SelectionPath = serde_json::from_str(&row.get::<_, String>(1)?)
+            .map_err(|_private_error| invalid("invalid compact publication path"))?;
+        if !keys.contains(&path_key(&path.to_path())?) {
+            continue;
+        }
+        let receipt = super::download_receipts::load(conn, &row.get::<_, String>(0)?)?
+            .ok_or_else(|| invalid("unproven compact publication owner"))?;
+        if receipt.account_key != binding.account_key
+            || receipt.provider_key != binding.provider_key
+            || receipt.scope != binding.scope
+            || receipt.library != op.library
+            || receipt.child != binding.child
+            || receipt.master != binding.master
+            || receipt.state_id != op.child
+            || !receipt.fulfills_pass(&op.pass)
+            || !matches(
+                &path.to_path(),
+                &receipt.version_size,
+                &receipt.provider_checksum,
+                Some(&receipt.local_checksum),
+            )
+            || !files.iter().any(|file| {
+                file.path == path
+                    && file.version == receipt.version_size
+                    && file.provider_checksum == receipt.provider_checksum
+                    && data_encoding::HEXLOWER.encode(&file.fingerprint.sha256)
+                        == receipt.local_checksum
+                    && file.source_checksum.as_deref() == Some(&receipt.source_checksum)
+            })
+        {
+            return Err(invalid(
+                "foreign compact owner occupies recovery publication",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn guard_recovery_snapshot(
     conn: &Connection,
     op: &LayoutOperation,
     proof: &LayoutRecoverySnapshot,
 ) -> Result<(), StateError> {
+    if let Some(binding) = &proof.publication {
+        binding.validate(conn)?;
+        if binding.library != op.library
+            || binding.state_id != op.child
+            || binding.child != op.asset_record_name
+            || binding.origin_pass != op.pass
+            || !proof.matches_master(&binding.master)
+        {
+            return Err(invalid("recovery publication identity changed"));
+        }
+        guard_publication_owners(conn, op, binding)?;
+    }
     let mut identity = op.clone();
     identity.phase = proof.operation.phase.clone();
     identity.members.clear();
@@ -952,6 +1097,7 @@ fn guard_recorded_catalogue_inner(
 }
 
 impl SqliteStateDb {
+    #[cfg(test)]
     pub(crate) async fn primary_layout_binding(
         &self,
         family: String,
@@ -992,6 +1138,7 @@ impl SqliteStateDb {
             Ok(result)
         }).await
     }
+    #[cfg(test)]
     pub(crate) async fn begin_primary_layout(&self, op: LayoutOperation) -> Result<(), StateError> {
         self.with_conn("begin_primary_layout", move |conn| {
             if op.members.is_empty() || op.members.len()>16 || op.phase!="planned" || op.generation<0 || !matches!(op.policy.as_str(),"primary"|"suffix") { return Err(invalid("invalid layout plan")); }
@@ -1029,6 +1176,7 @@ impl SqliteStateDb {
             tx.commit()?;Ok(())
         }).await
     }
+    #[cfg(test)]
     pub(crate) async fn cancel_primary_layout(&self, operation: String) -> Result<(), StateError> {
         self.with_conn("cancel_primary_layout",move |conn| {
             let tx=conn.unchecked_transaction()?;
@@ -1044,14 +1192,6 @@ impl SqliteStateDb {
             }
             tx.execute("UPDATE primary_layout_operations SET phase='cancelled' WHERE operation=?1",[operation])?;
             tx.commit()?;Ok(())
-        }).await
-    }
-    /// Retain the recoverable phase and immutable member evidence. A fixed
-    /// internal reason avoids persisting provider errors or identifiers.
-    pub(crate) async fn hold_primary_layout(&self, operation: String) -> Result<(), StateError> {
-        self.with_conn("hold_primary_layout",move |conn| {
-            conn.execute("UPDATE primary_layout_operations SET conflict='verified_recovery_required' WHERE operation=?1 AND phase NOT IN ('committed','cancelled')",[operation])?;
-            Ok(())
         }).await
     }
     pub(crate) async fn capture_layout_recovery(
@@ -1123,15 +1263,19 @@ impl SqliteStateDb {
         &self,
         op: LayoutOperation,
     ) -> Result<(), StateError> {
-        self.commit_primary_layout_with_recovery(op, None).await
+        self.commit_primary_layout_with_recovery(op, None, None)
+            .await
     }
     pub(crate) async fn commit_primary_layout_with_recovery(
         &self,
         op: LayoutOperation,
         proof: Option<LayoutRecoverySnapshot>,
+        validate_files: Option<Box<dyn FnOnce() -> Result<(), StateError> + Send>>,
     ) -> Result<(), StateError> {
         self.with_conn("commit_primary_layout", move |conn| {
             let tx=conn.unchecked_transaction()?;
+            let publication=proof.as_ref().and_then(|proof|proof.publication.as_ref());
+            if publication.is_some() && validate_files.is_none() {return Err(invalid("recovery publication lacks held file validation"));}
             let generation:i64=tx.query_row("SELECT generation FROM primary_layout_bindings WHERE family=?1",[&op.family],|r|r.get(0)).optional()?.unwrap_or(0);
             if generation!=op.generation { return Err(invalid("primary layout generation changed before commit")); }
             let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM primary_layout_operations WHERE operation=?1 AND phase='publishing')",[&op.operation],|r|r.get(0))?;
@@ -1144,6 +1288,16 @@ impl SqliteStateDb {
             if let Some(proof) = &proof { guard_recovery_snapshot(&tx, &op, proof)?; } else { guard_recorded_catalogue(&tx, &op)?; }
             let mut files=Vec::new();
             for member in &op.members {
+                if publication.is_some() && let (Some(record),Some(file))=(&member.record,&member.installed) {
+                    let prepared=member.prepared.as_ref().ok_or_else(||invalid("publication lacks source preparation"))?;
+                    if member.destination.as_ref()!=Some(&file.path) || file.version!=record.version_size.as_str() || file.provider_checksum!=record.checksum.as_ref()
+                        || file.version!=prepared.version || file.provider_checksum!=prepared.provider_checksum || file.source_checksum!=prepared.source_checksum
+                        || file.fingerprint.size!=prepared.fingerprint.size || file.fingerprint.sha256!=prepared.fingerprint.sha256
+                        || file.archive_original!=prepared.archive_original || file.metadata_decision!=prepared.metadata_decision
+                        || file.sidecar.as_ref().map(|f|(f.size,f.sha256))!=prepared.sidecar.as_ref().map(|f|(f.size,f.sha256)) {
+                        return Err(invalid("publication differs from source preparation"));
+                    }
+                }
                 if let Some(old)=&member.old {
                     if member.preserved.is_none() { return Err(invalid("displaced file has no preservation receipt")); }
                     // Historical per-path metadata remains retained. Slot guards
@@ -1191,7 +1345,38 @@ impl SqliteStateDb {
             let binding=LayoutBinding{family:op.family.clone(),library:op.library.clone(),source_library:op.source_library.clone(),child:op.child.clone(),generation:generation+1,decision:op.decision.clone(),policy:op.policy.clone(),qualifier:op.qualifier.clone(),files};
             tx.execute("INSERT INTO primary_layout_bindings VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(family) DO UPDATE SET generation=excluded.generation,decision=excluded.decision,policy=excluded.policy,binding=excluded.binding",params![op.family,op.library,op.source_library,op.child,generation+1,op.decision,op.policy,encode(&binding)?])?;
             tx.execute("DELETE FROM primary_layout_claims WHERE operation=?1",[&op.operation])?;
-            tx.execute("UPDATE primary_layout_operations SET phase='committed',conflict=NULL WHERE operation=?1",[op.operation])?;
+            tx.execute("UPDATE primary_layout_operations SET phase='committed',conflict=NULL WHERE operation=?1",[&op.operation])?;
+            if let Some(publication)=publication {
+                publication.validate(&tx)?;
+                guard_publication_owners(&tx,&op,publication)?;
+                for member in &op.members {
+                    if let (Some(record),Some(file))=(&member.record,&member.installed)
+                        && let Some(source)=&file.source_checksum {
+                        super::download_receipts::DownloadReceipt {
+                            account_key:publication.account_key.clone(),provider_key:publication.provider_key.clone(),scope:publication.scope.clone(),
+                            library:op.library.clone(),child:publication.child.clone(),master:publication.master.clone(),state_id:op.child.clone(),origin_pass:op.pass.clone(),
+                            version_size:record.version_size.as_str().into(),provider_checksum:record.checksum.to_string(),provider_size:record.size_bytes,
+                            native_path:file.path.clone(),source_checksum:source.clone(),local_checksum:data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),
+                        }.save(&tx)?;
+                    }
+                }
+                let saved:Vec<u8>=tx.query_row("SELECT binding FROM primary_layout_bindings WHERE family=?1 AND library=?2 AND child=?3 AND generation=?4 AND decision=?5 AND policy=?6",params![op.family,op.library,op.child,generation+1,op.decision,op.policy],|r|r.get(0))?;
+                if saved!=encode(&binding)? {return Err(invalid("recovery publication binding changed"));}
+                for member in &op.members {
+                    if let (Some(record),Some(file))=(&member.record,&member.installed) {
+                        let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM primary_layout_claims WHERE path_key=?1 AND family=?2 AND library=?3 AND child=?4 AND version=?5 AND provider_checksum=?6 AND local_checksum=?7 AND operation IS NULL AND native_path=?8)",params![path_key(&file.path.to_path())?,op.family,op.library,op.child,record.version_size.as_str(),record.checksum.as_ref(),data_encoding::HEXLOWER.encode(&file.fingerprint.sha256),encode(&file.path)?],|r|r.get(0))?;
+                        if !valid {return Err(invalid("recovery publication claim changed"));}
+                    }
+                }
+                let stored:Vec<u8>=tx.query_row("SELECT header FROM primary_layout_operations WHERE operation=?1 AND phase='committed'",[&op.operation],|r|r.get(0))?;
+                if stored!=encode(&identity)? {return Err(invalid("recovery publication journal changed"));}
+                let members:Vec<Vec<u8>>=tx.prepare("SELECT evidence FROM primary_layout_members WHERE operation=?1 ORDER BY member")?.query_map([&op.operation],|r|r.get(0))?.collect::<Result<_,_>>()?;
+                if members!=op.members.iter().map(encode).collect::<Result<Vec<_>,_>>()? {return Err(invalid("recovery publication members changed"));}
+                let mut selected=op.clone();selected.members.retain(|member|member.record.is_some());
+                guard_recorded_catalogue(&tx,&selected)?;
+                guard_publication_owners(&tx,&op,publication)?;
+            }
+            if let Some(validate)=validate_files {validate()?;}
             tx.commit()?;Ok(())
         }).await
     }
@@ -1475,7 +1660,7 @@ mod tests {
         current.filename = "newer-name.HEIC".into();
         db.upsert_seen(&current).await.unwrap();
         assert!(
-            db.commit_primary_layout_with_recovery(op.clone(), Some(proof))
+            db.commit_primary_layout_with_recovery(op.clone(), Some(proof), None)
                 .await
                 .is_err()
         );

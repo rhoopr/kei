@@ -67,6 +67,51 @@ impl ExifProbe {
         capture_timestamp_matches(existing, created_local)
     }
 
+    /// Strict capture-repair proof. The wall clock must render `created_local`
+    /// and the expected zone must be present in the timestamp itself, the
+    /// separate `OffsetTimeOriginal` value, or both. When both are present they
+    /// must agree; a conflict is not repaired evidence.
+    pub(crate) fn denotes_capture_time_with_offset(
+        &self,
+        created_local: &DateTime<FixedOffset>,
+        expected_offset: &str,
+    ) -> bool {
+        let Some(existing) = self.datetime_original.as_deref() else {
+            return false;
+        };
+        let Some((wall_clock, embedded_zone)) = parse_capture_timestamp(existing) else {
+            return false;
+        };
+        // Preserve the existing fractional rule: an exact wall clock, or a
+        // whole-second rendering of the expected capture time.
+        if wall_clock != created_local.naive_local()
+            && Some(wall_clock) != created_local.naive_local().with_nanosecond(0)
+        {
+            return false;
+        }
+        let embedded = embedded_zone.and_then(format_offset);
+        let embedded_matches = embedded.as_deref() == Some(expected_offset);
+        if embedded_zone.is_some() && !embedded_matches {
+            return false;
+        }
+        let separate = self.offset_time_original.as_deref();
+        let separate_matches = separate == Some(expected_offset);
+        if separate.is_some() && !separate_matches {
+            return false;
+        }
+        embedded_matches || separate_matches
+    }
+
+    /// True only when the timestamp itself carries the expected zone.
+    pub(crate) fn capture_time_zone_matches(&self, expected_offset: &str) -> bool {
+        self.datetime_original
+            .as_deref()
+            .and_then(parse_capture_timestamp)
+            .and_then(|(_, zone)| zone)
+            .and_then(format_offset)
+            .is_some_and(|zone| zone == expected_offset)
+    }
+
     pub(crate) fn native_heif_capture_time_repair_required(
         &self,
         created_local: &DateTime<FixedOffset>,
@@ -107,6 +152,16 @@ impl ExifProbe {
             }
         }
     }
+}
+
+fn format_offset(offset: FixedOffset) -> Option<String> {
+    let seconds = offset.local_minus_utc();
+    if seconds % 60 != 0 {
+        return None;
+    }
+    let minutes = i64::from(seconds).abs() / 60;
+    let sign = if seconds < 0 { '-' } else { '+' };
+    Some(format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60))
 }
 
 fn capture_timestamp_matches(value: &str, expected: &DateTime<FixedOffset>) -> bool {
@@ -493,6 +548,46 @@ mod tests {
             "probe must read GPS even when extension is `.kei-tmp`"
         );
         fs::remove_file(&path).ok();
+    }
+
+    /// Capture repair proof accepts only whole-minute zones.
+    /// `chrono::FixedOffset` can carry seconds; `format_offset` must not render
+    /// those as a valid `+HH:MM` match.
+    #[test]
+    fn capture_repair_proof_rejects_sub_minute_and_mismatched_zones() {
+        use super::{ExifProbe, format_offset};
+        use chrono::{DateTime, FixedOffset};
+
+        assert_eq!(
+            format_offset(FixedOffset::east_opt(5 * 3600 + 30 * 60 + 30).unwrap()),
+            None,
+            "a sub-minute offset has no minute-precision representation"
+        );
+        assert_eq!(
+            format_offset(FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap()).as_deref(),
+            Some("+05:30")
+        );
+        let created_local = DateTime::parse_from_rfc3339("2024-06-15T10:00:00+05:30").unwrap();
+        let probe = ExifProbe {
+            datetime_original: Some("2024-06-15T10:00:00+05:30".into()),
+            offset_time_original: Some("+05:30".into()),
+            ..ExifProbe::default()
+        };
+        assert!(probe.denotes_capture_time_with_offset(&created_local, "+05:30"));
+        assert!(!probe.denotes_capture_time_with_offset(&created_local, "+05:31"));
+        assert!(!probe.capture_time_zone_matches("+05:31"));
+        let conflicting = ExifProbe {
+            offset_time_original: Some("+05:31".into()),
+            ..probe
+        };
+        assert!(
+            !conflicting.denotes_capture_time_with_offset(&created_local, "+05:30"),
+            "a separate zone that contradicts the embedded zone is not repaired evidence"
+        );
+        assert!(
+            !conflicting.denotes_capture_time_with_offset(&created_local, "+05:31"),
+            "neither side of a conflicting pair is repaired evidence"
+        );
     }
 
     #[test]

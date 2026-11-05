@@ -274,6 +274,18 @@ fn pending_retry_no_download_result(
     }
 }
 
+/// Replay durable pending work without source enumeration. Used when an epoch
+/// proof is ready but a new baseline or config delta must not run.
+pub(crate) async fn replay_pending_work(
+    download_client: &Client,
+    passes: &[crate::commands::AlbumPass],
+    config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
+    shutdown_token: CancellationToken,
+) -> Result<SyncResult> {
+    run_targeted_recovery_pass(download_client, passes, config, controls, shutdown_token).await
+}
+
 pub(super) async fn append_targeted_recovery_to_sync_result(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],

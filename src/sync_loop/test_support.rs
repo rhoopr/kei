@@ -515,8 +515,34 @@ pub(super) async fn run_full_cycle_with_album(
 // the world (waste) or (b) skip previously-failed assets (silent loss).
 // None of the four critical branches had a direct unit test before.
 
+pub(super) fn synthetic_owner() -> state::db::account::AccountOwner {
+    state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(serde_json::json!({"dsInfo":{"dsid":"synthetic-test"}}))
+            .expect("synthetic account login response"),
+    )
+    .expect("synthetic account owner")
+}
+
+pub(super) fn bind_test_account_owner(db: &state::SqliteStateDb) {
+    let conn = db
+        .acquire_lock("bind synthetic test account owner")
+        .expect("lock state DB for test owner");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS account_owner(\
+         singleton INTEGER PRIMARY KEY CHECK(singleton=1), \
+         version INTEGER NOT NULL, account_key TEXT NOT NULL, \
+         provider_key TEXT NOT NULL);\
+         INSERT OR IGNORE INTO account_owner VALUES(1,1,'test-account','test-provider');",
+    )
+    .expect("bind synthetic test account owner");
+}
+
 pub(super) fn make_state_db() -> Arc<dyn download::DownloadStore> {
-    Arc::new(state::SqliteStateDb::open_in_memory().expect("open in-memory state DB"))
+    let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+    bind_test_account_owner(&db);
+    Arc::new(db)
 }
 
 pub(super) const SCOPED_DB_SYNC_TOKEN_FAILURE_KEY: &str = "scoped_db_sync_token";
@@ -1014,8 +1040,11 @@ impl crate::state::ReconciliationStateStore for FailingMetadataSetDb {
     async fn reserve_reconciliation_paths(
         &self,
         reservations: &[crate::state::ReconciliationReservation],
+        actual_child: Option<&str>,
     ) -> Result<(), crate::state::error::StateError> {
-        self.inner.reserve_reconciliation_paths(reservations).await
+        self.inner
+            .reserve_reconciliation_paths(reservations, actual_child)
+            .await
     }
 }
 
@@ -1412,12 +1441,6 @@ impl state::MembershipStore for FailingMetadataSetDb {
 
 #[async_trait::async_trait]
 impl state::MetadataRewriteStore for FailingMetadataSetDb {
-    fn metadata_activity_owner(
-        &self,
-    ) -> Option<&dyn crate::state::db::metadata_activity::MetadataActivityOwner> {
-        self.inner.metadata_activity_owner()
-    }
-
     async fn protected_legacy_paths(
         &self,
     ) -> Result<Vec<std::path::PathBuf>, crate::state::error::StateError> {
@@ -1635,4 +1658,56 @@ pub(crate) async fn run_prepared_fixture_cycle_with_refresh(
     )
     .await
     .unwrap()
+}
+
+#[cfg(test)]
+mod checked_finish_default_tests {
+    use crate::state::db::{
+        MetadataRewriteCompletion, MetadataRewriteQueue, PendingMetadataRewrite,
+    };
+    use crate::state::{MetadataRewriteStore, error::StateError};
+
+    #[tokio::test]
+    async fn supplied_file_proof_is_not_ignored_by_a_default_store() {
+        let inner = std::sync::Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
+        let store = super::FailingMetadataSetDb::without_set_failure(inner, "synthetic");
+        let pending = PendingMetadataRewrite {
+            asset: crate::test_helpers::TestAssetRecord::new("default-checked").build(),
+            selection_receipt: None,
+            capture_repair_receipt: None,
+            source_checksum: None,
+        };
+        let error = store
+            .finish_metadata_rewrite_checked(
+                &pending,
+                MetadataRewriteQueue::Ordinary,
+                None,
+                None,
+                MetadataRewriteCompletion::Ordinary,
+                Some(Box::new(|| Ok(()))),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StateError::Invariant { .. }));
+        let plain = store
+            .finish_metadata_rewrite_checked(
+                &pending,
+                MetadataRewriteQueue::Ordinary,
+                None,
+                None,
+                MetadataRewriteCompletion::Ordinary,
+                None,
+            )
+            .await;
+        assert!(
+            !matches!(
+                plain,
+                Err(StateError::Invariant {
+                    operation: "finish_metadata_rewrite_checked",
+                    ..
+                })
+            ),
+            "plain completion path still delegates to the store owner"
+        );
+    }
 }

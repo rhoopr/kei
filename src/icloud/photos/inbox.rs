@@ -60,13 +60,6 @@ impl ShadowCapture {
             {
                 Ok(plan) => plan,
                 Err(error) => {
-                    if super::error::classify_catalog_projection_error(&error) {
-                        crate::support::record_storage(
-                            crate::support::StorageComponent::Catalogue,
-                            crate::support::StorageOutcome::SingleItemLimit,
-                            None,
-                        );
-                    }
                     return Err(super::error::ShadowPageError::from(error).into());
                 }
             };

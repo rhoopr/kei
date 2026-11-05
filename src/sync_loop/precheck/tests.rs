@@ -717,4 +717,136 @@ async fn indexing_qualified_replay_bypasses_quiet_database_shortcut_across_reope
     }
 }
 
+async fn seed_epoch_pending(
+    db: &state::SqliteStateDb,
+    zone: &str,
+    attempt: &str,
+    next_attempt_at: i64,
+) {
+    let epoch = db.sync_epoch_id().await.unwrap().unwrap();
+    let library = serde_json::json!({
+        "version": 2,
+        "epoch": epoch,
+        "library": zone,
+        "state": "pending",
+        "reason": "historic_ambiguous",
+        "attempt": attempt,
+        "attempts": 1,
+        "next_attempt_at": next_attempt_at,
+        "last_outcome": null,
+        "baseline_scope": "scope",
+        "enrolled_at": 0,
+        "completed_at": null
+    });
+    db.set_metadata(
+        &crate::state::db::sync_epoch::library_key(zone),
+        &library.to_string(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn reset_record_wakes_only_when_due() {
+    let db = state::SqliteStateDb::open_in_memory().unwrap();
+    let zone = "PrimarySync";
+    seed_epoch_pending(&db, zone, "test-attempt", 0).await;
+    let library = make_run_cycle_library_state(zone, "sync_token", "zone_token");
+    let mut precheck = WatchPrecheck::SkipAll;
+    include_pending_local_work(&mut precheck, &db, &[library]).await;
+    assert!(
+        precheck.should_sync_zone(zone),
+        "a due reset library state must bypass the watch no-change shortcut"
+    );
+
+    seed_epoch_pending(
+        &db,
+        zone,
+        "test-attempt",
+        chrono::Utc::now().timestamp() + 3600,
+    )
+    .await;
+    let library = make_run_cycle_library_state(zone, "sync_token", "zone_token");
+    let mut precheck = WatchPrecheck::SkipAll;
+    include_pending_local_work(&mut precheck, &db, &[library]).await;
+    assert!(
+        !precheck.should_sync_zone(zone),
+        "a backed-off real library state must not wake a busy cycle"
+    );
+}
+
+#[tokio::test]
+async fn reset_hold_waits_for_record_backoff() {
+    let db = state::SqliteStateDb::open_in_memory().unwrap();
+    let zone = "PrimarySync";
+    seed_epoch_pending(
+        &db,
+        zone,
+        "test-attempt",
+        chrono::Utc::now().timestamp() + 3600,
+    )
+    .await;
+    let hold = serde_json::json!({
+        "version": 1,
+        "prior_cursor_sha256": "retained",
+        "enum_config_hash": "enum",
+        "preservation_config_hash": null,
+        "next_attempt_at": 0,
+        "attempt_count": 1
+    });
+    db.set_metadata(
+        &format!(
+            "{}{zone}",
+            crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
+        ),
+        &hold.to_string(),
+    )
+    .await
+    .unwrap();
+    let library = make_run_cycle_library_state(zone, "sync_token", "zone_token");
+    let mut precheck = WatchPrecheck::SkipAll;
+    include_pending_local_work(&mut precheck, &db, &[library]).await;
+    assert!(
+        !precheck.should_sync_zone(zone),
+        "a backed-off epoch record must suppress the retained-hold wake"
+    );
+}
+
+#[tokio::test]
+async fn reset_hold_does_not_wake_when_record_not_due() {
+    let db = state::SqliteStateDb::open_in_memory().unwrap();
+    let zone = "PrimarySync";
+    seed_epoch_pending(
+        &db,
+        zone,
+        "test-attempt",
+        chrono::Utc::now().timestamp() + 3600,
+    )
+    .await;
+    let hold = serde_json::json!({
+        "version": 1,
+        "prior_cursor_sha256": "retained",
+        "enum_config_hash": "enum",
+        "preservation_config_hash": null,
+        "next_attempt_at": 0,
+        "attempt_count": 1
+    });
+    db.set_metadata(
+        &format!(
+            "{}{zone}",
+            crate::sync_cycle::RETAINED_CHECKPOINT_HOLD_PREFIX
+        ),
+        &hold.to_string(),
+    )
+    .await
+    .unwrap();
+    let library = make_run_cycle_library_state(zone, "sync_token", "zone_token");
+    let mut precheck = WatchPrecheck::SkipAll;
+    include_pending_local_work(&mut precheck, &db, &[library]).await;
+    assert!(
+        !precheck.should_sync_zone(zone),
+        "a backed-off reset record must suppress the retained-hold wake"
+    );
+}
+
 mod baseline_watch_tests;

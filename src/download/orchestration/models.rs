@@ -70,6 +70,7 @@ pub enum FullEnumerationReason {
     AlbumRelationHydrationIncomplete,
     EnumConfigHashDrift,
     DownloadConfigHashDrift,
+    SyncEpochEnrollment,
     #[allow(
         dead_code,
         reason = "serialized public reason retained for report compatibility after retry work moved off full enumeration"
@@ -86,6 +87,7 @@ impl FullEnumerationReason {
             Self::AlbumRelationHydrationIncomplete => ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON,
             Self::EnumConfigHashDrift => "enum_config_hash_drift",
             Self::DownloadConfigHashDrift => "download_config_hash_drift",
+            Self::SyncEpochEnrollment => "sync_epoch_enrollment",
             Self::ExplicitRetryFailed => "explicit_retry_failed",
             Self::OtherStaticReason => "other_static_reason",
         }

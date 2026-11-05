@@ -59,7 +59,14 @@ including a mismatching-prefix negative control and unchanged bytes/mtime.
 The safe unchanged-byte subset requires source_checksum, recorded local SHA-256
 and the freshly computed local SHA-256 to agree, with matching provider
 rendition/signature/size and valid account/scope. Exclude managed layout-derived
-source evidence. This supports mixed-label reuse without remote media.
+source evidence. Baseline reuse also requires the selected target to be the
+exact scoped state or child, or to have an existing exclusive legacy owner claim
+naming the actual child. Bound cross-source or scoped receipt flows remain
+separate and unchanged; those flows may prove the same asset across a source
+boundary. Raw master mappings, filename, or equal content do not establish that
+identity. Historical Primary and Shared files stay preserved. An unproved
+foreign new asset gets a separate deterministic path and may download the same
+bytes once.
 
 The public v0.24.1/v0.25.2 writers demonstrate why source/local mismatches cannot
 by themselves prove legitimate metadata edits: generic size-based adoption
@@ -166,7 +173,7 @@ synthetic test proves its exercised boundary, not a reporter archive or beta.
 
 | Requirement | Evidence and remaining pass criterion |
 | --- | --- |
-| [#845](https://github.com/rhoopr/kei/issues/845), [#853](https://github.com/rhoopr/kei/issues/853): reuse historical Primary-to-Shared media without duplicate downloads or path churn | Existing scoped receipt and fresh-root tests are directional. Exercise a representative authenticated mixed-version migration with independent identity and full byte evidence, stable recorded paths, metadata and timestamps, still and motion renditions, multiple passes, preview/execution parity and no redundant media GET across reopen. Unsupported matches remain visible and pending. |
+| [#845](https://github.com/rhoopr/kei/issues/845), [#853](https://github.com/rhoopr/kei/issues/853): preserve historical Primary-to-Shared media, with reuse limited to the exact scoped state or child, or an existing exclusive legacy claim naming the actual child | Existing scoped receipt and fresh-root tests are directional. Exercise a representative authenticated mixed-version migration with independent identity and full byte evidence, stable recorded paths, metadata and timestamps, still and motion renditions, multiple passes, preview/execution parity and no redundant media GET for the proven same asset across reopen. Preserve historical Primary and Shared files. Treat an unproved foreign asset as separate work: it gets a deterministic separate path and may download the same bytes once. Earlier mixed-label passes used the prior content-only rule and do not retroactively qualify this boundary. Unsupported matches remain visible and pending. |
 | [#953](https://github.com/rhoopr/kei/issues/953), [#956](https://github.com/rhoopr/kei/issues/956), [#1044](https://github.com/rhoopr/kei/issues/1044): useful selected progress despite sparse or unselected holds | Prove authenticated account, zone, child/master and selection boundaries, bounded durable retries and independent progress across restart. Missing zone, empty search and unselected work do not establish identity or deletion. |
 | [#1044](https://github.com/rhoopr/kei/issues/1044): missed pre-baseline deletion in the reported Hidden-only selection | Existing unrestricted Unfiled source-revalidation fixture covers two renditions synthetically; its eligibility gate excludes Hidden-only. Exercise the actual selected baseline and service path with a previously held cursor, explicit provider deletion and expungement, both Live Photo renditions, independent work and reopen. Confirm both catalog rows while preserving exact local media, metadata, paths and timestamps. Require an authenticated library scope and exact stored source identity and rendition rows. Historical Hidden-pass membership is not required for confirmed catalog truth, and this lookup does not certify selected coverage or authorize downloads or checkpoints. Inventory absence, NOT_FOUND alone, missing master or zone, and ambiguous sibling ownership are not deletion authority. |
 | [#1024](https://github.com/rhoopr/kei/issues/1024), [#958](https://github.com/rhoopr/kei/issues/958): bounded state and quiet reopened cost | A small-budget synthetic full-legacy-inbox control passed at f3 with new raw captures forbidden; the near-512 MiB control was ignored. Prove representative near-full upgrade, retained due historical hydration, independent library progress and bounded repeated current/replay state and provider/catalog work. Full raw inbox alone is not shown to block current work; legacy owner retirement remains incomplete. |
@@ -187,7 +194,7 @@ head. Focused tests are evidence of individual outcomes, not readiness.
 
 | Required outcome | Demonstrated | Remaining gap |
 | --- | --- | --- |
-| Intelligent reuse | Unchanged source receipts across mixed labels, renamed/suffixed paths, separate identities, wrong-content controls | Supported raw missing-receipt matching passes normal-cycle fixtures; activation is validated for the scoped raw-file route; edited/unknown signatures and unrecorded renamed candidates remain gaps |
+| Intelligent reuse | Unchanged source receipts reuse only the exact scoped state or child, or an existing exclusive legacy claim naming the actual child; renamed/suffixed paths, separate identities and wrong-content controls remain separate. Bound cross-source or scoped receipt flows are unchanged and may prove the same asset across a source boundary | Supported raw missing-receipt matching passes normal-cycle fixtures; an unproved foreign new asset gets a separate deterministic path and may download the same bytes once; earlier mixed-label passes used the prior content-only rule and do not retroactively qualify this boundary; edited/unknown signatures and unrecorded renamed candidates remain gaps |
 | Visible uncertainty | Wrong-content/missing receipts remain pending with partial-failure reporting and no duplicate GET across reopen | Safe automatic resolution of the unverified subset |
 | Fresh baseline and incremental | Normal-cycle fixtures ignore old tokens, catch concurrent changes, download missing content, then run second/third incremental cycles without inventory | Broader expiry/selection coverage; no unconditional completion under endless rank mutations |
 | Independent retries | Failed transfers, quiet provider, changed templates, added/removed albums and changed filename filters preserve original destinations | Other selection combinations and expired-resource cases |

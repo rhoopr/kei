@@ -751,7 +751,13 @@ impl ReportStateStore for SqliteStateDb {
                 "SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND is_deleted=0 AND status IN ('pending','failed'))",
                 [&library], |row| row.get(0),
             ).map_err(|error| StateError::query("has_download_retry_work", error))?;
-            Ok(pending || super::source_revalidation::has_due(conn, &library)?)
+            Ok(pending
+                || super::source_revalidation::has_due(conn, &library)?
+                || super::sync_epoch::should_wake(
+                    conn,
+                    &library,
+                    chrono::Utc::now().timestamp(),
+                )?)
         }).await
     }
 

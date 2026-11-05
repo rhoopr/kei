@@ -25,7 +25,10 @@ pub(crate) struct PublicationBinding {
 }
 
 impl PublicationBinding {
-    fn validate(&self, conn: &rusqlite::Connection) -> Result<(), StateError> {
+    pub(in crate::state::db) fn validate(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> Result<(), StateError> {
         let owner: (String, String) = conn.query_row(
             "SELECT account_key,provider_key FROM account_owner WHERE singleton=1",
             [],

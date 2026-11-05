@@ -2,9 +2,9 @@
 
 Local iteration uses focused tests. Hosted PR CI owns complete offline and
 platform validation; do not repeat those suites locally by default. Run live
-provider and real host-service checks only when relevant and authorized.
-`KEI_FULL_TEST_REAL_SERVICE=1 just release-local` collects the local release
-prerequisites without replaying hosted offline checks. `just full-test` remains
+provider checks only when relevant and authorized. `just release-local` collects
+the local release prerequisites without replaying hosted offline checks.
+`just full-test` remains
 available for an explicit complete local audit. See [CI qualification](../docs/ci.md).
 
 Everything under `tests/` is either a Rust integration target or a shell
@@ -55,7 +55,6 @@ tests/
 | `scripts/full-test/run_release_archive_smoke.sh` | no | `just full-test` |
 | `scripts/test-scenarios/*.sh` | no | `just test scenario NAME` or `just test scenarios` |
 | `scripts/full-test/run_release_regression_smoke.sh` | no | `just release-smoke` |
-| `.github/workflows/service-smoke.yml` | no | `just service-smoke` (linux/macOS) |
 
 `branch_static` belongs to the complete offline routes, including `just gate`,
 rather than `just test fast`. Run it directly or through a relevant scenario
@@ -845,11 +844,11 @@ Choose the route by purpose:
 |---------|---------|-------|
 | Focused iteration | `just test scenario NAME`, `just test fast`, or `just test PATTERN` | Relevant tests with default features; not a complete gate |
 | Optional local offline gate | `just gate` | Static checks, all-feature and no-default suites, and focused-filter catalog checks |
-| Optional combined local battery | `just full-test` | The offline gate's checks plus nightly tools, package, Docker, live provider, release-binary, and service phases |
+| Optional combined local battery | `just full-test` | The offline gate's checks plus nightly tools, package, Docker, live provider, and release-binary phases |
 
 `just test offline` runs the behavior and catalog portion of `just gate`.
 `just test` runs only the all-feature suite. Existing focused, packaging,
-Docker, service, and live commands remain available individually.
+Docker, and live commands remain available individually.
 
 ### Route coverage
 
@@ -863,7 +862,7 @@ The change from the `8f3467c` route removes replay, not distinct test setups:
 | Focused scenarios | Default-feature library and `branch_static` filters, listed before execution | Unchanged; empty filters now also fail |
 | Nightly tools | Optional fuzz build; required nightly unused-dependency check | Unchanged |
 | Package and Docker | Release archive; extracted binary; container build, PUID, multiarch, CLI, default command | Unchanged |
-| Live and service | Provider tests; shell suites; release-binary CLI and import rehearsal; service smoke | Unchanged, including opt-in cross-zone and real host-service checks |
+| Live | Provider tests; shell suites; release-binary CLI and import rehearsal | Unchanged, including opt-in cross-zone checks |
 
 Both complete Rust suites include every integration target and the library
 scope matrix. At this baseline, the drift-target loop adds no targets.
@@ -914,7 +913,6 @@ just test state                 # shell: token + config-hash invariants
 just test docker                # shell: Docker container scenarios
 just test packaging             # release build + archive smoke
 just test docker-full           # Docker build, PUID, multiarch, CLI/default-command smokes
-just test service               # local service-smoke wrapper
 just test PATTERN               # passes through to cargo test PATTERN
 just static-checks              # fmt, clippy, docs, audit, lint, contracts, typos
 just gate                       # static checks + offline behavior tests
@@ -1010,13 +1008,12 @@ details are baked into test code.
 | `ICLOUD_PASSWORD` | required | Apple ID password |
 | `ICLOUD_TEST_COOKIE_DIR` | `./.test-cookies` | Pre-authenticated session dir |
 | `KEI_DOCKER_IMAGE` | `kei:latest` | Docker image under test |
-| `CARGO_TARGET_DIR` | `./target` | Cargo build directory. Full-test packaging, shell, live, service, and metrics phases use release artifacts from this directory. |
+| `CARGO_TARGET_DIR` | `./target` | Cargo build directory. Full-test packaging, shell, live, and metrics phases use release artifacts from this directory. |
 | `KEI_FULL_TEST_TMPDIR` | `/tmp/codex/kei/full-test/tmp` | Temporary directory for full-test child processes and shell-suite scratch data. |
 | `KEI_TEST_SCRATCH_DIR` | `/tmp/codex/kei/shell-tests-$USER` | Base dir for standalone shell-suite scratch; `just full-test` overrides this to `$KEI_FULL_TEST_TMPDIR/shell` or `/tmp/codex/kei/full-test/tmp/shell` |
 | `KEI_IMPORT_FIXTURE_DIR` | `/tmp/codex/kei/import-fixture` | Parent directory for isolated import fixture runs retained for failure inspection |
 | `KEI_FULL_TEST_CROSS_ZONE_ALBUM` | unset | Optional full-test album fixture for cross-zone hydration. The album must include at least one asset from a non-primary source zone. |
 | `KEI_FULL_TEST_CROSS_ZONE_MIN_FILES` | `1` | Minimum non-primary downloaded asset rows required when `KEI_FULL_TEST_CROSS_ZONE_ALBUM` is set. |
-| `KEI_FULL_TEST_REAL_SERVICE` | unset | Set to `1` to let `just full-test` install, start, status-check, and uninstall a real Linux user systemd service |
 | `KEI_FULL_TEST_EXPECT_VERSION` | unset | Optional exact Cargo package version expected by the release-archive smoke |
 
 `just test live` uses the shared bounded selection. Cookie dir falls through
@@ -1131,43 +1128,28 @@ happens:
   release-binary check for accounts with a prepared cross-zone album fixture.
   It selects the named album with `libraries = ["all"]` and fails unless the
   sync records at least one downloaded asset from a non-primary source zone.
-- **`service-smoke` workflow** - per-platform CI smoke for `kei install`
-  / `kei uninstall`. Builds the release binary on
-  `ubuntu-latest`/`macos-latest`/`windows-latest`, runs `kei install
-  --dry-run` to print the platform artifact (systemd unit, launchd
-  plist, or Windows SCM preview) without writing files or invoking the
-  service manager, validates the artifact or no-op contract with
-  platform-native checks (`systemd-analyze verify`, `plutil -lint`, or
-  `Get-Service`), then runs `kei uninstall` against a clean host.
-  Catches renderer, dry-run, and default install regressions; doesn't
-  exercise the actual service-manager handoff.
-
 ## Service testing contract
 
 Automated coverage:
 
-- CLI parse/help for `kei install`, `kei uninstall`, and `kei service`.
-- Pure systemd, launchd, Windows SCM renderers and status formatters.
-- `kei install --dry-run` prints the service artifact and writes nothing.
-- Linux/macOS/Windows smoke validates dry-run output syntax and clean
-  uninstall behavior.
+- CLI parse/help for `kei service run` and `kei service status`.
+- Linux systemd, macOS launchd, and Windows SCM status formatters.
+- Windows SCM runtime dispatch and foreground fallback.
+- Linux sd-notify readiness and watchdog behavior.
 - Docker packaging defaults to `kei service run` so containers keep the
   24-hour watch fallback when `[watch].interval` is unset.
 
-Manual real-install coverage:
+Manual host-supervisor coverage:
 
-- `systemctl enable --now` and systemd restart behavior.
-- `launchctl bootstrap` / `bootout` against a live GUI domain.
-- Windows SCM `CreateServiceW`, account password handoff, and service
-  control dispatcher startup.
-- Boot/reboot persistence and a real long-running sync against the
-  bounded primary-library selection.
+- Existing systemd units that run `kei service run --config ...` keep starting
+  and reporting status.
+- Existing launchd agents keep starting and reporting status.
+- Existing Windows SCM registrations keep starting and reporting status.
+- Operators remove a registration with the host supervisor. Removal never
+  deletes photos, configuration, credentials, state, or logs.
 
-`just full-test` can run the Linux user-service lifecycle with
-`KEI_FULL_TEST_REAL_SERVICE=1`. It refuses to run if `kei.service` already
-exists, and it uninstalls the service before returning. The installer may
-temporarily enable user linger; uninstall restores the prior linger state when
-that state was recorded during install.
+kei does not create or remove service registrations. Tests must not install,
+enable, disable, or uninstall a host service.
 
 ## Sparse-share identity regression
 
@@ -1464,23 +1446,17 @@ before the selected scope passes its own check. Malformed-list tests prove that
 invalid complete-list evidence is never cached. Existing queue admission tests
 cover capture attachment, durable receipts, rollback, replay and unchanged follow-up.
 
-### Managed edited-primary qualification
+### Recorded layout recovery qualification
 
-`cargo test --all-features --lib primary_layout` exercises the opt-in owner with file-backed SQLite, synthetic provider generations and a real local HTTP server. The fixture checks original, two edits, revert, edit-again from verified history, HEIC/JPEG extension changes, preserved media/sidecar hashes, rendition keys, manifests, private destination generations, suffix migration/reversal, collisions, source drift, read-only plans, state-write failure, process death and quiet reopened cycles. The ignored worker is launched and killed by the parent process-death test; it is not a skipped standalone proof.
+`cargo test --all-features --lib primary_layout` exercises recorded current-primary layout recovery. Production sync no longer creates or supports new layout transitions: `src/download/orchestration/primary_layout.rs` keeps the recovery path, and its `plan` helper is behind `#[cfg(test)]`. Test-only builders `prepared_layout_with_refresh`, `seed_unprepared_refresh` and `prepared_layout_in_library` seed released-shape schema-35 journals for these controls; they do not restore an opt-in layout planner.
 
-The protected-overlap regressions distinguish direct `finish` calls from the
-`recover` coordinator. Both media and sidecar conflicts preserve bytes, journals,
-retry debt and checkpoints across reopens. The coordinator stops before later
-independent operations; a separately completed family does not release the
-blocked journal on the next unchanged recovery attempt.
+`contract_file_publish_no_overwrite_primary_layout_edits_revert_and_quiet_reopen`, `primary_layout_heic_jpeg_extension_changes_retire_only_preserved_owned_aliases`, `primary_layout_preserves_sidecar_bytes_and_fences_old_metadata_queue`, `review501_legacy_reverted_edit_is_preserved_outside_visible_library`, `review501_retained_source_mutation_between_snapshots_holds_publication` and `primary_layout_stale_writers_and_downloaded_receipts_cannot_finalize_current_slots` check recorded journals, `.kei-history`, preserved media and sidecar bytes, receipt checksums, collisions, source drift, durable checkpoints and quiet reopens. The `portable_prepolicy_*` controls exercise the same recovery gates without requiring the ignored released-writer fixture.
 
-The process-death oracle restarts at every journal boundary, checks independently retained old bytes before completion, and requires two subsequent zero-download, zero-lookup cycles. Real Live Photo fixture bytes cover both MOV naming policies; automated byte preservation does not qualify Immich pairing. Manual Immich testing requires both exclusion patterns documented in `docs/edited-primary.md`.
+`primary_layout_root_drift_holds_recorded_media_and_exact_sidecar_journals` and `primary_layout_root_drift_after_old_parent_moves_redownloads_then_stays_quiet` keep recorded bytes at the old root and require quiet cycles after recovery. `naming_switch_preserves_existing_paths_without_redownload` and `ordinary_naming_change_does_not_initiate_layout_migration` prove current naming or root changes create no layout operations or bindings. `primary_layout_read_only_plans_preserve_files_and_ownership` proves dry-run and print-filenames write no layout or reconciliation rows.
 
-The independent-review `review501` regressions compose a failed started handover with root/template changes and policy reversal, checking the latest catalogue checksum/path after two quiet reopens. First-binding migrations also cover an unselected owned original, a provider-reverted suffix edit, a legacy HEIC/JPEG edit history with equal-content aliases, exact sidecar/history retention and a locally changed unselected original that must hold completion.
+`contract_source_checkpoint_requires_durable_recovery_and_temp_file_delete_requires_durable_ownership_primary_layout_process_death` restarts at journal boundaries with `primary_layout_death_worker`, checks retained bytes, durable checkpoints and process-death recovery, and requires two zero-download, zero-lookup cycles. The ignored worker is launched by the parent test rather than treated as a standalone proof. Existing recovery controls remain covered; none promises suffix migration or a new convergence flow.
 
-A deterministic, path-scoped one-shot hook mutates a committed retained source between its SHA-verified snapshot and candidate receipt snapshot, covering both in-place edits and inode replacement. The operation must hold without publishing mismatched bytes or advancing the checkpoint; restoring the synthetic history then proves convergence and two quiet reopens. Managed selected metadata belongs to the layout owner; ordinary whole-asset refresh must resolve ownership across all passes before updating any stored path. A selected album collecting delta after suffix reversal checks updated current sidecar/catalogue metadata, exact prior sidecar preservation, empty ordinary rewrite debt and two quiet reopens. A collecting media edit injects final binding-commit failure, holds its checkpoint, independently preserves the prior edit and restarts without another GET. Explicit refresh exercises a preparation-state failure, durable forced intent and restart without the operator flag before quiet reopens. Migration establishes real album membership before publication, while preserving an unfiled label only for path rendering; retains original-archive debt outside ordinary writers and checks that prepared capture repair still blocks source deletion.
-
-Qualification requires the full `just gate` at the candidate commit plus the final format and strict all-target/all-feature Clippy checks. Record macOS, Windows and target-filesystem checks separately; Linux fixture results do not stand in for unrun platform checks.
+Hosted PR CI owns the full offline gate. Run relevant focused tests locally, followed by `cargo fmt --all --check` and `cargo clippy --all-targets --all-features -- -D warnings`. Record macOS, Windows and target-filesystem results separately; Linux fixture results do not qualify unrun platforms. No test result or independent recovery acceptance is claimed here.
 
 
 ## Retained checkpoint expiry and mixed delta proof
@@ -1564,22 +1540,14 @@ oracles. Ordinary and Hidden production-cycle unknown-source controls retain the
 original checkpoint/proof/row/file checks and require the fixed prerequisite label.
 A production-cycle fallback control injects read failure, unavailable inspection
 and a changed snapshot while retaining unknown provenance and every checkpoint hold.
-Support-history round-trip coverage permits only the eight fixed labels and drops
-identifiers, paths, hashes, errors and unknown future labels. No reporter data,
-authenticated run, recovery action, migration or new acceptance rule is exercised.
+Support-diagnostic allowlist coverage permits only the eight fixed labels and
+drops identifiers, paths, hashes, errors and unknown future labels. No reporter
+data, authenticated run, recovery action, migration or new acceptance rule is
+exercised.
 
-## Token-equivalence diagnostics
+## Missing-reference inventory diagnostic
 
-`cargo test --lib token_equivalence` covers invocation-local token groups,
-missing/blank/dropped/incomplete and oversized evidence, collection bounds,
-malformed stored rows, redaction and export round trips. The 46-pass fixture
-runs the real full-enumeration and retry path with an empty synthetic destination,
-then exports its persisted history through the production offline collector.
-Persistent split and moving snapshot controls both retain the checkpoint and all
-46 retry passes; only their exported cross-round equivalence differs. A separate
-stream fixture proves drainage order and missing order after drop. These are
-observational tests, not a new durable state transition or a proof of media
-idempotence. Existing checkpoint and L1 preservation controls remain applicable.
+The `missing_reference_inventory_flag_is_removed` CLI guard in `tests/cli.rs` rejects `doctor --missing-reference-inventory` with exit code 2. `doctor_help_succeeds` also confirms the flag is absent from doctor help. Ordinary `doctor --json` and `doctor --live` remain. The removed live inventory route has no replacement diagnostic tests; normal provider identity recovery stays in the sync and checkpoint paths, not doctor.
 
 
 ### Indexing integration with newer main fixes
@@ -1594,8 +1562,8 @@ combines provisional downloads, FINISHED full recovery, missing/blank delta
 successors, and two reopened healthy cycles on a Hidden-only query. Independently
 seeded media stays unchanged, omitted media downloads once, and query tokens
 remain redacted diagnostic groups rather than source checkpoint authority.
-The existing `primary_discovery_`, `legacy_smart_only_`, `token_equivalence`, and
-managed `indexing_` controls qualify the other preserved main paths separately.
+The existing `primary_discovery_`, `legacy_smart_only_`, and managed
+`indexing_` controls qualify the other preserved main paths separately.
 
 ### Active shared-library identity qualification (#956)
 
@@ -1612,7 +1580,7 @@ checks omitted/deleted masters, another relationship change, foreign ownership,
 invalid capture dates, failed mapping writes and cancellation of the second read.
 Dry-run and filename-only controls assert one read and no durable mutation.
 The fixture asserts at most two provider
-reads and the original mapping after reopening. Lookup and support-history
+reads and the original mapping after reopening. Lookup and support-diagnostic
 controls distinguish missing/malformed references, actual different-master
 references and provider errors without exposing identifiers. Existing explicit
 non-default owner discovery and cancellation fixtures remain separate controls.
@@ -1621,21 +1589,10 @@ The `issue956_lookup_record_status`, `issue956_rejection_groups` and
 `issue956_single_target_statuses` tests distinguish master/child provider
 errors and omissions through the real lookup path. Same-category responses
 aggregate, distinct failing members remain separate, and normal logs and
-retained history exclude private provider values. History reopen revalidates
-the fixed vocabulary and preserves older records with unavailable fields.
+diagnostics exclude private provider values. The support allowlist revalidates
+the fixed vocabulary and leaves older unavailable fields absent.
 These diagnostics make no additional provider requests and do not qualify
 sparse links or change lookup/checkpoint outcomes.
-
-### Missing parent-reference diagnostics
-
-`preservation_proof::missing_reference::tests` exercises scoped response categories,
-first-seen/replacement history, timeout, cancellation and one-request limits through
-the inventory refusal. Useful lookup responses still return the original refusal
-and cannot construct complete inventory evidence. Photos session tests exercise
-real local HTTP error bodies and both declared and chunked response-size bounds.
-Support contract and history tests reject arbitrary category values and retain
-safe fields across restart and export revalidation. These tests use synthetic
-records and localhost only; no account or media operations are required.
 
 ### Session-lock inheritance (#968)
 
@@ -1653,19 +1610,6 @@ state changes are involved.
 The fixtures use no sleeps, retries, live credentials or provider requests.
 They demonstrate fork inheritance; they do not attribute the original parallel
 gate failure, whose conflicting descriptor was not captured.
-
-### Missing-reference inventory command
-
-`cargo test --all-features --lib diagnostic` and
-`cargo test --all-features --test cli missing_reference_inventory` exercise the
-cached-only early command path and restricted transport with synthetic auth and
-loopback provider fixtures. They cover all-EOF census/omissions, original auth and
-catalogue/media canaries, expired/future/malformed cache, endpoint qualification,
-HTTP authentication refusal, redirects, cancellation and shared raw-body/request
-budgets. Existing preservation and missing-reference lookup tests retain the
-ordinary fail-closed acceptance controls. No live account is used. Hard process
-supervision remains an external operational requirement, as documented in
-`docs/missing-reference-inventory.md`.
 
 `cargo test --lib trusted_legacy_files` exercises explicit local-byte acceptance
 through the real cycle owner using six synthetic historical renditions, four

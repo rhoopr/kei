@@ -54,6 +54,16 @@ pub(super) fn sanitize_username(username: &str) -> String {
     format!("account-v1-{:x}", hash.finalize())
 }
 
+pub(super) fn rebind_synthetic_provider(conn: &rusqlite::Connection, provider: &str) {
+    conn.execute("UPDATE account_owner SET provider_key=?1", [provider])
+        .unwrap();
+    conn.execute(
+        "UPDATE metadata SET value=json_set(value,'$.provider_key',?1) WHERE key='sync_epoch:v1'",
+        [provider],
+    )
+    .unwrap();
+}
+
 pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) {
     conn.execute_batch("CREATE TABLE account_owner (singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL, account_key TEXT NOT NULL, provider_key TEXT NOT NULL);").unwrap();
     use sha2::{Digest, Sha256};
@@ -80,7 +90,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 41;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 43;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -762,6 +772,42 @@ CREATE TABLE IF NOT EXISTS source_revalidation_debt (
 );
 CREATE INDEX IF NOT EXISTS source_revalidation_due ON source_revalidation_debt(next_retry_at,round,id);
 ").unwrap();
+    conn.execute(
+        "INSERT INTO metadata(key,value) SELECT 'sync_epoch:v1', json_object(
+           'version',1,
+           'epoch','00000000-0000-4000-8000-000000000043',
+           'account_key',account_key,
+           'provider_key',provider_key,
+           'origin','existing_upgrade',
+           'established_at',0,
+           'quarantined_rounds',0,
+           'retained_debts',0)
+         FROM account_owner WHERE singleton=1",
+        [],
+    )
+    .unwrap();
+    // Behavioral fixtures test non-epoch behavior. Treat the default primary
+    // library as already past the one-time epoch baseline; dedicated epoch
+    // tests construct their own database instead.
+    conn.execute(
+        "INSERT INTO metadata(key,value)
+         SELECT 'sync_epoch_library:v1:PrimarySync', json_object(
+           'version',2,
+           'epoch',json_extract(value,'$.epoch'),
+           'library','PrimarySync',
+           'state','complete',
+           'reason','existing_upgrade',
+           'attempt','test-primarysync',
+           'attempts',1,
+           'next_attempt_at',0,
+           'last_outcome','complete',
+           'baseline_scope','test',
+           'enrolled_at',0,
+           'completed_at',0)
+         FROM metadata WHERE key='sync_epoch:v1'",
+        [],
+    )
+    .unwrap();
     conn.pragma_update(None, "user_version", HELPER_SCHEMA_VERSION)
         .unwrap();
     conn

@@ -3,10 +3,6 @@
 set -euo pipefail
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
-[[ "${KEI_FULL_TEST_REAL_SERVICE:-0}" == 1 ]] || {
-    echo "local release checks require explicit KEI_FULL_TEST_REAL_SERVICE=1 authorization" >&2
-    exit 64
-}
 [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || {
     echo "local release qualification requires a clean exact-commit checkout" >&2
     exit 1
@@ -43,5 +39,4 @@ phase --live live_import_rehearsal -- scripts/full-test/run_live_import_rehearsa
 if [[ -n "${KEI_FULL_TEST_CROSS_ZONE_ALBUM:-}" ]]; then
     phase --live live_cross_zone_album -- scripts/full-test/run_cross_zone_album_hydration.sh
 fi
-phase --live host_service -- just test host-service
 python3 scripts/ci/local_release.py finalize --repo rhoopr/kei --sha "$(git rev-parse HEAD)" --report "$KEI_FULL_TEST_RUNS_DIR/qualified.json"

@@ -1,14 +1,10 @@
-//! Cross-platform helpers shared by every service-install backend.
+//! Cross-platform helpers shared by service execution and status.
 //!
-//! `container_supervisor` lets `kei install` no-op cleanly inside Docker so
-//! containerized deployments keep using the existing compose workflow
-//! instead of attempting to register a launchd/systemd/SCM service that
-//! the host would never invoke. `service_identifier` and
-//! `SERVICE_DESCRIPTION` are the branding constants every backend writes
-//! into its registry entry. `current_executable` returns a canonical
-//! absolute path so service files survive PATH changes, working-directory
-//! shifts (Windows SCM starts services in `C:\Windows\System32`), and
-//! symlinked installs (Homebrew Cellar -> /usr/local/bin).
+//! `container_supervisor` lets `kei status` report container-managed
+//! supervision instead of a misleading `not installed` line. `SERVICE_IDENTIFIER`
+//! is the platform service name used by the runtime and status probes.
+//! `current_executable` returns a canonical absolute path for service logs
+//! so operators can confirm which binary is running.
 
 use std::path::{Path, PathBuf};
 
@@ -25,10 +21,7 @@ const DEFAULT_CGROUP_PATH: &str = "/proc/1/cgroup";
 #[cfg(target_os = "linux")]
 const CONTAINER_CGROUP_MARKERS: &[&str] = &["docker", "containerd", "kubepods", "podman", "lxc"];
 
-/// Human-readable description shown in service-manager registries.
-pub(crate) const SERVICE_DESCRIPTION: &str = "kei Media Sync Engine";
-
-/// Service identifier used by the per-platform installer.
+/// Service identifier used by runtime status probes.
 ///
 /// Reverse-DNS form on macOS (launchd `Label`) and Windows (SCM service
 /// name); plain `kei` on Linux (systemd unit file basename).
@@ -82,11 +75,10 @@ pub(crate) fn container_supervisor_at(dockerenv: &Path, cgroup: &Path) -> Option
 
 /// Effective UID of the current process.
 ///
-/// Centralises the one `unsafe` block per backend that wraps
-/// `libc::geteuid` so each platform module doesn't carry its own copy
-/// with a duplicated SAFETY comment. POSIX-only -- Windows uses access
-/// tokens rather than UIDs, and the linux + macOS service backends are
-/// the only callers.
+/// Centralises the one `unsafe` block that wraps `libc::geteuid` for the
+/// macOS launchd status probe. POSIX-only: Windows uses access tokens
+/// rather than UIDs. The macOS module is compiled on every Unix target
+/// for its status parser tests, so this helper stays Unix-wide.
 #[cfg(unix)]
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: libc::geteuid is a stateless POSIX FFI call with no
@@ -95,87 +87,12 @@ pub(crate) fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// Reads `auth.username` out of `kei_dir/config.toml`.
-///
-/// Returns `None` when the file is missing, malformed, or has no
-/// non-empty username -- `--purge` callers treat any of those as "no
-/// credential to clear" and proceed. Cross-platform: Linux + macOS +
-/// Windows backends all share this helper.
-pub(crate) fn read_config_username(kei_dir: &Path) -> Option<String> {
-    let config_path = kei_dir.join("config.toml");
-    let toml = crate::config::load_toml_config(&config_path, false).ok()??;
-    toml.auth?.username.filter(|u| !u.is_empty())
-}
-
-/// Wipes `kei_dir` plus any platform-specific extras after clearing the
-/// stored credential. Each platform's `--purge` path resolves the kei
-/// state directory however it wants (linux honours `XDG_CONFIG_HOME`;
-/// macOS and Windows hard-code `~/.config/kei` rather than the platform
-/// default config dir) and passes the resolved path here.
-pub(crate) fn purge_kei_state(kei_dir: &Path, extra_dirs: &[PathBuf]) -> Result<()> {
-    if let Some(username) = read_config_username(kei_dir) {
-        let realm = crate::config::load_toml_config(&kei_dir.join("config.toml"), false)
-            .ok()
-            .flatten()
-            .and_then(|config| config.auth)
-            .and_then(|auth| auth.domain)
-            .unwrap_or(crate::types::Domain::Com);
-        let store = crate::credential::CredentialStore::new(&username, kei_dir, realm.as_str());
-        match store.delete() {
-            Err(e) => {
-                // delete() bails when neither backend has anything to remove,
-                // which is fine for purge - we're cleaning up regardless.
-                tracing::debug!(error = %e, "credential delete during purge: nothing to remove");
-            }
-            Ok(()) => {
-                tracing::info!(username, "cleared stored credential");
-            }
-        }
-    }
-
-    for dir in extra_dirs {
-        match std::fs::remove_dir_all(dir) {
-            Ok(()) => tracing::info!(path = %dir.display(), "removed auxiliary purge directory"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(
-                error = %e,
-                path = %dir.display(),
-                "failed to remove auxiliary purge directory",
-            ),
-        }
-    }
-
-    match std::fs::remove_dir_all(kei_dir) {
-        Ok(()) => {
-            tracing::info!(path = %kei_dir.display(), "purged kei state directory");
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(path = %kei_dir.display(), "no kei state directory to purge");
-            Ok(())
-        }
-        Err(e) => Err(e)
-            .with_context(|| format!("Could not remove state directory {}", kei_dir.display())),
-    }
-}
-
-/// kei state directory at the dotted-config convention.
-///
-/// macOS and Windows both bypass `dirs::config_dir()` (which returns
-/// `~/Library/Application Support` and `%APPDATA%\Roaming` respectively)
-/// so service purge paths match the rest of kei's `~/.config/kei` state.
-pub(crate) fn kei_state_dir_dotted() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| crate::config::kei_data_dir_with_home(&home))
-}
-
 /// Canonical absolute path to the running `kei` executable.
 ///
-/// Service unit files / launchd plists / SCM entries reference an
-/// absolute path so they keep working after `PATH` changes or
-/// working-directory shifts. `std::env::current_exe()` may return a
-/// path containing symlinks (e.g. Homebrew's Cellar shim);
-/// `canonicalize` resolves those so the registry entry points at the
-/// real binary.
+/// The service worker logs an absolute path so operators can confirm which
+/// binary a supervisor is running after `PATH` changes or symlinked
+/// installs. `std::env::current_exe()` may return a path containing
+/// symlinks (e.g. Homebrew's Cellar shim); `canonicalize` resolves those.
 pub(crate) fn current_executable() -> Result<PathBuf> {
     let raw = std::env::current_exe().context("Could not find the current executable path")?;
     raw.canonicalize()
@@ -195,14 +112,6 @@ mod tests {
         } else {
             assert_eq!(SERVICE_IDENTIFIER, "com.rhoopr.kei");
         }
-    }
-
-    #[test]
-    fn service_description_is_pinned() {
-        // Phase-1 plan locked this string. Regression-guard so a casual
-        // rename doesn't slip past review and orphan every installed
-        // service entry on user machines.
-        assert_eq!(SERVICE_DESCRIPTION, "kei Media Sync Engine");
     }
 
     #[test]

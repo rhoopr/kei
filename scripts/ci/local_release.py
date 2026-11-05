@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate local provider and host-service evidence and attest it for one release commit.
+"""Validate local provider evidence and attest it for one release commit.
 
 Publishing is explicit. Only phase status and a report digest leave the host.
 Release CI accepts the latest repository-owner attestation, never PR artifacts.
@@ -17,7 +17,7 @@ from pathlib import Path
 
 CONTEXT = "Release local qualification"
 MAX_AGE = timedelta(days=7)
-BASE_PHASES = {"build_release", "build_live_container", "live_provider", "live_import_rehearsal", "host_service"}
+BASE_PHASES = {"build_release", "build_live_container", "live_provider", "live_import_rehearsal"}
 LIVE_COMMANDS = {"live_status", "live_libraries", "live_albums", "live_dryrun", "live_config_show",
                  "live_verify", "live_reconcile_dryrun", "live_password_backend", "live_import_dryrun"}
 

@@ -1135,7 +1135,7 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
             };
             let store: Arc<dyn download::DownloadStore> = db.clone();
             let build = make_run_cycle_download_config_builder(&media, store.clone());
-            let (recorder, diagnostics) = crate::support::history::test_layer();
+            let (recorder, diagnostics) = crate::support::test_capture::test_layer();
             let result = run_cycle(
                 &[&selected],
                 &config,
@@ -1202,8 +1202,8 @@ async fn indexing_hidden_recovery_keeps_query_diagnostics_separate_from_source_s
             assert!(
                 events
                     .iter()
-                    .any(|event| event["kind"] == "support_token_equivalence_v1"
-                        && event["fields"]["rows"][0]["initial_status"] == "present"),
+                    .any(|event| event["kind"] == "support_token_evidence_v1"
+                        && event["fields"]["sync_token_expected_receivers"].is_number()),
                 "query token evidence must survive provisional/recovery composition: step {step}: {events:?}"
             );
             assert!(

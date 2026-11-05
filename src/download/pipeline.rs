@@ -19,6 +19,7 @@ mod producer;
 mod progress;
 mod streaming;
 mod task;
+#[cfg(test)]
 pub(in crate::download) use task::{DownloadSingleContext, download_single_task};
 
 #[cfg(test)]

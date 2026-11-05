@@ -118,7 +118,6 @@ pub(in crate::download) async fn write_download_metadata(
 
     if request.flags.any_embed() && request.embed_path.is_some() {
         crate::support::observe_metadata(
-            request.embed_path.unwrap_or(request.final_path),
             "support_metadata_v1",
             serde_json::json!({
                 "operation": "embed", "source_fractional": request.created_local.timestamp_subsec_nanos() != 0,

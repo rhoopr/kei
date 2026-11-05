@@ -108,9 +108,10 @@ pub(crate) async fn run_reset_sync_token(
     let db =
         state::SqliteStateDb::open_owned(&db_path, &super::super::get_account_owner(globals, toml))
             .await?;
-    db.set_metadata("db_sync_token", "").await?;
-    let cleared = db.delete_metadata_by_prefix("sync_token:").await?;
-    let scoped_cleared = db.delete_scoped_db_sync_tokens().await?;
+    // One IMMEDIATE transaction owns the token reset, scoped-token purge and
+    // epoch staging invalidation. Success is printed only after commit; any
+    // error leaves every token, proof, marker and checkpoint unchanged.
+    let (cleared, scoped_cleared) = db.reset_sync_tokens_atomic().await?;
     println!(
         "Cleared sync tokens ({} zone token{} + db token + {} scoped db token{}). Next sync will do a full enumeration.",
         cleared,

@@ -76,8 +76,6 @@ PHASE_META = {
     "live_import_dryrun":       (78, "live-bin", None),
     "live_import_rehearsal":    (79, "live-bin", None),
     "live_cross_zone_album":    (80, "live-bin", None),
-    "service":                  (90, "service", None),
-    "host_service":             (91, "host-service", None),
     # Legacy phase names from earlier full-test layouts.
     "gate":                     (10, "0", 1990),
     "nodefault":                (15, "0.5", None),
@@ -97,8 +95,6 @@ PHASE_META = {
     "test_state_machine":       (65, "4", 20),
     "test_concurrency":         (66, "4", 9),
     "test_docker_live":         (67, "4", 16),
-    "service_smoke":            (90, "6", None),
-    "real_service_lifecycle":   (91, "6", None),
 }
 
 ICON = {"pass": "✅", "fail": "❌", "skipped": "⏭", "rate_limited": "🚦"}

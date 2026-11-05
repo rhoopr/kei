@@ -2,6 +2,7 @@ use super::TaskPlanner;
 use crate::download::{DownloadConfig, baseline_matching::BaselineMatch};
 use crate::icloud::photos::{PhotoAlbum, PhotoAlbumConfig, PhotosSession, inbox::ShadowCapture};
 use crate::state::db::DownloadStateStore;
+use crate::state::db::download_receipts::DownloadReceipt;
 use crate::state::db::{
     ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
     ReconciliationStateStore, TempFileOwnershipStore,
@@ -153,18 +154,21 @@ async fn v027_compact_only_changed_template_modified_file_is_uncertain() {
     // transaction must recheck it instead of relying on the planner snapshot.
     let decision = planner.match_existing(&asset, &config, task).await;
     let key = crate::fs_util::confined_path_key(&old).unwrap();
-    db.reserve_reconciliation_paths(&[ReconciliationReservation {
-        library: "PrimarySync".into(),
-        asset_id: "foreign-child".into(),
-        version_size: task.version_size,
-        requested_path_key: ReconciliationPathKey(key.clone()),
-        destination_path_key: ReconciliationPathKey(key),
-        destination_path: old.clone(),
-        content: Some(ReconciliationContent {
-            checksum: task.checksum.to_string().into_boxed_str(),
-            size: task.size,
-        }),
-    }])
+    db.reserve_reconciliation_paths(
+        &[ReconciliationReservation {
+            library: "PrimarySync".into(),
+            asset_id: "foreign-child".into(),
+            version_size: task.version_size,
+            requested_path_key: ReconciliationPathKey(key.clone()),
+            destination_path_key: ReconciliationPathKey(key),
+            destination_path: old.clone(),
+            content: Some(ReconciliationContent {
+                checksum: task.checksum.to_string().into_boxed_str(),
+                size: task.size,
+            }),
+        }],
+        None,
+    )
     .await
     .unwrap();
     rusqlite::Connection::open(&db_path)
@@ -244,4 +248,78 @@ async fn distinct_occupant_confined_bytes_require_unchanged_file() {
             .await
         );
     }
+}
+
+#[tokio::test]
+async fn r2_compact_only_foreign_owner_skips_old_p_and_keeps_safe_sibling_missing() {
+    let root = tempfile::tempdir().unwrap();
+    let db_path = root.path().join("state.db");
+    let owner = AccountOwner::authenticated(
+        "compact@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"compact-only-owner"}})).unwrap(),
+    )
+    .unwrap();
+    let db = Arc::new(SqliteStateDb::open_owned(&db_path, &owner).await.unwrap());
+    let old = root.path().join("compact.JPG");
+    std::fs::write(&old, b"good").unwrap();
+    let digest = format!("{:x}", Sha256::digest(b"good"));
+    let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+    let receipt = DownloadReceipt {
+        account_key: account_key.to_string(),
+        provider_key: provider_key.to_string(),
+        scope: json!({
+            "database": "private",
+            "zone": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"}
+        })
+        .to_string(),
+        library: "PrimarySync".into(),
+        child: "foreign-child".into(),
+        master: "foreign-master".into(),
+        state_id: "foreign".into(),
+        origin_pass: "pass".into(),
+        version_size: "original".into(),
+        provider_checksum: "generation".into(),
+        provider_size: 4,
+        native_path: SelectionPath::from_path(&old),
+        source_checksum: digest.clone(),
+        local_checksum: digest,
+    };
+    receipt
+        .save(&db.acquire_lock("save compact foreign owner").unwrap())
+        .unwrap();
+    let mut config = DownloadConfig::test_default();
+    config.directory = root.path().to_path_buf().into();
+    config.folder_structure = "none".into();
+    config.state_db = Some(db.clone());
+    let asset = TestPhotoAsset::new("current-child")
+        .filename("compact.JPG")
+        .orig_size(4)
+        .orig_checksum("generation")
+        .build();
+    let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+    let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+    let task = &plan.tasks[0];
+    assert_ne!(task.download_path, old);
+    assert!(
+        matches!(
+            planner.match_existing(&asset, &config, task).await,
+            BaselineMatch::Missing
+        ),
+        "compact-only foreign owner must be skipped, not returned as Present"
+    );
+    drop(planner);
+    drop(db);
+    let db = Arc::new(SqliteStateDb::open_owned(&db_path, &owner).await.unwrap());
+    config.state_db = Some(db.clone());
+    let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+    let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+    assert_ne!(plan.tasks[0].download_path, old);
+    assert!(matches!(
+        planner
+            .match_existing(&asset, &config, &plan.tasks[0])
+            .await,
+        BaselineMatch::Missing
+    ));
+    assert_eq!(std::fs::read(&old).unwrap(), b"good");
 }

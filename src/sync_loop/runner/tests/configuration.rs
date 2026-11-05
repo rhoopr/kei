@@ -10,11 +10,12 @@ use crate::sync_cycle::{
 };
 use crate::sync_loop::test_support::{
     FailingMetadataSetDb, MetadataSetFailure, RunCycleDownloadConfigOptions, album_count_response,
-    full_album_page_with_download, make_empty_full_album, make_full_album_with_boxed_session,
-    make_named_empty_full_album, make_recording_run_cycle_download_config_builder,
-    make_run_cycle_config, make_run_cycle_download_config_builder,
-    make_run_cycle_download_config_builder_with_options, make_run_cycle_library_state_with_album,
-    make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle, make_state_db,
+    bind_test_account_owner, full_album_page_with_download, make_empty_full_album,
+    make_full_album_with_boxed_session, make_named_empty_full_album,
+    make_recording_run_cycle_download_config_builder, make_run_cycle_config,
+    make_run_cycle_download_config_builder, make_run_cycle_download_config_builder_with_options,
+    make_run_cycle_library_state_with_album, make_run_cycle_library_state_with_passes,
+    make_shared_session_for_run_cycle, make_state_db, synthetic_owner,
 };
 use crate::{config, download, state};
 
@@ -294,6 +295,8 @@ async fn cancelled_bridge_fixture_with_pages(
     unattributed_current: bool,
     omit_source_completion: bool,
 ) {
+    let owner = synthetic_owner();
+
     use crate::state::SparseIdentityStore;
     use std::time::Duration;
     use tracing_subscriber::layer::SubscriberExt;
@@ -306,7 +309,12 @@ async fn cancelled_bridge_fixture_with_pages(
     std::fs::create_dir(&media).unwrap();
     let sentinel = media.join("existing.jpg");
     std::fs::write(&sentinel, b"existing synthetic media").unwrap();
-    let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&database, &owner)
+            .await
+            .unwrap(),
+    );
+    bind_test_account_owner(&db);
     let marker = state::unresolved_identity_key("PrimarySync");
     let historical_marker = format!("{}PrimarySync", state::HISTORICAL_IDENTITY_PREFIX);
     db.set_metadata(&historical_marker, "1").await.unwrap();
@@ -363,7 +371,7 @@ async fn cancelled_bridge_fixture_with_pages(
     let config = make_run_cycle_config();
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
     let builder = make_run_cycle_download_config_builder(&media, db.clone());
-    let (layer, diagnostics) = crate::support::history::test_layer();
+    let (layer, diagnostics) = crate::support::test_capture::test_layer();
     let _default = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
     // Keep cold callsite registration independent of a worker's missing TLS
     // subscriber. Production installs a global subscriber instead.
@@ -445,7 +453,12 @@ async fn cancelled_bridge_fixture_with_pages(
     drop(cycle);
     drop(builder);
     drop(db);
-    let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&database, &owner)
+            .await
+            .unwrap(),
+    );
+    bind_test_account_owner(&db);
     for (key, expected) in [
         ("sync_token:v27:PrimarySync", "prior-token"),
         (ENUM_CONFIG_HASH_KEY, "old-enum-hash"),
@@ -531,7 +544,12 @@ async fn cancelled_bridge_fixture_with_pages(
     let mut prior_call_count = initial_calls.len();
     let mut prior_query_count = inventory_queries;
     for replay in 0..2 {
-        let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&database, &owner)
+                .await
+                .unwrap(),
+        );
+        bind_test_account_owner(&db);
         let builder = make_run_cycle_download_config_builder(&media, db.clone());
         // Reuse the exact Album/container route, releasing its synthetic gate.
         release.notify_one();
@@ -1198,7 +1216,7 @@ async fn run_cycle_enum_config_drift_atomically_promotes_bridged_checkpoint() {
 }
 
 #[tokio::test]
-async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_restarts() {
+async fn support_token_repair_and_bridge_phases_keep_redacted_evidence_at_info() {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -1211,11 +1229,23 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
         .await
         .unwrap();
     let download_dir = tempfile::tempdir().unwrap();
-    let history_dir = tempfile::tempdir().unwrap();
-    let history_path = history_dir.path().join("history.json");
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
     let build_download_config =
         make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+    let (layer, drain) = crate::support::test_capture::test_layer();
+    let subscriber = tracing_subscriber::registry().with(layer).with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::sink)
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+    );
+    // This current-thread test must cover spawned provider/pipeline tasks,
+    // not only polls of run_cycle (see the full-sync evidence test).
+    let _default = tracing::subscriber::set_default(subscriber);
+    // Keep cold callsite registration independent of a worker's missing TLS
+    // subscriber. Production installs a global subscriber instead.
+    let _worker_callsite_registration = tracing::Dispatch::new(tracing_subscriber::registry());
+    let mut all_events = Vec::new();
+    let mut cycles = Vec::new();
 
     // Actual cycle orchestration: failed inventory token repair, then complete
     // inventory with a failed bridge, then successful bridge after reopening.
@@ -1230,19 +1260,6 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
         );
         let lib_state =
             make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
-        let (recorder, guard) =
-            crate::support::history::start(history_path.clone(), serde_json::json!({})).unwrap();
-        let subscriber = tracing_subscriber::registry().with(recorder).with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::sink)
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-        );
-        // This current-thread test must cover spawned provider/pipeline tasks,
-        // not only polls of run_cycle (see the full-sync history test).
-        let _default = tracing::subscriber::set_default(subscriber);
-        // Keep cold callsite registration independent of a worker's missing TLS
-        // subscriber. Production installs a global subscriber instead.
-        let _worker_callsite_registration = tracing::Dispatch::new(tracing_subscriber::registry());
         let result = run_cycle(
             &[&lib_state],
             &config,
@@ -1256,19 +1273,16 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
         .await
         .unwrap();
         assert_eq!(result.db_sync_token_advance_safe, advance);
-        guard.finish().await;
+        let events = drain();
+        assert!(!events.is_empty());
+        all_events.extend(events.iter().cloned());
+        cycles.push(events);
     }
-    let history: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&history_path).unwrap()).unwrap();
-    let cycles = history["cycles"].as_array().unwrap();
-    assert_eq!(cycles.len(), 3);
     let component = |cycle: usize, name: &str| -> &serde_json::Value {
-        &cycles[cycle]["diagnostics"]
-            .as_array()
-            .unwrap()
+        &cycles[cycle]
             .iter()
             .find(|d| d["kind"] == "support_pass_completion_v1" && d["fields"]["component"] == name)
-            .unwrap()["fields"]
+            .unwrap_or_else(|| panic!("missing {name} evidence: {cycles:?}"))["fields"]
     };
     assert_eq!(component(0, "initial")["same_cycle_recovery_attempts"], 1);
     assert_eq!(component(0, "initial")["same_cycle_recovery_successes"], 0);
@@ -1278,7 +1292,7 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
     assert_eq!(
         component(1, "initial")["sync_token_blocked"],
         false,
-        "{}",
+        "{:?}",
         cycles[1]
     );
     assert_eq!(component(1, "delta_bridge")["token_present"], false);
@@ -1300,13 +1314,12 @@ async fn support_history_retains_token_repair_and_bridge_phases_at_info_across_r
     );
     assert_eq!(component(2, "delta_bridge")["token_present"], true);
     assert_eq!(component(2, "combined")["sync_token_blocked"], false);
-    let encoded = history.to_string();
+    let encoded = serde_json::to_string(&all_events).unwrap();
     for private in [
         "PRIVATE",
         "PrimarySync",
         "sync_token:PrimarySync",
         download_dir.path().to_str().unwrap(),
-        history_dir.path().to_str().unwrap(),
     ] {
         assert!(!encoded.contains(private), "private fixture value retained");
     }
@@ -3225,6 +3238,7 @@ async fn recent_exact_eof_bridge_receipt_survives_failed_cursor_commit_and_quiet
         let previous_bytes = std::fs::read(&kept).unwrap();
         {
             let db = state::SqliteStateDb::open(&database).await.unwrap();
+            bind_test_account_owner(&db);
             let record = crate::test_helpers::TestAssetRecord::new("asset-PREVIOUS")
                 .filename("previous.jpg")
                 .size(previous_bytes.len() as u64)
@@ -3259,6 +3273,7 @@ async fn recent_exact_eof_bridge_receipt_survives_failed_cursor_commit_and_quiet
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
         for cycle in 0..3 {
             let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            bind_test_account_owner(&db);
             if cycle == 0 {
                 db.acquire_lock("recent bridge cursor commit fault")
                     .unwrap()
@@ -3588,6 +3603,7 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
     let hash = download::compute_config_hash(&config);
     {
         let db = state::SqliteStateDb::open(&database).await.unwrap();
+        bind_test_account_owner(&db);
         let record = crate::test_helpers::TestAssetRecord::new("asset-CURRENT")
             .filename("photo.JPG")
             .size(1024)
@@ -3634,6 +3650,7 @@ async fn assert_issue956_pair_confirmation_reopens_quietly(old_master_error: Opt
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
     for cycle in 0..2 {
         let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        bind_test_account_owner(&db);
         let builder = make_run_cycle_download_config_builder(&media, db.clone());
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),

@@ -66,9 +66,9 @@ with open(src) as f:
 # platform-dependent phases can skip explicitly; offline proof cannot.
 required = {
     "static_checks", "offline_core", "nightly_tools", "package", "docker_full",
-    "live_provider", "live_import_rehearsal", "service",
+    "live_provider", "live_import_rehearsal",
 }
-may_skip = {"live_provider", "live_import_rehearsal", "service"}
+may_skip = {"live_provider", "live_import_rehearsal"}
 for phase in sorted(required):
     result = phases.get(phase, {})
     status = result.get("status")

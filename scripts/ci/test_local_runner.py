@@ -1,4 +1,4 @@
-"""Exercise local dispatch and evidence without credentials or a host service."""
+"""Exercise local dispatch and evidence without credentials."""
 
 import json
 import os
@@ -49,47 +49,19 @@ class LocalRunnerTests(unittest.TestCase):
                    "KEI_FULLTEST_LOG_DIR": str(Path(directory) / "logs"),
                    "KEI_TEST_SCRATCH_DIR": str(Path(directory) / "shell"),
                    "KEI_FULL_TEST_TMPDIR": str(Path(directory) / "tmp"),
-                   "KEI_FULL_TEST_REAL_SERVICE": "0", "KEI_FULL_TEST_CROSS_ZONE_ALBUM": ""}
+                   "KEI_FULL_TEST_CROSS_ZONE_ALBUM": ""}
             def run():
                 return subprocess.run(["bash", str(scripts / "run_local_release.sh")], cwd=root, env=env, capture_output=True, text=True, check=False)
-            self.assertEqual(run().returncode, 64)
-            self.assertFalse(Path(env["CALLS"]).exists())
-            env["KEI_FULL_TEST_REAL_SERVICE"] = "1"
             result = run()
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             record = json.loads((state / "qualified.json").read_text())
             self.assertEqual(set(record["phases"]), local_release.BASE_PHASES | local_release.LIVE_COMMANDS)
             self.assertEqual(Path(env["CALLS"]).read_text().splitlines(), [
-                "cargo build --locked --release", "docker build -t kei:local-release .", "just test live", "just test host-service"])
+                "cargo build --locked --release", "docker build -t kei:local-release .", "just test live"])
             self.assertFalse((state / ".run-marker").exists())
             (root / "dirty").touch()
             self.assertNotEqual(run().returncode, 0)
 
-    def test_existing_service_is_never_uninstalled(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "tests/shell").mkdir(parents=True)
-            (root / "bin").mkdir()
-            (root / "tests/shell/lib.sh").write_text('kei_require_env() { :; }\nkei_require_release_binary() { :; }\nkei_preflight_selection() { :; }\nkei_release_bin() { echo "$FIXTURE/bin/kei"; }\nkei_cookie_dir() { echo "$FIXTURE"; }\n')
-            executable(root / "bin/git", 'echo "$FIXTURE"\n')
-            executable(root / "bin/systemctl", 'echo enabled\n')
-            executable(root / "bin/loginctl", 'echo Linger=yes\n')
-            executable(root / "bin/kei", 'echo "$*" >> "$FIXTURE/kei-calls"\n')
-            def run(script):
-                return subprocess.run(["bash", str(script)], cwd=root,
-                    env={**os.environ, "PATH": f"{root / 'bin'}:{os.environ['PATH']}", "FIXTURE": str(root),
-                         "TMPDIR": str(root), "KEI_FULL_TEST_REAL_SERVICE": "1"}, capture_output=True, text=True, check=False)
-            script = ROOT / "scripts/full-test/run_real_service_lifecycle.sh"
-            result = run(script)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("refusing to mutate", result.stderr)
-            self.assertFalse((root / "kei-calls").exists())
-            # Reintroduce the defect in scratch and prove that this safety assertion detects it.
-            mutant = root / "mutant.sh"
-            mutant.write_text(script.read_text().replace("trap cleanup EXIT\n", "").replace(
-                "pre_enabled=$(", "trap cleanup EXIT\npre_enabled=$(", 1))
-            self.assertNotEqual(run(mutant).returncode, 0)
-            self.assertEqual((root / "kei-calls").read_text().strip(), "uninstall")
 
 
 if __name__ == "__main__":

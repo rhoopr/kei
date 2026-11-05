@@ -1,11 +1,13 @@
 //! Completion ownership survives body compaction and predecessor retirement.
 use super::{CURRENT, Fixture, controls, destination_pass, destination_pass_with, owner, records};
+use crate::download::DownloadTask;
 use crate::download::orchestration::models::DownloadStore;
 use crate::download::planner::{TaskPlanner, pending_record_for_task};
 use crate::icloud::photos::inbox::ShadowCapture;
 use crate::state::DownloadStateStore;
 use crate::state::MetadataRewriteStore;
 use crate::state::SqliteStateDb;
+use crate::state::db::DownloadContextStateStore;
 #[cfg(target_os = "linux")]
 use crate::state::db::provider_generations::ActiveGeneration;
 use crate::state::db::provider_generations::{
@@ -1107,6 +1109,7 @@ async fn v027_shared_physical_album_copy_keeps_both_fulfilled_passes_after_templ
     f.capture = ShadowCapture::new(f.db.clone(), owner(), "com");
     f.config.state_db = Some(f.db.clone() as Arc<dyn DownloadStore>);
     f.pass = destination_pass_with(&f.session, &f.capture, "A");
+    f.config.directory = f.dir.path().join("new-media-root").into();
     f.config.folder_structure_albums = "changed/{album}".into();
     let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
     let second = crate::download::download_photos_with_sync(
@@ -1158,6 +1161,7 @@ async fn v027_shared_physical_album_copy_keeps_both_fulfilled_passes_after_templ
         mtime
     );
     server.verify().await;
+    f.config.directory = f.dir.path().join("media").into();
     f.preserved().await;
 }
 
@@ -2065,6 +2069,23 @@ async fn v027_pending_reservation_reader_cost_with_unrelated_blocked_work() {
     }
 }
 
+async fn provider_pending_refusal(db: &SqliteStateDb, task: &DownloadTask, id: &str) {
+    use crate::test_helpers::TestAssetRecord;
+    let mut task = task.clone();
+    task.asset_id = id.into();
+    db.upsert_seen(&TestAssetRecord::new(id).build())
+        .await
+        .unwrap();
+    publish(db, &task).await;
+    let receipt = db.get_baseline_receipts().await.unwrap().pop().unwrap();
+    let selected = TestAssetRecord::new(id).build();
+    assert!(
+        db.adopt_baseline_receipt(&selected, &receipt, id, Box::new(|| Ok(())))
+            .await
+            .is_err()
+    );
+}
+
 #[tokio::test]
 async fn v027_path_lookup_keeps_collision_aliases_and_rejects_uncertain_projections() {
     use crate::state::db::provider_generations::pending_destination_reservations_for_path;
@@ -2085,6 +2106,10 @@ async fn v027_path_lookup_keeps_collision_aliases_and_rejects_uncertain_projecti
     )
     .await;
     let path = &tasks[0].download_path;
+    provider_pending_refusal(&db, &tasks[0], "asset-compact-0").await;
+    provider_pending_refusal(&db, &tasks[0], "current").await;
+    assert_eq!(std::fs::read(path).unwrap(), RAW);
+    std::fs::remove_file(path).unwrap();
     let original = serde_json::to_vec(&manifest).unwrap();
     {
         let conn = db

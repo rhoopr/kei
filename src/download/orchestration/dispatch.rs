@@ -374,12 +374,6 @@ async fn download_photos_with_sync_inner(
     controls: DownloadControls,
     shutdown_token: CancellationToken,
 ) -> Result<SyncResult> {
-    // Naming controls new filenames, never convergence of an existing archive.
-    let config = Arc::new(DownloadConfig {
-        primary_layout_active: false,
-        primary_layout_preview: false,
-        ..config.as_ref().clone()
-    });
     if config.provisional {
         // Finish only previously recorded operations. Incomplete provider
         // listings cannot authorize new layout plans or checkpoint retirement.

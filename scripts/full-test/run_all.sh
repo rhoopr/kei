@@ -14,8 +14,6 @@
 #   live_provider    live cargo (just test live)               --live
 #   live_shell       auto-discovered shell suites              --live
 #   live_binary      release-binary live smokes/import checks  --live
-#   service          service-smoke when supported
-#   host_service     real service lifecycle when KEI_FULL_TEST_REAL_SERVICE=1 --live
 #   finalize_run + diff_runs on success
 #
 # Live-tagged phases honor .live-skipped (prereq fail) and .rate-limited
@@ -117,17 +115,6 @@ current_phase="live_binary"
 run_live_phase live_import_rehearsal -- "$script_dir/run_live_import_rehearsal.sh"
 if [[ -n "${KEI_FULL_TEST_CROSS_ZONE_ALBUM:-}" ]]; then
     run_live_phase live_cross_zone_album -- "$script_dir/run_cross_zone_album_hydration.sh"
-fi
-
-# --- Service smoke ---------------------------------------------------------
-if ! command -v systemd-analyze >/dev/null 2>&1 && ! command -v plutil >/dev/null 2>&1; then
-    "$script_dir/record_skip.sh" service skipped "not Linux or macOS"
-else
-    run_phase service -- just test service
-fi
-
-if [[ "${KEI_FULL_TEST_REAL_SERVICE:-0}" == "1" ]]; then
-    run_live_phase host_service -- just test host-service
 fi
 
 # --- Cleanup --------------------------------------------------------------

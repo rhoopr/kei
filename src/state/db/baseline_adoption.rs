@@ -1,7 +1,11 @@
 //! Receipt-backed read-only adoption into the ordinary download ledger.
 
-use rusqlite::{OptionalExtension, params};
+use std::path::Path;
 
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
+
+use super::identity::{LegacyOwnersByLibrary, same_logical_asset};
+use super::provider_selection::SelectionPath;
 use super::{BaselineReceipt, SqliteStateDb};
 use crate::state::AssetRecord;
 use crate::state::error::StateError;
@@ -93,9 +97,10 @@ impl SqliteStateDb {
         &self,
         record: &AssetRecord,
         receipt: &BaselineReceipt,
+        child: &str,
         validate_file: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
     ) -> Result<(), StateError> {
-        self.adopt_existing_receipt(record, receipt, validate_file, true)
+        self.adopt_existing_receipt(record, receipt, child, validate_file, true)
             .await
     }
 
@@ -105,9 +110,10 @@ impl SqliteStateDb {
         &self,
         record: &AssetRecord,
         receipt: &BaselineReceipt,
+        child: &str,
         validate_file: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
     ) -> Result<(), StateError> {
-        self.adopt_existing_receipt(record, receipt, validate_file, false)
+        self.adopt_existing_receipt(record, receipt, child, validate_file, false)
             .await
     }
 
@@ -115,13 +121,15 @@ impl SqliteStateDb {
         &self,
         record: &AssetRecord,
         receipt: &BaselineReceipt,
+        child: &str,
         validate_file: Box<dyn FnOnce() -> Result<(), StateError> + Send>,
         historical: bool,
     ) -> Result<(), StateError> {
         let record = record.clone();
         let receipt = receipt.clone();
+        let child = child.to_owned();
         self.with_conn_mut("adopt_baseline_receipt", move |conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let refuse = || StateError::Invariant {
                 operation: "adopt_baseline_receipt",
                 detail: "existing-file receipt changed or has no source provenance".into(),
@@ -136,8 +144,7 @@ impl SqliteStateDb {
                 || record.version_size != receipt.version_size
                 || record.size_bytes != receipt.provider_size
                 || record.checksum.trim().is_empty()
-                || (!historical && (record.library.as_ref() != receipt.library
-                    || record.id.as_ref() != receipt.id))
+                || child.trim().is_empty()
                 || source != local
                 || source.len() != 64
                 || local.len() != 64
@@ -145,9 +152,69 @@ impl SqliteStateDb {
             {
                 return Err(refuse());
             }
+            let legacy_owners = {
+                let mut statement = tx.prepare_cached(
+                    "SELECT master_record_name,asset_record_name \
+                     FROM legacy_master_state_owners WHERE library=?1",
+                )?;
+                let rows = statement
+                    .query_map(params![record.library.as_ref()], |row| {
+                        Ok((
+                            record.library.to_string(),
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                        ))
+                    })?
+                    .collect::<Result<std::collections::HashSet<_>, _>>()?;
+                LegacyOwnersByLibrary::from_rows(rows)
+            };
+            if !same_logical_asset(
+                record.library.as_ref(),
+                record.id.as_ref(),
+                &child,
+                &receipt.library,
+                &receipt.id,
+                &legacy_owners,
+            ) {
+                return Err(refuse());
+            }
             let Some(path_text) = receipt.local_path.to_str() else {
                 return Err(refuse());
             };
+            let already_present: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2
+                 AND version_size=?3 AND checksum=?4 AND status='downloaded'
+                 AND is_deleted=0 AND size_bytes=?7
+                 AND local_path=?5 AND local_checksum=?6)",
+                params![record.library.as_ref(),record.id.as_ref(),record.version_size.as_str(),
+                    record.checksum.as_ref(),path_text,local,
+                    i64::try_from(record.size_bytes).map_err(|_error| refuse())?],
+                |row| row.get(0),
+            )?;
+            let census_scope = if already_present {
+                CensusScope::CompletedTarget
+            } else {
+                CensusScope::Full
+            };
+            let census = path_owner_census(
+                &tx,
+                &record,
+                &child,
+                &receipt,
+                &legacy_owners,
+                census_scope,
+            )?;
+            if census.blocking_pending || (census.incompatible && (!already_present || !census.exact_target)) {
+                return Err(refuse());
+            }
+            let target_has_path_receipt: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM asset_metadata_paths
+                 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4
+                   AND provider_checksum=?5 AND local_checksum=?6)",
+                params![record.library.as_ref(), record.id.as_ref(),
+                    record.version_size.as_str(), path_text, record.checksum.as_ref(), local],
+                |row| row.get(0),
+            )?;
             // Source deletion is not a byte mutation. Current target deletion
             // remains independently fenced below until authenticated admission.
             let unchanged: bool = !historical || tx.query_row(
@@ -215,16 +282,6 @@ impl SqliteStateDb {
             }
 
             // Already recorded exact identities need no metadata or timestamp update.
-            let already_present: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM assets WHERE library=?1 AND id=?2
-                 AND version_size=?3 AND checksum=?4 AND status='downloaded'
-                 AND is_deleted=0 AND size_bytes=?7
-                 AND local_path=?5 AND local_checksum=?6)",
-                params![record.library.as_ref(),record.id.as_ref(),record.version_size.as_str(),
-                    record.checksum.as_ref(),path_text,local,
-                    i64::try_from(record.size_bytes).map_err(|_error| refuse())?],
-                |row| row.get(0),
-            )?;
             if !already_present {
                 let now = chrono::Utc::now().timestamp();
                 if target.is_none() {
@@ -244,7 +301,7 @@ impl SqliteStateDb {
                     params![record.library.as_ref(),record.id.as_ref(),record.version_size.as_str()],
                 )?;
             }
-            if !historical {
+            if !historical && !target_has_path_receipt {
                 // A current already-downloaded row may predate path receipts.
                 // Establish only the checked raw-byte binding; preserve old
                 // optional metadata debt and all other recorded paths.
@@ -263,7 +320,8 @@ impl SqliteStateDb {
             }
             tx.execute(
                 "UPDATE asset_metadata_paths SET preserved_path_key=?5
-                 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4",
+                 WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4
+                   AND preserved_path_key IS NULL",
                 params![record.library.as_ref(),record.id.as_ref(),record.version_size.as_str(),
                     receipt.local_path.to_string_lossy(),super::primary_layout::path_key(&receipt.local_path)?],
             )?;
@@ -277,4 +335,190 @@ impl SqliteStateDb {
             Ok(())
         }).await
     }
+}
+
+#[derive(Clone, Copy)]
+enum CensusScope {
+    Full,
+    CompletedTarget,
+}
+
+struct PathOwnerCensus {
+    exact_target: bool,
+    incompatible: bool,
+    blocking_pending: bool,
+}
+
+fn adoption_invalid() -> StateError {
+    StateError::Invariant {
+        operation: "adopt_baseline_receipt",
+        detail: "existing-file receipt has an incompatible or unknown path owner".into(),
+    }
+}
+
+fn observe_owner(
+    census: &mut PathOwnerCensus,
+    record: &AssetRecord,
+    child: &str,
+    library: &str,
+    state_id: &str,
+    legacy_owners: &LegacyOwnersByLibrary,
+) {
+    if library == record.library.as_ref() && state_id == record.id.as_ref() {
+        census.exact_target = true;
+    }
+    if !same_logical_asset(
+        record.library.as_ref(),
+        record.id.as_ref(),
+        child,
+        library,
+        state_id,
+        legacy_owners,
+    ) {
+        census.incompatible = true;
+    }
+}
+
+fn path_owner_census(
+    tx: &rusqlite::Connection,
+    record: &AssetRecord,
+    child: &str,
+    receipt: &BaselineReceipt,
+    legacy_owners: &LegacyOwnersByLibrary,
+    scope: CensusScope,
+) -> Result<PathOwnerCensus, StateError> {
+    let target_key = crate::fs_util::confined_path_key(&receipt.local_path)
+        .map_err(|_private_error| adoption_invalid())?;
+    let mut census = PathOwnerCensus {
+        exact_target: matches!(scope, CensusScope::CompletedTarget),
+        incompatible: false,
+        blocking_pending: false,
+    };
+    if matches!(scope, CensusScope::Full) {
+        for table in ["assets", "asset_metadata_paths"] {
+            let sql =
+                format!("SELECT library,id,local_path FROM {table} WHERE local_path IS NOT NULL");
+            let mut statement = tx.prepare(&sql)?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (library, state_id, path) = row?;
+                let key = crate::fs_util::confined_path_key(Path::new(&path))
+                    .map_err(|_private_error| adoption_invalid())?;
+                if key == target_key {
+                    observe_owner(
+                        &mut census,
+                        record,
+                        child,
+                        &library,
+                        &state_id,
+                        legacy_owners,
+                    );
+                }
+            }
+        }
+    }
+
+    let mut statement = tx.prepare(
+        "SELECT library,id,provider_checksum,provider_size \
+         FROM reconciliation_paths WHERE destination_path_key=?1",
+    )?;
+    let rows = statement.query_map(params![target_key], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (library, state_id, checksum, size) = row?;
+        let compatible = same_logical_asset(
+            record.library.as_ref(),
+            record.id.as_ref(),
+            child,
+            &library,
+            &state_id,
+            legacy_owners,
+        );
+        observe_owner(
+            &mut census,
+            record,
+            child,
+            &library,
+            &state_id,
+            legacy_owners,
+        );
+        if !compatible
+            || checksum.as_str() != record.checksum.as_ref()
+            || u64::try_from(size).ok() != Some(record.size_bytes)
+        {
+            census.blocking_pending = true;
+        }
+    }
+
+    for reservation in super::provider_generations::pending_destination_reservations_for_path(
+        tx,
+        &receipt.local_path,
+    )? {
+        let compatible = same_logical_asset(
+            record.library.as_ref(),
+            record.id.as_ref(),
+            child,
+            &reservation.library,
+            &reservation.asset_id,
+            legacy_owners,
+        );
+        observe_owner(
+            &mut census,
+            record,
+            child,
+            &reservation.library,
+            &reservation.asset_id,
+            legacy_owners,
+        );
+        let content_matches = reservation.content.as_ref().is_some_and(|content| {
+            content.checksum.as_ref() == record.checksum.as_ref()
+                && content.size == record.size_bytes
+        });
+        if !compatible || !content_matches {
+            census.blocking_pending = true;
+        }
+    }
+
+    if matches!(scope, CensusScope::Full) {
+        let mut statement =
+            tx.prepare("SELECT library,state_id,native_path FROM download_receipts")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (library, state_id, encoded) = row?;
+            let native: SelectionPath =
+                serde_json::from_str(&encoded).map_err(|_private_error| adoption_invalid())?;
+            let key = crate::fs_util::confined_path_key(&native.to_path())
+                .map_err(|_private_error| adoption_invalid())?;
+            if key == target_key {
+                observe_owner(
+                    &mut census,
+                    record,
+                    child,
+                    &library,
+                    &state_id,
+                    legacy_owners,
+                );
+            }
+        }
+    }
+
+    Ok(census)
 }

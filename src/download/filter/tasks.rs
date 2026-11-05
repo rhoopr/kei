@@ -1,6 +1,6 @@
 //! Download task construction from derived paths, metadata, and collision results.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, FixedOffset, Local};
@@ -23,6 +23,21 @@ use super::{
     derive_mov_companion, derive_primary,
 };
 
+/// A positively proven prior publication at the originally requested path.
+/// Internal only; never serialized and never a completion authority.
+#[derive(Debug, Clone)]
+pub(in crate::download) struct SupersededRequestedPath {
+    requested: PathBuf,
+    root: PathBuf,
+    planned: PathBuf,
+    library: Arc<str>,
+    asset_id: Arc<str>,
+    asset_record_name: Arc<str>,
+    version_size: VersionSizeKey,
+    checksum: Box<str>,
+    size: u64,
+}
+
 /// A unit of work produced by the filter phase and consumed by the download phase.
 ///
 /// Fields ordered for optimal memory layout:
@@ -44,6 +59,9 @@ pub(in crate::download) struct DownloadTask {
     /// through finalization; ordinary task policy is unchanged. Clones share
     /// the original current-root association.
     pub(in crate::download) pending_cross_parent_root: Option<Arc<PathBuf>>,
+    /// A known prior publication at the originally requested path. This is
+    /// candidate-handoff evidence only, never completion or metadata authority.
+    pub(in crate::download) superseded_requested_path: Option<Arc<SupersededRequestedPath>>,
     pub(in crate::download) publication_binding: Option<Arc<crate::state::db::PublicationBinding>>,
     pub(in crate::download) checksum: Box<str>,
     /// iCloud asset ID for state tracking. Shared with the producer's
@@ -85,6 +103,52 @@ impl DownloadTask {
             None if self.require_created_entry => FinalPublication::CreateOnly,
             None => FinalPublication::NoReplace,
         }
+    }
+
+    pub(in crate::download) fn remember_superseded_requested(
+        &mut self,
+        root: &Path,
+        requested: PathBuf,
+    ) {
+        if self.download_path == requested {
+            return;
+        }
+        self.superseded_requested_path = Some(Arc::new(SupersededRequestedPath {
+            requested,
+            root: root.to_path_buf(),
+            planned: self.download_path.clone(),
+            library: Arc::clone(&self.library),
+            asset_id: Arc::clone(&self.asset_id),
+            asset_record_name: Arc::clone(&self.asset_record_name),
+            version_size: self.version_size,
+            checksum: self.checksum.clone(),
+            size: self.size,
+        }));
+    }
+
+    pub(in crate::download) fn superseded_requested(
+        &self,
+        root: &Path,
+        requested_path: &Path,
+    ) -> Option<&Path> {
+        let marker = self.superseded_requested_path.as_deref()?;
+        let marker_requested = crate::fs_util::confined_path_key(&marker.requested).ok()?;
+        let current_requested = crate::fs_util::confined_path_key(requested_path).ok()?;
+        let marker_root = crate::fs_util::confined_path_key(&marker.root).ok()?;
+        let current_root = crate::fs_util::confined_path_key(root).ok()?;
+        let marker_planned = crate::fs_util::confined_path_key(&marker.planned).ok()?;
+        let current_planned = crate::fs_util::confined_path_key(&self.download_path).ok()?;
+        (marker.requested != marker.planned
+            && marker_requested == current_requested
+            && marker_root == current_root
+            && marker_planned == current_planned
+            && marker.library == self.library
+            && marker.asset_id == self.asset_id
+            && marker.asset_record_name == self.asset_record_name
+            && marker.version_size == self.version_size
+            && marker.checksum == self.checksum
+            && marker.size == self.size)
+            .then_some(marker.requested.as_path())
     }
 
     /// Project the task fields the recap renderer needs (basename of the
@@ -168,6 +232,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 replacement_fingerprint: None,
                 publication_binding: None,
                 pending_cross_parent_root: None,
+                superseded_requested_path: None,
                 checksum: d.checksum,
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
@@ -245,6 +310,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 replacement_fingerprint: None,
                 publication_binding: None,
                 pending_cross_parent_root: None,
+                superseded_requested_path: None,
                 checksum,
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
@@ -316,6 +382,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 replacement_fingerprint: None,
                 publication_binding: None,
                 pending_cross_parent_root: None,
+                superseded_requested_path: None,
                 checksum,
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),
@@ -382,6 +449,7 @@ pub(in crate::download) fn filter_asset_to_tasks_with_primary(
                 replacement_fingerprint: None,
                 publication_binding: None,
                 pending_cross_parent_root: None,
+                superseded_requested_path: None,
                 checksum,
                 asset_id: asset.state_id_arc(),
                 asset_record_name: asset.asset_record_name_arc(),

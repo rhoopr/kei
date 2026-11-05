@@ -17,7 +17,10 @@ pub(in crate::download) async fn snapshot(
     tokio::task::spawn_blocking(move || snapshot_blocking(&root, &path)).await?
 }
 
-fn snapshot_blocking(root: &Path, path: &Path) -> Result<Option<LayoutFingerprint>> {
+pub(in crate::download) fn snapshot_blocking(
+    root: &Path,
+    path: &Path,
+) -> Result<Option<LayoutFingerprint>> {
     let confined = match ConfinedPath::open(root, path, ConfinedParents::Existing) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -83,6 +86,7 @@ pub(in crate::download) async fn copy_verified(
 /// An operation-bound stage copy. The returned identity comes from the file
 /// descriptor opened by the successful no-replace publication, not a later
 /// independent lookup of the destination path.
+#[cfg(test)]
 pub(in crate::download) async fn copy_verified_create_only(
     root: &Path,
     source: &Path,

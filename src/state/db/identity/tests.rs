@@ -4,6 +4,7 @@ use chrono::DateTime;
 use std::collections::HashSet;
 
 use crate::state::db::SqliteStateDb;
+use crate::state::db::identity::{LegacyOwnersByLibrary, same_logical_asset};
 
 #[tokio::test]
 async fn asset_master_mapping_is_library_scoped() {
@@ -229,4 +230,71 @@ async fn legacy_owner_claim_rejects_mixed_or_missing_rendition_dates() {
             );
         }
     }
+}
+
+#[test]
+fn same_logical_asset_requires_actual_child_or_explicit_exclusive_owner() {
+    let empty = LegacyOwnersByLibrary::default();
+    assert!(same_logical_asset(
+        "PrimarySync",
+        "child-a",
+        "child-a",
+        "PrimarySync",
+        "child-a",
+        &empty,
+    ));
+    assert!(!same_logical_asset(
+        "PrimarySync",
+        "child-a",
+        "child-a",
+        "PrimarySync",
+        "child-b",
+        &empty,
+    ));
+
+    let explicit = LegacyOwnersByLibrary::from_rows(HashSet::from([(
+        "PrimarySync".into(),
+        "master".into(),
+        "child-a".into(),
+    )]));
+    assert!(same_logical_asset(
+        "PrimarySync",
+        "child-a",
+        "child-a",
+        "PrimarySync",
+        "master",
+        &explicit,
+    ));
+    assert!(same_logical_asset(
+        "PrimarySync",
+        "master",
+        "child-a",
+        "PrimarySync",
+        "master",
+        &explicit,
+    ));
+    assert!(!same_logical_asset(
+        "PrimarySync",
+        "master",
+        "child-a",
+        "PrimarySync",
+        "master",
+        &empty,
+    ));
+    assert!(!same_logical_asset(
+        "PrimarySync",
+        "master",
+        "child-a",
+        "PrimarySync",
+        "child-b",
+        &explicit,
+    ));
+    assert!(!same_logical_asset(
+        "SharedSync",
+        "child-a",
+        "child-a",
+        "PrimarySync",
+        "child-a",
+        &explicit,
+    ));
 }

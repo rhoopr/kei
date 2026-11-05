@@ -20,13 +20,12 @@ mod baseline_adoption_tests;
 mod checkpoints;
 mod contracts;
 pub(crate) mod download_receipts;
-mod identity;
+pub(crate) mod identity;
 mod import;
 mod legacy_preservation;
 pub(crate) mod match_diagnostics;
 mod membership;
 mod metadata;
-pub(crate) mod metadata_activity;
 mod metadata_capture_retry;
 mod pending_publication;
 pub(crate) mod provider_catalog;
@@ -41,6 +40,8 @@ mod reconciliation;
 mod reports;
 pub(crate) mod source_revalidation;
 mod sparse_identity;
+pub(crate) mod sync_epoch;
+pub(crate) use sync_epoch::SyncEpochGate;
 pub(crate) mod support;
 pub(crate) use metadata_capture_retry::MetadataCaptureRetryGeneration;
 pub(crate) use sparse_identity::{
@@ -93,7 +94,6 @@ pub struct SqliteStateDb {
     conn: Arc<Mutex<Connection>>,
     /// Path to the database file (for error messages).
     path: PathBuf,
-    owner: Option<account::AccountOwner>,
     #[cfg(test)]
     legacy_owner_claim_failures: std::sync::atomic::AtomicUsize,
 }
@@ -113,10 +113,16 @@ impl SqliteStateDb {
         assert!(!path.exists(), "stock fixture must be a new database");
         let conn = account::open(path, owner).unwrap();
         schema::migrate_genuine_v36(&conn).unwrap();
+        // Existing v0.26 fixtures are treated as already past the one-time
+        // epoch baseline unless a test removes this marker explicitly.
+        conn.execute(
+            "INSERT INTO metadata(key,value) VALUES(?1,'1')",
+            [sync_epoch::TEST_PREEXISTING_EPOCH_KEY],
+        )
+        .unwrap();
         Self {
             conn: Arc::new(Mutex::new(conn)),
             path: path.to_owned(),
-            owner: Some(owner.clone()),
             legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -135,21 +141,49 @@ impl SqliteStateDb {
                 })?;
         }
         let cloned_path = path.clone();
-        let retained_owner = owner.clone();
         let owner = owner.clone();
         let conn = tokio::task::spawn_blocking(move || {
-            let conn = account::open(&cloned_path, &owner)?;
-            upgrade::preserve_before_v027(&conn, &cloned_path)?;
-            conn.pragma_update(None, "journal_mode", "WAL")?;
-            conn.pragma_update(None, "synchronous", "NORMAL")?;
-            schema::migrate(&conn)?;
-            Ok::<_, StateError>(conn)
+            let opened = account::open_with_origin(&cloned_path, &owner)?;
+            let start_version = schema::get_schema_version(&opened.conn)?;
+            if start_version > schema::SCHEMA_VERSION {
+                return Err(StateError::UnsupportedSchemaVersion {
+                    found: start_version,
+                    expected: schema::SCHEMA_VERSION,
+                });
+            }
+            // A current-version database must prove its epoch before any WAL or
+            // migration work. This makes a same-number schema 43 without an
+            // epoch fail closed instead of silently acquiring one.
+            if start_version == schema::SCHEMA_VERSION {
+                schema::validate_sync_epoch(&opened.conn)?;
+            }
+            if let Err(error) = schema::validate_metadata_activity_evidence(&opened.conn) {
+                // Refusal must not checkpoint a crash-left WAL on drop.
+                let _ = opened.conn.set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                    true,
+                );
+                return Err(error);
+            }
+            let fresh_install = opened.created && start_version == 0;
+            upgrade::preserve_before_v027(&opened.conn, &cloned_path)?;
+            opened.conn.pragma_update(None, "journal_mode", "WAL")?;
+            opened.conn.pragma_update(None, "synchronous", "NORMAL")?;
+            schema::migrate_with_origin(
+                &opened.conn,
+                if fresh_install {
+                    sync_epoch::EpochOrigin::FreshInstall
+                } else {
+                    sync_epoch::EpochOrigin::ExistingUpgrade
+                },
+            )?;
+            schema::validate_sync_epoch(&opened.conn)?;
+            Ok::<_, StateError>(opened.conn)
         })
         .await??;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
-            owner: Some(retained_owner),
             #[cfg(test)]
             legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -161,7 +195,6 @@ impl SqliteStateDb {
     ) -> Result<Self, StateError> {
         let path = path.to_path_buf();
         let cloned_path = path.clone();
-        let retained_owner = owner.clone();
         let owner = owner.clone();
         let conn = tokio::task::spawn_blocking(move || {
             let conn = account::open_read_only(&cloned_path)?;
@@ -179,13 +212,13 @@ impl SqliteStateDb {
                     expected: schema::SCHEMA_VERSION,
                 });
             }
+            schema::validate_sync_epoch(&conn)?;
             Ok::<_, StateError>(conn)
         })
         .await??;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
-            owner: Some(retained_owner),
             #[cfg(test)]
             legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -238,7 +271,6 @@ impl SqliteStateDb {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
-            owner: None,
             #[cfg(test)]
             legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -285,7 +317,6 @@ impl SqliteStateDb {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
-            owner: None,
             #[cfg(test)]
             legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -302,7 +333,6 @@ impl SqliteStateDb {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path: PathBuf::from(":memory:"),
-            owner: None,
             legacy_owner_claim_failures: std::sync::atomic::AtomicUsize::new(0),
         })
     }

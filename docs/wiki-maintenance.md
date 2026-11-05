@@ -50,7 +50,7 @@ These tools run manually against the declared wiki snapshot. This change adds no
 | Existing media / legacy account state | `docs/migration-from-icloudpd.md` / `docs/account-state-migration.md` |
 | Repair, metadata and layout changes | `docs/backup-maintenance.md`, `docs/metadata.md`, layout guides |
 | Password policy and account compatibility | Wiki Credentials / Authentication; command pages keep syntax |
-| Native background registration, control, update and removal | Wiki Service; old Install service anchors keep summaries |
+| Host-supervisor registration, control, update and removal | Wiki Service; old Install service anchors keep historical summaries |
 | Reports, metrics and privacy | Wiki Reports-and-Metrics / Support and `docs/support-export.md` |
 | Historical flags | Wiki Legacy-Flags and retained compatibility pages |
 

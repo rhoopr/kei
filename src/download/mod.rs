@@ -55,6 +55,7 @@ pub(crate) use orchestration::queue_projection::retained_work_config_hash_for_te
 pub(crate) use orchestration::queue_projection::{has_due_retained_work, prepare_retained_sources};
 pub(crate) use orchestration::recent::requires_recovery as recent_selection_requires_recovery;
 pub(crate) use orchestration::reconciliation::recover_recorded_sources;
+pub(crate) use orchestration::recovery::replay_pending_work;
 use orchestration::selection::build_pass_configs_resolving_deferred_excludes;
 use orchestration::url_refresh::{RetryTaskKey, UrlRetrySource, build_retry_download_tasks};
 

@@ -118,10 +118,11 @@ async fn platform_service_state() -> Result<ServiceState> {
 pub(crate) fn render_oneline(state: &ServiceState) -> String {
     match state {
         ServiceState::NotInstalled => {
-            "Service: not installed (run `kei install` to enable background sync)".to_string()
+            "Service: not installed (run `kei service run` under a supervisor for background sync)"
+                .to_string()
         }
         ServiceState::InContainer { supervisor } => format!(
-            "Service: container-managed (process supervisor: {supervisor}; `kei install` is not used)"
+            "Service: container-managed (process supervisor: {supervisor}; start the worker with `kei service run`)"
         ),
         ServiceState::BackendUnavailable { backend, reason } => {
             format!("Service: installed ({backend}, {reason})")
@@ -160,7 +161,7 @@ mod tests {
     fn renders_not_installed() {
         assert_eq!(
             render_oneline(&ServiceState::NotInstalled),
-            "Service: not installed (run `kei install` to enable background sync)",
+            "Service: not installed (run `kei service run` under a supervisor for background sync)",
         );
     }
 
@@ -170,7 +171,7 @@ mod tests {
             render_oneline(&ServiceState::InContainer {
                 supervisor: "docker",
             }),
-            "Service: container-managed (process supervisor: docker; `kei install` is not used)",
+            "Service: container-managed (process supervisor: docker; start the worker with `kei service run`)",
         );
     }
 
