@@ -115,6 +115,46 @@ def check_links(pages, repo):
                 raise ContractError(f"{name}: broken page/anchor {target}")
 
 
+GUIDES = {"backup-maintenance.md", "docker-first-backup.md", "metadata.md",
+          "migration-from-icloudpd.md"}
+
+
+def commit_sha(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+
+
+def guide_revisions(profile):
+    if "guide_revision" in profile:
+        if not commit_sha(profile["guide_revision"]):
+            raise ContractError("guide_revision must be an exact lowercase commit SHA")
+        revisions = {name: profile["guide_revision"] for name in GUIDES}
+    else:
+        revisions = {}
+    overrides = profile.get("guide_revisions", {})
+    if not isinstance(overrides, dict):
+        raise ContractError("guide_revisions must be a mapping")
+    for name, revision in overrides.items():
+        if name not in GUIDES:
+            raise ContractError(f"unknown guide revision: {name}")
+        if not commit_sha(revision):
+            raise ContractError(f"guide revision must be an exact lowercase commit SHA: {name}")
+        revisions[name] = revision
+    return revisions
+
+
+def check_guides(pages, profile):
+    revisions = guide_revisions(profile)
+    for name, text in pages.items():
+        for target in links(text):
+            url = urlsplit(target)
+            parts = url.path.split("/")
+            if (url.netloc != "github.com" or parts[:4] != ["", "rhoopr", "kei", "blob"]
+                    or len(parts) < 6 or parts[-1] not in revisions):
+                continue
+            if parts[4] != revisions[parts[-1]]:
+                raise ContractError(f"{name}: stale canonical guide revision {target}")
+
+
 def flatten(value, prefix=""):
     for key, item in value.items():
         name = f"{prefix}.{key}" if prefix else key
@@ -302,16 +342,7 @@ def validate(repo, wiki, contract, binary=None):
         if name not in pages or not anchors(old) <= anchors(pages[name]):
             raise ContractError(f"lost compatibility page/anchor: {path}")
     check_links(pages, repo)
-    if "guide_revision" in profile:
-        guides = {"backup-maintenance.md", "docker-first-backup.md", "metadata.md",
-                  "migration-from-icloudpd.md"}
-        for name, text in pages.items():
-            for target in links(text):
-                url = urlsplit(target)
-                if (url.netloc == "github.com" and url.path.startswith("/rhoopr/kei/blob/")
-                        and url.path.split("/")[-1] in guides
-                        and profile["guide_revision"] not in url.path):
-                    raise ContractError(f"{name}: stale canonical guide revision")
+    check_guides(pages, profile)
     legacy = {name for name, text in pages.items()
               if name.startswith("CLI") and "removed in v0.20" in text}
     if legacy:

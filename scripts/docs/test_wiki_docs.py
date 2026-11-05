@@ -46,8 +46,11 @@ class WikiDocsTests(unittest.TestCase):
             return subprocess.check_output(["git", "-C", str(path), *args], text=True,
                                            stderr=subprocess.DEVNULL)
         git("init", "-q")
-        git("add", "Home.md", "Sync.md", "Configuration.md") if (path / "Home.md").exists() else git(
-            "add", "Cargo.toml", "example.config.toml", "src/cli.rs")
+        paths = ["Home.md", "Sync.md", "Configuration.md"] if (path / "Home.md").exists() else [
+            "Cargo.toml", "example.config.toml", "src/cli.rs"]
+        paths.extend(name for name in ["Guides.md", "backup-maintenance.md",
+                                      "migration-from-icloudpd.md"] if (path / name).exists())
+        git("add", *paths)
         git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
             "commit", "-qm", "fixture")
         return git("rev-parse", "HEAD").strip()
@@ -209,6 +212,77 @@ class WikiDocsTests(unittest.TestCase):
             self.assertTrue(fixture["page"])
             self.assertTrue(fixture["without_help_effects"])
             self.assertTrue(fixture["argv"])
+
+    def guide_commits(self):
+        (self.repo / "backup-maintenance.md").write_text("# Backup\n")
+        (self.repo / "migration-from-icloudpd.md").write_text("# Migration\n")
+        default = self.commit(self.repo)
+        (self.repo / "migration-from-icloudpd.md").write_text("# Migration\n\n## Updated\n")
+        override = self.commit(self.repo)
+        return default, override
+
+    def guide_page(self, links):
+        (self.wiki / "Guides.md").write_text("# Guides\n\n" + "\n".join(links) + "\n")
+        self.contract["wiki_revision"] = self.commit(self.wiki)
+
+    def guide_contract(self, default, override):
+        self.contract["stable"]["guide_revision"] = default
+        self.contract["stable"]["guide_revisions"] = {
+            "migration-from-icloudpd.md": override}
+
+    def test_guide_revision_overrides_are_exact_and_scoped(self):
+        default, override = self.guide_commits()
+        self.guide_contract(default, override)
+        base = "https://github.com/rhoopr/kei/blob/"
+        self.guide_page([f"[backup]({base}{default}/backup-maintenance.md)",
+                         f"[migration]({base}{override}/migration-from-icloudpd.md)"])
+        self.check()
+        self.guide_page([f"[migration]({base}{default}/migration-from-icloudpd.md)"])
+        with self.assertRaisesRegex(docs.ContractError, "stale canonical guide"):
+            self.check()
+        self.guide_page([f"[backup]({base}{override}/backup-maintenance.md)"])
+        with self.assertRaisesRegex(docs.ContractError, "stale canonical guide"):
+            self.check()
+
+    def test_default_guide_revision_remains_valid_without_overrides(self):
+        default, newer = self.guide_commits()
+        self.contract["stable"]["guide_revision"] = default
+        base = "https://github.com/rhoopr/kei/blob/"
+        self.guide_page([f"[migration]({base}{default}/migration-from-icloudpd.md)"])
+        self.check()
+        self.guide_page([f"[migration]({base}{newer}/migration-from-icloudpd.md)"])
+        with self.assertRaisesRegex(docs.ContractError, "stale canonical guide"):
+            self.check()
+
+    def test_guide_revision_compares_exact_path_segment(self):
+        default, override = self.guide_commits()
+        self.guide_contract(default, override)
+        base = "https://github.com/rhoopr/kei/blob/"
+        self.guide_page([f"[backup]({base}{default}0/backup-maintenance.md)"])
+        with self.assertRaisesRegex(docs.ContractError, "stale canonical guide"):
+            self.check()
+
+    def test_malformed_guide_revision_values_are_rejected(self):
+        default, override = self.guide_commits()
+        self.guide_contract(default, override)
+        self.guide_page([])
+        base = copy.deepcopy(self.contract["stable"])
+        for update in [
+            {"guide_revisions": []},
+            {"guide_revisions": "not-a-mapping"},
+            {"guide_revisions": {"unknown.md": override}},
+            {"guide_revisions": {"migration-from-icloudpd.md": "f" * 39}},
+            {"guide_revisions": {"migration-from-icloudpd.md": "F" * 40}},
+            {"guide_revisions": {"migration-from-icloudpd.md": None}},
+            {"guide_revision": None},
+            {"guide_revision": "f" * 39},
+            {"guide_revision": "F" * 40},
+            {"guide_revision": 1},
+        ]:
+            with self.subTest(update=update):
+                self.contract["stable"] = {**base, **update}
+                with self.assertRaises(docs.ContractError):
+                    self.check()
 
 
 if __name__ == "__main__":
