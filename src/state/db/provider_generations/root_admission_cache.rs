@@ -1,5 +1,6 @@
 //! Transactional candidates for root-change admission. Entries never grant trust.
 use super::{StateError, params};
+use crate::state::VersionSizeKey;
 use rusqlite::{Connection, OptionalExtension};
 
 #[cfg(test)]
@@ -588,8 +589,14 @@ pub(in crate::state::db) fn guard_publication_choice(
         return Err(invalid());
     }
     let version = reservation.version_size.as_str();
+    let original_rendition = match reservation.version_size {
+        VersionSizeKey::Adjusted => Some(VersionSizeKey::Original),
+        VersionSizeKey::LiveAdjusted => Some(VersionSizeKey::LiveOriginal),
+        _ => None,
+    };
     let mut source = Vec::new();
-    for rendition in std::iter::once(version).chain((version == "adjusted").then_some("original")) {
+    for rendition in std::iter::once(version).chain(original_rendition.map(VersionSizeKey::as_str))
+    {
         for receipt in download_receipts::historical(
             conn,
             &binding.scope,
@@ -903,6 +910,82 @@ mod tests {
         reopened.execute_batch("BEGIN").unwrap();
         guard_publication_choice(&reopened, &binding, &reservation, &p).unwrap();
         reopened.execute_batch("COMMIT").unwrap();
+        let motion_p = dir.path().join("Photo.MOV");
+        let motion_s = dir.path().join("Sibling.MOV");
+        for (case, source_version, requested_version, foreign, allowed) in [
+            (
+                "motion original",
+                VersionSizeKey::LiveOriginal,
+                VersionSizeKey::LiveAdjusted,
+                false,
+                true,
+            ),
+            (
+                "still is not companion",
+                VersionSizeKey::Original,
+                VersionSizeKey::LiveAdjusted,
+                false,
+                false,
+            ),
+            (
+                "other motion rendition",
+                VersionSizeKey::LiveMedium,
+                VersionSizeKey::LiveAdjusted,
+                false,
+                false,
+            ),
+            (
+                "foreign motion owner",
+                VersionSizeKey::LiveOriginal,
+                VersionSizeKey::LiveAdjusted,
+                true,
+                false,
+            ),
+            (
+                "motion is not still original",
+                VersionSizeKey::LiveOriginal,
+                VersionSizeKey::Adjusted,
+                false,
+                false,
+            ),
+            (
+                "no unrelated fallback",
+                VersionSizeKey::LiveOriginal,
+                VersionSizeKey::LiveMedium,
+                false,
+                false,
+            ),
+        ] {
+            conn.execute_batch("SAVEPOINT companion_source").unwrap();
+            let mut companion = source.clone();
+            companion.version_size = source_version.as_str().into();
+            companion.native_path = SelectionPath::from_path(&motion_p);
+            companion.save(&conn).unwrap();
+            if foreign {
+                let mut other = companion.clone();
+                other.child = "foreign".into();
+                other.state_id = "foreign".into();
+                other.save(&conn).unwrap();
+            }
+            let mut choice = reservation.clone();
+            choice.version_size = requested_version;
+            choice.requested_path_key =
+                ReconciliationPathKey(crate::fs_util::confined_path_key(&motion_p).unwrap());
+            choice.destination_path_key =
+                ReconciliationPathKey(crate::fs_util::confined_path_key(&motion_s).unwrap());
+            choice.destination_path = motion_s.clone();
+            let result = guard_publication_choice(&conn, &binding, &choice, &motion_p);
+            if allowed {
+                assert!(result.is_ok(), "{case}: {result:?}");
+            } else {
+                assert!(
+                    matches!(&result, Err(StateError::ProviderWorkConflict)),
+                    "{case}: {result:?}"
+                );
+            }
+            conn.execute_batch("ROLLBACK TO companion_source; RELEASE companion_source")
+                .unwrap();
+        }
     }
 
     #[test]
