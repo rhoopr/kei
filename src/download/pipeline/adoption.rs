@@ -196,7 +196,6 @@ pub(super) async fn recover_pending_current_publications(
             };
             task_planner
                 .reconciliation_reservations()
-                .iter()
                 .any(|reservation| {
                     reservation.library == task.library
                         && reservation.asset_id.as_ref() == task.asset_id.as_ref()

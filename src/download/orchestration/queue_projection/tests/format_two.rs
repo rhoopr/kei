@@ -11,6 +11,262 @@ use crate::state::db::provider_selection::{
 use serde_json::json;
 use std::sync::Arc;
 
+async fn stream_collision_child(
+    f: &Fixture,
+    child: &str,
+    selected: bool,
+) -> crate::download::pipeline::StreamingResult {
+    use crate::download::orchestration::generation;
+    use crate::download::pipeline::{StreamRuntime, stream_and_download_from_stream};
+    let mut config = f.config.with_pass(&f.pass);
+    let mut asset = f
+        .pass
+        .album
+        .confirm_catalog_asset(child)
+        .await
+        .unwrap()
+        .asset;
+    if selected {
+        let context = generation::context_for_format(
+            std::slice::from_ref(&f.pass),
+            &f.config,
+            super::controls(),
+            2,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        config.selection_run = Some(
+            context
+                .start_for_test(std::slice::from_ref(&f.pass), &f.config)
+                .await
+                .unwrap(),
+        );
+        config.selection_pass = Some(generation::pass_key(&f.pass));
+        let run = config.selection_run.as_ref().unwrap();
+        let key = config.selection_pass.as_deref().unwrap();
+        let (current, confirmation) = run.confirm(key, asset).await.unwrap();
+        asset = current;
+        let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+            .await
+            .unwrap();
+        let mut plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        if child == "asset-b" {
+            assert_eq!(plan.tasks.len(), 1);
+            assert!(plan.tasks[0].superseded_requested_path.is_none());
+        }
+        eprintln!(
+            "COLLISION_PLAN child={child} tasks={:?} reservations={:?}",
+            plan.tasks
+                .iter()
+                .map(|t| (&t.download_path, &t.superseded_requested_path))
+                .collect::<Vec<_>>(),
+            planner.reconciliation_reservations().collect::<Vec<_>>()
+        );
+        let admitted = run
+            .project(
+                key,
+                &asset,
+                confirmation,
+                &mut plan,
+                &mut planner,
+                &config,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            admitted.as_ref().is_ok_and(|v| *v),
+            "{child} actual projection: {admitted:?}; plan={plan:?}"
+        );
+        if child == "asset-b" {
+            assert_eq!(
+                f.db.acquire_lock("ordinary B keeps post-Missing bookmark timing")
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(*) FROM reconciliation_paths WHERE id='asset-b'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+    stream_and_download_from_stream(
+        &reqwest::Client::new(),
+        futures_util::stream::iter([Ok(asset)]),
+        &Arc::new(config),
+        super::controls(),
+        1,
+        tokio_util::sync::CancellationToken::new(),
+        StreamRuntime::new(None, None),
+    )
+    .await
+    .unwrap()
+}
+
+#[cfg(unix)]
+async fn ordinary_collision_after_publication(bookmark: bool) {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::Ordering;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let server = wiremock::MockServer::start().await;
+    let original = b"\xff\xd8\xff\xe0original child A";
+    let edited = b"\xff\xd8\xff\xe0adjusted child A";
+    let independent = b"\xff\xd8\xff\xe0independent child B";
+    let checksum = |bytes: &[u8]| data_encoding::BASE64.encode(&Sha256::digest(bytes));
+    for (name, bytes) in [
+        ("original", original.as_slice()),
+        ("edited", edited.as_slice()),
+        ("independent", independent.as_slice()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(&server)
+            .await;
+    }
+    let mut f = Fixture::new().await;
+    f.config.folder_structure = "none".into();
+    f.config.edited = true;
+    f.config.edited_naming = crate::types::EditedNaming::Primary;
+    {
+        let mut values = f.session.records.lock().unwrap();
+        values[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+        values[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/original",server.uri()),"size":original.len(),"fileChecksum":checksum(original)});
+    }
+    let first = stream_collision_child(&f, "asset-m", false).await;
+    assert_eq!(
+        (first.downloaded, first.state_write_failures),
+        (1, 0),
+        "{first:?}"
+    );
+    let p = f.config.directory.join("photo.JPG");
+    assert_eq!(std::fs::read(&p).unwrap(), original);
+    if bookmark {
+        {
+            let mut values = f.session.records.lock().unwrap();
+            values[1]["fields"]["resJPEGFullRes"] = json!({"value":{"downloadURL":format!("{}/edited",server.uri()),"size":edited.len(),"fileChecksum":checksum(edited)}});
+            values[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+            values[1]["fields"]["adjustmentRenderType"] = json!({"value":1});
+        }
+        f.config.resolution = crate::types::PhotoResolution::None;
+        let adjusted = stream_collision_child(&f, "asset-m", true).await;
+        assert_eq!(
+            (adjusted.downloaded, adjusted.state_write_failures),
+            (1, 0),
+            "{adjusted:?}"
+        );
+    }
+    let (a_paths, proofs, mapping) = {
+        let conn = f.db.acquire_lock("snapshot A scoped publications").unwrap();
+        let paths: Vec<String> = conn.prepare("SELECT destination_path FROM reconciliation_paths WHERE id='asset-m' AND version_size='adjusted'").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(paths.len(), usize::from(bookmark));
+        let mut a_paths = vec![(p.clone(), original.as_slice())];
+        if bookmark {
+            a_paths.push((std::path::PathBuf::from(&paths[0]), edited.as_slice()));
+        }
+        let a_paths: Vec<_> = a_paths
+            .into_iter()
+            .map(|(path, bytes)| {
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                let m = std::fs::metadata(&path).unwrap();
+                (path, bytes.to_vec(), (m.ino(), m.mtime(), m.mtime_nsec()))
+            })
+            .collect();
+        let proofs: Vec<String> = conn.prepare("SELECT json_array(id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-m' ORDER BY id").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(proofs.len(), 1 + usize::from(bookmark));
+        let mapping: Vec<String> = conn.prepare("SELECT json_array(library,id,version_size,requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size) FROM reconciliation_paths ORDER BY id,version_size").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(mapping.len(), usize::from(bookmark));
+        (a_paths, proofs, mapping)
+    };
+    let old_state = Arc::downgrade(&f.db);
+    f = super::reopen_streaming_fixture(f).await;
+    assert!(old_state.upgrade().is_none());
+    let mut b = records("b", &checksum(independent), "independent child");
+    b[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+    b[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/independent",server.uri()),"size":independent.len(),"fileChecksum":checksum(independent)});
+    f.session.records.lock().unwrap().extend(b);
+    f.config.resolution = crate::types::PhotoResolution::Original;
+    // Exercise the generic new-collision producer, not Primary's managed path policy.
+    f.config.edited_naming = crate::types::EditedNaming::Suffix;
+    assert_eq!(f.db.acquire_lock("no B history before admission").unwrap().query_row("SELECT (SELECT count(*) FROM assets WHERE id='asset-b')+(SELECT count(*) FROM download_receipts WHERE child='asset-b')+(SELECT count(*) FROM reconciliation_paths WHERE id='asset-b')+(SELECT count(*) FROM provider_active_destinations WHERE child='asset-b')", [], |r|r.get::<_,i64>(0)).unwrap(), 0);
+    let next = stream_collision_child(&f, "asset-b", true).await;
+    eprintln!(
+        "ORDINARY_COLLISION bookmark={bookmark} downloaded={} state_failures={}",
+        next.downloaded, next.state_write_failures
+    );
+    assert_eq!(next.state_write_failures, 0, "{next:?}");
+    assert_eq!(next.downloaded, 1, "{next:?}");
+    assert!(next.failed.is_empty());
+    let b_path: String = f.db.acquire_lock("B independent publication").unwrap().query_row("SELECT local_path FROM assets WHERE id='asset-b' AND version_size='original' AND status='downloaded'", [], |r|r.get(0)).unwrap();
+    let b_path = std::path::PathBuf::from(b_path);
+    assert!(a_paths.iter().all(|(path, _, _)| path != &b_path));
+    assert_eq!(std::fs::read(&b_path).unwrap(), independent);
+    let gets = server.received_requests().await.unwrap();
+    assert_eq!(gets.len(), 2 + usize::from(bookmark));
+    assert_eq!(
+        gets.iter()
+            .filter(|r| r.url.path() == "/independent")
+            .count(),
+        1
+    );
+    let lookups = f.session.calls.load(Ordering::SeqCst);
+    f = super::reopen_streaming_fixture(f).await;
+    let quiet = crate::download::download_photos_with_sync(
+        &reqwest::Client::new(),
+        std::slice::from_ref(&f.pass),
+        Arc::new(f.config.clone()),
+        super::controls(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(quiet.outcome, crate::download::DownloadOutcome::Success),
+        "{quiet:?}"
+    );
+    assert_eq!(quiet.stats.downloaded, 0);
+    assert_eq!(f.session.calls.load(Ordering::SeqCst), lookups);
+    assert_eq!(server.received_requests().await.unwrap().len(), gets.len());
+    let conn =
+        f.db.acquire_lock("A remains unchanged after B and quiet reopen")
+            .unwrap();
+    let after: Vec<String> = conn.prepare("SELECT json_array(id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-m' ORDER BY id").unwrap()
+        .query_map([], |r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(after, proofs);
+    let after_mapping: Vec<String> = conn.prepare("SELECT json_array(library,id,version_size,requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size) FROM reconciliation_paths WHERE id='asset-m' ORDER BY id,version_size").unwrap()
+        .query_map([], |r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(after_mapping, mapping);
+    for (path, bytes, identity) in a_paths {
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let m = std::fs::metadata(path).unwrap();
+        assert_eq!((m.ino(), m.mtime(), m.mtime_nsec()), identity);
+    }
+    assert_eq!(std::fs::read(b_path).unwrap(), independent);
+    eprintln!(
+        "ORDINARY_COLLISION_COMPLETE bookmark={bookmark} independent_GET=1 A_proofs={} quiet_downloaded=0",
+        proofs.len()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ordinary_collision_with_unrelated_publication_bookmark_progresses() {
+    ordinary_collision_after_publication(true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ordinary_collision_without_unrelated_bookmark_progresses() {
+    ordinary_collision_after_publication(false).await;
+}
+
 #[tokio::test]
 #[cfg(unix)]
 async fn admitted_publication_choice_prefix_reopens_before_missing_and_dispatch() {
@@ -338,6 +594,202 @@ async fn admitted_publication_choice_prefix_reopens_before_missing_and_dispatch(
         (before.ino(), before.mtime(), before.mtime_nsec()),
         (after.ino(), after.mtime(), after.mtime_nsec())
     );
+}
+
+#[tokio::test]
+async fn stale_prior_publication_nomination_cannot_fall_back_to_ordinary() {
+    use crate::download::orchestration::generation;
+    use sha2::{Digest, Sha256};
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let original = b"\xff\xd8\xff\xe0unchanged original";
+    let edited = b"\xff\xd8\xff\xe0current adjusted";
+    let checksum = |bytes: &[u8]| data_encoding::BASE64.encode(&Sha256::digest(bytes));
+    for case in ["positive", "binding", "history", "history_and_marker"] {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/original"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(original))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/edited"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(edited))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut f = Fixture::new().await;
+        f.config.folder_structure = "none".into();
+        f.config.edited = true;
+        f.config.edited_naming = crate::types::EditedNaming::Primary;
+        {
+            let mut values = f.session.records.lock().unwrap();
+            values[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+            values[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/original",server.uri()),"size":original.len(),"fileChecksum":checksum(original)});
+        }
+        let first = stream_collision_child(&f, "asset-m", false).await;
+        assert_eq!((first.downloaded, first.state_write_failures), (1, 0));
+        {
+            let mut values = f.session.records.lock().unwrap();
+            values[1]["fields"]["resJPEGFullRes"] = json!({"value":{"downloadURL":format!("{}/edited",server.uri()),"size":edited.len(),"fileChecksum":checksum(edited)}});
+            values[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+            values[1]["fields"]["adjustmentRenderType"] = json!({"value":1});
+        }
+        f.config.resolution = crate::types::PhotoResolution::None;
+        let context = generation::context_for_format(
+            std::slice::from_ref(&f.pass),
+            &f.config,
+            super::controls(),
+            2,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let run = context
+            .start_for_test(std::slice::from_ref(&f.pass), &f.config)
+            .await
+            .unwrap();
+        let key = generation::pass_key(&f.pass);
+        let observed = f
+            .pass
+            .album
+            .confirm_catalog_asset("asset-m")
+            .await
+            .unwrap()
+            .asset;
+        let (asset, confirmation) = run.confirm(&key, observed).await.unwrap();
+        let mut config = f.config.with_pass(&f.pass);
+        config.selection_run = Some(run.clone());
+        config.selection_pass = Some(key.clone());
+        let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+            .await
+            .unwrap();
+        let mut plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        let p = f.config.directory.join("photo.JPG");
+        assert_eq!(plan.tasks.len(), 1);
+        let s = plan.tasks[0].download_path.clone();
+        assert_ne!(p, s);
+        assert!(
+            plan.tasks[0]
+                .superseded_requested(&config.directory, &p)
+                .is_some()
+        );
+        assert_eq!(
+            planner.reconciliation_reservations().count(),
+            1,
+            "positive producer did not nominate prior publication"
+        );
+        let count_sql = "SELECT (SELECT count(*) FROM reconciliation_paths),(SELECT count(*) FROM provider_active_destinations WHERE admitted=1)";
+        assert_eq!(
+            f.db.acquire_lock("before stale nomination")
+                .unwrap()
+                .query_row(count_sql, [], |r| Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?
+                )))
+                .unwrap(),
+            (0, 0)
+        );
+        match case {
+            "positive" => {}
+            "binding" => plan.tasks[0].publication_binding = None,
+            "history" | "history_and_marker" => {
+                f.db.acquire_lock("invalidate prior evidence after nomination")
+                    .unwrap()
+                    .execute("DELETE FROM download_receipts", [])
+                    .unwrap();
+                if case == "history_and_marker" {
+                    plan.tasks[0].superseded_requested_path = None;
+                }
+            }
+            _ => panic!("unexpected stale nomination case {case}"),
+        }
+        let result = planner
+            .persist_execution_publication_choices(&asset, &config, &plan.tasks)
+            .await;
+        if case == "positive" {
+            assert!(result.unwrap());
+            assert!(
+                run.project(
+                    &key,
+                    &asset,
+                    confirmation,
+                    &mut plan,
+                    &mut planner,
+                    &config,
+                    &CancellationToken::new()
+                )
+                .await
+                .unwrap()
+            );
+            assert_eq!(
+                f.db.acquire_lock("valid prior progress")
+                    .unwrap()
+                    .query_row(count_sql, [], |r| Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?
+                    )))
+                    .unwrap(),
+                (1, 1)
+            );
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                match case {
+                    "binding" => error == "Choice lost publication binding",
+                    "history" =>
+                        error == crate::state::error::StateError::ProviderWorkConflict.to_string(),
+                    "history_and_marker" => error == "Choice lost authenticated historical source",
+                    _ => false,
+                },
+                "{case}: {error}"
+            );
+            // Deliberately attempt the ordinary writer after rejection. It must
+            // neither drain provenance nor rewrite the final task's destination.
+            let mut fallback_tasks = plan.tasks.clone();
+            fallback_tasks[0].download_path = s.with_file_name("unapproved-final-rewrite.JPG");
+            let fallback = planner
+                .persist_download_reservations(f.db.as_ref(), &fallback_tasks)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                fallback.to_string(),
+                "Unconfirmed prior publication cannot use ordinary reservation writer"
+            );
+            assert!(
+                run.project(
+                    &key,
+                    &asset,
+                    confirmation,
+                    &mut plan,
+                    &mut planner,
+                    &config,
+                    &CancellationToken::new()
+                )
+                .await
+                .is_err(),
+                "{case} reached admission"
+            );
+            assert_eq!(
+                f.db.acquire_lock("stale prior has no intent or admission")
+                    .unwrap()
+                    .query_row(count_sql, [], |r| Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?
+                    )))
+                    .unwrap(),
+                (0, 0)
+            );
+            eprintln!(
+                "STALE_PRIOR case={case} refused={error} ordinary_fallback=refused intent=0 admitted=0 edited_GET=0"
+            );
+        }
+        assert!(!s.exists());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(std::fs::read(p).unwrap(), original);
+    }
 }
 
 #[tokio::test]
@@ -745,6 +1197,13 @@ async fn publication_choice_exact_replay_is_intent_not_historical_byte_proof() {
         let result = planner
             .persist_execution_publication_choices(&f.asset, &current, &plan.tasks)
             .await;
+        if matches!(case, "missing" | "conflict") {
+            assert!(
+                result.is_err(),
+                "{case} silently downgraded replay: {result:?}"
+            );
+            eprintln!("EXACT_REPLAY case={case} refused_exemption={result:?}");
+        }
         assert!(!result.unwrap_or(false), "{case} received replay exemption");
         db.acquire_lock("restore replay negative")
             .unwrap()

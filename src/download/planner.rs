@@ -35,6 +35,20 @@ enum ReservedReplay {
     PendingRetry,
 }
 
+/// Ephemeral producer provenance, never reconstructed from missing evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationOrigin {
+    OrdinaryCollision,
+    PriorPublication,
+    ExactReplayCandidate,
+}
+
+#[derive(Debug)]
+struct PlannedReservation {
+    reservation: ReconciliationReservation,
+    origin: ReservationOrigin,
+}
+
 /// Keep durable path ownership off the stack of the shared async planner.
 #[derive(Debug, Default)]
 struct ReconciliationPlanning {
@@ -43,7 +57,7 @@ struct ReconciliationPlanning {
     destinations:
         FxHashMap<(ReconciliationOwner, ReconciliationContent, NormalizedPath), std::path::PathBuf>,
     path_contents: FxHashMap<NormalizedPath, FxHashSet<Option<ReconciliationContent>>>,
-    reservations: Vec<ReconciliationReservation>,
+    reservations: Vec<PlannedReservation>,
     durable_destinations: FxHashSet<NormalizedPath>,
     downloaded_paths: FxHashMap<ReconciliationOwner, Vec<crate::state::DownloadedFileRecord>>,
     #[cfg(test)]
@@ -1006,9 +1020,9 @@ impl TaskPlanner {
             {
                 continue;
             }
-            self.reconciliation
-                .reservations
-                .push(ReconciliationReservation {
+            self.reconciliation.reservations.push(PlannedReservation {
+                origin: ReservationOrigin::PriorPublication,
+                reservation: ReconciliationReservation {
                     library: Arc::clone(&task.library),
                     asset_id: task.asset_id.as_ref().into(),
                     version_size: task.version_size,
@@ -1021,7 +1035,8 @@ impl TaskPlanner {
                         checksum: task.checksum.clone(),
                         size: task.size,
                     }),
-                });
+                },
+            });
         }
         Ok(())
     }
@@ -1035,13 +1050,24 @@ impl TaskPlanner {
         config: &DownloadConfig,
         tasks: &[DownloadTask],
     ) -> Result<bool> {
-        let Some(album) = &config.primary_layout_source else {
-            return Ok(false);
-        };
         let library = asset.source_zone().unwrap_or(&config.library);
-        if album.publication_scope(library)?.is_none() {
+        if !self.reconciliation.reservations.iter().any(|planned| {
+            let r = &planned.reservation;
+            planned.origin != ReservationOrigin::OrdinaryCollision
+                && r.library.as_ref() == library
+                && r.asset_id.as_ref() == asset.state_id()
+                && r.requested_path_key != r.destination_path_key
+                && tasks.iter().any(|task| task.version_size == r.version_size)
+        }) {
             return Ok(false);
         }
+        let album = config
+            .primary_layout_source
+            .as_ref()
+            .context("Missing choice source")?;
+        album
+            .publication_scope(library)?
+            .context("Missing choice scope")?;
         config
             .state_db
             .as_ref()
@@ -1059,19 +1085,18 @@ impl TaskPlanner {
         let mut consumed = Vec::new();
         let mut binding = None;
         let mut store = None;
-        for (index, reservation) in self.reconciliation.reservations.iter().enumerate() {
+        for (index, planned) in self.reconciliation.reservations.iter().enumerate() {
+            let reservation = &planned.reservation;
             if reservation.library.as_ref() != library
                 || reservation.asset_id.as_ref() != asset.state_id()
             {
                 continue;
             }
-            let Some((task, rebound)) = tasks.iter().zip(&checked.tasks).find(|(task, _)| {
-                task.version_size == reservation.version_size
-                    && reservation
-                        .content
-                        .as_ref()
-                        .is_some_and(|c| c.checksum == task.checksum && c.size == task.size)
-            }) else {
+            let Some((task, rebound)) = tasks
+                .iter()
+                .zip(&checked.tasks)
+                .find(|(task, _)| task.version_size == reservation.version_size)
+            else {
                 continue;
             };
             if PathPlanningMode::Reconciliation
@@ -1085,6 +1110,16 @@ impl TaskPlanner {
             if reservation.requested_path_key == reservation.destination_path_key {
                 continue;
             }
+            if planned.origin == ReservationOrigin::OrdinaryCollision {
+                continue;
+            }
+            anyhow::ensure!(
+                reservation
+                    .content
+                    .as_ref()
+                    .is_some_and(|c| c.checksum == task.checksum && c.size == task.size),
+                "Choice no longer matches nominated resource"
+            );
             let original = task
                 .publication_binding
                 .as_deref()
@@ -1157,15 +1192,16 @@ impl TaskPlanner {
                     task.size,
                 )
                 .await?;
-            if capture
+            let persisted = capture
                 .db
                 .publication_choice_is_persisted(
                     original.clone(),
                     reservation.clone(),
                     crate::state::db::provider_selection::SelectionPath::from_path(&requested.path),
                 )
-                .await?
-            {
+                .await?;
+            if planned.origin == ReservationOrigin::ExactReplayCandidate {
+                anyhow::ensure!(persisted, "Exact choice replay lost persisted intent");
                 replayed.push(reservation.clone());
                 consumed.push(index);
                 continue;
@@ -1955,9 +1991,9 @@ impl TaskPlanner {
             return Ok(false);
         };
         self.choose_independent_sibling(db, task).await?;
-        self.reconciliation
-            .reservations
-            .push(ReconciliationReservation {
+        self.reconciliation.reservations.push(PlannedReservation {
+            origin: ReservationOrigin::PriorPublication,
+            reservation: ReconciliationReservation {
                 library: Arc::clone(&task.library),
                 asset_id: task.asset_id.as_ref().into(),
                 version_size: task.version_size,
@@ -1978,7 +2014,8 @@ impl TaskPlanner {
                     checksum: task.checksum.clone(),
                     size: task.size,
                 }),
-            });
+            },
+        });
         Ok(true)
     }
 
@@ -2459,8 +2496,13 @@ impl TaskPlanner {
             .insert(path, size);
     }
 
-    pub(super) fn reconciliation_reservations(&self) -> &[ReconciliationReservation] {
-        &self.reconciliation.reservations
+    pub(super) fn reconciliation_reservations(
+        &self,
+    ) -> impl Iterator<Item = &ReconciliationReservation> {
+        self.reconciliation
+            .reservations
+            .iter()
+            .map(|planned| &planned.reservation)
     }
 
     /// Commit final choices, including recorded-path overrides, before dispatch.
@@ -2470,7 +2512,21 @@ impl TaskPlanner {
         db: &dyn DownloadStore,
         tasks: &[DownloadTask],
     ) -> Result<()> {
-        let mut reservations = std::mem::take(&mut self.reconciliation.reservations);
+        anyhow::ensure!(
+            !self.reconciliation.reservations.iter().any(|planned| {
+                planned.origin == ReservationOrigin::PriorPublication
+                    && tasks.iter().any(|task| {
+                        task.library == planned.reservation.library
+                            && task.asset_id.as_ref() == planned.reservation.asset_id.as_ref()
+                            && task.version_size == planned.reservation.version_size
+                    })
+            }),
+            "Unconfirmed prior publication cannot use ordinary reservation writer"
+        );
+        let mut reservations: Vec<_> = std::mem::take(&mut self.reconciliation.reservations)
+            .into_iter()
+            .map(|planned| planned.reservation)
+            .collect();
         reservations.retain_mut(|reservation| {
             let Some(task) = tasks.iter().find(|task| {
                 task.library == reservation.library
@@ -2621,6 +2677,11 @@ impl TaskPlanner {
                     };
                     let slot = (owner.clone(), content.clone(), requested_key.clone());
                     let mut destination = self.reconciliation.destinations.get(&slot).cloned();
+                    let origin = if destination.is_some() {
+                        ReservationOrigin::ExactReplayCandidate
+                    } else {
+                        ReservationOrigin::OrdinaryCollision
+                    };
                     let mut reused_logical_reservation = false;
                     if destination.is_none() {
                         // A previously recorded owner may be the same logical
@@ -2746,7 +2807,9 @@ impl TaskPlanner {
                     if !reused_logical_reservation {
                         self.reconciliation
                             .reservations
-                            .push(ReconciliationReservation {
+                            .push(PlannedReservation {
+                                origin,
+                                reservation: ReconciliationReservation {
                                 content: Some(content),
                                 library: Arc::clone(&task.library),
                                 asset_id: task.asset_id.as_ref().into(),
@@ -2760,6 +2823,7 @@ impl TaskPlanner {
                                 destination_path: crate::fs_util::absolute_confined_path(
                                     &task.download_path,
                                 )?,
+                                },
                             });
                     }
                 }
@@ -3249,7 +3313,7 @@ mod tests {
                 catalog.clear();
             }
             let reservations = if matches!(case, "frozen" | "missing") {
-                seed.reconciliation_reservations().to_vec()
+                seed.reconciliation_reservations().cloned().collect()
             } else {
                 Vec::new()
             };
@@ -3777,7 +3841,11 @@ mod tests {
         let initial = planner.plan_download_asset(&asset, &config).await.unwrap();
         let task = &initial.tasks[0];
         let legacy_path = task.download_path.clone();
-        let mut legacy = planner.reconciliation_reservations()[0].clone();
+        let mut legacy = planner
+            .reconciliation_reservations()
+            .next()
+            .unwrap()
+            .clone();
         legacy.content = None;
         db.reserve_reconciliation_paths(std::slice::from_ref(&legacy), None)
             .await
@@ -3840,9 +3908,15 @@ mod tests {
         let mut planner = TaskPlanner::for_reconciliation(Vec::new(), Vec::new()).unwrap();
         let initial = planner.plan_download_asset(&shared, &config).await.unwrap();
         let shared_path = initial.tasks[0].download_path.clone();
-        db.reserve_reconciliation_paths(planner.reconciliation_reservations(), None)
-            .await
-            .unwrap();
+        db.reserve_reconciliation_paths(
+            &planner
+                .reconciliation_reservations()
+                .cloned()
+                .collect::<Vec<_>>(),
+            None,
+        )
+        .await
+        .unwrap();
         let mut planner = TaskPlanner::for_download(Some(&db)).await.unwrap();
         let primary_plan = planner
             .plan_download_asset(&primary, &config)
