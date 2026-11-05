@@ -5965,6 +5965,124 @@ async fn primary_layout_root_template_transitions_cover_all_pass_kinds() {
     }
 }
 
+// Establish released managed ownership through the real preparation and commit
+// owners, after the caller has proved ordinary authenticated downloads.
+async fn seed_committed_root_journal_family(
+    root: &std::path::Path,
+    server: &MockServer,
+) -> (String, String) {
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let db = Arc::new(
+        state::SqliteStateDb::open_owned(&root.join("state.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    let provider = Session {
+        reported_count: None,
+        records: records(server, Some(("edit-one", EDIT_ONE))),
+        quiet: true,
+        lookups: Arc::new(AtomicUsize::new(0)),
+        current: None,
+        lookup_change: None,
+        indexing: None,
+        baseline_successor: None,
+        cycle_token: None,
+        trace: None,
+    };
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::default(),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from("TestAlbum"),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"})),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(provider),
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner, "com"),
+        Arc::from("private"),
+    );
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::default(),
+    };
+    let (capture, scope, _) = pass
+        .album
+        .publication_scope("PrimarySync")
+        .unwrap()
+        .unwrap();
+    assert!(Arc::ptr_eq(&db, &capture.db));
+    let media = root.join("media");
+    let store: Arc<dyn download::DownloadStore> = db.clone();
+    let build = make_run_cycle_download_config_builder(&media, store);
+    let mut config = build(
+        download::SyncMode::Full,
+        Arc::default(),
+        Arc::default(),
+        Arc::from("PrimarySync"),
+    )
+    .as_ref()
+    .clone();
+    config.folder_structure = String::new();
+    config.folder_structure_albums = Arc::from("");
+    config.folder_structure_smart_folders = Arc::from("");
+    config.edited = true;
+    config.edited_naming = EditedNaming::Primary;
+    #[cfg(feature = "xmp")]
+    {
+        config.metadata.xmp_sidecar = true;
+    }
+    let expected_pass = config.with_pass(&pass).primary_layout_pass.unwrap();
+    let requests = server.received_requests().await.unwrap().len();
+    let mut op = download::seed_prepared_edited_compat(&config, &pass).await;
+    assert_eq!(op.phase, "prepared");
+    assert_eq!(op.source_library, "PrimarySync");
+    assert_eq!(op.library, "PrimarySync");
+    assert_eq!(op.child, "asset-501");
+    assert_eq!(op.pass, expected_pass);
+    for (version, checksum) in [
+        ("original", provider_hash(ORIGINAL)),
+        ("adjusted", provider_hash(EDIT_ONE)),
+    ] {
+        assert!(op.members.iter().any(|member| {
+            member.record.as_ref().is_some_and(|record| {
+                record.version_size.as_str() == version && record.checksum.as_ref() == checksum
+            }) && member.prepared.is_some()
+        }));
+    }
+    download::finish_prepared_edited_compat(&config, &mut op).await;
+    assert_eq!(op.phase, "committed");
+    let binding = db
+        .primary_layout_binding(op.family.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.generation, op.generation + 1);
+    assert_eq!(binding.decision, op.decision);
+    assert_eq!(binding.files.len(), 2);
+    assert!(
+        db.primary_layout_operations("PrimarySync".into())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    (scope, expected_pass)
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn primary_layout_root_drift_holds_recorded_media_and_exact_sidecar_journals() {
@@ -5976,6 +6094,7 @@ async fn primary_layout_root_drift_holds_recorded_media_and_exact_sidecar_journa
         let edited = records(&server, Some(("edit-one", EDIT_ONE)));
         let options = |media_directory| CycleOptions {
             media_directory,
+            private: true,
             #[cfg(feature = "xmp")]
             sidecar: true,
             ..CycleOptions::default()
@@ -5990,10 +6109,21 @@ async fn primary_layout_root_drift_holds_recorded_media_and_exact_sidecar_journa
         .await;
         assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
         assert!(initial.db_sync_token_advance_safe);
+        assert_eq!(initial.stats.downloaded, 2);
+        assert_bytes(&root.path().join("media/IMG_0501.JPG"), EDIT_ONE);
+        assert_bytes(&root.path().join("media/IMG_0501_original.JPG"), ORIGINAL);
+        let _ = seed_committed_root_journal_family(root.path(), &server).await;
         let current = root.path().join("media/IMG_0501.JPG");
         let archive = root.path().join("media/IMG_0501_original.JPG");
         let sidecar = current.with_file_name("IMG_0501.JPG.xmp");
         let packet = std::fs::read(&sidecar).ok();
+        let archive_sidecar = archive.with_file_name("IMG_0501_original.JPG.xmp");
+        let archive_packet = std::fs::read(&archive_sidecar).ok();
+        #[cfg(feature = "xmp")]
+        assert!(
+            packet.is_some() && archive_packet.is_some(),
+            "committed family sidecars must exist"
+        );
         let target = if sidecar_journal { &sidecar } else { &current };
         let journal = target.with_file_name(format!(
             ".kei-replace-{}",
@@ -6014,6 +6144,8 @@ async fn primary_layout_root_drift_holds_recorded_media_and_exact_sidecar_journa
                 .query_row("SELECT group_concat(path_key || ':' || COALESCE(local_checksum,''), '|') FROM (SELECT path_key,local_checksum FROM primary_layout_claims ORDER BY path_key)", [], |row| row.get::<_, String>(0)).unwrap()
         };
         let original_claims = claims();
+        let bindings = db_count(root.path(), "SELECT COUNT(*) FROM primary_layout_bindings");
+        assert_eq!(bindings, 1);
         let requests = server.received_requests().await.unwrap().len();
         // Each cycle reopens SQLite and must preserve the same held generation.
         for _ in 0..2 {
@@ -6034,6 +6166,7 @@ async fn primary_layout_root_drift_holds_recorded_media_and_exact_sidecar_journa
             assert_bytes(&current, EDIT_ONE);
             assert_bytes(&archive, ORIGINAL);
             assert_eq!(std::fs::read(&sidecar).ok(), packet);
+            assert_eq!(std::fs::read(&archive_sidecar).ok(), archive_packet);
             assert_eq!(
                 std::fs::read(journal.join("manifest.json")).unwrap(),
                 b"retained replacement evidence"
@@ -6052,12 +6185,16 @@ async fn primary_layout_root_drift_holds_recorded_media_and_exact_sidecar_journa
                 operations
             );
             assert_eq!(claims(), original_claims);
+            assert_eq!(
+                db_count(root.path(), "SELECT COUNT(*) FROM primary_layout_bindings"),
+                bindings
+            );
             assert_eq!(server.received_requests().await.unwrap().len(), requests);
         }
-        // Remove only this synthetic journal, then prove recovery and steady state.
+        // Removing the obstruction permits ordinary reuse, not a root migration.
         std::fs::remove_dir_all(&journal).unwrap();
         for quiet in [false, true] {
-            let (resumed, _) = cycle_options(
+            let (resumed, lookups) = cycle_options(
                 root.path(),
                 edited.clone(),
                 quiet,
@@ -6067,10 +6204,31 @@ async fn primary_layout_root_drift_holds_recorded_media_and_exact_sidecar_journa
             .await;
             assert_eq!(resumed.failed_count, 0, "{:?}", resumed.stats);
             assert!(resumed.db_sync_token_advance_safe);
-            assert_bytes(&root.path().join("new-root/IMG_0501.JPG"), EDIT_ONE);
-            assert_bytes(
-                &root.path().join("new-root/IMG_0501_original.JPG"),
-                ORIGINAL,
+            assert_eq!(resumed.stats.downloaded, 0);
+            if quiet {
+                assert_eq!(lookups, 0);
+            }
+            assert_bytes(&current, EDIT_ONE);
+            assert_bytes(&archive, ORIGINAL);
+            assert_eq!(std::fs::read(&sidecar).ok(), packet);
+            assert_eq!(std::fs::read(&archive_sidecar).ok(), archive_packet);
+            assert!(
+                std::fs::read_dir(root.path().join("new-root"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+            assert_eq!(claims(), original_claims);
+            assert_eq!(
+                db_count(
+                    root.path(),
+                    "SELECT COUNT(*) FROM primary_layout_operations"
+                ),
+                operations
+            );
+            assert_eq!(
+                db_count(root.path(), "SELECT COUNT(*) FROM primary_layout_bindings"),
+                bindings
             );
             assert_eq!(server.received_requests().await.unwrap().len(), requests);
         }
@@ -6078,12 +6236,15 @@ async fn primary_layout_root_drift_holds_recorded_media_and_exact_sidecar_journa
 }
 
 #[tokio::test]
-async fn primary_layout_root_drift_after_old_parent_moves_redownloads_then_stays_quiet() {
+#[tracing_test::traced_test]
+async fn primary_layout_root_drift_after_old_parent_moves_holds_until_exact_parent_restoration() {
     let server = server().await;
     let root = tempfile::tempdir().unwrap();
     let edited = records(&server, Some(("edit-one", EDIT_ONE)));
-    let options = |media_directory| CycleOptions {
+    let options = |media_directory, token| CycleOptions {
         media_directory,
+        cycle_token: Some(token),
+        private: true,
         #[cfg(feature = "xmp")]
         sidecar: true,
         ..CycleOptions::default()
@@ -6093,77 +6254,231 @@ async fn primary_layout_root_drift_after_old_parent_moves_redownloads_then_stays
         edited.clone(),
         false,
         EditedNaming::Primary,
-        options("media"),
+        options("media", "root-parent-before"),
     )
     .await;
     assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
     assert!(initial.db_sync_token_advance_safe);
-    let old_family: String = rusqlite::Connection::open(root.path().join("state.db"))
-        .unwrap()
-        .query_row("SELECT family FROM primary_layout_bindings", [], |row| {
-            row.get(0)
-        })
+    assert_eq!(initial.stats.downloaded, 2);
+    assert_bytes(&root.path().join("media/IMG_0501.JPG"), EDIT_ONE);
+    assert_bytes(&root.path().join("media/IMG_0501_original.JPG"), ORIGINAL);
+    let (scope, pass_key) = seed_committed_root_journal_family(root.path(), &server).await;
+    let db_path = root.path().join("state.db");
+    let custody = || {
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
         .unwrap();
-    let old_claims = || {
-        rusqlite::Connection::open(root.path().join("state.db")).unwrap()
-            .query_row("SELECT group_concat(path_key || ':' || COALESCE(local_checksum,''), '|') FROM (SELECT path_key,local_checksum FROM primary_layout_claims WHERE family=?1 ORDER BY path_key)", [&old_family], |row| row.get::<_, String>(0)).unwrap()
+        [
+            "SELECT * FROM primary_layout_bindings ORDER BY family",
+            "SELECT * FROM primary_layout_operations ORDER BY operation",
+            "SELECT * FROM primary_layout_members ORDER BY operation,member",
+            "SELECT * FROM primary_layout_claims ORDER BY path_key",
+            "SELECT * FROM primary_layout_preserved ORDER BY operation,member",
+            "SELECT * FROM primary_layout_superseded_paths ORDER BY library,child,version,native_path",
+            "SELECT * FROM download_receipts ORDER BY id",
+            "SELECT library,id,version_size,local_path,provider_checksum,source_checksum,local_checksum FROM asset_metadata_paths ORDER BY library,id,version_size,local_path",
+        ]
+        .into_iter()
+        .map(|sql| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let columns = stmt.column_count();
+            stmt.query_map([], |row| {
+                (0..columns)
+                    .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        })
+        .collect::<Vec<_>>()
     };
-    let original_claims = old_claims();
+    let original_custody = custody();
+    assert_eq!(original_custody[0].len(), 1);
+    assert_eq!(original_custody[1].len(), 1);
+    assert_eq!(original_custody[2].len(), 2);
+    assert_eq!(original_custody[3].len(), 2);
+    assert_eq!(original_custody[6].len(), 2);
+    let media = root.path().join("media");
     let moved = root.path().join("moved-media");
-    let sidecar_name = "IMG_0501.JPG.xmp";
-    let packet = std::fs::read(root.path().join("media").join(sidecar_name)).ok();
-    std::fs::rename(root.path().join("media"), &moved).unwrap();
+    let files = |directory: &std::path::Path| {
+        [
+            "IMG_0501.JPG",
+            "IMG_0501_original.JPG",
+            "IMG_0501.JPG.xmp",
+            "IMG_0501_original.JPG.xmp",
+        ]
+        .into_iter()
+        .filter(|name| cfg!(feature = "xmp") || !name.ends_with(".xmp"))
+        .map(|name| {
+            let path = directory.join(name);
+            let file = std::fs::File::open(&path).unwrap();
+            (
+                name,
+                std::fs::read(&path).unwrap(),
+                crate::fs_util::file_identity(&file).unwrap(),
+                file.metadata().unwrap().modified().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>()
+    };
+    let original_files = files(&media);
+    let checkpoint = || {
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(checkpoint(), "root-parent-before");
+    {
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        for (version, name, bytes) in [
+            ("original", "IMG_0501_original.JPG", ORIGINAL),
+            ("adjusted", "IMG_0501.JPG", EDIT_ONE),
+        ] {
+            let destination = media.join(name);
+            let native = serde_json::to_string(
+                &state::db::provider_selection::SelectionPath::from_path(&destination),
+            )
+            .unwrap();
+            let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+            let count: i64 = conn.query_row("SELECT count(*) FROM download_receipts r JOIN account_owner a ON a.account_key=r.account_key AND a.provider_key=r.provider_key WHERE r.scope=?1 AND r.library='PrimarySync' AND r.child='asset-501' AND r.master='501' AND r.state_id='asset-501' AND r.origin_pass=?2 AND r.version_size=?3 AND r.provider_checksum=?4 AND r.provider_size=?5 AND r.native_path=?6 AND r.source_checksum=?7 AND r.local_checksum=?7 AND length(r.proof_hash)=64", rusqlite::params![scope,pass_key,version,provider_hash(bytes),i64::try_from(bytes.len()).unwrap(),native,hash], |row| row.get(0)).unwrap();
+            assert_eq!(
+                count, 1,
+                "missing authenticated recorded-path receipt for {version}"
+            );
+        }
+    }
+    let new_root_is_empty = || {
+        assert!(
+            std::fs::read_dir(root.path().join("new-root"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let admitted: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM provider_active_destinations WHERE admitted=1 AND compat_path LIKE ?1",
+                [format!("{}/%", root.path().join("new-root").display())],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(admitted, 0);
+    };
+    std::fs::rename(&media, &moved).unwrap();
     let requests = server.received_requests().await.unwrap().len();
-    let (changed, lookups) = cycle_options(
+    for (round, token) in ["root-parent-held-one", "root-parent-held-two"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            std::fs::symlink_metadata(&media).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let (held, _) = cycle_options(
+            root.path(),
+            edited.clone(),
+            false,
+            EditedNaming::Primary,
+            options("new-root", token),
+        )
+        .await;
+        assert!(held.failed_count > 0, "{:?}", held.stats);
+        assert!(!held.db_sync_token_advance_safe);
+        assert_eq!(held.stats.state_write_failures, 1);
+        assert_eq!(held.stats.enumeration_errors, 0);
+        assert_eq!(
+            held.stats.sync_token_blocked_reason,
+            Some("selection_generation_deferred")
+        );
+        logs_assert(|lines| {
+            let refusals = lines
+                .iter()
+                .filter(|line| line.contains("Selection projection refused canonical mutation error=Recorded old-root file is unavailable"))
+                .count();
+            if refusals == round + 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected {} exact old-root refusals, got {refusals}",
+                    round + 1
+                ))
+            }
+        });
+        assert_eq!(held.stats.downloaded, 0);
+        assert_eq!(checkpoint(), "root-parent-before");
+        assert_eq!(custody(), original_custody);
+        assert_eq!(files(&moved), original_files);
+        new_root_is_empty();
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        eprintln!(
+            "ROOT_PARENT_HELD round={round} candidate={token} checkpoint={} unchanged_custody=true unchanged_files=true GETs={requests}",
+            checkpoint()
+        );
+    }
+    // Restore only this fixture's exact recorded namespace, not a discovered path.
+    std::fs::rename(&moved, &media).unwrap();
+    assert!(!moved.exists());
+    assert_eq!(files(&media), original_files);
+    let (restored, _) = cycle_options(
         root.path(),
         edited.clone(),
         false,
         EditedNaming::Primary,
-        options("new-root"),
+        options("new-root", "root-parent-restored"),
     )
     .await;
-    assert_eq!(changed.failed_count, 0, "{:?}", changed.stats);
-    assert!(changed.db_sync_token_advance_safe);
-    assert!(lookups > 0, "missing sources must reach their layout owner");
-    assert!(changed.stats.downloaded > 0);
-    let resumed_requests = server.received_requests().await.unwrap().len();
-    assert!(
-        resumed_requests > requests,
-        "missing owned sources must be downloaded"
+    assert_eq!(restored.failed_count, 0, "{:?}", restored.stats);
+    assert!(restored.db_sync_token_advance_safe);
+    assert_eq!(restored.stats.downloaded, 0);
+    assert_eq!(checkpoint(), "root-parent-restored");
+    assert_eq!(custody(), original_custody);
+    assert_eq!(files(&media), original_files);
+    new_root_is_empty();
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    eprintln!(
+        "ROOT_PARENT_RESTORED checkpoint={} unchanged_custody=true unchanged_files=true GETs={requests}",
+        checkpoint()
     );
-    let operations = db_count(
-        root.path(),
-        "SELECT COUNT(*) FROM primary_layout_operations",
-    );
-    let (quiet, lookups) = cycle_options(
-        root.path(),
-        edited,
-        true,
-        EditedNaming::Primary,
-        options("new-root"),
-    )
-    .await;
-    assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
-    assert!(quiet.db_sync_token_advance_safe);
-    assert_eq!(quiet.stats.downloaded, 0);
-    assert_eq!(lookups, 0);
-    assert_eq!(
-        server.received_requests().await.unwrap().len(),
-        resumed_requests
-    );
-    assert_eq!(
-        db_count(
+    for round in 0..2 {
+        let (quiet, lookups) = cycle_options(
             root.path(),
-            "SELECT COUNT(*) FROM primary_layout_operations"
-        ),
-        operations
-    );
-    assert_eq!(old_claims(), original_claims);
-    assert!(!root.path().join("media").exists());
-    for directory in [moved, root.path().join("new-root")] {
-        assert_bytes(&directory.join("IMG_0501.JPG"), EDIT_ONE);
-        assert_bytes(&directory.join("IMG_0501_original.JPG"), ORIGINAL);
-        assert_eq!(std::fs::read(directory.join(sidecar_name)).ok(), packet);
+            edited.clone(),
+            true,
+            EditedNaming::Primary,
+            options("new-root", "root-parent-restored"),
+        )
+        .await;
+        assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+        assert!(quiet.db_sync_token_advance_safe);
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_eq!(lookups, 0);
+        assert_eq!(checkpoint(), "root-parent-restored");
+        assert_eq!(custody(), original_custody);
+        assert_eq!(files(&media), original_files);
+        new_root_is_empty();
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        eprintln!(
+            "ROOT_PARENT_QUIET round={round} unchanged_custody=true unchanged_files=true GETs={requests} downloads=0 lookups=0"
+        );
     }
 }
 
