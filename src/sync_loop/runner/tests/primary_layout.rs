@@ -5175,67 +5175,818 @@ async fn primary_layout_private_edit_retains_occupied_original_and_processes_new
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn primary_layout_preserves_sidecar_bytes_and_fences_old_metadata_queue() {
+    use crate::state::db::MetadataRewriteStore as _;
+
+    fn signature(bytes: &[u8]) -> String {
+        let mut hash = sha1::Sha1::new();
+        hash.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+        hash.update(bytes);
+        base64::engine::general_purpose::STANDARD.encode([&[1][..], &hash.finalize()[..]].concat())
+    }
+    fn rows(root: &std::path::Path, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let conn = rusqlite::Connection::open_with_flags(
+            root.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        stmt.query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+    fn check_file(file: &state::db::primary_layout::LayoutFile, path: &std::path::Path) {
+        let check = |path: &std::path::Path,
+                     proof: &state::db::primary_layout::LayoutFingerprint| {
+            let handle = std::fs::File::open(path).unwrap();
+            let bytes = std::fs::read(path).unwrap();
+            assert_eq!(bytes.len() as u64, proof.size, "{}", path.display());
+            assert_eq!(Sha256::digest(&bytes).as_slice(), proof.sha256.as_slice());
+            assert_eq!(
+                crate::fs_util::file_identity(&handle).unwrap(),
+                proof.identity
+            );
+        };
+        check(path, &file.fingerprint);
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(".xmp");
+        check(
+            std::path::Path::new(&sidecar),
+            file.sidecar.as_ref().unwrap(),
+        );
+    }
+    #[derive(Debug, PartialEq, Eq)]
+    struct PacketOrderKey {
+        before: String,
+        namespaces: Vec<String>,
+        properties: Vec<String>,
+        after: String,
+    }
+    // Strict compact fixture grammar, not an XML canonicalizer. Every accepted
+    // byte is retained except the two explicitly permitted permutations.
+    fn packet_order_key(packet: &[u8]) -> Option<PacketOrderKey> {
+        let text = std::str::from_utf8(packet).ok()?;
+        let _: xmp_toolkit::XmpMeta = text.parse().ok()?;
+        if text.contains("<!")
+            || text.contains("<?")
+            || text.matches("<rdf:Description").count() != 1
+            || text.matches("</rdf:Description>").count() != 1
+        {
+            return None;
+        }
+        let (before, rest) = text.split_once("<rdf:Description ")?;
+        let (attributes, rest) = rest.split_once('>')?;
+        let (body, after) = rest.split_once("</rdf:Description>")?;
+        let declarations = attributes.strip_prefix("rdf:about=\"\" ")?;
+        let name_part = |name: &str| {
+            !name.is_empty()
+                && name.as_bytes()[0].is_ascii_alphabetic()
+                && name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+        };
+        let mut prefixes = Vec::new();
+        let mut namespaces = Vec::new();
+        for token in declarations.split(' ') {
+            let (prefix, uri) = token.strip_prefix("xmlns:")?.split_once("=\"")?;
+            let uri = uri.strip_suffix('"')?;
+            if !name_part(prefix)
+                || uri.is_empty()
+                || uri.chars().any(|c| c.is_whitespace() || "\"<>".contains(c))
+                || prefixes.contains(&prefix)
+            {
+                return None;
+            }
+            prefixes.push(prefix);
+            namespaces.push(token.to_owned());
+        }
+        let mut body = body.strip_prefix(' ')?;
+        let mut properties = Vec::new();
+        while !body.is_empty() {
+            if !body.starts_with('<') {
+                return None;
+            }
+            let open_end = body.find('>')?;
+            if body.get(..=open_end)?.ends_with("/>") {
+                return None;
+            }
+            let name = body.get(1..open_end)?.split_ascii_whitespace().next()?;
+            let (prefix, local) = name.split_once(':')?;
+            if !name_part(prefix)
+                || !name_part(local)
+                || !(prefixes.contains(&prefix) || matches!(prefix, "rdf" | "xml"))
+            {
+                return None;
+            }
+            let close = format!("</{name}>");
+            let end = body.find(&close)? + close.len();
+            let block = body.get(..end)?;
+            // Nested same-name properties, comments and CDATA are unsupported,
+            // never guessed at or flattened. Other child structure stays raw.
+            if block.matches(format!("<{name}").as_str()).count() != 1 {
+                return None;
+            }
+            properties.push(block.to_owned());
+            body = body.get(end..)?.strip_prefix(' ')?;
+        }
+        if properties.is_empty() {
+            return None;
+        }
+        namespaces.sort();
+        properties.sort(); // Vec preserves multiplicity; never use a set.
+        Some(PacketOrderKey {
+            before: before.into(),
+            namespaces,
+            properties,
+            after: after.into(),
+        })
+    }
     let server = server().await;
-    let root = tempfile::tempdir().unwrap();
+    let mut root = tempfile::tempdir().unwrap();
+    root.disable_cleanup(true);
+    eprintln!("SIDECAR_RECORDED_FIXTURE {}", root.path().display());
     let media = root.path().join("media");
     let options = || CycleOptions {
         sidecar: true,
+        private: true,
         ..CycleOptions::default()
     };
+    let original_signature = signature(ORIGINAL);
+    let adjusted_signature = signature(EDIT_ONE);
+    let mut initial_records = records(&server, None);
+    initial_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+        json!(original_signature);
+    let mut current = records(&server, Some(("edit-one", EDIT_ONE)));
+    current[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(original_signature);
+    current[1]["fields"]["resJPEGFullRes"]["value"]["fileChecksum"] = json!(adjusted_signature);
+    for (expected, descriptor) in [
+        (
+            &original_signature,
+            &initial_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"],
+        ),
+        (
+            &original_signature,
+            &current[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"],
+        ),
+        (
+            &adjusted_signature,
+            &current[1]["fields"]["resJPEGFullRes"]["value"]["fileChecksum"],
+        ),
+    ] {
+        assert_eq!(descriptor.as_str(), Some(expected.as_str()));
+        assert_eq!(expected.len(), 28);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(expected)
+            .unwrap();
+        assert_eq!(decoded.len(), 21);
+        assert_eq!(decoded[0], 0x01);
+    }
     let (initial, _) = cycle_options(
         root.path(),
-        records(&server, None),
+        initial_records,
         false,
         EditedNaming::Primary,
         options(),
     )
     .await;
-    assert_eq!(initial.failed_count, 0);
+    assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    assert_eq!(initial.stats.downloaded, 1);
+    assert!(initial.db_sync_token_advance_safe);
+    assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
     let old_sidecar = std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap();
     assert!(!old_sidecar.is_empty());
-    let (edited, _) = cycle_options(
-        root.path(),
-        records(&server, Some(("edit-one", EDIT_ONE))),
-        false,
-        EditedNaming::Primary,
-        options(),
+    let old_packet_hash = Sha256::digest(&old_sidecar);
+    let old_packet_identity = crate::fs_util::file_identity(
+        &std::fs::File::open(media.join("IMG_0501.JPG.xmp")).unwrap(),
     )
-    .await;
-    assert_eq!(edited.failed_count, 0, "{:?}", edited.stats);
-    assert!(edited.db_sync_token_advance_safe);
-    assert_eq!(
-        std::fs::read(media.join("IMG_0501_original.JPG.xmp")).unwrap(),
-        old_sidecar
+    .unwrap();
+    let old_key = packet_order_key(&old_sidecar).expect("unsupported source fixture packet");
+    let old_text = std::str::from_utf8(&old_sidecar).unwrap();
+    let permuted = format!(
+        "{}<rdf:Description rdf:about=\"\" {}> {} </rdf:Description>{}",
+        old_key.before,
+        old_key
+            .namespaces
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" "),
+        old_key
+            .properties
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" "),
+        old_key.after
     );
-    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-    conn.execute("UPDATE asset_metadata_paths SET metadata_write_failed_at=1 WHERE version_size='original' AND local_path=?1",[media.join("IMG_0501.JPG").to_str().unwrap()]).unwrap();
-    drop(conn);
-    let current = std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap();
-    let downloads = server.received_requests().await.unwrap().len();
-    let (quiet, _) = cycle_options(
-        root.path(),
-        records(&server, Some(("edit-one", EDIT_ONE))),
-        true,
-        EditedNaming::Primary,
-        options(),
-    )
-    .await;
-    assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
-    assert!(quiet.db_sync_token_advance_safe);
-    assert_bytes(&media.join("IMG_0501.JPG"), EDIT_ONE);
+    assert_ne!(permuted.as_bytes(), old_sidecar);
     assert_eq!(
-        std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap(),
-        current
+        packet_order_key(permuted.as_bytes()).as_ref(),
+        Some(&old_key)
     );
-    assert_eq!(server.received_requests().await.unwrap().len(), downloads);
-    assert_eq!(
-        db_count(
-            root.path(),
-            "SELECT COUNT(*) FROM asset_metadata_paths WHERE version_size='original' AND metadata_write_failed_at=1"
+    let date = old_key
+        .properties
+        .iter()
+        .find(|p| p.starts_with("<xmp:CreateDate>"))
+        .unwrap();
+    assert_eq!(old_text.matches(date.as_str()).count(), 1);
+    let date_value = date
+        .strip_prefix("<xmp:CreateDate>")
+        .unwrap()
+        .strip_suffix("</xmp:CreateDate>")
+        .unwrap();
+    let date_format = "%Y-%m-%dT%H:%M:%S";
+    let changed_date_value = chrono::NaiveDateTime::parse_from_str(date_value, date_format)
+        .unwrap()
+        .checked_add_signed(chrono::Duration::seconds(1))
+        .unwrap();
+    let changed_date = format!(
+        "<xmp:CreateDate>{}</xmp:CreateDate>",
+        changed_date_value.format(date_format)
+    );
+    for changed in [
+        old_text.replacen(date.as_str(), &changed_date, 1),
+        old_text.replacen(
+            "http://ns.adobe.com/exif/1.0/",
+            "https://invalid.example/exif/1.0/",
+            1,
         ),
+        old_text.replacen(
+            " </rdf:Description>",
+            &format!(" {date} </rdf:Description>"),
+            1,
+        ),
+        old_text.replacen("<xmp:CreateDate>", "<xmp:CreateDate xml:lang=\"en\">", 1),
+        old_text.replacen("rdf:about=\"\"", "rdf:about=\"changed\"", 1),
+    ] {
+        assert_ne!(changed.as_bytes(), old_sidecar);
+        assert_ne!(
+            packet_order_key(changed.as_bytes()).as_ref(),
+            Some(&old_key)
+        );
+    }
+    let pair = "<rdf:li>TestAlbum</rdf:li> <rdf:li>SecondTag</rdf:li>";
+    let two_items = old_text.replacen("<rdf:li>TestAlbum</rdf:li>", pair, 1);
+    let reversed = two_items.replacen(
+        pair,
+        "<rdf:li>SecondTag</rdf:li> <rdf:li>TestAlbum</rdf:li>",
         1,
-        "historical marker was discarded"
     );
+    assert_ne!(
+        packet_order_key(two_items.as_bytes()).expect("two-item fixture"),
+        packet_order_key(reversed.as_bytes()).expect("reversed two-item fixture")
+    );
+    let original_receipts = rows(
+        root.path(),
+        "SELECT * FROM download_receipts WHERE version_size='original' ORDER BY id",
+    );
+    assert_eq!(original_receipts.len(), 1);
+    let original = media.join("IMG_0501.JPG");
+    assert_bytes(&original, ORIGINAL);
+    assert!(!media.join("IMG_0501_edited.JPG").exists());
+    let requests = server.received_requests().await.unwrap().len();
+    assert_eq!(requests, 1);
+    assert!(rows(root.path(), "SELECT * FROM primary_layout_operations").is_empty());
+    assert!(rows(root.path(), "SELECT * FROM primary_layout_bindings").is_empty());
+
+    // The ordinary Original publication supplies its real scoped receipt.
+    // The compatibility owner alone prepares and downloads the released edit.
+    let (
+        op,
+        scope,
+        pass_key,
+        marker,
+        adjusted_packet,
+        frozen_packets,
+        old_source_index,
+        old_source_proof,
+    ) = {
+        let (mut config, pass) = source_mutation_layout_context(
+            root.path(),
+            Arc::new(std::sync::Mutex::new(current.clone())),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+        config.metadata.xmp_sidecar = true;
+        let (capture, scope, _) = pass
+            .album
+            .publication_scope("PrimarySync")
+            .unwrap()
+            .unwrap();
+        let db = capture.db;
+        let concrete = db.clone() as Arc<dyn download::DownloadStore>;
+        assert!(Arc::ptr_eq(config.state_db.as_ref().unwrap(), &concrete));
+        let pass_key = config.primary_layout_pass.as_ref().unwrap().to_string();
+        let (account, provider) = capture.owner.authenticated_keys().unwrap();
+        {
+            let conn = db
+                .acquire_lock("real prehandover source and local receipts")
+                .unwrap();
+            let native = serde_json::to_string(
+                &state::db::provider_selection::SelectionPath::from_path(&original),
+            )
+            .unwrap();
+            let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL));
+            let checksum = current[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"]
+                .as_str()
+                .unwrap();
+            let count: i64 = conn.query_row("SELECT count(*) FROM download_receipts WHERE account_key=?1 AND provider_key=?2 AND scope=?3 AND origin_pass=?4 AND library='PrimarySync' AND child='asset-501' AND master='501' AND state_id='asset-501' AND version_size='original' AND provider_checksum=?5 AND provider_size=?6 AND native_path=?7 AND source_checksum=?8 AND local_checksum=?8 AND length(proof_hash)=64", rusqlite::params![account,provider,scope,pass_key,checksum,ORIGINAL.len() as i64,native,hash], |r| r.get(0)).unwrap();
+            assert_eq!(count, 1, "missing real source-backed Original download");
+        }
+        // Invoke the metadata failure state owner, not a fabricated timestamp.
+        // At this point the sole original path is still the live P publication.
+        db.record_metadata_write_failure("PrimarySync", "asset-501", "original")
+            .await
+            .unwrap();
+        let marker: i64 = db.acquire_lock("capture actual original retry marker").unwrap()
+            .query_row("SELECT metadata_write_failed_at FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?1", [original.to_str().unwrap()], |r| r.get(0)).unwrap();
+        assert!(marker > 0);
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                state::db::MetadataRewriteQueue::Ordinary,
+                Some(&["PrimarySync"]),
+                0,
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(
+            pending
+                .iter()
+                .any(|p| p.asset.version_size == state::VersionSizeKey::Original
+                    && p.asset.local_path.as_deref() == Some(original.as_path())),
+            "retry marker was not eligible before handover"
+        );
+
+        eprintln!(
+            "SIDECAR_OWNER_PREPARE_ENTER pass={pass_key} marker={marker} ordinary_original_GET={requests} ordinary_adjusted_GET=0 original_scoped_receipt=1"
+        );
+        let mut op = download::seed_prepared_edited_compat(&config, &pass).await;
+        eprintln!(
+            "SIDECAR_OWNER_PREPARED operation={} phase={} members={} total_GET={}",
+            op.operation,
+            op.phase,
+            op.members.len(),
+            server.received_requests().await.unwrap().len()
+        );
+        assert_eq!(op.phase, "prepared");
+        assert_eq!(op.pass, pass_key);
+        assert_eq!(op.library, "PrimarySync");
+        assert_eq!(op.child, "asset-501");
+        assert_eq!(op.source_library, "PrimarySync");
+        assert_eq!(op.policy, "primary");
+        assert!(config.metadata.xmp_sidecar);
+        for member in &op.members {
+            let prepared = member.prepared.as_ref().unwrap();
+            check_file(prepared, &prepared.path.to_path());
+            let (bytes, checksum) = match prepared.version.as_str() {
+                "original" => (ORIGINAL, &original_signature),
+                "adjusted" => (EDIT_ONE, &adjusted_signature),
+                version => panic!("unexpected prepared rendition {version}"),
+            };
+            assert_bytes(&prepared.path.to_path(), bytes);
+            assert_eq!(&prepared.provider_checksum, checksum);
+            assert_eq!(
+                prepared.source_checksum.as_deref(),
+                Some(
+                    data_encoding::HEXLOWER
+                        .encode(&Sha256::digest(bytes))
+                        .as_str()
+                )
+            );
+        }
+        let frozen_packets: Vec<_> = op
+            .members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| {
+                let proof = member.prepared.as_ref().unwrap().clone();
+                check_file(&proof, &proof.path.to_path());
+                let packet = std::fs::read(proof.path.to_path().with_extension("JPG.xmp")).unwrap();
+                let sidecar = proof.sidecar.as_ref().unwrap();
+                assert_eq!(packet.len() as u64, sidecar.size);
+                assert_eq!(
+                    Sha256::digest(&packet).as_slice(),
+                    sidecar.sha256.as_slice()
+                );
+                (index, proof, packet)
+            })
+            .collect();
+        let archive_packet = &frozen_packets
+            .iter()
+            .find(|(_, proof, _)| proof.version == "original")
+            .unwrap()
+            .2;
+        assert_eq!(
+            packet_order_key(archive_packet).as_ref(),
+            Some(&old_key),
+            "constant facts changed beyond the two allowed serialization permutations"
+        );
+        let adjusted_packet = frozen_packets
+            .iter()
+            .find(|(_, proof, _)| proof.version == "adjusted")
+            .unwrap()
+            .2
+            .clone();
+        let old_sources: Vec<_> = op
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(_, member)| {
+                member
+                    .old
+                    .as_ref()
+                    .is_some_and(|file| file.path.to_path() == original)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            old_sources.len(),
+            1,
+            "old source must have one recorded preservation member"
+        );
+        let old_source_index = old_sources[0];
+        let old_source_proof = op.members[old_source_index].old.as_ref().unwrap().clone();
+        check_file(&old_source_proof, &original);
+        let source_packet = old_source_proof.sidecar.as_ref().unwrap();
+        assert_eq!(source_packet.sha256.as_slice(), old_packet_hash.as_slice());
+        assert_eq!(source_packet.size, old_sidecar.len() as u64);
+        assert_eq!(source_packet.identity, old_packet_identity);
+        assert_bytes(&original, ORIGINAL);
+        assert_eq!(
+            std::fs::read(original.with_extension("JPG.xmp")).unwrap(),
+            old_sidecar
+        );
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), requests + 1);
+        assert_eq!(
+            received
+                .iter()
+                .filter(|request| request.url.path() == "/original")
+                .count(),
+            1
+        );
+        assert_eq!(
+            received
+                .iter()
+                .filter(|request| request.url.path() == "/edit-one")
+                .count(),
+            1
+        );
+        eprintln!(
+            "SIDECAR_OWNER_FINISH_ENTER operation={} pass={} marker={marker} ordinary_original_GET=1 preparation_adjusted_GET=1",
+            op.operation, op.pass
+        );
+        download::finish_prepared_edited_compat(&config, &mut op).await;
+        eprintln!(
+            "SIDECAR_OWNER_COMMITTED operation={} phase={} total_GET={}",
+            op.operation,
+            op.phase,
+            server.received_requests().await.unwrap().len()
+        );
+        assert_eq!(op.phase, "committed");
+        assert!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let pending = db
+            .get_pending_metadata_rewrites_page_for_queue(
+                state::db::MetadataRewriteQueue::Ordinary,
+                Some(&["PrimarySync"]),
+                0,
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !pending
+                .iter()
+                .any(|p| p.asset.version_size == state::VersionSizeKey::Original
+                    && p.asset.local_path.as_deref() == Some(original.as_path())),
+            "superseded original alias entered ordinary rewrite queue"
+        );
+        assert!(matches!(
+            db.guard_primary_writer(&original).await,
+            Err(state::error::StateError::Invariant {
+                operation: "primary_layout",
+                detail,
+            }) if detail == "managed primary slot requires its layout publication owner"
+        ));
+        (
+            op,
+            scope,
+            pass_key,
+            marker,
+            adjusted_packet,
+            frozen_packets,
+            old_source_index,
+            old_source_proof,
+        )
+    };
+    let requests = server.received_requests().await.unwrap().len();
+    assert_eq!(requests, 2);
+    assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+    assert_bytes(&original, EDIT_ONE);
+    let archive_packet = &frozen_packets
+        .iter()
+        .find(|(_, proof, _)| proof.version == "original")
+        .unwrap()
+        .2;
+    assert_eq!(
+        &std::fs::read(media.join("IMG_0501_original.JPG.xmp")).unwrap(),
+        archive_packet
+    );
+    assert_eq!(
+        std::fs::read(original.with_extension("JPG.xmp")).unwrap(),
+        adjusted_packet
+    );
+    let verify_files = || {
+        for member in &op.members {
+            for file in [&member.installed, &member.preserved].into_iter().flatten() {
+                check_file(file, &file.path.to_path());
+            }
+            if let Some(stage) = &member.stage
+                && stage.to_path().exists()
+            {
+                let path = stage.to_path();
+                let handle = std::fs::File::open(&path).unwrap();
+                let identity = crate::fs_util::file_identity(&handle).unwrap();
+                let saved = [&member.old, &member.prepared]
+                    .into_iter()
+                    .flatten()
+                    .find(|file| file.fingerprint.identity == identity)
+                    .expect("retained stage must have recorded old or prepared evidence");
+                check_file(saved, &path);
+            }
+        }
+    };
+    let physical = || {
+        let mut entries = std::collections::BTreeMap::new();
+        let mut directories = vec![media.clone()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    entries.insert(path.clone(), None);
+                    directories.push(path);
+                } else {
+                    assert!(entry.file_type().unwrap().is_file());
+                    let handle = std::fs::File::open(&path).unwrap();
+                    entries.insert(
+                        path.clone(),
+                        Some((
+                            std::fs::read(path).unwrap(),
+                            crate::fs_util::file_identity(&handle).unwrap(),
+                            handle.metadata().unwrap().modified().unwrap(),
+                        )),
+                    );
+                }
+            }
+        }
+        entries
+    };
+    let custody = || {
+        [
+        "SELECT * FROM primary_layout_operations ORDER BY operation",
+        "SELECT * FROM primary_layout_members ORDER BY operation,member",
+        "SELECT * FROM primary_layout_bindings ORDER BY family",
+        "SELECT * FROM primary_layout_claims ORDER BY path_key",
+        "SELECT * FROM primary_layout_preserved ORDER BY operation,member",
+        "SELECT * FROM primary_layout_superseded_paths ORDER BY library,child,version,native_path",
+        "SELECT * FROM download_receipts ORDER BY id",
+        "SELECT library,id,version_size,local_path,provider_checksum,source_checksum,local_checksum,download_checksum,metadata_write_failed_at FROM asset_metadata_paths ORDER BY library,id,version_size,local_path",
+        "SELECT * FROM owned_temp_files ORDER BY path",
+    ].map(|sql| rows(root.path(), sql))
+    };
+    let guard = || {
+        let conn = rusqlite::Connection::open_with_flags(
+            root.path().join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        for (index, frozen, packet) in &frozen_packets {
+            let member = &op.members[*index];
+            assert_eq!(
+                serde_json::to_value(member.prepared.as_ref().unwrap()).unwrap(),
+                serde_json::to_value(frozen).unwrap(),
+                "prepared proof changed after freeze"
+            );
+            let installed = member.installed.as_ref().unwrap();
+            let prepared_sidecar = frozen.sidecar.as_ref().unwrap();
+            let installed_sidecar = installed.sidecar.as_ref().unwrap();
+            assert_eq!(
+                (installed_sidecar.size, installed_sidecar.sha256),
+                (prepared_sidecar.size, prepared_sidecar.sha256)
+            );
+            assert_eq!(
+                &std::fs::read(installed.path.to_path().with_extension("JPG.xmp")).unwrap(),
+                packet
+            );
+            check_file(installed, &installed.path.to_path());
+        }
+        let source_member = &op.members[old_source_index];
+        assert_eq!(
+            serde_json::to_value(source_member.old.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&old_source_proof).unwrap()
+        );
+        let preserved = source_member.preserved.as_ref().unwrap();
+        assert_eq!(source_member.preserved_path.as_ref(), Some(&preserved.path));
+        assert_eq!(preserved.version, old_source_proof.version);
+        assert_eq!(
+            preserved.provider_checksum,
+            old_source_proof.provider_checksum
+        );
+        assert_eq!(preserved.source_checksum, old_source_proof.source_checksum);
+        assert_eq!(
+            preserved.fingerprint.sha256,
+            old_source_proof.fingerprint.sha256
+        );
+        assert_eq!(
+            preserved.sidecar.as_ref().unwrap().sha256.as_slice(),
+            old_packet_hash.as_slice()
+        );
+        let preserved_packet =
+            std::fs::read(preserved.path.to_path().with_extension("JPG.xmp")).unwrap();
+        assert_eq!(
+            preserved_packet, old_sidecar,
+            "raw old source packet was lost"
+        );
+        assert_eq!(
+            Sha256::digest(&preserved_packet).as_slice(),
+            old_packet_hash.as_slice()
+        );
+        check_file(preserved, &preserved.path.to_path());
+        let (member, evidence, native, hash): (Vec<u8>, Vec<u8>, Vec<u8>, String) = conn.query_row(
+            "SELECT m.evidence,p.evidence,p.native_path,p.sidecar_checksum FROM primary_layout_operations o JOIN primary_layout_members m ON m.operation=o.operation JOIN primary_layout_preserved p ON p.operation=m.operation AND p.member=m.member WHERE o.operation=?1 AND o.family=?2 AND o.phase='committed' AND m.member=?3",
+            rusqlite::params![op.operation,op.family,old_source_index as i64],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&member).unwrap(),
+            serde_json::to_value(source_member).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&evidence).unwrap(),
+            serde_json::to_value(preserved).unwrap()
+        );
+        assert_eq!(native, serde_json::to_vec(&preserved.path).unwrap());
+        assert_eq!(hash, data_encoding::HEXLOWER.encode(&old_packet_hash));
+        let saved: i64 = conn.query_row("SELECT metadata_write_failed_at FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?1", [original.to_str().unwrap()], |r| r.get(0)).unwrap();
+        assert_eq!(saved, marker, "historical marker was discarded or changed");
+        for (version, path, bytes, checksum) in [
+            (
+                "original",
+                media.join("IMG_0501_original.JPG"),
+                ORIGINAL,
+                current[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"]
+                    .as_str()
+                    .unwrap(),
+            ),
+            (
+                "adjusted",
+                original.clone(),
+                EDIT_ONE,
+                current[1]["fields"]["resJPEGFullRes"]["value"]["fileChecksum"]
+                    .as_str()
+                    .unwrap(),
+            ),
+        ] {
+            let native = serde_json::to_vec(
+                &state::db::provider_selection::SelectionPath::from_path(&path),
+            )
+            .unwrap();
+            let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+            let count: i64 = conn.query_row("SELECT count(*) FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size=?1 AND provider_checksum=?2 AND local_path=?3 AND source_checksum=?4 AND local_checksum=?4 AND download_checksum=?4",rusqlite::params![version,checksum,path.to_str().unwrap(),hash],|r|r.get(0)).unwrap();
+            assert_eq!(count, 1, "missing committed {version} state-path proof");
+            let claims: i64 = conn.query_row("SELECT count(*) FROM primary_layout_claims WHERE family=?1 AND library='PrimarySync' AND child='asset-501' AND version=?2 AND provider_checksum=?3 AND native_path=?4 AND local_checksum=?5 AND operation IS NULL",rusqlite::params![op.family,version,checksum,native,hash],|r|r.get(0)).unwrap();
+            assert_eq!(claims, 1, "missing committed {version} path claim");
+        }
+        let binding: Vec<u8> = conn.query_row("SELECT binding FROM primary_layout_bindings WHERE family=?1 AND library='PrimarySync' AND source_library='PrimarySync' AND child='asset-501' AND generation=?2 AND decision=?3 AND policy=?4", rusqlite::params![op.family,op.generation+1,op.decision,op.policy], |r| r.get(0)).unwrap();
+        let binding: state::db::primary_layout::LayoutBinding =
+            serde_json::from_slice(&binding).unwrap();
+        for member in &op.members {
+            if let Some(installed) = &member.installed {
+                let prepared = member.prepared.as_ref().unwrap();
+                assert_eq!(installed.version, prepared.version);
+                assert_eq!(installed.provider_checksum, prepared.provider_checksum);
+                assert_eq!(installed.source_checksum, prepared.source_checksum);
+                assert_eq!(installed.fingerprint.size, prepared.fingerprint.size);
+                assert_eq!(installed.fingerprint.sha256, prepared.fingerprint.sha256);
+                assert_eq!(
+                    installed
+                        .sidecar
+                        .as_ref()
+                        .map(|proof| (proof.size, proof.sha256)),
+                    prepared
+                        .sidecar
+                        .as_ref()
+                        .map(|proof| (proof.size, proof.sha256))
+                );
+                let saved = binding
+                    .files
+                    .iter()
+                    .find(|file| file.path == installed.path)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(saved).unwrap(),
+                    serde_json::to_value(installed).unwrap()
+                );
+            }
+        }
+        let original_receipt = &original_receipts[0];
+        assert!(rows(root.path(), "SELECT r.* FROM download_receipts r JOIN account_owner a ON a.account_key=r.account_key AND a.provider_key=r.provider_key ORDER BY r.id").contains(original_receipt));
+        let scoped: i64 = conn.query_row("SELECT count(*) FROM download_receipts WHERE scope=?1 AND origin_pass=?2 AND library='PrimarySync' AND child='asset-501' AND master='501' AND state_id='asset-501' AND version_size='original' AND provider_checksum=?3 AND native_path=?4", rusqlite::params![scope,pass_key,original_signature,serde_json::to_string(&state::db::provider_selection::SelectionPath::from_path(&original)).unwrap()], |r|r.get(0)).unwrap();
+        assert_eq!(
+            scoped, 1,
+            "original scoped receipt was lost during legacy publication"
+        );
+        for row in &original_receipts {
+            assert!(
+                rows(
+                    root.path(),
+                    "SELECT * FROM download_receipts WHERE version_size='original' ORDER BY id"
+                )
+                .contains(row)
+            );
+        }
+        verify_files();
+    };
+    guard();
+    let stable_files = physical();
+    let stable_custody = custody();
+    assert!(
+        stable_files.len() > 4,
+        "history and stage proof must not be just the visible pair"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    for round in 0..2 {
+        let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (quiet, lookups) = cycle_options(
+            root.path(),
+            current.clone(),
+            true,
+            EditedNaming::Primary,
+            CycleOptions {
+                trace: Some(trace.clone()),
+                ..options()
+            },
+        )
+        .await;
+        assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+        assert!(
+            quiet.stats.full_enumeration_reason.is_none(),
+            "{:?}",
+            quiet.stats
+        );
+        assert_eq!(quiet.stats.assets_seen, 0, "quiet feed was not empty");
+        assert!(quiet.db_sync_token_advance_safe);
+        assert_eq!(quiet.stats.downloaded, 0);
+        assert_eq!(quiet.stats.metadata_capture_refreshed, 0);
+        assert_eq!(lookups, 0);
+        let delta_requests = {
+            let trace = trace.lock().unwrap();
+            assert!(
+                !trace.is_empty(),
+                "quiet cycle did not request its incremental feed"
+            );
+            assert!(trace.iter().all(|(kind, _)| kind == "changes"));
+            trace.len()
+        };
+        assert_bytes(&original, EDIT_ONE);
+        assert_bytes(&media.join("IMG_0501_original.JPG"), ORIGINAL);
+        assert_eq!(
+            &std::fs::read(media.join("IMG_0501_original.JPG.xmp")).unwrap(),
+            archive_packet
+        );
+        assert_eq!(
+            std::fs::read(original.with_extension("JPG.xmp")).unwrap(),
+            adjusted_packet
+        );
+        guard();
+        assert_eq!(
+            physical(),
+            stable_files,
+            "media/history/stage bytes, identities, mtimes or namespace changed"
+        );
+        assert_eq!(
+            custody(),
+            stable_custody,
+            "recorded custody, path proof or retry evidence changed"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        eprintln!(
+            "SIDECAR_RECORDED_QUIET round={round} historical_marker={marker} files={} media_GET=0 rewrite=0 history_and_journal_growth=0 delta_requests={delta_requests} assets_seen={} full_enumeration_reason={:?}",
+            stable_files.len(),
+            quiet.stats.assets_seen,
+            quiet.stats.full_enumeration_reason
+        );
+    }
 }
 
 #[tokio::test]
