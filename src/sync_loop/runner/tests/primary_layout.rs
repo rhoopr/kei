@@ -8437,17 +8437,26 @@ async fn server_with_media(original: &[u8], edit_one: &[u8], edit_two: &[u8]) ->
 // Regression cases supplied by the independent review of c202d07, extended
 // with exact sidecar and catalogue oracles and two quiet reopened cycles.
 #[tokio::test]
-async fn review501_legacy_original_survives_adjusted_only_migration_as_archive() {
-    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+async fn review501_adjusted_only_preserves_owned_original_at_recorded_path() {
+    use state::db::provider_selection::SelectionPath;
+
     #[cfg(feature = "xmp")]
     let sidecar_modes = [false, true];
     #[cfg(not(feature = "xmp"))]
     let sidecar_modes = [false];
     for sidecar in sidecar_modes {
         let server = server_with_media(VALID_ORIGINAL, VALID_EDIT, EDIT_TWO).await;
-        let root = tempfile::tempdir().unwrap();
+        let mut root = tempfile::tempdir().unwrap();
+        if std::env::var_os("KEI_ADJUSTED_ONLY_RETAIN_FIXTURE").is_some() {
+            root.disable_cleanup(true);
+        }
+        eprintln!(
+            "ADJUSTED_ONLY_ROOT sidecar={sidecar} root={}",
+            root.path().display()
+        );
         let media = root.path().join("media");
         let options = |resolution| CycleOptions {
+            private: true,
             resolution,
             #[cfg(feature = "xmp")]
             sidecar,
@@ -8461,12 +8470,88 @@ async fn review501_legacy_original_survives_adjusted_only_migration_as_archive()
             options(crate::types::PhotoResolution::Original),
         )
         .await;
-        assert_eq!(initial.failed_count, 0);
-        assert_bytes(&media.join("IMG_0501.JPG"), VALID_ORIGINAL);
-        let original_sidecar =
-            sidecar.then(|| std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap());
+        assert_eq!(
+            (initial.failed_count, initial.stats.downloaded),
+            (0, 1),
+            "{initial:?}"
+        );
+        assert!(initial.db_sync_token_advance_safe);
+        let p = media.join("IMG_0501.JPG");
+        assert_bytes(&p, VALID_ORIGINAL);
+        let rows = |sql: &str| {
+            let conn = rusqlite::Connection::open_with_flags(
+                root.path().join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let mut stmt = conn.prepare(sql).unwrap();
+            let columns = stmt.column_count();
+            stmt.query_map([], |row| {
+                (0..columns)
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let file = |path: &std::path::Path| {
+            let handle = std::fs::File::open(path).unwrap();
+            (
+                std::fs::read(path).unwrap(),
+                crate::fs_util::file_identity(&handle).unwrap(),
+                handle.metadata().unwrap().modified().unwrap(),
+            )
+        };
+        let original_file = file(&p);
+        let original_sidecar = sidecar.then(|| file(&media.join("IMG_0501.JPG.xmp")));
+        let original_sql = "SELECT * FROM download_receipts WHERE child='asset-501' AND version_size='original' ORDER BY id";
+        let original_receipt = rows(original_sql);
+        assert_eq!(original_receipt.len(), 1);
+        let local_sql = "SELECT library,id,version_size,status,checksum,size_bytes,local_path,local_checksum,download_checksum FROM assets WHERE id='asset-501' AND version_size='original'";
+        let original_local = rows(local_sql);
+        let path_sql = "SELECT library,id,version_size,local_path,provider_checksum,source_checksum,local_checksum,download_checksum FROM asset_metadata_paths WHERE id='asset-501' AND version_size='original' ORDER BY local_path";
+        let original_paths = rows(path_sql);
+        assert_eq!(original_paths.len(), 1);
+        let owner = state::db::account::AccountOwner::authenticated(
+            "synthetic@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+        )
+        .unwrap();
+        let (account, provider) = owner.authenticated_keys().unwrap();
+        let scope = json!({"container":"com.apple.photos.cloud","database":"private","environment":"production","format":1,"realm":"com","zone":{"ownerRecordName":"_defaultOwner","zoneName":"PrimarySync"}}).to_string();
+        let selection = json!({"zone":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"name":"TestAlbum","list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted","obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted","query_filter":null,"container_id":null,"cross_zone_sources":[]});
+        let pass = format!(
+            "{:x}",
+            Sha256::digest(
+                json!({"kind":"Unfiled","scope":selection,"excludes":[]})
+                    .to_string()
+                    .as_bytes()
+            )
+        );
+        let prove_receipt = |version: &str, path: &std::path::Path, bytes: &[u8]| {
+            let conn = rusqlite::Connection::open_with_flags(
+                root.path().join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let sha = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+            let native = SelectionPath::from_path(path).key().unwrap();
+            let count: i64 = conn.query_row(
+                "SELECT count(*) FROM download_receipts r JOIN account_owner a ON a.account_key=r.account_key AND a.provider_key=r.provider_key WHERE r.account_key=?1 AND r.provider_key=?2 AND r.scope=?3 AND r.library='PrimarySync' AND r.child='asset-501' AND r.master='501' AND r.state_id='asset-501' AND r.origin_pass=?4 AND r.version_size=?5 AND r.provider_checksum=?6 AND r.provider_size=?7 AND r.native_path=?8 AND r.source_checksum=?9 AND r.local_checksum=?9 AND length(r.proof_hash)=64 AND r.trust_receipt IS NULL AND r.selected_metadata_hash IS NULL AND r.generation_id IS NULL",
+                rusqlite::params![account,provider,scope,pass,version,provider_hash(bytes),i64::try_from(bytes.len()).unwrap(),native,sha], |r|r.get(0),
+            ).unwrap();
+            assert_eq!(count, 1, "full scoped {version} proof at {path:?}");
+            let local: (String, String, String) = conn.query_row(
+                "SELECT source_checksum,local_checksum,download_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size=?1 AND local_path=?2 AND provider_checksum=?3",
+                rusqlite::params![version,path.to_str().unwrap(),provider_hash(bytes)], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+            ).unwrap();
+            assert_eq!(local, (sha.clone(), sha.clone(), sha));
+        };
+        prove_receipt("original", &p, VALID_ORIGINAL);
         let edited = records_with_original(&server, VALID_ORIGINAL, Some(("edit-one", VALID_EDIT)));
-        let (migrated, _) = cycle_options(
+        let (published, _) = cycle_options(
             root.path(),
             edited.clone(),
             false,
@@ -8475,42 +8560,111 @@ async fn review501_legacy_original_survives_adjusted_only_migration_as_archive()
         )
         .await;
         assert_eq!(
-            migrated.failed_count,
-            0,
-            "sidecar={sidecar}: {:?}; events {:?}",
-            migrated.stats,
-            capture
-                .events()
-                .into_iter()
-                .filter(|event| event.level == tracing::Level::WARN
-                    || event.level == tracing::Level::ERROR)
-                .collect::<Vec<_>>()
+            (published.failed_count, published.stats.downloaded),
+            (0, 1),
+            "{published:?}"
         );
-        assert!(migrated.db_sync_token_advance_safe);
-        assert_bytes(&media.join("IMG_0501.JPG"), VALID_EDIT);
-        assert_bytes(&media.join("IMG_0501_original.JPG"), VALID_ORIGINAL);
-        if let Some(expected) = &original_sidecar {
-            assert_bytes(&media.join("IMG_0501_original.JPG.xmp"), expected);
-        }
-        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-        let (checksum, local_path): (String, String) = conn.query_row(
-            "SELECT checksum,local_path FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='original'",
-            [], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).unwrap();
-        assert_eq!(checksum, provider_hash(VALID_ORIGINAL));
-        assert_eq!(
-            std::path::PathBuf::from(local_path),
-            media.join("IMG_0501_original.JPG")
-        );
+        assert!(published.db_sync_token_advance_safe);
+        let conn = rusqlite::Connection::open_with_flags(
+            root.path().join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let s: String = conn.query_row("SELECT local_path FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted' AND status='downloaded' AND checksum=?1", [provider_hash(VALID_EDIT)], |r|r.get(0)).unwrap();
+        let s = std::path::PathBuf::from(s);
         drop(conn);
+        assert_ne!(s, p);
+        assert_bytes(&s, VALID_EDIT);
+        prove_receipt("adjusted", &s, VALID_EDIT);
+        let prove_selected = || {
+            let selected: i64 = rusqlite::Connection::open_with_flags(
+                root.path().join("state.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ).unwrap().query_row(
+                "SELECT count(*) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.library='PrimarySync' AND d.child='asset-501' AND d.asset_id='asset-501' AND d.master='501' AND d.version_size='adjusted' AND d.checksum=?1 AND d.size_bytes=?2 AND d.path=?3 AND d.pass_key=?4 AND d.source_checksum=?5 AND d.local_checksum=?5 AND d.admitted=1 AND d.verified_media=1 AND g.account_key=?6 AND g.provider_key=?7 AND g.scope=?8 AND g.sealed=1 AND g.checkpoint_ready=1",
+                rusqlite::params![provider_hash(VALID_EDIT),i64::try_from(VALID_EDIT.len()).unwrap(),SelectionPath::from_path(&s).key().unwrap(),pass,data_encoding::HEXLOWER.encode(&Sha256::digest(VALID_EDIT)),account,provider,scope], |r|r.get(0),
+            ).unwrap();
+            assert!(
+                selected > 0,
+                "current Adjusted must reach verified scoped selection"
+            );
+        };
+        let adjusted_file = file(&s);
+        let mut sidecar_path = s.as_os_str().to_os_string();
+        sidecar_path.push(".xmp");
+        let sidecar_path = std::path::PathBuf::from(sidecar_path);
+        let adjusted_sidecar = sidecar.then(|| file(&sidecar_path));
+        let receipts_sql = "SELECT * FROM download_receipts WHERE child='asset-501' ORDER BY id";
+        let receipts = rows(receipts_sql);
+        assert_eq!(
+            receipts.len(),
+            2,
+            "no Original recertification or duplicate copy"
+        );
+        let adjusted_sql = "SELECT library,id,version_size,status,checksum,size_bytes,local_path,local_checksum,download_checksum FROM assets WHERE id='asset-501' AND version_size='adjusted'";
+        let adjusted_local = rows(adjusted_sql);
+        let checkpoint_sql = "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'";
+        let checkpoint = rows(checkpoint_sql);
+        assert_eq!(checkpoint.len(), 1);
+        let debt_sql = "SELECT version_size,local_path,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size FROM assets WHERE id='asset-501' ORDER BY version_size";
+        let path_debt_sql = "SELECT version_size,local_path,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size FROM asset_metadata_paths WHERE id='asset-501' ORDER BY version_size,local_path";
+        let durable_debt = (rows(debt_sql), rows(path_debt_sql));
+        let prove_custody = || {
+            prove_receipt("original", &p, VALID_ORIGINAL);
+            prove_receipt("adjusted", &s, VALID_EDIT);
+            prove_selected();
+            assert_eq!(file(&p), original_file);
+            assert_eq!(file(&s), adjusted_file);
+            assert_eq!(rows(original_sql), original_receipt);
+            assert_eq!(rows(local_sql), original_local);
+            assert_eq!(rows(path_sql), original_paths);
+            assert_eq!(rows(receipts_sql), receipts);
+            assert_eq!(rows(adjusted_sql), adjusted_local);
+            assert_eq!((rows(debt_sql), rows(path_debt_sql)), durable_debt);
+            if let Some(expected) = &original_sidecar {
+                assert_eq!(file(&media.join("IMG_0501.JPG.xmp")), *expected);
+            }
+            if let Some(expected) = &adjusted_sidecar {
+                assert_eq!(file(&sidecar_path), *expected);
+            }
+            let mut expected = vec![p.clone(), s.clone()];
+            if sidecar {
+                expected.extend([media.join("IMG_0501.JPG.xmp"), sidecar_path.clone()]);
+            }
+            expected.sort();
+            let mut actual = std::fs::read_dir(&media)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            actual.sort();
+            assert_eq!(
+                actual, expected,
+                "no archive, history, or duplicate outputs"
+            );
+            for table in [
+                "primary_layout_operations",
+                "primary_layout_bindings",
+                "primary_layout_members",
+                "primary_layout_claims",
+                "primary_layout_preserved",
+                "primary_layout_superseded_paths",
+            ] {
+                assert_eq!(
+                    db_count(root.path(), &format!("SELECT count(*) FROM {table}")),
+                    0,
+                    "unexpected {table}"
+                );
+            }
+        };
+        prove_custody();
         let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
         assert_eq!(
             requests
                 .iter()
                 .filter(|request| request.url.path() == "/original")
                 .count(),
             1,
-            "migration invented an unselected original download"
+            "adjusted-only selection invented an unselected Original download"
         );
         assert_eq!(
             requests
@@ -8519,7 +8673,28 @@ async fn review501_legacy_original_survives_adjusted_only_migration_as_archive()
                 .count(),
             1
         );
-        for _ in 0..2 {
+        // Independent optional metadata debt is not authority to rewrite P/S.
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        let debt = db
+            .get_pending_metadata_rewrites(100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| {
+                (
+                    a.id.to_string(),
+                    a.version_size.as_str().to_owned(),
+                    a.local_path,
+                )
+            })
+            .collect::<Vec<_>>();
+        drop(db);
+        eprintln!(
+            "ADJUSTED_ONLY_PUBLISHED sidecar={sidecar} P={p:?} S={s:?} receipts={receipts:?} debt={debt:?} checkpoint={checkpoint:?}"
+        );
+        for reopen in 0..2 {
             let (quiet, lookups) = cycle_options(
                 root.path(),
                 edited.clone(),
@@ -8532,55 +8707,378 @@ async fn review501_legacy_original_survives_adjusted_only_migration_as_archive()
             assert!(quiet.db_sync_token_advance_safe);
             assert_eq!(quiet.stats.downloaded, 0);
             assert_eq!(lookups, 0);
-            assert_bytes(&media.join("IMG_0501.JPG"), VALID_EDIT);
-            assert_bytes(&media.join("IMG_0501_original.JPG"), VALID_ORIGINAL);
-            if let Some(expected) = &original_sidecar {
-                assert_bytes(&media.join("IMG_0501_original.JPG.xmp"), expected);
-            }
+            prove_custody();
+            assert_eq!(rows(checkpoint_sql), checkpoint);
             assert_eq!(
                 server.received_requests().await.unwrap().len(),
                 requests.len()
             );
-        }
-        let db = state::SqliteStateDb::open(&root.path().join("state.db"))
-            .await
-            .unwrap();
-        assert!(
-            db.get_pending_metadata_rewrites(100)
+            let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+                .await
+                .unwrap();
+            let remaining = db
+                .get_pending_metadata_rewrites(100)
                 .await
                 .unwrap()
-                .is_empty(),
-            "an archive must not re-enter the ordinary writer queue"
-        );
-        // Prepared repair evidence must remain visible to source-deletion
-        // guards even when the original is archived and unselected.
-        let archive = media.join("IMG_0501_original.JPG");
-        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-        let checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(VALID_ORIGINAL));
-        let size = i64::try_from(VALID_ORIGINAL.len()).unwrap();
-        conn.execute(
-            "UPDATE assets SET capture_repair_metadata_hash='synthetic-prepared-repair',
-                capture_repair_output_checksum=?1,capture_repair_output_size=?2
-                WHERE library='PrimarySync' AND id='asset-501' AND version_size='original'",
-            rusqlite::params![checksum, size],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE asset_metadata_paths SET capture_repair_metadata_hash='synthetic-prepared-repair',
-                capture_repair_output_checksum=?1,capture_repair_output_size=?2
-                WHERE library='PrimarySync' AND id='asset-501' AND version_size='original' AND local_path=?3",
-            rusqlite::params![checksum, size, archive.to_str().unwrap()],
-        ).unwrap();
-        drop(conn);
-        assert!(
-            db.mark_master_family_soft_deleted("PrimarySync", "501", None)
-                .await
-                .is_err(),
-            "archival hid prepared capture-repair debt from source deletion"
-        );
-        assert_bytes(&archive, VALID_ORIGINAL);
-        assert_bytes(&media.join("IMG_0501.JPG"), VALID_EDIT);
+                .into_iter()
+                .map(|a| {
+                    (
+                        a.id.to_string(),
+                        a.version_size.as_str().to_owned(),
+                        a.local_path,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                remaining, debt,
+                "quiet reopen must not discard independent metadata debt"
+            );
+            eprintln!(
+                "ADJUSTED_ONLY_QUIET sidecar={sidecar} reopen={reopen} checkpoint_safe={} GETs={} debt={remaining:?}",
+                quiet.db_sync_token_advance_safe,
+                requests.len()
+            );
+        }
     }
+}
+
+#[tokio::test]
+async fn review501_committed_archive_prepared_capture_repair_blocks_source_deletion() {
+    use state::db::MetadataRewriteQueue;
+    use state::db::primary_layout::{LayoutBinding, LayoutMember, LayoutOperation};
+
+    let server = server().await;
+    let mut root = tempfile::tempdir().unwrap();
+    if std::env::var_os("KEI_ADJUSTED_ONLY_RETAIN_FIXTURE").is_some() {
+        root.disable_cleanup(true);
+    }
+    eprintln!("ARCHIVE_GUARD_ROOT root={}", root.path().display());
+    let (initial, _) = cycle_options(
+        root.path(),
+        records(&server, Some(("edit-one", EDIT_ONE))),
+        false,
+        EditedNaming::Suffix,
+        CycleOptions {
+            private: true,
+            #[cfg(feature = "xmp")]
+            sidecar: true,
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        (initial.failed_count, initial.stats.downloaded),
+        (0, 2),
+        "{initial:?}"
+    );
+    assert!(initial.db_sync_token_advance_safe);
+    eprintln!(
+        "ARCHIVE_GUARD_PHASE initial_owned_suffix_complete GETs={}",
+        server.received_requests().await.unwrap().len()
+    );
+    // A synthetic recorded compatibility handover, not an ordinary naming
+    // migration or a claim about a released database's chronology.
+    let (scope, pass) = seed_committed_root_journal_family(root.path(), &server).await;
+    let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+    let bytes: Vec<u8> = conn
+        .query_row("SELECT binding FROM primary_layout_bindings", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let binding: LayoutBinding = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(binding.library, "PrimarySync");
+    assert_eq!(binding.source_library, "PrimarySync");
+    assert_eq!(binding.child, "asset-501");
+    let archives = binding
+        .files
+        .iter()
+        .filter(|f| f.archive_original)
+        .collect::<Vec<_>>();
+    assert_eq!(archives.len(), 1);
+    let archive = archives[0];
+    let archive_path = archive.path.to_path();
+    assert_eq!(archive.version, "original");
+    assert_eq!(archive.provider_checksum, provider_hash(ORIGINAL));
+    let checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL));
+    let size = i64::try_from(ORIGINAL.len()).unwrap();
+    assert_eq!(archive.source_checksum.as_deref(), Some(checksum.as_str()));
+    assert_eq!(
+        archive.fingerprint.sha256.as_slice(),
+        Sha256::digest(ORIGINAL).as_slice()
+    );
+    assert_eq!(
+        archive.fingerprint.size,
+        u64::try_from(ORIGINAL.len()).unwrap()
+    );
+    assert_bytes(&archive_path, ORIGINAL);
+    assert_eq!(
+        crate::fs_util::file_identity(&std::fs::File::open(&archive_path).unwrap()).unwrap(),
+        archive.fingerprint.identity
+    );
+    let current = binding
+        .files
+        .iter()
+        .find(|f| f.version == "adjusted" && !f.archive_original)
+        .unwrap();
+    assert_bytes(&current.path.to_path(), EDIT_ONE);
+    assert_eq!(current.provider_checksum, provider_hash(EDIT_ONE));
+    assert_ne!(current.path, archive.path);
+    let (operation, header): (String,Vec<u8>) = conn.query_row("SELECT operation,header FROM primary_layout_operations WHERE family=?1 AND phase='committed'", [&binding.family], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    let op: LayoutOperation = serde_json::from_slice(&header).unwrap();
+    assert_eq!(op.operation, operation);
+    assert_eq!(op.family, binding.family);
+    assert_eq!(op.decision, binding.decision);
+    assert_eq!(op.generation + 1, binding.generation);
+    assert_eq!(op.pass, pass);
+    let members = conn
+        .prepare("SELECT evidence FROM primary_layout_members WHERE operation=?1 ORDER BY member")
+        .unwrap()
+        .query_map([&operation], |r| r.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .map(|r| serde_json::from_slice::<LayoutMember>(&r.unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    let member = members
+        .iter()
+        .find(|m| {
+            m.installed
+                .as_ref()
+                .is_some_and(|f| f.archive_original && f.path == archive.path)
+        })
+        .unwrap();
+    let record = member
+        .record
+        .as_ref()
+        .expect("compatibility archive has a selected Original member");
+    assert_eq!(record.version_size.as_str(), archive.version);
+    assert_eq!(record.checksum.as_ref(), archive.provider_checksum);
+    assert_eq!(member.destination.as_ref(), Some(&archive.path));
+    assert_eq!(
+        serde_json::to_value(member.installed.as_ref().unwrap()).unwrap(),
+        serde_json::to_value(archive).unwrap()
+    );
+    for saved in binding
+        .files
+        .iter()
+        .chain(members.iter().filter_map(|m| m.preserved.as_ref()))
+    {
+        let path = saved.path.to_path();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(u64::try_from(bytes.len()).unwrap(), saved.fingerprint.size);
+        assert_eq!(
+            Sha256::digest(&bytes).as_slice(),
+            saved.fingerprint.sha256.as_slice()
+        );
+        assert_eq!(
+            crate::fs_util::file_identity(&std::fs::File::open(&path).unwrap()).unwrap(),
+            saved.fingerprint.identity
+        );
+        if let Some(sidecar) = &saved.sidecar {
+            let mut path = path.into_os_string();
+            path.push(".xmp");
+            let path = std::path::PathBuf::from(path);
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(u64::try_from(bytes.len()).unwrap(), sidecar.size);
+            assert_eq!(Sha256::digest(&bytes).as_slice(), sidecar.sha256.as_slice());
+            assert_eq!(
+                crate::fs_util::file_identity(&std::fs::File::open(&path).unwrap()).unwrap(),
+                sidecar.identity
+            );
+        }
+        #[cfg(feature = "xmp")]
+        assert!(saved.sidecar.is_some());
+    }
+    assert!(
+        members.iter().any(|m| m.preserved.is_some()),
+        "archive fixture must retain real displaced history"
+    );
+    let active: i64 = conn.query_row("SELECT count(*) FROM primary_layout_claims WHERE family=?1 AND library=?2 AND child=?3 AND version=?4 AND provider_checksum=?5 AND local_checksum=?6 AND native_path=?7 AND operation IS NULL AND path_key=?8", rusqlite::params![binding.family,binding.library,binding.child,archive.version,archive.provider_checksum,checksum,serde_json::to_vec(&archive.path).unwrap(),state::db::primary_layout::path_key(&archive_path).unwrap()], |r|r.get(0)).unwrap();
+    assert_eq!(
+        active, 1,
+        "archive exclusion must not be inactive superseded-path exclusion"
+    );
+    let master: String = conn.query_row("SELECT master_record_name FROM asset_master_mappings WHERE library=?1 AND asset_record_name=?2", rusqlite::params![binding.library,binding.child], |r|r.get(0)).unwrap();
+    assert_eq!(master, "501");
+    let local: (String,String,String) = conn.query_row("SELECT source_checksum,local_checksum,download_checksum FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size=?3 AND provider_checksum=?4 AND local_path=?5", rusqlite::params![binding.library,binding.child,archive.version,archive.provider_checksum,archive_path.to_str().unwrap()], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(
+        local,
+        (checksum.clone(), checksum.clone(), checksum.clone())
+    );
+    let prepared_count = || {
+        conn.query_row("SELECT (SELECT count(*) FROM assets WHERE capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL) + (SELECT count(*) FROM asset_metadata_paths WHERE capture_repair_output_checksum IS NOT NULL OR capture_repair_output_size IS NOT NULL)", [], |r|r.get::<_,i64>(0)).unwrap()
+    };
+    assert_eq!(prepared_count(), 0, "no other repair may explain refusal");
+    // Explicit historical-debt test-state input, not a new archive writer.
+    // Without this marker, an empty ordinary queue could pass vacuously.
+    for (table, resource) in [
+        ("assets", "checksum"),
+        ("asset_metadata_paths", "provider_checksum"),
+    ] {
+        assert_eq!(conn.execute(&format!("UPDATE {table} SET metadata_write_failed_at=1 WHERE library=?1 AND id=?2 AND version_size=?3 AND {resource}=?4 AND local_path=?5 AND local_checksum=?6"), rusqlite::params![binding.library,binding.child,archive.version,archive.provider_checksum,archive_path.to_str().unwrap(),checksum]).unwrap(), 1);
+    }
+    let eligible_without_archive_filter: i64 = conn.query_row("SELECT count(*) FROM assets a WHERE library=?1 AND id=?2 AND version_size=?3 AND checksum=?4 AND local_path=?5 AND metadata_write_failed_at=1 AND status='downloaded' AND is_deleted=0 AND NOT EXISTS(SELECT 1 FROM unattributed_legacy u WHERE u.library=a.library AND u.asset_id=a.id)", rusqlite::params![binding.library,binding.child,archive.version,archive.provider_checksum,archive_path.to_str().unwrap()], |r|r.get(0)).unwrap();
+    assert_eq!(eligible_without_archive_filter, 1);
+    let owner = state::db::account::AccountOwner::authenticated(
+        "synthetic@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+    )
+    .unwrap();
+    let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+        .await
+        .unwrap();
+    let queue = db.get_pending_metadata_rewrites(100).await.unwrap();
+    assert!(
+        queue
+            .iter()
+            .all(|a| a.local_path.as_deref() != Some(archive_path.as_path())),
+        "marked active archive must not reach the ordinary writer: {queue:?}"
+    );
+    // The excluded archive has no selected capture-repair receipt. Do not
+    // fabricate a PendingMetadataRewrite to bypass the real API's eligibility.
+    let repairs = db
+        .get_pending_metadata_rewrites_page_for_queue(
+            MetadataRewriteQueue::CaptureRepair,
+            None,
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+    assert!(
+        repairs
+            .iter()
+            .all(|r| r.asset.local_path.as_deref() != Some(archive_path.as_path())),
+        "no genuinely eligible archive capture-repair API input: {repairs:?}"
+    );
+    eprintln!(
+        "ARCHIVE_GUARD_EXCLUSION archive={archive_path:?} family={} operation={operation} active_claims={active} scope={scope} pass={pass} ordinary={queue:?} prepared_before={}",
+        binding.family,
+        prepared_count()
+    );
+    // Narrow durable-state fault from the old regression footer: only these
+    // three prepared fields at the actual committed archive/resource/path.
+    for (table, resource) in [
+        ("assets", "checksum"),
+        ("asset_metadata_paths", "provider_checksum"),
+    ] {
+        assert_eq!(conn.execute(&format!("UPDATE {table} SET capture_repair_metadata_hash='synthetic-prepared-repair',capture_repair_output_checksum=?6,capture_repair_output_size=?7 WHERE library=?1 AND id=?2 AND version_size=?3 AND {resource}=?4 AND local_path=?5 AND local_checksum=?6"), rusqlite::params![binding.library,binding.child,archive.version,archive.provider_checksum,archive_path.to_str().unwrap(),checksum,size]).unwrap(), 1);
+        let receipt: (String,String,i64) = conn.query_row(&format!("SELECT capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size FROM {table} WHERE library=?1 AND id=?2 AND version_size=?3 AND {resource}=?4 AND local_path=?5"), rusqlite::params![binding.library,binding.child,archive.version,archive.provider_checksum,archive_path.to_str().unwrap()], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(
+            receipt,
+            ("synthetic-prepared-repair".into(), checksum.clone(), size)
+        );
+    }
+    assert_eq!(
+        prepared_count(),
+        2,
+        "only the two projections of this archive repair"
+    );
+    let durable = || {
+        let tables = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+                let columns = stmt.column_count();
+                let mut rows = stmt
+                    .query_map([], |r| {
+                        (0..columns)
+                            .map(|i| {
+                                r.get::<_, rusqlite::types::Value>(i)
+                                    .map(|v| format!("{v:?}"))
+                            })
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                rows.sort();
+                (table, rows)
+            })
+            .collect::<Vec<_>>()
+    };
+    type Physical = (
+        std::path::PathBuf,
+        Option<Vec<u8>>,
+        crate::fs_util::FileIdentity,
+        std::time::SystemTime,
+    );
+    fn physical(root: &std::path::Path) -> Vec<Physical> {
+        let mut paths = vec![root.to_path_buf()];
+        let mut census = Vec::new();
+        while let Some(path) = paths.pop() {
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            assert!(!metadata.file_type().is_symlink());
+            #[cfg(windows)]
+            let handle = {
+                use std::os::windows::fs::OpenOptionsExt;
+                use windows_sys::Win32::Storage::FileSystem::{
+                    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                };
+
+                // Attribute-only directory/file handles can coexist with the
+                // read_dir and full-byte readers below, without following links.
+                std::fs::OpenOptions::new()
+                    .access_mode(FILE_READ_ATTRIBUTES)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(&path)
+                    .unwrap()
+            };
+            #[cfg(not(windows))]
+            let handle = std::fs::File::open(&path).unwrap();
+            let bytes = if metadata.is_dir() {
+                paths.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+                None
+            } else {
+                assert!(metadata.is_file());
+                Some(std::fs::read(&path).unwrap())
+            };
+            census.push((
+                path,
+                bytes,
+                crate::fs_util::file_identity(&handle).unwrap(),
+                metadata.modified().unwrap(),
+            ));
+        }
+        census.sort_by(|a, b| a.0.cmp(&b.0));
+        census
+    }
+    let files = physical(&root.path().join("media"));
+    let before = durable();
+    let requests = server.received_requests().await.unwrap().len();
+    assert_eq!(requests, 2);
+    let error = db
+        .mark_master_family_soft_deleted(&binding.library, &master, None)
+        .await
+        .expect_err("archival must not hide the prepared repair");
+    assert!(
+        matches!(&error, state::error::StateError::Invariant { operation: "mark_master_family_soft_deleted", detail } if detail == "source deletion cannot hide a prepared capture-repair receipt"),
+        "wrong archive deletion failure: {error:?}"
+    );
+    assert_eq!(
+        durable(),
+        before,
+        "deletion flags, debt, receipts and every durable row must survive refusal"
+    );
+    assert_eq!(
+        physical(&root.path().join("media")),
+        files,
+        "all archive/current/history/stage/XMP bytes, IDs and mtimes must survive"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    eprintln!(
+        "ARCHIVE_GUARD_REFUSAL error={error:?} archive={archive_path:?} master={master} files={} preserved_members={} all_durable_rows_unchanged=true GETs={requests}",
+        files.len(),
+        members.iter().filter(|m| m.preserved.is_some()).count()
+    );
 }
 
 #[tokio::test]
