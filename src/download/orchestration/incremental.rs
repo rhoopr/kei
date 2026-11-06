@@ -884,7 +884,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
     }
 
     if config.selection_context.is_some() {
-        return Box::pin(super::generation::after_delta(
+        let mut selected = Box::pin(super::generation::after_delta(
             download_client,
             passes,
             config,
@@ -894,7 +894,11 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             zone_sync_token,
             downloadable_assets,
         ))
-        .await;
+        .await?;
+        if !controls.run_mode.downloads_files() {
+            selected.sync_token = None;
+        }
+        return Ok(selected);
     }
 
     if recent_active
@@ -1044,7 +1048,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         }
         tracing::info!("No new photos to download from incremental sync");
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
-        let sync_token = if controls.run_mode.only_print_filenames() {
+        let sync_token = if !controls.run_mode.downloads_files() {
             None
         } else {
             (!stats.sync_token_blocked)
@@ -1347,7 +1351,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         } else {
             DownloadOutcome::Success
         };
-        let sync_token = if controls.run_mode.only_print_filenames() {
+        let sync_token = if !controls.run_mode.downloads_files() {
             None
         } else {
             (enumeration_errors == 0 && !stats.sync_token_blocked)
@@ -1364,21 +1368,31 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         ));
     }
 
-    if controls.run_mode.only_print_filenames() {
+    if !controls.run_mode.downloads_files() {
         #[allow(
             clippy::print_stdout,
             reason = "--only-print-filenames writes target paths to stdout so callers can pipe to xargs/etc"
         )]
         for task in &tasks {
-            println!("{}", task.download_path.display());
+            if controls.run_mode.only_print_filenames() {
+                println!("{}", task.download_path.display());
+            } else {
+                tracing::info!(target: "kei::download::pipeline", path = %task.download_path.display(), "[DRY RUN] Would download");
+            }
         }
         let mut stats = SyncStats {
+            downloaded: if controls.run_mode.is_dry_run() {
+                tasks.len()
+            } else {
+                0
+            },
             skipped: skip_breakdown,
             enumeration_errors,
             state_write_failures: delta_summary
                 .state_transition_failures
                 .saturating_add(planning_state_write_failures),
             elapsed_secs: started.elapsed().as_secs_f64(),
+            interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
         stats.accumulate(&delta_summary.sparse_target_stats);
@@ -1387,11 +1401,12 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
         // Don't advance the sync token — this is a read-only operation.
+        let failed_count = enumeration_errors
+            .saturating_add(delta_summary.state_transition_failures)
+            .saturating_add(planning_state_write_failures);
         return Ok(SyncResult::from_incremental_execution(
-            if enumeration_errors > 0 || delta_summary.state_transition_failures > 0 {
-                DownloadOutcome::PartialFailure {
-                    failed_count: enumeration_errors + delta_summary.state_transition_failures,
-                }
+            if failed_count > 0 {
+                DownloadOutcome::PartialFailure { failed_count }
             } else {
                 DownloadOutcome::Success
             },

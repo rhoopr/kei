@@ -11,6 +11,795 @@ use crate::state::db::provider_selection::{
 use serde_json::json;
 use std::sync::Arc;
 
+fn noncommit_choice_snapshot(db: &SqliteStateDb) -> Vec<(String, Vec<String>)> {
+    let conn = db
+        .acquire_lock("noncommit choice and admission snapshot")
+        .unwrap();
+    [
+        ("reconciliation_paths", "SELECT * FROM reconciliation_paths"),
+        ("provider_active_generations", "SELECT * FROM provider_active_generations"),
+        ("provider_active_decisions", "SELECT * FROM provider_active_decisions"),
+        ("provider_active_destinations", "SELECT * FROM provider_active_destinations"),
+        ("provider_selection_generations", "SELECT * FROM provider_selection_generations"),
+        ("provider_selection_decisions", "SELECT * FROM provider_selection_decisions"),
+        ("provider_selection_destinations", "SELECT * FROM provider_selection_destinations"),
+        ("provider_work_receipts", "SELECT * FROM provider_work_receipts"),
+        ("provider_work_obligations", "SELECT * FROM provider_work_obligations"),
+        ("download_receipts", "SELECT * FROM download_receipts"),
+        ("asset_metadata_paths", "SELECT * FROM asset_metadata_paths"),
+        // Source observations can update seen/metadata fields or retain a pending
+        // asset without a path. Compare materialized queue destinations, not telemetry.
+        ("assets_with_destinations", "SELECT library,id,version_size,status,local_path,checksum,size_bytes,local_checksum FROM assets WHERE local_path IS NOT NULL"),
+    ].into_iter().map(|(name, sql)| {
+        let mut statement = conn.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        let mut rows: Vec<String> = statement.query_map([], |row| {
+            (0..columns).map(|index| row.get::<_,rusqlite::types::Value>(index)).collect::<Result<Vec<_>,_>>()
+                .map(|values| format!("{values:?}"))
+        }).unwrap().collect::<Result<_,_>>().unwrap();
+        rows.sort();
+        (name.to_owned(), rows)
+    }).collect()
+}
+
+#[tokio::test]
+async fn collecting_dry_run_mixed_task_observation_failure_preserves_successful_preview() {
+    use crate::download::orchestration::models::{
+        DownloadControls, DownloadReporting, DownloadRunMode,
+    };
+    use sha2::{Digest, Sha256};
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    for fail_b in [false, true] {
+        let server = wiremock::MockServer::start().await;
+        let mut f = Fixture::new().await;
+        f.config.folder_structure = "none".into();
+        let mut source = Vec::new();
+        for (name, filename, bytes) in [
+            (
+                "a",
+                "preview-a.JPG",
+                b"\xff\xd8\xff\xe0eligible preview A".as_slice(),
+            ),
+            (
+                "b",
+                "preview-b.JPG",
+                b"\xff\xd8\xff\xe0eligible preview B".as_slice(),
+            ),
+        ] {
+            let url = format!("{}/{name}", server.uri());
+            Mock::given(method("GET"))
+                .and(path(format!("/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let mut pair = super::eligible_records(name, &url);
+            pair[0]["fields"]["filenameEnc"]["value"] = json!(filename);
+            pair[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+                json!(data_encoding::BASE64.encode(&Sha256::digest(bytes)));
+            pair[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(bytes.len());
+            source.extend(pair);
+        }
+        *f.session.records.lock().unwrap() = source.clone();
+        *f.session.changes_records.lock().unwrap() = source;
+        assert!(f.dir.path().join("state.db").is_file());
+        let concrete: Arc<dyn crate::download::DownloadStore> = f.db.clone();
+        assert!(Arc::ptr_eq(f.config.state_db.as_ref().unwrap(), &concrete));
+        let (capture, _, _) = f
+            .pass
+            .album
+            .publication_scope("PrimarySync")
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&capture.db, &f.db));
+        for child in ["asset-a", "asset-b"] {
+            let asset = f
+                .pass
+                .album
+                .confirm_catalog_asset(child)
+                .await
+                .unwrap()
+                .asset;
+            assert_eq!(asset.state_id(), child);
+        }
+
+        let file_snapshot = || {
+            let mut files: Vec<_> = std::fs::read_dir(&f.config.directory)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    assert!(entry.file_type().unwrap().is_file());
+                    let handle = std::fs::File::open(entry.path()).unwrap();
+                    (
+                        entry.file_name(),
+                        std::fs::read(entry.path()).unwrap(),
+                        crate::fs_util::file_identity(&handle).unwrap(),
+                        handle.metadata().unwrap().modified().unwrap(),
+                    )
+                })
+                .collect();
+            files.sort_by(|left, right| left.0.cmp(&right.0));
+            files
+        };
+        let retained_snapshot = || {
+            let conn =
+                f.db.acquire_lock("collecting dry-run retained checkpoint and temp evidence")
+                    .unwrap();
+            let metadata = conn
+                .prepare("SELECT key,value FROM metadata ORDER BY key")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let unknown: Vec<u8> = conn
+                .query_row("SELECT payload FROM unknown_future", [], |row| row.get(0))
+                .unwrap();
+            let temps: i64 = conn
+                .query_row("SELECT count(*) FROM owned_temp_files", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            (metadata, unknown, temps)
+        };
+        let before = noncommit_choice_snapshot(&f.db);
+        let before_files = file_snapshot();
+        assert_eq!(
+            before_files.len(),
+            2,
+            "nonvacuous existing media and sidecar protection"
+        );
+        let before_retained = retained_snapshot();
+        assert!(!before_retained.0.is_empty());
+        assert_eq!(before_retained.1, [0, 255, 7]);
+        assert_eq!(before_retained.2, 0);
+        {
+            let conn =
+                f.db.acquire_lock("install only B task observation fault")
+                    .unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM assets WHERE id IN ('asset-a','asset-b')",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            if fail_b {
+                conn.execute_batch("CREATE TRIGGER dryrun_reject_b_task_observation BEFORE INSERT ON assets WHEN NEW.library='PrimarySync' AND NEW.id='asset-b' AND NEW.version_size='original' AND NEW.filename='preview-b.JPG' BEGIN SELECT RAISE(ABORT,'dryrun B task observation rejected'); END;").unwrap();
+            }
+        }
+
+        let (trace, _guard) = crate::test_helpers::TracingCapture::install();
+        let result =
+            crate::download::orchestration::incremental::download_photos_incremental_collecting(
+                &reqwest::Client::new(),
+                std::slice::from_ref(&f.pass),
+                &Arc::new(f.config.clone()),
+                "mixed-preview-source",
+                DownloadControls::new(DownloadRunMode::DryRun, DownloadReporting::hidden()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let would_download = if fail_b { 1 } else { 2 };
+        assert_eq!(
+            result.stats.downloaded, would_download,
+            "fail_b={fail_b}: {result:?}"
+        );
+        assert_eq!(result.stats.state_write_failures, usize::from(fail_b));
+        assert_eq!(
+            (
+                result.stats.enumeration_errors,
+                result.stats.exif_failures,
+                result.stats.metadata_capture_failures
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            result.stats.failed, 0,
+            "this is an observation-write failure, not a transfer failure"
+        );
+        assert!(!matches!(
+            &result.outcome,
+            crate::download::DownloadOutcome::SessionExpired { .. }
+        ));
+        assert!(!result.stats.enumeration_incomplete && !result.stats.sync_token_blocked);
+        assert!(!result.stats.identity_incomplete && !result.stats.interrupted);
+        assert!(result.sync_token.is_none());
+        assert_eq!(
+            (
+                result.stats.bytes_downloaded,
+                result.stats.disk_bytes_written,
+                result.stats.photos_downloaded,
+                result.stats.videos_downloaded
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            f.session.changes_cursors.lock().unwrap().as_slice(),
+            &[Some("mixed-preview-source".to_owned())]
+        );
+
+        let events = trace.events();
+        let planning: Vec<_> = events
+            .iter()
+            .filter(|event| event.message() == Some("Incremental task planning phase complete"))
+            .collect();
+        assert_eq!(planning.len(), 1);
+        assert_eq!(
+            planning[0].field("planned_tasks"),
+            Some(would_download.to_string().as_str())
+        );
+        assert!(!trace.contains_event(|event| event.message()
+            == Some("All incremental assets already downloaded or filtered")));
+        let a = f.config.directory.join("preview-a.JPG");
+        let b = f.config.directory.join("preview-b.JPG");
+        assert!(
+            trace.contains_event(|event| event.message() == Some("[DRY RUN] Would download")
+                && event.field("path") == Some(a.to_str().unwrap()))
+        );
+        assert_eq!(
+            trace.contains_event(|event| event.message() == Some("[DRY RUN] Would download")
+                && event.field("path") == Some(b.to_str().unwrap())),
+            !fail_b
+        );
+        let failed: Vec<_> = events
+            .iter()
+            .filter(|event| event.message() == Some("Failed to record asset in state DB"))
+            .collect();
+        assert_eq!(failed.len(), usize::from(fail_b));
+        if fail_b {
+            assert_eq!(failed[0].field("asset_id"), Some("asset-b"));
+            assert!(
+                failed[0]
+                    .field("error")
+                    .unwrap()
+                    .contains("dryrun B task observation rejected")
+            );
+        }
+        {
+            let conn =
+                f.db.acquire_lock("successful observation survives B-only abort")
+                    .unwrap();
+            let observed: Vec<(String, String, Option<String>)> = conn.prepare("SELECT id,status,local_path FROM assets WHERE id IN ('asset-a','asset-b') ORDER BY id").unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            let mut expected = vec![("asset-a".to_owned(), "pending".to_owned(), None)];
+            if !fail_b {
+                expected.push(("asset-b".to_owned(), "pending".to_owned(), None));
+            }
+            assert_eq!(observed, expected);
+        }
+        assert_eq!(noncommit_choice_snapshot(&f.db), before);
+        assert_eq!(retained_snapshot(), before_retained);
+        assert_eq!(file_snapshot(), before_files);
+        assert!(!a.exists() && !b.exists());
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        // Keep the outcome oracle last: all branch/safety preconditions above
+        // must pass before exposing the mixed-task Success misclassification.
+        if fail_b {
+            assert!(
+                matches!(
+                    result.outcome,
+                    crate::download::DownloadOutcome::PartialFailure { failed_count: 1 }
+                ),
+                "mixed dry-run planning failure must not report Success: {result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result.outcome, crate::download::DownloadOutcome::Success),
+                "no-fault two-preview control: {result:?}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn noncommitting_modes_preserve_positively_nominated_publication_choice() {
+    use crate::download::baseline_matching::BaselineMatch;
+    use crate::download::orchestration::models::{
+        DownloadControls, DownloadReporting, DownloadRunMode,
+    };
+    use crate::download::pipeline::{StreamRuntime, stream_and_download_from_stream};
+    use futures_util::StreamExt;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let original = b"\xff\xd8\xff\xe0unchanged original";
+    let edited = b"\xff\xd8\xff\xe0new adjusted bytes";
+    let checksum = |bytes: &[u8]| data_encoding::BASE64.encode(&Sha256::digest(bytes));
+    for (collecting, mode) in [
+        (false, DownloadRunMode::PrintFilenames),
+        (false, DownloadRunMode::DryRun),
+        (true, DownloadRunMode::PrintFilenames),
+        (true, DownloadRunMode::DryRun),
+    ] {
+        let case = format!(
+            "{}-{mode:?}",
+            if collecting {
+                "collecting"
+            } else {
+                "streaming"
+            }
+        );
+        let server = wiremock::MockServer::start().await;
+        for (name, bytes) in [
+            ("original", original.as_slice()),
+            ("edited", edited.as_slice()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .mount(&server)
+                .await;
+        }
+        let mut f = Fixture::new().await;
+        f.config.folder_structure = "none".into();
+        f.config.edited = true;
+        f.config.edited_naming = crate::types::EditedNaming::Primary;
+        {
+            let mut values = f.session.records.lock().unwrap();
+            values[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+            values[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/original",server.uri()),"size":original.len(),"fileChecksum":checksum(original)});
+        }
+        let baseline = stream_collision_child(&f, "asset-m", false).await;
+        assert_eq!(
+            (baseline.downloaded, baseline.state_write_failures),
+            (1, 0),
+            "{case}: {baseline:?}"
+        );
+        let p = f.config.directory.join("photo.JPG");
+        let metadata = std::fs::metadata(&p).unwrap();
+        let p_identity = (metadata.ino(), metadata.mtime(), metadata.mtime_nsec());
+        {
+            let mut values = f.session.records.lock().unwrap();
+            values[1]["fields"]["resJPEGFullRes"] = json!({"value":{"downloadURL":format!("{}/edited",server.uri()),"size":edited.len(),"fileChecksum":checksum(edited)}});
+            values[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+            values[1]["fields"]["adjustmentRenderType"] = json!({"value":1});
+        }
+        f.config.resolution = crate::types::PhotoResolution::None;
+        *f.session.changes_records.lock().unwrap() = f.session.records.lock().unwrap().clone();
+        let config = Arc::new(f.config.with_pass(&f.pass));
+        let concrete: Arc<dyn crate::download::DownloadStore> = f.db.clone();
+        assert!(Arc::ptr_eq(config.state_db.as_ref().unwrap(), &concrete));
+        let before = noncommit_choice_snapshot(&f.db);
+        let asset = f
+            .pass
+            .album
+            .confirm_catalog_asset("asset-m")
+            .await
+            .unwrap()
+            .asset;
+        let s = {
+            let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+                .await
+                .unwrap();
+            let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+            assert!(plan.filter_reason.is_none() && plan.malformed_resource.is_none());
+            assert_eq!(plan.tasks.len(), 1);
+            let task = &plan.tasks[0];
+            assert_eq!(task.version_size, crate::state::VersionSizeKey::Adjusted);
+            assert_eq!(
+                task.superseded_requested(&config.directory, &p),
+                Some(p.as_path())
+            );
+            assert_ne!(task.download_path, p);
+            assert!(!task.download_path.exists());
+            let reservations: Vec<_> = planner.reconciliation_reservations().collect();
+            assert_eq!(reservations.len(), 1);
+            assert_eq!(
+                reservations[0].requested_path_key.0,
+                crate::fs_util::confined_path_key(&p).unwrap()
+            );
+            assert_eq!(reservations[0].destination_path, task.download_path);
+            assert!(
+                matches!(
+                    planner.match_existing(&asset, &config, task).await,
+                    BaselineMatch::Missing
+                ),
+                "{case}: nomination is not eligible work"
+            );
+            let binding = task.publication_binding.as_deref().unwrap().clone();
+            let receipts =
+                f.db.bound_download_receipts(
+                    binding,
+                    "original".into(),
+                    checksum(original),
+                    original.len() as u64,
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].native_path.to_path(), p);
+            task.download_path.clone()
+        };
+        assert_eq!(
+            noncommit_choice_snapshot(&f.db),
+            before,
+            "{case}: pure nomination committed state"
+        );
+        let before_files: Vec<_> = std::fs::read_dir(&config.directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let gets_before = server.received_requests().await.unwrap().len();
+        assert_eq!(gets_before, 1);
+        let cursors_before = f.session.changes_cursors.lock().unwrap().len();
+        let controls = DownloadControls::new(mode, DownloadReporting::hidden());
+        let (trace, _guard) = crate::test_helpers::TracingCapture::install();
+        if collecting {
+            let result = crate::download::orchestration::incremental::download_photos_incremental_collecting(
+                &reqwest::Client::new(), std::slice::from_ref(&f.pass), &Arc::new(f.config.clone()),
+                "noncommit-source", controls, CancellationToken::new(),
+            ).await.unwrap();
+            eprintln!("NONCOMMIT_ENTRY case={case} result={result:?}");
+            assert!(
+                trace.contains_event(|event| event.message()
+                    == Some("Incremental task planning phase complete")
+                    && event.field("planned_tasks") == Some("1")),
+                "{case}: did not plan eligible collected task; events={:?}",
+                trace.events()
+            );
+            assert_eq!(result.stats.enumeration_errors, 0);
+            assert_eq!(result.stats.state_write_failures, 0);
+            assert!(matches!(
+                result.outcome,
+                crate::download::DownloadOutcome::Success
+            ));
+            assert!(
+                result.sync_token.is_none(),
+                "{case}: preview offered a checkpoint"
+            );
+            assert_eq!(
+                result.stats.downloaded,
+                usize::from(mode == DownloadRunMode::DryRun)
+            );
+            assert_eq!(
+                (
+                    result.stats.bytes_downloaded,
+                    result.stats.disk_bytes_written,
+                    result.stats.photos_downloaded,
+                    result.stats.videos_downloaded
+                ),
+                (0, 0, 0, 0)
+            );
+        } else {
+            let (changes, successor, _) = f
+                .pass
+                .album
+                .changes_stream_observed("noncommit-source", true);
+            let observed = Arc::new(AtomicUsize::new(0));
+            let enumerated = observed.clone();
+            let combined = changes.filter_map(move |change| {
+                futures_util::future::ready(match change {
+                    Ok(change) => change.asset.map(|asset| {
+                        assert_eq!(asset.asset_record_name(), "asset-m");
+                        enumerated.fetch_add(1, Ordering::SeqCst);
+                        Ok(asset)
+                    }),
+                    Err(error) => Some(Err(error)),
+                })
+            });
+            let result = stream_and_download_from_stream(
+                &reqwest::Client::new(),
+                combined,
+                &config,
+                controls,
+                1,
+                CancellationToken::new(),
+                StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                observed.load(Ordering::SeqCst),
+                1,
+                "{case}: source not consumed"
+            );
+            assert_eq!(successor.await.unwrap(), "quiet-zone-cursor");
+            assert!(result.enumeration_complete);
+            assert_eq!(
+                (
+                    result.enumeration_errors,
+                    result.provider_auth_errors,
+                    result.state_write_failures
+                ),
+                (0, 0, 0)
+            );
+            match mode {
+                DownloadRunMode::PrintFilenames => {
+                    assert_eq!(result.printed_filenames, vec![s.clone()])
+                }
+                DownloadRunMode::DryRun => {
+                    assert_eq!(result.downloaded, 1, "{case}: no eligible task counted")
+                }
+                DownloadRunMode::Download => panic!("unexpected download control"),
+            }
+        }
+        assert_eq!(
+            f.session.changes_cursors.lock().unwrap().len(),
+            cursors_before + 1,
+            "{case}: actual source enumeration did not run"
+        );
+        let after = noncommit_choice_snapshot(&f.db);
+        let changed: Vec<_> = before
+            .iter()
+            .zip(&after)
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| format!("{} BEFORE={:?} AFTER={:?}", a.0, a.1, b.1))
+            .collect();
+        let media = server.received_requests().await.unwrap();
+        let mut after_files: Vec<_> = std::fs::read_dir(&config.directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let mut before_files = before_files;
+        before_files.sort();
+        after_files.sort();
+        if !changed.is_empty()
+            || media.len() != gets_before
+            || s.exists()
+            || before_files != after_files
+        {
+            let retained = f.dir.keep();
+            panic!(
+                "NONCOMMIT_WRITE case={case} changed={changed:?} MEDIA_GET_before={gets_before} after={} S_exists={} before_files={before_files:?} after_files={after_files:?} retained={}",
+                media.len(),
+                s.exists(),
+                retained.display()
+            );
+        }
+        assert_eq!(std::fs::read(&p).unwrap(), original);
+        let metadata = std::fs::metadata(&p).unwrap();
+        assert_eq!(
+            (metadata.ino(), metadata.mtime(), metadata.mtime_nsec()),
+            p_identity
+        );
+        eprintln!(
+            "NONCOMMIT_PROVED case={case} eligible_nomination=1 actual_source_pages=1 intent_and_admission_unchanged=1 media_GET=0 siblings_absent=1 P_identity_and_scoped_proof_unchanged=1"
+        );
+        if collecting && mode == DownloadRunMode::DryRun {
+            crate::download::orchestration::test_support::seed_complete_album_snapshot(
+                f.db.as_ref(),
+                "preview-album",
+                "preview-album",
+                &[],
+            )
+            .await;
+            let passes = [super::destination_pass(&f, "preview-album"), f.pass.clone()];
+            assert!(
+                f.db.selected_album_containers_have_complete_snapshots(
+                    "PrimarySync",
+                    &["preview-album"]
+                )
+                .await
+                .unwrap()
+            );
+            f.config.sync_mode = crate::download::SyncMode::Incremental {
+                zone_sync_token: "noncommit-source".into(),
+            };
+            let plans_before = trace
+                .events()
+                .iter()
+                .filter(|event| event.message() == Some("Incremental task planning phase complete"))
+                .count();
+            let pages_before = f.session.changes_cursors.lock().unwrap().len();
+            let ranks_before = f.session.rank_calls.load(Ordering::SeqCst);
+            let routed = crate::download::download_photos_with_sync(
+                &reqwest::Client::new(),
+                &passes,
+                Arc::new(f.config.clone()),
+                controls,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(routed.outcome, crate::download::DownloadOutcome::Success),
+                "{routed:?}"
+            );
+            assert!(routed.sync_token.is_none());
+            // The public cycle also composes targeted retry previews. The
+            // collecting event below must still contain exactly one task.
+            assert!(routed.stats.downloaded >= 1);
+            assert_eq!(
+                (
+                    routed.stats.bytes_downloaded,
+                    routed.stats.disk_bytes_written
+                ),
+                (0, 0)
+            );
+            assert!(!routed.full_enumeration_ran);
+            assert_eq!(
+                f.session.changes_cursors.lock().unwrap().len(),
+                pages_before + 1
+            );
+            assert_eq!(
+                trace
+                    .events()
+                    .iter()
+                    .filter(|event| event.message()
+                        == Some("Incremental task planning phase complete")
+                        && event.field("planned_tasks") == Some("1"))
+                    .count(),
+                plans_before + 1
+            );
+            assert_eq!(noncommit_choice_snapshot(&f.db), before);
+            assert_eq!(server.received_requests().await.unwrap().len(), gets_before);
+            assert!(!s.exists());
+            assert_eq!(std::fs::read(&p).unwrap(), original);
+            let metadata = std::fs::metadata(&p).unwrap();
+            assert_eq!(
+                (metadata.ino(), metadata.mtime(), metadata.mtime_nsec()),
+                p_identity
+            );
+            eprintln!(
+                "COLLECTING_DRY_RUN_PUBLIC_ROUTE named_album_plus_unfiled=1 complete_snapshot=1 collected_tasks=1 aggregate_would_download={} retry_query_calls={} bytes=0 token=None source_pages=1 full_enumeration=0 protected_snapshot_unchanged=1",
+                routed.stats.downloaded,
+                f.session.rank_calls.load(Ordering::SeqCst) - ranks_before
+            );
+
+            let downloaded = crate::download::orchestration::incremental::download_photos_incremental_collecting(
+                &reqwest::Client::new(), std::slice::from_ref(&f.pass), &Arc::new(f.config.clone()),
+                "noncommit-source", super::controls(), CancellationToken::new(),
+            ).await.unwrap();
+            assert!(
+                matches!(
+                    downloaded.outcome,
+                    crate::download::DownloadOutcome::Success
+                ),
+                "{downloaded:?}"
+            );
+            assert_eq!(downloaded.sync_token.as_deref(), Some("quiet-zone-cursor"));
+            assert_eq!(downloaded.stats.downloaded, 1);
+            assert_eq!(downloaded.stats.bytes_downloaded, edited.len() as u64);
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                gets_before + 1
+            );
+            assert_eq!(std::fs::read(&s).unwrap(), edited);
+            assert_eq!(std::fs::read(&p).unwrap(), original);
+            let conn =
+                f.db.acquire_lock("real collecting download remains enabled")
+                    .unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM download_receipts WHERE version_size='adjusted'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(conn.query_row("SELECT count(*) FROM assets WHERE version_size='adjusted' AND status='downloaded' AND local_path=?1",[s.to_str().unwrap()],|r|r.get::<_,i64>(0)).unwrap(),1);
+            eprintln!(
+                "COLLECTING_DOWNLOAD_POSITIVE downloaded=1 media_GET=1 adjusted_receipt=1 S_published=1 token=Some"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn collecting_dry_run_empty_and_noop_withhold_tokens_but_download_keeps_them() {
+    use crate::download::orchestration::models::{
+        DownloadControls, DownloadReporting, DownloadRunMode,
+    };
+    use sha2::{Digest, Sha256};
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let media = b"\xff\xd8\xff\xe0unchanged original";
+    for empty in [true, false] {
+        for mode in [
+            DownloadRunMode::PrintFilenames,
+            DownloadRunMode::DryRun,
+            DownloadRunMode::Download,
+        ] {
+            let server = wiremock::MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/original"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(media))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut f = Fixture::new().await;
+            f.config.folder_structure = "none".into();
+            {
+                let mut records = f.session.records.lock().unwrap();
+                records[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+                records[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/original",server.uri()),"size":media.len(),"fileChecksum":data_encoding::BASE64.encode(&Sha256::digest(media))});
+            }
+            let seeded = stream_collision_child(&f, "asset-m", false).await;
+            assert_eq!((seeded.downloaded, seeded.state_write_failures), (1, 0));
+            if !empty {
+                *f.session.changes_records.lock().unwrap() =
+                    f.session.records.lock().unwrap().clone();
+            }
+            let before = noncommit_choice_snapshot(&f.db);
+            let (trace, _guard) = crate::test_helpers::TracingCapture::install();
+            let result=crate::download::orchestration::incremental::download_photos_incremental_collecting(
+                &reqwest::Client::new(),std::slice::from_ref(&f.pass),&Arc::new(f.config.clone()),
+                "noncommit-source",DownloadControls::new(mode,DownloadReporting::hidden()),CancellationToken::new(),
+            ).await.unwrap();
+            assert!(
+                matches!(result.outcome, crate::download::DownloadOutcome::Success),
+                "empty={empty} mode={mode:?}: {result:?}"
+            );
+            assert_eq!(
+                result.sync_token.as_deref(),
+                mode.downloads_files().then_some("quiet-zone-cursor"),
+                "empty={empty} mode={mode:?}: readonly checkpoint leak"
+            );
+            assert_eq!(
+                (
+                    result.stats.downloaded,
+                    result.stats.bytes_downloaded,
+                    result.stats.disk_bytes_written
+                ),
+                (0, 0, 0)
+            );
+            assert_eq!(
+                (
+                    result.stats.enumeration_errors,
+                    result.stats.state_write_failures
+                ),
+                (0, 0)
+            );
+            assert_eq!(f.session.changes_cursors.lock().unwrap().len(), 1);
+            let expected = if empty {
+                "No new photos to download from incremental sync"
+            } else {
+                "All incremental assets already downloaded or filtered"
+            };
+            assert!(
+                trace.contains_event(|event| event.message() == Some(expected)),
+                "empty={empty} mode={mode:?}: wrong branch"
+            );
+            if !empty {
+                assert_eq!(result.stats.skipped.by_state, 1);
+            }
+            let after = noncommit_choice_snapshot(&f.db);
+            if mode.downloads_files() {
+                // Real Download adoption can fill its missing preserved-path
+                // key. Readonly modes must preserve even that field exactly.
+                assert_eq!(
+                    after
+                        .iter()
+                        .filter(|(table, _)| table != "asset_metadata_paths")
+                        .collect::<Vec<_>>(),
+                    before
+                        .iter()
+                        .filter(|(table, _)| table != "asset_metadata_paths")
+                        .collect::<Vec<_>>()
+                );
+            } else {
+                assert_eq!(after, before);
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert_eq!(
+                std::fs::read(f.config.directory.join("photo.JPG")).unwrap(),
+                media
+            );
+            eprintln!(
+                "COLLECTING_NOOP_TOKEN empty={empty} mode={mode:?} token={:?} source_pages=1 would_download=0 media_GET=0 snapshot_unchanged=1",
+                result.sync_token
+            );
+        }
+    }
+}
+
 async fn stream_collision_child(
     f: &Fixture,
     child: &str,
