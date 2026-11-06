@@ -4911,3 +4911,801 @@ async fn first_adjusted_suffix_nomination_precedes_admission() {
         "eligible first-Adjusted intent must precede admission"
     );
 }
+
+fn marker_free_history_rows(
+    db: &SqliteStateDb,
+    table: &str,
+    column: &str,
+    value: &str,
+) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn = db.acquire_lock("marker-free complete evidence").unwrap();
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT * FROM {table} WHERE {column}=?1 ORDER BY 1"
+        ))
+        .unwrap();
+    let columns = statement.column_count();
+    statement
+        .query_map([value], |row| {
+            (0..columns)
+                .map(|index| row.get(index))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn marker_free_history_file(
+    path: &std::path::Path,
+) -> (Vec<u8>, crate::fs_util::FileIdentity, std::time::SystemTime) {
+    let file = std::fs::File::open(path).unwrap();
+    (
+        std::fs::read(path).unwrap(),
+        crate::fs_util::file_identity(&file).unwrap(),
+        file.metadata().unwrap().modified().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn marker_free_same_rendition_history_controls_saved_destination() {
+    use crate::download::baseline_matching::BaselineMatch;
+    use crate::download::orchestration::generation;
+    use sha2::{Digest, Sha256};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    // DEPENDENCY: genuine historical nominations in both download modes must
+    // qualify first. Never remove Q or force the planner's mode/origin/marker.
+    let c0 = b"\xff\xd8\xff\xe0old original";
+    let c1 = b"\xff\xd8\xff\xe0a distinctly longer replacement original";
+    let checksum = |bytes: &[u8]| data_encoding::BASE64.encode(&Sha256::digest(bytes));
+    assert_ne!(c0.len(), c1.len());
+    assert!(!crate::download::file::supported_provider_signature(
+        &checksum(c1)
+    ));
+    for case in [
+        "unchanged",
+        "absent",
+        "changed",
+        "directory",
+        "missing_receipt",
+    ] {
+        let positive = matches!(case, "unchanged" | "absent");
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/original"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(c0))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/q"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(c1))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut f = Fixture::new().await;
+        f.dir.disable_cleanup(true);
+        eprintln!(
+            "MARKER_FREE_HISTORY_FIXTURE case={case} retained={}",
+            f.dir.path().display()
+        );
+        f.config.folder_structure = "none".into();
+        f.config.resolution = crate::types::PhotoResolution::Original;
+        f.config.edited = false;
+        f.config.retry = crate::retry::RetryConfig {
+            max_retries: 0,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        };
+        {
+            let mut values = f.session.records.lock().unwrap();
+            values[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+            values[0]["fields"]["resOriginalRes"]["value"] = json!({
+                "downloadURL":format!("{}/original", server.uri()), "size":c0.len(), "fileChecksum":checksum(c0)
+            });
+        }
+        let published = stream_collision_child(&f, "asset-m", false).await;
+        assert_eq!(
+            (published.downloaded, published.state_write_failures),
+            (1, 0)
+        );
+        assert!(published.failed.is_empty());
+        drop(published);
+        let p = f.config.directory.join("photo.JPG");
+        let q = f.config.directory.join("companion.JPG");
+        let backup = f.dir.path().join("historical-original-backup.JPG");
+        assert!(!backup.starts_with(&*f.config.directory));
+        let old_file = marker_free_history_file(&p);
+        assert_eq!(old_file.0, c0);
+        let mut initial_entries: Vec<_> = std::fs::read_dir(&*f.config.directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        initial_entries.sort();
+        let retained_files: Vec<_> = initial_entries
+            .iter()
+            .filter(|path| *path != &p)
+            .map(|path| (path.clone(), marker_free_history_file(path)))
+            .collect();
+        let old_proof = marker_free_history_rows(&f.db, "download_receipts", "child", "asset-m");
+        assert_eq!(old_proof.len(), 1);
+        let old_paths = marker_free_history_rows(
+            &f.db,
+            "asset_metadata_paths",
+            "local_path",
+            p.to_str().unwrap(),
+        );
+        assert!(!old_paths.is_empty());
+        let old_claims = marker_free_history_rows(
+            &f.db,
+            "legacy_master_state_owners",
+            "asset_record_name",
+            "asset-m",
+        );
+        let token = marker_free_history_rows(&f.db, "metadata", "key", "sync_token:PrimarySync");
+        let other_token = marker_free_history_rows(
+            &f.db,
+            "metadata",
+            "key",
+            "pending_sync_token:sparse:OtherZone",
+        );
+        assert_eq!((token.len(), other_token.len()), (1, 1));
+        {
+            let mut values = f.session.records.lock().unwrap();
+            values[0]["fields"]["resOriginalRes"]["value"] = json!({
+                "downloadURL":format!("{}/current", server.uri()), "size":c1.len(), "fileChecksum":checksum(c1)
+            });
+            let mut companion = records("q", &checksum(c1), "genuine unfinished disjoint work");
+            companion[0]["fields"]["filenameEnc"]["value"] = json!("companion.JPG");
+            companion[0]["fields"]["resOriginalRes"]["value"] = json!({
+                "downloadURL":format!("{}/q", server.uri()), "size":c1.len(), "fileChecksum":checksum(c1)
+            });
+            values.extend(companion);
+        }
+        let q_rows = |db: &SqliteStateDb| {
+            [
+                marker_free_history_rows(db, "provider_active_destinations", "child", "asset-q"),
+                marker_free_history_rows(db, "provider_active_decisions", "child", "asset-q"),
+                marker_free_history_rows(db, "assets", "id", "asset-q"),
+                marker_free_history_rows(db, "asset_metadata_paths", "id", "asset-q"),
+                marker_free_history_rows(
+                    db,
+                    "asset_master_mappings",
+                    "asset_record_name",
+                    "asset-q",
+                ),
+                marker_free_history_rows(db, "reconciliation_paths", "id", "asset-q"),
+            ]
+        };
+        let (s, root, pass, binding, q_debt) = {
+            let context = generation::context_for_format(
+                std::slice::from_ref(&f.pass),
+                &f.config,
+                super::controls(),
+                2,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let run = context
+                .start_for_test(std::slice::from_ref(&f.pass), &f.config)
+                .await
+                .unwrap();
+            let pass = generation::pass_key(&f.pass);
+            let mut config = f.config.with_pass(&f.pass);
+            config.selection_run = Some(run.clone());
+            config.selection_pass = Some(pass.clone());
+            {
+                let observed = f
+                    .pass
+                    .album
+                    .confirm_catalog_asset("asset-q")
+                    .await
+                    .unwrap()
+                    .asset;
+                let (asset, proof) = run.confirm(&pass, observed).await.unwrap();
+                let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+                    .await
+                    .unwrap();
+                let mut plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+                assert_eq!(plan.tasks.len(), 1);
+                assert_eq!(plan.tasks[0].download_path, q);
+                assert!(
+                    run.project(
+                        &pass,
+                        &asset,
+                        proof,
+                        &mut plan,
+                        &mut planner,
+                        &config,
+                        &CancellationToken::new()
+                    )
+                    .await
+                    .unwrap()
+                );
+            }
+            let q_debt = q_rows(&f.db);
+            assert_eq!(
+                (q_debt[0].len(), q_debt[1].len(), q_debt[2].len()),
+                (1, 1, 1)
+            );
+            assert_eq!(f.db.acquire_lock("actual unverified Q").unwrap().query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-q' AND admitted=1 AND verified_media=0", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+            let observed = f
+                .pass
+                .album
+                .confirm_catalog_asset("asset-m")
+                .await
+                .unwrap()
+                .asset;
+            let (asset, proof) = run.confirm(&pass, observed).await.unwrap();
+            let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+                .await
+                .unwrap();
+            let mut plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+            assert_eq!(plan.tasks.len(), 1);
+            let task = &plan.tasks[0];
+            assert!(
+                task.superseded_requested_path.is_none(),
+                "{case}: marker was not naturally absent"
+            );
+            assert_eq!(task.version_size, crate::state::VersionSizeKey::Original);
+            assert_eq!(
+                (task.checksum.as_ref(), task.size),
+                (checksum(c1).as_str(), c1.len() as u64)
+            );
+            let s = task.download_path.clone();
+            assert_ne!(s, p);
+            assert_ne!(s, q);
+            assert!(!s.exists());
+            let binding = task.publication_binding.as_deref().unwrap().clone();
+            let (account, provider) = f.capture.owner.authenticated_keys().unwrap();
+            assert_eq!(
+                json!([
+                    binding.account_key,
+                    binding.provider_key,
+                    binding.scope,
+                    binding.library,
+                    binding.child,
+                    binding.master,
+                    binding.state_id,
+                    binding.origin_pass
+                ]),
+                json!([
+                    account,
+                    provider,
+                    run.root.spec.scope,
+                    "PrimarySync",
+                    "asset-m",
+                    "m",
+                    "asset-m",
+                    pass
+                ])
+            );
+            let historical =
+                f.db.bound_historical_downloads(
+                    binding.clone(),
+                    "original".into(),
+                    checksum(c1),
+                    c1.len() as u64,
+                )
+                .await
+                .unwrap();
+            assert_eq!(historical.len(), 1);
+            assert_eq!(historical[0].native_path, SelectionPath::from_path(&p));
+            assert_eq!(
+                (
+                    historical[0].version_size.as_str(),
+                    historical[0].provider_checksum.as_str(),
+                    historical[0].provider_size
+                ),
+                ("original", checksum(c0).as_str(), c0.len() as u64)
+            );
+            assert_eq!(
+                (
+                    historical[0].source_checksum.as_str(),
+                    historical[0].local_checksum.as_str()
+                ),
+                (
+                    data_encoding::HEXLOWER.encode(&Sha256::digest(c0)).as_str(),
+                    data_encoding::HEXLOWER.encode(&Sha256::digest(c0)).as_str()
+                )
+            );
+            assert!(historical[0].fulfills_pass(&pass));
+            assert!(
+                marker_free_history_rows(&f.db, "reconciliation_paths", "id", "asset-m").is_empty()
+            );
+            assert!(
+                marker_free_history_rows(&f.db, "provider_active_destinations", "child", "asset-m")
+                    .is_empty()
+            );
+            // Existing projection INSERT is the assertion boundary, not an admission seed.
+            f.db.acquire_lock("intent must precede real admission").unwrap().execute_batch(
+                "CREATE TEMP TRIGGER marker_free_before_admission BEFORE INSERT ON provider_active_destinations WHEN NEW.child='asset-m' BEGIN SELECT RAISE(ABORT,'historical intent missing before admission') WHERE NOT EXISTS(SELECT 1 FROM reconciliation_paths r WHERE r.library=NEW.library AND r.id=NEW.asset_id AND r.version_size=NEW.version_size AND r.provider_checksum=NEW.checksum AND r.provider_size=NEW.size_bytes AND r.requested_path_key<>r.destination_path_key); END;"
+            ).unwrap();
+            assert!(
+                run.project(
+                    &pass,
+                    &asset,
+                    proof,
+                    &mut plan,
+                    &mut planner,
+                    &config,
+                    &CancellationToken::new()
+                )
+                .await
+                .unwrap(),
+                "{case}"
+            );
+            f.db.acquire_lock("remove scoped ordering assertion")
+                .unwrap()
+                .execute_batch("DROP TRIGGER marker_free_before_admission")
+                .unwrap();
+            assert_eq!(plan.tasks[0].download_path, s);
+            assert!(plan.tasks[0].superseded_requested_path.is_none());
+            assert_eq!(q_rows(&f.db), q_debt);
+            (s, run.root.id.clone(), pass, binding, q_debt)
+        };
+        let mapping_sql = "SELECT json_array(library,id,version_size,requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size) FROM reconciliation_paths WHERE id='asset-m'";
+        let expected_mapping = json!([
+            "PrimarySync",
+            "asset-m",
+            "original",
+            crate::fs_util::confined_path_key(&p).unwrap(),
+            crate::fs_util::confined_path_key(&s).unwrap(),
+            s.to_str().unwrap(),
+            checksum(c1),
+            c1.len()
+        ])
+        .to_string();
+        let choice = marker_free_history_rows(&f.db, "reconciliation_paths", "id", "asset-m");
+        assert_eq!(choice.len(), 1);
+        assert_eq!(
+            f.db.acquire_lock("real project wrote exact history choice")
+                .unwrap()
+                .query_row(mapping_sql, [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            expected_mapping
+        );
+        let admission_sql = "SELECT json_array(generation,pass_key,child,library,asset_id,master,version_size,path,checksum,size_bytes,admitted,verified_media) FROM provider_active_destinations WHERE child='asset-m'";
+        let expected_admission = json!([
+            root,
+            pass,
+            "asset-m",
+            "PrimarySync",
+            "asset-m",
+            "m",
+            "original",
+            SelectionPath::from_path(&s).key().unwrap(),
+            checksum(c1),
+            c1.len(),
+            1,
+            0
+        ])
+        .to_string();
+        assert_eq!(
+            f.db.acquire_lock("exact pending S")
+                .unwrap()
+                .query_row(admission_sql, [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            expected_admission
+        );
+        assert_eq!(
+            f.db.acquire_lock("actual catalogue replacement")
+                .unwrap()
+                .query_row(
+                    "SELECT checksum FROM assets WHERE id='asset-m' AND version_size='original'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            checksum(c1)
+        );
+        eprintln!(
+            "MARKER_FREE_HISTORY_ADMITTED case={case} P={} S={} Q={} marker=None intent=exact admission=exact",
+            p.display(),
+            s.display(),
+            q.display()
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let database = f.dir.path().join("state.db");
+        let callback_database = database.clone();
+        let callback_mapping = expected_mapping.clone();
+        let callback_admission = expected_admission.clone();
+        let failure = Mock::given(method("GET"))
+            .and(path("/current"))
+            .respond_with(move |_: &wiremock::Request| {
+                let conn = rusqlite::Connection::open_with_flags(
+                    &callback_database,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                assert_eq!(
+                    conn.query_row(mapping_sql, [], |r| r.get::<_, String>(0))
+                        .unwrap(),
+                    callback_mapping
+                );
+                assert_eq!(
+                    conn.query_row(admission_sql, [], |r| r.get::<_, String>(0))
+                        .unwrap(),
+                    callback_admission
+                );
+                seen.fetch_add(1, Ordering::SeqCst);
+                eprintln!("MARKER_FREE_HISTORY_FAILED_GET case={case} intent=exact admission=exact status=500");
+                ResponseTemplate::new(500)
+            })
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let failed = stream_collision_child(&f, "asset-m", false).await;
+        assert_eq!(
+            (
+                failed.downloaded,
+                failed.state_write_failures,
+                failed.failed.len()
+            ),
+            (0, 0, 1)
+        );
+        assert_eq!(failed.failed[0].download_path, s);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        drop(failed);
+        drop(failure);
+        assert!(!s.exists());
+        let stage =
+            crate::download::file::temp_download_path(&s, &checksum(c1), &f.config.temp_suffix)
+                .unwrap();
+        let stage_file = match std::fs::symlink_metadata(&stage) {
+            Ok(metadata) => {
+                assert!(metadata.is_file());
+                Some(marker_free_history_file(&stage))
+            }
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                None
+            }
+        };
+        assert_eq!(marker_free_history_file(&p), old_file);
+        assert_eq!(
+            marker_free_history_rows(&f.db, "download_receipts", "child", "asset-m"),
+            old_proof
+        );
+        let old_state = Arc::downgrade(&f.db);
+        f = super::reopen_streaming_fixture(f).await;
+        assert!(
+            old_state.upgrade().is_none(),
+            "old planner/run/store handle survived reopen"
+        );
+        f.db.make_selection_retry_due(owner(), "asset-m".into())
+            .await
+            .unwrap();
+        if matches!(case, "absent" | "changed" | "directory") {
+            std::fs::rename(&p, &backup).unwrap();
+            assert_eq!(marker_free_history_file(&backup), old_file);
+            if case == "changed" {
+                std::fs::write(&p, b"changed synthetic historical occupant").unwrap();
+            } else if case == "directory" {
+                std::fs::create_dir(&p).unwrap();
+            }
+        }
+        if case == "missing_receipt" {
+            // Fault only the actual compact source receipt. No owner API forgets
+            // just this proof while preserving the genuine current choice/Q debt.
+            let receipt_id: String =
+                f.db.acquire_lock("identify real proof fault")
+                    .unwrap()
+                    .query_row(
+                        "SELECT id FROM download_receipts WHERE child='asset-m' AND native_path=?1",
+                        [SelectionPath::from_path(&p).key().unwrap()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+            assert_eq!(f.db.acquire_lock("scoped missing-proof fault").unwrap().execute("DELETE FROM download_receipts WHERE id=?1 AND child='asset-m' AND native_path=?2", rusqlite::params![receipt_id, SelectionPath::from_path(&p).key().unwrap()]).unwrap(), 1);
+        }
+        let expected_proof = if case == "missing_receipt" {
+            Vec::new()
+        } else {
+            old_proof.clone()
+        };
+        let changed_file = (case == "changed").then(|| marker_free_history_file(&p));
+        let directory_time =
+            (case == "directory").then(|| std::fs::metadata(&p).unwrap().modified().unwrap());
+        let physical = || {
+            for (path, expected) in &retained_files {
+                assert_eq!(marker_free_history_file(path), *expected);
+            }
+            if case == "absent" {
+                assert_eq!(
+                    std::fs::symlink_metadata(&p).unwrap_err().kind(),
+                    std::io::ErrorKind::NotFound
+                );
+            } else if case == "directory" {
+                assert!(std::fs::metadata(&p).unwrap().is_dir());
+                assert_eq!(
+                    std::fs::metadata(&p).unwrap().modified().unwrap(),
+                    directory_time.unwrap()
+                );
+                assert_eq!(std::fs::read_dir(&p).unwrap().count(), 0);
+            } else {
+                assert_eq!(
+                    marker_free_history_file(&p),
+                    changed_file.as_ref().unwrap_or(&old_file).clone()
+                );
+            }
+            if matches!(case, "absent" | "changed" | "directory") {
+                assert_eq!(marker_free_history_file(&backup), old_file);
+            } else {
+                assert!(!backup.exists());
+            }
+            let mut expected_entries = initial_entries.clone();
+            if case == "absent" {
+                expected_entries.retain(|path| path != &p);
+            }
+            if s.exists() {
+                assert!(positive, "negative case published a saved destination");
+                assert!(!stage.exists());
+                expected_entries.push(s.clone());
+            } else {
+                let current_stage = match std::fs::symlink_metadata(&stage) {
+                    Ok(metadata) => {
+                        assert!(metadata.is_file());
+                        Some(marker_free_history_file(&stage))
+                    }
+                    Err(error) => {
+                        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                        None
+                    }
+                };
+                assert_eq!(current_stage, stage_file);
+                if stage_file.is_some() {
+                    expected_entries.push(stage.clone());
+                }
+            }
+            let media = p.parent().unwrap();
+            let mut actual_entries: Vec<_> = std::fs::read_dir(media)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            actual_entries.sort();
+            expected_entries.sort();
+            assert_eq!(
+                actual_entries, expected_entries,
+                "extra media, sibling or stage: {case}"
+            );
+        };
+        let preserved = |db: &SqliteStateDb| {
+            assert_eq!(q_rows(db), q_debt);
+            assert_eq!(
+                marker_free_history_rows(db, "reconciliation_paths", "id", "asset-m"),
+                choice
+            );
+            assert_eq!(
+                marker_free_history_rows(
+                    db,
+                    "asset_metadata_paths",
+                    "local_path",
+                    p.to_str().unwrap()
+                ),
+                old_paths
+            );
+            assert_eq!(
+                marker_free_history_rows(
+                    db,
+                    "legacy_master_state_owners",
+                    "asset_record_name",
+                    "asset-m"
+                ),
+                old_claims
+            );
+            assert_eq!(
+                marker_free_history_rows(db, "metadata", "key", "sync_token:PrimarySync"),
+                token
+            );
+            assert_eq!(
+                marker_free_history_rows(
+                    db,
+                    "metadata",
+                    "key",
+                    "pending_sync_token:sparse:OtherZone"
+                ),
+                other_token
+            );
+            assert!(!q.exists());
+            physical();
+        };
+        Mock::given(method("GET"))
+            .and(path("/current"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(c1))
+            .expect(u64::from(positive))
+            .mount(&server)
+            .await;
+        {
+            let confirmation = f.pass.album.confirm_catalog_asset("asset-m").await.unwrap();
+            let config = f.config.with_pass(&f.pass);
+            assert!(config.selection_run.is_none());
+            let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+                .await
+                .unwrap();
+            let plan = planner
+                .plan_download_asset(&confirmation.asset, &config)
+                .await
+                .unwrap();
+            assert_eq!(plan.tasks.len(), 1);
+            assert_eq!(plan.tasks[0].download_path, s);
+            assert!(plan.tasks[0].superseded_requested_path.is_none());
+            assert!(
+                f.db.bound_download_receipts(
+                    binding.clone(),
+                    "original".into(),
+                    checksum(c1),
+                    c1.len() as u64
+                )
+                .await
+                .unwrap()
+                .is_empty()
+            );
+            let historical =
+                f.db.bound_historical_downloads(
+                    binding.clone(),
+                    "original".into(),
+                    checksum(c1),
+                    c1.len() as u64,
+                )
+                .await
+                .unwrap();
+            assert_eq!(historical.len(), usize::from(case != "missing_receipt"));
+            let matched = planner
+                .match_existing(&confirmation.asset, &config, &plan.tasks[0])
+                .await;
+            eprintln!(
+                "MARKER_FREE_HISTORY_MATCH case={case} actual={matched:?} selection_run=None current_receipts=0"
+            );
+            if positive {
+                assert!(
+                    matches!(matched, BaselineMatch::Missing),
+                    "{case}: {matched:?}"
+                );
+            } else {
+                assert!(
+                    matches!(matched, BaselineMatch::Uncertain(_)),
+                    "{case}: {matched:?}"
+                );
+            }
+            if case == "unchanged" {
+                let c2 = b"\xff\xd8\xff\xe0genuinely newer provider original resource";
+                let descriptor =
+                    f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"]
+                        .clone();
+                f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] = json!({
+                    "downloadURL":format!("{}/never-fetch-stale", server.uri()), "size":c2.len(), "fileChecksum":checksum(c2)
+                });
+                let newer = f.pass.album.confirm_catalog_asset("asset-m").await.unwrap();
+                let error = planner
+                    .persist_execution_publication_choices(&newer.asset, &config, &plan.tasks)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "Choice no longer matches current requested resource"
+                );
+                f.session.records.lock().unwrap()[0]["fields"]["resOriginalRes"]["value"] =
+                    descriptor;
+                preserved(&f.db);
+                assert_eq!(server.received_requests().await.unwrap().len(), 2);
+            }
+        }
+        let lookups = f.session.calls.load(Ordering::SeqCst);
+        let result = stream_collision_child(&f, "asset-m", false).await;
+        assert_eq!(f.session.calls.load(Ordering::SeqCst), lookups + 2);
+        assert_eq!(result.state_write_failures, 0);
+        assert_eq!(result.downloaded, usize::from(positive));
+        assert!(result.failed.is_empty());
+        if !positive {
+            assert_eq!(result.skip_summary.uncertain, 1);
+        }
+        drop(result);
+        preserved(&f.db);
+        let s_physical = if positive {
+            Some(marker_free_history_file(&s))
+        } else {
+            None
+        };
+        if positive {
+            assert_eq!(s_physical.as_ref().unwrap().0, c1);
+            let receipts =
+                f.db.bound_download_receipts(
+                    binding.clone(),
+                    "original".into(),
+                    checksum(c1),
+                    c1.len() as u64,
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].native_path, SelectionPath::from_path(&s));
+            assert!(receipts[0].fulfills_pass(&pass));
+            assert_eq!(
+                (
+                    receipts[0].source_checksum.as_str(),
+                    receipts[0].local_checksum.as_str()
+                ),
+                (
+                    data_encoding::HEXLOWER.encode(&Sha256::digest(c1)).as_str(),
+                    data_encoding::HEXLOWER.encode(&Sha256::digest(c1)).as_str()
+                )
+            );
+            assert!(
+                f.db.selection_destination_verified(
+                    owner(),
+                    root.clone(),
+                    pass.clone(),
+                    "asset-m".into(),
+                    "original".into()
+                )
+                .await
+                .unwrap()
+            );
+        } else {
+            assert!(!s.exists());
+            assert!(
+                !f.db
+                    .selection_destination_verified(
+                        owner(),
+                        root.clone(),
+                        pass.clone(),
+                        "asset-m".into(),
+                        "original".into()
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+        let receipt_rows = marker_free_history_rows(&f.db, "download_receipts", "child", "asset-m");
+        assert_eq!(
+            receipt_rows.len(),
+            expected_proof.len() + usize::from(positive)
+        );
+        assert!(expected_proof.iter().all(|row| receipt_rows.contains(row)));
+        let requests = server.received_requests().await.unwrap().len();
+        assert_eq!(requests, 2 + usize::from(positive));
+        for round in 0..2 {
+            let old_state = Arc::downgrade(&f.db);
+            f = super::reopen_streaming_fixture(f).await;
+            assert!(old_state.upgrade().is_none());
+            let lookups = f.session.calls.load(Ordering::SeqCst);
+            let quiet = stream_collision_child(&f, "asset-m", false).await;
+            assert_eq!(f.session.calls.load(Ordering::SeqCst), lookups + 2);
+            assert_eq!((quiet.downloaded, quiet.state_write_failures), (0, 0));
+            assert!(quiet.failed.is_empty());
+            if !positive {
+                assert_eq!(quiet.skip_summary.uncertain, 1);
+            }
+            drop(quiet);
+            preserved(&f.db);
+            assert_eq!(
+                marker_free_history_rows(&f.db, "download_receipts", "child", "asset-m"),
+                receipt_rows
+            );
+            if let Some(expected) = &s_physical {
+                assert_eq!(marker_free_history_file(&s), *expected);
+            } else {
+                assert!(!s.exists());
+            }
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+            eprintln!(
+                "MARKER_FREE_HISTORY_REDISCOVERY case={case} round={round} fresh_lookups=2 additional_GETs=0 physical_and_all_rows=unchanged"
+            );
+        }
+        eprintln!(
+            "MARKER_FREE_HISTORY_CASE_COMPLETE case={case} successful_C1_GETs={} retained_C0_receipts={} rediscoveries=2",
+            usize::from(positive),
+            expected_proof.len()
+        );
+        // Bounded A rediscovery only. Q remains unfinished; no seal/token/config
+        // promotion or globally quiet cycle is inferred from these direct calls.
+    }
+}
