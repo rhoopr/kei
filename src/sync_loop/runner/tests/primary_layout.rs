@@ -13278,103 +13278,537 @@ async fn review501_recorded_legacy_extension_aliases_require_each_saved_path_ide
 }
 
 #[tokio::test]
-async fn review501_retained_source_mutation_between_snapshots_holds_publication() {
+async fn review501_retained_source_mutation_during_compatibility_preparation_holds_publication() {
+    use rusqlite::types::Value as SqlValue;
+
+    let fixture_metadata = |config: download::DownloadConfig| {
+        #[cfg(feature = "xmp")]
+        let config = {
+            let mut config = config;
+            config.metadata.xmp_sidecar = true;
+            config
+        };
+        config
+    };
+
     for replace_inode in [false, true] {
         let server = server().await;
-        let root = tempfile::tempdir().unwrap();
-        let current = root.path().join("media/IMG_0501.JPG");
-        for edit in [("edit-one", EDIT_ONE), ("edit-two", EDIT_TWO)] {
-            let (result, _) = cycle(
-                root.path(),
-                records(&server, Some(edit)),
-                false,
-                EditedNaming::Primary,
-            )
-            .await;
-            assert_eq!(result.failed_count, 0, "{:?}", result.stats);
-            assert!(result.db_sync_token_advance_safe);
+        let mut root = tempfile::tempdir().unwrap();
+        if std::env::var_os("KEI_RETAINED_SOURCE_COMPAT_RETAIN_FIXTURE").is_some() {
+            root.disable_cleanup(true);
         }
-        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
-            .await
-            .unwrap();
-        let manifest = db.get_manifest_assets().await.unwrap();
-        let history = manifest
-            .iter()
-            .flat_map(|row| &row.preserved_files)
-            .find(|file| file.provider_checksum == provider_hash(EDIT_ONE))
-            .expect("edit-one history missing")
-            .native_path
-            .to_path();
-        drop(db);
-        assert_bytes(&history, EDIT_ONE);
-        let changed = b"unrelated local bytes introduced between source snapshots";
-        let hook = crate::test_helpers::primary_source_mutation(
-            history.clone(),
-            changed.to_vec(),
-            replace_inode,
+        eprintln!(
+            "RETAINED_COMPAT root={} replacement={replace_inode}",
+            root.path().display()
         );
-        let requests = server.received_requests().await.unwrap().len();
-        let (held, _) = cycle(
+        let media = root.path().join("media");
+        let visible = media.join("IMG_0501.JPG");
+        let original = media.join("IMG_0501_original.JPG");
+        let rows = |sql: &str| {
+            let conn = rusqlite::Connection::open_with_flags(
+                root.path().join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let mut statement = conn.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|i| row.get::<_, SqlValue>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let custody = || {
+            [
+                "SELECT * FROM primary_layout_operations ORDER BY operation",
+                "SELECT * FROM primary_layout_members ORDER BY operation,member",
+                "SELECT * FROM primary_layout_claims ORDER BY path_key",
+                "SELECT * FROM primary_layout_bindings ORDER BY family",
+                "SELECT * FROM primary_layout_preserved ORDER BY operation,member",
+                "SELECT * FROM primary_layout_superseded_paths ORDER BY library,child,version,provider_checksum,native_path",
+                "SELECT * FROM owned_temp_files ORDER BY path",
+            ].map(rows)
+        };
+        let proofs = || {
+            [
+                "SELECT * FROM assets ORDER BY library,id,version_size",
+                "SELECT * FROM asset_metadata_paths ORDER BY library,id,version_size,local_path",
+                "SELECT * FROM asset_metadata_capture_revisions ORDER BY rowid",
+                "SELECT * FROM download_receipts ORDER BY id",
+                "SELECT * FROM metadata ORDER BY key",
+            ]
+            .map(rows)
+        };
+        let file = |path: &std::path::Path| {
+            let handle = std::fs::File::open(path).unwrap();
+            assert_eq!(crate::fs_util::file_link_count(&handle).unwrap(), 1);
+            (
+                std::fs::read(path).unwrap(),
+                crate::fs_util::file_identity(&handle).unwrap(),
+                handle.metadata().unwrap().modified().unwrap(),
+            )
+        };
+        let tree = || {
+            let mut files = std::collections::BTreeMap::new();
+            let mut directories = vec![media.clone()];
+            while let Some(directory) = directories.pop() {
+                for entry in std::fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        directories.push(entry.path());
+                    } else {
+                        assert!(entry.file_type().unwrap().is_file());
+                        files.insert(entry.path(), file(&entry.path()));
+                    }
+                }
+            }
+            files
+        };
+        let (initial, _) = cycle_options(
             root.path(),
-            records(&server, Some(("edit-one", EDIT_ONE))),
+            records(&server, None),
             false,
             EditedNaming::Primary,
+            CycleOptions {
+                private: true,
+                baseline_successor: Some("retained-original"),
+                cycle_token: Some("retained-original"),
+                #[cfg(feature = "xmp")]
+                sidecar: true,
+                ..CycleOptions::default()
+            },
         )
         .await;
-        assert!(
-            hook.fired(),
-            "the deterministic proof boundary was not exercised"
+        assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+        assert!(initial.db_sync_token_advance_safe);
+        assert_eq!(initial.stats.downloaded, 1);
+        let first = records(&server, Some(("edit-one", EDIT_ONE)));
+        let current = Arc::new(std::sync::Mutex::new(first.clone()));
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let mut committed = Vec::new();
+        for selected in [
+            first.clone(),
+            records(&server, Some(("edit-two", EDIT_TWO))),
+        ] {
+            *current.lock().unwrap() = selected;
+            let (config, pass) =
+                source_mutation_layout_context(root.path(), current.clone(), lookups.clone()).await;
+            let config = fixture_metadata(config);
+            let mut op = download::plan_edited_compat(&config, &pass).await.unwrap();
+            assert_eq!(op.pass, config.primary_layout_pass.as_deref().unwrap());
+            assert!(!op.refresh_metadata);
+            eprintln!(
+                "RETAINED_COMPAT baseline preparing operation={} generation={} phase={} pass={}",
+                op.operation, op.generation, op.phase, op.pass
+            );
+            download::prepare_edited_compat(&config, &pass, &mut op)
+                .await
+                .unwrap();
+            download::finish_prepared_edited_compat(&config, &mut op).await;
+            assert_eq!(op.phase, "committed");
+            eprintln!(
+                "RETAINED_COMPAT baseline operation={} generation={} phase={}",
+                op.operation, op.generation, op.phase
+            );
+            committed.push(op);
+        }
+        assert_bytes(&visible, EDIT_TWO);
+        assert_bytes(&original, ORIGINAL);
+        let retained = committed[1]
+            .members
+            .iter()
+            .filter_map(|m| m.preserved.as_ref())
+            .find(|f| f.provider_checksum == provider_hash(EDIT_ONE))
+            .unwrap()
+            .clone();
+        let history = retained.path.to_path();
+        let original_history = file(&history);
+        assert_eq!(original_history.0, EDIT_ONE);
+        assert_eq!(retained.fingerprint.identity, original_history.1);
+        assert_eq!(retained.fingerprint.size, EDIT_ONE.len() as u64);
+        assert_eq!(
+            retained.fingerprint.sha256.as_slice(),
+            Sha256::digest(EDIT_ONE).as_slice()
         );
-        assert!(!held.db_sync_token_advance_safe);
-        assert!(held.failed_count > 0, "{:?}", held.stats);
+        assert_eq!(
+            retained.source_checksum.as_deref(),
+            Some(
+                data_encoding::HEXLOWER
+                    .encode(&Sha256::digest(EDIT_ONE))
+                    .as_str()
+            )
+        );
+        #[cfg(feature = "xmp")]
+        assert!(retained.sidecar.is_some());
+        let requests = server.received_requests().await.unwrap().len();
+        assert_eq!(requests, 3);
+        *current.lock().unwrap() = first;
+        let mut op = {
+            let (config, pass) =
+                source_mutation_layout_context(root.path(), current.clone(), lookups.clone()).await;
+            let config = fixture_metadata(config);
+            let op = download::plan_edited_compat(&config, &pass).await.unwrap();
+            assert_eq!(op.generation, committed[1].generation + 1);
+            assert_eq!(op.phase, "planned");
+            assert!(
+                op.members
+                    .iter()
+                    .filter_map(|m| m.old.as_ref())
+                    .any(|f| f.provider_checksum == provider_hash(EDIT_TWO))
+            );
+            assert!(
+                op.members
+                    .iter()
+                    .filter_map(|m| m.old.as_ref())
+                    .all(|f| f.provider_checksum != provider_hash(EDIT_ONE))
+            );
+            assert!(
+                op.members
+                    .iter()
+                    .filter_map(|m| m.record.as_ref())
+                    .any(|r| r.checksum.as_ref() == provider_hash(EDIT_ONE))
+            );
+            op
+        };
+        // Planning legitimately changes catalogue observations. Freeze proofs only now.
+        let before_proofs = proofs();
+        let before_custody = custody();
+        let before_tree = tree();
+        let planned = op.clone();
+        let evidence = root.path().join("mutation-evidence");
+        std::fs::create_dir(&evidence).unwrap();
+        let parked = evidence.join("original-inode");
+        let changed = b"unrelated local bytes introduced between source snapshots";
+        let hook = if replace_inode {
+            crate::test_helpers::primary_source_replacement_with_parked_original(
+                history.clone(),
+                changed.to_vec(),
+                parked.clone(),
+            )
+        } else {
+            crate::test_helpers::primary_source_mutation(history.clone(), changed.to_vec(), false)
+        };
+        let error = {
+            let (config, pass) =
+                source_mutation_layout_context(root.path(), current.clone(), lookups.clone()).await;
+            let config = fixture_metadata(config);
+            eprintln!(
+                "RETAINED_COMPAT mutation preparing operation={} generation={} phase={} source={}",
+                op.operation,
+                op.generation,
+                op.phase,
+                history.display()
+            );
+            download::prepare_edited_compat(&config, &pass, &mut op)
+                .await
+                .unwrap_err()
+        };
+        assert!(hook.fired(), "receipt fallback mutation hook not reached");
+        assert_eq!(
+            error.to_string(),
+            "Retained primary source changed while proving its receipt"
+        );
+        eprintln!(
+            "RETAINED_COMPAT refusal operation={} generation={} phase={} hook={} error={error:#}",
+            op.operation,
+            op.generation,
+            op.phase,
+            hook.fired()
+        );
+        assert_eq!(op.phase, "planned");
+        assert_eq!(proofs(), before_proofs);
+        // The earlier Original member may already have a durable private stage.
+        // Only real preparation receipts can account for those additional files.
+        let mut expected = planned;
+        let mut partial_stages = 0;
+        let mut changed_tree = before_tree.clone();
+        for (before, after) in expected.members.iter_mut().zip(&op.members) {
+            if let Some(prepared) = &after.prepared {
+                partial_stages += 1;
+                assert_eq!(prepared.version, "original");
+                assert_eq!(before.stage.as_ref(), Some(&prepared.path));
+                let stage = prepared.path.to_path();
+                assert_bytes(&stage, ORIGINAL);
+                let snapshot = file(&stage);
+                assert_eq!(snapshot.1, prepared.fingerprint.identity);
+                assert_eq!(prepared.fingerprint.size, ORIGINAL.len() as u64);
+                assert_eq!(
+                    prepared.fingerprint.sha256.as_slice(),
+                    Sha256::digest(ORIGINAL).as_slice()
+                );
+                changed_tree.insert(stage.clone(), snapshot);
+                if let Some(sidecar) = &prepared.sidecar {
+                    let mut path = stage.as_os_str().to_os_string();
+                    path.push(".xmp");
+                    let path = std::path::PathBuf::from(path);
+                    let packet = file(&path);
+                    assert_eq!(packet.1, sidecar.identity);
+                    assert_eq!(packet.0.len() as u64, sidecar.size);
+                    assert_eq!(
+                        Sha256::digest(&packet.0).as_slice(),
+                        sidecar.sha256.as_slice()
+                    );
+                    changed_tree.insert(path, packet);
+                }
+                before.prepared = Some(prepared.clone());
+            }
+        }
+        assert_eq!(partial_stages, 1);
+        assert_eq!(
+            serde_json::to_value(expected).unwrap(),
+            serde_json::to_value(&op).unwrap()
+        );
+        let held_custody = custody();
+        for index in [0, 2, 3, 4, 5, 6] {
+            assert_eq!(held_custody[index], before_custody[index]);
+        }
+        let other_members = |snapshot: &[Vec<SqlValue>]| {
+            snapshot
+                .iter()
+                .filter(|row| row[0] != SqlValue::Text(op.operation.clone()))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            other_members(&held_custody[1]),
+            other_members(&before_custody[1])
+        );
+        changed_tree.insert(history.clone(), file(&history));
+        assert_eq!(
+            tree(),
+            changed_tree,
+            "no unaccounted partial stage or publication"
+        );
         assert_bytes(&history, changed);
-        assert_bytes(&current, EDIT_TWO);
+        assert_bytes(&visible, EDIT_TWO);
+        if replace_inode {
+            assert_eq!(file(&parked), original_history);
+            assert_ne!(file(&history).1, original_history.1);
+        } else {
+            assert_eq!(file(&history).1, original_history.1);
+        }
         assert_eq!(server.received_requests().await.unwrap().len(), requests);
-        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-        let local: String = conn.query_row("SELECT local_checksum FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'", [], |row| row.get(0)).unwrap();
-        assert_ne!(
-            local,
-            data_encoding::HEXLOWER.encode(&Sha256::digest(changed))
+
+        // Normal recorded recovery must not perform compatibility preparation.
+        {
+            let (config, pass) =
+                source_mutation_layout_context(root.path(), current.clone(), lookups.clone()).await;
+            let config = fixture_metadata(config);
+            let unused = crate::test_helpers::primary_source_mutation(
+                history.clone(),
+                b"must not run".to_vec(),
+                false,
+            );
+            let held = download::recover_recorded_sources(
+                &reqwest::Client::new(),
+                std::slice::from_ref(&pass),
+                Arc::new(config.clone()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(!held.complete && !held.complete_after_smart_query);
+            assert_eq!(held.stats.downloaded, 0);
+            assert!(!unused.fired());
+            let pending = config
+                .state_db
+                .as_ref()
+                .unwrap()
+                .primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&pending[0]).unwrap(),
+                serde_json::to_value(&op).unwrap()
+            );
+            eprintln!(
+                "RETAINED_COMPAT normal reopened recovery held operation={} phase={} automatic_hook=false",
+                op.operation, op.phase
+            );
+        }
+        assert_eq!(proofs(), before_proofs);
+        assert_eq!(custody(), held_custody);
+        assert_eq!(tree(), changed_tree);
+        let changed_evidence = evidence.join("changed-source");
+        assert!(!changed_evidence.try_exists().unwrap());
+        if replace_inode {
+            std::fs::rename(&history, &changed_evidence).unwrap();
+            std::fs::rename(&parked, &history).unwrap();
+            assert_eq!(file(&history), original_history);
+        } else {
+            std::fs::copy(&history, &changed_evidence).unwrap();
+            std::fs::write(&history, EDIT_ONE).unwrap();
+            let restored = file(&history);
+            assert_eq!(restored.0, original_history.0);
+            assert_eq!(restored.1, original_history.1);
+            eprintln!(
+                "RETAINED_COMPAT in-place restored mtime={:?} previous={:?}",
+                restored.2, original_history.2
+            );
+        }
+        assert_bytes(&changed_evidence, changed);
+        eprintln!(
+            "RETAINED_COMPAT restored replacement={replace_inode} original_identity={:?} restored_identity={:?} changed_identity={:?} evidence={}",
+            original_history.1,
+            file(&history).1,
+            file(&changed_evidence).1,
+            changed_evidence.display()
+        );
+        {
+            let (config, pass) =
+                source_mutation_layout_context(root.path(), current.clone(), lookups.clone()).await;
+            let config = fixture_metadata(config);
+            let saved = config
+                .state_db
+                .as_ref()
+                .unwrap()
+                .primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap();
+            op = saved.into_iter().next().unwrap();
+            let operation = op.operation.clone();
+            download::prepare_edited_compat(&config, &pass, &mut op)
+                .await
+                .unwrap();
+            assert_eq!(op.operation, operation);
+            assert_eq!(op.phase, "prepared");
+            let recovered = download::recover_recorded_sources(
+                &reqwest::Client::new(),
+                std::slice::from_ref(&pass),
+                Arc::new(config.clone()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(recovered.complete);
+            assert_eq!(recovered.stats.failed, 0);
+            assert_eq!(recovered.stats.downloaded, 0);
+            assert!(
+                config
+                    .state_db
+                    .as_ref()
+                    .unwrap()
+                    .primary_layout_operations("PrimarySync".into())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            eprintln!(
+                "RETAINED_COMPAT same-operation reprepare+normal-finish operation={operation}"
+            );
+        }
+        assert_bytes(&visible, EDIT_ONE);
+        assert_bytes(&original, ORIGINAL);
+        assert_bytes(&history, EDIT_ONE);
+        assert_eq!(
+            rows("SELECT generation FROM primary_layout_bindings"),
+            vec![vec![SqlValue::Integer(op.generation + 1)]]
         );
         assert_eq!(
             db_count(
                 root.path(),
                 "SELECT COUNT(*) FROM primary_layout_operations WHERE phase='committed'"
             ),
-            2
+            3
         );
-        assert_eq!(
-            db_count(
-                root.path(),
-                "SELECT COUNT(*) FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled')"
-            ),
-            1
-        );
-        drop(conn);
-        // Restore only the synthetic fixture's known history bytes. The held
-        // journal must then converge without changing provider identity or GETs.
-        std::fs::write(&history, EDIT_ONE).unwrap();
-        for quiet in [false, true, true] {
-            let (result, _) = cycle(
-                root.path(),
-                records(&server, Some(("edit-one", EDIT_ONE))),
-                quiet,
-                EditedNaming::Primary,
-            )
-            .await;
-            assert_eq!(result.failed_count, 0, "{:?}", result.stats);
-            assert!(result.db_sync_token_advance_safe);
-            assert_bytes(&current, EDIT_ONE);
-            assert_eq!(server.received_requests().await.unwrap().len(), requests);
-            let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-            let (checksum, local, path): (String, String, String) = conn.query_row("SELECT checksum,local_checksum,local_path FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
-            assert_eq!(checksum, provider_hash(EDIT_ONE));
-            assert_eq!(
-                local,
-                data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_ONE))
-            );
-            assert_eq!(std::path::PathBuf::from(path), current);
+        let final_members = custody()[1]
+            .iter()
+            .filter(|row| matches!(row.first(), Some(SqlValue::Text(operation)) if operation == &op.operation))
+            .map(|row| {
+                let [
+                    SqlValue::Text(_),
+                    SqlValue::Integer(_),
+                    SqlValue::Blob(bytes),
+                ] = row.as_slice()
+                else {
+                    panic!("unexpected durable layout member shape")
+                };
+                serde_json::from_slice::<state::db::primary_layout::LayoutMember>(bytes).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(final_members.len(), 2);
+        for member in &final_members {
+            for (receipt, adjusted) in [
+                (member.installed.as_ref().unwrap(), EDIT_ONE),
+                (member.preserved.as_ref().unwrap(), EDIT_TWO),
+            ] {
+                let expected = if receipt.version == "original" {
+                    ORIGINAL
+                } else {
+                    adjusted
+                };
+                let snapshot = file(&receipt.path.to_path());
+                assert_eq!(snapshot.0, expected);
+                assert_eq!(snapshot.1, receipt.fingerprint.identity);
+                assert_eq!(receipt.fingerprint.size, expected.len() as u64);
+                assert_eq!(
+                    receipt.fingerprint.sha256.as_slice(),
+                    Sha256::digest(expected).as_slice()
+                );
+                assert_eq!(receipt.provider_checksum, provider_hash(expected));
+                assert_eq!(
+                    receipt.source_checksum.as_deref(),
+                    Some(
+                        data_encoding::HEXLOWER
+                            .encode(&Sha256::digest(expected))
+                            .as_str()
+                    )
+                );
+                assert_eq!(receipt.sidecar.is_some(), cfg!(feature = "xmp"));
+                if let Some(sidecar) = &receipt.sidecar {
+                    let mut path = receipt.path.to_path().into_os_string();
+                    path.push(".xmp");
+                    let packet = file(std::path::Path::new(&path));
+                    assert!(!packet.0.is_empty());
+                    assert_eq!(packet.1, sidecar.identity);
+                    assert_eq!(packet.0.len() as u64, sidecar.size);
+                    assert_eq!(
+                        Sha256::digest(&packet.0).as_slice(),
+                        sidecar.sha256.as_slice()
+                    );
+                }
+            }
         }
+        let quiet_proofs = proofs();
+        let quiet_custody = custody();
+        let quiet_tree = tree();
+        for quiet in 0..2 {
+            let (config, pass) =
+                source_mutation_layout_context(root.path(), current.clone(), lookups.clone()).await;
+            let config = fixture_metadata(config);
+            let recovered = download::recover_recorded_sources(
+                &reqwest::Client::new(),
+                std::slice::from_ref(&pass),
+                Arc::new(config.clone()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(recovered.complete);
+            assert_eq!(recovered.stats.failed, 0);
+            assert_eq!(recovered.stats.downloaded, 0);
+            drop(pass);
+            drop(config);
+            assert_eq!(proofs(), quiet_proofs);
+            assert_eq!(custody(), quiet_custody);
+            assert_eq!(tree(), quiet_tree);
+            assert_bytes(&changed_evidence, changed);
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+            eprintln!(
+                "RETAINED_COMPAT quiet reopen={quiet} operation={} GETs={requests}",
+                op.operation
+            );
+        }
+        assert_eq!(
+            rows("SELECT value FROM metadata WHERE key='sync_token:PrimarySync'"),
+            vec![vec![SqlValue::Text("retained-original".into())]],
+            "recovery-only cannot advance source checkpoints"
+        );
     }
 }
 

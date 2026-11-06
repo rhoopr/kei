@@ -2289,6 +2289,65 @@ pub(crate) mod tests {
             .unwrap();
     }
 
+    pub(crate) async fn plan_edited_compat(
+        config: &DownloadConfig,
+        pass: &crate::commands::AlbumPass,
+    ) -> anyhow::Result<LayoutOperation> {
+        let config = config.with_pass(pass).check_ownership().await?;
+        let asset = pass
+            .album
+            .confirm_layout_asset("asset-501", "PrimarySync")
+            .await?
+            .asset;
+        let db = config.state_db.as_deref().unwrap();
+        let session = LayoutSession::load(db).await?;
+        let key = family(&asset, &config)?;
+        let binding = db.primary_layout_binding(key.clone()).await?;
+        let op = plan(
+            &asset,
+            &config,
+            &session,
+            binding.as_ref(),
+            key,
+            decision(&asset, &config)?,
+        )
+        .await?;
+        for member in &op.members {
+            if let Some(record) = &member.record {
+                db.upsert_seen(record).await?;
+            }
+        }
+        Ok(op)
+    }
+
+    pub(crate) async fn prepare_edited_compat(
+        config: &DownloadConfig,
+        pass: &crate::commands::AlbumPass,
+        op: &mut LayoutOperation,
+    ) -> anyhow::Result<()> {
+        let config = config.with_pass(pass).check_ownership().await?;
+        let asset = pass
+            .album
+            .confirm_layout_asset(&op.asset_record_name, &op.library)
+            .await?
+            .asset;
+        anyhow::ensure!(decision(&asset, &config)? == op.decision);
+        let db = config.state_db.as_deref().unwrap();
+        let session = LayoutSession::load(db).await?;
+        super::prepare(
+            &reqwest::Client::new(),
+            &asset,
+            &config,
+            &session,
+            op,
+            &CancellationToken::new(),
+        )
+        .await?;
+        op.phase = "prepared".into();
+        db.save_primary_layout(op.clone()).await?;
+        Ok(())
+    }
+
     /// Stop after the first create-only member has been installed and its
     /// receipt persisted, matching the released publishing-phase boundary.
     pub(crate) async fn seed_partly_published_compat(

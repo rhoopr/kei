@@ -1310,6 +1310,7 @@ struct PrimarySourceMutation {
     path: std::path::PathBuf,
     bytes: Vec<u8>,
     replace_inode: bool,
+    parked_original: Option<std::path::PathBuf>,
     fired: Arc<std::sync::atomic::AtomicBool>,
 }
 static PRIMARY_SOURCE_MUTATIONS: std::sync::Mutex<Vec<PrimarySourceMutation>> =
@@ -1336,6 +1337,25 @@ pub(crate) fn primary_source_mutation(
     bytes: Vec<u8>,
     replace_inode: bool,
 ) -> PrimarySourceMutationGuard {
+    install_primary_source_mutation(path, bytes, replace_inode, None)
+}
+
+pub(crate) fn primary_source_replacement_with_parked_original(
+    path: std::path::PathBuf,
+    bytes: Vec<u8>,
+    parked_original: std::path::PathBuf,
+) -> PrimarySourceMutationGuard {
+    assert_ne!(path, parked_original);
+    assert!(!parked_original.try_exists().unwrap());
+    install_primary_source_mutation(path, bytes, true, Some(parked_original))
+}
+
+fn install_primary_source_mutation(
+    path: std::path::PathBuf,
+    bytes: Vec<u8>,
+    replace_inode: bool,
+    parked_original: Option<std::path::PathBuf>,
+) -> PrimarySourceMutationGuard {
     let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut hooks = PRIMARY_SOURCE_MUTATIONS.lock().unwrap();
     assert!(!hooks.iter().any(|hook| hook.path == path));
@@ -1343,6 +1363,7 @@ pub(crate) fn primary_source_mutation(
         path: path.clone(),
         bytes,
         replace_inode,
+        parked_original,
         fired: fired.clone(),
     });
     PrimarySourceMutationGuard { path, fired }
@@ -1359,6 +1380,15 @@ pub(crate) async fn primary_source_snapshot_point(path: &std::path::Path) -> any
         if hook.replace_inode {
             let replacement = path.with_extension("primary-snapshot-test");
             tokio::fs::write(&replacement, &hook.bytes).await?;
+            if let Some(parked) = hook.parked_original {
+                anyhow::ensure!(
+                    tokio::fs::symlink_metadata(&parked)
+                        .await
+                        .is_err_and(|error| { error.kind() == std::io::ErrorKind::NotFound }),
+                    "Fixture original parking path is occupied"
+                );
+                tokio::fs::rename(path, parked).await?;
+            }
             tokio::fs::rename(replacement, path).await?;
         } else {
             tokio::fs::write(path, &hook.bytes).await?;
@@ -1371,6 +1401,55 @@ pub(crate) async fn primary_source_snapshot_point(path: &std::path::Path) -> any
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn primary_source_parked_replacement_preserves_original_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.jpg");
+        let parked = root.path().join("parked-original");
+        std::fs::write(&source, b"original").unwrap();
+        let original = std::fs::File::open(&source).unwrap();
+        let identity = crate::fs_util::file_identity(&original).unwrap();
+        let hook = primary_source_replacement_with_parked_original(
+            source.clone(),
+            b"replacement".to_vec(),
+            parked.clone(),
+        );
+        primary_source_snapshot_point(&source).await.unwrap();
+        assert!(hook.fired());
+        let saved = std::fs::File::open(&parked).unwrap();
+        let changed = std::fs::File::open(&source).unwrap();
+        assert_eq!(crate::fs_util::file_identity(&saved).unwrap(), identity);
+        assert_ne!(crate::fs_util::file_identity(&changed).unwrap(), identity);
+        assert_eq!(std::fs::read(&parked).unwrap(), b"original");
+        assert_eq!(std::fs::read(&source).unwrap(), b"replacement");
+        for file in [&saved, &changed] {
+            assert_eq!(crate::fs_util::file_link_count(file).unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_source_existing_mutation_modes_keep_their_semantics() {
+        for replace_inode in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("source.jpg");
+            std::fs::write(&path, b"original").unwrap();
+            let original = std::fs::File::open(&path).unwrap();
+            let identity = crate::fs_util::file_identity(&original).unwrap();
+            let hook = primary_source_mutation(path.clone(), b"changed".to_vec(), replace_inode);
+            primary_source_snapshot_point(&path).await.unwrap();
+            assert!(hook.fired());
+            let changed = std::fs::File::open(&path).unwrap();
+            assert_eq!(crate::fs_util::file_link_count(&changed).unwrap(), 1);
+            assert_eq!(
+                crate::fs_util::file_identity(&changed).unwrap() == identity,
+                !replace_inode
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"changed");
+            primary_source_snapshot_point(&path).await.unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"changed");
+        }
+    }
 
     #[tokio::test]
     async fn mock_session_records_calls_and_sequences_responses() {
