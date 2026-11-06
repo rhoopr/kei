@@ -6083,6 +6083,120 @@ async fn seed_committed_root_journal_family(
     (scope, expected_pass)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct RootJournalHistoryFile {
+    recorded_path: std::path::PathBuf,
+    bytes: Vec<u8>,
+    identity: crate::fs_util::FileIdentity,
+    mtime: std::time::SystemTime,
+}
+
+fn root_journal_history_snapshot(
+    root: &std::path::Path,
+    parent_mapping: Option<(&std::path::Path, &std::path::Path)>,
+) -> Vec<RootJournalHistoryFile> {
+    use crate::state::db::primary_layout::{LayoutFile, LayoutFingerprint, LayoutMember};
+    use std::io::Read as _;
+    use std::path::PathBuf;
+
+    let conn = rusqlite::Connection::open_with_flags(
+        root.join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let members: Vec<LayoutMember> = conn
+        .prepare("SELECT evidence FROM primary_layout_members ORDER BY operation,member")
+        .unwrap()
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .unwrap()
+        .map(|row| serde_json::from_slice(&row.unwrap()).unwrap())
+        .collect();
+    assert!(
+        !members.is_empty(),
+        "fixture has no recorded layout members"
+    );
+    let resolve = |path: &std::path::Path| {
+        parent_mapping
+            .and_then(|(old, moved)| path.strip_prefix(old).ok().map(|tail| moved.join(tail)))
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+    let mut snapshots = Vec::new();
+    let mut capture = |recorded_path: PathBuf, expected: &LayoutFingerprint| {
+        let physical_path = resolve(&recorded_path);
+        let mut file = std::fs::File::open(&physical_path).unwrap_or_else(|error| {
+            panic!("retained history {recorded_path:?} at {physical_path:?}: {error}")
+        });
+        let identity = crate::fs_util::file_identity(&file).unwrap();
+        let mtime = file.metadata().unwrap().modified().unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(
+            u64::try_from(bytes.len()).unwrap(),
+            expected.size,
+            "retained history size at {recorded_path:?}"
+        );
+        assert_eq!(
+            Sha256::digest(&bytes).as_slice(),
+            expected.sha256.as_slice(),
+            "retained history bytes at {recorded_path:?}"
+        );
+        assert_eq!(
+            identity, expected.identity,
+            "retained history identity at {recorded_path:?}"
+        );
+        eprintln!(
+            "ROOT_HISTORY recorded={recorded_path:?} physical={physical_path:?} bytes={}",
+            bytes.len()
+        );
+        snapshots.push(RootJournalHistoryFile {
+            recorded_path,
+            bytes,
+            identity,
+            mtime,
+        });
+    };
+    let mut capture_file = |saved: &LayoutFile, path: PathBuf| {
+        capture(path.clone(), &saved.fingerprint);
+        #[cfg(feature = "xmp")]
+        assert!(
+            saved.sidecar.is_some(),
+            "fixture has no recorded history sidecar at {path:?}"
+        );
+        if let Some(sidecar) = &saved.sidecar {
+            let mut native = path.into_os_string();
+            native.push(".xmp");
+            capture(native.into(), sidecar);
+        }
+    };
+    for member in members {
+        let preserved = member
+            .preserved
+            .as_ref()
+            .expect("fixture member was not preserved");
+        capture_file(preserved, preserved.path.to_path());
+        assert!(
+            member.retirement.is_none(),
+            "unexpected retired fixture alias"
+        );
+        if let Some(stage) = &member.stage {
+            let path = stage.to_path();
+            if resolve(&path).try_exists().unwrap() {
+                let displaced = member
+                    .old
+                    .as_ref()
+                    .expect("retained stage has no old-file proof");
+                capture_file(displaced, path);
+            }
+        }
+    }
+    snapshots.sort_by(|a, b| a.recorded_path.cmp(&b.recorded_path));
+    assert!(
+        !snapshots.is_empty(),
+        "fixture has no retained history files"
+    );
+    snapshots
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn primary_layout_root_drift_holds_recorded_media_and_exact_sidecar_journals() {
@@ -6113,6 +6227,7 @@ async fn primary_layout_root_drift_holds_recorded_media_and_exact_sidecar_journa
         assert_bytes(&root.path().join("media/IMG_0501.JPG"), EDIT_ONE);
         assert_bytes(&root.path().join("media/IMG_0501_original.JPG"), ORIGINAL);
         let _ = seed_committed_root_journal_family(root.path(), &server).await;
+        let history = root_journal_history_snapshot(root.path(), None);
         let current = root.path().join("media/IMG_0501.JPG");
         let archive = root.path().join("media/IMG_0501_original.JPG");
         let sidecar = current.with_file_name("IMG_0501.JPG.xmp");
@@ -6167,6 +6282,7 @@ async fn primary_layout_root_drift_holds_recorded_media_and_exact_sidecar_journa
             assert_bytes(&archive, ORIGINAL);
             assert_eq!(std::fs::read(&sidecar).ok(), packet);
             assert_eq!(std::fs::read(&archive_sidecar).ok(), archive_packet);
+            assert_eq!(root_journal_history_snapshot(root.path(), None), history);
             assert_eq!(
                 std::fs::read(journal.join("manifest.json")).unwrap(),
                 b"retained replacement evidence"
@@ -6212,6 +6328,7 @@ async fn primary_layout_root_drift_holds_recorded_media_and_exact_sidecar_journa
             assert_bytes(&archive, ORIGINAL);
             assert_eq!(std::fs::read(&sidecar).ok(), packet);
             assert_eq!(std::fs::read(&archive_sidecar).ok(), archive_packet);
+            assert_eq!(root_journal_history_snapshot(root.path(), None), history);
             assert!(
                 std::fs::read_dir(root.path().join("new-root"))
                     .unwrap()
@@ -6263,6 +6380,7 @@ async fn primary_layout_root_drift_after_old_parent_moves_holds_until_exact_pare
     assert_bytes(&root.path().join("media/IMG_0501.JPG"), EDIT_ONE);
     assert_bytes(&root.path().join("media/IMG_0501_original.JPG"), ORIGINAL);
     let (scope, pass_key) = seed_committed_root_journal_family(root.path(), &server).await;
+    let history = root_journal_history_snapshot(root.path(), None);
     let db_path = root.path().join("state.db");
     let custody = || {
         let conn = rusqlite::Connection::open_with_flags(
@@ -6384,6 +6502,10 @@ async fn primary_layout_root_drift_after_old_parent_moves_holds_until_exact_pare
         assert_eq!(admitted, 0);
     };
     std::fs::rename(&media, &moved).unwrap();
+    assert_eq!(
+        root_journal_history_snapshot(root.path(), Some((&media, &moved))),
+        history
+    );
     let requests = server.received_requests().await.unwrap().len();
     for (round, token) in ["root-parent-held-one", "root-parent-held-two"]
         .into_iter()
@@ -6427,6 +6549,10 @@ async fn primary_layout_root_drift_after_old_parent_moves_holds_until_exact_pare
         assert_eq!(checkpoint(), "root-parent-before");
         assert_eq!(custody(), original_custody);
         assert_eq!(files(&moved), original_files);
+        assert_eq!(
+            root_journal_history_snapshot(root.path(), Some((&media, &moved))),
+            history
+        );
         new_root_is_empty();
         assert_eq!(server.received_requests().await.unwrap().len(), requests);
         eprintln!(
@@ -6438,6 +6564,7 @@ async fn primary_layout_root_drift_after_old_parent_moves_holds_until_exact_pare
     std::fs::rename(&moved, &media).unwrap();
     assert!(!moved.exists());
     assert_eq!(files(&media), original_files);
+    assert_eq!(root_journal_history_snapshot(root.path(), None), history);
     let (restored, _) = cycle_options(
         root.path(),
         edited.clone(),
@@ -6452,6 +6579,7 @@ async fn primary_layout_root_drift_after_old_parent_moves_holds_until_exact_pare
     assert_eq!(checkpoint(), "root-parent-restored");
     assert_eq!(custody(), original_custody);
     assert_eq!(files(&media), original_files);
+    assert_eq!(root_journal_history_snapshot(root.path(), None), history);
     new_root_is_empty();
     assert_eq!(server.received_requests().await.unwrap().len(), requests);
     eprintln!(
@@ -6474,6 +6602,7 @@ async fn primary_layout_root_drift_after_old_parent_moves_holds_until_exact_pare
         assert_eq!(checkpoint(), "root-parent-restored");
         assert_eq!(custody(), original_custody);
         assert_eq!(files(&media), original_files);
+        assert_eq!(root_journal_history_snapshot(root.path(), None), history);
         new_root_is_empty();
         assert_eq!(server.received_requests().await.unwrap().len(), requests);
         eprintln!(
