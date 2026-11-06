@@ -11314,7 +11314,9 @@ async fn review501_changed_unselected_original_keeps_failed_adjusted_pending() {
 }
 
 #[tokio::test]
-async fn review501_legacy_changed_extensions_and_aliases_retire_after_revert() {
+async fn review501_legacy_changed_extensions_and_aliases_preserve_after_revert() {
+    use state::db::provider_selection::SelectionPath;
+
     let heic = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/data/media/pattern.heic"
@@ -11330,27 +11332,339 @@ async fn review501_legacy_changed_extensions_and_aliases_retire_after_revert() {
             .respond_with(ResponseTemplate::new(200).set_body_bytes(heic.as_slice()))
             .mount(&server)
             .await;
-        let root = tempfile::tempdir().unwrap();
+        let mut root = tempfile::tempdir().unwrap();
+        if std::env::var_os("KEI_LEGACY_ALIAS_RETAIN_FIXTURE").is_some() {
+            root.disable_cleanup(true);
+        }
+        eprintln!(
+            "LEGACY_ALIAS_A_ROOT sidecar={sidecar} root={}",
+            root.path().display()
+        );
         let media = root.path().join("media");
         let options = || CycleOptions {
+            private: true,
             #[cfg(feature = "xmp")]
             sidecar,
             ..CycleOptions::default()
         };
+        let rows = |sql: &str| {
+            let conn = rusqlite::Connection::open_with_flags(
+                root.path().join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let mut statement = conn.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let file = |path: &std::path::Path| {
+            let handle = std::fs::File::open(path).unwrap();
+            (
+                std::fs::read(path).unwrap(),
+                crate::fs_util::file_identity(&handle).unwrap(),
+                handle.metadata().unwrap().modified().unwrap(),
+            )
+        };
+        let physical = || {
+            let mut files = std::collections::BTreeMap::new();
+            let mut pending = vec![media.clone()];
+            while let Some(path) = pending.pop() {
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                assert!(!metadata.file_type().is_symlink());
+                #[cfg(windows)]
+                let handle = {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    use windows_sys::Win32::Storage::FileSystem::{
+                        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+                        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                    };
+                    std::fs::OpenOptions::new()
+                        .access_mode(FILE_READ_ATTRIBUTES)
+                        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                        .open(&path)
+                        .unwrap()
+                };
+                #[cfg(not(windows))]
+                let handle = std::fs::File::open(&path).unwrap();
+                let bytes = if metadata.is_dir() {
+                    pending.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+                    None
+                } else {
+                    assert!(metadata.is_file());
+                    Some(std::fs::read(&path).unwrap())
+                };
+                files.insert(
+                    path,
+                    (
+                        bytes,
+                        crate::fs_util::file_identity(&handle).unwrap(),
+                        metadata.modified().unwrap(),
+                    ),
+                );
+            }
+            files
+        };
+        let receipt_sql = "SELECT id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,trust_receipt,selected_metadata_hash,generation_id FROM download_receipts ORDER BY id";
+        let path_sql = "SELECT * FROM asset_metadata_paths ORDER BY library,id,version_size,provider_checksum,local_path";
+        let catalogue_sql = "SELECT library,id,version_size,status,checksum,size_bytes,local_path,local_checksum,download_checksum,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size FROM assets ORDER BY library,id,version_size";
+        let custody = || {
+            [
+                rows("SELECT * FROM primary_layout_operations ORDER BY operation"),
+                rows("SELECT * FROM primary_layout_bindings ORDER BY family"),
+                rows("SELECT * FROM primary_layout_members ORDER BY operation,member"),
+                rows("SELECT * FROM primary_layout_claims ORDER BY path_key"),
+                rows("SELECT * FROM primary_layout_preserved ORDER BY operation,member"),
+                rows(
+                    "SELECT * FROM primary_layout_superseded_paths ORDER BY library,child,version,provider_checksum,native_path",
+                ),
+            ]
+        };
+        let owner = state::db::account::AccountOwner::authenticated(
+            "synthetic@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+        )
+        .unwrap();
+        let (account, provider) = owner.authenticated_keys().unwrap();
+        let scope = json!({"container":"com.apple.photos.cloud","database":"private","environment":"production","format":1,"realm":"com","zone":{"ownerRecordName":"_defaultOwner","zoneName":"PrimarySync"}}).to_string();
+        let selection = json!({"zone":{"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"},"name":"TestAlbum","list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted","obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted","query_filter":null,"container_id":null,"cross_zone_sources":[]});
+        let pass = format!(
+            "{:x}",
+            Sha256::digest(
+                json!({"kind":"Unfiled","scope":selection,"excludes":[]})
+                    .to_string()
+                    .as_bytes()
+            )
+        );
+        let prove = |version: &str, path: &std::path::Path, bytes: &[u8]| {
+            let sha = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+            let conn = rusqlite::Connection::open_with_flags(
+                root.path().join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let count: i64 = conn.query_row(
+                "SELECT count(*) FROM download_receipts r JOIN account_owner a ON a.account_key=r.account_key AND a.provider_key=r.provider_key WHERE r.account_key=?1 AND r.provider_key=?2 AND r.scope=?3 AND r.origin_pass=?4 AND r.library='PrimarySync' AND r.child='asset-501' AND r.master='501' AND r.state_id='asset-501' AND r.version_size=?5 AND r.provider_checksum=?6 AND r.provider_size=?7 AND r.native_path=?8 AND r.source_checksum=?9 AND r.local_checksum=?9 AND length(r.id)>0 AND length(r.proof_hash)=64 AND r.trust_receipt IS NULL AND r.selected_metadata_hash IS NULL AND r.generation_id IS NULL",
+                rusqlite::params![account,provider,scope,pass,version,provider_hash(bytes),i64::try_from(bytes.len()).unwrap(),SelectionPath::from_path(path).key().unwrap(),sha], |r|r.get(0),
+            ).unwrap();
+            assert_eq!(count, 1, "full scoped publication at {path:?}");
+            let local: (String,String,String) = conn.query_row("SELECT source_checksum,local_checksum,download_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size=?1 AND provider_checksum=?2 AND local_path=?3", rusqlite::params![version,provider_hash(bytes),path.to_str().unwrap()], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(local, (sha.clone(), sha.clone(), sha));
+        };
         let mut first = records(&server, Some(("edit-heic", heic.as_slice())));
         first[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.heic"});
+        let first_provider = first.clone();
         let (initial, _) =
             cycle_options(root.path(), first, false, EditedNaming::Suffix, options()).await;
         assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+        assert!(initial.db_sync_token_advance_safe);
+        assert_eq!(
+            (
+                initial.stats.downloaded,
+                initial.stats.skipped.uncertain,
+                initial.stats.state_write_failures
+            ),
+            (2, 0, 0)
+        );
+        let original = media.join("IMG_0501.JPG");
+        let old_heic = media.join("IMG_0501_edited.HEIC");
+        assert_bytes(&original, ORIGINAL);
         assert_bytes(&media.join("IMG_0501_edited.HEIC"), heic);
+        prove("original", &original, ORIGINAL);
+        prove("adjusted", &old_heic, heic);
+        let initial_files = [file(&original), file(&old_heic)];
+        let initial_xmp = sidecar.then(|| {
+            [
+                file(&media.join("IMG_0501.JPG.xmp")),
+                file(&media.join("IMG_0501_edited.HEIC.xmp")),
+            ]
+        });
+        let initial_receipts = rows(receipt_sql);
+        let initial_paths = rows(path_sql);
+        assert_eq!(initial_receipts.len(), 2);
         let second = records(&server, Some(("edit-two", EDIT_TWO)));
+        let named_rows = |table: &str| {
+            let conn = rusqlite::Connection::open_with_flags(
+                root.path().join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let mut statement = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let columns: Vec<_> = statement
+                .column_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            statement
+                .query_map([], |row| {
+                    let mut fields = serde_json::Map::new();
+                    for (index, name) in columns.iter().enumerate() {
+                        let value = match row.get::<_, rusqlite::types::Value>(index)? {
+                            rusqlite::types::Value::Null => Value::Null,
+                            rusqlite::types::Value::Integer(value) => json!(value),
+                            rusqlite::types::Value::Real(value) => json!(value),
+                            rusqlite::types::Value::Text(value) => json!(value),
+                            rusqlite::types::Value::Blob(value) => {
+                                json!({"blob_hex": data_encoding::HEXLOWER.encode(&value)})
+                            }
+                        };
+                        fields.insert(name.clone(), value);
+                    }
+                    Ok(Value::Object(fields))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let phase_rows = || {
+            json!({
+                "paths": named_rows("asset_metadata_paths"),
+                "assets": named_rows("assets"),
+                "receipts": named_rows("download_receipts"),
+                "destinations": named_rows("provider_active_destinations"),
+                "generations": named_rows("provider_active_generations"),
+                "groupings": named_rows("asset_albums"),
+                "metadata": named_rows("metadata"),
+            })
+        };
+        let before_jpeg = phase_rows();
+        eprintln!(
+            "LEGACY_ALIAS_A_ROW_BEFORE sidecar={sidecar} root={} rows={before_jpeg} provider_before={first_provider:?} provider_after={second:?} policy=Suffix resolution=Original refresh_metadata=false capture_policy=Preserve private=true GETs={:?} files={:?}",
+            root.path().display(),
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| (&r.method, r.url.path()))
+                .collect::<Vec<_>>(),
+            physical()
+        );
         let (updated, _) =
             cycle_options(root.path(), second, false, EditedNaming::Suffix, options()).await;
+        let after_jpeg = phase_rows();
+        eprintln!(
+            "LEGACY_ALIAS_A_ROW_AFTER sidecar={sidecar} root={} rows={after_jpeg} result={updated:?} GETs={:?} files={:?}",
+            root.path().display(),
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| (&r.method, r.url.path()))
+                .collect::<Vec<_>>(),
+            physical()
+        );
         assert_eq!(updated.failed_count, 0, "{:?}", updated.stats);
+        assert!(updated.db_sync_token_advance_safe);
+        assert_eq!(
+            (
+                updated.stats.downloaded,
+                updated.stats.skipped.uncertain,
+                updated.stats.state_write_failures
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!([file(&original), file(&old_heic)], initial_files);
+        if let Some(expected) = &initial_xmp {
+            assert_eq!(
+                &[
+                    file(&media.join("IMG_0501.JPG.xmp")),
+                    file(&media.join("IMG_0501_edited.HEIC.xmp"))
+                ],
+                expected
+            );
+        }
+        let conn = rusqlite::Connection::open_with_flags(
+            root.path().join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let statement = conn.prepare(path_sql).unwrap();
+        let path_column = statement.column_index("local_path").unwrap();
+        let marker_column = statement.column_index("preserved_path_key").unwrap();
+        let version_column = statement.column_index("version_size").unwrap();
+        let library_column = statement.column_index("library").unwrap();
+        let child_column = statement.column_index("id").unwrap();
+        let published_paths = rows(path_sql);
+        for mut expected in initial_paths {
+            if expected[path_column]
+                == rusqlite::types::Value::Text(original.to_str().unwrap().to_owned())
+            {
+                let actual = published_paths
+                    .iter()
+                    .find(|row| {
+                        row[path_column] == expected[path_column]
+                            && row[version_column] == expected[version_column]
+                    })
+                    .unwrap();
+                if actual[marker_column] != expected[marker_column] {
+                    // The measured second-publication transition is exact
+                    // read-only Original reuse, not a media/metadata write or
+                    // debt completion. Every other full-row field stays strict.
+                    assert!(
+                        !sidecar,
+                        "only the measured zero-write reuse transition is authorized"
+                    );
+                    assert_eq!(
+                        expected[library_column],
+                        rusqlite::types::Value::Text("PrimarySync".into())
+                    );
+                    assert_eq!(
+                        expected[child_column],
+                        rusqlite::types::Value::Text("asset-501".into())
+                    );
+                    assert_eq!(
+                        expected[version_column],
+                        rusqlite::types::Value::Text("original".into())
+                    );
+                    assert_eq!(expected[marker_column], rusqlite::types::Value::Null);
+                    let canonical = state::db::primary_layout::path_key(&original).unwrap();
+                    assert_eq!(
+                        actual[marker_column],
+                        rusqlite::types::Value::Text(canonical.clone())
+                    );
+                    assert_eq!(file(&original), initial_files[0]);
+                    prove("original", &original, ORIGINAL);
+                    let verified_readonly: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation JOIN assets a ON a.library=d.library AND a.id=d.asset_id AND a.version_size=d.version_size WHERE d.library='PrimarySync' AND d.child='asset-501' AND d.asset_id='asset-501' AND d.master='501' AND d.version_size='original' AND d.pass_key=?1 AND d.path=?2 AND d.checksum=?3 AND d.size_bytes=?4 AND d.source_checksum=?5 AND d.local_checksum=?5 AND d.admitted=1 AND d.verified_media=1 AND d.metadata_hash=a.metadata_hash AND g.account_key=?6 AND g.provider_key=?7 AND g.scope=?8 AND g.metadata_enabled=0 AND json_extract(CAST(g.specification AS TEXT),'$.metadata_flags')=0", rusqlite::params![pass,SelectionPath::from_path(&original).key().unwrap(),provider_hash(ORIGINAL),i64::try_from(ORIGINAL.len()).unwrap(),data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL)),account,provider,scope], |r|r.get(0)).unwrap();
+                    assert_eq!(
+                        verified_readonly, 1,
+                        "exact scoped Original read-only reuse owner basis"
+                    );
+                    expected[marker_column] = rusqlite::types::Value::Text(canonical);
+                    eprintln!(
+                        "LEGACY_ALIAS_A_EXACT_READONLY_TRANSITION sidecar={sidecar} native={original:?} expected_full_row={expected:?} verified_readonly={verified_readonly} debt_and_all_other_columns_unchanged=true"
+                    );
+                }
+            }
+            assert!(
+                published_paths.contains(&expected),
+                "unexpected second-publication path-row change: expected={expected:?}; actual={published_paths:?}"
+            );
+        }
+        drop(statement);
+        drop(conn);
+        for row in initial_receipts {
+            assert!(rows(receipt_sql).contains(&row));
+        }
         assert_bytes(&media.join("IMG_0501_edited.HEIC"), heic);
         assert_bytes(&media.join("IMG_0501_edited.JPG"), EDIT_TWO);
-        // Two durable aliases can have identical content and sidecars but
-        // distinct inodes. They need distinct journaled retirement slots.
+        prove("original", &original, ORIGINAL);
+        prove("adjusted", &old_heic, heic);
+        prove("adjusted", &media.join("IMG_0501_edited.JPG"), EDIT_TWO);
+        let authentic_receipts = rows(receipt_sql);
+        assert_eq!(authentic_receipts.len(), 3);
+        // Explicit synthetic durable legacy association. Copy + mark_downloaded
+        // is catalogue-only evidence, NOT a second authenticated publication.
         let alias_name = format!("IMG_0501_edited-{}.JPG", EDIT_TWO.len());
         let alias = media.join(&alias_name);
         std::fs::copy(media.join("IMG_0501_edited.JPG"), &alias).unwrap();
@@ -11361,7 +11675,7 @@ async fn review501_legacy_changed_extensions_and_aliases_retire_after_revert() {
             )
             .unwrap();
         }
-        let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
             .await
             .unwrap();
         db.mark_downloaded(
@@ -11375,19 +11689,91 @@ async fn review501_legacy_changed_extensions_and_aliases_retire_after_revert() {
         .await
         .unwrap();
         drop(db);
-        let old_files: Vec<_> = [
-            ("IMG_0501_edited.HEIC", heic.as_slice()),
-            ("IMG_0501_edited.JPG", EDIT_TWO),
-            (alias_name.as_str(), EDIT_TWO),
-        ]
-        .into_iter()
-        .map(|(name, bytes)| {
-            let xmp = sidecar.then(|| std::fs::read(media.join(format!("{name}.xmp"))).unwrap());
-            (name.to_owned(), bytes, xmp)
-        })
-        .collect();
+        assert_ne!(file(&alias).1, file(&media.join("IMG_0501_edited.JPG")).1);
+        assert_eq!(
+            rows(receipt_sql),
+            authentic_receipts,
+            "no ScopedAlias receipt may be invented"
+        );
+        let conn = rusqlite::Connection::open_with_flags(
+            root.path().join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let alias_receipts: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM download_receipts WHERE native_path=?1",
+                [SelectionPath::from_path(&alias).key().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alias_receipts, 0);
+        let alias_association: (String,String) = conn.query_row("SELECT provider_checksum,local_checksum FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted' AND local_path=?1", [alias.to_str().unwrap()], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(
+            alias_association,
+            (
+                provider_hash(EDIT_TWO),
+                data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_TWO))
+            )
+        );
+        drop(conn);
+        let before_files = physical();
+        assert_eq!(before_files.len(), 1 + 4 * if sidecar { 2 } else { 1 });
+        let before_paths = rows(path_sql);
+        let before_catalogue = rows(catalogue_sql);
+        let before_custody = custody();
+        assert!(before_custody.iter().all(Vec::is_empty));
+        assert_eq!(before_paths.len(), 4);
         let requests = server.received_requests().await.unwrap().len();
+        assert_eq!(requests, 3);
+        for endpoint in ["/original", "/edit-heic", "/edit-two"] {
+            assert_eq!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.method == "GET" && r.url.path() == endpoint)
+                    .count(),
+                1,
+                "{endpoint}"
+            );
+        }
+        eprintln!(
+            "LEGACY_ALIAS_A_BEFORE sidecar={sidecar} files={before_files:?} path_proofs={before_paths:?} scoped19={authentic_receipts:?} catalogue={before_catalogue:?} GETs=original:1,edit-heic:1,edit-two:1 synthetic_alias_no_scoped_receipt=true"
+        );
         let current = records(&server, None);
+        let before_revert = phase_rows();
+        let pending = async || {
+            let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+                .await
+                .unwrap();
+            db.get_pending_metadata_rewrites_page_for_queue(
+                state::db::MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                100,
+            )
+            .await
+            .unwrap()
+        };
+        assert!(
+            pending().await.is_empty(),
+            "unexpected pre-revert metadata queue peer"
+        );
+        let current_metadata =
+            crate::icloud::photos::PhotoAsset::new(current[0].clone(), current[1].clone())
+                .metadata_arc(state::VersionSizeKey::Original);
+        let old_metadata = crate::icloud::photos::PhotoAsset::new(
+            first_provider[0].clone(),
+            first_provider[1].clone(),
+        )
+        .metadata_arc(state::VersionSizeKey::Original);
+        eprintln!(
+            "LEGACY_ALIAS_A_ROW_BEFORE_REVERT sidecar={sidecar} root={} rows={before_revert}",
+            root.path().display()
+        );
+        let revert_started = chrono::Utc::now().timestamp();
         let (migrated, _) = cycle_options(
             root.path(),
             current.clone(),
@@ -11396,83 +11782,211 @@ async fn review501_legacy_changed_extensions_and_aliases_retire_after_revert() {
             options(),
         )
         .await;
+        let revert_finished = chrono::Utc::now().timestamp();
+        let after_revert = phase_rows();
+        eprintln!(
+            "LEGACY_ALIAS_A_ROW_AFTER_REVERT sidecar={sidecar} root={} rows={after_revert} result={migrated:?}",
+            root.path().display()
+        );
         assert_eq!(
             migrated.failed_count, 0,
             "sidecar={sidecar}: {:?}",
             migrated.stats
         );
         assert!(migrated.db_sync_token_advance_safe);
+        assert_eq!(
+            (
+                migrated.stats.downloaded,
+                migrated.stats.skipped.uncertain,
+                migrated.stats.state_write_failures
+            ),
+            (0, 0, 0)
+        );
         assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
         assert_eq!(server.received_requests().await.unwrap().len(), requests);
-        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
-            .await
-            .unwrap();
-        let manifest = db.get_manifest_assets().await.unwrap();
-        let mut histories = Vec::new();
-        for (name, bytes, expected_xmp) in &old_files {
-            assert!(!media.join(name).exists(), "left old visible alias {name}");
-            assert!(!media.join(format!("{name}.xmp")).exists());
-            let receipt = manifest
-                .iter()
-                .flat_map(|row| &row.preserved_files)
-                .find(|receipt| {
-                    receipt
-                        .native_path
-                        .to_path()
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        == Some(name.as_str())
-                })
-                .expect("missing per-path historical receipt");
-            let path = receipt.native_path.to_path();
-            assert!(
-                path.strip_prefix(&media)
-                    .unwrap()
-                    .components()
-                    .any(|part| part.as_os_str() == ".kei-history")
-            );
-            assert_bytes(&path, bytes);
-            assert_eq!(receipt.provider_checksum, provider_hash(bytes));
-            assert_eq!(
-                receipt.local_checksum,
-                data_encoding::HEXLOWER.encode(&Sha256::digest(bytes))
-            );
-            if let Some(expected) = expected_xmp {
-                let mut xmp = path.as_os_str().to_os_string();
-                xmp.push(".xmp");
-                assert_bytes(&std::path::PathBuf::from(xmp), expected);
-                assert_eq!(
-                    receipt.sidecar_checksum.as_deref(),
-                    Some(
-                        data_encoding::HEXLOWER
-                            .encode(&Sha256::digest(expected))
-                            .as_str()
-                    )
-                );
-            }
-            histories.push(path);
-        }
-        let receipts =
-            crate::state::db::DownloadContextStateStore::get_primary_layout_receipts(&db)
-                .await
-                .unwrap();
-        for history in &histories {
-            assert!(
-                receipts.iter().any(|receipt| {
-                    receipt.local_path.as_ref() == Some(history) && receipt.is_preserved_history
-                }),
-                "preserved history must remain a reuse source, not a visible legacy alias"
-            );
-        }
-        let summary = db.get_summary().await.unwrap().primary_layout.unwrap();
-        let inventory = (
-            summary.bound_families,
-            summary.preserved_files,
-            summary.pending_operations,
-            summary.held_operations,
+        assert_eq!(
+            physical(),
+            before_files,
+            "all original/native alias/XMP bytes, IDs and mtimes survive ordinary revert"
         );
-        drop(db);
-        for _ in 0..2 {
+        let mut expected_paths = before_paths.clone();
+        let mut expected_catalogue = before_catalogue.clone();
+        let pending_after = pending().await;
+        let before_original = before_revert["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["version_size"] == "original")
+            .unwrap();
+        let after_original = after_revert["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["version_size"] == "original")
+            .unwrap();
+        assert_eq!(
+            before_original["metadata_hash"],
+            json!(old_metadata.metadata_hash)
+        );
+        assert_eq!(
+            after_original["metadata_hash"],
+            json!(current_metadata.metadata_hash)
+        );
+        assert_ne!(old_metadata.metadata_hash, current_metadata.metadata_hash);
+        assert_eq!(
+            after_original["provider_data"],
+            json!(current_metadata.provider_data)
+        );
+        assert!(before_revert["groupings"].as_array().unwrap().is_empty());
+        assert!(after_revert["groupings"].as_array().unwrap().is_empty());
+        let generations = after_revert["generations"].as_array().unwrap();
+        assert_eq!(generations.len(), 1);
+        let generation = &generations[0];
+        assert_eq!(generation["metadata_enabled"], i64::from(sidecar));
+        let spec: Value = serde_json::from_slice(
+            &data_encoding::HEXLOWER
+                .decode(
+                    generation["specification"]["blob_hex"]
+                        .as_str()
+                        .unwrap()
+                        .as_bytes(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(spec["metadata_enabled"], sidecar);
+        assert_eq!(spec["metadata_flags"].as_u64().unwrap() != 0, sidecar);
+        let destinations = after_revert["destinations"].as_array().unwrap();
+        assert_eq!(destinations.len(), 1);
+        let selected_original = &destinations[0];
+        for (key, value) in [
+            ("generation", &generation["id"]),
+            ("library", &json!("PrimarySync")),
+            ("child", &json!("asset-501")),
+            ("asset_id", &json!("asset-501")),
+            ("master", &json!("501")),
+            ("pass_key", &json!(pass)),
+            ("version_size", &json!("original")),
+            ("metadata_hash", &json!(current_metadata.metadata_hash)),
+            ("checksum", &json!(provider_hash(ORIGINAL))),
+            ("size_bytes", &json!(ORIGINAL.len())),
+            ("admitted", &json!(1)),
+            ("verified_media", &json!(1)),
+        ] {
+            assert_eq!(&selected_original[key], value, "{key}");
+        }
+        assert_eq!(
+            serde_json::from_str::<SelectionPath>(selected_original["path"].as_str().unwrap())
+                .unwrap()
+                .to_path(),
+            original
+        );
+        let sha = data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL));
+        assert_eq!(selected_original["source_checksum"], sha);
+        assert_eq!(selected_original["local_checksum"], sha);
+        if sidecar {
+            // Admission records new work on provider-current metadata hash drift.
+            // This is a pending addition, never proof of a local metadata write.
+            let conn = rusqlite::Connection::open_with_flags(
+                root.path().join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM asset_album_memberships", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0
+            );
+            let stamp = after_original["metadata_write_failed_at"].as_i64().unwrap();
+            assert!((revert_started..=revert_finished).contains(&stamp));
+            let paths = conn.prepare(path_sql).unwrap();
+            let debt_column = paths.column_index("metadata_write_failed_at").unwrap();
+            let expected = expected_paths
+                .iter_mut()
+                .find(|row| {
+                    row[path_column]
+                        == rusqlite::types::Value::Text(original.to_str().unwrap().into())
+                        && row[version_column] == rusqlite::types::Value::Text("original".into())
+                })
+                .unwrap();
+            assert_eq!(expected[debt_column], rusqlite::types::Value::Null);
+            assert_eq!(before_original["metadata_write_failed_at"], Value::Null);
+            expected[debt_column] = rusqlite::types::Value::Integer(stamp);
+            let catalogue = conn.prepare(catalogue_sql).unwrap();
+            let debt_column = catalogue.column_index("metadata_write_failed_at").unwrap();
+            let version_column = catalogue.column_index("version_size").unwrap();
+            let expected = expected_catalogue
+                .iter_mut()
+                .find(|row| row[version_column] == rusqlite::types::Value::Text("original".into()))
+                .unwrap();
+            assert_eq!(expected[debt_column], rusqlite::types::Value::Null);
+            expected[debt_column] = rusqlite::types::Value::Integer(stamp);
+            assert_eq!(
+                pending_after.len(),
+                1,
+                "unexpected unfiltered metadata queue peer"
+            );
+            let queued = &pending_after[0];
+            assert_eq!(
+                (
+                    queued.asset.library.as_ref(),
+                    queued.asset.id.as_ref(),
+                    queued.asset.version_size
+                ),
+                ("PrimarySync", "asset-501", state::VersionSizeKey::Original)
+            );
+            assert_eq!(queued.asset.local_path.as_ref(), Some(&original));
+            assert_eq!(queued.asset.checksum.as_ref(), provider_hash(ORIGINAL));
+            assert_eq!(queued.asset.size_bytes, ORIGINAL.len() as u64);
+            assert_eq!(
+                queued.asset.metadata.metadata_hash,
+                current_metadata.metadata_hash
+            );
+            assert_eq!(
+                queued.asset.metadata.provider_data,
+                current_metadata.provider_data
+            );
+            assert_eq!(queued.source_checksum.as_deref(), Some(sha.as_str()));
+            assert_eq!(queued.asset.local_checksum.as_deref(), Some(sha.as_str()));
+            assert_eq!(
+                queued.asset.download_checksum.as_deref(),
+                Some(sha.as_str())
+            );
+            assert!(queued.selection_receipt.is_none() && queued.capture_repair_receipt.is_none());
+            eprintln!(
+                "LEGACY_ALIAS_A_PENDING_ADDITION root={} bounds={revert_started}..={revert_finished} stamp={stamp} old_hash={:?} current_metadata={current_metadata:?} selected={selected_original} generation={generation} normal_queue={pending_after:?}",
+                root.path().display(),
+                old_metadata.metadata_hash
+            );
+        } else {
+            assert!(pending_after.is_empty());
+        }
+        assert_eq!(rows(path_sql), expected_paths);
+        assert_eq!(rows(catalogue_sql), expected_catalogue);
+        assert_eq!(rows(receipt_sql), authentic_receipts);
+        assert_eq!(custody(), before_custody);
+        assert!(!media.join(".kei-history").exists());
+        assert!(!media.join("IMG_0501_original.JPG").exists());
+        let checkpoint_sql = "SELECT key,value FROM metadata WHERE key='sync_token:PrimarySync'";
+        let checkpoint = rows(checkpoint_sql);
+        assert_eq!(checkpoint.len(), 1);
+        let selection_sql = "SELECT d.* FROM provider_active_destinations d ORDER BY generation,pass_key,child,version_size,path";
+        let selected = rows(selection_sql);
+        assert!(!selected.is_empty());
+        let conn = rusqlite::Connection::open_with_flags(
+            root.path().join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let selected_original: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.library='PrimarySync' AND d.child='asset-501' AND d.asset_id='asset-501' AND d.master='501' AND d.version_size='original' AND d.pass_key=?1 AND d.path=?2 AND d.checksum=?3 AND d.size_bytes=?4 AND d.source_checksum=?5 AND d.local_checksum=?5 AND d.admitted=1 AND d.verified_media=1 AND g.account_key=?6 AND g.provider_key=?7 AND g.scope=?8", rusqlite::params![pass,SelectionPath::from_path(&original).key().unwrap(),provider_hash(ORIGINAL),i64::try_from(ORIGINAL.len()).unwrap(),data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL)),account,provider,scope], |r|r.get(0)).unwrap();
+        assert!(
+            selected_original > 0,
+            "reverted Original must actually reach verified selection"
+        );
+        drop(conn);
+        for round in 0..2 {
             let (quiet, lookups) = cycle_options(
                 root.path(),
                 current.clone(),
@@ -11484,30 +11998,1280 @@ async fn review501_legacy_changed_extensions_and_aliases_retire_after_revert() {
             assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
             assert!(quiet.db_sync_token_advance_safe);
             assert_eq!(quiet.stats.downloaded, 0);
-            assert_eq!(lookups, 0);
-            assert_bytes(&media.join("IMG_0501.JPG"), ORIGINAL);
-            for ((name, bytes, expected_xmp), history) in old_files.iter().zip(&histories) {
-                assert!(!media.join(name).exists());
-                assert_bytes(history, bytes);
-                if let Some(expected) = expected_xmp {
-                    let mut xmp = history.as_os_str().to_os_string();
-                    xmp.push(".xmp");
-                    assert_bytes(&std::path::PathBuf::from(xmp), expected);
-                }
-            }
-            assert_eq!(server.received_requests().await.unwrap().len(), requests);
-            let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
-                .await
-                .unwrap();
-            let summary = db.get_summary().await.unwrap().primary_layout.unwrap();
             assert_eq!(
                 (
-                    summary.bound_families,
-                    summary.preserved_files,
-                    summary.pending_operations,
-                    summary.held_operations
+                    quiet.stats.skipped.uncertain,
+                    quiet.stats.state_write_failures
                 ),
-                inventory
+                (0, 0)
+            );
+            assert_eq!(lookups, 0);
+            assert_eq!(physical(), before_files);
+            assert_eq!(rows(path_sql), expected_paths);
+            assert_eq!(rows(catalogue_sql), expected_catalogue);
+            let quiet_pending = pending().await;
+            assert_eq!(format!("{quiet_pending:?}"), format!("{pending_after:?}"));
+            assert_eq!(phase_rows()["generations"], after_revert["generations"]);
+            assert_eq!(rows(receipt_sql), authentic_receipts);
+            assert_eq!(custody(), before_custody);
+            assert_eq!(rows(checkpoint_sql), checkpoint);
+            assert_eq!(rows(selection_sql), selected);
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+            eprintln!(
+                "LEGACY_ALIAS_A_QUIET sidecar={sidecar} round={round} files={} path_proofs={} scoped19={} custody=empty checkpoint={checkpoint:?} selection={selected:?} GETs=3 lookups=0",
+                before_files.len(),
+                before_paths.len(),
+                authentic_receipts.len()
+            );
+            eprintln!(
+                "LEGACY_ALIAS_A_PENDING_QUIET sidecar={sidecar} round={round} root={} full_queue={quiet_pending:?} full_paths={expected_paths:?} full_catalogue={expected_catalogue:?}",
+                root.path().display()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn review501_recorded_legacy_extension_aliases_require_each_saved_path_identity() {
+    use state::db::primary_layout::{LayoutFile, LayoutMember, LayoutOperation};
+    use state::db::provider_selection::SelectionPath;
+
+    fn sidecar_path(path: &std::path::Path) -> std::path::PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".xmp");
+        name.into()
+    }
+    fn file(
+        path: &std::path::Path,
+    ) -> (Vec<u8>, crate::fs_util::FileIdentity, std::time::SystemTime) {
+        let handle = std::fs::File::open(path).unwrap();
+        (
+            std::fs::read(path).unwrap(),
+            crate::fs_util::file_identity(&handle).unwrap(),
+            handle.metadata().unwrap().modified().unwrap(),
+        )
+    }
+    fn check_file(proof: &LayoutFile, path: &std::path::Path) {
+        let (bytes, identity, _) = file(path);
+        assert_eq!(identity, proof.fingerprint.identity, "{path:?}");
+        assert_eq!(bytes.len() as u64, proof.fingerprint.size);
+        assert_eq!(
+            Sha256::digest(&bytes).as_slice(),
+            proof.fingerprint.sha256.as_slice()
+        );
+        assert_eq!(proof.provider_checksum, provider_hash(&bytes));
+        match proof.version.as_str() {
+            "original" => assert_eq!(
+                proof.source_checksum.as_deref(),
+                Some(
+                    data_encoding::HEXLOWER
+                        .encode(&Sha256::digest(&bytes))
+                        .as_str()
+                )
+            ),
+            "adjusted" => assert!(
+                proof.source_checksum.is_none(),
+                "synthetic legacy media has no authenticated download source"
+            ),
+            other => panic!("unexpected fixture rendition {other}"),
+        }
+        if let Some(xmp) = &proof.sidecar {
+            let (bytes, identity, _) = file(&sidecar_path(path));
+            assert_eq!(identity, xmp.identity);
+            assert_eq!(bytes.len() as u64, xmp.size);
+            assert_eq!(Sha256::digest(&bytes).as_slice(), xmp.sha256.as_slice());
+        } else {
+            assert!(!sidecar_path(path).exists());
+        }
+    }
+    // An empty-name Unfiled pass avoids inventing TestAlbum membership/debt.
+    // Both publication and every recovery reopen derive their pass from this
+    // real album context; no manually hashed alternate pass is substituted.
+    async fn context(
+        root: &std::path::Path,
+        records: Vec<Value>,
+        sidecar: bool,
+        folder: &str,
+    ) -> (download::DownloadConfig, AlbumPass, Session) {
+        assert!(!sidecar || cfg!(feature = "xmp"));
+        let owner = state::db::account::AccountOwner::authenticated(
+            "synthetic@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+        )
+        .unwrap();
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&root.join("state.db"), &owner)
+                .await
+                .unwrap(),
+        );
+        let provider = Session {
+            reported_count: None,
+            records,
+            quiet: false,
+            lookups: Arc::new(AtomicUsize::new(0)),
+            current: None,
+            lookup_change: None,
+            indexing: None,
+            baseline_successor: None,
+            cycle_token: None,
+            trace: None,
+        };
+        let mut album = crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::default(),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from(""),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(
+                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                ),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(provider.clone()),
+        );
+        album.set_shadow_capture(
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner, "com"),
+            Arc::from("private"),
+        );
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album,
+            exclude_ids: Arc::default(),
+        };
+        let media = root.join("media");
+        let store: Arc<dyn download::DownloadStore> = db;
+        let build = make_run_cycle_download_config_builder(&media, store);
+        let mut config = build(
+            download::SyncMode::Full,
+            Arc::default(),
+            Arc::default(),
+            Arc::from("PrimarySync"),
+        )
+        .as_ref()
+        .clone();
+        config.folder_structure = folder.into();
+        config.folder_structure_albums = Arc::from(folder);
+        config.folder_structure_smart_folders = Arc::from(folder);
+        config.edited = true;
+        config.edited_naming = EditedNaming::Primary;
+        config.refresh_metadata = false;
+        #[cfg(feature = "xmp")]
+        {
+            config.metadata.xmp_sidecar = sidecar;
+        }
+        (config.with_pass(&pass), pass, provider)
+    }
+    async fn publish_source(
+        root: &std::path::Path,
+        records: Vec<Value>,
+        sidecar: bool,
+        naming: EditedNaming,
+    ) -> (crate::sync_cycle::CycleResult, String) {
+        let (mut download, pass, provider) = context(root, records, sidecar, "").await;
+        download.edited_naming = naming;
+        let pass_key = download.primary_layout_pass.as_deref().unwrap().to_owned();
+        let mut library = make_run_cycle_library_state_with_passes(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            vec![pass],
+        );
+        library.library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+            Box::new(provider),
+            "PrimarySync",
+        );
+        std::fs::create_dir_all(root.join("media")).unwrap();
+        let build = |mode, exclude, groups, zone| {
+            let mut next = download.clone();
+            next.sync_mode = mode;
+            next.exclude_asset_ids = exclude;
+            next.asset_groupings = groups;
+            next.library = zone;
+            Arc::new(next)
+        };
+        let mut config = make_run_cycle_config();
+        config.download.directory = root.join("media");
+        config.download.folder_structure = String::new();
+        config.download.folder_structure_albums = String::new();
+        config.download.folder_structure_smart_folders = String::new();
+        config.photos.edited = true;
+        config.photos.edited_naming = naming;
+        #[cfg(feature = "xmp")]
+        {
+            config.metadata.xmp_sidecar = sidecar;
+        }
+        let (_session_root, session) = make_shared_session_for_run_cycle().await;
+        let result = Box::pin(crate::sync_cycle::run_cycle(
+            &[&library],
+            &config,
+            Some(download.state_db.as_ref().unwrap().as_ref()),
+            false,
+            &build,
+            download::DownloadControls::download_hidden(),
+            &session,
+            &CancellationToken::new(),
+        ))
+        .await
+        .unwrap();
+        (result, pass_key)
+    }
+    let heic = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/media/pattern.heic"
+    ));
+    #[cfg(feature = "xmp")]
+    let sidecar_modes = [false, true];
+    #[cfg(not(feature = "xmp"))]
+    let sidecar_modes = [false];
+    for sidecar in sidecar_modes {
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+        let server = server().await;
+        Mock::given(method("GET"))
+            .and(path("/edit-heic"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(heic.as_slice()))
+            .mount(&server)
+            .await;
+        let mut root = tempfile::tempdir().unwrap();
+        if std::env::var_os("KEI_LEGACY_ALIAS_RETAIN_FIXTURE").is_some() {
+            root.disable_cleanup(true);
+        }
+        eprintln!(
+            "LEGACY_ALIAS_B_ROOT sidecar={sidecar} root={}",
+            root.path().display()
+        );
+        let media = root.path().join("media");
+        let rows = |sql: &str| {
+            let conn = rusqlite::Connection::open_with_flags(
+                root.path().join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let mut statement = conn.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |r| {
+                    (0..columns)
+                        .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let operation = || {
+            let conn = rusqlite::Connection::open_with_flags(
+                root.path().join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let header: Vec<u8> = conn
+                .query_row("SELECT header FROM primary_layout_operations", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let mut op: LayoutOperation = serde_json::from_slice(&header).unwrap();
+            let mut statement = conn
+                .prepare("SELECT evidence FROM primary_layout_members ORDER BY member")
+                .unwrap();
+            op.members = statement
+                .query_map([], |r| r.get::<_, Vec<u8>>(0))
+                .unwrap()
+                .map(|bytes| serde_json::from_slice::<LayoutMember>(&bytes.unwrap()).unwrap())
+                .collect();
+            op
+        };
+        let physical = || {
+            let mut files = std::collections::BTreeMap::new();
+            let mut pending = vec![media.clone()];
+            while let Some(path) = pending.pop() {
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                assert!(!metadata.file_type().is_symlink());
+                #[cfg(windows)]
+                let handle = {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    use windows_sys::Win32::Storage::FileSystem::{
+                        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+                        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                    };
+                    std::fs::OpenOptions::new()
+                        .access_mode(FILE_READ_ATTRIBUTES)
+                        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                        .open(&path)
+                        .unwrap()
+                };
+                #[cfg(not(windows))]
+                let handle = std::fs::File::open(&path).unwrap();
+                let bytes = if metadata.is_dir() {
+                    pending.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+                    None
+                } else {
+                    assert!(metadata.is_file());
+                    Some(std::fs::read(&path).unwrap())
+                };
+                files.insert(
+                    path,
+                    (
+                        bytes,
+                        crate::fs_util::file_identity(&handle).unwrap(),
+                        metadata.modified().unwrap(),
+                    ),
+                );
+            }
+            files
+        };
+        let receipt_sql = "SELECT id,account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash,trust_receipt,selected_metadata_hash,generation_id FROM download_receipts ORDER BY id";
+        let path_sql = "SELECT * FROM asset_metadata_paths ORDER BY library,id,version_size,provider_checksum,local_path";
+        let checkpoint_sql = "SELECT key,value FROM metadata WHERE key='sync_token:PrimarySync'";
+        let current = records(&server, None);
+        let (initial, saved_pass) =
+            publish_source(root.path(), current.clone(), sidecar, EditedNaming::Suffix).await;
+        assert_eq!(
+            (
+                initial.failed_count,
+                initial.stats.downloaded,
+                initial.stats.skipped.uncertain,
+                initial.stats.state_write_failures
+            ),
+            (0, 1, 0, 0),
+            "{initial:?}"
+        );
+        assert!(initial.db_sync_token_advance_safe);
+        let original = media.join("IMG_0501.JPG");
+        assert_bytes(&original, ORIGINAL);
+        let source_file = file(&original);
+        let source_xmp = sidecar.then(|| file(&sidecar_path(&original)));
+        let published_receipt = rows(receipt_sql);
+        let source_debt_sql = "SELECT library,id,version_size,local_path,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size FROM asset_metadata_paths WHERE version_size='original'";
+        let published_debt = rows(source_debt_sql);
+        eprintln!(
+            "LEGACY_ALIAS_B_SOURCE_PUBLISHED sidecar={sidecar} root={} actual_pass={saved_pass} full_path_rows={:?} full_scoped19={published_receipt:?} debt={published_debt:?} media={source_file:?} xmp={source_xmp:?} result={initial:?}",
+            root.path().display(),
+            rows(path_sql)
+        );
+        // Read-only reuse disables optional metadata writes, retaining any raw
+        // source XMP from its genuine publication. Prep/recovery below both use
+        // the requested sidecar mode, but only on an independent new copy.
+        let (reused, reused_pass) =
+            publish_source(root.path(), current.clone(), false, EditedNaming::Primary).await;
+        assert_eq!(
+            (
+                reused.failed_count,
+                reused.stats.downloaded,
+                reused.stats.skipped.uncertain,
+                reused.stats.state_write_failures
+            ),
+            (0, 0, 0, 0),
+            "{reused:?}"
+        );
+        assert!(reused.db_sync_token_advance_safe);
+        assert_eq!(reused_pass, saved_pass);
+        assert_eq!(file(&original), source_file);
+        if let Some(xmp) = &source_xmp {
+            assert_eq!(&file(&sidecar_path(&original)), xmp);
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let source_sql = format!(
+            "SELECT * FROM asset_metadata_paths WHERE local_path='{}'",
+            original.to_str().unwrap().replace('\'', "''")
+        );
+        let source_receipt_sql = format!(
+            "SELECT * FROM download_receipts WHERE native_path='{}' ORDER BY id",
+            SelectionPath::from_path(&original)
+                .key()
+                .unwrap()
+                .replace('\'', "''")
+        );
+        let source_path = rows(&source_sql);
+        let authentic = rows(&source_receipt_sql);
+        eprintln!(
+            "LEGACY_ALIAS_B_SOURCE_PROTECTED sidecar={sidecar} root={} actual_pass={reused_pass} full_source_path={source_path:?} full_scoped19={authentic:?} debt={:?} result={reused:?}",
+            root.path().display(),
+            rows(source_debt_sql)
+        );
+        assert_eq!(
+            rows(source_debt_sql),
+            published_debt,
+            "read-only source reuse cannot clear or replace existing debt"
+        );
+        assert_eq!(rows(receipt_sql), published_receipt);
+        assert_eq!(source_path.len(), 1);
+        assert_eq!(authentic.len(), 1);
+        assert_eq!(rows(receipt_sql).len(), 1);
+        let conn = rusqlite::Connection::open_with_flags(
+            root.path().join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let marker: String = conn
+            .query_row(
+                "SELECT preserved_path_key FROM asset_metadata_paths WHERE local_path=?1",
+                [original.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            marker,
+            state::db::primary_layout::path_key(&original).unwrap()
+        );
+        let receipt_pass: String = conn
+            .query_row("SELECT origin_pass FROM download_receipts", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(receipt_pass, saved_pass);
+        drop(conn);
+        let assert_source = || {
+            assert_eq!(
+                rows(&source_sql),
+                source_path,
+                "protected source full path/debt/provenance row changed"
+            );
+            assert_eq!(
+                rows(&source_receipt_sql),
+                authentic,
+                "protected source authentic scoped receipt changed"
+            );
+            assert_eq!(file(&original), source_file);
+            if let Some(xmp) = &source_xmp {
+                assert_eq!(&file(&sidecar_path(&original)), xmp);
+            }
+        };
+        let legacy = media.join("legacy");
+        std::fs::create_dir(&legacy).unwrap();
+        let old_heic = legacy.join("IMG_0501_edited.HEIC");
+        let jpeg = legacy.join("IMG_0501_edited.JPG");
+        let alias = legacy.join(format!("IMG_0501_edited-{}.JPG", EDIT_TWO.len()));
+        let destination = legacy.join("IMG_0501.JPG");
+        let owner = state::db::account::AccountOwner::authenticated(
+            "synthetic@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+        )
+        .unwrap();
+        // These are explicit synthetic historical catalogue associations, not
+        // authenticated downloads or a claimed released-writer chronology.
+        for (name, bytes, path) in [
+            ("edit-heic", heic.as_slice(), &old_heic),
+            ("edit-two", EDIT_TWO, &jpeg),
+        ] {
+            let mut observation = records(&server, Some((name, bytes)));
+            if name == "edit-heic" {
+                observation[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.heic"});
+            }
+            let (mut config, pass, _) = context(root.path(), observation, sidecar, "legacy").await;
+            config.edited_naming = EditedNaming::Suffix;
+            assert_eq!(
+                config.primary_layout_pass.as_deref(),
+                Some(saved_pass.as_str())
+            );
+            let asset = pass
+                .album
+                .confirm_layout_asset("asset-501", "PrimarySync")
+                .await
+                .unwrap()
+                .asset;
+            let paths = download::filter::expected_paths_for(&asset, &config);
+            let selected = paths
+                .iter()
+                .find(|p| p.version_size == state::VersionSizeKey::Adjusted)
+                .unwrap();
+            assert_eq!(&selected.path, path);
+            assert_eq!(selected.checksum.as_ref(), provider_hash(bytes));
+            let record = state::AssetRecord::new_pending(
+                Arc::from(asset.source_zone().unwrap()),
+                asset.state_id().to_owned(),
+                selected.version_size,
+                selected.checksum.to_string(),
+                selected
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                asset.created(),
+                Some(asset.added_date()),
+                selected.size,
+                download::determine_media_type(selected.version_size, &asset),
+            )
+            .with_metadata_arc(download::filter::metadata_for_selected_version(
+                &asset,
+                &config,
+                selected.version_size,
+            ));
+            std::fs::write(path, bytes).unwrap();
+            if let Some(xmp) = &source_xmp {
+                std::fs::write(sidecar_path(path), &xmp.0).unwrap();
+            }
+            let db = config.state_db.as_ref().unwrap();
+            db.upsert_seen(&record).await.unwrap();
+            db.mark_downloaded(
+                "PrimarySync",
+                "asset-501",
+                "adjusted",
+                path,
+                &data_encoding::HEXLOWER.encode(&Sha256::digest(bytes)),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        std::fs::copy(&jpeg, &alias).unwrap();
+        if sidecar {
+            std::fs::copy(sidecar_path(&jpeg), sidecar_path(&alias)).unwrap();
+        }
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "asset-501",
+            "adjusted",
+            &alias,
+            &data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_TWO)),
+            None,
+        )
+        .await
+        .unwrap();
+        drop(db);
+        assert_eq!(rows(&source_receipt_sql), authentic);
+        assert_eq!(
+            rows(receipt_sql).len(),
+            1,
+            "no authenticated Adjusted publication was created"
+        );
+        assert_source();
+        assert_ne!(file(&alias).1, file(&jpeg).1);
+        let unassociated = legacy.join("unassociated-equal-bytes.JPG");
+        std::fs::copy(&jpeg, &unassociated).unwrap();
+        if sidecar {
+            std::fs::copy(sidecar_path(&jpeg), sidecar_path(&unassociated)).unwrap();
+        }
+        let unassociated_file = file(&unassociated);
+        let unassociated_xmp = sidecar.then(|| file(&sidecar_path(&unassociated)));
+        let old_physical = physical();
+        let path_proofs = rows(path_sql);
+        assert_eq!(path_proofs.len(), 4);
+        let checkpoint = rows(checkpoint_sql);
+        let debt_sql = "SELECT library,id,version_size,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size FROM assets ORDER BY library,id,version_size";
+        let catalogue_debt = rows(debt_sql);
+        let recover = async || {
+            let (config, pass, provider) =
+                context(root.path(), current.clone(), sidecar, "legacy").await;
+            assert_eq!(
+                config.primary_layout_pass.as_deref(),
+                Some(saved_pass.as_str())
+            );
+            let report = download::recover_recorded_sources(
+                &reqwest::Client::new(),
+                std::slice::from_ref(&pass),
+                Arc::new(config),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            (report, provider.lookups.load(Ordering::SeqCst))
+        };
+        let (op, protected) = {
+            let (config, pass, _) = context(root.path(), current.clone(), sidecar, "legacy").await;
+            let (capture, scope, _) = pass
+                .album
+                .publication_scope("PrimarySync")
+                .unwrap()
+                .unwrap();
+            let db = capture.db;
+            let (account, provider) = capture.owner.authenticated_keys().unwrap();
+            let pass_key = config.primary_layout_pass.as_deref().unwrap();
+            assert_eq!(pass_key, saved_pass);
+            assert!(
+                rows("SELECT * FROM primary_layout_bindings").is_empty(),
+                "a binding would bypass legacy per-path discovery"
+            );
+            assert!(rows("SELECT * FROM primary_layout_operations").is_empty());
+            let receipts =
+                state::db::DownloadContextStateStore::get_primary_layout_receipts(db.as_ref())
+                    .await
+                    .unwrap();
+            assert_eq!(receipts.len(), 4);
+            for (path, version, bytes) in [
+                (&original, "original", ORIGINAL),
+                (&old_heic, "adjusted", heic.as_slice()),
+                (&jpeg, "adjusted", EDIT_TWO),
+                (&alias, "adjusted", EDIT_TWO),
+            ] {
+                let receipt = receipts
+                    .iter()
+                    .find(|r| r.local_path.as_ref() == Some(path))
+                    .unwrap();
+                let sha = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+                assert_eq!(receipt.library, "PrimarySync");
+                assert_eq!(receipt.id, "asset-501");
+                assert_eq!(receipt.version_size.as_str(), version);
+                assert_eq!(receipt.checksum, provider_hash(bytes));
+                assert_eq!(receipt.local_checksum.as_deref(), Some(sha.as_str()));
+                assert_eq!(
+                    receipt.download_checksum.as_deref(),
+                    if path == &original {
+                        Some(sha.as_str())
+                    } else {
+                        None
+                    }
+                );
+                assert!(!receipt.is_preserved_history);
+                assert_eq!(
+                    path.parent(),
+                    Some(if path == &original {
+                        media.as_path()
+                    } else {
+                        legacy.as_path()
+                    })
+                );
+                let conn = db
+                    .acquire_lock("inspect genuine scoped publication versus synthetic alias")
+                    .unwrap();
+                let count: i64 = conn.query_row("SELECT count(*) FROM download_receipts r JOIN account_owner a ON a.account_key=r.account_key AND a.provider_key=r.provider_key WHERE r.account_key=?1 AND r.provider_key=?2 AND r.scope=?3 AND r.origin_pass=?4 AND r.library='PrimarySync' AND r.child='asset-501' AND r.master='501' AND r.state_id='asset-501' AND r.version_size=?5 AND r.provider_checksum=?6 AND r.provider_size=?7 AND r.native_path=?8 AND r.source_checksum=?9 AND r.local_checksum=?9 AND length(r.id)>0 AND length(r.proof_hash)=64 AND r.trust_receipt IS NULL AND r.selected_metadata_hash IS NULL AND r.generation_id IS NULL", rusqlite::params![account,provider,scope,pass_key,version,provider_hash(bytes),i64::try_from(bytes.len()).unwrap(),SelectionPath::from_path(path).key().unwrap(),sha], |r|r.get(0)).unwrap();
+                assert_eq!(
+                    count,
+                    i64::from(path == &original),
+                    "all three Adjusted paths are synthetic catalogue-only inputs"
+                );
+                let provenance:(Option<String>,Option<String>)=conn.query_row("SELECT source_checksum,download_checksum FROM asset_metadata_paths WHERE local_path=?1",[path.to_str().unwrap()],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                assert_eq!(
+                    provenance,
+                    if path == &original {
+                        (Some(sha.clone()), Some(sha))
+                    } else {
+                        (None, None)
+                    },
+                    "actual synthetic provenance must not be source-stamped"
+                );
+            }
+            assert!(
+                !receipts
+                    .iter()
+                    .any(|r| r.local_path.as_ref() == Some(&unassociated))
+            );
+            eprintln!(
+                "LEGACY_ALIAS_B_PREPARE_ENTER sidecar={sidecar} capture_policy={:?} metadata={:?} refresh={} no_prior_binding=true scoped19={authentic:?} paths={path_proofs:?} files={old_physical:?} legacy_receipts={receipts:?}",
+                config.capture_timestamp_repair, config.metadata, config.refresh_metadata
+            );
+            let protected = config
+                .state_db
+                .as_ref()
+                .unwrap()
+                .protected_legacy_paths()
+                .await
+                .unwrap();
+            assert!(protected.contains(&original));
+            assert!(protected.contains(&sidecar_path(&original)));
+            (
+                download::seed_prepared_edited_compat(&config, &pass).await,
+                protected,
+            )
+        };
+        eprintln!("LEGACY_ALIAS_B_PREPARED sidecar={sidecar} operation={op:?}");
+        assert_eq!(op.phase, "prepared");
+        assert_eq!(op.generation, 0);
+        assert_eq!(op.policy, "primary");
+        assert!(!op.refresh_metadata);
+        assert_eq!(op.members.len(), 4);
+        assert_eq!(
+            serde_json::to_value(operation()).unwrap(),
+            serde_json::to_value(&op).unwrap()
+        );
+        let mut preservation_paths = std::collections::BTreeSet::new();
+        let mut retirement_paths = std::collections::BTreeSet::new();
+        let mut prepared_files = Vec::new();
+        for member in &op.members {
+            assert!(member.preserved.is_none() && member.installed.is_none());
+            if let Some(old) = &member.old {
+                check_file(old, &old.path.to_path());
+                assert_eq!(old.sidecar.is_some(), sidecar);
+                assert!(!old.archive_original);
+                assert!(old.source_checksum.is_none());
+                assert!(
+                    preservation_paths.insert(member.preserved_path.as_ref().unwrap().to_path())
+                );
+                let retirement = member.retirement.as_ref().unwrap();
+                assert!(retirement_paths.insert(retirement.to_path()));
+                assert!(member.destination.is_none() && member.record.is_none());
+                assert!(
+                    [old_heic.clone(), jpeg.clone(), alias.clone()].contains(&old.path.to_path())
+                );
+            } else {
+                assert_eq!(member.destination.as_ref().unwrap().to_path(), destination);
+                assert!(member.retirement.is_none() && member.preserved_path.is_none());
+                assert!(!destination.exists());
+                assert_eq!(
+                    member.record.as_ref().unwrap().version_size,
+                    state::VersionSizeKey::Original
+                );
+            }
+            for path in [
+                member.destination.as_ref(),
+                member.old.as_ref().map(|old| &old.path),
+                member.preserved_path.as_ref(),
+                member.retirement.as_ref(),
+                member.stage.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                for candidate in [path.to_path(), sidecar_path(&path.to_path())] {
+                    let key = crate::fs_util::confined_path_key(&candidate).unwrap();
+                    assert!(
+                        protected
+                            .iter()
+                            .all(|p| crate::fs_util::confined_path_key(p).unwrap() != key),
+                        "recorded path overlaps protected source: {candidate:?}"
+                    );
+                }
+            }
+            if let Some(prepared) = &member.prepared {
+                check_file(prepared, &prepared.path.to_path());
+                prepared_files.push((prepared.path.to_path(), file(&prepared.path.to_path())));
+                if sidecar {
+                    prepared_files.push((
+                        sidecar_path(&prepared.path.to_path()),
+                        file(&sidecar_path(&prepared.path.to_path())),
+                    ));
+                }
+            }
+        }
+        assert_eq!((preservation_paths.len(), retirement_paths.len()), (3, 3));
+        assert!(!op.members.iter().any(|m| {
+            m.old
+                .as_ref()
+                .is_some_and(|f| f.path.to_path() == unassociated)
+        }));
+        for path in [&old_heic, &jpeg, &alias] {
+            assert_eq!(
+                op.members
+                    .iter()
+                    .filter(|m| m.old.as_ref().is_some_and(|f| f.path.to_path() == *path))
+                    .count(),
+                1
+            );
+        }
+        let jpeg_member = op
+            .members
+            .iter()
+            .find(|m| m.old.as_ref().is_some_and(|old| old.path.to_path() == jpeg))
+            .unwrap();
+        let alias_index = op
+            .members
+            .iter()
+            .position(|m| {
+                m.old
+                    .as_ref()
+                    .is_some_and(|old| old.path.to_path() == alias)
+            })
+            .unwrap();
+        let alias_member = &op.members[alias_index];
+        let jpeg_old = jpeg_member.old.as_ref().unwrap();
+        let alias_old = alias_member.old.as_ref().unwrap();
+        assert_eq!(jpeg_old.version, alias_old.version);
+        assert_eq!(jpeg_old.provider_checksum, alias_old.provider_checksum);
+        assert_eq!(jpeg_old.fingerprint.sha256, alias_old.fingerprint.sha256);
+        assert_ne!(jpeg_old.path, alias_old.path);
+        assert_ne!(
+            jpeg_old.fingerprint.identity,
+            alias_old.fingerprint.identity
+        );
+        assert_ne!(jpeg_member.preserved_path, alias_member.preserved_path);
+        assert_ne!(jpeg_member.retirement, alias_member.retirement);
+        if sidecar {
+            assert_eq!(
+                jpeg_old.sidecar.as_ref().unwrap().sha256,
+                alias_old.sidecar.as_ref().unwrap().sha256
+            );
+            assert_ne!(
+                jpeg_old.sidecar.as_ref().unwrap().identity,
+                alias_old.sidecar.as_ref().unwrap().identity
+            );
+        }
+        assert_eq!(rows(&source_receipt_sql), authentic);
+        let claims = rows("SELECT * FROM primary_layout_claims ORDER BY path_key");
+        assert_eq!(claims.len(), 4);
+        let original_before = file(&original);
+        assert_source();
+        eprintln!(
+            "LEGACY_ALIAS_B_PROTECTED_SOURCE sidecar={sidecar} source={original:?} marker={marker} path_row={source_path:?} scoped19={authentic:?} source_file={source_file:?} source_xmp={source_xmp:?} actual_pass={saved_pass} protected={protected:?} operation={op:?}"
+        );
+        // Park the real inode outside every discovered/recorded path. No hardlink
+        // or rewritten journal fingerprint participates in this negative.
+        let backup = root.path().join("fixture-original-alias.backup");
+        let replacement_archive = root.path().join("fixture-equal-byte-replacement.retained");
+        std::fs::rename(&alias, &backup).unwrap();
+        std::fs::copy(&jpeg, &alias).unwrap();
+        let replacement = file(&alias);
+        assert_eq!(replacement.0, EDIT_TWO);
+        assert_ne!(replacement.1, alias_old.fingerprint.identity);
+        assert_eq!(file(&backup).1, alias_old.fingerprint.identity);
+        let events_before = capture.events().len();
+        eprintln!(
+            "LEGACY_ALIAS_B_MUTATION_ENTER sidecar={sidecar} operation={} parked={backup:?} replacement={replacement:?} paths={:?}",
+            op.operation,
+            rows(path_sql)
+        );
+        let (held, _) = recover().await;
+        let errors: Vec<_> = capture
+            .events()
+            .into_iter()
+            .skip(events_before)
+            .filter(|e| e.field("error").is_some())
+            .collect();
+        eprintln!(
+            "LEGACY_ALIAS_B_MUTATION_HOLD sidecar={sidecar} result={held:?} errors={errors:?} operation={:?}",
+            operation()
+        );
+        assert!(
+            held.stats.failed == 1 && !held.complete && !held.complete_after_smart_query,
+            "{held:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field("error") == Some("Owned layout file changed locally")),
+            "{errors:?}"
+        );
+        assert_eq!(held.stats.downloaded, 0);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let partial = operation();
+        assert_eq!(partial.operation, op.operation);
+        assert_eq!(partial.phase, "prepared");
+        assert!(partial.members.iter().all(|m| m.installed.is_none()));
+        assert!(partial.members[alias_index].preserved.is_none());
+        assert_eq!(
+            rows("SELECT * FROM primary_layout_preserved").len(),
+            partial
+                .members
+                .iter()
+                .filter(|m| m.preserved.is_some())
+                .count()
+        );
+        assert_eq!(rows("SELECT * FROM primary_layout_bindings").len(), 0);
+        assert_eq!(
+            rows("SELECT * FROM primary_layout_claims ORDER BY path_key"),
+            claims
+        );
+        assert_eq!(rows(&source_receipt_sql), authentic);
+        assert_eq!(rows(checkpoint_sql), checkpoint);
+        assert_eq!(file(&original), original_before);
+        assert_source();
+        assert!(!destination.exists());
+        assert_eq!(rows(path_sql), path_proofs);
+        assert_eq!(rows(debt_sql), catalogue_debt);
+        assert_eq!(file(&alias), replacement);
+        for (path, (bytes, identity, modified)) in &old_physical {
+            if let Some(bytes) = bytes
+                && path != &alias
+            {
+                assert_eq!(file(path), (bytes.clone(), *identity, *modified));
+            }
+        }
+        for (index, member) in partial.members.iter().enumerate() {
+            assert_eq!(
+                serde_json::to_value(&member.old).unwrap(),
+                serde_json::to_value(&op.members[index].old).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&member.prepared).unwrap(),
+                serde_json::to_value(&op.members[index].prepared).unwrap()
+            );
+            if let Some(preserved) = &member.preserved {
+                check_file(preserved, &preserved.path.to_path());
+                let old = member.old.as_ref().unwrap();
+                assert_eq!(preserved.fingerprint.sha256, old.fingerprint.sha256);
+                assert_ne!(preserved.fingerprint.identity, old.fingerprint.identity);
+                eprintln!(
+                    "LEGACY_ALIAS_B_PARTIAL_PRESERVATION member={index} proof={preserved:?} retirement_not_started=true"
+                );
+            }
+            if let Some(retired) = &member.retirement {
+                assert!(!retired.to_path().exists());
+            }
+        }
+        for (path, snapshot) in &prepared_files {
+            assert_eq!(&file(path), snapshot);
+        }
+        assert_eq!(file(&unassociated), unassociated_file);
+        if let Some(xmp) = &unassociated_xmp {
+            assert_eq!(&file(&sidecar_path(&unassociated)), xmp);
+        }
+        // Restore only the real inode/name. Retain the replacement separately;
+        // never rewrite a frozen fingerprint, source checksum or saved claim.
+        std::fs::rename(&alias, &replacement_archive).unwrap();
+        std::fs::rename(&backup, &alias).unwrap();
+        check_file(alias_old, &alias);
+        assert_eq!(file(&replacement_archive), replacement);
+        // Inject one test-only phase interruption to observe ALL durable per-path
+        // preservation receipts while every old inode is still at its old name.
+        // Recovery must resume the same operation after this barrier is removed.
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        conn.execute_batch("CREATE TRIGGER legacy_alias_preservation_barrier BEFORE UPDATE OF phase ON primary_layout_operations WHEN NEW.phase='publishing' BEGIN SELECT RAISE(FAIL,'legacy alias preservation barrier'); END").unwrap();
+        drop(conn);
+        let events_before = capture.events().len();
+        let (preserved_hold, _) = recover().await;
+        assert!(
+            preserved_hold.stats.failed == 1 && !preserved_hold.complete,
+            "{preserved_hold:?}"
+        );
+        let barrier_errors: Vec<_> = capture
+            .events()
+            .into_iter()
+            .skip(events_before)
+            .filter(|event| event.field("error").is_some())
+            .collect();
+        assert!(
+            barrier_errors.iter().any(|event| event
+                .field("error")
+                .is_some_and(|error| error.contains("legacy alias preservation barrier"))),
+            "unexpected refusal, not the injected preservation barrier: {barrier_errors:?}"
+        );
+        let preserved = operation();
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        eprintln!(
+            "LEGACY_ALIAS_B_PRESERVED_BEFORE_RETIREMENT sidecar={sidecar} operation={preserved:?}"
+        );
+        assert_eq!(preserved.operation, op.operation);
+        assert_eq!(preserved.phase, "preserved");
+        assert_eq!(rows("SELECT * FROM primary_layout_preserved").len(), 3);
+        assert!(rows("SELECT * FROM primary_layout_bindings").is_empty());
+        assert_eq!(rows(&source_receipt_sql), authentic);
+        assert_eq!(rows(checkpoint_sql), checkpoint);
+        assert_source();
+        assert_eq!(rows(path_sql), path_proofs);
+        assert_eq!(rows(debt_sql), catalogue_debt);
+        assert!(!destination.exists());
+        for member in &preserved.members {
+            let Some(old) = &member.old else {
+                assert!(member.preserved.is_none() && member.installed.is_none());
+                continue;
+            };
+            let receipt = member.preserved.as_ref().unwrap();
+            check_file(old, &old.path.to_path());
+            check_file(receipt, &receipt.path.to_path());
+            assert_eq!(file(&old.path.to_path()).0, file(&receipt.path.to_path()).0);
+            assert_eq!(receipt.provider_checksum, old.provider_checksum);
+            assert_eq!(receipt.source_checksum, old.source_checksum);
+            assert_eq!(receipt.fingerprint.sha256, old.fingerprint.sha256);
+            assert_ne!(receipt.fingerprint.identity, old.fingerprint.identity);
+            if sidecar {
+                assert_eq!(
+                    file(&sidecar_path(&old.path.to_path())).0,
+                    file(&sidecar_path(&receipt.path.to_path())).0
+                );
+            }
+            assert!(member.installed.is_none());
+            if let Some(retired) = &member.retirement {
+                assert!(!retired.to_path().exists());
+            }
+        }
+        for (path, (bytes, identity, modified)) in &old_physical {
+            if let Some(bytes) = bytes {
+                assert_eq!(file(path), (bytes.clone(), *identity, *modified));
+            }
+        }
+        for (path, snapshot) in &prepared_files {
+            assert_eq!(&file(path), snapshot);
+        }
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        conn.execute_batch("DROP TRIGGER legacy_alias_preservation_barrier")
+            .unwrap();
+        drop(conn);
+        let (recovered, _) = recover().await;
+        eprintln!(
+            "LEGACY_ALIAS_B_RECOVERED sidecar={sidecar} result={recovered:?} operation={:?}",
+            operation()
+        );
+        assert_eq!(
+            (
+                recovered.stats.failed,
+                recovered.stats.downloaded,
+                recovered.stats.skipped.uncertain,
+                recovered.stats.state_write_failures
+            ),
+            (0, 0, 0, 0),
+            "{recovered:?}"
+        );
+        assert!(recovered.complete);
+        let committed = operation();
+        let committed_paths = rows(path_sql);
+        eprintln!(
+            "LEGACY_ALIAS_B_DEBT_COMMIT sidecar={sidecar} operation={} flags={} prepared_decisions={:?} full_path_proofs_before={path_proofs:?} full_path_proofs_after={committed_paths:?}",
+            op.operation,
+            op.metadata_flags,
+            op.members
+                .iter()
+                .map(|m| m.prepared.as_ref().map(|f| (&f.path, &f.metadata_decision)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            committed_paths.len(),
+            path_proofs.len() + 1,
+            "only the new Original destination may add a path row"
+        );
+        for old in &path_proofs {
+            assert!(
+                committed_paths.contains(old),
+                "STOP: recorded commit changed old path debt/provenance: {old:?}; actual={committed_paths:?}"
+            );
+        }
+        assert_eq!(
+            rows(debt_sql),
+            catalogue_debt,
+            "STOP: recorded commit changed independent catalogue debt"
+        );
+        assert_source();
+        assert_eq!(committed.operation, op.operation);
+        // Commit advances the SQL phase, not the frozen publishing header.
+        // Inspect both independently; never overlay status on the raw header.
+        assert_eq!(committed.phase, "publishing");
+        let conn = rusqlite::Connection::open_with_flags(
+            root.path().join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let (sql_phase, raw_header): (String, Vec<u8>) = conn.query_row(
+            "SELECT phase,header FROM primary_layout_operations WHERE operation=?1 AND family=?2 AND library=?3 AND source_library=?4",
+            rusqlite::params![op.operation,op.family,op.library,op.source_library],
+            |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!(sql_phase, "committed");
+        let mut expected_publishing_header = op.clone();
+        expected_publishing_header.members.clear();
+        expected_publishing_header.phase = "publishing".into();
+        assert_eq!(
+            raw_header,
+            serde_json::to_vec(&expected_publishing_header).unwrap()
+        );
+        drop(conn);
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        let binding = db
+            .primary_layout_binding(op.family.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.generation, op.generation + 1);
+        assert_eq!(
+            (
+                &binding.family,
+                &binding.library,
+                &binding.source_library,
+                &binding.child,
+                &binding.decision,
+                &binding.policy,
+                &binding.qualifier
+            ),
+            (
+                &op.family,
+                &op.library,
+                &op.source_library,
+                &op.child,
+                &op.decision,
+                &op.policy,
+                &op.qualifier
+            )
+        );
+        assert!(
+            db.primary_layout_operations(op.source_library.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        eprintln!(
+            "LEGACY_ALIAS_B_AUTHORITATIVE_PHASE sidecar={sidecar} operation={} sql_phase={sql_phase} raw_header_phase={} raw_header_hex={} binding_generation={} binding={binding:?} normal_pending_reader=empty",
+            op.operation,
+            committed.phase,
+            data_encoding::HEXLOWER.encode(&raw_header),
+            binding.generation
+        );
+        drop(db);
+        assert_eq!(rows("SELECT * FROM primary_layout_bindings").len(), 1);
+        assert_eq!(rows("SELECT * FROM primary_layout_operations").len(), 1);
+        for (index, member) in committed.members.iter().enumerate() {
+            let Some(old) = &member.old else {
+                assert!(member.preserved.is_none() && member.retirement.is_none());
+                let installed = member.installed.as_ref().unwrap();
+                assert_eq!(installed.path.to_path(), destination);
+                check_file(installed, &destination);
+                assert_bytes(&destination, ORIGINAL);
+                assert_ne!(installed.fingerprint.identity, source_file.1);
+                assert_eq!(
+                    installed.fingerprint,
+                    member.prepared.as_ref().unwrap().fingerprint
+                );
+                eprintln!(
+                    "LEGACY_ALIAS_B_ORIGINAL_COPY source={original:?} installed={installed:?} protected_source_unchanged=true"
+                );
+                continue;
+            };
+            let receipt = member.preserved.as_ref().unwrap();
+            assert_eq!(
+                serde_json::to_value(receipt).unwrap(),
+                serde_json::to_value(preserved.members[index].preserved.as_ref().unwrap()).unwrap()
+            );
+            check_file(receipt, &receipt.path.to_path());
+            if let Some(retired) = &member.retirement {
+                check_file(old, &retired.to_path());
+                let (bytes, identity, modified) = &old_physical[&old.path.to_path()];
+                assert_eq!(
+                    file(&retired.to_path()),
+                    (bytes.clone().unwrap(), *identity, *modified)
+                );
+                if sidecar {
+                    let (bytes, identity, modified) =
+                        &old_physical[&sidecar_path(&old.path.to_path())];
+                    assert_eq!(
+                        file(&sidecar_path(&retired.to_path())),
+                        (bytes.clone().unwrap(), *identity, *modified)
+                    );
+                }
+                assert!(!old.path.to_path().exists());
+                assert!(!sidecar_path(&old.path.to_path()).exists());
+                eprintln!(
+                    "LEGACY_ALIAS_B_DISTINCT_SLOT member={index} old={old:?} preservation={receipt:?} retirement={retired:?}"
+                );
+            }
+        }
+        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+            .await
+            .unwrap();
+        let histories = state::db::DownloadContextStateStore::get_primary_layout_receipts(&db)
+            .await
+            .unwrap();
+        for member in &committed.members {
+            let Some(preserved) = &member.preserved else {
+                continue;
+            };
+            let receipt = histories
+                .iter()
+                .find(|r| {
+                    r.local_path.as_ref() == Some(&preserved.path.to_path())
+                        && r.is_preserved_history
+                })
+                .unwrap();
+            assert!(!receipt.is_current_path);
+            assert_eq!(receipt.library, "PrimarySync");
+            assert_eq!(receipt.id, "asset-501");
+            assert_eq!(receipt.version_size.as_str(), preserved.version);
+            assert_eq!(receipt.checksum, preserved.provider_checksum);
+            assert_eq!(receipt.download_checksum, preserved.source_checksum);
+            assert_eq!(
+                receipt.local_checksum.as_deref(),
+                Some(
+                    data_encoding::HEXLOWER
+                        .encode(&preserved.fingerprint.sha256)
+                        .as_str()
+                )
+            );
+        }
+        assert_eq!(
+            histories.iter().filter(|r| r.is_preserved_history).count(),
+            3
+        );
+        let current_original = histories
+            .iter()
+            .find(|r| r.local_path.as_ref() == Some(&destination))
+            .unwrap();
+        assert!(current_original.is_current_path && !current_original.is_preserved_history);
+        assert_eq!(
+            current_original.version_size,
+            state::VersionSizeKey::Original
+        );
+        assert_eq!(current_original.checksum, provider_hash(ORIGINAL));
+        assert_eq!(
+            current_original.local_checksum.as_deref(),
+            Some(
+                data_encoding::HEXLOWER
+                    .encode(&Sha256::digest(ORIGINAL))
+                    .as_str()
+            )
+        );
+        let retained_source = histories
+            .iter()
+            .find(|r| r.local_path.as_ref() == Some(&original))
+            .unwrap();
+        assert!(!retained_source.is_current_path && !retained_source.is_preserved_history);
+        drop(db);
+        assert_eq!(file(&unassociated), unassociated_file);
+        if let Some(xmp) = &unassociated_xmp {
+            assert_eq!(&file(&sidecar_path(&unassociated)), xmp);
+        }
+        assert_eq!(file(&replacement_archive), replacement);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        for (endpoint, count) in [("/original", 1), ("/edit-heic", 0), ("/edit-two", 0)] {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r.method == "GET" && r.url.path() == endpoint)
+                    .count(),
+                count
+            );
+        }
+        let quiet_files = physical();
+        let quiet_receipts = rows(receipt_sql);
+        let quiet_paths = rows(path_sql);
+        let custody = || {
+            [
+                rows("SELECT * FROM primary_layout_operations ORDER BY operation"),
+                rows("SELECT * FROM primary_layout_members ORDER BY operation,member"),
+                rows("SELECT * FROM primary_layout_bindings ORDER BY family"),
+                rows("SELECT * FROM primary_layout_claims ORDER BY path_key"),
+                rows("SELECT * FROM primary_layout_preserved ORDER BY operation,member"),
+                rows(
+                    "SELECT * FROM primary_layout_superseded_paths ORDER BY library,child,version,provider_checksum,native_path",
+                ),
+            ]
+        };
+        let quiet_custody = custody();
+        let quiet_checkpoint = rows(checkpoint_sql);
+        for round in 0..2 {
+            let (quiet, lookups) = recover().await;
+            assert_eq!(
+                (
+                    quiet.stats.failed,
+                    quiet.stats.downloaded,
+                    quiet.stats.skipped.uncertain,
+                    quiet.stats.state_write_failures
+                ),
+                (0, 0, 0, 0),
+                "{quiet:?}"
+            );
+            assert!(quiet.complete);
+            assert_eq!(lookups, 0);
+            assert_eq!(physical(), quiet_files);
+            assert_eq!(rows(receipt_sql), quiet_receipts);
+            assert_eq!(rows(path_sql), quiet_paths);
+            assert_eq!(custody(), quiet_custody);
+            assert_eq!(rows(checkpoint_sql), quiet_checkpoint);
+            assert_eq!(file(&replacement_archive), replacement);
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert_source();
+            assert_eq!(rows(debt_sql), catalogue_debt);
+            let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+                .await
+                .unwrap();
+            let actual = state::db::DownloadContextStateStore::get_primary_layout_receipts(&db)
+                .await
+                .unwrap();
+            assert_eq!(format!("{actual:?}"), format!("{histories:?}"));
+            eprintln!(
+                "LEGACY_ALIAS_B_QUIET sidecar={sidecar} round={round} operation={} files={} history=3 distinct_retirement_slots=3 full_scoped19={} path_proofs={} checkpoint={quiet_checkpoint:?} GETs=1 lookups=0 protected_source_unassociated_and_replacement_unchanged=true",
+                op.operation,
+                quiet_files.len(),
+                quiet_receipts.len(),
+                quiet_paths.len()
             );
         }
     }

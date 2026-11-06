@@ -11,6 +11,406 @@ use crate::state::db::provider_selection::{
 use serde_json::json;
 use std::sync::Arc;
 
+async fn named_admission_declaration(
+    f: &Fixture,
+    kind: Option<&str>,
+    name: &str,
+    metadata_enabled: bool,
+) -> (
+    crate::state::db::provider_generations::ActiveGeneration,
+    ActiveDecision,
+    Vec<crate::state::AssetRecord>,
+) {
+    let (_, scope, zone) = f.pass.album.private_selection_scope().unwrap().unwrap();
+    let current = f.pass.album.confirm_catalog_asset("asset-m").await.unwrap();
+    let mut config = f.config.with_pass(&f.pass);
+    config.metadata.set_exif_datetime = metadata_enabled;
+    let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+        .await
+        .unwrap();
+    let plan = planner
+        .plan_download_asset(&current.asset, &config)
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    let records: Vec<_> = plan
+        .tasks
+        .iter()
+        .map(|task| pending_record_for_task(&config, &current.asset, task))
+        .collect();
+    let mut selected_pass = json!({"key":"named-admission","scope":f.pass.album.selection_scope()});
+    selected_pass["scope"]["name"] = json!(name);
+    if let Some(kind) = kind {
+        selected_pass["kind"] = json!(kind);
+    }
+    let root = f.db.begin_selection_generation(owner(), GenerationSpec {
+        format:2, scope, zone, config_hash:"a".repeat(64), basis:"b".repeat(64),
+        profile:json!({"coverage":"selected_downloads","current_download_metadata":1,"passes":[selected_pass]}),
+        metadata_enabled, metadata_flags:crate::download::pipeline::MetadataFlags::from(&config).bits(),
+    }, MAX_GENERATION_BYTES).await.unwrap();
+    let decision = ActiveDecision {
+        state_id: "asset-m".into(),
+        sources: Vec::new(),
+        decision: SelectionDecision {
+            pass_key: "named-admission".into(),
+            child: "asset-m".into(),
+            master: Some("m".into()),
+            confirmation: Some(current.body),
+            outcome: SelectionOutcome::Selected,
+            reason: String::new(),
+            destinations: plan
+                .tasks
+                .iter()
+                .zip(&records)
+                .map(|(task, record)| SelectionDestination {
+                    version_size: task.version_size.as_str().into(),
+                    path: SelectionPath::from_path(&task.download_path),
+                    checksum: task.checksum.to_string(),
+                    size: task.size,
+                    metadata_hash: record.metadata.metadata_hash.clone().unwrap(),
+                })
+                .collect(),
+        },
+    };
+    (root, decision, records)
+}
+
+#[tokio::test]
+async fn named_admission_unfiled_label_creates_neither_membership_nor_retry_marker() {
+    for metadata_enabled in [false, true] {
+        for (kind, name, expected) in [
+            (Some("Unfiled"), "TestAlbum", false),
+            (Some("Album"), "TestAlbum", true),
+            (Some("SmartFolder"), "TestAlbum", true),
+            (None, "TestAlbum", true),
+            (Some("FutureKind"), "TestAlbum", true),
+            (Some("Album"), "", false),
+        ] {
+            let f = Fixture::new().await;
+            let (root, decision, records) =
+                named_admission_declaration(&f, kind, name, metadata_enabled).await;
+            let projection =
+                f.db.project_selection_decision(
+                    owner(),
+                    root.id.clone(),
+                    decision.clone(),
+                    records.clone(),
+                    MAX_GENERATION_BYTES,
+                )
+                .await
+                .unwrap();
+            assert!(projection.admitted, "{kind:?}: {}", projection.reason);
+            // This is the downstream owner that inherited the invented association.
+            f.db.upsert_seen(&records[0]).await.unwrap();
+            f.preserved().await;
+            let Fixture {
+                dir,
+                db,
+                capture,
+                session,
+                pass,
+                config,
+            } = f;
+            drop((db, capture, session, pass, config));
+            let db = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+                .await
+                .unwrap();
+            assert_eq!(
+                db.selection_decision(
+                    owner(),
+                    root.id.clone(),
+                    "named-admission".into(),
+                    "asset-m".into()
+                )
+                .await
+                .unwrap(),
+                Some(decision)
+            );
+            assert!(
+                !db.selection_destination_verified(
+                    owner(),
+                    root.id,
+                    "named-admission".into(),
+                    "asset-m".into(),
+                    "original".into()
+                )
+                .await
+                .unwrap()
+            );
+            let conn = db
+                .acquire_lock("reopened name-derived admission evidence")
+                .unwrap();
+            let (associations, marked):(i64,bool) = conn.query_row("SELECT (SELECT count(*) FROM asset_albums WHERE library='PrimarySync' AND asset_id='asset-m'),metadata_write_failed_at IS NOT NULL FROM assets WHERE library='PrimarySync' AND id='asset-m'",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+            assert_eq!(
+                (associations, marked),
+                (i64::from(expected), expected),
+                "kind={kind:?}, metadata={metadata_enabled}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn named_admission_unfiled_label_cannot_block_on_unfinished_groupings() {
+    for kind in [
+        Some("Unfiled"),
+        Some("Album"),
+        Some("SmartFolder"),
+        None,
+        Some("FutureKind"),
+    ] {
+        let f = Fixture::new().await;
+        let (old, old_decision, records) =
+            named_admission_declaration(&f, Some("Unfiled"), "", true).await;
+        assert!(
+            f.db.project_selection_decision(
+                owner(),
+                old.id.clone(),
+                old_decision,
+                records,
+                MAX_GENERATION_BYTES
+            )
+            .await
+            .unwrap()
+            .admitted
+        );
+        let (root, decision, records) =
+            named_admission_declaration(&f, kind, "TestAlbum", true).await;
+        let protected = || {
+            f.db.acquire_lock("unfinished grouping intent").unwrap().query_row("SELECT grouping_hash,intent_hash,verified_media,verified_metadata,frozen_metadata FROM provider_active_destinations WHERE generation=?1",[&old.id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,bool>(2)?,row.get::<_,bool>(3)?,row.get::<_,Option<Vec<u8>>>(4)?))).unwrap()
+        };
+        let before = protected();
+        assert!(!before.2 && !before.3 && before.4.is_none());
+        let projection =
+            f.db.project_selection_decision(
+                owner(),
+                root.id.clone(),
+                decision.clone(),
+                records,
+                MAX_GENERATION_BYTES,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            projection.admitted,
+            kind == Some("Unfiled"),
+            "{kind:?}: {}",
+            projection.reason
+        );
+        assert_eq!(
+            projection.reason,
+            if kind == Some("Unfiled") {
+                ""
+            } else {
+                "unfinished_grouping_conflict"
+            }
+        );
+        assert_eq!(
+            protected(),
+            before,
+            "independent writer intent must survive either outcome"
+        );
+        f.preserved().await;
+        let Fixture {
+            dir,
+            db,
+            capture,
+            session,
+            pass,
+            config,
+        } = f;
+        drop((db, capture, session, pass, config));
+        let db = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.selection_decision(owner(), root.id, "named-admission".into(), "asset-m".into())
+                .await
+                .unwrap(),
+            Some(decision)
+        );
+        let conn = db
+            .acquire_lock("reopened grouping admission state")
+            .unwrap();
+        let (admission, reason): (String, String) = conn
+            .query_row(
+                "SELECT admission,reason FROM provider_active_decisions WHERE generation<>?1",
+                [old.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            admission,
+            if kind == Some("Unfiled") {
+                "admitted"
+            } else {
+                "deferred"
+            }
+        );
+        assert_eq!(reason, projection.reason);
+    }
+}
+
+#[tokio::test]
+async fn named_admission_does_not_clean_up_existing_unfiled_label_association() {
+    let f = Fixture::new().await;
+    f.db.add_asset_album("PrimarySync", "asset-m", "TestAlbum", "icloud")
+        .await
+        .unwrap();
+    let (root, decision, records) =
+        named_admission_declaration(&f, Some("Unfiled"), "TestAlbum", false).await;
+    assert!(
+        f.db.project_selection_decision(
+            owner(),
+            root.id,
+            decision,
+            records.clone(),
+            MAX_GENERATION_BYTES
+        )
+        .await
+        .unwrap()
+        .admitted
+    );
+    f.db.upsert_seen(&records[0]).await.unwrap();
+    let conn =
+        f.db.acquire_lock("existing label is not cleanup authority")
+            .unwrap();
+    let (associations, marked): (i64, bool) = conn.query_row(
+        "SELECT (SELECT count(*) FROM asset_albums WHERE library='PrimarySync' AND asset_id='asset-m' AND album_name='TestAlbum'),metadata_write_failed_at IS NOT NULL FROM assets WHERE library='PrimarySync' AND id='asset-m'",
+        [], |row| Ok((row.get(0)?, row.get(1)?))
+    ).unwrap();
+    assert_eq!((associations, marked), (1, true));
+}
+
+#[tokio::test]
+async fn named_admission_preserves_real_membership_and_prepared_capture_debt() {
+    use crate::state::db::MetadataRewriteQueue;
+    use crate::state::{METADATA_CAPTURE_REVISION, MetadataCapture};
+    let f = Fixture::new().await;
+    f.db.upsert_album_container("PrimarySync", "real-container", "RealAlbum", "Album")
+        .await
+        .unwrap();
+    assert!(
+        f.db.upsert_album_membership_delta(
+            "PrimarySync",
+            "real-container",
+            "asset-m",
+            Some("m"),
+            "icloud"
+        )
+        .await
+        .unwrap()
+    );
+    let peer = crate::test_helpers::TestAssetRecord::new("capture-peer").build();
+    f.db.upsert_seen(&peer).await.unwrap();
+    let path = f.config.directory.join("existing.jpg");
+    f.db.mark_downloaded(
+        "PrimarySync",
+        "capture-peer",
+        "original",
+        &path,
+        "retained-local",
+        None,
+    )
+    .await
+    .unwrap();
+    let capture = MetadataCapture {
+        shared: peer.metadata.clone(),
+        renditions: Default::default(),
+    };
+    assert_eq!(
+        f.db.refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            "capture-peer",
+            (&capture, peer.created_at, peer.added_at),
+            true,
+            true,
+            METADATA_CAPTURE_REVISION
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let pending =
+        f.db.get_pending_metadata_rewrites_page_for_queue(
+            MetadataRewriteQueue::CaptureRepair,
+            None,
+            0,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(
+        f.db.record_capture_repair_prepared(&pending[0], "prepared-capture", 42)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let before = noncommit_choice_snapshot(&f.db);
+    let (root, decision, records) =
+        named_admission_declaration(&f, Some("Unfiled"), "TestAlbum", false).await;
+    assert!(
+        f.db.project_selection_decision(
+            owner(),
+            root.id.clone(),
+            decision.clone(),
+            records.clone(),
+            MAX_GENERATION_BYTES
+        )
+        .await
+        .unwrap()
+        .admitted
+    );
+    f.db.upsert_seen(&records[0]).await.unwrap();
+    f.preserved().await;
+    let Fixture {
+        dir,
+        db,
+        capture,
+        session,
+        pass,
+        config,
+    } = f;
+    drop((db, capture, session, pass, config));
+    let db = SqliteStateDb::open_owned(&dir.path().join("state.db"), &owner())
+        .await
+        .unwrap();
+    assert_eq!(
+        db.selection_decision(owner(), root.id, "named-admission".into(), "asset-m".into())
+            .await
+            .unwrap(),
+        Some(decision)
+    );
+    let conn = db
+        .acquire_lock("real membership and capture debt survive Unfiled admission")
+        .unwrap();
+    let names:Vec<String>=conn.prepare("SELECT album_name FROM asset_albums WHERE library='PrimarySync' AND asset_id='asset-m' ORDER BY album_name").unwrap().query_map([],|row|row.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(names, ["RealAlbum"]);
+    assert!(
+        conn.query_row(
+            "SELECT metadata_write_failed_at IS NOT NULL FROM assets WHERE id='asset-m'",
+            [],
+            |row| row.get::<_, bool>(0)
+        )
+        .unwrap()
+    );
+    assert_eq!(conn.query_row("SELECT count(*) FROM asset_album_memberships WHERE container_id='real-container' AND asset_record_name='asset-m'",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+    let debt:(String,i64,bool)=conn.query_row("SELECT capture_repair_output_checksum,capture_repair_output_size,metadata_write_failed_at IS NOT NULL FROM assets WHERE id='capture-peer'",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert_eq!(debt, ("prepared-capture".into(), 42, true));
+    drop(conn);
+    let after = noncommit_choice_snapshot(&db);
+    assert_eq!(
+        before
+            .iter()
+            .find(|(table, _)| table == "asset_metadata_paths"),
+        after
+            .iter()
+            .find(|(table, _)| table == "asset_metadata_paths"),
+        "prepared per-path capture packet unchanged"
+    );
+}
+
 fn noncommit_choice_snapshot(db: &SqliteStateDb) -> Vec<(String, Vec<String>)> {
     let conn = db
         .acquire_lock("noncommit choice and admission snapshot")

@@ -2002,8 +2002,12 @@ impl SqliteStateDb {
                     }
                 }
             }
+            let selected_pass=pass(&root,&d.pass_key)?;
+            // An Unfiled path label is not evidence of album membership.
+            let album_name=selected_pass.pointer("/scope/name").and_then(Value::as_str).filter(|name|
+                !name.is_empty() && selected_pass.get("kind").and_then(Value::as_str)!=Some("Unfiled"));
             if d.outcome==SelectionOutcome::Selected
-                && let Some(album)=pass(&root,&d.pass_key)?.pointer("/scope/name").and_then(Value::as_str).filter(|name|!name.is_empty()) {
+                && let Some(album)=album_name {
                 let conflict:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation WHERE w.library=?1 AND w.asset_id=?2 AND w.admitted=1 AND g.metadata_enabled=1 AND w.verified_metadata=0 AND w.frozen_metadata IS NULL AND w.grouping_hash IS NOT NULL) AND NOT EXISTS(SELECT 1 FROM asset_albums WHERE library=?1 AND asset_id=?2 AND album_name=?3)",params![root.spec.zone.get("zoneName").and_then(Value::as_str),manifest.state_id,album],|r|r.get(0))?;
                 if conflict {reason="unfinished_grouping_conflict".to_owned()}
             }
@@ -2058,7 +2062,7 @@ impl SqliteStateDb {
                     }
                 }
                 tx.execute("INSERT INTO asset_master_mappings(library,asset_record_name,master_record_name,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(library,asset_record_name) DO UPDATE SET master_record_name=excluded.master_record_name,updated_at=excluded.updated_at",params![library,d.child,d.master,now])?;
-                if let Some(album)=pass(&root,&d.pass_key)?.pointer("/scope/name").and_then(Value::as_str).filter(|name|!name.is_empty()) {
+                if let Some(album)=album_name {
                     tx.execute("INSERT OR IGNORE INTO asset_albums(library,asset_id,album_name,source) VALUES(?1,?2,?3,'icloud')",params![library,manifest.state_id,album])?;
                 }
                 refresh_asset_album_groupings_tx(&tx,library,&manifest.state_id,None)?;
