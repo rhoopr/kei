@@ -2893,3 +2893,709 @@ async fn v027_deferred_observation_requires_fresh_proof_and_atomic_first_destina
     assert!(f.count("provider_active_destinations") > 0);
     f.preserved().await;
 }
+
+// Both tests need a genuine cross-rendition nomination, not a seeded reservation.
+struct IdentityRaceNomination {
+    f: Fixture,
+    config: crate::download::DownloadConfig,
+    asset: crate::icloud::photos::PhotoAsset,
+    confirmation: crate::download::orchestration::generation::SelectionConfirmation,
+    planner: TaskPlanner,
+    plan: crate::download::planner::AssetTaskPlan,
+}
+
+async fn identity_race_nomination(server: &wiremock::MockServer) -> IdentityRaceNomination {
+    use crate::download::orchestration::generation;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let original = b"\xff\xd8\xff\xe0unchanged original";
+    let adjusted = b"\xff\xd8\xff\xe0current adjusted";
+    let checksum = |bytes: &[u8]| data_encoding::BASE64.encode(&Sha256::digest(bytes));
+    for (name, bytes, expected) in [
+        ("original", original.as_slice(), 1),
+        ("adjusted", adjusted.as_slice(), 0),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .expect(expected)
+            .mount(server)
+            .await;
+    }
+    let mut dir = tempfile::tempdir().unwrap();
+    if std::env::var_os("KEI_IDENTITY_RACE_RETAIN_FIXTURE").is_some() {
+        dir.disable_cleanup(true);
+        eprintln!("IDENTITY_RACE_FIXTURE path={}", dir.path().display());
+    }
+    let mut f = Fixture::new_in(dir, "state.db").await;
+    f.config.folder_structure = "none".into();
+    f.config.edited = true;
+    f.config.edited_naming = crate::types::EditedNaming::Primary;
+    {
+        let mut values = f.session.records.lock().unwrap();
+        values[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+        values[0]["fields"]["resOriginalRes"]["value"] = json!({
+            "downloadURL":format!("{}/original", server.uri()),
+            "size":original.len(), "fileChecksum":checksum(original)
+        });
+    }
+    let first = stream_collision_child(&f, "asset-m", false).await;
+    assert_eq!((first.downloaded, first.state_write_failures), (1, 0));
+    assert!(first.failed.is_empty());
+    assert_eq!(
+        std::fs::read(f.config.directory.join("photo.JPG")).unwrap(),
+        original
+    );
+    {
+        let mut values = f.session.records.lock().unwrap();
+        values[1]["fields"]["resJPEGFullRes"] = json!({"value":{
+            "downloadURL":format!("{}/adjusted", server.uri()),
+            "size":adjusted.len(), "fileChecksum":checksum(adjusted)
+        }});
+        values[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+        values[1]["fields"]["adjustmentRenderType"] = json!({"value":1});
+    }
+    f.config.resolution = crate::types::PhotoResolution::None;
+    let context = generation::context_for_format(
+        std::slice::from_ref(&f.pass),
+        &f.config,
+        super::controls(),
+        2,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let run = context
+        .start_for_test(std::slice::from_ref(&f.pass), &f.config)
+        .await
+        .unwrap();
+    let key = generation::pass_key(&f.pass);
+    let observed = f
+        .pass
+        .album
+        .confirm_catalog_asset("asset-m")
+        .await
+        .unwrap()
+        .asset;
+    let (asset, confirmation) = run.confirm(&key, observed).await.unwrap();
+    let mut config = f.config.with_pass(&f.pass);
+    config.selection_run = Some(run.clone());
+    config.selection_pass = Some(key.clone());
+    let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+        .await
+        .unwrap();
+    let plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    let task = &plan.tasks[0];
+    let p = config.directory.join("photo.JPG");
+    assert_eq!(task.version_size, crate::state::VersionSizeKey::Adjusted);
+    assert_eq!(task.checksum.as_ref(), checksum(adjusted));
+    assert_eq!(task.size, adjusted.len() as u64);
+    assert_ne!(task.download_path, p);
+    assert!(!task.download_path.exists());
+    assert!(task.superseded_requested(&config.directory, &p).is_some());
+    let binding = task.publication_binding.as_deref().unwrap();
+    let (account, provider) = f.capture.owner.authenticated_keys().unwrap();
+    assert_eq!(
+        json!([
+            binding.account_key,
+            binding.provider_key,
+            binding.scope,
+            binding.library,
+            binding.child,
+            binding.master,
+            binding.state_id,
+            binding.origin_pass
+        ]),
+        json!([
+            account,
+            provider,
+            run.root.spec.scope,
+            "PrimarySync",
+            "asset-m",
+            "m",
+            "asset-m",
+            key
+        ])
+    );
+    let choices: Vec<_> = planner.reconciliation_reservations().collect();
+    assert_eq!(choices.len(), 1);
+    let choice = choices[0];
+    assert_eq!(choice.library.as_ref(), "PrimarySync");
+    assert_eq!(choice.asset_id.as_ref(), "asset-m");
+    assert_eq!(choice.version_size, task.version_size);
+    assert_eq!(
+        choice.requested_path_key.0,
+        crate::fs_util::confined_path_key(&p).unwrap()
+    );
+    assert_eq!(
+        choice.destination_path_key.0,
+        crate::fs_util::confined_path_key(&task.download_path).unwrap()
+    );
+    assert_eq!(choice.destination_path, task.download_path);
+    let content = choice.content.as_ref().unwrap();
+    assert_eq!(
+        (content.checksum.as_ref(), content.size),
+        (task.checksum.as_ref(), task.size)
+    );
+    assert_eq!(run.root.spec.format, 2);
+    assert_eq!(f.count("reconciliation_paths"), 0);
+    assert_eq!(f.count("provider_active_destinations"), 0);
+    assert!(
+        f.db.bound_historical_downloads(
+            binding.clone(),
+            "adjusted".into(),
+            task.checksum.to_string(),
+            task.size
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    eprintln!(
+        "IDENTITY_RACE_NOMINATION P={} S={} adjusted_history=0 intent=0 admission=0 original_GET=1 adjusted_GET=0",
+        p.display(),
+        task.download_path.display()
+    );
+    IdentityRaceNomination {
+        f,
+        config,
+        asset,
+        confirmation,
+        planner,
+        plan,
+    }
+}
+
+// All-column snapshots retain proof hashes, nullable trust fields and immutable debt.
+fn identity_race_rows(
+    db: &SqliteStateDb,
+    table: &str,
+    column: &str,
+    value: &str,
+) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn = db.acquire_lock("identity race immutable rows").unwrap();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT * FROM {table} WHERE {column}=?1 ORDER BY 1"
+        ))
+        .unwrap();
+    let columns = stmt.column_count();
+    stmt.query_map([value], |row| {
+        (0..columns)
+            .map(|i| row.get(i))
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+#[tokio::test]
+async fn publication_choice_after_preload_pending_owner_race_is_path_local() {
+    use crate::state::error::StateError;
+    use tokio_util::sync::CancellationToken;
+
+    for conflict in [false, true] {
+        let server = wiremock::MockServer::start().await;
+        let IdentityRaceNomination {
+            f,
+            config,
+            asset,
+            confirmation,
+            mut planner,
+            mut plan,
+        } = identity_race_nomination(&server).await;
+        let run = config.selection_run.as_ref().unwrap();
+        let key = config.selection_pass.as_ref().unwrap();
+        let p = config.directory.join("photo.JPG");
+        let s = plan.tasks[0].download_path.clone();
+        let checksum = plan.tasks[0].checksum.to_string();
+        let size = plan.tasks[0].size;
+        let original = std::fs::read(&p).unwrap();
+        let file = std::fs::File::open(&p).unwrap();
+        let physical = (
+            crate::fs_util::file_identity(&file).unwrap(),
+            file.metadata().unwrap().modified().unwrap(),
+        );
+        drop(file);
+        let proof = identity_race_rows(&f.db, "download_receipts", "child", "asset-m");
+        assert_eq!(proof.len(), 1);
+        let token = identity_race_rows(&f.db, "metadata", "key", "sync_token:PrimarySync");
+        let unrelated = identity_race_rows(
+            &f.db,
+            "metadata",
+            "key",
+            "pending_sync_token:sparse:OtherZone",
+        );
+        assert_eq!((token.len(), unrelated.len()), (1, 1));
+        // The independent identity appears only after A's actual planner preload.
+        let leaf = if conflict {
+            s.file_name().unwrap().to_str().unwrap()
+        } else {
+            "companion.JPG"
+        };
+        {
+            let mut values = f.session.records.lock().unwrap();
+            let adjusted = values[1]["fields"]["resJPEGFullRes"].clone();
+            let mut b = records("b", CURRENT, "independent equal-resource adjusted child");
+            b[0]["fields"]["filenameEnc"]["value"] = json!(leaf);
+            b[1]["fields"]["resJPEGFullRes"] = adjusted;
+            b[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+            b[1]["fields"]["adjustmentRenderType"] = json!({"value":1});
+            values.extend(b);
+        }
+        let confirmed = f.pass.album.confirm_catalog_asset("asset-b").await.unwrap();
+        assert_eq!(confirmed.asset.id(), "b");
+        assert_eq!(confirmed.asset.state_id(), "asset-b");
+        let b_config = f.config.with_pass(&f.pass);
+        let mut b_planner = TaskPlanner::for_download(b_config.state_db.as_deref())
+            .await
+            .unwrap();
+        let b_plan = b_planner
+            .plan_download_asset(&confirmed.asset, &b_config)
+            .await
+            .unwrap();
+        assert_eq!(b_plan.tasks.len(), 1);
+        let b_task = &b_plan.tasks[0];
+        let b_path = b_task.download_path.clone();
+        assert_eq!(
+            b_path,
+            config.directory.join(leaf),
+            "real path owner did not derive B's target"
+        );
+        assert_eq!(b_path == s, conflict);
+        assert_ne!(b_path, p);
+        assert!(!b_path.exists());
+        assert_eq!(
+            (b_task.version_size, b_task.checksum.as_ref(), b_task.size),
+            (
+                plan.tasks[0].version_size,
+                plan.tasks[0].checksum.as_ref(),
+                plan.tasks[0].size
+            )
+        );
+        let b_binding = b_task.publication_binding.as_deref().unwrap();
+        let a_binding = plan.tasks[0].publication_binding.as_deref().unwrap();
+        assert_eq!(
+            json!([
+                b_binding.account_key,
+                b_binding.provider_key,
+                b_binding.scope,
+                b_binding.library,
+                b_binding.child,
+                b_binding.master,
+                b_binding.state_id,
+                b_binding.origin_pass
+            ]),
+            json!([
+                a_binding.account_key,
+                a_binding.provider_key,
+                a_binding.scope,
+                "PrimarySync",
+                "asset-b",
+                "b",
+                "asset-b",
+                key
+            ])
+        );
+        let pending = pending_record_for_task(&b_config, &confirmed.asset, b_task);
+        assert!(pending.local_path.is_none());
+        let b_decision = ActiveDecision {
+            state_id: confirmed.asset.state_id().into(),
+            sources: Vec::new(),
+            decision: SelectionDecision {
+                pass_key: key.clone(),
+                child: confirmed.asset.asset_record_name().into(),
+                master: Some(confirmed.asset.id().into()),
+                confirmation: Some(confirmed.body),
+                outcome: SelectionOutcome::Selected,
+                reason: String::new(),
+                destinations: vec![SelectionDestination {
+                    version_size: b_task.version_size.as_str().into(),
+                    path: SelectionPath::from_path(&b_path),
+                    checksum: b_task.checksum.to_string(),
+                    size: b_task.size,
+                    metadata_hash: pending.metadata.metadata_hash.clone().unwrap(),
+                }],
+            },
+        };
+        let database = f.dir.path().join("state.db");
+        let external = SqliteStateDb::open_owned(&database, &owner())
+            .await
+            .unwrap();
+        assert!(
+            external
+                .project_selection_decision(
+                    owner(),
+                    run.root.id.clone(),
+                    b_decision.clone(),
+                    vec![pending],
+                    MAX_GENERATION_BYTES
+                )
+                .await
+                .unwrap()
+                .admitted
+        );
+        assert_eq!(
+            external
+                .selection_decision(owner(), run.root.id.clone(), key.clone(), "asset-b".into())
+                .await
+                .unwrap(),
+            Some(b_decision)
+        );
+        let debt = |db: &SqliteStateDb| {
+            [
+                identity_race_rows(db, "provider_active_destinations", "child", "asset-b"),
+                identity_race_rows(db, "provider_active_decisions", "child", "asset-b"),
+                identity_race_rows(db, "assets", "id", "asset-b"),
+                identity_race_rows(db, "asset_master_mappings", "asset_record_name", "asset-b"),
+                identity_race_rows(db, "asset_metadata_paths", "id", "asset-b"),
+            ]
+        };
+        let saved_debt = debt(&external);
+        assert_eq!(
+            (
+                saved_debt[0].len(),
+                saved_debt[1].len(),
+                saved_debt[2].len()
+            ),
+            (1, 1, 1)
+        );
+        {
+            let conn = external
+                .acquire_lock("real pending B binding and no publication")
+                .unwrap();
+            let row: String = conn.query_row("SELECT json_array(d.generation,d.pass_key,d.child,d.library,d.asset_id,d.master,d.version_size,d.path,d.checksum,d.size_bytes,d.admitted,d.verified_media,d.verified_metadata,d.prepared_hash,d.prepared_checksum,d.source_checksum,d.local_checksum,g.scope,g.account_key,g.provider_key) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.child='asset-b'", [], |r| r.get(0)).unwrap();
+            eprintln!("IDENTITY_RACE_PENDING conflict={conflict} row={row}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&row).unwrap(),
+                json!([
+                    run.root.id,
+                    key,
+                    "asset-b",
+                    "PrimarySync",
+                    "asset-b",
+                    "b",
+                    "adjusted",
+                    SelectionPath::from_path(&b_path).key().unwrap(),
+                    b_task.checksum,
+                    b_task.size,
+                    1,
+                    0,
+                    0,
+                    null,
+                    null,
+                    null,
+                    null,
+                    run.root.spec.scope,
+                    b_binding.account_key,
+                    b_binding.provider_key
+                ])
+            );
+            assert_eq!(conn.query_row("SELECT count(*) FROM assets WHERE id='asset-b' AND status='pending' AND local_path IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        }
+        let preserved = |db: &SqliteStateDb| {
+            assert_eq!(debt(db), saved_debt);
+            assert_eq!(
+                identity_race_rows(db, "download_receipts", "child", "asset-m"),
+                proof
+            );
+            assert_eq!(
+                identity_race_rows(db, "metadata", "key", "sync_token:PrimarySync"),
+                token
+            );
+            assert_eq!(
+                identity_race_rows(db, "metadata", "key", "pending_sync_token:sparse:OtherZone"),
+                unrelated
+            );
+            assert!(identity_race_rows(db, "download_receipts", "child", "asset-b").is_empty());
+            assert!(identity_race_rows(db, "reconciliation_paths", "id", "asset-b").is_empty());
+            assert_eq!(
+                db.acquire_lock("no prepared publication")
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(*) FROM owned_temp_files WHERE publication IS NOT NULL",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(std::fs::read(&p).unwrap(), original);
+            let file = std::fs::File::open(&p).unwrap();
+            assert_eq!(
+                (
+                    crate::fs_util::file_identity(&file).unwrap(),
+                    file.metadata().unwrap().modified().unwrap()
+                ),
+                physical
+            );
+            assert!(!s.exists());
+            assert!(!b_path.exists());
+        };
+        let a_state = |db: &SqliteStateDb, admitted: bool| {
+            let mappings = identity_race_rows(db, "reconciliation_paths", "id", "asset-m");
+            let destinations =
+                identity_race_rows(db, "provider_active_destinations", "child", "asset-m");
+            assert_eq!(
+                (mappings.len(), destinations.len()),
+                (usize::from(!conflict), usize::from(admitted))
+            );
+            assert_eq!(
+                identity_race_rows(db, "provider_active_decisions", "child", "asset-m").len(),
+                usize::from(admitted)
+            );
+            let conn = db
+                .acquire_lock("exact A helper and projection boundaries")
+                .unwrap();
+            if !conflict {
+                let mapping: String = conn.query_row("SELECT json_array(library,id,version_size,requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size) FROM reconciliation_paths WHERE id='asset-m'", [], |r| r.get(0)).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&mapping).unwrap(),
+                    json!([
+                        "PrimarySync",
+                        "asset-m",
+                        "adjusted",
+                        crate::fs_util::confined_path_key(&p).unwrap(),
+                        crate::fs_util::confined_path_key(&s).unwrap(),
+                        s.to_str().unwrap(),
+                        checksum,
+                        size
+                    ])
+                );
+            }
+            if admitted {
+                let row: String = conn.query_row("SELECT json_array(d.generation,d.pass_key,d.child,d.library,d.asset_id,d.master,d.version_size,d.path,d.checksum,d.size_bytes,d.admitted,d.verified_media,g.scope,g.account_key,g.provider_key) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.child='asset-m'", [], |r| r.get(0)).unwrap();
+                let (account, provider) = f.capture.owner.authenticated_keys().unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&row).unwrap(),
+                    json!([
+                        run.root.id,
+                        key,
+                        "asset-m",
+                        "PrimarySync",
+                        "asset-m",
+                        "m",
+                        "adjusted",
+                        SelectionPath::from_path(&s).key().unwrap(),
+                        checksum,
+                        size,
+                        1,
+                        0,
+                        run.root.spec.scope,
+                        account,
+                        provider
+                    ])
+                );
+            }
+        };
+        preserved(&external);
+        assert!(identity_race_rows(&external, "reconciliation_paths", "id", "asset-m").is_empty());
+        assert!(
+            identity_race_rows(
+                &external,
+                "provider_active_destinations",
+                "child",
+                "asset-m"
+            )
+            .is_empty()
+        );
+        let result = planner
+            .persist_execution_publication_choices(&asset, &config, &plan.tasks)
+            .await;
+        eprintln!("IDENTITY_RACE_HELPER conflict={conflict} result={result:?}");
+        if conflict {
+            assert!(matches!(
+                result.unwrap_err().downcast_ref::<StateError>(),
+                Some(StateError::ProviderWorkConflict)
+            ));
+            assert_eq!(planner.reconciliation_reservations().count(), 1);
+        } else {
+            assert!(result.unwrap());
+        }
+        preserved(&f.db);
+        a_state(&f.db, false);
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].download_path, s);
+        assert!(
+            plan.tasks[0]
+                .superseded_requested(&config.directory, &p)
+                .is_some()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let projected = run
+            .project(
+                key,
+                &asset,
+                confirmation,
+                &mut plan,
+                &mut planner,
+                &config,
+                &CancellationToken::new(),
+            )
+            .await;
+        eprintln!("IDENTITY_RACE_PROJECT conflict={conflict} result={projected:?}");
+        if conflict {
+            assert!(matches!(
+                projected.unwrap_err().downcast_ref::<StateError>(),
+                Some(StateError::ProviderWorkConflict)
+            ));
+            assert_eq!(planner.reconciliation_reservations().count(), 1);
+        } else {
+            assert!(projected.unwrap());
+        }
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].download_path, s);
+        assert!(
+            plan.tasks[0]
+                .superseded_requested(&config.directory, &p)
+                .is_some()
+        );
+        for db in [
+            &*f.db,
+            &SqliteStateDb::open_owned(&database, &owner())
+                .await
+                .unwrap(),
+        ] {
+            preserved(db);
+            a_state(db, !conflict);
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        eprintln!(
+            "IDENTITY_RACE_COMPLETE conflict={conflict} owned_reopen=true P_proof_and_file_unchanged=true B_debt_unchanged=true adjusted_GET=0"
+        );
+    }
+}
+
+#[tokio::test]
+async fn publication_choice_zero_history_still_validates_binding() {
+    use crate::state::db::account::AccountOwner;
+    use crate::state::error::StateError;
+
+    let server = wiremock::MockServer::start().await;
+    let nomination = identity_race_nomination(&server).await;
+    let task = &nomination.plan.tasks[0];
+    let binding_a = task.publication_binding.as_deref().unwrap().clone();
+    let reservation = nomination
+        .planner
+        .reconciliation_reservations()
+        .next()
+        .unwrap()
+        .clone();
+    let proof = identity_race_rows(&nomination.f.db, "download_receipts", "child", "asset-m");
+    let owner_b = AccountOwner::authenticated(
+        "identity-race-b@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"identity-race-b"}})).unwrap(),
+    )
+    .unwrap();
+    let path = nomination.f.dir.path().join("account-b.db");
+    let db_b = SqliteStateDb::open_owned(&path, &owner_b).await.unwrap();
+    // bind_publication, not the fixture, derives B's actual account/provider keys.
+    let binding_b = db_b
+        .bind_publication(owner_b.clone(), binding_a.clone())
+        .await
+        .unwrap();
+    assert_ne!(binding_a.account_key, binding_b.account_key);
+    assert_ne!(binding_a.provider_key, binding_b.provider_key);
+    assert_eq!(
+        json!([
+            binding_a.scope,
+            binding_a.library,
+            binding_a.child,
+            binding_a.master,
+            binding_a.state_id,
+            binding_a.origin_pass
+        ]),
+        json!([
+            binding_b.scope,
+            binding_b.library,
+            binding_b.child,
+            binding_b.master,
+            binding_b.state_id,
+            binding_b.origin_pass
+        ])
+    );
+    let own = db_b
+        .bound_historical_downloads(
+            binding_b.clone(),
+            "adjusted".into(),
+            task.checksum.to_string(),
+            task.size,
+        )
+        .await
+        .unwrap();
+    assert!(own.is_empty());
+    assert!(identity_race_rows(&db_b, "download_receipts", "child", "asset-m").is_empty());
+    let foreign = db_b
+        .bound_historical_downloads(
+            binding_a.clone(),
+            "adjusted".into(),
+            task.checksum.to_string(),
+            task.size,
+        )
+        .await
+        .unwrap_err();
+    eprintln!("IDENTITY_RACE_ZERO_HISTORY own=empty foreign_read={foreign:?}");
+    assert!(matches!(
+        foreign,
+        StateError::Invariant {
+            operation: "prepared_publication",
+            ..
+        }
+    ));
+    let requested = SelectionPath::from_path(&nomination.config.directory.join("photo.JPG"));
+    let foreign_write = db_b
+        .reserve_bound_publication_choices(binding_a, vec![(reservation, requested)])
+        .await
+        .unwrap_err();
+    eprintln!("IDENTITY_RACE_ZERO_HISTORY foreign_write={foreign_write:?}");
+    assert!(matches!(
+        foreign_write,
+        StateError::Invariant {
+            operation: "prepared_publication",
+            ..
+        }
+    ));
+    for db in [
+        &db_b,
+        &SqliteStateDb::open_owned(&path, &owner_b).await.unwrap(),
+    ] {
+        assert_eq!(
+            db.acquire_lock("zero foreign intent inserts")
+                .unwrap()
+                .query_row("SELECT count(*) FROM reconciliation_paths", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(identity_race_rows(db, "reconciliation_paths", "id", "asset-m").is_empty());
+        assert!(identity_race_rows(db, "download_receipts", "child", "asset-m").is_empty());
+        assert!(
+            db.bound_historical_downloads(
+                binding_b.clone(),
+                "adjusted".into(),
+                task.checksum.to_string(),
+                task.size
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+    }
+    assert_eq!(
+        identity_race_rows(&nomination.f.db, "download_receipts", "child", "asset-m"),
+        proof
+    );
+    assert_eq!(nomination.f.count("reconciliation_paths"), 0);
+    assert_eq!(nomination.f.count("provider_active_destinations"), 0);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    eprintln!(
+        "IDENTITY_RACE_ZERO_HISTORY_COMPLETE owned_reopen=true own=empty foreign_intent=0 A_proof_unchanged=true adjusted_GET=0"
+    );
+    // Static immutable-principal boundary only; no concurrent account rebind is attempted.
+}
