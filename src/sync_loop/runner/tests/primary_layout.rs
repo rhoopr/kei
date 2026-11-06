@@ -7376,91 +7376,8 @@ async fn primary_layout_read_only_conflict_discloses_and_keeps_local_changes() {
 
 #[tokio::test]
 async fn primary_layout_root_template_transitions_cover_all_pass_kinds() {
-    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
-    let server = server().await;
     for pass_kind in [PassKind::Unfiled, PassKind::Album, PassKind::SmartFolder] {
-        let root = tempfile::tempdir().unwrap();
-        let edited = records(&server, Some(("edit-one", EDIT_ONE)));
-        let options = |media_directory, folder_structure| CycleOptions {
-            media_directory,
-            folder_structure,
-            pass_kind,
-            ..CycleOptions::default()
-        };
-        let (initial, _) = cycle_options(
-            root.path(),
-            edited.clone(),
-            false,
-            EditedNaming::Primary,
-            options("media", "first"),
-        )
-        .await;
-        assert_eq!(
-            initial.failed_count, 0,
-            "{pass_kind:?}: {:?}",
-            initial.stats
-        );
-        assert!(initial.db_sync_token_advance_safe);
-        let first = root.path().join("media/first");
-        assert_bytes(&first.join("IMG_0501.JPG"), EDIT_ONE);
-        assert_bytes(&first.join("IMG_0501_original.JPG"), ORIGINAL);
-        let requests = server.received_requests().await.unwrap().len();
-        let (changed, _) = cycle_options(
-            root.path(),
-            edited.clone(),
-            false,
-            EditedNaming::Primary,
-            options("new-root", "second"),
-        )
-        .await;
-        assert_eq!(
-            changed.failed_count,
-            0,
-            "{pass_kind:?}: {:?}; errors {:?}",
-            changed.stats,
-            capture
-                .events()
-                .into_iter()
-                .filter(|event| event.level == tracing::Level::ERROR
-                    || event.level == tracing::Level::WARN)
-                .collect::<Vec<_>>()
-        );
-        assert!(changed.db_sync_token_advance_safe);
-        let second = root.path().join("new-root/second");
-        assert_bytes(&first.join("IMG_0501.JPG"), EDIT_ONE);
-        assert_bytes(&first.join("IMG_0501_original.JPG"), ORIGINAL);
-        assert_bytes(&second.join("IMG_0501.JPG"), EDIT_ONE);
-        assert_bytes(&second.join("IMG_0501_original.JPG"), ORIGINAL);
-        assert_eq!(
-            server.received_requests().await.unwrap().len(),
-            requests,
-            "root drift redownloaded owned bytes"
-        );
-        let operations = db_count(
-            root.path(),
-            "SELECT COUNT(*) FROM primary_layout_operations",
-        );
-        for _ in 0..2 {
-            let (quiet, lookups) = cycle_options(
-                root.path(),
-                edited.clone(),
-                true,
-                EditedNaming::Primary,
-                options("new-root", "second"),
-            )
-            .await;
-            assert_eq!(quiet.failed_count, 0);
-            assert!(quiet.db_sync_token_advance_safe);
-            assert_eq!(lookups, 0, "{pass_kind:?}: unexpected quiet lookup");
-            assert_eq!(server.received_requests().await.unwrap().len(), requests);
-            assert_eq!(
-                db_count(
-                    root.path(),
-                    "SELECT COUNT(*) FROM primary_layout_operations"
-                ),
-                operations
-            );
-        }
+        root_change_preserves_verified_paths_for_pass(pass_kind, "second").await;
     }
 }
 
@@ -12621,15 +12538,23 @@ async fn ordinary_template_preserves_recorded_smart_folder_paths() {
     ordinary_template_preserves_recorded_paths(PassKind::SmartFolder).await;
 }
 
-async fn root_change_preserves_verified_paths_for_pass(pass_kind: PassKind) {
+async fn root_change_preserves_verified_paths_for_pass(
+    pass_kind: PassKind,
+    next_folder: &'static str,
+) {
     let server = server().await;
-    let root = tempfile::tempdir().unwrap();
+    let mut root = tempfile::tempdir().unwrap();
+    root.disable_cleanup(true);
+    eprintln!(
+        "ROOT_TEMPLATE_REUSE_FIXTURE pass={pass_kind:?} folder={next_folder} root={}",
+        root.path().display()
+    );
     let current = records(&server, Some(("edit-one", EDIT_ONE)));
-    let options = |directory, token| CycleOptions {
+    let options = |directory, folder, token| CycleOptions {
         private: true,
         pass_kind,
         media_directory: directory,
-        folder_structure: "first",
+        folder_structure: folder,
         baseline_successor: Some("initial-token"),
         cycle_token: Some(token),
         ..CycleOptions::default()
@@ -12639,7 +12564,7 @@ async fn root_change_preserves_verified_paths_for_pass(pass_kind: PassKind) {
         current.clone(),
         false,
         EditedNaming::Primary,
-        options("media", "initial-token"),
+        options("media", "first", "initial-token"),
     )
     .await;
     assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
@@ -12659,6 +12584,12 @@ async fn root_change_preserves_verified_paths_for_pass(pass_kind: PassKind) {
         let paths: Vec<String> = conn.prepare("SELECT json_array(version_size,local_path,provider_checksum,local_checksum,source_checksum,metadata_write_failed_at) FROM asset_metadata_paths WHERE id='asset-501' ORDER BY version_size").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
         (receipts, paths)
     };
+    let identities = || {
+        [&original, &edit]
+            .map(|path| crate::fs_util::file_identity(&std::fs::File::open(path).unwrap()).unwrap())
+    };
+    let before_identities = identities();
+    let new_dir = root.path().join("new-root").join(next_folder);
     let before = snapshot();
     assert_eq!(before.0.len(), 2);
     assert_eq!(before.1.len(), 2);
@@ -12675,7 +12606,7 @@ async fn root_change_preserves_verified_paths_for_pass(pass_kind: PassKind) {
             current.clone(),
             round != 0,
             EditedNaming::Primary,
-            options("new-root", "changed-token"),
+            options("new-root", next_folder, "changed-token"),
         )
         .await;
         assert_eq!(result.failed_count, 0, "round {round}: {:?}", result.stats);
@@ -12701,13 +12632,9 @@ async fn root_change_preserves_verified_paths_for_pass(pass_kind: PassKind) {
             ]
         );
         assert_eq!(snapshot(), before);
-        assert!(!root.path().join("new-root/first/IMG_0501.JPG").exists());
-        assert!(
-            !root
-                .path()
-                .join("new-root/first/IMG_0501_original.JPG")
-                .exists()
-        );
+        assert_eq!(identities(), before_identities);
+        assert!(!new_dir.join("IMG_0501.JPG").exists());
+        assert!(!new_dir.join("IMG_0501_original.JPG").exists());
         let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
             .await
             .unwrap();
@@ -12739,11 +12666,15 @@ async fn root_change_preserves_verified_paths_for_pass(pass_kind: PassKind) {
             ),
             0
         );
+        eprintln!(
+            "ROOT_TEMPLATE_REUSE_ROUND pass={pass_kind:?} folder={next_folder} round={round} old_identity_proofs_stable=true GETs={requests} downloads=0 metadata_debt=2"
+        );
     }
     // This synthetic Album session reports one selected member; its root
     // preservation is covered above. The Unfiled and SmartFolder fixtures
     // below also exercise a genuinely new download at the new root.
     if pass_kind == PassKind::Album {
+        root.disable_cleanup(false);
         return;
     }
     const NEW: &[u8] = b"\xff\xd8\xff\xe0new independent asset bytes";
@@ -12768,12 +12699,12 @@ async fn root_change_preserves_verified_paths_for_pass(pass_kind: PassKind) {
         both,
         false,
         EditedNaming::Primary,
-        options("new-root", "new-token"),
+        options("new-root", next_folder, "new-token"),
     )
     .await;
     assert_eq!(new.failed_count, 0, "{:?}", new.stats);
     assert_eq!(new.stats.downloaded, 1, "{:?}", new.stats);
-    assert_bytes(&root.path().join("new-root/first/IMG_0502.JPG"), NEW);
+    assert_bytes(&new_dir.join("IMG_0502.JPG"), NEW);
     assert_bytes(&original, ORIGINAL);
     assert_bytes(&edit, EDIT_ONE);
     assert_eq!(
@@ -12784,21 +12715,36 @@ async fn root_change_preserves_verified_paths_for_pass(pass_kind: PassKind) {
         ]
     );
     assert_eq!(snapshot(), before);
+    assert_eq!(identities(), before_identities);
+    let actual_requests = server.received_requests().await.unwrap();
+    assert_eq!(actual_requests.len(), requests + 1);
+    assert_eq!(
+        actual_requests
+            .iter()
+            .filter(|r| r.url.path() == "/new-resource")
+            .count(),
+        1
+    );
+    eprintln!(
+        "ROOT_TEMPLATE_REUSE_NEW pass={pass_kind:?} folder={next_folder} path={} GETs=1 old_proofs_unchanged=true",
+        new_dir.join("IMG_0502.JPG").display()
+    );
+    root.disable_cleanup(false);
 }
 
 #[tokio::test]
 async fn root_change_preserves_verified_paths_and_places_new_asset_in_new_root() {
-    root_change_preserves_verified_paths_for_pass(PassKind::Unfiled).await;
+    root_change_preserves_verified_paths_for_pass(PassKind::Unfiled, "first").await;
 }
 
 #[tokio::test]
 async fn root_change_preserves_verified_album_paths() {
-    root_change_preserves_verified_paths_for_pass(PassKind::Album).await;
+    root_change_preserves_verified_paths_for_pass(PassKind::Album, "first").await;
 }
 
 #[tokio::test]
 async fn root_change_preserves_verified_smart_folder_paths() {
-    root_change_preserves_verified_paths_for_pass(PassKind::SmartFolder).await;
+    root_change_preserves_verified_paths_for_pass(PassKind::SmartFolder, "first").await;
 }
 
 #[cfg(unix)]
