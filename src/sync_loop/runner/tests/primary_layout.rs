@@ -4031,97 +4031,506 @@ async fn scoped_distinct_admitted_edits_publish_current_and_preserve_old_debt() 
 
 #[tokio::test]
 async fn scoped_missing_original_keeps_admitted_adjusted_pending() {
+    use crate::state::db::match_diagnostics::MatchDiagnostics;
+    use crate::state::db::provider_selection::SelectionPath;
+    use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicBool;
+
+    fn provider_hash(bytes: &[u8]) -> String {
+        use sha1::{Digest as _, Sha1};
+        let mut hash = Sha1::new();
+        hash.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+        hash.update(bytes);
+        base64::engine::general_purpose::STANDARD.encode([&[1][..], &hash.finalize()[..]].concat())
+    }
+    fn rows(db_path: &std::path::Path, sql: &str) -> Vec<Value> {
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.prepare(sql)
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+            .collect()
+    }
     let server = server().await;
-    let root = tempfile::tempdir().unwrap();
-    let original = root.path().join("media/IMG_0501.JPG");
-    let options = |resolution| CycleOptions {
+    let root = tempfile::tempdir().unwrap().keep();
+    eprintln!("MISSING_ORIGINAL_ROOT={}", root.display());
+    let db_path = root.join("state.db");
+    let media = root.join("media");
+    let original = media.join("IMG_0501.JPG");
+    let retained_original = root.join("retained-original.bin");
+    let file_snapshot = |path: &std::path::Path| {
+        let file = std::fs::File::open(path).unwrap();
+        (
+            std::fs::read(path).unwrap(),
+            crate::fs_util::file_identity(&file).unwrap(),
+            file.metadata().unwrap().modified().unwrap(),
+        )
+    };
+    let media_paths = || {
+        std::fs::read_dir(&media)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect::<BTreeSet<_>>()
+    };
+    let page = |edit: Option<(&str, &[u8])>| {
+        let mut page = records(&server, edit);
+        page[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(provider_hash(ORIGINAL));
+        if let Some((_, bytes)) = edit {
+            page[1]["fields"]["resJPEGFullRes"]["value"]["fileChecksum"] =
+                json!(provider_hash(bytes));
+        }
+        page
+    };
+    let receipt_sql = "SELECT json_object('id',id,'account',account_key,'provider',provider_key,'scope',scope,'library',library,'child',child,'master',master,'state',state_id,'pass',origin_pass,'version',version_size,'checksum',provider_checksum,'size',provider_size,'path',native_path,'source',source_checksum,'local',local_checksum,'proof',proof_hash,'trust',trust_receipt,'metadata',selected_metadata_hash,'generation',generation_id) FROM download_receipts WHERE library='PrimarySync' AND child='asset-501' AND version_size='original' ORDER BY id";
+    let adjusted_sql = receipt_sql.replace("version_size='original'", "version_size='adjusted'");
+    let intent_sql = "SELECT json_object('library',library,'child',id,'version',version_size,'requested',requested_path_key,'destination_key',destination_path_key,'destination',destination_path,'checksum',provider_checksum,'size',provider_size) FROM reconciliation_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted' ORDER BY provider_checksum,provider_size";
+    let debt_sql = "SELECT json_object('generation',g.id,'format',json_extract(CAST(g.specification AS TEXT),'$.format'),'account',g.account_key,'provider',g.provider_key,'scope',g.scope,'pass',d.pass_key,'library',d.library,'child',d.child,'state',d.asset_id,'master',d.master,'version',d.version_size,'path',d.path,'compat_path',d.compat_path,'checksum',d.checksum,'size',d.size_bytes,'metadata',d.metadata_hash,'admitted',d.admitted,'verified',d.verified_media,'sealed',g.sealed,'ready',g.checkpoint_ready) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.library='PrimarySync' AND d.child='asset-501' AND d.version_size='adjusted' ORDER BY g.id,d.pass_key,d.path";
+    let checkpoint_sql =
+        "SELECT json_quote(value) FROM metadata WHERE key='sync_token:PrimarySync'";
+    let error_sql = "SELECT json_quote(last_error) FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'";
+    let temp_sql =
+        "SELECT json_array(hex(path),claimed_at,publication) FROM owned_temp_files ORDER BY path";
+    let options = |resolution, token| CycleOptions {
+        retry: Some(crate::retry::RetryConfig {
+            max_retries: 1,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        }),
         private: true,
         resolution,
+        cycle_token: Some(token),
         ..CycleOptions::default()
     };
     let (first, _) = cycle_options(
-        root.path(),
-        records(&server, None),
+        &root,
+        page(None),
         false,
         EditedNaming::Primary,
-        options(crate::types::PhotoResolution::Original),
+        options(
+            crate::types::PhotoResolution::Original,
+            "missing-original-start",
+        ),
     )
     .await;
     assert_eq!(first.failed_count, 0);
-    std::fs::write(&original, b"changed original").unwrap();
-    let edited = records(&server, Some(("edit-one", EDIT_ONE)));
-    let (held, _) = cycle_options(
-        root.path(),
+    assert_bytes(&original, ORIGINAL);
+    let original_file = file_snapshot(&original);
+    let original_receipts = rows(&db_path, receipt_sql);
+    assert_eq!(original_receipts.len(), 1);
+    assert_eq!(
+        rows(&db_path, checkpoint_sql),
+        [json!("missing-original-start")]
+    );
+    let mapping_sql = "SELECT json_array(library,asset_record_name,master_record_name) FROM asset_master_mappings WHERE asset_record_name='asset-501' ORDER BY library";
+    let original_mapping = rows(&db_path, mapping_sql);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let fault = Arc::new(AtomicBool::new(true));
+    let fail_requests = fault.clone();
+    Mock::given(method("GET"))
+        .and(path("/edit-one"))
+        .respond_with(move |_: &wiremock::Request| {
+            if fail_requests.load(Ordering::SeqCst) {
+                seen.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200).set_body_bytes(EDIT_ONE)
+            }
+        })
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let mut edited = page(Some(("edit-one", EDIT_ONE)));
+    let (failed, _) = cycle_options(
+        &root,
         edited.clone(),
         false,
         EditedNaming::Primary,
-        options(crate::types::PhotoResolution::None),
+        options(crate::types::PhotoResolution::None, "missing-original-debt"),
     )
     .await;
-    assert!(held.failed_count > 0);
+    assert!(failed.failed_count > 0, "{failed:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 8);
+    assert!(failed.db_sync_token_advance_safe);
+    let intent = rows(&db_path, intent_sql);
+    assert_eq!(intent.len(), 1);
+    let sibling = std::path::PathBuf::from(intent[0]["destination"].as_str().unwrap());
+    assert_ne!(sibling, original);
+    assert!(sibling.starts_with(&media));
+    assert!(!sibling.exists());
+    assert_eq!(
+        intent[0]["requested"],
+        crate::fs_util::confined_path_key(&original).unwrap()
+    );
+    assert_eq!(
+        intent[0]["destination_key"],
+        crate::fs_util::confined_path_key(&sibling).unwrap()
+    );
+    assert_eq!(intent[0]["checksum"], provider_hash(EDIT_ONE));
+    assert_eq!(intent[0]["size"], EDIT_ONE.len());
+    let debt = rows(&db_path, debt_sql);
+    assert!(!debt.is_empty());
+    let assert_debt = |debt: &[Value]| {
+        for d in debt {
+            for key in [
+                "account", "provider", "scope", "pass", "library", "child", "state", "master",
+            ] {
+                assert_eq!(d[key], original_receipts[0][key], "{key}: {d:?}");
+            }
+            assert_eq!(d["format"], 2);
+            assert_eq!(d["version"], "adjusted");
+            let native: SelectionPath = serde_json::from_str(d["path"].as_str().unwrap()).unwrap();
+            assert_eq!(native.to_path(), sibling);
+            assert_eq!(d["compat_path"], sibling.to_str().unwrap());
+            assert_eq!(d["checksum"], provider_hash(EDIT_ONE));
+            assert_eq!(d["size"], EDIT_ONE.len());
+            for key in ["admitted", "sealed", "ready"] {
+                assert_eq!(d[key], 1);
+            }
+            assert_eq!(d["verified"], 0);
+        }
+    };
+    assert_debt(&debt);
+    let generations: BTreeSet<_> = debt
+        .iter()
+        .map(|d| d["generation"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        generations.len(),
+        debt.len(),
+        "one selected S per generation"
+    );
+    assert!(rows(&db_path, &adjusted_sql).is_empty());
+    let failed_error = rows(&db_path, error_sql);
+    assert_eq!(failed_error.len(), 1);
+    assert!(failed_error[0].as_str().unwrap().contains("HTTP 500"));
+    assert!(MatchDiagnostics::decode(failed_error[0].as_str().unwrap()).is_none());
+    assert_eq!(
+        rows(&db_path, checkpoint_sql),
+        [json!("missing-original-debt")]
+    );
+    assert_eq!(rows(&db_path, receipt_sql), original_receipts);
+    assert_eq!(file_snapshot(&original), original_file);
+    let temp_custody = rows(&db_path, temp_sql);
+    let failed_paths = media_paths();
+    let other_files: Vec<_> = failed_paths
+        .iter()
+        .filter(|p| **p != original)
+        .map(|p| (p.clone(), file_snapshot(p)))
+        .collect();
+    std::fs::write(root.join("failed-transfer-evidence.json"), serde_json::to_vec_pretty(&json!({"intent":intent,"debt":debt,"original_receipt":original_receipts,"error":failed_error,"failed_gets":calls.load(Ordering::SeqCst),"temps":temp_custody})).unwrap()).unwrap();
+    fault.store(false, Ordering::SeqCst);
+    // Retain the exact inode outside the media root, not as a discoverable sibling.
+    std::fs::rename(&original, &retained_original).unwrap();
+    assert_eq!(file_snapshot(&retained_original), original_file);
     let owner = state::db::account::AccountOwner::authenticated(
         "synthetic@example.invalid",
         "com",
         &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
     )
     .unwrap();
-    std::fs::remove_file(&original).unwrap();
+    let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+    assert_eq!(debt[0]["account"], account_key);
+    assert_eq!(debt[0]["provider"], provider_key);
+    let binding = state::db::PublicationBinding {
+        account_key: account_key.into(),
+        provider_key: provider_key.into(),
+        scope: debt[0]["scope"].as_str().unwrap().into(),
+        origin_pass: debt[0]["pass"].as_str().unwrap().into(),
+        library: "PrimarySync".into(),
+        child: "asset-501".into(),
+        master: "501".into(),
+        state_id: "asset-501".into(),
+    };
     {
-        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+        let db = state::SqliteStateDb::open_owned(&db_path, &owner)
             .await
             .unwrap();
         db.make_selection_retry_due(owner.clone(), "asset-501".into())
             .await
             .unwrap();
     }
-    let requests = server.received_requests().await.unwrap().len();
-    let (_held, _) = cycle_options(
-        root.path(),
+    let mut healthy = page(None);
+    for record in &mut healthy {
+        record["recordName"] = json!(record["recordName"].as_str().unwrap().replace("501", "502"));
+        if let Some(reference) = record["fields"].get_mut("masterRef") {
+            reference["value"]["recordName"] = json!("502");
+        }
+    }
+    healthy[0]["fields"]["filenameEnc"]["value"] = json!("IMG_0502.JPG");
+    healthy[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/edit-two",server.uri()),"size":EDIT_TWO.len(),"fileChecksum":provider_hash(EDIT_TWO)});
+    healthy[1]["fields"]["resJPEGFullRes"] = json!({"value":{"downloadURL":format!("{}/edit-two",server.uri()),"size":EDIT_TWO.len(),"fileChecksum":provider_hash(EDIT_TWO)}});
+    healthy[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+    healthy[1]["fields"]["adjustmentRenderType"] = json!({"value":1});
+    edited.extend(healthy);
+    let (held, lookups) = cycle_options(
+        &root,
         edited.clone(),
-        true,
+        false,
         EditedNaming::Primary,
-        options(crate::types::PhotoResolution::None),
+        options(crate::types::PhotoResolution::None, "missing-original-held"),
     )
     .await;
+    let held_debt = rows(&db_path, debt_sql);
+    let error = rows(&db_path, error_sql);
+    let requests = server.received_requests().await.unwrap();
+    let adjusted_gets = requests
+        .iter()
+        .filter(|r| r.method == "GET" && r.url.path() == "/edit-one")
+        .count();
+    std::fs::write(root.join("missing-original-evidence.json"), serde_json::to_vec_pretty(&json!({"cycle":format!("{held:?}"),"lookups":lookups,"debt":held_debt,"intent":rows(&db_path,intent_sql),"adjusted_receipts":rows(&db_path,&adjusted_sql),"diagnostic":error,"adjusted_gets":adjusted_gets,"requests":requests.iter().map(|r| r.url.path()).collect::<Vec<_>>(),"original_absent":!original.exists(),"s_absent":!sibling.exists(),"retained_original":format!("{:?}",file_snapshot(&retained_original)),"temps":rows(&db_path,temp_sql),"checkpoint":rows(&db_path,checkpoint_sql)})).unwrap()).unwrap();
+    assert!(
+        lookups > 0,
+        "actual due retry must confirm the retained child"
+    );
+    assert!(held.failed_count > 0, "{held:?}");
+    assert_eq!(held.stats.downloaded, 1, "{held:?}");
+    assert!(held.db_sync_token_advance_safe);
     assert!(!original.exists());
-    assert_eq!(server.received_requests().await.unwrap().len(), requests);
-    {
-        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
-            .await
-            .unwrap();
-        let conn = db
-            .acquire_lock("missing original retains adjusted debt")
-            .unwrap();
-        let pending:i64=conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND admitted=1 AND verified_media=0",[],|r|r.get(0)).unwrap();
-        assert!(pending > 0);
+    assert!(!sibling.exists());
+    assert_eq!(adjusted_gets, 8);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.method == "GET" && r.url.path() == "/edit-two")
+            .count(),
+        1
+    );
+    assert_ne!(error, failed_error);
+    let diagnostic = MatchDiagnostics::decode(error[0].as_str().unwrap()).unwrap();
+    assert!(
+        diagnostic.attempts.iter().any(|a| {
+            a.child == "asset-501"
+                && a.destination.to_path() == sibling
+                && a.checksum == provider_hash(EDIT_ONE)
+                && a.generation
+                    .as_deref()
+                    .is_some_and(|g| generations.contains(g))
+                && a.pass.as_deref() == Some(binding.origin_pass.as_str())
+                && a.explanation.candidates.iter().any(|c| {
+                    c.path.as_ref().is_some_and(|p| p.to_path() == original)
+                        && c.reason == "historical_occupant_changed_or_unsafe"
+                })
+        }),
+        "{}",
+        error[0]
+    );
+    assert_debt(&held_debt);
+    for initial in &debt {
+        assert!(
+            held_debt.contains(initial),
+            "lost initial debt: {initial:?}; {held_debt:?}"
+        );
     }
-    std::fs::write(&original, ORIGINAL).unwrap();
-    {
-        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+    let held_generations: BTreeSet<_> = held_debt
+        .iter()
+        .map(|d| d["generation"].as_str().unwrap())
+        .collect();
+    assert!(generations.is_subset(&held_generations));
+    assert_eq!(held_generations.len(), held_debt.len());
+    assert_eq!(rows(&db_path, intent_sql), intent);
+    assert!(rows(&db_path, &adjusted_sql).is_empty());
+    assert_eq!(rows(&db_path, receipt_sql), original_receipts);
+    assert_eq!(rows(&db_path, mapping_sql), original_mapping);
+    assert_eq!(rows(&db_path, temp_sql), temp_custody);
+    assert_eq!(
+        rows(&db_path, checkpoint_sql),
+        [json!("missing-original-held")]
+    );
+    assert_eq!(file_snapshot(&retained_original), original_file);
+    for (path, before) in &other_files {
+        assert_eq!(&file_snapshot(path), before);
+    }
+    let healthy_path = media.join("IMG_0502.JPG");
+    assert_bytes(&healthy_path, EDIT_TWO);
+    let healthy_file = file_snapshot(&healthy_path);
+    let mut expected_paths = failed_paths;
+    expected_paths.remove(&original);
+    expected_paths.insert(healthy_path.clone());
+    assert_eq!(media_paths(), expected_paths);
+    let healthy_binding = state::db::PublicationBinding {
+        child: "asset-502".into(),
+        master: "502".into(),
+        state_id: "asset-502".into(),
+        ..binding.clone()
+    };
+    let healthy_receipts = {
+        let db = state::SqliteStateDb::open_owned(&db_path, &owner)
             .await
             .unwrap();
-        db.make_selection_retry_due(owner, "asset-501".into())
+        db.bound_download_receipts(
+            healthy_binding.clone(),
+            "adjusted".into(),
+            provider_hash(EDIT_TWO),
+            EDIT_TWO.len() as u64,
+        )
+        .await
+        .unwrap()
+    };
+    assert_eq!(healthy_receipts.len(), 1);
+    assert_eq!(healthy_receipts[0].native_path.to_path(), healthy_path);
+    assert_eq!(
+        healthy_receipts[0].source_checksum,
+        format!("{:x}", Sha256::digest(EDIT_TWO))
+    );
+    // Restore the exact retained file, never synthesize fresh Original bytes or proof.
+    std::fs::rename(&retained_original, &original).unwrap();
+    assert_eq!(file_snapshot(&original), original_file);
+    {
+        let db = state::SqliteStateDb::open_owned(&db_path, &owner)
+            .await
+            .unwrap();
+        db.make_selection_retry_due(owner.clone(), "asset-501".into())
             .await
             .unwrap();
     }
     let (recovered, _) = cycle_options(
-        root.path(),
-        edited,
+        &root,
+        edited.clone(),
         true,
         EditedNaming::Primary,
-        options(crate::types::PhotoResolution::None),
+        options(
+            crate::types::PhotoResolution::None,
+            "missing-original-recovered",
+        ),
     )
     .await;
     assert_eq!(recovered.failed_count, 0, "{:?}", recovered.stats);
-    assert_bytes(&original, ORIGINAL);
-    assert!(
-        std::fs::read_dir(root.path().join("media"))
-            .unwrap()
-            .any(|entry| {
-                let path = entry.unwrap().path();
-                path != original && std::fs::read(path).is_ok_and(|bytes| bytes == EDIT_ONE)
-            })
+    assert_eq!(recovered.stats.downloaded, 1);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        requests.len() + 1
     );
+    assert_bytes(&sibling, EDIT_ONE);
+    let sibling_file = file_snapshot(&sibling);
+    let adjusted_receipts = rows(&db_path, &adjusted_sql);
+    assert_eq!(adjusted_receipts.len(), 1);
+    for (key, expected) in [
+        ("account", &binding.account_key),
+        ("provider", &binding.provider_key),
+        ("scope", &binding.scope),
+        ("pass", &binding.origin_pass),
+        ("library", &binding.library),
+        ("child", &binding.child),
+        ("master", &binding.master),
+        ("state", &binding.state_id),
+    ] {
+        assert_eq!(adjusted_receipts[0][key], expected.as_str(), "{key}");
+    }
+    assert_eq!(adjusted_receipts[0]["version"], "adjusted");
+    let native: SelectionPath =
+        serde_json::from_str(adjusted_receipts[0]["path"].as_str().unwrap()).unwrap();
+    assert_eq!(native.to_path(), sibling);
+    assert_eq!(adjusted_receipts[0]["checksum"], provider_hash(EDIT_ONE));
+    assert_eq!(adjusted_receipts[0]["size"], EDIT_ONE.len());
+    assert_eq!(
+        adjusted_receipts[0]["source"],
+        format!("{:x}", Sha256::digest(EDIT_ONE))
+    );
+    assert_eq!(
+        adjusted_receipts[0]["local"],
+        adjusted_receipts[0]["source"]
+    );
+    for key in ["trust", "metadata", "generation"] {
+        assert!(adjusted_receipts[0][key].is_null());
+    }
+    let verified_receipts = {
+        let db = state::SqliteStateDb::open_owned(&db_path, &owner)
+            .await
+            .unwrap();
+        db.bound_download_receipts(
+            binding.clone(),
+            "adjusted".into(),
+            provider_hash(EDIT_ONE),
+            EDIT_ONE.len() as u64,
+        )
+        .await
+        .unwrap()
+    };
+    assert_eq!(verified_receipts.len(), 1);
+    assert_eq!(
+        adjusted_receipts[0]["id"],
+        verified_receipts[0].id().unwrap()
+    );
+    for round in 0..=2 {
+        if round > 0 {
+            let before = server.received_requests().await.unwrap().len();
+            let (quiet, lookups) = cycle_options(
+                &root,
+                edited.clone(),
+                true,
+                EditedNaming::Primary,
+                options(
+                    crate::types::PhotoResolution::None,
+                    "missing-original-recovered",
+                ),
+            )
+            .await;
+            assert_eq!(quiet.failed_count, 0, "{quiet:?}");
+            assert_eq!((quiet.stats.downloaded, lookups), (0, 0));
+            assert_eq!(server.received_requests().await.unwrap().len(), before);
+        }
+        assert_eq!(file_snapshot(&original), original_file);
+        assert_eq!(file_snapshot(&sibling), sibling_file);
+        assert_eq!(file_snapshot(&healthy_path), healthy_file);
+        assert!(!retained_original.exists());
+        assert_eq!(rows(&db_path, receipt_sql), original_receipts);
+        assert_eq!(rows(&db_path, &adjusted_sql), adjusted_receipts);
+        assert_eq!(rows(&db_path, mapping_sql), original_mapping);
+        assert_eq!(rows(&db_path, intent_sql), intent);
+        assert_eq!(
+            rows(&db_path, checkpoint_sql),
+            [json!("missing-original-recovered")]
+        );
+        let finished = rows(&db_path, debt_sql);
+        for initial in &held_debt {
+            let mut completed = initial.clone();
+            completed["verified"] = json!(1);
+            assert!(
+                finished.contains(&completed),
+                "initial destination not verified at exact S: {initial:?}; {finished:?}"
+            );
+        }
+        assert_eq!(
+            db_count(
+                &root,
+                "SELECT count(*) FROM provider_active_destinations WHERE library='PrimarySync' AND child='asset-501' AND version_size='adjusted' AND admitted=1 AND verified_media=0"
+            ),
+            0
+        );
+        let db = state::SqliteStateDb::open_owned(&db_path, &owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.bound_download_receipts(
+                binding.clone(),
+                "adjusted".into(),
+                provider_hash(EDIT_ONE),
+                EDIT_ONE.len() as u64
+            )
+            .await
+            .unwrap(),
+            verified_receipts
+        );
+        assert_eq!(
+            db.bound_download_receipts(
+                healthy_binding.clone(),
+                "adjusted".into(),
+                provider_hash(EDIT_TWO),
+                EDIT_TWO.len() as u64
+            )
+            .await
+            .unwrap(),
+            healthy_receipts
+        );
+        assert_eq!(media_paths().len(), 3);
+    }
 }
 
 #[tokio::test]
