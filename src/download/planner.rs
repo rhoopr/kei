@@ -1022,6 +1022,10 @@ impl TaskPlanner {
                         .key(&receipt.native_path.to_path())
                         .is_ok_and(|key| key == requested_key)
                 })
+                && self
+                    .cross_rendition_original(asset, config, task, &requested.path)
+                    .await?
+                    .is_none()
             {
                 continue;
             }

@@ -3919,48 +3919,326 @@ async fn scoped_unaccounted_source_holds_distinct_checkpoint() {
 }
 
 #[tokio::test]
-async fn scoped_adjusted_only_holds_changed_or_foreign_original() {
-    for changed in [true, false] {
-        let server = server().await;
-        let root = tempfile::tempdir().unwrap();
-        let media = root.path().join("media");
-        let options = |resolution| CycleOptions {
-            private: true,
-            resolution,
-            ..CycleOptions::default()
-        };
-        if changed {
-            let (first, _) = cycle_options(
-                root.path(),
-                records(&server, None),
-                false,
-                EditedNaming::Primary,
-                options(crate::types::PhotoResolution::Original),
-            )
-            .await;
-            assert_eq!(first.failed_count, 0);
-        } else {
-            std::fs::create_dir_all(&media).unwrap();
+async fn scoped_adjusted_only_preserves_changed_original_and_publishes_sibling() {
+    use rusqlite::types::Value as SqlValue;
+    use state::db::provider_selection::SelectionPath;
+
+    let server = server().await;
+    let mut root = tempfile::tempdir().unwrap();
+    if std::env::var_os("KEI_CHANGED_ORIGINAL_RETAIN_FIXTURE").is_some() {
+        root.disable_cleanup(true);
+    }
+    eprintln!("CHANGED_ORIGINAL_FIXTURE {}", root.path().display());
+    let media = root.path().join("media");
+    let p = media.join("IMG_0501.JPG");
+    let options = |resolution| CycleOptions {
+        private: true,
+        resolution,
+        ..CycleOptions::default()
+    };
+    let (first, _) = cycle_options(
+        root.path(),
+        records(&server, None),
+        false,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::Original),
+    )
+    .await;
+    assert_eq!((first.failed_count, first.stats.downloaded), (0, 1));
+    assert_bytes(&p, ORIGINAL);
+    let rows = |sql: &str| {
+        let conn = rusqlite::Connection::open_with_flags(
+            root.path().join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut statement = conn.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|i| row.get::<_, SqlValue>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let file = |path: &std::path::Path| {
+        let handle = std::fs::File::open(path).unwrap();
+        let metadata = handle.metadata().unwrap();
+        (
+            std::fs::read(path).unwrap(),
+            crate::fs_util::file_identity(&handle).unwrap(),
+            metadata.len(),
+            metadata.modified().unwrap(),
+        )
+    };
+    let original_sql = "SELECT * FROM download_receipts WHERE child='asset-501' AND version_size='original' ORDER BY id";
+    let original_receipts = rows(original_sql);
+    assert_eq!(original_receipts.len(), 1);
+    let binding_columns =
+        "account_key,provider_key,scope,library,child,master,state_id,origin_pass";
+    let original_binding = rows(&format!(
+        "SELECT {binding_columns} FROM download_receipts WHERE child='asset-501' AND version_size='original'"
+    ));
+    let old_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL));
+    assert_eq!(
+        rows(
+            "SELECT provider_checksum,provider_size,native_path,source_checksum,local_checksum,length(proof_hash) FROM download_receipts WHERE child='asset-501' AND version_size='original'"
+        ),
+        vec![vec![
+            SqlValue::Text(provider_hash(ORIGINAL)),
+            SqlValue::Integer(i64::try_from(ORIGINAL.len()).unwrap()),
+            SqlValue::Text(SelectionPath::from_path(&p).key().unwrap()),
+            SqlValue::Text(old_hash.clone()),
+            SqlValue::Text(old_hash.clone()),
+            SqlValue::Integer(64),
+        ]]
+    );
+    let original_owner_sql = "SELECT library,id,version_size,status,checksum,size_bytes,local_path,local_checksum FROM assets WHERE id='asset-501' AND version_size='original'";
+    let original_owner = rows(original_owner_sql);
+    let modified = b"foreign or locally changed original";
+    std::fs::write(&p, modified).unwrap();
+    let modified_file = file(&p);
+    assert_ne!(
+        old_hash,
+        data_encoding::HEXLOWER.encode(&Sha256::digest(modified))
+    );
+    let requests = server.received_requests().await.unwrap().len();
+    assert_eq!(requests, 1);
+    let edited = records(&server, Some(("edit-one", EDIT_ONE)));
+    let (published, _) = cycle_options(
+        root.path(),
+        edited.clone(),
+        false,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::None),
+    )
+    .await;
+    assert_eq!(
+        (published.failed_count, published.stats.downloaded),
+        (0, 1),
+        "{:?}",
+        published.stats
+    );
+    let gets = server.received_requests().await.unwrap();
+    assert_eq!(gets.len(), requests + 1);
+    assert_eq!(
+        gets.iter()
+            .filter(|request| request.url.path() == "/edit-one")
+            .count(),
+        1
+    );
+    let paths = rows(
+        "SELECT local_path FROM assets WHERE id='asset-501' AND version_size='adjusted' AND status='downloaded'",
+    );
+    let [path] = paths.as_slice() else {
+        panic!("expected one downloaded Adjusted path")
+    };
+    let [SqlValue::Text(path)] = path.as_slice() else {
+        panic!("expected native Adjusted locator")
+    };
+    let s = std::path::PathBuf::from(path);
+    assert_ne!(s, p);
+    assert_bytes(&s, EDIT_ONE);
+    let sibling_file = file(&s);
+    let local = data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_ONE));
+    assert_eq!(
+        rows(&format!(
+            "SELECT {binding_columns} FROM download_receipts WHERE child='asset-501' AND version_size='adjusted'"
+        )),
+        original_binding
+    );
+    assert_eq!(
+        rows(
+            "SELECT version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,length(proof_hash) FROM download_receipts WHERE child='asset-501' AND version_size='adjusted'"
+        ),
+        vec![vec![
+            SqlValue::Text("adjusted".into()),
+            SqlValue::Text(provider_hash(EDIT_ONE)),
+            SqlValue::Integer(i64::try_from(EDIT_ONE.len()).unwrap()),
+            SqlValue::Text(SelectionPath::from_path(&s).key().unwrap()),
+            SqlValue::Text(local.clone()),
+            SqlValue::Text(local),
+            SqlValue::Integer(64),
+        ]]
+    );
+    let intent_sql = "SELECT library,id,version_size,requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size FROM reconciliation_paths WHERE id='asset-501' ORDER BY version_size,requested_path_key";
+    let intent = rows(intent_sql);
+    assert_eq!(
+        intent,
+        vec![vec![
+            SqlValue::Text("PrimarySync".into()),
+            SqlValue::Text("asset-501".into()),
+            SqlValue::Text("adjusted".into()),
+            SqlValue::Text(crate::fs_util::confined_path_key(&p).unwrap()),
+            SqlValue::Text(crate::fs_util::confined_path_key(&s).unwrap()),
+            SqlValue::Text(s.to_str().unwrap().to_owned()),
+            SqlValue::Text(provider_hash(EDIT_ONE)),
+            SqlValue::Integer(i64::try_from(EDIT_ONE.len()).unwrap()),
+        ]]
+    );
+    assert_eq!(
+        rows(
+            "SELECT DISTINCT compat_path FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND admitted=1 AND verified_media=1"
+        ),
+        vec![vec![SqlValue::Text(s.to_str().unwrap().to_owned())]]
+    );
+    let receipts_sql = "SELECT * FROM download_receipts WHERE child='asset-501' ORDER BY id";
+    let completed_receipts = rows(receipts_sql);
+    assert_eq!(completed_receipts.len(), 2);
+    let owners_sql = "SELECT library,id,version_size,status,checksum,size_bytes,local_path,local_checksum FROM assets WHERE id='asset-501' ORDER BY version_size";
+    let owners = rows(owners_sql);
+    let prove_custody = || {
+        assert_eq!(file(&p), modified_file);
+        assert_eq!(file(&s), sibling_file);
+        assert_eq!(rows(original_sql), original_receipts);
+        assert_eq!(rows(original_owner_sql), original_owner);
+        assert_eq!(rows(receipts_sql), completed_receipts);
+        assert_eq!(rows(owners_sql), owners);
+        assert_eq!(rows(intent_sql), intent);
+        assert!(rows(&format!("SELECT compat_path FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND compat_path!='{}'", s.to_str().unwrap().replace('\'', "''"))).is_empty());
+        for table in [
+            "primary_layout_operations",
+            "primary_layout_members",
+            "primary_layout_bindings",
+            "primary_layout_claims",
+            "primary_layout_preserved",
+            "primary_layout_superseded_paths",
+        ] {
+            assert_eq!(
+                db_count(root.path(), &format!("SELECT count(*) FROM {table}")),
+                0,
+                "unexpected managed history: {table}"
+            );
         }
-        let original = media.join("IMG_0501.JPG");
-        let foreign = b"foreign or locally changed original";
-        std::fs::write(&original, foreign).unwrap();
-        let requests = server.received_requests().await.unwrap().len();
-        let (held, _) = cycle_options(
+        let mut files = std::fs::read_dir(&media)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        files.sort();
+        let mut expected = vec![p.clone(), s.clone()];
+        expected.sort();
+        assert_eq!(files, expected, "unexpected archive or reorganization");
+    };
+    prove_custody();
+    for rediscovery in 0..2 {
+        let (observed, lookups) = cycle_options(
             root.path(),
-            records(&server, Some(("edit-one", EDIT_ONE))),
+            edited.clone(),
             false,
             EditedNaming::Primary,
             options(crate::types::PhotoResolution::None),
         )
         .await;
-        assert!(held.failed_count > 0, "{changed}: {:?}", held.stats);
-        assert_bytes(&original, foreign);
-        assert_eq!(server.received_requests().await.unwrap().len(), requests);
-        assert!(!std::fs::read_dir(&media).unwrap().any(|entry| {
-            std::fs::read(entry.unwrap().path()).is_ok_and(|bytes| bytes == EDIT_ONE)
-        }));
+        assert_eq!(
+            (observed.failed_count, observed.stats.downloaded),
+            (0, 0),
+            "{:?}",
+            observed.stats
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            requests + 1
+        );
+        prove_custody();
+        eprintln!(
+            "CHANGED_ORIGINAL_REDISCOVERY index={rediscovery} assets_seen={} lookups={lookups} new_GETs=0 P_S_proofs_intent_stable=true",
+            observed.stats.assets_seen
+        );
     }
+    eprintln!(
+        "CHANGED_ORIGINAL_PASS new_adjusted_GET=1 independent_S=true P_old_proof_unchanged=true rediscoveries=2"
+    );
+}
+
+#[tokio::test]
+async fn scoped_adjusted_only_holds_foreign_original() {
+    let server = server().await;
+    let mut root = tempfile::tempdir().unwrap();
+    if std::env::var_os("KEI_CHANGED_ORIGINAL_RETAIN_FIXTURE").is_some() {
+        root.disable_cleanup(true);
+    }
+    eprintln!("FOREIGN_ORIGINAL_FIXTURE {}", root.path().display());
+    let media = root.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let original = media.join("IMG_0501.JPG");
+    let foreign = b"foreign or locally changed original";
+    std::fs::write(&original, foreign).unwrap();
+    let handle = std::fs::File::open(&original).unwrap();
+    let before = (
+        crate::fs_util::file_identity(&handle).unwrap(),
+        handle.metadata().unwrap().modified().unwrap(),
+    );
+    drop(handle);
+    let requests = server.received_requests().await.unwrap().len();
+    assert_eq!(requests, 0);
+    let (held, _) = cycle_options(
+        root.path(),
+        records(&server, Some(("edit-one", EDIT_ONE))),
+        false,
+        EditedNaming::Primary,
+        CycleOptions {
+            private: true,
+            resolution: crate::types::PhotoResolution::None,
+            ..CycleOptions::default()
+        },
+    )
+    .await;
+    assert!(held.failed_count > 0, "{:?}", held.stats);
+    assert_eq!(held.stats.downloaded, 0);
+    assert_bytes(&original, foreign);
+    let handle = std::fs::File::open(&original).unwrap();
+    assert_eq!(
+        (
+            crate::fs_util::file_identity(&handle).unwrap(),
+            handle.metadata().unwrap().modified().unwrap()
+        ),
+        before
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), requests);
+    assert!(!std::fs::read_dir(&media).unwrap().any(|entry| {
+        std::fs::read(entry.unwrap().path()).is_ok_and(|bytes| bytes == EDIT_ONE)
+    }));
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM download_receipts WHERE child='asset-501'"
+        ),
+        0
+    );
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM reconciliation_paths WHERE id='asset-501'"
+        ),
+        0
+    );
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM assets WHERE id='asset-501' AND version_size='original'"
+        ),
+        0
+    );
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM assets WHERE id='asset-501' AND version_size='adjusted' AND status='pending' AND local_path IS NULL AND local_checksum IS NULL"
+        ),
+        1
+    );
+    assert_eq!(
+        db_count(
+            root.path(),
+            "SELECT count(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND admitted=1 AND verified_media=0 AND source_checksum IS NULL AND local_checksum IS NULL"
+        ),
+        1
+    );
+    eprintln!(
+        "FOREIGN_ORIGINAL_PASS downloads=0 GETs=0 receipts=0 intent=0 pending_unverified=1 P_preserved=true"
+    );
 }
 
 #[tokio::test]

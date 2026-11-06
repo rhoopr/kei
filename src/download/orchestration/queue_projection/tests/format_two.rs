@@ -4328,3 +4328,586 @@ async fn verified_same_pass_receipt_supersedes_new_publication_choice() {
         // This is only the direct admission prefix, not completed dispatch or checkpoint proof.
     }
 }
+
+#[tokio::test]
+async fn first_adjusted_suffix_nomination_precedes_admission() {
+    use crate::download::orchestration::generation;
+    use crate::state::VersionSizeKey;
+    use sha2::{Digest, Sha256};
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let original = b"\xff\xd8\xff\xe0source original";
+    let adjusted = b"\xff\xd8\xff\xe0first adjusted resource";
+    let checksum = |bytes: &[u8]| data_encoding::BASE64.encode(&Sha256::digest(bytes));
+    let local = |bytes: &[u8]| data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+    let file = |path: &std::path::Path| {
+        let handle = std::fs::File::open(path).unwrap();
+        let metadata = handle.metadata().unwrap();
+        (
+            std::fs::read(path).unwrap(),
+            crate::fs_util::file_identity(&handle).unwrap(),
+            metadata.len(),
+            metadata.modified().unwrap(),
+        )
+    };
+    let mut missing_intent = 0;
+    // Prove admission ordering and real publication before testing stale nominations.
+    for (pending_q, own_original, invalidation) in [
+        (true, true, None),
+        (false, true, None),
+        (true, false, None),
+        (false, false, None),
+        (true, true, Some("changed")),
+        (true, true, Some("missing")),
+    ] {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/original"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(original))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/adjusted"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(adjusted))
+            .expect(u64::from(invalidation.is_none()))
+            .mount(&server)
+            .await;
+        let mut f = Fixture::new().await;
+        if std::env::var_os("KEI_FIRST_ADJUSTED_RETAIN_FIXTURE").is_some() {
+            f.dir.disable_cleanup(true);
+        }
+        eprintln!(
+            "FIRST_ADJUSTED_CASE pending_q={pending_q} own_original={own_original} invalidation={invalidation:?} fixture={}",
+            f.dir.path().display()
+        );
+        f.config.folder_structure = "none".into();
+        f.config.edited_naming = crate::types::EditedNaming::Suffix;
+        f.config.resolution = crate::types::PhotoResolution::Original;
+        f.config.edited = false;
+        {
+            let mut values = f.session.records.lock().unwrap();
+            values[0]["fields"]["filenameEnc"]["value"] = json!("photo_edited.JPG");
+            values[0]["fields"]["resOriginalRes"]["value"] = json!({
+                "downloadURL":format!("{}/original",server.uri()),"size":original.len(),"fileChecksum":checksum(original)
+            });
+        }
+        let initial = stream_collision_child(&f, "asset-m", false).await;
+        assert_eq!((initial.downloaded, initial.state_write_failures), (1, 0));
+        assert!(initial.failed.is_empty());
+        let p = f.config.directory.join("photo_edited.JPG");
+        let original_file = file(&p);
+        assert_eq!(original_file.0, original);
+        let rows = |table: &str, column: &str, child: &str| {
+            let conn =
+                f.db.acquire_lock("first Adjusted complete evidence")
+                    .unwrap();
+            let mut statement = conn
+                .prepare(&format!(
+                    "SELECT * FROM {table} WHERE {column}=?1 ORDER BY 1"
+                ))
+                .unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([child], |row| {
+                    (0..columns)
+                        .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let original_receipts = rows("download_receipts", "child", "asset-m");
+        assert_eq!(original_receipts.len(), 1);
+        let target = if own_original { "asset-m" } else { "asset-b" };
+        let master = if own_original { "m" } else { "b" };
+        {
+            let mut values = f.session.records.lock().unwrap();
+            values[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+            let mut current = records(master, &checksum(original), "first adjusted");
+            current[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+            current[0]["fields"]["resOriginalRes"] = values[0]["fields"]["resOriginalRes"].clone();
+            current[1]["fields"]["resJPEGFullRes"] = json!({"value":{"downloadURL":format!("{}/adjusted",server.uri()),"size":adjusted.len(),"fileChecksum":checksum(adjusted)}});
+            current[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+            current[1]["fields"]["adjustmentRenderType"] = json!({"value":1});
+            if own_original {
+                *values = current;
+            } else {
+                values.extend(current);
+            }
+            let mut companion = records("q", &checksum(original), "pending companion");
+            companion[0]["fields"]["filenameEnc"]["value"] = json!("companion.JPG");
+            companion[1]["fields"]["resJPEGFullRes"] = json!({"value":{"downloadURL":format!("{}/companion",server.uri()),"size":adjusted.len(),"fileChecksum":checksum(adjusted)}});
+            companion[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+            companion[1]["fields"]["adjustmentRenderType"] = json!({"value":1});
+            values.extend(companion);
+        }
+        f.config.resolution = crate::types::PhotoResolution::None;
+        f.config.edited = true;
+        let context = generation::context_for_format(
+            std::slice::from_ref(&f.pass),
+            &f.config,
+            super::controls(),
+            2,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let run = context
+            .start_for_test(std::slice::from_ref(&f.pass), &f.config)
+            .await
+            .unwrap();
+        let key = generation::pass_key(&f.pass);
+        let mut config = f.config.with_pass(&f.pass);
+        config.selection_run = Some(run.clone());
+        config.selection_pass = Some(key.clone());
+        if pending_q {
+            let observed = f
+                .pass
+                .album
+                .confirm_catalog_asset("asset-q")
+                .await
+                .unwrap()
+                .asset;
+            let (asset, confirmation) = run.confirm(&key, observed).await.unwrap();
+            let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+                .await
+                .unwrap();
+            let mut plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+            assert_eq!(plan.tasks.len(), 1);
+            assert_eq!(plan.tasks[0].version_size, VersionSizeKey::Adjusted);
+            assert!(
+                run.project(
+                    &key,
+                    &asset,
+                    confirmation,
+                    &mut plan,
+                    &mut planner,
+                    &config,
+                    &CancellationToken::new()
+                )
+                .await
+                .unwrap()
+            );
+        }
+        let q_destinations = rows("provider_active_destinations", "child", "asset-q");
+        let q_decisions = rows("provider_active_decisions", "child", "asset-q");
+        let q_queue = rows("assets", "id", "asset-q");
+        assert_eq!(
+            (q_destinations.len(), q_decisions.len(), q_queue.len()),
+            (
+                usize::from(pending_q),
+                usize::from(pending_q),
+                usize::from(pending_q)
+            )
+        );
+        if pending_q {
+            assert_eq!(f.db.acquire_lock("Q really unfinished").unwrap().query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-q' AND admitted=1 AND verified_media=0", [], |row|row.get::<_,i64>(0)).unwrap(), 1);
+        }
+        let observed = f
+            .pass
+            .album
+            .confirm_catalog_asset(target)
+            .await
+            .unwrap()
+            .asset;
+        let (asset, confirmation) = run.confirm(&key, observed).await.unwrap();
+        assert_eq!(asset.filename(), Some("photo.JPG"));
+        let expected = crate::download::filter::expected_paths_for(&asset, &config);
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].version_size, VersionSizeKey::Adjusted);
+        assert_eq!(
+            expected[0].path, p,
+            "actual Suffix requested path must be occupied Original P"
+        );
+        let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+            .await
+            .unwrap();
+        let mut plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let task = &plan.tasks[0];
+        assert_eq!(task.version_size, VersionSizeKey::Adjusted);
+        assert_eq!(
+            (task.checksum.as_ref(), task.size),
+            (checksum(adjusted).as_str(), adjusted.len() as u64)
+        );
+        let s = task.download_path.clone();
+        assert_ne!(s, p, "collision must choose S before late chooser");
+        assert!(!s.exists());
+        assert!(task.superseded_requested_path.is_none());
+        assert!(task.superseded_requested(&config.directory, &p).is_none());
+        let binding = task.publication_binding.as_deref().unwrap().clone();
+        let (account, provider) = f.capture.owner.authenticated_keys().unwrap();
+        assert_eq!(
+            json!([
+                binding.account_key,
+                binding.provider_key,
+                binding.scope,
+                binding.library,
+                binding.child,
+                binding.master,
+                binding.state_id,
+                binding.origin_pass
+            ]),
+            json!([
+                account,
+                provider,
+                run.root.spec.scope,
+                "PrimarySync",
+                target,
+                master,
+                target,
+                key
+            ])
+        );
+        assert!(
+            f.db.bound_historical_downloads(
+                binding.clone(),
+                "adjusted".into(),
+                checksum(adjusted),
+                adjusted.len() as u64
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        let original_key = crate::download::filter::provider_version_for_selected(
+            &asset,
+            &config,
+            VersionSizeKey::Original,
+        );
+        let (_, resource) = asset
+            .versions()
+            .iter()
+            .find(|(version, _)| VersionSizeKey::from(*version) == original_key)
+            .unwrap();
+        assert_eq!(
+            (resource.checksum.as_ref(), resource.size),
+            (checksum(original).as_str(), original.len() as u64)
+        );
+        let fingerprint = crate::download::file::fingerprint_downloaded_path(&config.directory, &p)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                data_encoding::HEXLOWER.encode(&fingerprint.sha256),
+                fingerprint.size
+            ),
+            (local(original), original.len() as u64)
+        );
+        let proof =
+            f.db.bound_cross_rendition_original(
+                binding.clone(),
+                VersionSizeKey::Adjusted,
+                crate::state::db::CrossRenditionOriginal {
+                    path: SelectionPath::from_path(&p),
+                    provider_checksum: resource.checksum.to_string(),
+                    provider_size: resource.size,
+                    local_checksum: Some(data_encoding::HEXLOWER.encode(&fingerprint.sha256)),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            proof.is_some(),
+            own_original,
+            "existing scoped Original witness eligibility"
+        );
+        if let Some(proof) = proof {
+            let receipt = proof.receipt;
+            assert!(receipt.fulfills_pass(&key));
+            assert_eq!(
+                json!([
+                    receipt.account_key,
+                    receipt.provider_key,
+                    receipt.scope,
+                    receipt.library,
+                    receipt.child,
+                    receipt.master,
+                    receipt.state_id,
+                    receipt.origin_pass,
+                    receipt.version_size,
+                    receipt.provider_checksum,
+                    receipt.provider_size,
+                    receipt.native_path,
+                    receipt.source_checksum,
+                    receipt.local_checksum
+                ]),
+                json!([
+                    account,
+                    provider,
+                    run.root.spec.scope,
+                    "PrimarySync",
+                    target,
+                    master,
+                    target,
+                    key,
+                    "original",
+                    checksum(original),
+                    original.len(),
+                    SelectionPath::from_path(&p),
+                    local(original),
+                    local(original)
+                ])
+            );
+        }
+        assert_eq!(
+            rows("download_receipts", "child", "asset-m"),
+            original_receipts
+        );
+        assert_eq!(file(&p), original_file);
+        assert!(rows("reconciliation_paths", "id", target).is_empty());
+        assert!(rows("provider_active_destinations", "child", target).is_empty());
+        if own_original {
+            let nominations = planner.reconciliation_reservations().collect::<Vec<_>>();
+            assert_eq!(nominations.len(), 1);
+            let nomination = nominations[0];
+            assert_eq!(nomination.library.as_ref(), "PrimarySync");
+            assert_eq!(nomination.asset_id.as_ref(), target);
+            assert_eq!(nomination.version_size, VersionSizeKey::Adjusted);
+            assert_eq!(
+                nomination.requested_path_key.0,
+                crate::fs_util::confined_path_key(&p).unwrap()
+            );
+            assert_eq!(
+                nomination.destination_path_key.0,
+                crate::fs_util::confined_path_key(&s).unwrap()
+            );
+            assert_eq!(nomination.destination_path, s);
+            let content = nomination.content.as_ref().unwrap();
+            assert_eq!(
+                (content.checksum.as_ref(), content.size),
+                (checksum(adjusted).as_str(), adjusted.len() as u64)
+            );
+        }
+        eprintln!(
+            "FIRST_ADJUSTED_PREMISES pending_q={pending_q} own_original={own_original} suffix=true collision_before_project=true marker_absent=true adjusted_history=0 original_witness={}",
+            own_original
+        );
+        let (condition, diagnostic) = if own_original {
+            (
+                "NOT EXISTS",
+                "first Adjusted intent missing before admission",
+            )
+        } else {
+            ("EXISTS", "new child gained early Adjusted intent")
+        };
+        f.db.acquire_lock("first Adjusted actual admission observer").unwrap().execute_batch(&format!(
+            "CREATE TRIGGER first_adjusted_order BEFORE INSERT ON provider_active_destinations
+             WHEN NEW.child='{target}' AND NEW.version_size='adjusted' BEGIN SELECT CASE WHEN {condition}(
+             SELECT 1 FROM reconciliation_paths r WHERE r.library=NEW.library AND r.id=NEW.asset_id
+             AND r.version_size=NEW.version_size AND r.provider_checksum=NEW.checksum AND r.provider_size=NEW.size_bytes
+             AND r.requested_path_key='{}' AND r.destination_path_key='{}'
+             AND r.destination_path=NEW.compat_path AND NEW.admitted=1)
+             THEN RAISE(ABORT,'{diagnostic}') END; END;",
+            crate::fs_util::confined_path_key(&p).unwrap().replace('\'', "''"),
+            crate::fs_util::confined_path_key(&s).unwrap().replace('\'', "''"),
+        )).unwrap();
+        let invalidated_file = invalidation.map(|change| {
+            let path = if change == "changed" {
+                std::fs::write(&p, b"concurrent synthetic local change").unwrap();
+                p.clone()
+            } else {
+                let retained = p.with_file_name("retained-original.JPG");
+                std::fs::rename(&p, &retained).unwrap();
+                assert_eq!(file(&retained), original_file);
+                retained
+            };
+            let snapshot = file(&path);
+            (path, snapshot)
+        });
+        let projected = run
+            .project(
+                &key,
+                &asset,
+                confirmation,
+                &mut plan,
+                &mut planner,
+                &config,
+                &CancellationToken::new(),
+            )
+            .await;
+        if let Some((retained, snapshot)) = invalidated_file {
+            let reason = format!("{:#}", projected.expect_err("invalidated positive nomination must refuse, not fall back to ordinary admission"));
+            assert!(
+                reason.contains("Choice lost authenticated historical source"),
+                "unexpected owner obstacle: {reason}"
+            );
+            assert!(rows("reconciliation_paths", "id", target).is_empty());
+            assert!(rows("provider_active_destinations", "child", target).is_empty());
+            assert_eq!(
+                rows("download_receipts", "child", "asset-m"),
+                original_receipts
+            );
+            assert_eq!(file(&retained), snapshot);
+            if invalidation == Some("missing") {
+                assert!(!p.exists());
+            }
+            assert_eq!(
+                rows("provider_active_destinations", "child", "asset-q"),
+                q_destinations
+            );
+            assert_eq!(
+                rows("provider_active_decisions", "child", "asset-q"),
+                q_decisions
+            );
+            assert_eq!(rows("assets", "id", "asset-q"), q_queue);
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            eprintln!(
+                "FIRST_ADJUSTED_STALE_PASS invalidation={invalidation:?} prior-nomination=true refused-before-intent-admission-GET=true reason={reason}"
+            );
+            continue;
+        }
+        let prefix_admitted = match projected {
+            Err(error) if own_original => {
+                let reason = format!("{error:#}");
+                assert!(
+                    reason.contains("first Adjusted intent missing before admission"),
+                    "unexpected owner obstacle: {reason}"
+                );
+                missing_intent += 1;
+                assert!(rows("provider_active_destinations", "child", target).is_empty());
+                assert!(rows("reconciliation_paths", "id", target).is_empty());
+                eprintln!(
+                    "FIRST_ADJUSTED_RED pending_q={pending_q} unique_insert_tripwire=true reason={reason}"
+                );
+                false
+            }
+            result => {
+                assert!(result.unwrap());
+                assert_eq!(
+                    rows("provider_active_destinations", "child", target).len(),
+                    1
+                );
+                assert_eq!(
+                    rows("reconciliation_paths", "id", target).len(),
+                    usize::from(own_original)
+                );
+                let admitted: String = f.db.acquire_lock("first Adjusted exact admitted prefix").unwrap().query_row(
+                    "SELECT json_array(d.generation,d.pass_key,d.child,d.library,d.asset_id,d.master,d.version_size,d.path,d.checksum,d.size_bytes,d.admitted,d.verified_media,g.scope,g.account_key,g.provider_key) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.child=?1",
+                    [target], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&admitted).unwrap(),
+                    json!([
+                        run.root.id,
+                        key,
+                        target,
+                        "PrimarySync",
+                        target,
+                        master,
+                        "adjusted",
+                        SelectionPath::from_path(&s).key().unwrap(),
+                        checksum(adjusted),
+                        adjusted.len(),
+                        1,
+                        0,
+                        run.root.spec.scope,
+                        account,
+                        provider
+                    ])
+                );
+                eprintln!(
+                    "FIRST_ADJUSTED_CONTROL pending_q={pending_q} own_original={own_original} admitted=true early_intent={own_original}"
+                );
+                true
+            }
+        };
+        assert_eq!(
+            rows("download_receipts", "child", "asset-m"),
+            original_receipts
+        );
+        assert_eq!(file(&p), original_file);
+        assert_eq!(
+            rows("provider_active_destinations", "child", "asset-q"),
+            q_destinations
+        );
+        assert_eq!(
+            rows("provider_active_decisions", "child", "asset-q"),
+            q_decisions
+        );
+        assert_eq!(rows("assets", "id", "asset-q"), q_queue);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        eprintln!(
+            "FIRST_ADJUSTED_CUSTODY pending_q={pending_q} own_original={own_original} P_Q_exact=true adjusted_GET=0"
+        );
+        if !prefix_admitted {
+            continue;
+        }
+        if !own_original {
+            f.db.acquire_lock("release ordinary prefix observer")
+                .unwrap()
+                .execute_batch("DROP TRIGGER first_adjusted_order")
+                .unwrap();
+        }
+        let published = crate::download::pipeline::stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            futures_util::stream::iter([Ok(asset)]),
+            &Arc::new(config.clone()),
+            super::controls(),
+            1,
+            CancellationToken::new(),
+            crate::download::pipeline::StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (published.downloaded, published.state_write_failures),
+            (1, 0),
+            "{published:?}"
+        );
+        assert!(published.failed.is_empty());
+        assert_eq!(std::fs::read(&s).unwrap(), adjusted);
+        let completed =
+            f.db.bound_download_receipts(
+                binding,
+                "adjusted".into(),
+                checksum(adjusted),
+                adjusted.len() as u64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].native_path, SelectionPath::from_path(&s));
+        assert!(completed[0].fulfills_pass(&key));
+        assert_eq!(
+            (&completed[0].source_checksum, &completed[0].local_checksum),
+            (&local(adjusted), &local(adjusted))
+        );
+        let after = rows("download_receipts", "child", "asset-m");
+        assert!(
+            original_receipts
+                .iter()
+                .all(|receipt| after.contains(receipt))
+        );
+        assert_eq!(after.len(), 1 + usize::from(own_original));
+        assert_eq!(file(&p), original_file);
+        assert_eq!(
+            rows("provider_active_destinations", "child", "asset-q"),
+            q_destinations
+        );
+        assert_eq!(
+            rows("provider_active_decisions", "child", "asset-q"),
+            q_decisions
+        );
+        assert_eq!(rows("assets", "id", "asset-q"), q_queue);
+        let gets = server.received_requests().await.unwrap();
+        assert_eq!(gets.len(), 2);
+        assert_eq!(
+            gets.iter()
+                .filter(|request| request.url.path() == "/adjusted")
+                .count(),
+            1
+        );
+        eprintln!(
+            "FIRST_ADJUSTED_MEDIA_PASS pending_q={pending_q} own_original={own_original} saved-S=true adjusted_GET=1 P_Q_exact=true"
+        );
+    }
+    assert_eq!(
+        missing_intent, 0,
+        "eligible first-Adjusted intent must precede admission"
+    );
+}
