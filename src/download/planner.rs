@@ -963,6 +963,11 @@ impl TaskPlanner {
         if matches!(self.path_mode, PathPlanningMode::Download) {
             self.relocate_protected_tasks(&mut plan, asset, config)
                 .await?;
+        }
+        if matches!(
+            self.path_mode,
+            PathPlanningMode::Download | PathPlanningMode::ReservedDownload
+        ) {
             self.reserve_changed_publication_choices(asset, config, &plan)
                 .await?;
         }
@@ -970,7 +975,7 @@ impl TaskPlanner {
     }
 
     // Only nominate choices backed by scoped prior publications. The caller
-    // persists them after matching returns Missing, before dispatch.
+    // persists the final choice before selection admission or ordinary dispatch.
     async fn reserve_changed_publication_choices(
         &mut self,
         asset: &PhotoAsset,
@@ -1020,23 +1025,52 @@ impl TaskPlanner {
             {
                 continue;
             }
-            self.reconciliation.reservations.push(PlannedReservation {
-                origin: ReservationOrigin::PriorPublication,
-                reservation: ReconciliationReservation {
-                    library: Arc::clone(&task.library),
-                    asset_id: task.asset_id.as_ref().into(),
-                    version_size: task.version_size,
-                    requested_path_key: ReconciliationPathKey(requested_key.as_ref().to_owned()),
-                    destination_path_key: ReconciliationPathKey(
-                        destination_key.as_ref().to_owned(),
-                    ),
-                    destination_path: crate::fs_util::absolute_confined_path(&task.download_path)?,
-                    content: Some(ReconciliationContent {
-                        checksum: task.checksum.clone(),
-                        size: task.size,
-                    }),
-                },
-            });
+            let reservation = ReconciliationReservation {
+                library: Arc::clone(&task.library),
+                asset_id: task.asset_id.as_ref().into(),
+                version_size: task.version_size,
+                requested_path_key: ReconciliationPathKey(requested_key.as_ref().to_owned()),
+                destination_path_key: ReconciliationPathKey(destination_key.as_ref().to_owned()),
+                destination_path: crate::fs_util::absolute_confined_path(&task.download_path)?,
+                content: Some(ReconciliationContent {
+                    checksum: task.checksum.clone(),
+                    size: task.size,
+                }),
+            };
+            let mut matching = None;
+            for (index, planned) in self.reconciliation.reservations.iter().enumerate() {
+                let saved = &planned.reservation;
+                if saved.library == reservation.library
+                    && saved.asset_id == reservation.asset_id
+                    && saved.version_size == reservation.version_size
+                    && saved.content == reservation.content
+                    && saved.requested_path_key == reservation.requested_path_key
+                {
+                    anyhow::ensure!(
+                        saved == &reservation,
+                        "Conflicting prior publication destination"
+                    );
+                    anyhow::ensure!(
+                        matching.replace(index).is_none(),
+                        "Duplicate prior publication nomination"
+                    );
+                }
+            }
+            if let Some(index) = matching {
+                let planned = self
+                    .reconciliation
+                    .reservations
+                    .get_mut(index)
+                    .context("Prior publication nomination disappeared")?;
+                if planned.origin == ReservationOrigin::OrdinaryCollision {
+                    planned.origin = ReservationOrigin::PriorPublication;
+                }
+            } else {
+                self.reconciliation.reservations.push(PlannedReservation {
+                    origin: ReservationOrigin::PriorPublication,
+                    reservation,
+                });
+            }
         }
         Ok(())
     }

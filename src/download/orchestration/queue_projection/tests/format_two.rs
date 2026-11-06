@@ -3599,3 +3599,732 @@ async fn publication_choice_zero_history_still_validates_binding() {
     );
     // Static immutable-principal boundary only; no concurrent account rebind is attempted.
 }
+
+#[tokio::test]
+async fn verified_same_pass_receipt_supersedes_new_publication_choice() {
+    use crate::download::orchestration::generation;
+    use crate::state::VersionSizeKey;
+    use sha2::{Digest, Sha256};
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let old = b"\xff\xd8\xff\xe0historical original";
+    let current = b"\xff\xd8\xff\xe0replacement original";
+    let companion = b"\xff\xd8\xff\xe0disjoint pending child";
+    let checksum = |bytes: &[u8]| data_encoding::BASE64.encode(&Sha256::digest(bytes));
+    let local = |bytes: &[u8]| data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+    let identity = |path: &std::path::Path| {
+        let file = std::fs::File::open(path).unwrap();
+        let metadata = file.metadata().unwrap();
+        (
+            crate::fs_util::file_identity(&file).unwrap(),
+            metadata.len(),
+            metadata.modified().unwrap(),
+        )
+    };
+    // Prove both historical prefixes before testing independent R publication.
+    for (publish_r, pending_q, new_child) in [
+        (false, false, false),
+        (false, true, false),
+        (false, false, true),
+        (false, true, true),
+        (true, false, false),
+        (true, true, false),
+    ] {
+        let server = wiremock::MockServer::start().await;
+        for (name, bytes, expected) in [
+            ("old", old.as_slice(), 1),
+            (
+                "current",
+                current.as_slice(),
+                u64::from(publish_r || new_child),
+            ),
+            ("companion", companion.as_slice(), 0),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(expected)
+                .mount(&server)
+                .await;
+        }
+        let mut f = Fixture::new().await;
+        if std::env::var_os("KEI_FINAL_R_RETAIN_FIXTURE").is_some() {
+            f.dir.disable_cleanup(true);
+        }
+        eprintln!(
+            "FINAL_R_CASE publish_r={publish_r} pending_q={pending_q} new_child={new_child} fixture={}",
+            f.dir.path().display()
+        );
+        f.config.folder_structure = "none".into();
+        f.config.resolution = crate::types::PhotoResolution::Original;
+        f.config.edited = false;
+        {
+            let mut values = f.session.records.lock().unwrap();
+            values[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+            values[0]["fields"]["resOriginalRes"]["value"] = json!({
+                "downloadURL":format!("{}/old", server.uri()),
+                "size":old.len(), "fileChecksum":checksum(old)
+            });
+        }
+        let first = stream_collision_child(&f, "asset-m", false).await;
+        assert_eq!((first.downloaded, first.state_write_failures), (1, 0));
+        assert!(first.failed.is_empty());
+        let p = f.config.directory.join("photo.JPG");
+        let r = f.config.directory.join("verified.JPG");
+        let q = f.config.directory.join("companion.JPG");
+        assert_eq!(std::fs::read(&p).unwrap(), old);
+        let p_identity = identity(&p);
+        // Snapshot every column, including immutable proof and nullable trust fields.
+        let rows = |table: &str, column: &str, child: &str| {
+            let conn = f.db.acquire_lock("final R complete row snapshot").unwrap();
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT * FROM {table} WHERE {column}=?1 ORDER BY 1"
+                ))
+                .unwrap();
+            let columns = stmt.column_count();
+            stmt.query_map([child], |row| {
+                (0..columns)
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        let p_receipts = rows("download_receipts", "child", "asset-m");
+        assert_eq!(p_receipts.len(), 1);
+        {
+            let mut values = f.session.records.lock().unwrap();
+            values[0]["fields"]["resOriginalRes"]["value"] = json!({
+                "downloadURL":format!("{}/current", server.uri()),
+                "size":current.len(), "fileChecksum":checksum(current)
+            });
+            let mut other = records("q", &checksum(companion), "disjoint unfinished child");
+            other[0]["fields"]["filenameEnc"]["value"] = json!("companion.JPG");
+            other[0]["fields"]["resOriginalRes"]["value"] = json!({
+                "downloadURL":format!("{}/companion", server.uri()),
+                "size":companion.len(), "fileChecksum":checksum(companion)
+            });
+            values.extend(other);
+        }
+        assert_ne!(checksum(old), checksum(current));
+        let context = generation::context_for_format(
+            std::slice::from_ref(&f.pass),
+            &f.config,
+            super::controls(),
+            2,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let run = context
+            .start_for_test(std::slice::from_ref(&f.pass), &f.config)
+            .await
+            .unwrap();
+        let key = generation::pass_key(&f.pass);
+        let mut config = f.config.with_pass(&f.pass);
+        config.selection_run = Some(run.clone());
+        config.selection_pass = Some(key.clone());
+        assert_eq!(run.root.spec.format, 2);
+        if pending_q {
+            let observed = f
+                .pass
+                .album
+                .confirm_catalog_asset("asset-q")
+                .await
+                .unwrap()
+                .asset;
+            let (asset, confirmation) = run.confirm(&key, observed).await.unwrap();
+            let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+                .await
+                .unwrap();
+            let mut plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+            assert_eq!(plan.tasks.len(), 1);
+            assert_eq!(plan.tasks[0].download_path, q);
+            assert!(
+                run.project(
+                    &key,
+                    &asset,
+                    confirmation,
+                    &mut plan,
+                    &mut planner,
+                    &config,
+                    &CancellationToken::new()
+                )
+                .await
+                .unwrap()
+            );
+        }
+        let admitted_sql = "SELECT json_array(d.generation,d.pass_key,d.child,d.library,d.asset_id,d.master,d.version_size,d.path,d.checksum,d.size_bytes,d.admitted,d.verified_media,g.scope,g.account_key,g.provider_key) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.generation=?1 AND d.pass_key=?2 AND d.child=?3";
+        let admitted = |child: &str| -> serde_json::Value {
+            let text: String =
+                f.db.acquire_lock("final R exact admission")
+                    .unwrap()
+                    .query_row(
+                        admitted_sql,
+                        rusqlite::params![run.root.id, key, child],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+            serde_json::from_str(&text).unwrap()
+        };
+        let (account, provider) = f.capture.owner.authenticated_keys().unwrap();
+        if pending_q {
+            assert_eq!(
+                admitted("asset-q"),
+                json!([
+                    run.root.id,
+                    key,
+                    "asset-q",
+                    "PrimarySync",
+                    "asset-q",
+                    "q",
+                    "original",
+                    SelectionPath::from_path(&q).key().unwrap(),
+                    checksum(companion),
+                    companion.len(),
+                    1,
+                    0,
+                    run.root.spec.scope,
+                    account,
+                    provider
+                ])
+            );
+        }
+        let q_destinations = rows("provider_active_destinations", "child", "asset-q");
+        let q_decisions = rows("provider_active_decisions", "child", "asset-q");
+        let q_queue = rows("assets", "id", "asset-q");
+        assert_eq!(
+            (q_destinations.len(), q_decisions.len(), q_queue.len()),
+            (
+                usize::from(pending_q),
+                usize::from(pending_q),
+                usize::from(pending_q)
+            )
+        );
+        assert!(!q.exists());
+        if new_child {
+            let mut b = records("b", &checksum(current), "new child without history");
+            b[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+            b[0]["fields"]["resOriginalRes"]["value"] = json!({
+                "downloadURL":format!("{}/current", server.uri()),
+                "size":current.len(), "fileChecksum":checksum(current)
+            });
+            f.session.records.lock().unwrap().extend(b);
+            for table in ["download_receipts", "provider_active_destinations"] {
+                assert!(rows(table, "child", "asset-b").is_empty());
+            }
+            assert!(rows("reconciliation_paths", "id", "asset-b").is_empty());
+            let observed = f
+                .pass
+                .album
+                .confirm_catalog_asset("asset-b")
+                .await
+                .unwrap()
+                .asset;
+            let (b, confirmation) = run.confirm(&key, observed).await.unwrap();
+            let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+                .await
+                .unwrap();
+            let mut plan = planner.plan_download_asset(&b, &config).await.unwrap();
+            assert_eq!(plan.tasks.len(), 1);
+            assert_ne!(plan.tasks[0].download_path, p);
+            assert!(plan.tasks[0].superseded_requested_path.is_none());
+            let binding = plan.tasks[0].publication_binding.as_deref().unwrap();
+            assert_eq!(binding.child, "asset-b");
+            assert_eq!(binding.master, "b");
+            assert!(
+                f.db.bound_historical_downloads(
+                    binding.clone(),
+                    "original".into(),
+                    checksum(current),
+                    current.len() as u64
+                )
+                .await
+                .unwrap()
+                .is_empty()
+            );
+            f.db.acquire_lock("new B has no early bookmark")
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER no_early_b BEFORE INSERT ON provider_active_destinations
+                 WHEN NEW.child='asset-b' BEGIN SELECT CASE WHEN EXISTS(
+                 SELECT 1 FROM reconciliation_paths WHERE id='asset-b')
+                 THEN RAISE(ABORT,'new B gained early intent') END; END;",
+                )
+                .unwrap();
+            assert!(
+                run.project(
+                    &key,
+                    &b,
+                    confirmation,
+                    &mut plan,
+                    &mut planner,
+                    &config,
+                    &CancellationToken::new()
+                )
+                .await
+                .unwrap()
+            );
+            assert!(rows("reconciliation_paths", "id", "asset-b").is_empty());
+            assert!(rows("download_receipts", "child", "asset-b").is_empty());
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            f.db.acquire_lock("release B prefix observer")
+                .unwrap()
+                .execute_batch("DROP TRIGGER no_early_b")
+                .unwrap();
+            let result = crate::download::pipeline::stream_and_download_from_stream(
+                &reqwest::Client::new(),
+                futures_util::stream::iter([Ok(b)]),
+                &Arc::new(config.clone()),
+                super::controls(),
+                1,
+                CancellationToken::new(),
+                crate::download::pipeline::StreamRuntime::new(None, None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (result.downloaded, result.state_write_failures),
+                (1, 0),
+                "{result:?}"
+            );
+            assert!(result.failed.is_empty());
+            let receipts =
+                f.db.acquire_lock("B completed path")
+                    .unwrap()
+                    .query_row(
+                        "SELECT local_path FROM assets WHERE id='asset-b' AND status='downloaded'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap();
+            assert_eq!(std::fs::read(receipts).unwrap(), current);
+            assert_eq!(rows("download_receipts", "child", "asset-b").len(), 1);
+            assert_eq!(rows("download_receipts", "child", "asset-m"), p_receipts);
+            assert_eq!(std::fs::read(&p).unwrap(), old);
+            assert_eq!(identity(&p), p_identity);
+            assert_eq!(
+                rows("provider_active_destinations", "child", "asset-q"),
+                q_destinations
+            );
+            assert_eq!(
+                rows("provider_active_decisions", "child", "asset-q"),
+                q_decisions
+            );
+            assert_eq!(rows("assets", "id", "asset-q"), q_queue);
+            assert!(!q.exists());
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+            eprintln!(
+                "ORIGIN_MATRIX_PASS new_child=true pending_q={pending_q} no-early-intent=true published=true P-Q-unchanged=true"
+            );
+            continue;
+        }
+        let observed = f
+            .pass
+            .album
+            .confirm_catalog_asset("asset-m")
+            .await
+            .unwrap()
+            .asset;
+        let (asset, confirmation) = run.confirm(&key, observed).await.unwrap();
+        assert_eq!(asset.filename(), Some("photo.JPG"));
+        let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+            .await
+            .unwrap();
+        let mut plan = planner.plan_download_asset(&asset, &config).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let task = &plan.tasks[0];
+        assert_eq!(task.version_size, VersionSizeKey::Original);
+        assert_eq!(task.checksum.as_ref(), checksum(current));
+        assert_eq!(task.size, current.len() as u64);
+        let s = task.download_path.clone();
+        assert_ne!(s, p);
+        assert_ne!(s, q);
+        assert_ne!(s, r);
+        assert!(!s.exists());
+        // Ordinary planning already chose S; the bound historical P receipt,
+        // not a relocation marker, must authenticate this prior-publication choice.
+        assert!(
+            task.superseded_requested_path.is_none(),
+            "unexpected raw marker: {:?}",
+            task.superseded_requested_path
+        );
+        assert!(task.superseded_requested(&config.directory, &p).is_none());
+        let binding = task.publication_binding.as_deref().unwrap().clone();
+        assert_eq!(
+            json!([
+                binding.account_key,
+                binding.provider_key,
+                binding.scope,
+                binding.library,
+                binding.child,
+                binding.master,
+                binding.state_id,
+                binding.origin_pass
+            ]),
+            json!([
+                account,
+                provider,
+                run.root.spec.scope,
+                "PrimarySync",
+                "asset-m",
+                "m",
+                "asset-m",
+                key
+            ])
+        );
+        let nominated: Vec<_> = planner.reconciliation_reservations().collect();
+        assert_eq!(nominated.len(), 1);
+        let nomination = nominated[0];
+        assert_eq!(nomination.library.as_ref(), "PrimarySync");
+        assert_eq!(nomination.asset_id.as_ref(), "asset-m");
+        assert_eq!(nomination.version_size, VersionSizeKey::Original);
+        assert_eq!(
+            nomination.requested_path_key.0,
+            crate::fs_util::confined_path_key(&p).unwrap()
+        );
+        assert_eq!(
+            nomination.destination_path_key.0,
+            crate::fs_util::confined_path_key(&s).unwrap()
+        );
+        assert_eq!(nomination.destination_path, s);
+        let content = nomination.content.as_ref().unwrap();
+        assert_eq!(
+            (content.checksum.as_ref(), content.size),
+            (checksum(current).as_str(), current.len() as u64)
+        );
+        assert!(rows("reconciliation_paths", "id", "asset-m").is_empty());
+        assert!(rows("provider_active_destinations", "child", "asset-m").is_empty());
+        let old_receipts =
+            f.db.bound_historical_downloads(
+                binding.clone(),
+                "original".into(),
+                checksum(current),
+                current.len() as u64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_receipts.len(), 1);
+        let historical = &old_receipts[0];
+        assert_eq!(historical.native_path.to_path(), p);
+        assert!(historical.fulfills_pass(&key));
+        assert_eq!(
+            json!([
+                historical.account_key,
+                historical.provider_key,
+                historical.scope,
+                historical.library,
+                historical.child,
+                historical.master,
+                historical.state_id,
+                historical.origin_pass,
+                historical.version_size,
+                historical.provider_checksum,
+                historical.provider_size
+            ]),
+            json!([
+                account,
+                provider,
+                run.root.spec.scope,
+                "PrimarySync",
+                "asset-m",
+                "m",
+                "asset-m",
+                key,
+                "original",
+                checksum(old),
+                old.len()
+            ])
+        );
+        assert_eq!(
+            (
+                old_receipts[0].source_checksum.as_str(),
+                old_receipts[0].local_checksum.as_str()
+            ),
+            (local(old).as_str(), local(old).as_str())
+        );
+        assert_eq!(rows("download_receipts", "child", "asset-m"), p_receipts);
+        assert_eq!(std::fs::read(&p).unwrap(), old);
+        assert_eq!(identity(&p), p_identity);
+        eprintln!(
+            "FINAL_R_NOMINATION publish_r={publish_r} pending_q={pending_q} marker-free=true historical-P=true exact-nomination=true"
+        );
+        let r_identity = if publish_r {
+            // Do not start another run, reload the retained planner, or rewrite a receipt/path.
+            f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"]["value"] =
+                json!("verified.JPG");
+            let result = stream_collision_child(&f, "asset-m", false).await;
+            assert_eq!(
+                (result.downloaded, result.state_write_failures),
+                (1, 0),
+                "{result:?}"
+            );
+            assert!(result.failed.is_empty());
+            f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"]["value"] =
+                json!("photo.JPG");
+            assert_eq!(std::fs::read(&r).unwrap(), current);
+            let receipts =
+                f.db.bound_download_receipts(
+                    binding.clone(),
+                    "original".into(),
+                    checksum(current),
+                    current.len() as u64,
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipts.len(), 1);
+            let receipt = &receipts[0];
+            assert_eq!(receipt.native_path, SelectionPath::from_path(&r));
+            assert!(receipt.fulfills_pass(&key));
+            assert_eq!(
+                json!([
+                    receipt.account_key,
+                    receipt.provider_key,
+                    receipt.scope,
+                    receipt.library,
+                    receipt.child,
+                    receipt.master,
+                    receipt.state_id,
+                    receipt.version_size,
+                    receipt.provider_checksum,
+                    receipt.provider_size,
+                    receipt.source_checksum,
+                    receipt.local_checksum
+                ]),
+                json!([
+                    account,
+                    provider,
+                    run.root.spec.scope,
+                    "PrimarySync",
+                    "asset-m",
+                    "m",
+                    "asset-m",
+                    "original",
+                    checksum(current),
+                    current.len(),
+                    local(current),
+                    local(current)
+                ])
+            );
+            let fingerprint =
+                crate::download::file::fingerprint_downloaded_path(&config.directory, &r)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                (
+                    data_encoding::HEXLOWER.encode(&fingerprint.sha256),
+                    fingerprint.size
+                ),
+                (local(current), current.len() as u64)
+            );
+            assert!(
+                f.db.verified_selection_paths(
+                    owner(),
+                    run.root.spec.scope.clone(),
+                    key.clone(),
+                    "asset-m".into(),
+                    "m".into(),
+                    "original".into(),
+                    (checksum(current), current.len() as u64)
+                )
+                .await
+                .unwrap()
+                .contains(&SelectionPath::from_path(&r))
+            );
+            assert!(
+                f.db.selection_path_reusable_for_pass(
+                    owner(),
+                    run.root.id.clone(),
+                    run.root.spec.scope.clone(),
+                    key.clone(),
+                    "asset-m".into(),
+                    SelectionPath::from_path(&r)
+                )
+                .await
+                .unwrap()
+            );
+            assert!(
+                f.db.selection_path_matches_local(
+                    owner(),
+                    run.root.spec.scope.clone(),
+                    key.clone(),
+                    "asset-m".into(),
+                    SelectionPath::from_path(&r),
+                    (local(current), current.len() as u64)
+                )
+                .await
+                .unwrap()
+            );
+            eprintln!("FINAL_R_VERIFIED same-pass-receipt=true local-fingerprint=true");
+            Some(identity(&r))
+        } else {
+            assert!(!r.exists());
+            None
+        };
+        // Any ordinary R-to-R bookmark is legitimate, never an obsolete P-to-R choice.
+        let map_sql = "SELECT json_array(library,id,version_size,requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size) FROM reconciliation_paths WHERE id='asset-m' ORDER BY requested_path_key";
+        let mappings = || -> Vec<serde_json::Value> {
+            let conn = f.db.acquire_lock("final R mapping tuples").unwrap();
+            conn.prepare(map_sql)
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|text| serde_json::from_str(&text.unwrap()).unwrap())
+                .collect()
+        };
+        let tuple = |requested: &std::path::Path, destination: &std::path::Path| {
+            json!([
+                "PrimarySync",
+                "asset-m",
+                "original",
+                crate::fs_util::confined_path_key(requested).unwrap(),
+                crate::fs_util::confined_path_key(destination).unwrap(),
+                destination.to_str().unwrap(),
+                checksum(current),
+                current.len()
+            ])
+        };
+        let before_maps = mappings();
+        assert!(before_maps.len() <= usize::from(publish_r));
+        assert!(before_maps.iter().all(|row| *row == tuple(&r, &r)));
+        let receipts_before = rows("download_receipts", "child", "asset-m");
+        assert_eq!(receipts_before.len(), 1 + usize::from(publish_r));
+        assert!(p_receipts.iter().all(|row| receipts_before.contains(row)));
+        assert_eq!(plan.tasks[0].download_path, s);
+        assert!(
+            plan.tasks[0].superseded_requested_path.is_none(),
+            "retained plan unexpectedly acquired a raw marker: {:?}",
+            plan.tasks[0].superseded_requested_path
+        );
+        assert!(
+            plan.tasks[0]
+                .superseded_requested(&config.directory, &p)
+                .is_none()
+        );
+        assert_eq!(
+            f.session.records.lock().unwrap()[0]["fields"]["filenameEnc"]["value"],
+            json!("photo.JPG")
+        );
+        assert!(rows("provider_active_destinations", "child", "asset-m").is_empty());
+        let gets = server.received_requests().await.unwrap().len();
+        assert_eq!(gets, 1 + usize::from(publish_r));
+        if !publish_r {
+            f.db.acquire_lock("observe exact prior intent before admission").unwrap().execute_batch(&format!(
+                "CREATE TRIGGER exact_prior_before_admission BEFORE INSERT ON provider_active_destinations
+                 WHEN NEW.child='asset-m' BEGIN SELECT CASE WHEN NOT EXISTS(
+                 SELECT 1 FROM reconciliation_paths r WHERE r.library=NEW.library
+                 AND r.id=NEW.asset_id AND r.version_size=NEW.version_size
+                 AND r.provider_checksum=NEW.checksum AND r.provider_size=NEW.size_bytes
+                 AND r.requested_path_key='{}' AND r.destination_path_key='{}'
+                 AND r.destination_path=NEW.compat_path AND NEW.admitted=1)
+                 THEN RAISE(ABORT,'historical nomination missing before admission') END; END;",
+                crate::fs_util::confined_path_key(&p).unwrap().replace('\'', "''"),
+                crate::fs_util::confined_path_key(&s).unwrap().replace('\'', "''"),
+            )).unwrap();
+        }
+        assert!(
+            run.project(
+                &key,
+                &asset,
+                confirmation,
+                &mut plan,
+                &mut planner,
+                &config,
+                &CancellationToken::new()
+            )
+            .await
+            .unwrap()
+        );
+        let expected = if publish_r { &r } else { &s };
+        let manifest =
+            f.db.selection_decision(owner(), run.root.id.clone(), key.clone(), "asset-m".into())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(manifest.state_id, "asset-m");
+        assert_eq!(manifest.decision.outcome, SelectionOutcome::Selected);
+        assert_eq!(manifest.decision.master.as_deref(), Some("m"));
+        assert!(manifest.sources.is_empty());
+        assert!(manifest.decision.confirmation.is_some());
+        assert_eq!(manifest.decision.destinations.len(), 1);
+        let destination = &manifest.decision.destinations[0];
+        assert_eq!(destination.path, SelectionPath::from_path(expected));
+        assert_eq!(destination.version_size, "original");
+        assert_eq!(
+            (destination.checksum.as_str(), destination.size),
+            (checksum(current).as_str(), current.len() as u64)
+        );
+        assert_eq!(
+            admitted("asset-m"),
+            json!([
+                run.root.id,
+                key,
+                "asset-m",
+                "PrimarySync",
+                "asset-m",
+                "m",
+                "original",
+                SelectionPath::from_path(expected).key().unwrap(),
+                checksum(current),
+                current.len(),
+                1,
+                i64::from(publish_r),
+                run.root.spec.scope,
+                account,
+                provider
+            ])
+        );
+        assert_eq!(
+            rows("provider_active_destinations", "child", "asset-m").len(),
+            1
+        );
+        assert_eq!(plan.tasks.len(), usize::from(!publish_r));
+        if !publish_r {
+            assert_eq!(plan.tasks[0].download_path, s);
+        }
+        if publish_r {
+            assert_eq!(
+                mappings(),
+                before_maps,
+                "obsolete nomination wrote P-to-S/P-to-R intent"
+            );
+            assert_eq!(std::fs::read(&r).unwrap(), current);
+            assert_eq!(Some(identity(&r)), r_identity);
+        } else {
+            assert_eq!(
+                mappings(),
+                vec![tuple(&p, &s)],
+                "positive control did not persist exact P-to-S"
+            );
+        }
+        assert!(!s.exists());
+        assert!(!q.exists());
+        assert_eq!(std::fs::read(&p).unwrap(), old);
+        assert_eq!(identity(&p), p_identity);
+        assert_eq!(
+            rows("download_receipts", "child", "asset-m"),
+            receipts_before
+        );
+        assert_eq!(
+            rows("provider_active_destinations", "child", "asset-q"),
+            q_destinations
+        );
+        assert_eq!(
+            rows("provider_active_decisions", "child", "asset-q"),
+            q_decisions
+        );
+        assert_eq!(rows("assets", "id", "asset-q"), q_queue);
+        assert!(rows("download_receipts", "child", "asset-q").is_empty());
+        assert_eq!(server.received_requests().await.unwrap().len(), gets);
+        eprintln!(
+            "FINAL_R_PASS publish_r={publish_r} pending_q={pending_q} destination={} verified_media={} Q-unchanged=true projection-GETs=0",
+            if publish_r { "R" } else { "S" },
+            i64::from(publish_r)
+        );
+        // This is only the direct admission prefix, not completed dispatch or checkpoint proof.
+    }
+}
