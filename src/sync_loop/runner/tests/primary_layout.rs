@@ -3107,18 +3107,201 @@ async fn scoped_bad_admitted_adjusted_recovers_after_reopen() {
 
 #[tokio::test]
 async fn scoped_distinct_admitted_edits_publish_current_and_preserve_old_debt() {
+    use rusqlite::OptionalExtension;
+    use std::collections::BTreeSet;
+    use std::os::unix::fs::MetadataExt;
+    fn rows(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut statement = conn.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map(params, |row| {
+                (0..columns).map(|index| row.get(index)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+    fn receipt(conn: &rusqlite::Connection) -> Vec<Vec<rusqlite::types::Value>> {
+        rows(
+            conn,
+            "SELECT * FROM download_receipts WHERE child='asset-501' AND version_size='original' ORDER BY id",
+            &[],
+        )
+    }
+    fn immutable_debt(conn: &rusqlite::Connection) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        let checksum = provider_hash(EDIT_ONE);
+        let mut snapshot = [
+            "SELECT g.id,g.account_key,g.provider_key,g.scope,g.config_hash,g.basis,g.metadata_enabled,g.specification,g.specification_hash,g.sealed,g.checkpoint_ready,g.seal_hash,g.seal_header_hash FROM provider_active_generations g WHERE g.id IN (SELECT generation FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND checksum=?1) ORDER BY g.id",
+            "SELECT p.generation,p.pass_key,p.child,p.manifest,p.manifest_hash,p.outcome,p.admission,p.compacted_hash FROM provider_active_decisions p WHERE p.generation IN (SELECT generation FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND checksum=?1) ORDER BY p.generation,p.pass_key,p.child",
+            "SELECT d.* FROM provider_active_destinations d WHERE d.generation IN (SELECT generation FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND checksum=?1) ORDER BY d.generation,d.pass_key,d.child,d.version_size,d.path",
+            "SELECT * FROM reconciliation_paths WHERE id='asset-501' AND version_size='adjusted' AND provider_checksum=?1 ORDER BY library,id,requested_path_key,destination_path_key",
+        ].map(|sql|rows(conn,sql,&[&checksum])).to_vec();
+        snapshot.push(rows(
+            conn,
+            "SELECT * FROM owned_temp_files ORDER BY path",
+            &[],
+        ));
+        snapshot
+    }
+    fn schedule(conn: &rusqlite::Connection) -> Vec<(String, String, u32, i64, String, String)> {
+        conn.prepare("SELECT p.generation,p.pass_key,p.attempts,p.next_retry_at,p.reason,p.admission_hash FROM provider_active_decisions p WHERE p.generation IN (SELECT generation FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND checksum=?1) ORDER BY p.generation,p.pass_key")
+            .unwrap().query_map([provider_hash(EDIT_ONE)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))
+            .unwrap().collect::<Result<_,_>>().unwrap()
+    }
+    fn policy(conn: &rusqlite::Connection) -> (Option<String>, Option<String>) {
+        let get = |key| {
+            conn.query_row("SELECT value FROM metadata WHERE key=?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()
+            .unwrap()
+        };
+        (get("config_hash"), get("pending_download_config_hash"))
+    }
+    fn policy_config(
+        root: &std::path::Path,
+        db: Arc<state::SqliteStateDb>,
+        resolution: crate::types::PhotoResolution,
+    ) -> Arc<download::DownloadConfig> {
+        let media = root.join("media");
+        let build = make_run_cycle_download_config_builder(&media, db);
+        let mut config = build(
+            download::SyncMode::Full,
+            Arc::default(),
+            Arc::default(),
+            "PrimarySync".into(),
+        )
+        .as_ref()
+        .clone();
+        config.folder_structure = String::new();
+        config.folder_structure_albums = Arc::from("");
+        config.folder_structure_smart_folders = Arc::from("");
+        config.edited = true;
+        config.edited_naming = EditedNaming::Primary;
+        config.resolution = resolution;
+        Arc::new(config)
+    }
+    async fn check_local_recovery(
+        db: Arc<state::SqliteStateDb>,
+        owner: &state::db::account::AccountOwner,
+        config: Arc<download::DownloadConfig>,
+        source: Vec<Value>,
+        server: &MockServer,
+    ) {
+        let provider = Session {
+            reported_count: None,
+            records: source,
+            quiet: true,
+            lookups: Arc::new(AtomicUsize::new(0)),
+            current: None,
+            lookup_change: None,
+            indexing: None,
+            baseline_successor: None,
+            cycle_token: None,
+            trace: None,
+        };
+        let mut album = crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::default(),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from("TestAlbum"),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(
+                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                ),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(provider),
+        );
+        album.set_shadow_capture(
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner.clone(), "com"),
+            "private".into(),
+        );
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album,
+            exclude_ids: Arc::default(),
+        };
+        let requests = server.received_requests().await.unwrap().len();
+        let cancel = CancellationToken::new();
+        let result = download::recover_recorded_sources(
+            &reqwest::Client::new(),
+            &[pass],
+            config,
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        eprintln!(
+            "OLDER_DEBT_LOCAL_GATE complete={} smart_query={} failed={} state_errors={} enumeration_errors={} cancelled={}",
+            result.complete,
+            result.complete_after_smart_query,
+            result.stats.failed,
+            result.stats.state_write_failures,
+            result.stats.enumeration_errors,
+            cancel.is_cancelled()
+        );
+        assert!(result.complete && !result.complete_after_smart_query);
+        assert_eq!(
+            (
+                result.stats.failed,
+                result.stats.state_write_failures,
+                result.stats.enumeration_errors
+            ),
+            (0, 0, 0)
+        );
+        assert!(!cancel.is_cancelled());
+        assert!(
+            db.primary_layout_operations("PrimarySync".into())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), requests);
+        let conn = db
+            .acquire_lock("recorded recovery indexing and source holds")
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [crate::sync_cycle::indexing_reconciliation_key(
+                    "PrimarySync"
+                )],
+                |r| r.get::<_, String>(0)
+            )
+            .optional()
+            .unwrap(),
+            None
+        );
+    }
     let server = server().await;
-    let root = tempfile::tempdir().unwrap();
-    let media = root.path().join("media");
+    let root = tempfile::tempdir().unwrap().keep();
+    eprintln!("OLDER_DEBT_RETAINED_FIXTURE {}", root.display());
+    let media = root.join("media");
     let original = media.join("IMG_0501.JPG");
+    let db_path = root.join("state.db");
     let options = |resolution, token| CycleOptions {
+        retry: Some(crate::retry::RetryConfig {
+            max_retries: 1,
+            base_delay_secs: 0,
+            max_delay_secs: 0,
+        }),
         private: true,
         resolution,
         cycle_token: Some(token),
         ..CycleOptions::default()
     };
     let (initial, _) = cycle_options(
-        root.path(),
+        &root,
         records(&server, None),
         false,
         EditedNaming::Primary,
@@ -3127,59 +3310,291 @@ async fn scoped_distinct_admitted_edits_publish_current_and_preserve_old_debt() 
     .await;
     assert_eq!(initial.failed_count, 0);
     assert_bytes(&original, ORIGINAL);
-    let original_receipt: String = {
-        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
-            .await
+    let metadata = std::fs::metadata(&original).unwrap();
+    let original_identity = (metadata.ino(), metadata.mtime(), metadata.mtime_nsec());
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
-        let conn = db.acquire_lock("original source-backed receipt").unwrap();
-        conn.query_row("SELECT json_array(id,scope,child,master,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-501' AND version_size='original' AND source_checksum IS NOT NULL",[],|r|r.get(0)).unwrap()
-    };
-    std::fs::write(&original, b"changed original").unwrap();
-    let first = records(&server, Some(("edit-one", EDIT_ONE)));
-    let (old, _) = cycle_options(
-        root.path(),
-        first,
-        false,
-        EditedNaming::Primary,
-        options(crate::types::PhotoResolution::None, "old-edit-token"),
-    )
-    .await;
-    assert!(old.failed_count > 0);
-    assert!(old.db_sync_token_advance_safe);
-    let current = records(&server, Some(("edit-two", EDIT_TWO)));
-    let (new, _) = cycle_options(
-        root.path(),
-        current.clone(),
-        false,
-        EditedNaming::Primary,
-        options(crate::types::PhotoResolution::None, "current-edit-token"),
-    )
-    .await;
-    assert!(new.failed_count > 0);
-    assert!(new.db_sync_token_advance_safe);
+    let original_receipt = receipt(&conn);
+    assert_eq!(original_receipt.len(), 1);
+    let (account,provider,scope,pass,source_sha,local_sha):(String,String,String,String,String,String) = conn.query_row("SELECT account_key,provider_key,scope,origin_pass,source_checksum,local_checksum FROM download_receipts WHERE version_size='original'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).unwrap();
+    assert_eq!(
+        source_sha,
+        data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL))
+    );
+    assert_eq!(source_sha, local_sha);
+    let initial_policy = policy(&conn);
+    drop(conn);
     let owner = state::db::account::AccountOwner::authenticated(
         "synthetic@example.invalid",
         "com",
         &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
     )
     .unwrap();
-    std::fs::write(&original, ORIGINAL).unwrap();
-    let original_mtime = std::fs::metadata(&original).unwrap().modified().unwrap();
-    let old_snapshot: Vec<String> = {
-        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
-            .await
-            .unwrap();
-        db.make_selection_retry_due(owner.clone(), "asset-501".into())
-            .await
-            .unwrap();
-        let conn = db.acquire_lock("capture distinct historical debt").unwrap();
-        let rows:Vec<String>=conn.prepare("SELECT json_array(d.generation,d.path,d.checksum,d.verified_media,d.verified_metadata,g.sealed,g.seal_hash,p.admission,p.reason,p.attempts,p.next_retry_at,p.manifest_hash) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation JOIN provider_active_decisions p ON p.generation=d.generation AND p.pass_key=d.pass_key AND p.child=d.child WHERE d.child='asset-501' AND d.version_size='adjusted' AND d.checksum=?1 ORDER BY d.generation").unwrap().query_map([provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
-        assert!(!rows.is_empty(), "old edit must be admitted debt");
-        let current_count:i64=conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND checksum=?1 AND admitted=1 AND verified_media=0",[provider_hash(EDIT_TWO)],|r|r.get(0)).unwrap();
-        assert!(
-            current_count > 0,
-            "current edit must have an admitted bad destination"
+    let (target, initial_target, legacy_initial_target) = {
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&db_path, &owner)
+                .await
+                .unwrap(),
         );
+        let initial_config =
+            policy_config(&root, db.clone(), crate::types::PhotoResolution::Original);
+        let current_config = policy_config(&root, db.clone(), crate::types::PhotoResolution::None);
+        let initial_target = download::hash_download_config(&initial_config);
+        let legacy_initial_target = download::hash_legacy_download_config(&initial_config);
+        let target = download::hash_download_config(&current_config);
+        eprintln!(
+            "OLDER_DEBT_EXPECTED_POLICY initial={initial_target} legacy_initial={legacy_initial_target} target={target} observed_initial={initial_policy:?}"
+        );
+        assert_eq!(initial_policy, (Some(initial_target.clone()), None));
+        assert_ne!(initial_target, target);
+        check_local_recovery(
+            db.clone(),
+            &owner,
+            current_config,
+            records(&server, Some(("edit-one", EDIT_ONE))),
+            &server,
+        )
+        .await;
+        let conn = db
+            .acquire_lock("local recovery preserves original proof and applied policy")
+            .unwrap();
+        assert_eq!(receipt(&conn), original_receipt);
+        assert_eq!(policy(&conn), initial_policy);
+        (target, initial_target, legacy_initial_target)
+    };
+    eprintln!(
+        "OLDER_DEBT_POLICY_HASH_OWNER target={target} initial={initial_target} legacy_initial={legacy_initial_target}"
+    );
+    let assert_original = |conn: &rusqlite::Connection| {
+        assert_bytes(&original, ORIGINAL);
+        let metadata = std::fs::metadata(&original).unwrap();
+        assert_eq!(
+            (metadata.ino(), metadata.mtime(), metadata.mtime_nsec()),
+            original_identity
+        );
+        assert_eq!(receipt(conn), original_receipt);
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let callback_path = db_path.clone();
+    let p = original.clone();
+    let proof = original_receipt.clone();
+    let expected_account = account.clone();
+    let expected_provider = provider.clone();
+    let expected_scope = scope.clone();
+    let expected_pass = pass.clone();
+    let expected_initial_policy = initial_policy.clone();
+    let expected_pending = target.clone();
+    // A finite fault avoids wiremock 0.6.5 scoped IDs becoming stale when
+    // priority sorting moves the scoped entry away from its registered index.
+    Mock::given(method("GET")).and(path("/edit-one")).respond_with(move |_:&wiremock::Request| {
+        let conn=rusqlite::Connection::open_with_flags(&callback_path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let staged=policy(&conn);
+        eprintln!("OLDER_DEBT_POLICY_BEFORE_PROMOTION applied={:?} pending={:?} expected_target={expected_pending}",staged.0,staged.1);
+        assert_eq!(staged,(expected_initial_policy.0.clone(),Some(expected_pending.clone())));
+        let (requested,destination,key,checksum,size):(String,String,String,String,i64)=conn.query_row("SELECT requested_path_key,destination_path,destination_path_key,provider_checksum,provider_size FROM reconciliation_paths WHERE id='asset-501' AND version_size='adjusted' AND provider_checksum=?1",[provider_hash(EDIT_ONE)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+        assert_eq!(requested,crate::fs_util::confined_path_key(&p).unwrap());
+        let s=std::path::PathBuf::from(destination);
+        assert_ne!(s,p);
+        assert_eq!(key,crate::fs_util::confined_path_key(&s).unwrap());
+        assert_eq!((checksum,size),(provider_hash(EDIT_ONE),EDIT_ONE.len() as i64));
+        assert!(!s.exists());
+        let obligations:Vec<String>=conn.prepare("SELECT json_array(d.generation,d.pass_key,d.child,d.library,d.asset_id,d.master,d.version_size,d.path,d.checksum,d.size_bytes,d.admitted,d.verified_media,g.account_key,g.provider_key,g.scope,json_extract(CAST(g.specification AS TEXT),'$.format')) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.child='asset-501' AND d.version_size='adjusted' AND d.admitted=1 ORDER BY d.generation").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert!(!obligations.is_empty());
+        for obligation in obligations {
+            let row:Value=serde_json::from_str(&obligation).unwrap();
+            let root_id=row[0].as_str().unwrap();
+            let native:state::db::provider_selection::SelectionPath=serde_json::from_str(row[7].as_str().unwrap()).unwrap();
+            assert_eq!(native.to_path(),s);
+            assert_eq!(row,json!([root_id,expected_pass,"asset-501","PrimarySync","asset-501","501","adjusted",row[7],provider_hash(EDIT_ONE),EDIT_ONE.len(),1,0,expected_account,expected_provider,expected_scope,2]));
+            eprintln!("OLDER_DEBT_FAILED_GET root={root_id} pass={} S={} checksum={} admitted=1 media=0",expected_pass,s.display(),provider_hash(EDIT_ONE));
+        }
+        assert_bytes(&p,ORIGINAL);
+        let metadata=std::fs::metadata(&p).unwrap();
+        assert_eq!((metadata.ino(),metadata.mtime(),metadata.mtime_nsec()),original_identity);
+        assert_eq!(receipt(&conn),proof);
+        assert_eq!(conn.query_row("SELECT count(*) FROM download_receipts WHERE version_size='adjusted'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        seen.fetch_add(1,Ordering::SeqCst);
+        ResponseTemplate::new(500)
+    }).with_priority(2).up_to_n_times(8).expect(8).mount(&server).await;
+    let first = records(&server, Some(("edit-one", EDIT_ONE)));
+    let (old, _) = cycle_options(
+        &root,
+        first,
+        false,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::None, "old-edit-token"),
+    )
+    .await;
+    eprintln!(
+        "OLDER_DEBT_TRANSPORT old={old:?} failed_GETs={}",
+        calls.load(Ordering::SeqCst)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 8);
+    assert!(old.stats.failed > 0 && old.failed_count > 0);
+    assert!(!old.session_expired && !old.stats.interrupted && !old.stats.identity_incomplete);
+    assert_eq!(
+        (
+            old.stats.downloaded,
+            old.stats.state_write_failures,
+            old.stats.enumeration_errors
+        ),
+        (0, 0, 0)
+    );
+    // Every cycle helper has dropped its DB/source handles before this owned reopen.
+    let (s, old_snapshot, fence, temp_custody, expected_old_obligations) = {
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&db_path, &owner)
+                .await
+                .unwrap(),
+        );
+        let (before_gate, before_policy) = {
+            let conn = db
+                .acquire_lock("capture actual promotion before recovery verification")
+                .unwrap();
+            let current_policy = policy(&conn);
+            eprintln!(
+                "OLDER_DEBT_POLICY_OWNED_REOPEN applied={:?} pending={:?} computed_target={target}",
+                current_policy.0, current_policy.1
+            );
+            (immutable_debt(&conn), current_policy)
+        };
+        check_local_recovery(
+            db.clone(),
+            &owner,
+            policy_config(&root, db.clone(), crate::types::PhotoResolution::None),
+            records(&server, Some(("edit-one", EDIT_ONE))),
+            &server,
+        )
+        .await;
+        let custody = db
+            .get_owned_temp_files_before(i64::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|file| {
+                let bytes = match std::fs::read(&file.path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("temp custody read: {error}"),
+                };
+                (file, bytes)
+            })
+            .collect::<Vec<_>>();
+        let conn = db.acquire_lock("reopen actual failed media debt").unwrap();
+        assert_original(&conn);
+        let s:String=conn.query_row("SELECT destination_path FROM reconciliation_paths WHERE version_size='adjusted' AND provider_checksum=?1",[provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap();
+        let snapshot = immutable_debt(&conn);
+        assert_eq!(
+            snapshot, before_gate,
+            "local recovery must not settle format2 media"
+        );
+        assert!(!snapshot[0].is_empty());
+        let roots:Vec<String>=conn.prepare("SELECT DISTINCT generation FROM provider_active_destinations WHERE checksum=?1 AND admitted=1 AND verified_media=0 ORDER BY generation").unwrap().query_map([provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(roots.len(), snapshot[0].len());
+        let expected_old_obligations: BTreeSet<(String, String)> = schedule(&conn)
+            .into_iter()
+            .map(|row| (row.0, row.1))
+            .collect();
+        assert!(!expected_old_obligations.is_empty());
+        eprintln!("OLDER_DEBT_EXPECTED_OLD_OBLIGATIONS {expected_old_obligations:?}");
+        assert_eq!(conn.query_row("SELECT count(*) FROM provider_active_generations WHERE id IN (SELECT generation FROM provider_active_destinations WHERE checksum=?1) AND (sealed=0 OR seal_hash IS NULL)",[provider_hash(EDIT_ONE)],|r|r.get::<_,i64>(0)).unwrap(),0);
+        let fence = policy(&conn);
+        eprintln!(
+            "OLDER_DEBT_POLICY_AFTER_LOCAL_GATE applied={:?} pending={:?} computed_target={target}",
+            fence.0, fence.1
+        );
+        assert_eq!(fence, before_policy);
+        assert_eq!(fence, (Some(target.clone()), None));
+        eprintln!(
+            "OLDER_DEBT_REOPEN roots={roots:?} S={s} immutable={snapshot:?} scheduling={:?} config_hash={:?} pending_hash={:?} temp_custody={custody:?}",
+            schedule(&conn),
+            fence.0,
+            fence.1
+        );
+        (
+            std::path::PathBuf::from(s),
+            snapshot,
+            fence,
+            custody,
+            expected_old_obligations,
+        )
+    };
+    let current = records(&server, Some(("edit-two", EDIT_TWO)));
+    let result = try_cycle_options(
+        &root,
+        current.clone(),
+        false,
+        EditedNaming::Primary,
+        options(crate::types::PhotoResolution::None, "current-edit-token"),
+    )
+    .await;
+    eprintln!("OLDER_DEBT_CURRENT result={result:?}");
+    if !result.as_ref().is_ok_and(|(cycle, _)| {
+        cycle.stats.downloaded == 1
+            && cycle.stats.failed == 0
+            && cycle.stats.state_write_failures == 0
+            && cycle.stats.enumeration_errors == 0
+    }) {
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        eprintln!(
+            "OLDER_DEBT_OBSTRUCTION immutable={:?} schedule={:?} mapping={:?} policy={:?}",
+            immutable_debt(&conn),
+            schedule(&conn),
+            rows(
+                &conn,
+                "SELECT * FROM reconciliation_paths ORDER BY provider_checksum",
+                &[]
+            ),
+            policy(&conn)
+        );
+        drop(conn);
+        panic!(
+            "current EDIT_TWO did not independently publish; retained={}",
+            root.display()
+        );
+    }
+    let (new, _) = result.unwrap();
+    let (r, current_receipt) = {
+        let db = state::SqliteStateDb::open_owned(&db_path, &owner)
+            .await
+            .unwrap();
+        let conn = db
+            .acquire_lock("verify independent R and retained S")
+            .unwrap();
+        assert_original(&conn);
+        assert_eq!(immutable_debt(&conn), old_snapshot);
+        assert_eq!(policy(&conn), fence);
+        let native:String=conn.query_row("SELECT native_path FROM download_receipts WHERE version_size='adjusted' AND provider_checksum=?1",[provider_hash(EDIT_TWO)],|r|r.get(0)).unwrap();
+        let r = serde_json::from_str::<state::db::provider_selection::SelectionPath>(&native)
+            .unwrap()
+            .to_path();
+        assert_ne!(r, original);
+        assert_ne!(r, s);
+        assert!(!s.exists());
+        assert_bytes(&r, EDIT_TWO);
+        let proof = rows(
+            &conn,
+            "SELECT * FROM download_receipts WHERE version_size='adjusted' AND provider_checksum=?1 ORDER BY id",
+            &[&provider_hash(EDIT_TWO)],
+        );
+        assert_eq!(proof.len(), 1);
+        let checksum:String=conn.query_row("SELECT source_checksum FROM download_receipts WHERE version_size='adjusted' AND provider_checksum=?1 AND account_key=?2 AND provider_key=?3 AND scope=?4 AND origin_pass=?5 AND child='asset-501' AND master='501' AND state_id='asset-501' AND source_checksum=local_checksum",rusqlite::params![provider_hash(EDIT_TWO),account,provider,scope,pass],|r|r.get(0)).unwrap();
+        assert_eq!(
+            checksum,
+            data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_TWO))
+        );
+        let sealed:i64=conn.query_row("SELECT count(*) FROM provider_active_generations WHERE sealed=1 AND checkpoint_ready=1 AND seal_hash IS NOT NULL AND id IN (SELECT generation FROM provider_active_destinations WHERE checksum=?1 AND verified_media=1)",[provider_hash(EDIT_TWO)],|r|r.get(0)).unwrap();
+        assert!(
+            sealed > 0,
+            "current token needs actual accounted selection/seal"
+        );
+        assert!(new.db_sync_token_advance_safe);
         let token: String = conn
             .query_row(
                 "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
@@ -3188,107 +3603,155 @@ async fn scoped_distinct_admitted_edits_publish_current_and_preserve_old_debt() 
             )
             .unwrap();
         assert_eq!(token, "current-edit-token");
-        rows
-    };
-    let (recovered, _) = cycle_options(
-        root.path(),
-        current.clone(),
-        true,
-        EditedNaming::Primary,
-        options(crate::types::PhotoResolution::None, "recovered-token"),
-    )
-    .await;
-    assert_eq!(recovered.stats.downloaded, 1, "{:?}", recovered.stats);
-    assert!(recovered.db_sync_token_advance_safe);
-    assert_bytes(&original, ORIGINAL);
-    let sibling = std::fs::read_dir(&media)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .find(|p| p != &original && std::fs::read(p).is_ok_and(|b| b == EDIT_TWO))
-        .expect("current edit sibling");
-    let old_immutable: Vec<String> = {
-        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
-            .await
-            .unwrap();
-        let conn = db
-            .acquire_lock("verify historical debt survives current publication")
-            .unwrap();
-        let rows:Vec<String>=conn.prepare("SELECT json_array(d.generation,d.path,d.checksum,d.verified_media,d.verified_metadata,g.sealed,g.seal_hash,p.admission,p.reason,p.attempts,p.next_retry_at,p.manifest_hash) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation JOIN provider_active_decisions p ON p.generation=d.generation AND p.pass_key=d.pass_key AND p.child=d.child WHERE d.child='asset-501' AND d.version_size='adjusted' AND d.checksum=?1 ORDER BY d.generation").unwrap().query_map([provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
-        assert_eq!(
-            rows, old_snapshot,
-            "historical debt and seal must not be rewritten"
+        assert_eq!(conn.query_row("SELECT count(*) FROM download_receipts WHERE version_size='adjusted' AND provider_checksum=?1",[provider_hash(EDIT_ONE)],|r|r.get::<_,i64>(0)).unwrap(),0);
+        eprintln!(
+            "OLDER_DEBT_CURRENT_PUBLISHED R={} old_S={} sealed_current={sealed} failed_count={} errors=0 downloaded=1 config={:?}",
+            r.display(),
+            s.display(),
+            new.failed_count,
+            policy(&conn)
         );
-        let fabricated:i64=conn.query_row("SELECT count(*) FROM download_receipts WHERE child='asset-501' AND version_size='adjusted' AND provider_checksum=?1",[provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap();
-        assert_eq!(fabricated, 0);
-        let completed:i64=conn.query_row("SELECT count(*) FROM download_receipts WHERE child='asset-501' AND version_size='adjusted' AND provider_checksum=?1 AND source_checksum IS NOT NULL",[provider_hash(EDIT_TWO)],|r|r.get(0)).unwrap();
-        assert_eq!(completed, 1);
-        let retained:String=conn.query_row("SELECT json_array(id,scope,child,master,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash) FROM download_receipts WHERE child='asset-501' AND version_size='original' AND source_checksum IS NOT NULL",[],|r|r.get(0)).unwrap();
-        assert_eq!(retained, original_receipt);
-        assert_eq!(
-            std::fs::metadata(&original).unwrap().modified().unwrap(),
-            original_mtime
-        );
-        let token: String = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(token, "recovered-token");
-        let immutable:Vec<String>=conn.prepare("SELECT json_array(d.generation,d.path,d.checksum,d.verified_media,d.verified_metadata,g.sealed,g.seal_hash,p.admission,p.manifest_hash) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation JOIN provider_active_decisions p ON p.generation=d.generation AND p.pass_key=d.pass_key AND p.child=d.child WHERE d.child='asset-501' AND d.version_size='adjusted' AND d.checksum=?1 ORDER BY d.generation").unwrap().query_map([provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
-        immutable
+        (r, proof)
     };
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|r| r.url.path() == "/edit-one")
-            .count(),
-        0
-    );
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|r| r.url.path() == "/edit-two")
-            .count(),
-        1
-    );
-    drop(requests);
-    for _ in 0..2 {
-        let (quiet, _) = cycle_options(
-            root.path(),
+    let metadata = std::fs::metadata(&r).unwrap();
+    let r_identity = (metadata.ino(), metadata.mtime(), metadata.mtime_nsec());
+    let mut reconsidered_old_obligations = BTreeSet::new();
+    for round in 0..2 {
+        let before_schedule = {
+            let db = state::SqliteStateDb::open_owned(&db_path, &owner)
+                .await
+                .unwrap();
+            db.make_selection_retry_due(owner.clone(), "asset-501".into())
+                .await
+                .unwrap();
+            let conn = db.acquire_lock("prove due old rediscovery").unwrap();
+            let before = schedule(&conn);
+            assert!(
+                before
+                    .iter()
+                    .any(|row| row.3 <= chrono::Utc::now().timestamp())
+            );
+            assert_eq!(immutable_debt(&conn), old_snapshot);
+            before
+        };
+        let trace: RequestTrace = Arc::default();
+        let mut quiet_options = options(crate::types::PhotoResolution::None, "current-edit-token");
+        quiet_options.trace = Some(trace.clone());
+        let (quiet, lookups) = cycle_options(
+            &root,
             current.clone(),
             true,
             EditedNaming::Primary,
-            options(crate::types::PhotoResolution::None, "recovered-token"),
+            quiet_options,
         )
         .await;
         assert_eq!(quiet.stats.downloaded, 0);
-        assert_bytes(&original, ORIGINAL);
-        assert_eq!(
-            std::fs::metadata(&original).unwrap().modified().unwrap(),
-            original_mtime
+        assert!(lookups > 0, "backoff skip is not rediscovery");
+        assert!(
+            trace
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(kind, _)| kind == "lookup")
         );
-        assert_bytes(&sibling, EDIT_TWO);
-        let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
+        assert_eq!(
+            (
+                quiet.stats.failed,
+                quiet.stats.state_write_failures,
+                quiet.stats.enumeration_errors
+            ),
+            (0, 0, 0)
+        );
+        let db = state::SqliteStateDb::open_owned(&db_path, &owner)
             .await
             .unwrap();
-        let conn = db.acquire_lock("reopened historical debt").unwrap();
-        let old_pending:i64=conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE child='asset-501' AND version_size='adjusted' AND checksum=?1 AND admitted=1 AND verified_media=0",[provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap();
-        assert!(old_pending > 0);
-        let immutable:Vec<String>=conn.prepare("SELECT json_array(d.generation,d.path,d.checksum,d.verified_media,d.verified_metadata,g.sealed,g.seal_hash,p.admission,p.manifest_hash) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation JOIN provider_active_decisions p ON p.generation=d.generation AND p.pass_key=d.pass_key AND p.child=d.child WHERE d.child='asset-501' AND d.version_size='adjusted' AND d.checksum=?1 ORDER BY d.generation").unwrap().query_map([provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
-        assert_eq!(immutable, old_immutable);
-    }
-    assert_eq!(
-        server
-            .received_requests()
+        let custody = db
+            .get_owned_temp_files_before(i64::MAX)
             .await
             .unwrap()
-            .iter()
-            .filter(|r| r.url.path() == "/edit-two")
-            .count(),
-        1
+            .into_iter()
+            .map(|file| {
+                let bytes = match std::fs::read(&file.path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("temp custody read: {error}"),
+                };
+                (file, bytes)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(custody, temp_custody);
+        {
+            let conn = db
+                .acquire_lock("reopened immutable historical debt and fresh backoff")
+                .unwrap();
+            let old_receipts: i64 = conn.query_row("SELECT count(*) FROM download_receipts WHERE version_size='adjusted' AND provider_checksum=?1",[provider_hash(EDIT_ONE)],|r|r.get(0)).unwrap();
+            eprintln!("OLDER_DEBT_QUIET_OLD_RECEIPTS round={round} count={old_receipts}");
+            assert_eq!(
+                old_receipts, 0,
+                "quiet rediscovery must not complete old media"
+            );
+            assert_original(&conn);
+            assert_bytes(&r, EDIT_TWO);
+            assert!(!s.exists());
+            let metadata = std::fs::metadata(&r).unwrap();
+            assert_eq!(
+                (metadata.ino(), metadata.mtime(), metadata.mtime_nsec()),
+                r_identity
+            );
+            assert_eq!(immutable_debt(&conn), old_snapshot);
+            assert_eq!(policy(&conn), fence);
+            assert_eq!(
+                rows(
+                    &conn,
+                    "SELECT * FROM download_receipts WHERE version_size='adjusted' AND provider_checksum=?1 ORDER BY id",
+                    &[&provider_hash(EDIT_TWO)]
+                ),
+                current_receipt
+            );
+            let after = schedule(&conn);
+            assert_eq!(after.len(), before_schedule.len());
+            let mut reconsidered = 0;
+            for (before, after) in before_schedule.iter().zip(&after) {
+                assert_eq!((&before.0, &before.1), (&after.0, &after.1));
+                assert!(after.2 >= before.2);
+                if after.2 > before.2 {
+                    reconsidered += 1;
+                    reconsidered_old_obligations.insert((after.0.clone(), after.1.clone()));
+                    assert_eq!(after.4, "current_confirmation_unavailable");
+                    assert!(after.3 > chrono::Utc::now().timestamp());
+                    assert_ne!(after.5, before.5);
+                }
+            }
+            assert!(
+                reconsidered > 0,
+                "fresh lookup did not reconsider old decision"
+            );
+            eprintln!(
+                "OLDER_DEBT_QUIET round={round} lookups={lookups} before={before_schedule:?} after={after:?} immutable=unchanged P_R=unchanged applied_config=computed pending_config=None"
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path() == "/edit-one")
+                .count(),
+            8
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.url.path() == "/edit-two")
+                .count(),
+            1
+        );
+    }
+    eprintln!(
+        "OLDER_DEBT_RECONSIDERED_OLD_OBLIGATIONS expected={expected_old_obligations:?} observed={reconsidered_old_obligations:?}"
+    );
+    assert_eq!(
+        reconsidered_old_obligations, expected_old_obligations,
+        "both quiet rounds must reconsider the full captured old obligation set"
     );
 }
 
