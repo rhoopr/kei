@@ -5709,3 +5709,286 @@ async fn marker_free_same_rendition_history_controls_saved_destination() {
         // promotion or globally quiet cycle is inferred from these direct calls.
     }
 }
+
+#[tokio::test]
+async fn missing_original_receipt_cannot_classify_discovered_original() {
+    use crate::download::baseline_matching::BaselineMatch;
+    use crate::types::{EditedNaming, PhotoResolution};
+    use sha2::{Digest, Sha256};
+    use std::sync::atomic::Ordering;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    fn signature(bytes: &[u8]) -> String {
+        use sha1::{Digest as _, Sha1};
+        let mut hash = Sha1::new();
+        hash.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+        hash.update(bytes);
+        data_encoding::BASE64.encode(&[&[1][..], &hash.finalize()[..]].concat())
+    }
+    let c0 = b"\xff\xd8\xff\xe0original source";
+    let c1 = b"\xff\xd8\xff\xe0first adjusted resource bytes";
+    let c2 = b"\xff\xd8\xff\xe0newer adjusted resource with a different size";
+    assert_ne!(c0.len(), c1.len());
+    assert_ne!(c1.len(), c2.len());
+    assert_ne!(c0.len(), c2.len());
+    let server = wiremock::MockServer::start().await;
+    for (name, bytes, expected) in [
+        ("original", c0.as_slice(), 1_u64),
+        ("adjusted", c1.as_slice(), 1),
+        ("current", c2.as_slice(), 0),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .expect(expected)
+            .mount(&server)
+            .await;
+    }
+    let mut f = Fixture::new().await;
+    f.dir.disable_cleanup(true);
+    eprintln!(
+        "DISCOVERED_ORIGINAL_DIRECT_FIXTURE retained={}",
+        f.dir.path().display()
+    );
+    f.config.folder_structure = "none".into();
+    f.config.resolution = PhotoResolution::Original;
+    f.config.edited = true;
+    f.config.edited_naming = EditedNaming::Suffix;
+    f.config.refresh_metadata = false;
+    {
+        let mut values = f.session.records.lock().unwrap();
+        values[0]["fields"]["filenameEnc"]["value"] = json!("photo.JPG");
+        values[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/original",server.uri()),"fileChecksum":signature(c0),"size":c0.len()});
+        values[1]["fields"]["resJPEGFullRes"] = json!({"value":{"downloadURL":format!("{}/adjusted",server.uri()),"fileChecksum":signature(c1),"size":c1.len()}});
+        values[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+        values[1]["fields"]["adjustmentRenderType"] = json!({"value":1});
+    }
+    let initial = stream_collision_child(&f, "asset-m", false).await;
+    assert_eq!((initial.downloaded, initial.state_write_failures), (2, 0));
+    assert!(initial.failed.is_empty());
+    drop(initial);
+    let p = f.config.directory.join("photo.JPG");
+    let e = f.config.directory.join("photo_edited.JPG");
+    assert_eq!(marker_free_history_file(&p).0, c0);
+    assert_eq!(marker_free_history_file(&e).0, c1);
+    let physical = || {
+        let mut files: Vec<_> = std::fs::read_dir(&f.config.directory)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                assert!(entry.file_type().unwrap().is_file());
+                (entry.path(), marker_free_history_file(&entry.path()))
+            })
+            .collect();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    };
+    let old_files = physical();
+    f.session.records.lock().unwrap()[1]["fields"]["resJPEGFullRes"]["value"] = json!({"downloadURL":format!("{}/current",server.uri()),"fileChecksum":signature(c2),"size":c2.len()});
+    let confirmation = f.pass.album.confirm_catalog_asset("asset-m").await.unwrap();
+    let config = f.config.with_pass(&f.pass);
+    assert!(config.selection_run.is_none());
+    let mut planner = TaskPlanner::for_download(config.state_db.as_deref())
+        .await
+        .unwrap();
+    let plan = planner
+        .plan_download_asset(&confirmation.asset, &config)
+        .await
+        .unwrap();
+    let adjusted: Vec<_> = plan
+        .tasks
+        .iter()
+        .filter(|task| task.version_size == crate::state::VersionSizeKey::Adjusted)
+        .collect();
+    assert_eq!(adjusted.len(), 1);
+    let task = adjusted[0];
+    assert_eq!(
+        (task.checksum.as_ref(), task.size),
+        (signature(c2).as_str(), c2.len() as u64)
+    );
+    assert!(task.superseded_requested_path.is_none());
+    let s = task.download_path.clone();
+    assert_ne!(s, p);
+    assert_ne!(s, e);
+    assert!(!s.exists());
+    let binding = task.publication_binding.as_deref().unwrap().clone();
+    let (account, provider) = f.capture.owner.authenticated_keys().unwrap();
+    assert_eq!(
+        (binding.account_key.as_str(), binding.provider_key.as_str()),
+        (account, provider)
+    );
+    assert_eq!(
+        (
+            binding.child.as_str(),
+            binding.master.as_str(),
+            binding.state_id.as_str()
+        ),
+        ("asset-m", "m", "asset-m")
+    );
+    assert_eq!(
+        binding.origin_pass,
+        crate::download::orchestration::generation::pass_key(&f.pass)
+    );
+    assert!(
+        f.db.bound_download_receipts(
+            binding.clone(),
+            "adjusted".into(),
+            signature(c2),
+            c2.len() as u64
+        )
+        .await
+        .unwrap()
+        .is_empty()
+    );
+    let historical =
+        f.db.bound_historical_downloads(
+            binding.clone(),
+            "adjusted".into(),
+            signature(c2),
+            c2.len() as u64,
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical.len(), 1);
+    assert_eq!(historical[0].native_path, SelectionPath::from_path(&e));
+    assert_eq!(
+        (
+            historical[0].provider_checksum.as_str(),
+            historical[0].provider_size
+        ),
+        (signature(c1).as_str(), c1.len() as u64)
+    );
+    let healthy = planner
+        .match_existing(&confirmation.asset, &config, task)
+        .await;
+    assert!(
+        matches!(healthy, BaselineMatch::Missing),
+        "healthy discovered Original must classify history: {healthy:?}"
+    );
+    let calls = f.session.calls.load(Ordering::SeqCst);
+    let gets = server.received_requests().await.unwrap().len();
+    assert_eq!(gets, 2);
+    let receipts = marker_free_history_rows(&f.db, "download_receipts", "child", "asset-m");
+    assert_eq!(receipts.len(), 2);
+    let original = marker_free_history_rows(&f.db, "download_receipts", "version_size", "original");
+    assert_eq!(original.len(), 1);
+    let (id, proof_hash): (String, String) = f.db.acquire_lock("save genuine Original proof before corruption").unwrap().query_row("SELECT id,proof_hash FROM download_receipts WHERE child='asset-m' AND version_size='original' AND native_path=?1", [SelectionPath::from_path(&p).key().unwrap()], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert!(!proof_hash.is_empty());
+    let surviving: Vec<_> = receipts
+        .iter()
+        .filter(|row| !original.contains(row))
+        .cloned()
+        .collect();
+    assert_eq!(surviving.len(), 1);
+    let snapshot = || {
+        [
+            marker_free_history_rows(&f.db, "assets", "id", "asset-m"),
+            marker_free_history_rows(&f.db, "asset_metadata_paths", "id", "asset-m"),
+            marker_free_history_rows(
+                &f.db,
+                "asset_master_mappings",
+                "asset_record_name",
+                "asset-m",
+            ),
+            marker_free_history_rows(
+                &f.db,
+                "legacy_master_state_owners",
+                "asset_record_name",
+                "asset-m",
+            ),
+            marker_free_history_rows(&f.db, "provider_active_destinations", "child", "asset-m"),
+            marker_free_history_rows(&f.db, "provider_active_decisions", "child", "asset-m"),
+            marker_free_history_rows(&f.db, "reconciliation_paths", "id", "asset-m"),
+        ]
+    };
+    let before = snapshot();
+    assert_eq!(
+        (before[0].len(), before[1].len(), before[2].len()),
+        (2, 2, 1)
+    );
+    let stage =
+        crate::download::file::temp_download_path(&s, &signature(c2), &config.temp_suffix).unwrap();
+    assert!(!stage.exists());
+    eprintln!(
+        "DISCOVERED_ORIGINAL_DIRECT_HEALTHY result=Missing S={} marker=None selection_run=None GETs={gets} saved_original_id={id} proof_hash={proof_hash} deleted_row_backup={original:?}",
+        s.display()
+    );
+    assert_eq!(f.db.acquire_lock("explicit exact compact-receipt corruption").unwrap().execute("DELETE FROM download_receipts WHERE id=?1 AND child='asset-m' AND version_size='original' AND native_path=?2",rusqlite::params![id,SelectionPath::from_path(&p).key().unwrap()]).unwrap(),1);
+    let original_after =
+        f.db.bound_cross_rendition_original(
+            binding.clone(),
+            crate::state::VersionSizeKey::Adjusted,
+            crate::state::db::CrossRenditionOriginal {
+                path: SelectionPath::from_path(&p),
+                provider_checksum: signature(c0),
+                provider_size: c0.len() as u64,
+                local_checksum: Some(data_encoding::HEXLOWER.encode(&Sha256::digest(c0))),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(original_after.is_none());
+    assert_eq!(
+        f.db.bound_historical_downloads(
+            binding.clone(),
+            "adjusted".into(),
+            signature(c2),
+            c2.len() as u64
+        )
+        .await
+        .unwrap(),
+        historical
+    );
+    let matched = planner
+        .match_existing(&confirmation.asset, &config, task)
+        .await;
+    let BaselineMatch::Uncertain(explanation) = matched else {
+        panic!(
+            "missing Original proof must not retain cached positive classification: {matched:?}"
+        );
+    };
+    assert!(
+        explanation
+            .candidates
+            .iter()
+            .any(
+                |candidate| candidate.path.as_ref() == Some(&SelectionPath::from_path(&p))
+                    && candidate.reason == "candidate_bytes_not_verified_for_current_resource"
+            ),
+        "actual P candidate refusal required: {explanation:?}"
+    );
+    assert!(
+        !explanation
+            .candidates
+            .iter()
+            .any(|candidate| candidate.reason == "scoped_receipt_or_reservation_validation_failed")
+    );
+    assert_eq!(
+        f.session.calls.load(Ordering::SeqCst),
+        calls,
+        "matcher must not reconfirm or replan after damage"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), gets);
+    assert!(!s.exists() && !stage.exists());
+    assert_eq!(physical(), old_files);
+    assert_eq!(snapshot(), before);
+    assert_eq!(
+        marker_free_history_rows(&f.db, "download_receipts", "child", "asset-m"),
+        surviving
+    );
+    assert!(
+        marker_free_history_rows(&f.db, "download_receipts", "version_size", "original").is_empty()
+    );
+    assert!(
+        f.db.bound_download_receipts(binding, "adjusted".into(), signature(c2), c2.len() as u64)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    eprintln!(
+        "DISCOVERED_ORIGINAL_DIRECT_COMPLETE actual={explanation:?} fresh_original_reader=None same_planner_asset_config_task=true provider_lookups=unchanged GETs={gets} files_surviving_rows=unchanged no_current_completion=true"
+    );
+    // This is the read-only matcher boundary, not a healthy damaged-root replay,
+    // current selection admission, source checkpoint or whole-cycle proof.
+}

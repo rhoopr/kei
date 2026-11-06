@@ -458,6 +458,10 @@ Before initial adjusted
 selection, an exact source-backed original receipt and matching confined local
 fingerprint can classify the occupied requested name. The planner reserves a
 separate identity-suffixed destination and rechecks the original during matching.
+Adjusted matching also reads Original witnesses at already-discovered native
+paths through the same scoped reader. These per-call historical receipts classify
+unchanged occupants only; fresh file checks and a distinct selected destination
+remain required. They never certify Adjusted bytes.
 Local-trust receipts do not supply this authority. Due replay can redirect an
 already admitted incomplete adjusted destination only after fresh scoped source
 confirmation, fresh membership for each affected selecting pass, and a complete

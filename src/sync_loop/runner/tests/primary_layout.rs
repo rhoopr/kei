@@ -4466,7 +4466,9 @@ async fn contract_source_checkpoint_requires_durable_recovery_and_temp_file_dele
         "journal-installed",
         "journal-committed",
     ] {
-        let root = tempfile::tempdir().unwrap();
+        let mut root = tempfile::tempdir().unwrap();
+        root.disable_cleanup(true);
+        eprintln!("C2 {point} {:?}", root.path());
         let media = root.path().join("media");
         eprintln!("DEATH_POINT_BEGIN {point}");
         let (baseline, _) = cycle_options(
@@ -4831,6 +4833,7 @@ async fn contract_source_checkpoint_requires_durable_recovery_and_temp_file_dele
             eprintln!(
                 "DEATH_POINT_PASS {point} held=true independent_current=true verified_before_token=true"
             );
+            root.disable_cleanup(false);
             continue;
         }
         let requests = server.received_requests().await.unwrap().len();
@@ -5014,6 +5017,7 @@ async fn contract_source_checkpoint_requires_durable_recovery_and_temp_file_dele
         eprintln!(
             "DEATH_POINT_PASS {point} recovered=true pending=0 committed=true cleanup=true checkpoint_safe=true"
         );
+        root.disable_cleanup(false);
     }
 }
 
@@ -6112,7 +6116,9 @@ async fn primary_layout_real_live_photo_pair_edits_reverts_and_reopens() {
         crate::types::LivePhotoMovFilenamePolicy::Original,
     ] {
         let before = server.received_requests().await.unwrap().len();
-        let root = tempfile::tempdir().unwrap();
+        let mut root = tempfile::tempdir().unwrap();
+        root.disable_cleanup(true);
+        eprintln!("LIVE {policy:?} {:?}", root.path());
         let media = root.path().join("media");
         let current_motion = if policy == crate::types::LivePhotoMovFilenamePolicy::Suffix {
             "IMG_0501_HEVC.MOV"
@@ -6500,6 +6506,7 @@ async fn primary_layout_real_live_photo_pair_edits_reverts_and_reopens() {
             .collect();
         assert!(preserved.iter().any(|bytes| bytes == original_still));
         assert!(preserved.iter().any(|bytes| bytes == original_motion));
+        root.disable_cleanup(false);
     }
 }
 
@@ -13514,5 +13521,780 @@ async fn review501_unreceipted_refresh_stage_remains_safely_held() {
         );
         assert_eq!(server.received_requests().await.unwrap().len(), requests);
         eprintln!("REVIEW501_REACHED safe_hold_verified sidecar={sidecar}");
+    }
+}
+
+#[tokio::test]
+async fn ordinary_suffix_album_new_adjusted_resource_preserves_prior_publications() {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Physical {
+        File(Vec<u8>, crate::fs_util::FileIdentity, std::time::SystemTime),
+        Directory(std::time::SystemTime),
+    }
+    fn physical(path: &Path) -> Physical {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        if metadata.is_dir() {
+            assert_eq!(std::fs::read_dir(path).unwrap().count(), 0);
+            return Physical::Directory(metadata.modified().unwrap());
+        }
+        assert!(metadata.is_file(), "unexpected physical entry: {path:?}");
+        let file = std::fs::File::open(path).unwrap();
+        Physical::File(
+            std::fs::read(path).unwrap(),
+            crate::fs_util::file_identity(&file).unwrap(),
+            file.metadata().unwrap().modified().unwrap(),
+        )
+    }
+    fn signature(bytes: &[u8]) -> String {
+        use sha1::{Digest as _, Sha1};
+        let mut hash = Sha1::new();
+        hash.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+        hash.update(bytes);
+        let signature = data_encoding::BASE64.encode(&[&[1][..], &hash.finalize()[..]].concat());
+        assert_eq!(signature.len(), 28);
+        assert_eq!(
+            data_encoding::BASE64
+                .decode(signature.as_bytes())
+                .unwrap()
+                .len(),
+            21
+        );
+        signature
+    }
+    fn positive_records(server: &MockServer, name: &str, bytes: &[u8]) -> Vec<Value> {
+        let mut values = records(server, Some((name, bytes)));
+        values[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(signature(ORIGINAL));
+        values[1]["fields"]["resJPEGFullRes"]["value"]["fileChecksum"] = json!(signature(bytes));
+        eprintln!(
+            "ORDINARY_VALID_PROVIDER resource={name} original={} adjusted={} protocol=MMCS_v1 local_proof=independent_SHA256",
+            signature(ORIGINAL),
+            signature(bytes)
+        );
+        values
+    }
+    fn rows(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+    ) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut statement = conn.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map(params, |row| {
+                (0..columns).map(|index| row.get(index)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+    fn census(media: &Path) -> BTreeMap<PathBuf, Physical> {
+        std::fs::read_dir(media)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.path(), physical(&entry.path()))
+            })
+            .collect()
+    }
+    fn ordinary_only(conn: &rusqlite::Connection) {
+        for table in ["primary_layout_bindings", "primary_layout_operations"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "ordinary authenticated publication must not manufacture {table}"
+            );
+        }
+    }
+    fn assert_scoped_publication(
+        conn: &rusqlite::Connection,
+        path: &Path,
+        version: &str,
+        bytes: &[u8],
+    ) {
+        let owner = state::db::account::AccountOwner::authenticated(
+            "synthetic@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+        )
+        .unwrap();
+        let (account, provider) = owner.authenticated_keys().unwrap();
+        let pass = "8f22641465c3b441df94dc2d08b5c1029c663a7da888d17799e8eb30e9caf0c2";
+        let native = state::db::provider_selection::SelectionPath::from_path(path)
+            .key()
+            .unwrap();
+        let checksum = signature(bytes);
+        let sha = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+        let proof: String = conn.query_row("SELECT json_array(account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,trust_receipt,selected_metadata_hash,generation_id) FROM download_receipts WHERE child='asset-501' AND version_size=?1 AND provider_checksum=?2 AND native_path=?3", rusqlite::params![version,checksum,native], |row|row.get(0)).unwrap();
+        let proof: Value = serde_json::from_str(&proof).unwrap();
+        let scope = proof[2].as_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(scope).unwrap(),
+            json!({"container":"com.apple.photos.cloud","database":"private","environment":"production","format":1,"realm":"com","zone":{"ownerRecordName":"_defaultOwner","zoneName":"PrimarySync"}})
+        );
+        assert_eq!(
+            proof,
+            json!([
+                account,
+                provider,
+                scope,
+                "PrimarySync",
+                "asset-501",
+                "501",
+                "asset-501",
+                pass,
+                version,
+                checksum,
+                bytes.len(),
+                native,
+                sha,
+                sha,
+                null,
+                null,
+                null
+            ])
+        );
+        let verified: i64 = conn.query_row("SELECT count(*) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.library='PrimarySync' AND d.child='asset-501' AND d.asset_id='asset-501' AND d.master='501' AND d.version_size=?1 AND d.checksum=?2 AND d.size_bytes=?3 AND d.path=?4 AND d.pass_key=?5 AND d.admitted=1 AND d.verified_media=1 AND d.source_checksum=?6 AND d.local_checksum=?6 AND g.account_key=?7 AND g.provider_key=?8 AND g.scope=?9 AND g.sealed=1 AND g.checkpoint_ready=1 AND json_extract(CAST(g.specification AS TEXT),'$.format')=2", rusqlite::params![version,checksum,bytes.len() as i64,native,pass,sha,account,provider,scope], |row|row.get(0)).unwrap();
+        assert!(
+            verified > 0,
+            "completed scoped resource needs verified sealed destination: {path:?}"
+        );
+        eprintln!(
+            "ORDINARY_AUTHENTICATED_PROOF version={version} path={} provider_size={} receipt=source_backed scoped_owner=matched verified_destinations={verified}",
+            path.display(),
+            bytes.len()
+        );
+    }
+    fn assert_retained_paths(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[&dyn rusqlite::ToSql],
+        before: &[Vec<rusqlite::types::Value>],
+    ) {
+        let actual = rows(conn, sql, params);
+        assert_eq!(actual.len(), before.len());
+        let statement = conn.prepare(sql).unwrap();
+        let marker = statement.column_index("preserved_path_key").unwrap();
+        let path = statement.column_index("local_path").unwrap();
+        let mut expected = before.to_vec();
+        for (old, current) in expected.iter_mut().zip(&actual) {
+            // Verified reuse may add protection, never alter any byte proof.
+            if old[marker] == rusqlite::types::Value::Null && current[marker] != old[marker] {
+                let rusqlite::types::Value::Text(native) = &old[path] else {
+                    panic!("path proof must name its native file");
+                };
+                old[marker] = rusqlite::types::Value::Text(
+                    state::db::primary_layout::path_key(Path::new(native)).unwrap(),
+                );
+            }
+        }
+        assert_eq!(
+            actual, expected,
+            "old path evidence changed beyond exact read-only protection"
+        );
+    }
+    fn assert_publication(conn: &rusqlite::Connection, path: &Path, version: &str, bytes: &[u8]) {
+        let sha = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+        let proof: String = conn.query_row("SELECT json_array(a.library,a.id,a.version_size,a.checksum,a.size_bytes,a.status,a.local_path,a.local_checksum,a.download_checksum,a.is_deleted,p.provider_checksum,p.source_checksum,p.local_checksum,p.download_checksum) FROM assets a JOIN asset_metadata_paths p ON p.library=a.library AND p.id=a.id AND p.version_size=a.version_size AND p.local_path=a.local_path WHERE a.library='PrimarySync' AND a.id='asset-501' AND a.version_size=?1", [version], |row| row.get(0)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&proof).unwrap(),
+            json!([
+                "PrimarySync",
+                "asset-501",
+                version,
+                signature(bytes),
+                bytes.len(),
+                "downloaded",
+                path.to_str().unwrap(),
+                sha,
+                sha,
+                0,
+                signature(bytes),
+                sha,
+                sha,
+                sha
+            ])
+        );
+    }
+    async fn media_requests(server: &MockServer, phase: &str) -> [usize; 3] {
+        let requests = server.received_requests().await.unwrap();
+        for request in &requests {
+            assert_eq!(request.method.as_str(), "GET");
+            eprintln!(
+                "ORDINARY_COLLECTING_REQUEST phase={phase} method={} path={}",
+                request.method,
+                request.url.path()
+            );
+        }
+        let counts = ["/original", "/edit-one", "/edit-two"].map(|path| {
+            requests
+                .iter()
+                .filter(|request| request.url.path() == path)
+                .count()
+        });
+        assert_eq!(counts.iter().sum::<usize>(), requests.len());
+        counts
+    }
+    for case in [
+        "unchanged",
+        "changed",
+        "directory",
+        "missing_original_receipt",
+    ] {
+        let server = server().await;
+        let mut root = tempfile::tempdir().unwrap();
+        root.disable_cleanup(true);
+        eprintln!(
+            "ORDINARY_COLLECTING_FIXTURE case={case} retained={}",
+            root.path().display()
+        );
+        let media = root.path().join("media");
+        let database = root.path().join("state.db");
+        let p = media.join("IMG_0501.JPG");
+        let e = media.join("IMG_0501_edited.JPG");
+        let options = |token, trace| CycleOptions {
+            pass_kind: PassKind::Album,
+            // Production owns the DB and propagates capture to selected albums too.
+            // Album selection, not capture absence, chooses incremental collecting.
+            private: true,
+            resolution: crate::types::PhotoResolution::Original,
+            refresh_metadata: false,
+            #[cfg(feature = "xmp")]
+            sidecar: false,
+            controls: download::DownloadControls::download_hidden(),
+            cycle_token: Some(token),
+            trace: Some(trace),
+            ..CycleOptions::default()
+        };
+        let first = positive_records(&server, "edit-one", EDIT_ONE);
+        let initial_trace: RequestTrace = Arc::default();
+        let initial = try_cycle_options(
+            root.path(),
+            first,
+            false,
+            EditedNaming::Suffix,
+            options("ordinary-initial", initial_trace.clone()),
+        )
+        .await;
+        eprintln!(
+            "ORDINARY_COLLECTING_INITIAL result={initial:?} requests={:?}",
+            *initial_trace.lock().unwrap()
+        );
+        let (initial, _) = initial.unwrap();
+        assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+        assert!(initial.can_advance_database_checkpoint());
+        assert_eq!(initial.stats.downloaded, 2);
+        assert_bytes(&p, ORIGINAL);
+        assert_bytes(&e, EDIT_ONE);
+        let old_physical = census(&media);
+        assert_eq!(
+            old_physical.keys().cloned().collect::<Vec<_>>(),
+            vec![p.clone(), e.clone()]
+        );
+        assert_eq!(media_requests(&server, "initial").await, [1, 1, 0]);
+        let connect = || {
+            rusqlite::Connection::open_with_flags(
+                &database,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap()
+        };
+        let path_sql = "SELECT * FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' AND local_path IN (?1,?2) ORDER BY version_size,local_path";
+        let catalogue_sql = "SELECT library,id,version_size,checksum,size_bytes,status,local_path,local_checksum,download_checksum,is_deleted FROM assets WHERE library='PrimarySync' AND id='asset-501' ORDER BY version_size";
+        let claims_sql =
+            "SELECT * FROM legacy_master_state_owners ORDER BY library,master_record_name";
+        let receipts_sql = "SELECT * FROM download_receipts ORDER BY id";
+        let (old_paths, old_catalogue, old_claims, old_receipts, membership, cursor) = {
+            let conn = connect();
+            ordinary_only(&conn);
+            assert_publication(&conn, &p, "original", ORIGINAL);
+            assert_publication(&conn, &e, "adjusted", EDIT_ONE);
+            assert_scoped_publication(&conn, &p, "original", ORIGINAL);
+            assert_scoped_publication(&conn, &e, "adjusted", EDIT_ONE);
+            let receipts = rows(&conn, receipts_sql, &[]);
+            assert_eq!(receipts.len(), 2);
+            let paths = rows(
+                &conn,
+                path_sql,
+                &[&p.to_str().unwrap(), &e.to_str().unwrap()],
+            );
+            assert_eq!(paths.len(), 2);
+            let catalogue = rows(&conn, catalogue_sql, &[]);
+            assert_eq!(catalogue.len(), 2);
+            let claims = rows(&conn, claims_sql, &[]);
+            let membership = rows(
+                &conn,
+                "SELECT * FROM asset_album_memberships WHERE library='PrimarySync' AND asset_record_name='asset-501' AND container_id='album-501' AND is_deleted=0",
+                &[],
+            );
+            assert_eq!(membership.len(), 1);
+            assert_eq!(conn.query_row("SELECT count(*) FROM album_membership_snapshots s JOIN asset_album_memberships m ON m.library=s.library AND m.container_id=s.container_id AND m.generation=s.generation WHERE s.library='PrimarySync' AND s.container_id='album-501' AND s.status='complete' AND s.completed_at IS NOT NULL AND m.asset_record_name='asset-501' AND m.is_deleted=0", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+            let cursor: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(cursor, "ordinary-initial");
+            eprintln!(
+                "ORDINARY_COLLECTING_BEFORE physical={old_physical:?} full_path_rows={paths:?} catalogue={:?} legacy_claims={claims:?} scoped_receipts={receipts:?} membership={membership:?} cursor={cursor}",
+                rows(
+                    &conn,
+                    "SELECT * FROM assets ORDER BY library,id,version_size",
+                    &[]
+                )
+            );
+            (paths, catalogue, claims, receipts, membership, cursor)
+        };
+        let backup = root.path().join("original-before-controlled-change.JPG");
+        if matches!(case, "changed" | "directory") {
+            std::fs::rename(&p, &backup).unwrap();
+            assert_eq!(physical(&backup), old_physical[&p]);
+            if case == "changed" {
+                std::fs::write(&p, b"changed Original witness, not the selected resource").unwrap();
+            } else {
+                std::fs::create_dir(&p).unwrap();
+            }
+        }
+        let mut expected_receipts = old_receipts.clone();
+        let mut old_selection = None;
+        let mut deleted_receipt = None;
+        if case == "missing_original_receipt" {
+            // Simulate corruption of exactly the genuine Original compact receipt.
+            // The original row is retained in old_receipts and the causal log.
+            let conn = rusqlite::Connection::open(&database).unwrap();
+            old_selection = Some([
+                rows(
+                    &conn,
+                    "SELECT * FROM provider_active_generations ORDER BY id",
+                    &[],
+                ),
+                rows(
+                    &conn,
+                    "SELECT * FROM provider_active_decisions ORDER BY generation,pass_key,child",
+                    &[],
+                ),
+                rows(
+                    &conn,
+                    "SELECT * FROM provider_active_destinations ORDER BY generation,pass_key,child,version_size,path",
+                    &[],
+                ),
+            ]);
+            let native = state::db::provider_selection::SelectionPath::from_path(&p)
+                .key()
+                .unwrap();
+            let id: String = conn.query_row("SELECT id FROM download_receipts WHERE child='asset-501' AND version_size='original' AND native_path=?1 AND provider_checksum=?2",rusqlite::params![native,signature(ORIGINAL)],|row|row.get(0)).unwrap();
+            eprintln!(
+                "DISCOVERED_ORIGINAL_PROOF_FAULT case={case} id={id} retained_original_rows={old_receipts:?}"
+            );
+            assert_eq!(conn.execute("DELETE FROM download_receipts WHERE id=?1 AND child='asset-501' AND version_size='original' AND native_path=?2",rusqlite::params![id,native]).unwrap(),1);
+            expected_receipts.retain(|row| row[0] != rusqlite::types::Value::Text(id.clone()));
+            assert_eq!(expected_receipts.len(), 1);
+            deleted_receipt = Some((
+                id.clone(),
+                old_receipts
+                    .iter()
+                    .find(|row| row[0] == rusqlite::types::Value::Text(id.clone()))
+                    .unwrap()
+                    .clone(),
+            ));
+        }
+        let controlled_physical = census(&media);
+        let current = positive_records(&server, "edit-two", EDIT_TWO);
+        let delta_trace: RequestTrace = Arc::default();
+        let (capture, _guard) = crate::test_helpers::TracingCapture::install();
+        let current_result = try_cycle_options(
+            root.path(),
+            current.clone(),
+            false,
+            EditedNaming::Suffix,
+            options("ordinary-current", delta_trace.clone()),
+        )
+        .await;
+        let requests = delta_trace.lock().unwrap().clone();
+        eprintln!(
+            "ORDINARY_COLLECTING_CURRENT result={current_result:?} requests={requests:?} events={:?}",
+            capture.events()
+        );
+        let current_counts = media_requests(&server, "current").await;
+        {
+            let conn = connect();
+            eprintln!(
+                "ORDINARY_COLLECTING_ACTUAL catalogue={:?} paths={:?} choices={:?} physical={:?} scoped_receipts={:?}",
+                rows(
+                    &conn,
+                    "SELECT * FROM assets ORDER BY library,id,version_size",
+                    &[]
+                ),
+                rows(
+                    &conn,
+                    "SELECT * FROM asset_metadata_paths ORDER BY library,id,version_size,local_path",
+                    &[]
+                ),
+                rows(
+                    &conn,
+                    "SELECT * FROM reconciliation_paths ORDER BY library,id,version_size",
+                    &[]
+                ),
+                census(&media),
+                rows(&conn, receipts_sql, &[])
+            );
+        }
+        assert!(
+            capture.contains_event(|event| event.message() == Some("Starting sync cycle")
+                && event.field("sync_mode") == Some("incremental")
+                && event.field("zone") == Some("PrimarySync")),
+            "replacement did not start incremental"
+        );
+        assert!(
+            capture.contains_event(
+                |event| event.message() == Some("Incremental changes read complete")
+            ),
+            "replacement did not execute collecting change reader"
+        );
+        let changes: Vec<_> = requests
+            .iter()
+            .filter(|(kind, _)| kind == "changes")
+            .collect();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].1["zones"][0]["syncToken"], cursor);
+        assert_eq!(
+            changes[0].1["zones"][0]["zoneID"]["zoneName"],
+            "PrimarySync"
+        );
+        if case == "missing_original_receipt" {
+            let error = current_result
+                .as_ref()
+                .expect_err("corrupt completed proof must fail provenance before selection");
+            assert!(
+                error.chain().any(|cause| matches!(
+                    cause.downcast_ref::<state::error::StateError>(),
+                    Some(state::error::StateError::ProviderSelectionInvalid)
+                )),
+                "wrong corruption boundary: {error:#}"
+            );
+            assert!(capture.contains_event(|event| {
+                event.message()
+                    == Some("Failed to record asset/master mapping from incremental delta")
+                    && event.field("asset_record_name") == Some("asset-501")
+                    && event.field("asset_id") == Some("501")
+                    && event.field("library") == Some("PrimarySync")
+                    && event.field("error")
+                        == Some(
+                            state::error::StateError::ProviderSelectionInvalid
+                                .to_string()
+                                .as_str(),
+                        )
+            }));
+            assert!(!capture.contains_event(|event| event.message() == Some("Started sync run")));
+            assert_eq!(current_counts, [1, 1, 0]);
+            assert_eq!(census(&media), old_physical);
+            assert!(!backup.exists());
+            let conn = connect();
+            ordinary_only(&conn);
+            assert_eq!(rows(&conn, receipts_sql, &[]), expected_receipts);
+            let (deleted_id, deleted_row) = deleted_receipt.as_ref().unwrap();
+            assert!(old_receipts.contains(deleted_row));
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM download_receipts WHERE id=?1",
+                    [deleted_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                rows(
+                    &conn,
+                    path_sql,
+                    &[&p.to_str().unwrap(), &e.to_str().unwrap()]
+                ),
+                old_paths
+            );
+            assert_eq!(rows(&conn, catalogue_sql, &[]), old_catalogue);
+            assert_eq!(rows(&conn, claims_sql, &[]), old_claims);
+            assert_eq!(
+                [
+                    rows(
+                        &conn,
+                        "SELECT * FROM provider_active_generations ORDER BY id",
+                        &[]
+                    ),
+                    rows(
+                        &conn,
+                        "SELECT * FROM provider_active_decisions ORDER BY generation,pass_key,child",
+                        &[]
+                    ),
+                    rows(
+                        &conn,
+                        "SELECT * FROM provider_active_destinations ORDER BY generation,pass_key,child,version_size,path",
+                        &[]
+                    ),
+                ],
+                *old_selection.as_ref().unwrap(),
+                "corruption must not admit a current root or destination"
+            );
+            for sql in [
+                "SELECT count(*) FROM provider_active_destinations WHERE checksum=?1",
+                "SELECT count(*) FROM reconciliation_paths WHERE provider_checksum=?1",
+                "SELECT count(*) FROM download_receipts WHERE provider_checksum=?1",
+            ] {
+                assert_eq!(
+                    conn.query_row(sql, [signature(EDIT_TWO)], |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+            let token: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(token, "ordinary-initial");
+            eprintln!(
+                "DISCOVERED_ORIGINAL_PROVENANCE_COMPLETE case={case} error=ProviderSelectionInvalid boundary=asset_master_mapping producer_started=false current_root_admission_intent_receipt=none GETs={current_counts:?} physical_and_surviving_proofs=unchanged deleted_original_backup={deleted_row:?}"
+            );
+            continue;
+        }
+        // Authenticated collecting returns through generation::after_delta before
+        // the later, non-selection "Incremental task planning" event is emitted.
+        assert!(
+            capture.contains_event(|event| event.message() == Some("Started sync run")),
+            "authenticated delta did not enter the selection producer"
+        );
+        let (published, _) = current_result.unwrap();
+        if case != "unchanged" {
+            assert_eq!(
+                (
+                    published.stats.downloaded,
+                    published.stats.failed,
+                    published.stats.state_write_failures,
+                    published.stats.enumeration_errors
+                ),
+                (0, 0, 0, 0),
+                "negative candidate must reach uncertainty, not fail elsewhere: {case} {:?}",
+                published.stats
+            );
+            assert!(
+                published.stats.skipped.uncertain > 0,
+                "negative did not execute uncertain matching: {case}"
+            );
+            assert_eq!(current_counts, [1, 1, 0]);
+            assert_eq!(census(&media), controlled_physical);
+            assert_eq!(physical(&e), old_physical[&e]);
+            if backup.exists() {
+                assert_eq!(physical(&backup), old_physical[&p]);
+            }
+            let conn = connect();
+            ordinary_only(&conn);
+            assert_eq!(
+                rows(&conn, receipts_sql, &[]),
+                expected_receipts,
+                "negative changed genuine receipt evidence: {case}"
+            );
+            assert_eq!(rows(&conn, claims_sql, &[]), old_claims);
+            assert_retained_paths(
+                &conn,
+                path_sql,
+                &[&p.to_str().unwrap(), &e.to_str().unwrap()],
+                &old_paths,
+            );
+            let diagnostic:String=conn.query_row("SELECT last_error FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted' AND checksum=?1 AND status='pending'",[signature(EDIT_TWO)],|row|row.get(0)).unwrap();
+            let diagnostic: Value =
+                serde_json::from_str(diagnostic.strip_prefix("existing_match_v1:").unwrap())
+                    .unwrap();
+            let attempt = diagnostic["attempts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|attempt| attempt["checksum"] == signature(EDIT_TWO))
+                .unwrap();
+            let refusal = attempt["explanation"]["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|candidate| candidate["path"]["path"] == p.to_str().unwrap())
+                .unwrap();
+            assert_eq!(
+                refusal["reason"],
+                if case == "directory" {
+                    "candidate_unreadable_unsafe_or_changed"
+                } else {
+                    "candidate_bytes_not_verified_for_current_resource"
+                }
+            );
+            let destination: state::db::provider_selection::SelectionPath =
+                serde_json::from_value(attempt["destination"].clone()).unwrap();
+            let s = destination.to_path();
+            assert_ne!(s, p);
+            assert_ne!(s, e);
+            assert!(!s.exists());
+            let pending:i64=conn.query_row("SELECT count(*) FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child='asset-501' AND version_size='adjusted' AND path=?3 AND checksum=?4 AND admitted=1 AND verified_media=0 AND source_checksum IS NULL AND local_checksum IS NULL",rusqlite::params![attempt["generation"].as_str().unwrap(),attempt["pass"].as_str().unwrap(),destination.key().unwrap(),signature(EDIT_TWO)],|row|row.get(0)).unwrap();
+            assert_eq!(pending, 1);
+            assert_eq!(conn.query_row("SELECT count(*) FROM download_receipts WHERE version_size='adjusted' AND provider_checksum=?1",[signature(EDIT_TWO)],|row|row.get::<_,i64>(0)).unwrap(),0);
+            let mapping:String=conn.query_row("SELECT json_array(requested_path_key,destination_path_key,destination_path,provider_checksum,provider_size) FROM reconciliation_paths WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted' AND provider_checksum=?1",[signature(EDIT_TWO)],|row|row.get(0)).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&mapping).unwrap(),
+                json!([
+                    crate::fs_util::confined_path_key(&e).unwrap(),
+                    crate::fs_util::confined_path_key(&s).unwrap(),
+                    s.to_str().unwrap(),
+                    signature(EDIT_TWO),
+                    EDIT_TWO.len()
+                ])
+            );
+            eprintln!(
+                "DISCOVERED_ORIGINAL_NEGATIVE_COMPLETE case={case} refusal={refusal:?} destination={} pending={pending} GETs={current_counts:?} physical=unchanged full_proofs=retained",
+                s.display()
+            );
+            continue;
+        }
+        assert!(
+            capture.contains_event(|event| event.message() == Some("Completed sync run")
+                && event.field("downloaded") == Some("1")
+                && event.field("failed") == Some("0")),
+            "authenticated selection must publish the new resource once"
+        );
+        assert_eq!(published.failed_count, 0, "{:?}", published.stats);
+        assert!(published.can_advance_database_checkpoint());
+        assert_eq!(
+            (
+                published.stats.downloaded,
+                published.stats.state_write_failures,
+                published.stats.enumeration_errors
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!(current_counts, [1, 1, 1]);
+        let (s, current_paths, current_catalogue, current_receipts) = {
+            let conn = connect();
+            ordinary_only(&conn);
+            let s: String = conn.query_row("SELECT local_path FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted' AND checksum=?1 AND status='downloaded'", [signature(EDIT_TWO)], |row| row.get(0)).unwrap();
+            let s = PathBuf::from(s);
+            assert_ne!(s, p);
+            assert_ne!(s, e);
+            assert_eq!(s.parent(), Some(media.as_path()));
+            assert_bytes(&s, EDIT_TWO);
+            assert_publication(&conn, &p, "original", ORIGINAL);
+            assert_publication(&conn, &s, "adjusted", EDIT_TWO);
+            assert_scoped_publication(&conn, &s, "adjusted", EDIT_TWO);
+            let receipts = rows(&conn, receipts_sql, &[]);
+            assert_eq!(receipts.len(), 3);
+            assert!(
+                old_receipts.iter().all(|proof| receipts.contains(proof)),
+                "old full scoped receipts must remain unchanged"
+            );
+            assert_retained_paths(
+                &conn,
+                path_sql,
+                &[&p.to_str().unwrap(), &e.to_str().unwrap()],
+                &old_paths,
+            );
+            assert_eq!(rows(&conn, claims_sql, &[]), old_claims);
+            assert_eq!(
+                rows(
+                    &conn,
+                    "SELECT * FROM asset_album_memberships WHERE library='PrimarySync' AND asset_record_name='asset-501' AND container_id='album-501' AND is_deleted=0",
+                    &[]
+                ),
+                membership
+            );
+            let catalogue = rows(&conn, catalogue_sql, &[]);
+            assert_eq!(
+                catalogue
+                    .iter()
+                    .find(|row| row[2] == rusqlite::types::Value::Text("original".into())),
+                old_catalogue
+                    .iter()
+                    .find(|row| row[2] == rusqlite::types::Value::Text("original".into()))
+            );
+            let token: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(token, "ordinary-current");
+            let paths = rows(
+                &conn,
+                "SELECT * FROM asset_metadata_paths ORDER BY library,id,version_size,local_path",
+                &[],
+            );
+            assert_eq!(paths.len(), 3);
+            (s, paths, catalogue, receipts)
+        };
+        let current_physical = census(&media);
+        assert_eq!(current_physical.len(), 3);
+        for (path, proof) in &old_physical {
+            assert_eq!(current_physical.get(path), Some(proof));
+        }
+        assert!(current_physical.contains_key(&s));
+        eprintln!(
+            "ORDINARY_COLLECTING_PUBLISHED S={} physical={current_physical:?} path_proofs={current_paths:?} catalogue={current_catalogue:?} scoped_receipts={current_receipts:?} GETs={current_counts:?}",
+            s.display()
+        );
+        for round in 0..2 {
+            let trace: RequestTrace = Arc::default();
+            let (quiet, _) = cycle_options(
+                root.path(),
+                current.clone(),
+                true,
+                EditedNaming::Suffix,
+                options("ordinary-current", trace.clone()),
+            )
+            .await;
+            eprintln!(
+                "ORDINARY_COLLECTING_QUIET round={round} result={quiet:?} requests={:?}",
+                *trace.lock().unwrap()
+            );
+            assert_eq!(quiet.failed_count, 0, "{:?}", quiet.stats);
+            assert!(quiet.can_advance_database_checkpoint());
+            assert_eq!(
+                (
+                    quiet.stats.downloaded,
+                    quiet.stats.state_write_failures,
+                    quiet.stats.enumeration_errors
+                ),
+                (0, 0, 0)
+            );
+            assert_eq!(media_requests(&server, "quiet").await, current_counts);
+            assert_eq!(census(&media), current_physical);
+            let conn = connect();
+            ordinary_only(&conn);
+            assert_eq!(
+                rows(
+                    &conn,
+                    "SELECT * FROM asset_metadata_paths ORDER BY library,id,version_size,local_path",
+                    &[]
+                ),
+                current_paths
+            );
+            assert_eq!(rows(&conn, catalogue_sql, &[]), current_catalogue);
+            assert_eq!(rows(&conn, claims_sql, &[]), old_claims);
+            assert_eq!(rows(&conn, receipts_sql, &[]), current_receipts);
+            assert_publication(&conn, &p, "original", ORIGINAL);
+            assert_publication(&conn, &s, "adjusted", EDIT_TWO);
+            assert_scoped_publication(&conn, &s, "adjusted", EDIT_TWO);
+            let token: String = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(token, "ordinary-current");
+            eprintln!(
+                "ORDINARY_COLLECTING_QUIET_COMPLETE round={round} GETs=unchanged full_physical_and_path_proofs=unchanged old_claims=unchanged all_scoped_receipts=unchanged"
+            );
+        }
     }
 }

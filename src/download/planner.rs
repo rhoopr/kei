@@ -1714,6 +1714,31 @@ impl TaskPlanner {
             };
         }
         let discovered = self.discover_baseline_family(asset, requested).await;
+        if task.version_size == VersionSizeKey::Adjusted {
+            let mut seen = FxHashSet::default();
+            for candidate in &discovered.paths {
+                if !seen.insert(candidate) {
+                    continue;
+                }
+                match self
+                    .cross_rendition_original(asset, config, task, candidate)
+                    .await
+                {
+                    Ok(Some(receipt)) => {
+                        if !historical.contains(&receipt) {
+                            historical.push(receipt);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        return super::baseline_matching::uncertain(
+                            "scoped_receipt_or_reservation_validation_failed",
+                            Some(candidate),
+                        );
+                    }
+                }
+            }
+        }
         // A separately admitted absent destination may ignore an independently
         // authenticated occupant, but only for the particular path proved here.
         let mut distinct = std::collections::HashSet::new();
