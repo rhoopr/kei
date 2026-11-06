@@ -740,6 +740,107 @@ async fn policy_excluded_asset_is_non_actionable_until_redispatched() {
 }
 
 #[tokio::test]
+async fn policy_excluded_preserves_independent_match_diagnostic_after_reopen() {
+    use crate::state::db::match_diagnostics::{MatchAttempt, MatchDiagnostics, MatchExplanation};
+    use crate::state::db::provider_selection::SelectionPath;
+
+    let root = tempfile::tempdir().unwrap().keep();
+    eprintln!("LEGACY_POLICY_DIAGNOSTIC_ROOT={}", root.display());
+    let path = root.join("state.db");
+    let db = SqliteStateDb::open(&path).await.unwrap();
+    let mut record = TestAssetRecord::new("INDEPENDENT_MATCH")
+        .version_size(VersionSizeKey::Adjusted)
+        .checksum("independent-provider-resource")
+        .size(37)
+        .build();
+    db.upsert_seen(&record).await.unwrap();
+    let destination = root.join("candidate.JPG");
+    let mut explanation = MatchExplanation::default();
+    explanation.add(
+        Some(&destination),
+        "candidate_bytes_not_verified_for_current_resource",
+    );
+    let diagnostic = MatchDiagnostics {
+        last_transfer_error: None,
+        attempts: vec![MatchAttempt {
+            generation: None,
+            pass: None,
+            child: record.id.to_string(),
+            destination: SelectionPath::from_path(&destination),
+            checksum: record.checksum.to_string(),
+            observed_at: 123,
+            explanation,
+        }],
+        omitted: 0,
+    }
+    .encode()
+    .unwrap();
+    record.last_error = Some(diagnostic.clone());
+    db.defer_baseline_match(&record).await.unwrap();
+    let pending = db.get_pending_retry_candidates().await.unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "real independent pending owner before exclusion"
+    );
+    assert_eq!(pending[0].status, AssetStatus::Pending);
+    assert_eq!(pending[0].last_error.as_deref(), Some(diagnostic.as_str()));
+    assert!(
+        db.mark_policy_excluded("PrimarySync", "INDEPENDENT_MATCH", "adjusted")
+            .await
+            .unwrap()
+    );
+
+    let snapshot = |db: &SqliteStateDb| {
+        let conn = db
+            .acquire_lock("inspect independent exclusion diagnostic")
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM provider_active_destinations",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        conn.query_row(
+            "SELECT status,last_error,checksum,is_deleted FROM assets WHERE library='PrimarySync' AND id='INDEPENDENT_MATCH' AND version_size='adjusted'",
+            [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, bool>(3)?)),
+        ).unwrap()
+    };
+    let expected = (
+        "policy_excluded".to_owned(),
+        diagnostic.clone(),
+        record.checksum.to_string(),
+        false,
+    );
+    assert_eq!(snapshot(&db), expected);
+    assert!(db.get_pending().await.unwrap().is_empty());
+    assert!(db.get_pending_retry_candidates().await.unwrap().is_empty());
+    drop(db);
+
+    let reopened = SqliteStateDb::open(&path).await.unwrap();
+    assert_eq!(snapshot(&reopened), expected);
+    assert!(reopened.get_pending().await.unwrap().is_empty());
+    assert!(
+        reopened
+            .get_pending_retry_candidates()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let decoded = MatchDiagnostics::decode(&snapshot(&reopened).1).unwrap();
+    assert_eq!(decoded.encode().as_deref(), Some(diagnostic.as_str()));
+    assert_eq!(decoded.attempts.len(), 1);
+    assert!(decoded.attempts[0].generation.is_none() && decoded.attempts[0].pass.is_none());
+    assert_eq!(decoded.attempts[0].destination.to_path(), destination);
+    eprintln!(
+        "LEGACY_POLICY_DIAGNOSTIC_REOPEN exact={expected:?} independent=true non_actionable=true"
+    );
+}
+
+#[tokio::test]
 async fn policy_excluded_revalidation_reader_is_live_and_library_scoped() {
     let db = SqliteStateDb::open_in_memory().unwrap();
     for (id, library) in [

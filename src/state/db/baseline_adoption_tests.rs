@@ -11,7 +11,12 @@ use super::{
 };
 use crate::state::db::account::AccountOwner;
 use crate::state::db::download_receipts::DownloadReceipt;
-use crate::state::db::provider_selection::SelectionPath;
+use crate::state::db::provider_generations::{
+    ActiveDecision, GenerationSpec, MAX_GENERATION_BYTES,
+};
+use crate::state::db::provider_selection::{
+    SelectionDecision, SelectionDestination, SelectionOutcome, SelectionPath,
+};
 use crate::state::{
     AssetRecord, ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
     VersionSizeKey, error::StateError,
@@ -1354,6 +1359,529 @@ async fn r3_census_profile_first_admission_and_idempotent_repeat() {
                 .map(|sample| format!("{:.3}", sample.as_secs_f64() * 1000.0))
                 .collect::<Vec<_>>();
             eprintln!("R3_PROFILE size={owners} {label}_ms={millis:?}");
+        }
+    }
+}
+
+const PENDING_BYTES: [&[u8]; 2] = [b"good", b"adjusted good"];
+
+fn pending_signature(bytes: &[u8]) -> String {
+    let mut hash = sha1::Sha1::new();
+    hash.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
+    hash.update(bytes);
+    data_encoding::BASE64.encode(&[&[1][..], &hash.finalize()[..]].concat())
+}
+
+fn pending_pair(
+    library: &str,
+    child: &str,
+    original: (&str, u64),
+    paths: &[PathBuf; 2],
+) -> (GenerationSpec, ActiveDecision, Vec<AssetRecord>) {
+    use serde_json::json;
+
+    let zone = json!({"zoneName":library,"ownerRecordName":"_defaultOwner"});
+    let mut values = crate::test_helpers::mock_photo_records_for_zone_with_filename(
+        "master", library, "pair.JPG",
+    );
+    for record in &mut values {
+        record["zoneID"] = zone.clone();
+    }
+    values[1]["recordName"] = json!(child);
+    values[1]["fields"]["masterRef"]["value"]["zoneID"] = zone.clone();
+    values[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(original.0);
+    values[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(original.1);
+    values[1]["fields"]["resJPEGFullRes"] = json!({"value":{
+        "downloadURL":"https://p01.icloud-content.com/adjusted.jpg",
+        "fileChecksum":pending_signature(PENDING_BYTES[1]),"size":PENDING_BYTES[1].len()
+    }});
+    values[1]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+    values[1]["fields"]["adjustmentRenderType"] = json!({"value":1});
+    let body = serde_json::to_vec(&json!({"records":values})).unwrap();
+    let asset = crate::icloud::photos::current_asset(&body, child, "master", &zone).unwrap();
+    let mut records = Vec::new();
+    let mut destinations = Vec::new();
+    for (version, path) in [VersionSizeKey::Original, VersionSizeKey::Adjusted]
+        .into_iter()
+        .zip(paths)
+    {
+        let (_, resource) = asset
+            .versions()
+            .iter()
+            .find(|(key, _)| VersionSizeKey::from(*key) == version)
+            .unwrap();
+        records.push(
+            TestAssetRecord::new(child)
+                .library(library)
+                .version_size(version)
+                .checksum(&resource.checksum)
+                .size(resource.size)
+                .filename(path.file_name().unwrap().to_str().unwrap())
+                .created_at(asset.created())
+                .added_at(asset.added_date())
+                .build()
+                .with_metadata_arc(asset.metadata_arc(version)),
+        );
+        destinations.push(SelectionDestination {
+            version_size: version.as_str().into(),
+            path: SelectionPath::from_path(path),
+            checksum: resource.checksum.to_string(),
+            size: resource.size,
+            metadata_hash: records
+                .last()
+                .unwrap()
+                .metadata
+                .metadata_hash
+                .clone()
+                .unwrap(),
+        });
+    }
+    let spec = GenerationSpec {
+        format: 2,
+        scope: json!({"format":1,"realm":"com","container":"com.apple.photos.cloud",
+            "environment":"production","database":if library == "PrimarySync" {"private"} else {"shared"},"zone":zone}).to_string(),
+        zone: zone.clone(), config_hash: "a".repeat(64), basis: "b".repeat(64),
+        profile: json!({"coverage":"selected_downloads","passes":[{"key":"pass","scope":{"zone":zone}}]}),
+        metadata_enabled: false, metadata_flags: 0,
+    };
+    let manifest = ActiveDecision {
+        decision: SelectionDecision {
+            pass_key: "pass".into(),
+            child: child.into(),
+            master: Some("master".into()),
+            confirmation: Some(body),
+            outcome: SelectionOutcome::Selected,
+            reason: String::new(),
+            destinations,
+        },
+        sources: Vec::new(),
+        state_id: child.into(),
+    };
+    (spec, manifest, records)
+}
+
+struct PendingAdoptionFixture {
+    _directory: tempfile::TempDir,
+    db_path: PathBuf,
+    db: SqliteStateDb,
+    generation: String,
+    paths: [PathBuf; 2],
+    records: Vec<AssetRecord>,
+    receipts: Vec<BaselineReceipt>,
+}
+
+impl PendingAdoptionFixture {
+    async fn new(already_downloaded: bool) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("state.db");
+        let db = SqliteStateDb::open_owned(&db_path, &admission_owner())
+            .await
+            .unwrap();
+        let paths = [
+            directory.path().join("original.JPG"),
+            directory.path().join("adjusted.JPG"),
+        ];
+        let (spec, manifest, records) = pending_pair(
+            "PrimarySync",
+            "current",
+            (
+                &pending_signature(PENDING_BYTES[0]),
+                PENDING_BYTES[0].len() as u64,
+            ),
+            &paths,
+        );
+        // Establish legitimate source receipts before admission. Completing an
+        // ordinary download after admission would incorrectly settle the test's
+        // pending destination before it reaches the adoption owner.
+        let source_id = if already_downloaded {
+            "current"
+        } else {
+            "old-master"
+        };
+        for ((record, path), bytes) in records.iter().zip(&paths).zip(PENDING_BYTES) {
+            std::fs::write(path, bytes).unwrap();
+            let mut source = record.clone();
+            source.id = source_id.into();
+            db.upsert_seen(&source).await.unwrap();
+            let hash = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
+            db.mark_verified_download(
+                "PrimarySync",
+                source_id,
+                record.version_size.as_str(),
+                path,
+                &hash,
+                Some(&hash),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        if !already_downloaded {
+            assert!(
+                db.claim_legacy_master_state_owner("PrimarySync", "old-master", "current")
+                    .await
+                    .unwrap()
+            );
+        }
+        let mut receipts = db.get_baseline_receipts().await.unwrap();
+        receipts.sort_by_key(|receipt| receipt.version_size != VersionSizeKey::Original);
+        assert_eq!(receipts.len(), 2);
+        let generation = db
+            .begin_selection_generation(admission_owner(), spec, MAX_GENERATION_BYTES)
+            .await
+            .unwrap()
+            .id;
+        assert!(
+            db.project_selection_decision(
+                admission_owner(),
+                generation.clone(),
+                manifest,
+                records.clone(),
+                MAX_GENERATION_BYTES
+            )
+            .await
+            .unwrap()
+            .admitted
+        );
+        db.set_metadata("sync_token:PrimarySync", "held-boundary")
+            .await
+            .unwrap();
+        let fixture = Self {
+            _directory: directory,
+            db_path,
+            db,
+            generation,
+            paths,
+            records,
+            receipts,
+        };
+        assert_eq!(
+            fixture.progress(),
+            vec![("adjusted".into(), false), ("original".into(), false)]
+        );
+        fixture
+    }
+
+    async fn adopt(&self, index: usize, historical: bool) -> Result<(), StateError> {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        let receipt = self.receipts[index].clone();
+        let validate = Box::new(move || {
+            callback_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let bytes = std::fs::read(&receipt.local_path).unwrap();
+            assert_eq!(pending_signature(&bytes), receipt.provider_checksum);
+            assert_eq!(
+                data_encoding::HEXLOWER.encode(&Sha256::digest(&bytes)),
+                receipt.source_checksum.unwrap()
+            );
+            Ok(())
+        });
+        let result = if historical {
+            self.db
+                .adopt_baseline_receipt(
+                    &self.records[index],
+                    &self.receipts[index],
+                    "current",
+                    validate,
+                )
+                .await
+        } else {
+            self.db
+                .adopt_provider_signature(
+                    &self.records[index],
+                    &self.receipts[index],
+                    "current",
+                    validate,
+                )
+                .await
+        };
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(result.is_ok()),
+            "successful adoption validates exactly once; census refusal never reaches the callback"
+        );
+        result
+    }
+
+    fn sibling(&self) -> Vec<Value> {
+        let conn = self.db.acquire_lock("unchanged pending sibling").unwrap();
+        let mut stmt = conn.prepare("SELECT * FROM provider_active_destinations WHERE generation=?1 AND version_size='adjusted'").unwrap();
+        let columns = stmt.column_count();
+        stmt.query_row([&self.generation], |row| {
+            (0..columns).map(|i| row.get(i)).collect()
+        })
+        .unwrap()
+    }
+
+    fn progress(&self) -> Vec<(String, bool)> {
+        self.db.acquire_lock("pending adoption progress").unwrap()
+            .prepare("SELECT version_size,verified_media FROM provider_active_destinations WHERE generation=?1 ORDER BY version_size").unwrap()
+            .query_map([&self.generation], |row| Ok((row.get(0)?, row.get(1)?))).unwrap()
+            .collect::<Result<_, _>>().unwrap()
+    }
+
+    fn snapshot(&self) -> Vec<Vec<Value>> {
+        let mut rows = adoption_snapshot(&self.db_path);
+        let conn = self.db.acquire_lock("pending adoption atomicity").unwrap();
+        for query in [
+            "SELECT * FROM provider_active_generations ORDER BY id",
+            "SELECT * FROM provider_active_decisions ORDER BY generation,pass_key,child",
+            "SELECT * FROM provider_active_destinations ORDER BY generation,pass_key,child,version_size,path",
+            "SELECT * FROM assets ORDER BY library,id,version_size",
+            "SELECT * FROM metadata ORDER BY key",
+        ] {
+            let mut stmt = conn.prepare(query).unwrap();
+            let count = stmt.column_count();
+            rows.extend(
+                stmt.query_map([], |row| {
+                    (0..count)
+                        .map(|i| row.get(i))
+                        .collect::<rusqlite::Result<Vec<Value>>>()
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            );
+        }
+        rows
+    }
+
+    fn files(&self) -> Vec<(Vec<u8>, std::time::SystemTime, crate::fs_util::FileIdentity)> {
+        self.paths
+            .iter()
+            .map(|path| {
+                (
+                    std::fs::read(path).unwrap(),
+                    std::fs::metadata(path).unwrap().modified().unwrap(),
+                    crate::fs_util::file_identity(&std::fs::File::open(path).unwrap()).unwrap(),
+                )
+            })
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn pending_adoption_settles_only_exact_path_and_preserves_sibling() {
+    for historical in [false, true] {
+        for already_downloaded in [false, true] {
+            let mut fixture = PendingAdoptionFixture::new(already_downloaded).await;
+            let files = fixture.files();
+            let sibling = fixture.sibling();
+            assert_ne!(
+                crate::fs_util::confined_path_key(&fixture.paths[0]).unwrap(),
+                crate::fs_util::confined_path_key(&fixture.paths[1]).unwrap()
+            );
+            fixture.adopt(0, historical).await.unwrap();
+            assert_eq!(
+                fixture.sibling(),
+                sibling,
+                "other destination's complete obligation stays unchanged"
+            );
+            assert_eq!(
+                fixture.progress(),
+                vec![("adjusted".into(), false), ("original".into(), true)]
+            );
+            fixture.adopt(1, historical).await.unwrap();
+            assert!(fixture.progress().iter().all(|(_, verified)| *verified));
+            assert_eq!(fixture.files(), files);
+            let before = fixture.snapshot();
+            let replacement = SqliteStateDb::open_owned(&fixture.db_path, &admission_owner())
+                .await
+                .unwrap();
+            drop(std::mem::replace(&mut fixture.db, replacement));
+            for index in 0..2 {
+                fixture.adopt(index, historical).await.unwrap();
+            }
+            assert_eq!(
+                fixture.snapshot(),
+                before,
+                "reopened exact adoption is idempotent"
+            );
+            assert_eq!(fixture.files(), files);
+        }
+    }
+}
+
+#[tokio::test]
+async fn pending_adoption_keeps_same_path_identity_and_content_guards() {
+    for historical in [false, true] {
+        for conflict in ["foreign", "checksum", "size", "foreign-scope", "dot-alias"] {
+            let fixture = PendingAdoptionFixture::new(true).await;
+            let selected_rows = || {
+                let conn = fixture
+                    .db
+                    .acquire_lock("selected adoption evidence")
+                    .unwrap();
+                ["assets", "asset_metadata_paths"].map(|table| {
+                    let mut stmt = conn
+                        .prepare(&format!(
+                            "SELECT * FROM {table} WHERE library='PrimarySync' AND id='current' ORDER BY version_size"
+                        ))
+                        .unwrap();
+                    let columns = stmt.column_count();
+                    stmt.query_map([], |row| {
+                        (0..columns)
+                            .map(|index| row.get::<_, Value>(index))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+                })
+            };
+            let selected_before = selected_rows();
+            let mut paths = fixture.paths.clone();
+            let child = if matches!(conflict, "foreign" | "dot-alias") {
+                "foreign"
+            } else {
+                "current"
+            };
+            let library = if conflict == "foreign-scope" {
+                "SharedSync-adoption"
+            } else {
+                "PrimarySync"
+            };
+            let checksum = pending_signature(if conflict == "checksum" {
+                b"evil"
+            } else {
+                PENDING_BYTES[0]
+            });
+            let size = if conflict == "size" { 5 } else { 4 };
+            if conflict == "dot-alias" {
+                paths[0] = paths[0]
+                    .parent()
+                    .unwrap()
+                    .join(".")
+                    .join(paths[0].file_name().unwrap());
+            }
+            let (mut spec, mut manifest, mut records) =
+                pending_pair(library, child, (&checksum, size), &paths);
+            if matches!(conflict, "checksum" | "size") {
+                // A valid exclusive legacy owner is the same logical child but
+                // projects a separate state row. Keep the selected target and
+                // historical receipt intact so later stale-target/provenance
+                // guards cannot mask a missing pending-content census check.
+                assert!(
+                    fixture
+                        .db
+                        .claim_legacy_master_state_owner(library, "master", "current")
+                        .await
+                        .unwrap()
+                );
+                manifest.state_id = "master".into();
+                for record in &mut records {
+                    record.id = "master".into();
+                }
+            }
+            spec.config_hash = "c".repeat(64);
+            let generation = fixture
+                .db
+                .begin_selection_generation(admission_owner(), spec, MAX_GENERATION_BYTES)
+                .await
+                .unwrap();
+            assert!(
+                fixture
+                    .db
+                    .project_selection_decision(
+                        admission_owner(),
+                        generation.id,
+                        manifest,
+                        records,
+                        MAX_GENERATION_BYTES
+                    )
+                    .await
+                    .unwrap()
+                    .admitted,
+                "valid {conflict} reservation"
+            );
+            assert_eq!(
+                selected_rows(),
+                selected_before,
+                "{conflict} projection must preserve every selected target and historical receipt column"
+            );
+            let before = fixture.snapshot();
+            let files = fixture.files();
+            eprintln!("pending adoption refusal: historical={historical}, conflict={conflict}");
+            let error = fixture.adopt(0, historical).await.unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    StateError::Invariant {
+                        operation: "adopt_baseline_receipt",
+                        ..
+                    }
+                ),
+                "{conflict}: {error:?}"
+            );
+            assert_eq!(
+                fixture.snapshot(),
+                before,
+                "{conflict} refusal must not mutate receipts, verification or checkpoints"
+            );
+            assert_eq!(fixture.files(), files);
+        }
+    }
+}
+
+#[tokio::test]
+async fn pending_adoption_validates_disjoint_manifest_before_path_exclusion() {
+    for warm in [false, true] {
+        for corruption in ["manifest-hash", "sibling-projection", "parent-traversal"] {
+            let fixture = PendingAdoptionFixture::new(true).await;
+            if warm {
+                let conn = fixture
+                    .db
+                    .acquire_lock("populate pending candidates")
+                    .unwrap();
+                let candidates =
+                    super::provider_generations::pending_destination_reservations_for_path(
+                        &conn,
+                        &fixture.paths[0],
+                    )
+                    .unwrap();
+                assert_eq!(
+                    candidates.len(),
+                    2,
+                    "reader intentionally returns all manifest siblings"
+                );
+            }
+            {
+                let conn = fixture
+                    .db
+                    .acquire_lock("damage retained pending evidence")
+                    .unwrap();
+                let installed: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE name='pending_path_candidates_valid')", [], |row| row.get(0)).unwrap();
+                assert_eq!(
+                    installed, warm,
+                    "exercise genuinely cold and populated candidate caches"
+                );
+                match corruption {
+                    "manifest-hash" => {
+                        conn.execute("UPDATE provider_active_decisions SET manifest_hash='invalid' WHERE generation=?1", [&fixture.generation]).unwrap();
+                    }
+                    "sibling-projection" => {
+                        conn.execute("UPDATE provider_active_destinations SET checksum='damaged' WHERE generation=?1 AND version_size='adjusted'", [&fixture.generation]).unwrap();
+                    }
+                    "parent-traversal" => {}
+                    other => panic!("unexpected pending corruption: {other}"),
+                }
+            }
+            let mut fixture = fixture;
+            if corruption == "parent-traversal" {
+                fixture.receipts[0].local_path = fixture.paths[0]
+                    .parent()
+                    .unwrap()
+                    .join("..")
+                    .join("original.JPG");
+            }
+            let before = fixture.snapshot();
+            let files = fixture.files();
+            assert!(
+                fixture.adopt(0, false).await.is_err(),
+                "{corruption}, warm={warm}"
+            );
+            assert_eq!(fixture.snapshot(), before);
+            assert_eq!(fixture.files(), files);
         }
     }
 }

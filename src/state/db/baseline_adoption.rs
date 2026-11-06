@@ -466,6 +466,9 @@ fn path_owner_census(
         tx,
         &receipt.local_path,
     )? {
+        if reservation.destination_path_key.0 != target_key {
+            continue;
+        }
         let compatible = same_logical_asset(
             record.library.as_ref(),
             record.id.as_ref(),
