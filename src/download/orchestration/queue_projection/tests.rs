@@ -7524,8 +7524,53 @@ async fn private_lookup_session_recovery(multi: bool) {
         );
         let calls = f.session.calls.load(Ordering::SeqCst);
         let ranks = f.session.rank_calls.load(Ordering::SeqCst);
+        let pass_keys: Vec<_> = passes
+            .iter()
+            .map(crate::download::orchestration::generation::pass_key)
+            .collect();
+        drop(passes);
+        let d_receipts = |fixture: &Fixture| {
+            use sha2::{Digest as _, Sha256};
+            let conn = fixture
+                .db
+                .acquire_lock("independent recovered d destinations")
+                .unwrap();
+            pass_keys
+                .iter()
+                .zip(["A/", "B/", ""])
+                .map(|(key, prefix)| {
+                    let path = fixture
+                        .config
+                        .directory
+                        .join(format!("{prefix}recovered-d.JPG"));
+                    let native = SelectionPath::from_path(&path).key().unwrap();
+                    let encoded: String = conn
+                        .query_row(
+                            "SELECT json_object('pass',origin_pass,'provider',provider_checksum,'size',provider_size,'source',source_checksum,'local',local_checksum,'proof',proof_hash,'native',native_path) FROM download_receipts WHERE library='PrimarySync' AND child='asset-d' AND version_size='original' AND native_path=?1",
+                            [&native],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    let receipt: Value = serde_json::from_str(&encoded).unwrap();
+                    let bytes = std::fs::read(&path).unwrap();
+                    let digest = Sha256::digest(&bytes);
+                    assert_eq!(receipt["pass"], key.as_str());
+                    assert_eq!(receipt["provider"], data_encoding::BASE64.encode(&digest));
+                    assert_eq!(receipt["size"], bytes.len());
+                    assert_eq!(receipt["source"], data_encoding::HEXLOWER.encode(&digest));
+                    assert_eq!(receipt["local"], receipt["source"]);
+                    receipt
+                })
+                .collect::<Vec<_>>()
+        };
+        let stable_d = if multi { d_receipts(&f) } else { Vec::new() };
         for _ in 0..2 {
+            let old_db = Arc::downgrade(&f.db);
             f = reopen_destination_fixture(f).await;
+            assert!(
+                old_db.upgrade().is_none(),
+                "old fixture store retained after reopen"
+            );
             let passes = session_recovery_passes(&f, multi);
             let quiet = crate::download::download_photos_with_sync(
                 &reqwest::Client::new(),
@@ -7539,6 +7584,9 @@ async fn private_lookup_session_recovery(multi: bool) {
             assert_eq!(quiet.stats.downloaded, 0);
             assert_eq!(f.session.calls.load(Ordering::SeqCst), calls);
             assert_eq!(f.session.rank_calls.load(Ordering::SeqCst), ranks);
+            if multi {
+                assert_eq!(d_receipts(&f), stable_d);
+            }
             f.preserved().await;
         }
     }

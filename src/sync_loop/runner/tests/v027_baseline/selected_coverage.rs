@@ -10,6 +10,7 @@ use crate::sync_loop::test_support::{
     make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle,
 };
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_util::sync::CancellationToken;
@@ -165,6 +166,7 @@ enum Transition {
     Stable,
     PathChange,
     MixedPathChange,
+    MixedPathChangeUnfiledFirst,
     #[cfg(feature = "xmp")]
     SidecarPathChange,
 }
@@ -177,6 +179,12 @@ async fn v027_hidden_template_change_preserves_recorded_paths_then_stays_quiet()
 #[tokio::test]
 async fn v027_favorites_mixed_template_change_preserves_paths_and_current_membership() {
     selected_contract(Selection::Favorites, false, Transition::MixedPathChange).await;
+    selected_contract(
+        Selection::Favorites,
+        false,
+        Transition::MixedPathChangeUnfiledFirst,
+    )
+    .await;
 }
 
 #[cfg(feature = "xmp")]
@@ -186,18 +194,20 @@ async fn v027_smart_template_change_preserves_sidecar_bytes_and_timestamps() {
 }
 
 async fn selected_contract(selection: Selection, incomplete_window: bool, transition: Transition) {
+    let mixed = matches!(
+        transition,
+        Transition::MixedPathChange | Transition::MixedPathChangeUnfiledFirst
+    );
     let server = crate::start_wiremock_or_skip!();
     for name in ["original", "next"] {
         Mock::given(method("GET"))
             .and(path(format!("/{name}")))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
-            .expect(
-                if name == "next" && transition == Transition::MixedPathChange {
-                    2 // Two newly selected physical destinations, not a copy of old media.
-                } else {
-                    u64::from(name == "original" || !incomplete_window)
-                },
-            )
+            .expect(if name == "next" && mixed {
+                2 // Two newly selected physical destinations, not a copy of old media.
+            } else {
+                u64::from(name == "original" || !incomplete_window)
+            })
             .mount(&server)
             .await;
     }
@@ -288,24 +298,22 @@ async fn selected_contract(selection: Selection, incomplete_window: bool, transi
                 exclude_ids: Arc::default(),
             }],
         );
-        if transition == Transition::MixedPathChange {
+        if mixed {
             selected.plan.passes.push(AlbumPass {
                 kind: PassKind::Unfiled,
                 album: library.all(),
                 exclude_ids: Arc::default(),
             });
             selected.pass_scope.include_unfiled = true;
+            if transition == Transition::MixedPathChangeUnfiledFirst {
+                selected.plan.passes.reverse();
+            }
         }
         selected.library = library;
         let base = make_run_cycle_download_config_builder(&root, db.clone());
         let builder = |mode, exclude, groups, zone| {
             let mut config = (*base(mode, exclude, groups, zone)).clone();
-            config.folder_structure = if transition == Transition::MixedPathChange {
-                "selected"
-            } else {
-                "none"
-            }
-            .into();
+            config.folder_structure = if mixed { "selected" } else { "none" }.into();
             config.folder_structure_smart_folders =
                 if transition != Transition::Stable && cycle > 0 {
                     "new-selected"
@@ -389,7 +397,7 @@ async fn selected_contract(selection: Selection, incomplete_window: bool, transi
                 std::fs::read(next_directory.join("next.JPG")).unwrap(),
                 MEDIA
             );
-            if transition == Transition::MixedPathChange {
+            if mixed {
                 assert_eq!(
                     std::fs::read(directory.join("next.JPG")).unwrap(),
                     MEDIA,
@@ -414,7 +422,7 @@ async fn selected_contract(selection: Selection, incomplete_window: bool, transi
         }
         assert_eq!(
             result.stats.downloaded,
-            if cycle == 1 && transition == Transition::MixedPathChange {
+            if cycle == 1 && mixed {
                 2
             } else {
                 usize::from(cycle < 2)
@@ -433,6 +441,63 @@ async fn selected_contract(selection: Selection, incomplete_window: bool, transi
                 0,
                 "quiet provider must not repeat inventory"
             );
+        }
+        if mixed {
+            let unfiled = "571668339df97ffc6ff6d86c05a2a23bdcc1676e0a821041a1b0bdc60f483f36";
+            let smart = "c47378b2e025f34efcbe8f8d81073b77160d26b02e1aa560345c1edf363edbce";
+            let child = if cycle == 0 {
+                "asset-selected-original"
+            } else {
+                "asset-selected-next"
+            };
+            let conn = db
+                .acquire_lock("mixed physical destinations retain their actual fulfilled passes")
+                .unwrap();
+            let mut statement = conn.prepare("SELECT native_path,origin_pass,provider_checksum,provider_size,source_checksum,local_checksum FROM download_receipts WHERE library=?1 AND child=?2 AND version_size='original'").unwrap();
+            let receipts: Vec<_> = statement
+                .query_map([ZONE, child], |row| {
+                    Ok((
+                        row.get::<_, String>("native_path")?,
+                        row.get::<_, String>("origin_pass")?,
+                        row.get::<_, String>("provider_checksum")?,
+                        row.get::<_, i64>("provider_size")?,
+                        row.get::<_, String>("source_checksum")?,
+                        row.get::<_, String>("local_checksum")?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(receipts.len(), if cycle == 0 { 1 } else { 2 });
+            for (native, aliases, provider, size, source, local) in receipts {
+                let native: Value = serde_json::from_str(&native).unwrap();
+                assert_eq!(native["encoding"], "utf8");
+                let expected = if cycle == 0 {
+                    assert_eq!(native["path"], first.to_str().unwrap());
+                    vec![unfiled, smart]
+                } else if native["path"] == directory.join("next.JPG").to_str().unwrap() {
+                    vec![unfiled]
+                } else {
+                    assert_eq!(
+                        native["path"],
+                        root.join("new-selected/next.JPG").to_str().unwrap()
+                    );
+                    vec![smart]
+                };
+                let fulfilled: Vec<String> = if aliases.starts_with('[') {
+                    serde_json::from_str(&aliases).unwrap()
+                } else {
+                    vec![aliases]
+                };
+                assert_eq!(fulfilled, expected);
+                assert_eq!(
+                    provider,
+                    super::generation(if cycle == 0 { 21 } else { 22 })
+                );
+                assert_eq!(size, MEDIA.len() as i64);
+                assert_eq!(source, format!("{:x}", Sha256::digest(MEDIA)));
+                assert_eq!(local, source);
+            }
         }
     }
     server.verify().await;

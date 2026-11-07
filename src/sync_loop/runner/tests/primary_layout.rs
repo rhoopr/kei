@@ -17882,6 +17882,7 @@ async fn review501_explicit_metadata_refresh_keeps_existing_naming_paths() {
         refresh_metadata,
         sidecar: true,
         private: true,
+        pass_kind: PassKind::Album,
         ..CycleOptions::default()
     };
     let initial_records =
@@ -17895,6 +17896,37 @@ async fn review501_explicit_metadata_refresh_keeps_existing_naming_paths() {
     )
     .await;
     assert_eq!(initial.failed_count, 0, "{:?}", initial.stats);
+    {
+        let conn = rusqlite::Connection::open_with_flags(
+            root.path().join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut statement = conn.prepare(
+            "SELECT c.container_id, c.album_name, m.asset_record_name, m.master_record_name, m.source \
+             FROM asset_album_memberships m JOIN album_containers c \
+             ON c.library = m.library AND c.container_id = m.container_id \
+             WHERE m.library = 'PrimarySync' AND c.is_deleted = 0 AND m.is_deleted = 0 \
+             ORDER BY c.container_id, m.asset_record_name",
+        ).unwrap();
+        let memberships = statement
+            .query_map([], |row| {
+                Ok([
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ])
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            memberships,
+            [["album-501", "TestAlbum", "asset-501", "501", "icloud"].map(str::to_owned)]
+        );
+    }
     let original = media.join("IMG_0501.JPG");
     let edited = media.join("IMG_0501_edited.JPG");
     assert_bytes(&original, VALID_ORIGINAL);
@@ -19257,10 +19289,15 @@ async fn root_change_preserves_verified_paths_for_pass(
     let before = snapshot();
     assert_eq!(before.0.len(), 2);
     assert_eq!(before.1.len(), 2);
+    let expected_metadata_debt = if pass_kind == PassKind::Unfiled { 0 } else { 2 };
     assert!(before.1.iter().all(|row| {
-        serde_json::from_str::<Value>(row).unwrap()[5]
-            .as_i64()
-            .is_some_and(|v| v > 0)
+        let row: Value = serde_json::from_str(row).unwrap();
+        let metadata_write_failed_at = &row[5];
+        if pass_kind == PassKind::Unfiled {
+            metadata_write_failed_at.is_null()
+        } else {
+            metadata_write_failed_at.as_i64().is_some_and(|v| v > 0)
+        }
     }));
     let requests = server.received_requests().await.unwrap().len();
     assert_eq!(requests, 2);
@@ -19312,7 +19349,7 @@ async fn root_change_preserves_verified_paths_for_pass(
         assert!(db.get_pending().await.unwrap().is_empty());
         assert_eq!(
             db.get_pending_metadata_rewrites(100).await.unwrap().len(),
-            2
+            expected_metadata_debt
         );
         drop(db);
         assert_eq!(server.received_requests().await.unwrap().len(), requests);
@@ -19331,7 +19368,7 @@ async fn root_change_preserves_verified_paths_for_pass(
             0
         );
         eprintln!(
-            "ROOT_TEMPLATE_REUSE_ROUND pass={pass_kind:?} folder={next_folder} round={round} old_identity_proofs_stable=true GETs={requests} downloads=0 metadata_debt=2"
+            "ROOT_TEMPLATE_REUSE_ROUND pass={pass_kind:?} folder={next_folder} round={round} old_identity_proofs_stable=true GETs={requests} downloads=0 metadata_debt={expected_metadata_debt}"
         );
     }
     // This synthetic Album session reports one selected member; its root

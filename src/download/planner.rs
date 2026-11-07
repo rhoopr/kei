@@ -654,16 +654,43 @@ impl TaskPlanner {
             if record.checksum != derived.checksum.as_ref() {
                 continue;
             }
-            if matches!(
-                config.primary_layout_pass_kind,
-                Some(crate::commands::PassKind::Album | crate::commands::PassKind::SmartFolder)
-            ) && !super::filter::stored_path_matches_download_family(
+            let matches_family = super::filter::stored_path_matches_download_family(
                 asset.state_id(),
                 derived,
                 &derived_paths,
                 config,
                 path,
-            ) {
+            );
+            if !matches_family && let Some(owner_run) = &config.selection_run {
+                let run = owner_run.for_asset(asset)?;
+                let key = config
+                    .selection_pass
+                    .as_deref()
+                    .context("Missing selection pass")?;
+                if !run
+                    .capture
+                    .db
+                    .selection_path_reusable_for_pass(
+                        run.capture.owner.clone(),
+                        run.root.id.clone(),
+                        run.root.spec.scope.clone(),
+                        key.to_owned(),
+                        asset.asset_record_name().to_owned(),
+                        crate::state::db::provider_selection::SelectionPath::from_path(path),
+                    )
+                    .await?
+                {
+                    // A current other-pass publication cannot choose this pass's
+                    // first destination; preserve its requested collision plan.
+                    continue;
+                }
+            }
+            if !matches_family
+                && matches!(
+                    config.primary_layout_pass_kind,
+                    Some(crate::commands::PassKind::Album | crate::commands::PassKind::SmartFolder)
+                )
+            {
                 let (Some(binding), Some(album)) =
                     (&task.publication_binding, &config.primary_layout_source)
                 else {
