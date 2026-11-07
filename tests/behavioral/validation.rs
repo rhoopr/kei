@@ -369,7 +369,9 @@ fn sync_bails_on_album_token_in_smart_folders_template() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("{album}"))
-        .stderr(predicate::str::contains("--folder-structure-albums"));
+        .stderr(predicate::str::contains(
+            "[download].folder_structure_albums",
+        ));
 }
 
 #[test]
@@ -378,7 +380,9 @@ fn sync_bails_on_smart_folder_token_in_albums_template() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains("{smart-folder}"))
-        .stderr(predicate::str::contains("--folder-structure-smart-folders"));
+        .stderr(predicate::str::contains(
+            "[download].folder_structure_smart_folders",
+        ));
 }
 
 #[test]

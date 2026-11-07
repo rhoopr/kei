@@ -30,6 +30,13 @@ pub(super) fn export(config_path: &Path, explicit: bool, output: &Path) -> anyho
     } else {
         "unavailable"
     };
+    let configuration_input = match toml.as_ref() {
+        Some(config) => Ok(Some(config)),
+        None => match std::fs::symlink_metadata(config_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            _ => Err(()),
+        },
+    };
     let globals = crate::config::GlobalArgs::from_bootstrap_env();
     let (username, _, domain, directory) = crate::config::resolve_auth(
         &globals,
@@ -91,7 +98,7 @@ pub(super) fn export(config_path: &Path, explicit: bool, output: &Path) -> anyho
             "supported_state_schema": crate::state::schema::SCHEMA_VERSION,
         },
         "configuration": {"status": config_status, "scope": "current_file_and_bootstrap_environment",
-            "values": configuration(toml.as_ref(), explicit),
+            "values": configuration(configuration_input, explicit),
             "effective_sync_overrides": "unavailable_after_recorder_removal"},
         "state": state,
         "health": {"status": if health.is_some() { "available" } else { "unavailable" }, "counters": health},

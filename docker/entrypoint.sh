@@ -139,7 +139,8 @@ docker_upgrade_preflight() {
     echo "kei: /config/config.toml is required for v0.20 Docker sync settings." >&2
     echo "kei: found removed env config: $removed" >&2
     echo "kei: move durable settings into /config/config.toml; keep env for secrets and runtime glue." >&2
-    echo "kei: see https://github.com/rhoopr/kei/blob/main/docs/v0.20-migration.md" >&2
+    echo "kei: current settings: https://github.com/rhoopr/kei/blob/main/example.config.toml" >&2
+    echo "kei: legacy state adoption: https://github.com/rhoopr/kei/blob/main/docs/account-state-migration.md" >&2
     exit 1
 }
 

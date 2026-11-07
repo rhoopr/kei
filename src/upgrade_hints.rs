@@ -1,5 +1,7 @@
-pub(crate) const V020_MIGRATION_URL: &str =
-    "https://github.com/rhoopr/kei/blob/main/docs/v0.20-migration.md";
+pub(crate) const CONFIG_EXAMPLE_URL: &str =
+    "https://github.com/rhoopr/kei/blob/main/example.config.toml";
+pub(crate) const ACCOUNT_STATE_MIGRATION_URL: &str =
+    "https://github.com/rhoopr/kei/blob/main/docs/account-state-migration.md";
 
 pub(crate) const REMOVED_DURABLE_ENV_VARS: &[&str] = &[
     "KEI_DOWNLOAD_DIR",
@@ -42,7 +44,7 @@ pub(crate) fn stale_env_hint() -> Option<String> {
     }
 
     Some(format!(
-        "note: found removed v0.20 env config: {}.\n      These env vars are ignored in v0.20. Move durable sync settings into config.toml.\n      See {V020_MIGRATION_URL}",
+        "note: found removed v0.20 env config: {}.\n      These env vars are ignored in v0.20. Move durable sync settings into config.toml.\n      Current settings: {CONFIG_EXAMPLE_URL}\n      Legacy state adoption: {ACCOUNT_STATE_MIGRATION_URL}",
         present.join(", ")
     ))
 }
@@ -57,6 +59,6 @@ pub(crate) fn with_stale_env_hint(mut message: String) -> String {
 
 pub(crate) fn toml_unknown_field_hint() -> String {
     format!(
-        "note: this config contains a key kei does not recognize. If this is a pre-v0.20 config, move durable sync settings to the v0.20 config.toml shape.\n      See {V020_MIGRATION_URL}"
+        "note: this config contains a key kei does not recognize. If this is a pre-v0.20 config, move durable sync settings to the current config.toml shape.\n      Current settings: {CONFIG_EXAMPLE_URL}\n      Legacy state adoption: {ACCOUNT_STATE_MIGRATION_URL}"
     )
 }

@@ -1013,14 +1013,20 @@ fn assert_removed_env_config_hint(stderr: &str) {
         stderr.contains("KEI_DOWNLOAD_DIR"),
         "stale sync env vars should name KEI_DOWNLOAD_DIR; stderr: {stderr}"
     );
+    assert!(
+        stderr.contains("/example.config.toml")
+            && stderr.contains("docs/account-state-migration.md")
+            && !stderr.contains("docs/v0.20-migration.md"),
+        "stale env guidance must use current settings and safe adoption URLs; stderr: {stderr}"
+    );
 }
 
 #[test]
 fn removed_legacy_album_in_toml_errors() {
     let stderr = run_config_show_error("folder_structure = \"{album}/%B\"\n");
     assert!(
-        stderr.contains("`{album}` cannot be used in --folder-structure")
-            && stderr.contains("--folder-structure-albums"),
+        stderr.contains("`{album}` cannot be used in [download].folder_structure")
+            && stderr.contains("[download].folder_structure_albums"),
         "stderr: {stderr}"
     );
 }
@@ -1032,7 +1038,10 @@ fn removed_legacy_album_env_is_ignored() {
         .arg("--only-print-filenames")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("`{album}` cannot be used in --folder-structure").not());
+        .stderr(
+            predicate::str::contains("`{album}` cannot be used in [download].folder_structure")
+                .not(),
+        );
 }
 
 #[test]
@@ -1041,8 +1050,8 @@ fn removed_legacy_album_errors_even_with_user_set_albums_template() {
         "folder_structure = \"{album}/%Y\"\nfolder_structure_albums = \"{album}/custom\"\n",
     );
     assert!(
-        stderr.contains("`{album}` cannot be used in --folder-structure")
-            && stderr.contains("--folder-structure-albums"),
+        stderr.contains("`{album}` cannot be used in [download].folder_structure")
+            && stderr.contains("[download].folder_structure_albums"),
         "stderr: {stderr}"
     );
 }
@@ -1190,8 +1199,10 @@ fn removed_toml_filter_aliases_error() {
             "expected v0.20 migration hint for {field}; stderr:\n{stderr}"
         );
         assert!(
-            stderr.contains("docs/v0.20-migration.md"),
-            "expected migration guide URL for {field}; stderr:\n{stderr}"
+            stderr.contains("/example.config.toml")
+                && stderr.contains("docs/account-state-migration.md")
+                && !stderr.contains("docs/v0.20-migration.md"),
+            "expected current settings and safe adoption URLs for {field}; stderr:\n{stderr}"
         );
     }
 }

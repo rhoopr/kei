@@ -1,6 +1,259 @@
 use super::privacy;
 use serde_json::json;
 
+const CONCURRENCY_CASES: &[(&str, Option<u16>)] = &[
+    ("", Some(10)),
+    ("threads=1", Some(1)),
+    ("threads=64", Some(64)),
+    ("threads=7", Some(7)),
+    ("bandwidth_limit='2M'", Some(1)),
+    ("bandwidth_limit='0.1K'", Some(1)),
+    ("threads=7\nbandwidth_limit='2M'", Some(7)),
+    ("threads=64\nbandwidth_limit='1.5Mi'", Some(64)),
+    ("threads=0", None),
+    ("threads=65", None),
+    ("threads=65535", None),
+    ("bandwidth_limit='PRIVATE_CONCURRENCY_CANARY'", None),
+    ("bandwidth_limit='0'", None),
+    (
+        "threads=7\nbandwidth_limit='PRIVATE_CONCURRENCY_CANARY'",
+        None,
+    ),
+    (
+        "threads=0\nbandwidth_limit='PRIVATE_CONCURRENCY_CANARY'",
+        None,
+    ),
+    ("threads=65536", None),
+    ("threads=-1", None),
+    ("threads='PRIVATE_CONCURRENCY_CANARY'", None),
+];
+
+fn concurrency_fixture() -> tempfile::TempDir {
+    let mut root = tempfile::tempdir().unwrap();
+    if std::env::var_os("KEI_SNAPSHOT_CONCURRENCY_RETAIN_FIXTURES").is_some() {
+        root.disable_cleanup(true);
+    }
+    eprintln!(
+        "SNAPSHOT_CONCURRENCY_FIXTURE root={}",
+        root.path().display()
+    );
+    root
+}
+
+#[test]
+fn snapshot_concurrency_matches_runtime_configuration() {
+    let root = concurrency_fixture();
+    let globals = crate::config::GlobalArgs {
+        username: Some("synthetic@example.invalid".into()),
+        domain: None,
+        data_dir: Some(root.path().to_str().unwrap().into()),
+    };
+    let runtime = |toml: Option<&crate::config::TomlConfig>| {
+        crate::config::Config::build(
+            &globals,
+            &crate::cli::PasswordArgs::default(),
+            crate::cli::SyncArgs::default(),
+            toml,
+        )
+    };
+    assert_eq!(super::configuration(Ok(None), true)["threads"], 10);
+    assert_eq!(runtime(None).unwrap().download.threads_num, 10);
+    assert!(super::configuration(Err(()), true)["threads"].is_null());
+    for (index, &(settings, expected)) in CONCURRENCY_CASES.iter().enumerate() {
+        let body = format!("[download]\n{settings}");
+        let Ok(parsed) = toml::from_str::<crate::config::TomlConfig>(&body) else {
+            assert!(expected.is_none());
+            assert!(super::configuration(Err(()), true)["threads"].is_null());
+            eprintln!("SNAPSHOT_CONCURRENCY_RUNTIME case={index} input=unparseable threads=null");
+            continue;
+        };
+        let projected = super::configuration(Ok(Some(&parsed)), true);
+        assert_eq!(projected["threads"], json!(expected), "case {index}");
+        match expected {
+            Some(count) => assert_eq!(runtime(Some(&parsed)).unwrap().download.threads_num, count),
+            None => {
+                let error = runtime(Some(&parsed)).unwrap_err().to_string();
+                if settings.contains("bandwidth_limit") {
+                    assert!(error.starts_with("Invalid [download].bandwidth_limit in config:"));
+                } else {
+                    let count = parsed.download.as_ref().unwrap().threads.unwrap();
+                    assert_eq!(
+                        error,
+                        format!("[download].threads must be between 1 and 64, got {count}.")
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "SNAPSHOT_CONCURRENCY_RUNTIME case={index} threads={}",
+            projected["threads"]
+        );
+    }
+}
+
+#[test]
+fn snapshot_concurrency_collection_preserves_inputs_and_output_contract() {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    fn inputs(root: &Path, output: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut entries = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.path() == output {
+                    continue;
+                }
+                let directory = entry.file_type().unwrap().is_dir();
+                let bytes = (!directory).then(|| std::fs::read(entry.path()).unwrap());
+                entries.insert(entry.path(), bytes);
+                if directory {
+                    pending.push(entry.path());
+                }
+            }
+        }
+        entries
+    }
+
+    for (index, &(settings, expected)) in CONCURRENCY_CASES.iter().enumerate() {
+        let root = concurrency_fixture();
+        let data = root.path().join("data");
+        let media = root.path().join("media");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&media).unwrap();
+        std::fs::write(
+            media.join("PRIVATE_CONCURRENCY_CANARY.jpg"),
+            b"original media",
+        )
+        .unwrap();
+        let db = rusqlite::Connection::open(data.join("input-state.db")).unwrap();
+        db.execute_batch("CREATE TABLE fixture(value TEXT); INSERT INTO fixture VALUES('PRIVATE_CONCURRENCY_CANARY');").unwrap();
+        drop(db);
+        std::fs::write(
+            data.join("health.json"),
+            br#"{"total_syncs":3,"private":"PRIVATE_CONCURRENCY_CANARY"}"#,
+        )
+        .unwrap();
+        let marker = root.path().join("password-command-ran");
+        let config = root.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "data_dir={}\n[auth]\npassword_command={}\n[download]\ndirectory={}\n{settings}\n",
+                json!(data.to_str().unwrap()),
+                json!(format!("touch {}", marker.display())),
+                json!(media.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        let output = root.path().join("support.json");
+        let before = inputs(root.path(), &output);
+        eprintln!(
+            "SNAPSHOT_CONCURRENCY_COLLECT root={} case={index}",
+            root.path().display()
+        );
+        assert!(super::collect::export(&config, true, &output).unwrap());
+        let bytes = std::fs::read(&output).unwrap();
+        let bundle: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(bundle["schema_version"], 1);
+        assert_eq!(bundle["privacy_contract"], "allowlist_v1");
+        assert_eq!(bundle["summary"]["collection"], "offline_read_only");
+        assert_eq!(bundle["summary"]["automatic_upload"], false);
+        assert!(
+            bundle["configuration"]["values"]
+                .as_object()
+                .unwrap()
+                .contains_key("threads")
+        );
+        assert_eq!(
+            bundle["configuration"]["values"]["threads"],
+            json!(expected)
+        );
+        assert_eq!(bundle["state"]["status"], "account_unavailable");
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(!text.contains("PRIVATE_CONCURRENCY_CANARY"));
+        assert!(!text.contains(root.path().to_str().unwrap()));
+        assert!(!marker.exists());
+        assert_eq!(inputs(root.path(), &output), before);
+        assert!(super::collect::export(&config, true, &output).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), bytes);
+        assert_eq!(inputs(root.path(), &output), before);
+        assert!(
+            super::collect::export(&config, true, &root.path().join("absent/output.json")).is_err()
+        );
+        assert!(!root.path().join("absent").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let link = root.path().join("output-link.json");
+            std::os::unix::fs::symlink(&config, &link).unwrap();
+            let original = std::fs::read(&config).unwrap();
+            assert!(super::collect::export(&config, true, &link).is_err());
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read(&config).unwrap(), original);
+        }
+        eprintln!(
+            "SNAPSHOT_CONCURRENCY_COLLECT_COMPLETE root={} case={index} threads={}",
+            root.path().display(),
+            bundle["configuration"]["values"]["threads"]
+        );
+    }
+}
+
+#[test]
+fn snapshot_concurrency_distinguishes_missing_from_unavailable_configuration() {
+    for kind in [
+        "missing",
+        "empty",
+        "invalid",
+        "directory",
+        "dangling-symlink",
+    ] {
+        #[cfg(not(unix))]
+        if kind == "dangling-symlink" {
+            continue;
+        }
+        let root = concurrency_fixture();
+        let config = root.path().join("config.toml");
+        match kind {
+            "missing" => {}
+            "empty" => std::fs::write(&config, "").unwrap(),
+            "invalid" => std::fs::write(&config, "[download]\nthreads = [").unwrap(),
+            "directory" => std::fs::create_dir(&config).unwrap(),
+            "dangling-symlink" => {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(root.path().join("absent.toml"), &config).unwrap();
+            }
+            _ => panic!("unknown availability fixture: {kind}"),
+        }
+        let output = root.path().join("support.json");
+        assert!(super::collect::export(&config, true, &output).unwrap());
+        let bundle: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        let expected = matches!(kind, "missing" | "empty").then_some(10);
+        assert_eq!(
+            bundle["configuration"]["values"]["threads"],
+            json!(expected)
+        );
+        assert_eq!(bundle["state"]["status"], "account_unavailable");
+        eprintln!(
+            "SNAPSHOT_CONCURRENCY_AVAILABILITY root={} kind={kind} threads={}",
+            root.path().display(),
+            bundle["configuration"]["values"]["threads"]
+        );
+    }
+}
+
 #[test]
 fn malicious_reports_configurations_and_errors_are_allowlisted() {
     let malicious = json!({
@@ -229,7 +482,7 @@ fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
         let input: crate::config::TomlConfig =
             toml::from_str(&format!("[photos]\nfile_match_policy={label:?}")).unwrap();
         assert_eq!(
-            super::configuration(Some(&input), true)["file_match_policy"],
+            super::configuration(Ok(Some(&input)), true)["file_match_policy"],
             expected
         );
     }
@@ -237,7 +490,7 @@ fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
         let input: crate::config::TomlConfig =
             toml::from_str(&format!("[photos]\nraw_policy={label:?}")).unwrap();
         assert_eq!(
-            super::configuration(Some(&input), true)["raw_policy"],
+            super::configuration(Ok(Some(&input)), true)["raw_policy"],
             label
         );
     }
@@ -245,14 +498,14 @@ fn typed_effective_configuration_preserves_every_file_raw_and_live_mode() {
         let input: crate::config::TomlConfig =
             toml::from_str(&format!("[photos]\nlive_photo_mode={label:?}")).unwrap();
         assert_eq!(
-            super::configuration(Some(&input), true)["live_photo_mode"],
+            super::configuration(Ok(Some(&input)), true)["live_photo_mode"],
             label
         );
     }
     let input: crate::config::TomlConfig =
         toml::from_str("[auth]\nusername=\"PRIVATE_USER\"").unwrap();
     assert!(
-        !super::configuration(Some(&input), true)
+        !super::configuration(Ok(Some(&input)), true)
             .to_string()
             .contains("PRIVATE")
     );

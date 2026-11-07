@@ -201,7 +201,8 @@ prefail_out=$(docker run --rm \
 printf '%s\n' "$prefail_out"
 echo "$prefail_out" | grep -q "/config/config.toml is required for v0.20 Docker sync settings"
 echo "$prefail_out" | grep -q "KEI_DOWNLOAD_DIR"
-echo "$prefail_out" | grep -q "docs/v0.20-migration.md"
+echo "$prefail_out" | grep -q "/example.config.toml"
+echo "$prefail_out" | grep -q "docs/account-state-migration.md"
 
 echo "--- v0.20 Docker preflight: --version bypasses removed env config check ---"
 preflight_version_out=$(docker run --rm \

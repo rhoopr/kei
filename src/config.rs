@@ -39,8 +39,8 @@ pub(crate) use persistence::persist_first_run_config;
 )]
 pub(crate) use resolve::{
     PathDerivationCliArgs, PathDerivationFields, SyncConfigOverrides, resolve_auth,
-    resolve_library_selector, resolve_media_selection, resolve_notify_systemd,
-    resolve_path_derivation_fields, smart_retry_delay, unfiled_default,
+    resolve_download_threads, resolve_library_selector, resolve_media_selection,
+    resolve_notify_systemd, resolve_path_derivation_fields, smart_retry_delay, unfiled_default,
 };
 #[expect(
     unused_imports,

@@ -440,10 +440,10 @@ fn find_multi_library_commingle_flags_reports_per_active_pass() {
     // CG-6 contract: only *active* passes whose templates lack
     // `{library}` show up in the missing-flags list.
     //
-    // Scenario: --folder-structure-albums '{library}/{album}' (token
-    // present, active) + --folder-structure-smart-folders
-    // '{smart-folder}' (no token, active because --smart-folder all)
-    // + --unfiled false (inactive).
+    // Scenario: [download].folder_structure_albums = '{library}/{album}'
+    // (token present, active) + folder_structure_smart_folders =
+    // '{smart-folder}' (no token, active because smart_folders = ["all"])
+    // + [filters].unfiled = false (inactive).
     use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
     let sel = Selection {
         albums: AlbumSelector::All {
@@ -467,7 +467,7 @@ fn find_multi_library_commingle_flags_reports_per_active_pass() {
     );
     assert_eq!(
         missing,
-        vec!["--folder-structure-smart-folders"],
+        vec!["[download].folder_structure_smart_folders"],
         "only the active smart-folder pass with `{{library}}`-less template should be listed"
     );
 
@@ -531,9 +531,9 @@ fn find_multi_library_commingle_flags_reports_all_missing_when_every_active_temp
     assert_eq!(
         missing,
         vec![
-            "--folder-structure",
-            "--folder-structure-albums",
-            "--folder-structure-smart-folders",
+            "[download].folder_structure",
+            "[download].folder_structure_albums",
+            "[download].folder_structure_smart_folders",
         ],
         "every active template lacks `{{library}}` - all three should be listed",
     );
@@ -543,11 +543,11 @@ fn find_multi_library_commingle_flags_reports_all_missing_when_every_active_temp
 fn find_multi_library_commingle_flags_reports_with_none_folder_structure_too() {
     // `none` (date hierarchy disabled) is the worst-case commingle:
     // every asset lands directly in the download dir. Still surfaces
-    // the unfiled flag so the user knows the namespace is shared.
+    // the unfiled setting so the user knows the namespace is shared.
     let sel = selection_all_passes_active();
     let states = commingle_test_states(5, &sel);
     let missing = find_multi_library_commingle_flags(&states, "none", "{album}", "{smart-folder}");
-    assert!(missing.contains(&"--folder-structure"));
+    assert!(missing.contains(&"[download].folder_structure"));
 }
 
 #[test]
@@ -600,9 +600,9 @@ fn warn_if_multi_library_paths_commingle_emits_structured_fields() {
     assert_eq!(warn.field("library_count"), Some("3"));
     let missing = warn.field("missing").expect("missing field");
     for flag in [
-        "--folder-structure",
-        "--folder-structure-albums",
-        "--folder-structure-smart-folders",
+        "[download].folder_structure",
+        "[download].folder_structure_albums",
+        "[download].folder_structure_smart_folders",
     ] {
         assert!(
             missing.contains(flag),

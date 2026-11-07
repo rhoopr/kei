@@ -84,7 +84,7 @@ Approve the sign-in prompt on your trusted Apple device and enter the six-digit 
 2. Open the destination in your file manager. Look for the recent photos you expected in the album and date folders, and open a photo and video if you selected both. Live Photos normally include a still image and a MOV video.
 3. Run `kei status` to check progress. A clean result does not mean you selected every item or version in iCloud. You can also run `kei verify --checksums` to check saved files against their recorded checksums. That check cannot tell you whether the backup includes everything in iCloud or repair damaged files.
 
-Photos are saved in the folder set by `[download].directory`. Settings, saved logins and kei's record of your backup normally live under `~/.config/kei`. If you use a custom configuration file, kei normally keeps its state beside that file; `data_dir` or `KEI_DATA_DIR` can change this location. Keep the state as well as your photos and videos.
+Photos are saved in the folder set by `[download].directory`. Settings normally live in `~/.config/kei/config.toml`; saved sessions and backup state normally live in `~/.config/kei/cookies`, even with a custom configuration file. Set `data_dir` to change the session and state directory; `KEI_DATA_DIR` takes precedence over that setting. Keep the state as well as your photos and videos.
 
 By default, kei downloads originals and the videos that accompany Live Photos. Select edited versions and other versions, including RAW, explicitly if you want them. See [example.config.toml](example.config.toml).
 

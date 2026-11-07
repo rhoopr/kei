@@ -251,6 +251,17 @@ fn docker_packaging_defaults_to_service_run() {
     );
 
     let entrypoint = repo_file("docker/entrypoint.sh");
+    for guide in ["/example.config.toml", "docs/account-state-migration.md"] {
+        assert!(
+            entrypoint.contains(guide),
+            "missing current guidance: {guide}"
+        );
+        assert!(
+            repo_file("scripts/full-test/run_docker_puid_smoke.sh").contains(guide),
+            "Docker smoke expectation must track current guidance: {guide}"
+        );
+    }
+    assert!(!entrypoint.contains("docs/v0.20-migration.md"));
     let whitelist = entrypoint
         .lines()
         .find(|line| {
@@ -346,6 +357,13 @@ fn migration_guide_uses_toml_for_durable_sync_settings() {
 
 #[test]
 fn notification_script_docs_pin_legacy_env_plus_report_json() {
+    let wiring = repo_file("scripts/notify-synology-photos.sh");
+    assert!(wiring.contains("[notifications].script in config.toml"));
+    assert!(!wiring.contains("--notification-script"));
+    let notifier = repo_file("src/notifications.rs");
+    assert!(notifier.contains("[notifications].script is unix-only"));
+    assert!(!notifier.contains("--notification-script"));
+
     let changelog = repo_file("CHANGELOG.md");
     assert!(
         changelog.contains(

@@ -210,7 +210,7 @@ pub(super) async fn refresh_needed_library_plans(
 }
 
 /// Identify active-pass templates that lack `{library}` when multiple
-/// libraries are selected. Returns a sorted list of CLI flag names whose
+/// libraries are selected. Returns a sorted list of TOML setting names whose
 /// templates would let same-named assets from different zones land in the
 /// same on-disk path. Empty list means the multi-library plan is unambiguous.
 ///
@@ -232,7 +232,7 @@ pub(crate) fn count_passes(plan: &crate::commands::AlbumPlan) -> (usize, usize, 
 }
 
 /// Template strings whose pass is disabled (e.g. `folder_structure_smart_folders`
-/// when `--smart-folder none`) don't render any path so they don't need
+/// when `[filters].smart_folders = ["none"]`) don't render any path so they don't need
 /// `{library}` to keep the sync safe.
 fn find_multi_library_commingle_flags(
     library_states: &[LibraryState],
@@ -271,13 +271,13 @@ fn find_multi_library_commingle_flags(
 
     let mut missing: Vec<&'static str> = Vec::new();
     if active_unfiled_libraries > 1 && !folder_structure.contains("{library}") {
-        missing.push("--folder-structure");
+        missing.push("[download].folder_structure");
     }
     if active_album_libraries > 1 && !folder_structure_albums.contains("{library}") {
-        missing.push("--folder-structure-albums");
+        missing.push("[download].folder_structure_albums");
     }
     if active_smart_folder_libraries > 1 && !folder_structure_smart_folders.contains("{library}") {
-        missing.push("--folder-structure-smart-folders");
+        missing.push("[download].folder_structure_smart_folders");
     }
     missing
 }

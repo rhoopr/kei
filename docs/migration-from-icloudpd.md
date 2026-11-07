@@ -191,7 +191,7 @@ kei sync --config ~/.config/kei/config.toml
 
 Use the same account, folders and selection settings. If unexpected bulk downloads start, stop and review which files were unmatched. Don't reset kei's state or remove existing photos to force progress.
 
-Keep the saved state as well as your media. It normally lives in `~/.config/kei`; with a custom configuration file, it normally lives beside that file. `data_dir` or `KEI_DATA_DIR` can override the location.
+Keep the saved state as well as your media. Sessions and state normally live in `~/.config/kei/cookies`, even with a custom configuration file. Settings normally live separately in `~/.config/kei/config.toml`. Set `data_dir` to change the session and state directory; `KEI_DATA_DIR` takes precedence over that setting.
 
 Use `kei password set` if you want kei to save a prompted password. The `--save-password` flag on sync only saves a password supplied directly on the command line or through the environment; it does not save prompted, password-file or password-command input.
 

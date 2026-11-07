@@ -13,10 +13,10 @@
 # not accidentally enable a feature, write to a path, or use a secret source.
 
 # Option: data_dir
-# Default value: parent directory of the resolved config file; Docker sets KEI_DATA_DIR=/config
+# Default value: ~/.config/kei/cookies for sessions and state, even with a custom config; Docker sets KEI_DATA_DIR=/config
 # Valid values: filesystem path; ~ expands to your home directory
-# Description: Stores sessions, state DBs, credentials, health data, and cookies.
-# data_dir = "~/.config/kei"
+# Description: Stores sessions, state DBs, credentials, health data, and cookies. KEI_DATA_DIR overrides this setting; settings normally live separately in ~/.config/kei/config.toml.
+# data_dir = "~/.config/kei/cookies"
 
 # Option: log_level
 # Default value: info
@@ -211,7 +211,7 @@ edited = false
 # Option: photos.edited_naming
 # Default value: suffix
 # Valid values: suffix, primary
-# Description: primary requires edited=true; preserves owned originals and edit history before managing the ordinary filename. See docs/edited-primary.md.
+# Description: primary requires edited=true and uses the ordinary filename for edited new downloads. Existing recorded media, metadata, and paths stay unchanged; only already-started recorded recovery uses layout history. See docs/edited-primary.md.
 edited_naming = "suffix"
 
 # Option: photos.alternative

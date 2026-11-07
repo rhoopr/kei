@@ -30,6 +30,8 @@ The version 1 export has a versioned allowlist and these sections:
 - Bounded read-only account state totals and durable retry, unresolved identity, metadata, publication and reconciliation work counts.
 - An explicitly unavailable operation-history section with no records. This build does not retain normal-operation history.
 
+`configuration.values.threads` follows the current file's valid download settings: an explicit count from 1 to 64 wins; otherwise a bandwidth limit selects 1, and no limit selects 10. A missing configuration file uses that default. The value is `null` when the file cannot be read or parsed, or its thread count or bandwidth limit is invalid. Sync-time overrides are not available in this snapshot.
+
 No credentials, cookies, tokens, Apple IDs, provider IDs, album names, private paths, checksums, provider URLs, responses or arbitrary error text are exported.
 
 ## Limits and partial evidence

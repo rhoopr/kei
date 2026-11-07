@@ -11,7 +11,18 @@ pub(crate) use privacy::fixed_label;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-fn configuration(toml: Option<&crate::config::TomlConfig>, explicit: bool) -> Value {
+// Ok(None) means an omitted file; Err means its settings could not be read or parsed.
+fn configuration(input: Result<Option<&crate::config::TomlConfig>, ()>, explicit: bool) -> Value {
+    let threads = input.ok().and_then(|toml| {
+        let download = toml.and_then(|t| t.download.as_ref());
+        let bandwidth = download
+            .and_then(|d| d.bandwidth_limit.as_deref())
+            .map(crate::cli::parse_bandwidth_limit)
+            .transpose()
+            .ok()?;
+        crate::config::resolve_download_threads(download.and_then(|d| d.threads), bandwidth).ok()
+    });
+    let toml = input.ok().flatten();
     let filters = toml.and_then(|t| t.filters.as_ref());
     let download = toml.and_then(|t| t.download.as_ref());
     let auth = toml.and_then(|t| t.auth.as_ref());
@@ -30,7 +41,7 @@ fn configuration(toml: Option<&crate::config::TomlConfig>, explicit: bool) -> Va
         "unfiled": filters.and_then(|f| f.unfiled).unwrap_or(true),
         "date_filter_present": filters.is_some_and(|f| f.skip_created_before.is_some() || f.skip_created_after.is_some()),
         "recent_limit_present": filters.is_some_and(|f| f.recent.is_some()),
-        "threads": download.and_then(|d| d.threads).unwrap_or(3),
+        "threads": threads,
         "legacy_preservation_allow_hardlinks": download.and_then(|d| d.legacy_preservation_allow_hardlinks).unwrap_or(false),
         "watch_interval_secs": watch.and_then(|w| w.interval),
         "reconcile_every_n_cycles": watch.and_then(|w| w.reconcile_every_n_cycles),

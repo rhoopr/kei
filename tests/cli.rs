@@ -46,7 +46,9 @@ fn assert_removed_sync_flag_hint(args: &[&str]) {
         .stderr(predicate::str::contains(
             "v0.20 removed durable sync CLI flags",
         ))
-        .stderr(predicate::str::contains("docs/v0.20-migration.md"));
+        .stderr(predicate::str::contains("/example.config.toml"))
+        .stderr(predicate::str::contains("docs/account-state-migration.md"))
+        .stderr(predicate::str::contains("docs/v0.20-migration.md").not());
 }
 
 // ── Help output ─────────────────────────────────────────────────────────

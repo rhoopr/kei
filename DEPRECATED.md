@@ -1,11 +1,10 @@
 # Removed compatibility surfaces
 
-There are no active warning windows. Removed flags, commands, env vars, and TOML keys fail during CLI parsing or config validation.
+There are no active warning windows. Removed flags, commands and TOML keys fail during CLI parsing or config validation. Removed durable-setting env vars are ignored; they do not supply sync settings.
 
 ## v0.20.0
 
-The v0.20 cleanup removed the v0.13-v0.19 compatibility aliases. Current
-migration guidance lives in [docs/v0.20-migration.md](docs/v0.20-migration.md).
+The v0.20 cleanup removed the v0.13-v0.19 compatibility aliases. Use [example.config.toml](example.config.toml) for current settings and [account-bound state migration](docs/account-state-migration.md) before adopting legacy state. Do not copy or rename old authentication files into the current session directory. The historical v0.20 migration guide is not current adoption guidance.
 
 Removed examples include:
 

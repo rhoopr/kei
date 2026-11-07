@@ -1,13 +1,13 @@
 //! Folder-template defaults and token validation.
 
 /// Default template for album passes: a flat per-album folder. Users opt
-/// into a date hierarchy by passing `--folder-structure-albums "{album}/%Y..."`.
+/// into a date hierarchy with `[download].folder_structure_albums = "{album}/%Y..."`.
 pub(crate) const DEFAULT_FOLDER_STRUCTURE_ALBUMS: &str = "{album}";
 
 /// Default template for smart-folder passes: a flat per-smart-folder folder.
 pub(crate) const DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS: &str = "{smart-folder}";
 
-/// Which folder-structure flag a template was supplied via. Drives the
+/// Which `[download]` setting supplied a template. Drives the
 /// per-template token rules: each kind allows exactly one category token
 /// (`{album}` for albums, `{smart-folder}` for smart folders, none for the
 /// unfiled base) and `{library}` is allowed in all three.
@@ -17,20 +17,20 @@ pub(crate) const DEFAULT_FOLDER_STRUCTURE_SMART_FOLDERS: &str = "{smart-folder}"
 /// different rules: `TemplateKind::Unfiled` forbids category tokens.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum TemplateKind {
-    /// `--folder-structure-albums`.
+    /// `[download].folder_structure_albums`.
     Albums,
-    /// `--folder-structure-smart-folders`.
+    /// `[download].folder_structure_smart_folders`.
     SmartFolders,
-    /// `--folder-structure` (unfiled / library-wide).
+    /// `[download].folder_structure` (unfiled / library-wide).
     Unfiled,
 }
 
 impl TemplateKind {
     fn flag_name(self) -> &'static str {
         match self {
-            Self::Albums => "--folder-structure-albums",
-            Self::SmartFolders => "--folder-structure-smart-folders",
-            Self::Unfiled => "--folder-structure",
+            Self::Albums => "[download].folder_structure_albums",
+            Self::SmartFolders => "[download].folder_structure_smart_folders",
+            Self::Unfiled => "[download].folder_structure",
         }
     }
 
@@ -49,10 +49,10 @@ impl TemplateKind {
 
 /// Cross-template token & placement validator. Enforces:
 ///
-/// - `{album}` is only valid in `--folder-structure-albums`; same for
-///   `{smart-folder}` and `--folder-structure-smart-folders`. The opposite
+/// - `{album}` is only valid in `[download].folder_structure_albums`; same for
+///   `{smart-folder}` and `[download].folder_structure_smart_folders`. The opposite
 ///   token in either category template, or *any* category token in the
-///   unfiled template, bails with a pointer to the right flag.
+///   unfiled template, bails with a pointer to the right setting.
 /// - Single occurrence of every token ({album}, {smart-folder}, {library}).
 /// - `{library}`, when present, must be the leading path segment.
 /// - When `{library}` and the category token coexist, the category token
@@ -71,8 +71,11 @@ pub(super) fn validate_template_tokens(
 
     // Reject category tokens that don't belong here.
     for (token, owner) in [
-        (TOKEN_ALBUM, "--folder-structure-albums"),
-        (TOKEN_SMART_FOLDER, "--folder-structure-smart-folders"),
+        (TOKEN_ALBUM, "[download].folder_structure_albums"),
+        (
+            TOKEN_SMART_FOLDER,
+            "[download].folder_structure_smart_folders",
+        ),
     ] {
         if Some(token) == category {
             continue;
@@ -156,13 +159,15 @@ mod tests {
     fn validate_template_tokens_rejects_album_token_outside_album_template() {
         let err = validate_template_tokens("{album}/%Y", TemplateKind::Unfiled).unwrap_err();
         assert!(
-            err.to_string().contains("--folder-structure-albums"),
+            err.to_string()
+                .contains("[download].folder_structure_albums"),
             "{err}"
         );
 
         let err = validate_template_tokens("{album}", TemplateKind::SmartFolders).unwrap_err();
         assert!(
-            err.to_string().contains("--folder-structure-albums"),
+            err.to_string()
+                .contains("[download].folder_structure_albums"),
             "{err}"
         );
     }
@@ -170,12 +175,14 @@ mod tests {
     fn validate_template_tokens_rejects_smart_folder_token_outside_smart_folders_template() {
         let err = validate_template_tokens("{smart-folder}", TemplateKind::Unfiled).unwrap_err();
         assert!(
-            err.to_string().contains("--folder-structure-smart-folders"),
+            err.to_string()
+                .contains("[download].folder_structure_smart_folders"),
             "{err}"
         );
         let err = validate_template_tokens("{smart-folder}", TemplateKind::Albums).unwrap_err();
         assert!(
-            err.to_string().contains("--folder-structure-smart-folders"),
+            err.to_string()
+                .contains("[download].folder_structure_smart_folders"),
             "{err}"
         );
     }

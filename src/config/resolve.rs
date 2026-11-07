@@ -75,6 +75,20 @@ pub(crate) struct SyncConfigOverrides {
 
 // ── Application Config ──────────────────────────────────────────────
 
+/// Resolve concurrency after input precedence and bandwidth parsing.
+/// Explicit counts must be in 1..=64; capped downloads otherwise default to one.
+pub(crate) fn resolve_download_threads(
+    explicit: Option<u16>,
+    bandwidth_limit: Option<u64>,
+) -> anyhow::Result<u16> {
+    let threads_num = explicit.unwrap_or(if bandwidth_limit.is_some() { 1 } else { 10 });
+    anyhow::ensure!(
+        (1..=64).contains(&threads_num),
+        "[download].threads must be between 1 and 64, got {threads_num}."
+    );
+    Ok(threads_num)
+}
+
 /// Resolve library selection from the programmatic override, TOML, or the
 /// default (`primary`). The override and TOML `[filters].libraries` array share
 /// the selector grammar
@@ -580,26 +594,10 @@ impl Config {
             None
         };
 
-        let toml_threads = toml_dl.and_then(|d| d.threads);
-
-        // When a bandwidth limit is set without an explicit thread-count flag,
-        // default concurrency to 1: many connections starving for a capped
-        // total budget just fragments downloads and adds connection overhead.
-        let threads_explicitly_set = overrides.threads.is_some() || toml_threads.is_some();
-        let threads_default = if bandwidth_limit.is_some() && !threads_explicitly_set {
-            1
-        } else {
-            10
-        };
-
-        let threads_num = overrides
-            .threads
-            .or(toml_threads)
-            .unwrap_or(threads_default);
-        anyhow::ensure!(
-            (1..=64).contains(&threads_num),
-            "[download].threads must be between 1 and 64, got {threads_num}."
-        );
+        let threads_num = resolve_download_threads(
+            overrides.threads.or(toml_dl.and_then(|d| d.threads)),
+            bandwidth_limit,
+        )?;
         let temp_suffix = resolve(
             overrides.temp_suffix,
             toml_dl.and_then(|d| d.temp_suffix.clone()),
@@ -981,6 +979,49 @@ mod tests {
     };
     use chrono::NaiveDate;
     use std::path::PathBuf;
+
+    #[test]
+    fn download_threads_keep_override_precedence_and_validation_order() {
+        let mut root = tempfile::tempdir().unwrap();
+        if std::env::var_os("KEI_SNAPSHOT_CONCURRENCY_RETAIN_FIXTURES").is_some() {
+            root.disable_cleanup(true);
+        }
+        eprintln!(
+            "SNAPSHOT_CONCURRENCY_OVERRIDE root={}",
+            root.path().display()
+        );
+        let globals = GlobalArgs {
+            data_dir: Some(root.path().to_str().unwrap().into()),
+            ..default_globals()
+        };
+        let parsed: TomlConfig =
+            toml::from_str("[download]\nthreads=0\nbandwidth_limit='invalid'").unwrap();
+        let mut sync = default_sync();
+        sync.config_overrides.threads = Some(8);
+        let error = Config::build(&globals, &default_password(), sync, Some(&parsed))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("Invalid [download].bandwidth_limit in config:"));
+        let mut sync = default_sync();
+        sync.config_overrides.threads = Some(8);
+        sync.config_overrides.bandwidth_limit = Some(1024);
+        let config = Config::build(&globals, &default_password(), sync, Some(&parsed)).unwrap();
+        assert_eq!(config.download.threads_num, 8);
+        assert_eq!(config.download.bandwidth_limit, Some(1024));
+        let parsed: TomlConfig =
+            toml::from_str("[download]\nthreads=64\nbandwidth_limit='1M'").unwrap();
+        for count in [0, 65, u16::MAX] {
+            let mut sync = default_sync();
+            sync.config_overrides.threads = Some(count);
+            let error = Config::build(&globals, &default_password(), sync, Some(&parsed))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!("[download].threads must be between 1 and 64, got {count}.")
+            );
+        }
+    }
 
     #[test]
     fn edited_naming_is_opt_in_and_requires_edited_selection() {
@@ -1524,12 +1565,12 @@ mod tests {
         let mut sync = default_sync();
         sync.config_overrides.folder_structure_smart_folders = Some("{album}/%Y".to_string());
         let err = Config::build(&default_globals(), &default_password(), sync, None)
-            .expect_err("`{album}` in --folder-structure-smart-folders must bail");
+            .expect_err("`{album}` in [download].folder_structure_smart_folders must bail");
         let msg = err.to_string();
         assert!(
-            msg.contains("--folder-structure-smart-folders")
-                && msg.contains("--folder-structure-albums"),
-            "error should name both flags: {msg}"
+            msg.contains("[download].folder_structure_smart_folders")
+                && msg.contains("[download].folder_structure_albums"),
+            "error should name both settings: {msg}"
         );
     }
     #[test]
@@ -3410,7 +3451,7 @@ mod tests {
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
-                .contains("`{album}` cannot be used in --folder-structure"),
+                .contains("`{album}` cannot be used in [download].folder_structure"),
             "unexpected error: {err}"
         );
     }
@@ -3421,7 +3462,7 @@ mod tests {
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
-                .contains("`{album}` cannot be used in --folder-structure"),
+                .contains("`{album}` cannot be used in [download].folder_structure"),
             "unexpected error: {err}"
         );
     }
@@ -3432,7 +3473,7 @@ mod tests {
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
-                .contains("`{album}` cannot be used in --folder-structure"),
+                .contains("`{album}` cannot be used in [download].folder_structure"),
             "unexpected error: {err}"
         );
     }
@@ -3443,7 +3484,7 @@ mod tests {
         let err = Config::build(&default_globals(), &default_password(), sync, None).unwrap_err();
         assert!(
             err.to_string()
-                .contains("`{album}` cannot be used in --folder-structure"),
+                .contains("`{album}` cannot be used in [download].folder_structure"),
             "unexpected error: {err}"
         );
     }

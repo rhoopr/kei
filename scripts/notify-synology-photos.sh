@@ -1,8 +1,8 @@
 #!/bin/sh
 # kei notification script: ping a Synology NAS after a sync cycle.
 #
-# Wire into kei via [notifications] script in config.toml or
-# --notification-script. See the Synology wiki page for setup details.
+# Wire into kei via [notifications].script in config.toml.
+# See the Synology wiki page for setup details.
 #
 # Two things to know before relying on this:
 #

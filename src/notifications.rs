@@ -124,7 +124,7 @@ impl Notifier {
         // and warn once at construction time.
         if script.is_some() && cfg!(windows) {
             tracing::warn!(
-                "--notification-script is unix-only (kei invokes scripts via /bin/sh). \
+                "[notifications].script is unix-only (kei invokes scripts via /bin/sh). \
                  Ignoring the configured script on Windows."
             );
             return Self {

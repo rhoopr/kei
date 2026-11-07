@@ -835,8 +835,9 @@ fn should_append_removed_sync_surface_hint(argv: &[OsString], err: &clap::Error)
 
 fn with_removed_sync_surface_hint(message: String) -> String {
     format!(
-        "{message}\n\nnote: v0.20 removed durable sync CLI flags. Put persistent sync settings in config.toml instead.\n      See {}",
-        crate::upgrade_hints::V020_MIGRATION_URL
+        "{message}\n\nnote: v0.20 removed durable sync CLI flags. Put persistent sync settings in config.toml instead.\n      Current settings: {}\n      Legacy state adoption: {}",
+        crate::upgrade_hints::CONFIG_EXAMPLE_URL,
+        crate::upgrade_hints::ACCOUNT_STATE_MIGRATION_URL
     )
 }
 

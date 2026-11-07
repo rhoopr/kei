@@ -86,8 +86,7 @@ rendition dimensions and duration. This does not claim ownership of every
 historical copy.
 
 Untouched stale sidecars have no automatic output-revision sweep; that remains
-[#799](https://github.com/rhoopr/kei/issues/799). Path reconciliation copies an
-existing valid packet rather than regenerating it.
+[#799](https://github.com/rhoopr/kei/issues/799). Recovery of an already-started recorded path operation copies an existing valid packet rather than regenerating it. Changing a path template does not move recorded files or rewrite their metadata.
 
 ### GPS coordinates
 
