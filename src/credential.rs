@@ -717,7 +717,8 @@ mod tests {
         let delete_result = store.delete();
         if let Err(err) = delete_result {
             assert!(
-                err.to_string().contains("partially failed") && err.to_string().contains("keyring"),
+                err.to_string().contains("deleted from encrypted-file")
+                    && err.to_string().contains("could not delete it from keyring"),
                 "headless keyring failures should surface as partial deletion, got: {err}"
             );
             assert!(

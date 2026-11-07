@@ -201,19 +201,16 @@ impl Fixture {
         };
         let database = crate::get_db_path(&globals, None).await.unwrap();
         assert!(database.starts_with(&root));
-        let db = state::SqliteStateDb::open(&database).await.unwrap();
-        {
-            let conn = db.acquire_lock("synthetic ownership fixture").unwrap();
-            conn.execute_batch("CREATE TABLE account_owner(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL,account_key TEXT NOT NULL,provider_key TEXT NOT NULL)").unwrap();
-            conn.execute(
-                "INSERT INTO account_owner VALUES(1,1,?1,?2)",
-                (
-                    crate::account::namespace(USER, "com"),
-                    crate::account::provider_fingerprint("com", "synthetic-only"),
-                ),
-            )
+        let owner = crate::state::db::account::AccountOwner::authenticated(
+            USER,
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-only"}})).unwrap(),
+        )
+        .unwrap();
+        let db = state::SqliteStateDb::open_owned(&database, &owner)
+            .await
             .unwrap();
-        }
+        assert!(db.sync_epoch_id().await.unwrap().is_some());
         let server = Arc::new(MockServer::start().await);
         let body = include_bytes!("../../../../tests/data/media/pattern.jpg").to_vec();
         let mut records = Vec::new();

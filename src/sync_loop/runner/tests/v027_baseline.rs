@@ -4871,9 +4871,31 @@ async fn epoch_baseline_disappearance_is_not_consumption_evidence() {
             .await
             .unwrap(),
     );
-    db.delete_metadata_by_prefix(&evidence.baseline_key)
+    let key = &evidence.baseline_key;
+    let pending = &evidence.pending_key;
+    let staged = db.get_metadata(pending).await.unwrap();
+    {
+        let conn = db.acquire_lock("drop injected abort").unwrap();
+        conn.execute("DROP TRIGGER fail_epoch_promotion_clear", [])
+            .unwrap();
+        assert_eq!(
+            conn.execute("DELETE FROM metadata WHERE key=?1", [key])
+                .unwrap(),
+            1
+        );
+    }
+    drop(db);
+    let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
         .await
         .unwrap();
+    assert_eq!(db.get_metadata(key).await.unwrap(), None);
+    assert!(staged.is_some());
+    assert_eq!(db.get_metadata(pending).await.unwrap(), staged);
+    let ready = epoch_record(&db.acquire_lock("retained ready binding").unwrap(), ZONE).unwrap();
+    assert_eq!(ready.state, "ready");
+    let binding = ready.binding.unwrap();
+    assert_eq!(binding.baseline_key, evidence.baseline_key);
+    assert_eq!(binding.token_key, evidence.pending_key);
     let gate = db
         .sync_epoch_gate(ZONE.to_owned(), "scope".to_owned(), None)
         .await
