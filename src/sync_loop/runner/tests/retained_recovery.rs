@@ -13,7 +13,7 @@ use crate::sync_loop::test_support::{
     RUN_CYCLE_ASSET_DATE_MS, RunCycleDownloadConfigOptions, album_count_response,
     full_album_page_with_download, make_full_album_with_boxed_session, make_run_cycle_config,
     make_run_cycle_download_config_builder_with_options, make_run_cycle_library_state_with_album,
-    make_shared_session_for_run_cycle, media_without_photo_downloads,
+    make_shared_session_for_run_cycle, media_without_photo_downloads, run_cycle_account_owner,
 };
 use crate::{download, state};
 
@@ -698,10 +698,15 @@ async fn retained_checkpoint_expiry_holds_all_trigger_classes_and_quiet_reopen()
 
 #[tokio::test]
 async fn retained_checkpoint_historical_metadata_does_not_require_preparation() {
-    let fixture = Fixture::new(Trigger::Legacy).await;
+    let owner = run_cycle_account_owner();
+    let fixture = Fixture::new_with_owner(Trigger::Legacy, Some(&owner)).await;
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     for cycle in 0..3 {
-        let db = Arc::new(state::SqliteStateDb::open(&fixture.database).await.unwrap());
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&fixture.database, &owner)
+                .await
+                .unwrap(),
+        );
         let cancel = CancellationToken::new();
         let provider = fixture.session(true, Fault::None, cancel.clone());
         let library = make_run_cycle_library_state_with_album(
@@ -779,11 +784,16 @@ async fn retained_checkpoint_historical_metadata_does_not_require_preparation() 
 async fn retained_checkpoint_hold_valid_old_replay_recovers_then_two_quiet_reopens() {
     // This control repairs a previously rejected OLD cursor. A valid fresh
     // inventory alone never repairs permanent historical-token expiry.
-    let fixture = Fixture::new(Trigger::Eligibility).await;
+    let owner = run_cycle_account_owner();
+    let fixture = Fixture::new_with_owner(Trigger::Eligibility, Some(&owner)).await;
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     let config = make_run_cycle_config();
     for cycle in 0..4 {
-        let db = Arc::new(state::SqliteStateDb::open(&fixture.database).await.unwrap());
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&fixture.database, &owner)
+                .await
+                .unwrap(),
+        );
         if cycle == 1 {
             let raw = db.get_metadata(HOLD_KEY).await.unwrap().unwrap();
             let mut receipt: Value = serde_json::from_str(&raw).unwrap();
@@ -974,16 +984,23 @@ impl PhotosSession for UnaffectedSession {
 
 #[tokio::test]
 async fn retained_checkpoint_held_zone_does_not_block_clean_zone_or_clear_aggregate_hold() {
-    let fixture = Fixture::new(Trigger::Sparse).await;
+    let owner = run_cycle_account_owner();
+    let fixture = Fixture::new_with_owner(Trigger::Sparse, Some(&owner)).await;
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     {
-        let db = state::SqliteStateDb::open(&fixture.database).await.unwrap();
+        let db = state::SqliteStateDb::open_owned(&fixture.database, &owner)
+            .await
+            .unwrap();
         db.set_metadata("sync_token:v27:SharedSync-CLEAN", "clean-zone-before")
             .await
             .unwrap();
     }
     for cycle in 0..3 {
-        let db = Arc::new(state::SqliteStateDb::open(&fixture.database).await.unwrap());
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&fixture.database, &owner)
+                .await
+                .unwrap(),
+        );
         let cancel = CancellationToken::new();
         let primary_provider = fixture.session(true, Fault::None, cancel.clone());
         let primary = make_run_cycle_library_state_with_album(

@@ -12,6 +12,26 @@ use crate::icloud::photos::PhotosSession;
 use crate::sync_cycle::{CycleResult, LibraryState, run_cycle};
 use crate::{auth, cli, config, download, retry, state};
 
+pub(super) fn run_cycle_account_owner() -> state::db::account::AccountOwner {
+    state::db::account::AccountOwner::authenticated(
+        "test@example.com",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-run-cycle"}})).unwrap(),
+    )
+    .unwrap()
+}
+
+/// Opt into account-bound state without changing a fixture's provider dispatcher.
+pub(super) async fn open_run_cycle_db(
+    path: &std::path::Path,
+    owner: Option<&state::db::account::AccountOwner>,
+) -> Result<state::SqliteStateDb, state::error::StateError> {
+    match owner {
+        Some(owner) => state::SqliteStateDb::open_owned(path, owner).await,
+        None => state::SqliteStateDb::open(path).await,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct MutableCaptureSession {
     pub(super) zone: &'static str,

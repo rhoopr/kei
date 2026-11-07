@@ -1,10 +1,14 @@
 //! Preview and execution share provider proof without widening production visibility.
 use super::{MOTION, STILL as MEDIA};
 use crate::download;
+use crate::download::{DownloadConfig, DownloadControls, DownloadReporting, DownloadRunMode};
+use crate::icloud::photos::PhotoAsset;
 use crate::state::{DownloadStateStore, SqliteStateDb};
 use base64::Engine as _;
+use rusqlite::types::Value as SqlValue;
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
+use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
@@ -145,20 +149,56 @@ fn signature(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(value)
 }
 
+async fn run_raw_candidate(
+    db_path: &Path,
+    root: &Path,
+    records: &[Value],
+    mode: DownloadRunMode,
+) -> download::pipeline::outcome::StreamingResult {
+    let db = Arc::new(
+        SqliteStateDb::open_owned(db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let asset = PhotoAsset::new(records[0].clone(), records[1].clone())
+        .with_source_zone(Arc::from(ZONE))
+        .with_state_record_name(Arc::from("asset-current-existing"));
+    let mut configured = DownloadConfig::test_default();
+    configured.directory = root.into();
+    configured.folder_structure = "none".into();
+    configured.library = ZONE.into();
+    configured.state_db = Some(db.clone());
+    let configured = Arc::new(configured);
+    assert!(configured.primary_layout_source.is_none() && configured.selection_run.is_none());
+    let result = download::pipeline::stream_and_download_from_stream(
+        &reqwest::Client::new(),
+        futures_util::stream::iter(vec![Ok::<_, anyhow::Error>(asset)]),
+        &configured,
+        DownloadControls::new(mode, DownloadReporting::hidden()),
+        1,
+        CancellationToken::new(),
+        download::pipeline::StreamRuntime::new(None, None),
+    )
+    .await
+    .unwrap();
+    assert!(result.enumeration_complete, "{result:?}");
+    drop(configured);
+    assert_eq!(
+        Arc::strong_count(&db),
+        1,
+        "capture/config cannot survive reopen"
+    );
+    drop(db);
+    eprintln!("PROVIDER_B_CYCLE nonempty=1 {mode:?} {result:?}");
+    result
+}
+
 #[tokio::test]
 async fn v027_provider_signature_preview_execution_parity_for_raw_missing_receipts() {
-    use crate::download::{DownloadConfig, DownloadControls, DownloadReporting, DownloadRunMode};
-    use crate::icloud::photos::PhotoAsset;
     for failure in [None, Some("tail"), Some("unsupported"), Some("foreign")] {
         let server = crate::test_helpers::start_wiremock_or_skip("preview parity")
             .await
             .expect("acceptance server must bind");
-        Mock::given(method("GET"))
-            .and(path("/still"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
         Mock::given(method("GET"))
             .and(path("/motion"))
             .respond_with(
@@ -175,6 +215,14 @@ async fn v027_provider_signature_preview_execution_parity_for_raw_missing_receip
         let old_path = root.join("existing.JPG");
         let mut original = MEDIA.to_vec();
         original.resize(original.len().max(65_537), 42);
+        assert!(original.len() > 65_536);
+        let source_sha = format!("{:x}", sha2::Sha256::digest(&original));
+        Mock::given(method("GET"))
+            .and(path("/still"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(original.clone()))
+            .expect(u64::from(failure == Some("foreign")))
+            .mount(&server)
+            .await;
         let mut local = original.clone();
         if failure == Some("tail") {
             *local.last_mut().unwrap() ^= 1;
@@ -191,10 +239,11 @@ async fn v027_provider_signature_preview_execution_parity_for_raw_missing_receip
         let mtime = std::fs::metadata(&old_path).unwrap().modified().unwrap();
         let motion_path = root.join("existing.MOV");
         std::fs::write(&motion_path, MOTION).unwrap();
-        let foreign_path = root.join("foreign-shared.JPG");
-        if failure == Some("foreign") {
-            std::fs::write(&foreign_path, &original).unwrap();
-        }
+        let foreign_path = old_path.clone();
+        let historical_path = root.join("primary-history.JPG");
+        let historical_motion = root.join("primary-history.MOV");
+        std::fs::write(&historical_path, &local).unwrap();
+        std::fs::write(&historical_motion, MOTION).unwrap();
         let db_path = dir.path().join("state.db");
         let db = Arc::new(
             SqliteStateDb::open_owned(&db_path, &baseline_owner())
@@ -208,12 +257,17 @@ async fn v027_provider_signature_preview_execution_parity_for_raw_missing_receip
             .size(original.len() as u64)
             .build();
         db.upsert_seen(&record).await.unwrap();
-        let sha = download::file::compute_sha256(&old_path).await.unwrap();
+        let sha = download::file::compute_sha256(&historical_path)
+            .await
+            .unwrap();
+        if failure == Some("tail") {
+            assert_ne!(sha, source_sha);
+        }
         db.mark_verified_download(
             "PrimarySync",
             "old-primary-master",
             "original",
-            &old_path,
+            &historical_path,
             &sha,
             None,
             false,
@@ -228,12 +282,12 @@ async fn v027_provider_signature_preview_execution_parity_for_raw_missing_receip
             .size(MOTION.len() as u64)
             .build();
         db.upsert_seen(&motion_record).await.unwrap();
-        let motion_sha = download::file::compute_sha256(&motion_path).await.unwrap();
+        let motion_sha = format!("{:x}", sha2::Sha256::digest(MOTION));
         db.mark_verified_download(
             "PrimarySync",
             "old-primary-master",
             "live_original",
-            &motion_path,
+            &historical_motion,
             &motion_sha,
             None,
             false,
@@ -259,7 +313,7 @@ async fn v027_provider_signature_preview_execution_parity_for_raw_missing_receip
         if failure == Some("foreign") {
             let other = crate::test_helpers::TestAssetRecord::new("asset-other-shared")
                 .library(ZONE)
-                .filename("foreign-shared.JPG")
+                .filename("existing.JPG")
                 .checksum(&checksum)
                 .size(original.len() as u64)
                 .build();
@@ -284,7 +338,6 @@ async fn v027_provider_signature_preview_execution_parity_for_raw_missing_receip
             &db_path,
             "SELECT asset_record_name,master_record_name FROM asset_master_mappings WHERE library='PrimarySync' AND master_record_name='old-primary-master' ORDER BY asset_record_name",
         );
-        use rusqlite::types::Value as SqlValue;
         assert_eq!(
             mapping_names,
             vec![
@@ -319,6 +372,17 @@ async fn v027_provider_signature_preview_execution_parity_for_raw_missing_receip
         let foreign_count = usize::from(failure == Some("foreign"));
         assert_eq!(foreign_asset_rows.len(), foreign_count);
         assert_eq!(foreign_path_rows.len(), foreign_count);
+        assert_eq!(
+            query_snapshot(
+                &db_path,
+                "SELECT source_checksum FROM asset_metadata_paths WHERE library='PrimarySync' ORDER BY version_size"
+            ),
+            vec![vec![SqlValue::Null], vec![SqlValue::Null]]
+        );
+        assert!(query_snapshot(&db_path, "SELECT * FROM asset_metadata_paths WHERE library='SharedSync-v027-synthetic' AND id='asset-current-existing'").is_empty());
+        assert!(query_snapshot(&db_path, "SELECT * FROM download_receipts WHERE library='SharedSync-v027-synthetic' AND child='asset-current-existing'").is_empty());
+        assert_eq!(Arc::strong_count(&db), 1);
+        drop(db);
         let before_preview = database_snapshot(&db_path);
         let before_tree = tree_snapshot(&root);
         let mut records = pair(
@@ -334,38 +398,18 @@ async fn v027_provider_signature_preview_execution_parity_for_raw_missing_receip
             "fileChecksum":signature(MOTION)}});
         records[0]["fields"]["resOriginalVidComplFileType"] =
             json!({"value":"com.apple.quicktime-movie"});
-        let asset = PhotoAsset::new(records[0].clone(), records[1].clone())
-            .with_source_zone(Arc::from(ZONE))
-            .with_state_record_name(Arc::from("asset-current-existing"));
-        let mut configured = DownloadConfig::test_default();
-        configured.directory = root.clone().into();
-        configured.folder_structure = "none".into();
-        configured.library = ZONE.into();
-        configured.state_db = Some(db.clone());
-        configured.concurrent_downloads = 1;
-        let configured = Arc::new(configured);
-        let run = |mode| {
-            let asset = asset.clone();
-            let configured = configured.clone();
-            async move {
-                download::pipeline::stream_and_download_from_stream(
-                    &reqwest::Client::new(),
-                    futures_util::stream::iter(vec![Ok::<_, anyhow::Error>(asset)]),
-                    &configured,
-                    DownloadControls::new(mode, DownloadReporting::hidden()),
-                    1,
-                    CancellationToken::new(),
-                    download::pipeline::StreamRuntime::new(None, None),
-                )
-                .await
-                .unwrap()
-            }
-        };
-        let preview = run(DownloadRunMode::PrintFilenames).await;
-        assert!(
-            preview.printed_filenames.is_empty(),
+        let preview =
+            run_raw_candidate(&db_path, &root, &records, DownloadRunMode::PrintFilenames).await;
+        assert_eq!(
+            preview.printed_filenames.len(),
+            foreign_count,
             "{failure:?}: {preview:?}"
         );
+        let selected = preview.printed_filenames.first().cloned();
+        if let Some(path) = &selected {
+            assert_ne!(path, &foreign_path);
+            assert!(!path.exists());
+        }
         assert_eq!(
             database_snapshot(&db_path),
             before_preview,
@@ -376,9 +420,22 @@ async fn v027_provider_signature_preview_execution_parity_for_raw_missing_receip
             before_tree,
             "preview mutated media: {failure:?}"
         );
-        let execution = run(DownloadRunMode::Download).await;
-        assert_eq!(execution.downloaded, 0, "{failure:?}: {execution:?}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+        eprintln!(
+            "PROVIDER_B_INITIAL parity {failure:?} current_receipt_absent=true requested_foreign={foreign_count} compact=0 bytes={} tail_offset={} path={old_path:?} checksum={checksum} expected_sha256={source_sha}",
+            original.len(),
+            original.len() - 1
+        );
+        let execution =
+            run_raw_candidate(&db_path, &root, &records, DownloadRunMode::Download).await;
+        assert_eq!(
+            execution.downloaded, foreign_count,
+            "{failure:?}: {execution:?}"
+        );
+        assert!(execution.failed.is_empty());
         assert_eq!(execution.state_write_failures, 0, "{execution:?}");
+        let uncertain = usize::from(matches!(failure, Some("tail" | "unsupported")));
+        assert_eq!(execution.skip_summary.uncertain, uncertain);
         let connection = rusqlite::Connection::open(&db_path).unwrap();
         for (version, expected) in [
             (
@@ -398,19 +455,44 @@ async fn v027_provider_signature_preview_execution_parity_for_raw_missing_receip
                 assert_eq!(
                     std::path::Path::new(&path),
                     if version == "original" {
-                        old_path.as_path()
+                        selected.as_deref().unwrap_or(old_path.as_path())
                     } else {
                         motion_path.as_path()
                     }
                 );
+                let proof: (String, String, String) = connection.query_row("SELECT provider_checksum,source_checksum,local_checksum FROM asset_metadata_paths WHERE library=?1 AND id='asset-current-existing' AND version_size=?2 AND local_path=?3", rusqlite::params![ZONE,version,path], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+                assert_eq!(
+                    proof,
+                    if version == "original" {
+                        (checksum.clone(), source_sha.clone(), source_sha.clone())
+                    } else {
+                        (signature(MOTION), motion_sha.clone(), motion_sha.clone())
+                    }
+                );
+                eprintln!("PROVIDER_B_PROOF parity {failure:?} {version} path={path:?} {proof:?}");
             }
         }
-        assert!(
-            run(DownloadRunMode::PrintFilenames)
-                .await
-                .printed_filenames
-                .is_empty()
-        );
+        drop(connection);
+        let settled_sql = "SELECT version_size,status,local_path,local_checksum FROM assets WHERE library='SharedSync-v027-synthetic' AND id='asset-current-existing' ORDER BY version_size";
+        let settled = query_snapshot(&db_path, settled_sql);
+        for reopen in 0..2 {
+            let before = database_snapshot(&db_path);
+            let preview =
+                run_raw_candidate(&db_path, &root, &records, DownloadRunMode::PrintFilenames).await;
+            assert!(preview.printed_filenames.is_empty());
+            assert_eq!(database_snapshot(&db_path), before);
+            let repeated =
+                run_raw_candidate(&db_path, &root, &records, DownloadRunMode::Download).await;
+            assert_eq!(repeated.downloaded, 0, "{repeated:?}");
+            assert_eq!(repeated.state_write_failures, 0);
+            assert_eq!(repeated.skip_summary.uncertain, uncertain);
+            assert_eq!(query_snapshot(&db_path, settled_sql), settled);
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                foreign_count
+            );
+            eprintln!("PROVIDER_B_REOPEN parity {failure:?} reopen={reopen} gets={foreign_count}");
+        }
         assert_eq!(historical_rows(&db_path), old_rows);
         assert_eq!(
             query_snapshot(&db_path, mappings_sql),
@@ -432,10 +514,15 @@ async fn v027_provider_signature_preview_execution_parity_for_raw_missing_receip
             foreign_path_rows,
             "other Shared path receipt changed: {failure:?}"
         );
+        let mut after_tree = tree_snapshot(&root);
+        if let Some(path) = &selected {
+            assert_eq!(std::fs::read(path).unwrap(), original);
+            assert_eq!(after_tree.len(), before_tree.len() + 1);
+            after_tree.retain(|entry| entry.0 != path.file_name().unwrap());
+        }
         assert_eq!(
-            tree_snapshot(&root),
-            before_tree,
-            "execution changed media: {failure:?}"
+            after_tree, before_tree,
+            "existing media changed: {failure:?}"
         );
         assert_eq!(std::fs::read(&old_path).unwrap(), local);
         assert_eq!(
@@ -443,9 +530,16 @@ async fn v027_provider_signature_preview_execution_parity_for_raw_missing_receip
             mtime
         );
         eprintln!(
-            "PREVIEW_PARITY_REACHED {failure:?} preview=0 downloaded=0 mappings=2 debt=1 foreign_rows={} tree={}",
+            "PREVIEW_PARITY_REACHED {failure:?} mappings=2 debt=1 foreign_rows={} tree={}",
             foreign_count,
             before_tree.len()
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), foreign_count);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() == "/still")
         );
         server.verify().await;
     }
@@ -453,8 +547,6 @@ async fn v027_provider_signature_preview_execution_parity_for_raw_missing_receip
 
 #[tokio::test]
 async fn v027_provider_signature_preview_execution_missing_motion_control() {
-    use crate::download::{DownloadConfig, DownloadControls, DownloadReporting, DownloadRunMode};
-    use crate::icloud::photos::PhotoAsset;
     for failure in [None, Some("tail"), Some("unsupported")] {
         let server = crate::start_wiremock_or_skip!();
         Mock::given(method("GET"))
@@ -479,6 +571,8 @@ async fn v027_provider_signature_preview_execution_missing_motion_control() {
         let old_path = root.join("renamed-suffixed_2.JPG");
         let mut original = MEDIA.to_vec();
         original.resize(original.len().max(65_537), 42);
+        assert!(original.len() > 65_536);
+        let source_sha = format!("{:x}", sha2::Sha256::digest(&original));
         let mut local = original.clone();
         if failure == Some("tail") {
             *local.last_mut().unwrap() ^= 1;
@@ -493,6 +587,8 @@ async fn v027_provider_signature_preview_execution_missing_motion_control() {
         }
         std::fs::write(&old_path, &local).unwrap();
         let mtime = std::fs::metadata(&old_path).unwrap().modified().unwrap();
+        let historical_path = root.join("primary-history.JPG");
+        std::fs::write(&historical_path, &local).unwrap();
         let db_path = dir.path().join("state.db");
         let db = Arc::new(
             SqliteStateDb::open_owned(&db_path, &baseline_owner())
@@ -507,9 +603,32 @@ async fn v027_provider_signature_preview_execution_missing_motion_control() {
             .build();
         db.upsert_seen(&record).await.unwrap();
         let sha = download::file::compute_sha256(&old_path).await.unwrap();
+        let local_sha = format!("{:x}", sha2::Sha256::digest(&local));
+        assert_eq!(sha, local_sha);
+        if failure == Some("tail") {
+            assert_ne!(sha, source_sha);
+        }
         db.mark_verified_download(
             "PrimarySync",
             "old-primary-master",
+            "original",
+            &historical_path,
+            &sha,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let current = crate::test_helpers::TestAssetRecord::new("asset-current-existing")
+            .library(ZONE)
+            .filename("existing.JPG")
+            .checksum(&checksum)
+            .size(original.len() as u64)
+            .build();
+        db.upsert_seen(&current).await.unwrap();
+        db.mark_verified_download(
+            ZONE,
+            "asset-current-existing",
             "original",
             &old_path,
             &sha,
@@ -518,7 +637,29 @@ async fn v027_provider_signature_preview_execution_missing_motion_control() {
         )
         .await
         .unwrap();
+        let proof_sql = "SELECT provider_checksum,source_checksum,local_checksum,local_path FROM asset_metadata_paths WHERE library='SharedSync-v027-synthetic' AND id='asset-current-existing' AND version_size='original'";
+        assert_eq!(
+            query_snapshot(&db_path, proof_sql),
+            vec![vec![
+                checksum.clone().into(),
+                SqlValue::Null,
+                sha.clone().into(),
+                old_path.to_string_lossy().into_owned().into()
+            ]]
+        );
+        assert!(query_snapshot(&db_path, "SELECT * FROM download_receipts WHERE library='SharedSync-v027-synthetic' AND child='asset-current-existing'").is_empty());
+        assert_eq!(
+            query_snapshot(
+                &db_path,
+                "SELECT source_checksum FROM asset_metadata_paths WHERE library='PrimarySync'"
+            ),
+            vec![vec![SqlValue::Null]]
+        );
+        assert_eq!(Arc::strong_count(&db), 1);
+        drop(db);
         let old_rows = historical_rows(&db_path);
+        let before_preview = database_snapshot(&db_path);
+        let before_tree = tree_snapshot(&root);
         let mut records = pair(
             "current-existing",
             "existing.JPG",
@@ -532,57 +673,36 @@ async fn v027_provider_signature_preview_execution_missing_motion_control() {
             "fileChecksum":signature(MOTION)}});
         records[0]["fields"]["resOriginalVidComplFileType"] =
             json!({"value":"com.apple.quicktime-movie"});
-        let asset = PhotoAsset::new(records[0].clone(), records[1].clone())
-            .with_source_zone(Arc::from(ZONE))
-            .with_state_record_name(Arc::from("asset-current-existing"));
-        let mut configured = DownloadConfig::test_default();
-        configured.directory = root.clone().into();
-        configured.folder_structure = "none".into();
-        configured.library = ZONE.into();
-        configured.state_db = Some(db.clone());
-        configured.concurrent_downloads = 1;
-        let configured = Arc::new(configured);
-        let run = |mode| {
-            let asset = asset.clone();
-            let configured = configured.clone();
-            async move {
-                download::pipeline::stream_and_download_from_stream(
-                    &reqwest::Client::new(),
-                    futures_util::stream::iter(vec![Ok::<_, anyhow::Error>(asset)]),
-                    &configured,
-                    DownloadControls::new(mode, DownloadReporting::hidden()),
-                    1,
-                    CancellationToken::new(),
-                    download::pipeline::StreamRuntime::new(None, None),
-                )
-                .await
-                .unwrap()
-            }
-        };
-        let preview = run(DownloadRunMode::PrintFilenames).await;
+        let preview =
+            run_raw_candidate(&db_path, &root, &records, DownloadRunMode::PrintFilenames).await;
         assert_eq!(preview.printed_filenames.len(), 1, "{preview:?}");
         let destination = preview.printed_filenames[0].clone();
         assert!(!destination.exists());
-        let connection = rusqlite::Connection::open(&db_path).unwrap();
-        let current_count: i64 = connection
-            .query_row(
-                "SELECT count(*) FROM assets WHERE library=?1",
-                [ZONE],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            current_count, 0,
-            "preview cannot adopt or admit current work"
+        assert_eq!(database_snapshot(&db_path), before_preview);
+        assert_eq!(tree_snapshot(&root), before_tree);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        eprintln!(
+            "PROVIDER_B_INITIAL missing-motion {failure:?} source_unknown=true generic_local={sha} compact=0 path={old_path:?} checksum={checksum} expected_sha256={source_sha}"
         );
-        let execution = run(DownloadRunMode::Download).await;
+        let execution =
+            run_raw_candidate(&db_path, &root, &records, DownloadRunMode::Download).await;
         assert_eq!(
             execution.downloaded,
             preview.printed_filenames.len(),
             "{execution:?}"
         );
         assert_eq!(execution.state_write_failures, 0, "{execution:?}");
+        assert_eq!(
+            execution.skip_summary.by_state, 0,
+            "fresh verification, not state skip"
+        );
+        assert!(execution.failed.is_empty());
+        assert_eq!(
+            execution.skip_summary.uncertain,
+            usize::from(failure.is_some())
+        );
         assert_eq!(std::fs::read(&destination).unwrap(), MOTION);
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
         let status: String = connection.query_row(
             "SELECT status FROM assets WHERE library=?1 AND id='asset-current-existing' AND version_size='original'",
             [ZONE], |row| row.get(0)).unwrap();
@@ -594,12 +714,41 @@ async fn v027_provider_signature_preview_execution_missing_motion_control() {
                 "pending"
             }
         );
-        assert!(
-            run(DownloadRunMode::PrintFilenames)
-                .await
-                .printed_filenames
-                .is_empty()
+        drop(connection);
+        let proof = query_snapshot(&db_path, proof_sql);
+        eprintln!("PROVIDER_B_PROOF missing-motion {failure:?} path={old_path:?} {proof:?}");
+        // Fresh provider proof does not backfill the unknown source of an
+        // already-downloaded generic path receipt.
+        assert_eq!(
+            proof,
+            vec![vec![
+                checksum.clone().into(),
+                SqlValue::Null,
+                local_sha.clone().into(),
+                old_path.to_string_lossy().into_owned().into()
+            ]]
         );
+        let settled_sql = "SELECT version_size,status,local_path,local_checksum FROM assets WHERE library='SharedSync-v027-synthetic' AND id='asset-current-existing' ORDER BY version_size";
+        let settled = query_snapshot(&db_path, settled_sql);
+        for reopen in 0..2 {
+            let before = database_snapshot(&db_path);
+            let preview =
+                run_raw_candidate(&db_path, &root, &records, DownloadRunMode::PrintFilenames).await;
+            assert!(preview.printed_filenames.is_empty());
+            assert_eq!(database_snapshot(&db_path), before);
+            let repeated =
+                run_raw_candidate(&db_path, &root, &records, DownloadRunMode::Download).await;
+            assert_eq!(repeated.downloaded, 0, "{repeated:?}");
+            assert_eq!(repeated.state_write_failures, 0);
+            assert_eq!(
+                repeated.skip_summary.uncertain,
+                usize::from(failure.is_some())
+            );
+            assert_eq!(query_snapshot(&db_path, settled_sql), settled);
+            assert_eq!(query_snapshot(&db_path, proof_sql), proof);
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            eprintln!("PROVIDER_B_REOPEN missing-motion {failure:?} reopen={reopen} gets=1");
+        }
         assert_eq!(historical_rows(&db_path), old_rows);
         assert_eq!(std::fs::read(&old_path).unwrap(), local);
         assert_eq!(
@@ -607,6 +756,15 @@ async fn v027_provider_signature_preview_execution_missing_motion_control() {
             mtime
         );
         assert!(!root.join("existing.JPG").exists());
+        let after_tree = tree_snapshot(&root);
+        assert_eq!(after_tree.len(), before_tree.len() + 1);
+        for entry in &before_tree {
+            assert!(after_tree.contains(entry));
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/motion");
+        eprintln!("PROVIDER_B_MISSING_REACHED {failure:?} gets=1 still={status}");
         server.verify().await;
     }
 }

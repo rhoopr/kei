@@ -13,7 +13,7 @@ use crate::sync_cycle::{
 use crate::sync_loop::test_support::{
     album_count_response, make_named_full_album_with_boxed_session, make_run_cycle_config,
     make_run_cycle_download_config_builder, make_run_cycle_library_state_with_passes,
-    make_shared_session_for_run_cycle,
+    make_shared_session_for_run_cycle, open_run_cycle_db, run_cycle_account_owner,
 };
 use crate::{download, state};
 
@@ -113,12 +113,17 @@ fn smart_album(zone: &str, name: &str, session: Box<dyn PhotosSession>) -> Photo
 
 #[tokio::test]
 async fn mixed_valid_delta_hidden_refresh_promotes_inventory_bridge_then_quiet_reopen() {
-    Box::pin(mixed_lifecycle(true, None)).await;
+    Box::pin(mixed_lifecycle(
+        true,
+        None,
+        Some(&run_cycle_account_owner()),
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn mixed_valid_delta_hidden_refresh_clears_retained_identity_marker_without_extra_replay() {
-    Box::pin(mixed_lifecycle(false, None)).await;
+    Box::pin(mixed_lifecycle(false, None, None)).await;
 }
 
 #[tokio::test]
@@ -130,11 +135,20 @@ async fn mixed_delta_hidden_refresh_preserves_vetoes_then_recovers_after_reopen(
         MixedFault::CheckpointWrite,
         MixedFault::StalePlan,
     ] {
-        Box::pin(mixed_lifecycle(true, Some(fault))).await;
+        Box::pin(mixed_lifecycle(
+            true,
+            Some(fault),
+            Some(&run_cycle_account_owner()),
+        ))
+        .await;
     }
 }
 
-async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
+async fn mixed_lifecycle(
+    drift: bool,
+    fault: Option<MixedFault>,
+    owner: Option<&state::db::account::AccountOwner>,
+) {
     let root = tempfile::tempdir().unwrap();
     let database = root.path().join("state.db");
     let media = root.path().join("media");
@@ -152,7 +166,7 @@ async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
     };
     let marker = state::unresolved_identity_key("PrimarySync");
     {
-        let db = state::SqliteStateDb::open(&database).await.unwrap();
+        let db = open_run_cycle_db(&database, owner).await.unwrap();
         let checksum = download::file::compute_sha256(&kept).await.unwrap();
         db.upsert_seen(
             &crate::test_helpers::TestAssetRecord::new("asset-HISTORY")
@@ -194,7 +208,7 @@ async fn mixed_lifecycle(drift: bool, fault: Option<MixedFault>) {
     for cycle in 0..=recovery_cycle + 2 {
         let held = cycle < recovery_cycle;
         let active_fault = if held { fault } else { None };
-        let db = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+        let db = Arc::new(open_run_cycle_db(&database, owner).await.unwrap());
         if active_fault == Some(MixedFault::CheckpointWrite) {
             db.acquire_lock("mixed checkpoint fault")
                 .unwrap()
@@ -590,7 +604,14 @@ fn inventory_root() -> tempfile::TempDir {
 }
 
 async fn inventory_anchors(root: &std::path::Path) -> Vec<(String, String)> {
-    let db = state::SqliteStateDb::open(&root.join("state.db"))
+    inventory_anchors_with_owner(root, None).await
+}
+
+async fn inventory_anchors_with_owner(
+    root: &std::path::Path,
+    owner: Option<&state::db::account::AccountOwner>,
+) -> Vec<(String, String)> {
+    let db = open_run_cycle_db(&root.join("state.db"), owner)
         .await
         .unwrap();
     let conn = db.acquire_lock("inventory evidence after reopen").unwrap();
@@ -617,6 +638,14 @@ async fn inventory_cycle(
     root: &std::path::Path,
     step: &InventoryStep,
 ) -> crate::sync_cycle::CycleResult {
+    inventory_cycle_with_owner(root, step, None).await
+}
+
+async fn inventory_cycle_with_owner(
+    root: &std::path::Path,
+    step: &InventoryStep,
+    owner: Option<&state::db::account::AccountOwner>,
+) -> crate::sync_cycle::CycleResult {
     use crate::cycle_reporter::{CycleFacts, CycleReporter, CycleReporterConfig};
     use crate::sync_loop::test_support::{
         FailingMetadataSetDb, MetadataSetFailure,
@@ -624,7 +653,7 @@ async fn inventory_cycle(
     };
 
     let db = Arc::new(
-        state::SqliteStateDb::open(&root.join("state.db"))
+        open_run_cycle_db(&root.join("state.db"), owner)
             .await
             .unwrap(),
     );
@@ -801,7 +830,15 @@ async fn inventory_cycle(
 }
 
 async fn assert_inventory_ledger(root: &std::path::Path, result: &crate::sync_cycle::CycleResult) {
-    let db = state::SqliteStateDb::open(&root.join("state.db"))
+    assert_inventory_ledger_with_owner(root, result, None).await;
+}
+
+async fn assert_inventory_ledger_with_owner(
+    root: &std::path::Path,
+    result: &crate::sync_cycle::CycleResult,
+    owner: Option<&state::db::account::AccountOwner>,
+) {
+    let db = open_run_cycle_db(&root.join("state.db"), owner)
         .await
         .unwrap();
     let summary = db.get_summary().await.unwrap();
@@ -868,22 +905,23 @@ async fn comparable_inventory_full_then_mixed_refresh_does_not_replace_anchor() 
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn comparable_inventory_bridge_keeps_initial_count_and_additive_activity() {
+    let owner = run_cycle_account_owner();
     let root = inventory_root();
     let mut step = InventoryStep::mixed(90, 10);
     step.drift = true;
-    let result = inventory_cycle(root.path(), &step).await;
+    let result = inventory_cycle_with_owner(root.path(), &step, Some(&owner)).await;
     assert_eq!(result.failed_count, 0);
     assert!(result.db_sync_token_advance_safe);
     assert_eq!(result.stats.api_total_at_start, Some(110));
     assert!(result.stats.api_total_at_start_partial);
     assert_eq!(result.stats.assets_seen, 110);
     assert_eq!(result.stats.inventory_drop_warnings, 0);
-    let rows = inventory_anchors(root.path()).await;
+    let rows = inventory_anchors_with_owner(root.path(), Some(&owner)).await;
     assert_eq!(anchor_total(&rows), 100);
     let anchor: Value = serde_json::from_str(&rows[0].1).unwrap();
     assert_eq!(anchor["assets_seen"], 100);
-    assert_inventory_ledger(root.path(), &result).await;
-    let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+    assert_inventory_ledger_with_owner(root.path(), &result, Some(&owner)).await;
+    let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
         .await
         .unwrap();
     assert_eq!(
@@ -903,13 +941,19 @@ async fn comparable_inventory_bridge_keeps_initial_count_and_additive_activity()
     drop(db);
     step.drift = false;
     step.full = false;
-    let mixed = inventory_cycle(root.path(), &step).await;
+    let mixed = inventory_cycle_with_owner(root.path(), &step, Some(&owner)).await;
     assert_eq!(mixed.stats.inventory_drop_warnings, 0);
-    assert_eq!(inventory_anchors(root.path()).await, rows);
+    assert_eq!(
+        inventory_anchors_with_owner(root.path(), Some(&owner)).await,
+        rows
+    );
     step.full = true;
-    let full = inventory_cycle(root.path(), &step).await;
+    let full = inventory_cycle_with_owner(root.path(), &step, Some(&owner)).await;
     assert_eq!(full.stats.inventory_drop_warnings, 0);
-    assert_eq!(anchor_total(&inventory_anchors(root.path()).await), 100);
+    assert_eq!(
+        anchor_total(&inventory_anchors_with_owner(root.path(), Some(&owner)).await),
+        100
+    );
     assert!(!logs_contain(
         "Inventory dropped below previous comparable full run"
     ));
@@ -1005,12 +1049,13 @@ async fn comparable_inventory_four_percent_decline_does_not_warn() {
 #[tokio::test]
 async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
     use crate::config::CreatedDateFilter;
+    let owner = run_cycle_account_owner();
     for case in 0..14 {
         let root = inventory_root();
-        inventory_cycle(root.path(), &InventoryStep::mixed(90, 10)).await;
-        let before = inventory_anchors(root.path()).await;
+        inventory_cycle_with_owner(root.path(), &InventoryStep::mixed(90, 10), Some(&owner)).await;
+        let before = inventory_anchors_with_owner(root.path(), Some(&owner)).await;
         if case >= 11 {
-            let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+            let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
                 .await
                 .unwrap();
             db.set_metadata("sync_token:PrimarySync", "veto-prior-cursor")
@@ -1052,18 +1097,22 @@ async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
                 step.fault = Some(InventoryFault::BlankSuccessor);
             }
         }
-        let result = inventory_cycle(root.path(), &step).await;
+        let result = inventory_cycle_with_owner(root.path(), &step, Some(&owner)).await;
         assert_eq!(
             result.stats.inventory_drop_warnings, 0,
             "case {case}: {result:?}"
         );
-        assert_eq!(inventory_anchors(root.path()).await, before, "case {case}");
+        assert_eq!(
+            inventory_anchors_with_owner(root.path(), Some(&owner)).await,
+            before,
+            "case {case}"
+        );
         if case >= 11 {
             assert!(
                 !result.db_sync_token_advance_safe,
                 "case {case}: {result:?}"
             );
-            let db = state::SqliteStateDb::open(&root.path().join("state.db"))
+            let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1075,11 +1124,16 @@ async fn comparable_inventory_vetoes_preserve_complete_anchor_then_recover() {
                 "case {case}"
             );
         }
-        assert_inventory_ledger(root.path(), &result).await;
-        let recovered = inventory_cycle(root.path(), &InventoryStep::mixed(90, 10)).await;
+        assert_inventory_ledger_with_owner(root.path(), &result, Some(&owner)).await;
+        let recovered =
+            inventory_cycle_with_owner(root.path(), &InventoryStep::mixed(90, 10), Some(&owner))
+                .await;
         assert_eq!(recovered.failed_count, 0, "case {case}: {recovered:?}");
         assert_eq!(recovered.stats.inventory_drop_warnings, 0, "case {case}");
-        assert_eq!(anchor_total(&inventory_anchors(root.path()).await), 100);
+        assert_eq!(
+            anchor_total(&inventory_anchors_with_owner(root.path(), Some(&owner)).await),
+            100
+        );
     }
 }
 

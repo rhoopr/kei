@@ -4,7 +4,7 @@ use crate::state::SparseIdentityStore as _;
 use crate::sync_loop::test_support::{
     album_count_response, full_album_page_with_download, make_run_cycle_config,
     make_run_cycle_download_config_builder, make_run_cycle_library_state_with_album,
-    make_shared_session_for_run_cycle,
+    make_shared_session_for_run_cycle, run_cycle_account_owner, run_cycle_expected_date_dir,
 };
 use crate::{download, state};
 use serde_json::{Value, json};
@@ -183,6 +183,7 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
         Mock, ResponseTemplate,
         matchers::{method, path},
     };
+    let owner = run_cycle_account_owner();
     for (selected, owner_matches, pending, unrelated, baseline, late, same_source, tamper) in [
         (true, true, false, false, true, false, false, false),
         (true, true, false, false, true, true, false, false),
@@ -216,7 +217,7 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                     .set_body_bytes(bytes)
                     .insert_header("content-type", "image/jpeg"),
             )
-            .expect(if selected && owner_matches { 1 } else { 0 })
+            .expect(u64::from(selected && owner_matches) + u64::from(same_source))
             .mount(&server)
             .await;
         let records = full_album_page_with_download(
@@ -258,7 +259,11 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
         for cycle in 0..cycles {
             let source_calls_at_start = source_calls.lock().unwrap().len();
-            let inner = Arc::new(state::SqliteStateDb::open(&database).await.unwrap());
+            let inner = Arc::new(
+                state::SqliteStateDb::open_owned(&database, &owner)
+                    .await
+                    .unwrap(),
+            );
             let db: Arc<dyn download::DownloadStore> = inner.clone();
             let builder = make_run_cycle_download_config_builder(&media, db.clone());
             if cycle == 0 {
@@ -417,6 +422,81 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                     result.stats.identity_incomplete,
                     "an intervening paired source cannot reuse the old proof"
                 );
+                assert!(!result.db_sync_token_advance_safe);
+                let proof_db = inner.clone();
+                let proof_media = media.clone();
+                let proof_checksum = checksum.clone();
+                tokio::task::spawn_blocking(move || {
+                    use crate::fs_util::{file_identity, file_link_count};
+
+                    let conn = proof_db.acquire_lock("same_source_publications").unwrap();
+                    let source_sha = format!("{:x}", Sha256::digest(bytes));
+                    let mut identities = Vec::new();
+                    for (library, child, master, filename) in [
+                        (
+                            "PrimarySync",
+                            "source-child",
+                            "changed-master",
+                            "changed.JPG",
+                        ),
+                        (
+                            "SharedSync-test",
+                            "asset-target",
+                            "target",
+                            "cGhvdG8uanBn.JPG",
+                        ),
+                    ] {
+                        let path = proof_media
+                            .join(run_cycle_expected_date_dir())
+                            .join(filename);
+                        let file = std::fs::File::open(&path).unwrap();
+                        assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+                        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                        assert_eq!(file_link_count(&file).unwrap(), 1);
+                        identities.push(file_identity(&file).unwrap());
+                        let verified: i64 = conn
+                            .query_row(
+                                "SELECT COUNT(*) FROM assets a JOIN asset_master_mappings m
+                                 ON m.library=a.library AND m.asset_record_name=a.id
+                                 JOIN asset_metadata_paths p ON p.library=a.library AND p.id=a.id
+                                 AND p.version_size=a.version_size AND p.local_path=a.local_path
+                                 WHERE a.library=?1 AND a.id=?2 AND m.master_record_name=?3
+                                 AND a.version_size='original' AND a.status='downloaded'
+                                 AND a.local_path=?4 AND a.checksum=?5 AND p.provider_checksum=?5
+                                 AND a.local_checksum=?6 AND a.download_checksum=?6
+                                 AND p.local_checksum=?6 AND p.download_checksum=?6
+                                 AND p.source_checksum=?6",
+                                rusqlite::params![
+                                    library,
+                                    child,
+                                    master,
+                                    path.to_str().unwrap(),
+                                    proof_checksum,
+                                    source_sha
+                                ],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(verified, 1, "{library}/{child}: original receipt");
+                    }
+                    assert_ne!(identities[0], identities[1], "distinct native files");
+                    let retained: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM unresolved_sparse_identities WHERE epoch=1
+                             AND library='PrimarySync' AND source_record_name='source-child'
+                             AND generation=2 AND original_evidence=?1 AND observed_evidence=?1
+                             AND lookup_evidence=?1 AND attempts=1 AND last_outcome='unresolved'
+                             AND next_retry_at > last_attempt_at AND observation_origin IS NULL
+                             AND EXISTS(SELECT 1 FROM metadata
+                             WHERE key='sync_token:v27:SharedSync-test' AND value='target-after')",
+                            [r#"[1,"asset-target","SharedSync-test","owner-test"]"#],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(retained, 1, "original link and retry retained");
+                })
+                .await
+                .unwrap();
             }
             eprintln!(
                 "SPARSE_BRIDGE_REACHED selected={selected} owner_matches={owner_matches} pending={pending} unrelated={unrelated} baseline={baseline} late={late} same_source={same_source} cycle={cycle} identity_incomplete={} downloads={}",
@@ -476,7 +556,7 @@ async fn sparse_target_selected_materializes_and_reopened_cycle_is_quiet() {
                 assert!(result.stats.identity_incomplete);
                 assert_eq!(
                     result.stats.downloaded,
-                    usize::from(selected && owner_matches && cycle == 0),
+                    usize::from(selected && owner_matches && cycle == 0) + usize::from(same_source),
                     "eligible target work progresses while changed source remains held"
                 );
                 assert_eq!(
