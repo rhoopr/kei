@@ -1260,18 +1260,17 @@ async fn raw_policy_rendition_metadata_tracks_bytes_across_refresh_and_config_dr
                     assert_eq!(hashes, refreshed);
                 }
             }
-            // Unknown historical bytes retain shared metadata but no measurements.
+            // Retain measurements for the recorded generation, not its replacement.
             db.acquire_lock("allow raw metadata refresh")
                 .unwrap()
                 .execute_batch("DROP TRIGGER fail_provider_metadata_refresh")
                 .unwrap();
             master["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!("replacement");
             master["fields"]["resOriginalAltWidth"] = json!({"value": 9999});
+            let asset = PhotoAsset::new(master, fields);
             let result = stream_and_download_from_stream(
                 &Client::new(),
-                stream::iter(vec![Ok::<_, anyhow::Error>(PhotoAsset::new(
-                    master, fields,
-                ))]),
+                stream::iter(vec![Ok::<_, anyhow::Error>(asset.clone())]),
                 &Arc::new(config),
                 DownloadControls::download_hidden(),
                 1,
@@ -1285,6 +1284,8 @@ async fn raw_policy_rendition_metadata_tracks_bytes_across_refresh_and_config_dr
             for row in rows {
                 if row.version_size == VersionSizeKey::Original {
                     assert_eq!(row.metadata.width, Some(9999));
+                    assert_eq!(row.metadata.height, Some(4600));
+                    assert_eq!(row.metadata.duration_secs, None);
                 } else {
                     assert_eq!(
                         (
@@ -1292,9 +1293,18 @@ async fn raw_policy_rendition_metadata_tracks_bytes_across_refresh_and_config_dr
                             row.metadata.height,
                             row.metadata.duration_secs
                         ),
-                        (None, None, None)
+                        (Some(4000), Some(3000), None)
                     );
                 }
+                let provider_key = if row.version_size == VersionSizeKey::Original {
+                    VersionSizeKey::Alternative
+                } else {
+                    VersionSizeKey::Original
+                };
+                assert_eq!(
+                    row.metadata.metadata_hash,
+                    asset.metadata_arc(provider_key).metadata_hash
+                );
                 let before = initial
                     .iter()
                     .find(|before| before.version_size == row.version_size)
@@ -1383,6 +1393,12 @@ async fn filtered_replacement_renditions_capture_shared_metadata_without_guessin
         config.exclude_asset_ids = Arc::new(["asset-REPLACED".into()].into_iter().collect());
         master["fields"][format!("{prefix}Res")]["value"]["fileChecksum"] = json!("replacement");
         fields["fields"]["isFavorite"] = json!({"value": 1});
+        let changed = PhotoAsset::new(master.clone(), fields.clone());
+        let mut expected_metadata = (*changed.shared_metadata_arc()).clone();
+        expected_metadata.width = before.metadata.width;
+        expected_metadata.height = before.metadata.height;
+        expected_metadata.duration_secs = before.metadata.duration_secs;
+        expected_metadata.refresh_hash();
         let mut refreshed_hash = None;
         for cycle in 0..2 {
             if cycle == 1 {
@@ -1416,8 +1432,13 @@ async fn filtered_replacement_renditions_capture_shared_metadata_without_guessin
                     row.metadata.height,
                     row.metadata.duration_secs
                 ),
-                (None, None, None)
+                (
+                    before.metadata.width,
+                    before.metadata.height,
+                    before.metadata.duration_secs
+                )
             );
+            assert_eq!(row.metadata.metadata_hash, expected_metadata.metadata_hash);
             assert_eq!(
                 row.metadata.metadata_hash,
                 Some(row.metadata.compute_hash())

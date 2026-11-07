@@ -1045,9 +1045,9 @@ async fn filtered_original_replacement_refreshes_metadata_and_advances_checkpoin
                 Some(1920)
             );
             let mut expected_metadata = (*changed.metadata_arc(VersionSizeKey::Original)).clone();
-            expected_metadata.width = None;
-            expected_metadata.height = None;
-            expected_metadata.duration_secs = None;
+            expected_metadata.width = before.metadata.width;
+            expected_metadata.height = before.metadata.height;
+            expected_metadata.duration_secs = before.metadata.duration_secs;
             expected_metadata.refresh_hash();
             let mut token = "zone-token-prev".to_owned();
             for cycle in 0..2 {
@@ -1093,7 +1093,11 @@ async fn filtered_original_replacement_refreshes_metadata_and_advances_checkpoin
                         row.metadata.height,
                         row.metadata.duration_secs
                     ),
-                    (None, None, None)
+                    (
+                        before.metadata.width,
+                        before.metadata.height,
+                        before.metadata.duration_secs
+                    )
                 );
                 assert_eq!(
                     row.metadata.metadata_hash,
@@ -1216,15 +1220,18 @@ async fn raw_policy_incremental_metadata_refresh_captures_unknown_bytes_without_
                     .find(|initial| initial.version_size == row.version_size)
                     .unwrap();
                 let expected = if row.version_size == VersionSizeKey::Original {
-                    if cycle < 2 {
-                        (Some(6200), Some(4500))
-                    } else {
-                        (None, None)
-                    }
+                    (Some(6200), Some(4500))
                 } else {
                     (Some(4000), Some(3000))
                 };
                 assert_eq!((row.metadata.width, row.metadata.height), expected);
+                let current = PhotoAsset::new(records[0].clone(), records[1].clone());
+                let mut expected_metadata = (*current.shared_metadata_arc()).clone();
+                expected_metadata.width = expected.0;
+                expected_metadata.height = expected.1;
+                expected_metadata.duration_secs = None;
+                expected_metadata.refresh_hash();
+                assert_eq!(row.metadata.metadata_hash, expected_metadata.metadata_hash);
                 assert_eq!(row.metadata.is_favorite, cycle >= 2);
                 if cycle >= 2 && row.version_size == VersionSizeKey::Original {
                     assert_eq!(row.metadata.duration_secs, None);
