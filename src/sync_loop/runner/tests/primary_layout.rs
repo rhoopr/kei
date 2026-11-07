@@ -10691,128 +10691,1964 @@ async fn review501_legacy_reverted_edit_is_preserved_outside_visible_library() {
 }
 
 #[tokio::test]
-async fn review501_started_old_root_finishes_before_new_root_commits() {
-    let (capture, _guard) = crate::test_helpers::TracingCapture::install();
-    for (directory, template) in [("new-root", ""), ("media", "new-template")] {
-        for naming in [EditedNaming::Primary, EditedNaming::Suffix] {
-            let server = server().await;
-            let root = tempfile::tempdir().unwrap();
-            let old_media = root.path().join("media");
-            let (initial, _) = cycle(
-                root.path(),
-                records(&server, None),
-                false,
-                EditedNaming::Primary,
-            )
-            .await;
-            assert_eq!(initial.failed_count, 0);
-            let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-            conn.execute_batch("CREATE TRIGGER fail_layout_commit BEFORE INSERT ON primary_layout_bindings BEGIN SELECT RAISE(FAIL,'independent review commit failure'); END").unwrap();
-            drop(conn);
-            let (failed, _) = cycle(
-                root.path(),
-                records(&server, Some(("edit-one", EDIT_ONE))),
-                false,
-                EditedNaming::Primary,
-            )
-            .await;
-            assert!(!failed.db_sync_token_advance_safe);
-            assert_eq!(
-                db_count(
-                    root.path(),
-                    "SELECT COUNT(*) FROM primary_layout_operations WHERE phase='publishing'"
-                ),
-                1
-            );
-            assert_bytes(&old_media.join("IMG_0501.JPG"), EDIT_ONE);
-            rusqlite::Connection::open(root.path().join("state.db"))
-                .unwrap()
-                .execute_batch("DROP TRIGGER fail_layout_commit")
-                .unwrap();
-            let current = records(&server, Some(("edit-two", EDIT_TWO)));
-            let parent = root.path().join(directory).join(template);
-            let adjusted_path = parent.join(if naming == EditedNaming::Primary {
-                "IMG_0501.JPG"
-            } else {
-                "IMG_0501_edited.JPG"
-            });
-            let original_path = parent.join(if naming == EditedNaming::Primary {
-                "IMG_0501_original.JPG"
-            } else {
-                "IMG_0501.JPG"
-            });
-            for quiet in [false, true, true] {
-                let before_requests = server.received_requests().await.unwrap().len();
-                let (result, lookups) = cycle_options(
-                    root.path(),
-                    current.clone(),
-                    quiet,
-                    naming,
-                    CycleOptions {
-                        media_directory: directory,
-                        folder_structure: template,
-                        ..CycleOptions::default()
-                    },
-                )
-                .await;
-                assert_eq!(
-                    result.failed_count,
-                    0,
-                    "{directory}/{template}, {naming:?}: {:?}, events {:?}",
-                    result.stats,
-                    capture
-                        .events()
-                        .into_iter()
-                        .filter(
-                            |e| e.level == tracing::Level::WARN || e.level == tracing::Level::ERROR
-                        )
-                        .collect::<Vec<_>>()
-                );
-                assert!(result.db_sync_token_advance_safe);
-                assert_bytes(&adjusted_path, EDIT_TWO);
-                assert_bytes(&original_path, ORIGINAL);
-                assert_bytes(&old_media.join("IMG_0501.JPG"), EDIT_ONE);
-                assert_bytes(&old_media.join("IMG_0501_original.JPG"), ORIGINAL);
-                let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
-                let (checksum, local_path): (String, String) = conn.query_row(
-                    "SELECT checksum,local_path FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size='adjusted'",
-                    [], |row| Ok((row.get(0)?, row.get(1)?)),
-                ).unwrap();
-                assert_eq!(checksum, provider_hash(EDIT_TWO));
-                assert_eq!(std::path::PathBuf::from(local_path), adjusted_path);
-                assert_eq!(
-                    db_count(
-                        root.path(),
-                        "SELECT COUNT(*) FROM primary_layout_operations WHERE phase NOT IN ('committed','cancelled')"
-                    ),
-                    0
-                );
-                if quiet {
-                    assert_eq!(result.stats.downloaded, 0);
-                    assert_eq!(lookups, 0);
-                    assert_eq!(
-                        server.received_requests().await.unwrap().len(),
-                        before_requests
+async fn zero_write_recorded_recovery_preserves_debt_across_native_paths() {
+    use crate::state::db::primary_layout::{LayoutBinding, LayoutFile, LayoutMember};
+    use crate::state::db::provider_selection::SelectionPath;
+    use rusqlite::types::Value as SqlValue;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+
+    type Physical = (Vec<u8>, crate::fs_util::FileIdentity, std::time::SystemTime);
+    fn tree(root: &Path) -> BTreeMap<PathBuf, Physical> {
+        let mut out = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(parent) = pending.pop() {
+            for entry in std::fs::read_dir(parent).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    assert!(entry.file_type().unwrap().is_file());
+                    let file = std::fs::File::open(entry.path()).unwrap();
+                    out.insert(
+                        entry.path(),
+                        (
+                            std::fs::read(entry.path()).unwrap(),
+                            crate::fs_util::file_identity(&file).unwrap(),
+                            file.metadata().unwrap().modified().unwrap(),
+                        ),
                     );
                 }
             }
-            let requests = server.received_requests().await.unwrap();
-            for endpoint in ["/original", "/edit-one", "/edit-two"] {
+        }
+        out
+    }
+    fn rows(root: &Path, sql: &str) -> Vec<Vec<SqlValue>> {
+        let conn = rusqlite::Connection::open_with_flags(
+            root.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        stmt.query_map([], |r| {
+            (0..columns)
+                .map(|i| r.get(i))
+                .collect::<Result<Vec<SqlValue>, _>>()
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+    fn json_rows(root: &Path, sql: &str) -> Vec<Value> {
+        rows(root, sql)
+            .into_iter()
+            .map(|r| {
+                let [SqlValue::Text(text)] = r.as_slice() else {
+                    panic!("expected JSON row")
+                };
+                serde_json::from_str(text).unwrap()
+            })
+            .collect()
+    }
+    fn owner() -> state::db::account::AccountOwner {
+        state::db::account::AccountOwner::authenticated(
+            "synthetic@example.invalid",
+            "com",
+            &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+        )
+        .unwrap()
+    }
+    async fn context(
+        root: &Path,
+        current: Vec<Value>,
+        folder: &str,
+        quiet: bool,
+    ) -> (
+        Arc<state::SqliteStateDb>,
+        AlbumPass,
+        download::DownloadConfig,
+        Session,
+    ) {
+        let db = Arc::new(
+            state::SqliteStateDb::open_owned(&root.join("state.db"), &owner())
+                .await
+                .unwrap(),
+        );
+        let provider = Session {
+            reported_count: Some(1),
+            records: current,
+            quiet,
+            lookups: Arc::new(AtomicUsize::new(0)),
+            current: None,
+            lookup_change: None,
+            indexing: None,
+            baseline_successor: None,
+            cycle_token: Some("zero-write-debt-token"),
+            trace: None,
+        };
+        let mut album = crate::icloud::photos::PhotoAlbum::new(
+            crate::icloud::photos::PhotoAlbumConfig {
+                params: Arc::default(),
+                service_endpoint: Arc::from("https://example.com"),
+                name: Arc::from(""),
+                list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                query_filter: None,
+                page_size: 100,
+                zone_id: Arc::new(
+                    json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                ),
+                retry_config: crate::retry::RetryConfig::default(),
+                container_id: None,
+                cross_zone_sources: Vec::new(),
+            },
+            Box::new(provider.clone()),
+        );
+        album.set_shadow_capture(
+            crate::icloud::photos::inbox::ShadowCapture::new(db.clone(), owner(), "com"),
+            Arc::from("private"),
+        );
+        let pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album,
+            exclude_ids: Arc::default(),
+        };
+        let observed =
+            state::MembershipStore::get_asset_groupings(db.as_ref(), "PrimarySync", &["asset-501"])
+                .await
+                .unwrap();
+        let mut groups = download::AssetGroupings::default();
+        for (asset, name) in observed.albums {
+            groups.albums.entry(asset).or_default().push(name);
+        }
+        for (asset, name) in observed.people {
+            groups.people.entry(asset).or_default().push(name);
+        }
+        let store: Arc<dyn download::DownloadStore> = db.clone();
+        let media = root.join("media");
+        let build = make_run_cycle_download_config_builder(&media, store);
+        let mut config = build(
+            download::SyncMode::Full,
+            Arc::default(),
+            Arc::new(groups),
+            Arc::from("PrimarySync"),
+        )
+        .as_ref()
+        .clone();
+        config.folder_structure = folder.into();
+        config.folder_structure_albums = Arc::from(folder);
+        config.folder_structure_smart_folders = Arc::from(folder);
+        config.edited = true;
+        config.edited_naming = EditedNaming::Suffix;
+        assert_eq!(format!("{:?}", config.capture_timestamp_repair), "Preserve");
+        assert!(
+            !config.metadata.set_exif_datetime
+                && !config.metadata.set_exif_rating
+                && !config.metadata.set_exif_gps
+                && !config.metadata.set_exif_description
+        );
+        #[cfg(feature = "xmp")]
+        {
+            assert!(!config.metadata.xmp_sidecar && !config.metadata.embed_xmp);
+        }
+        (db, pass, config, provider)
+    }
+    async fn cycle(
+        root: &Path,
+        current: Vec<Value>,
+        folder: &str,
+        quiet: bool,
+    ) -> anyhow::Result<(crate::sync_cycle::CycleResult, usize)> {
+        let (db, pass, template, provider) = context(root, current, folder, quiet).await;
+        let lookups = provider.lookups.clone();
+        let mut library = make_run_cycle_library_state_with_passes(
+            "PrimarySync",
+            "sync_token:PrimarySync",
+            vec![pass],
+        );
+        library.library = crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+            Box::new(provider),
+            "PrimarySync",
+        );
+        let media = root.join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let store: Arc<dyn download::DownloadStore> = db.clone();
+        let base = make_run_cycle_download_config_builder(&media, store);
+        let build = |mode, exclude, groups, zone| {
+            let mut c = base(mode, exclude, groups, zone).as_ref().clone();
+            c.folder_structure = template.folder_structure.clone();
+            c.folder_structure_albums = template.folder_structure_albums.clone();
+            c.folder_structure_smart_folders = template.folder_structure_smart_folders.clone();
+            c.edited = true;
+            c.edited_naming = EditedNaming::Suffix;
+            Arc::new(c)
+        };
+        let globals = crate::config::GlobalArgs {
+            username: Some("synthetic@example.invalid".into()),
+            domain: None,
+            data_dir: Some(root.to_str().unwrap().into()),
+        };
+        let mut config = crate::config::Config::build(
+            &globals,
+            &crate::cli::PasswordArgs::default(),
+            crate::cli::SyncArgs::default(),
+            None,
+        )
+        .unwrap();
+        config.download.directory = media.clone();
+        config.download.folder_structure = folder.into();
+        config.download.folder_structure_albums = folder.into();
+        config.download.folder_structure_smart_folders = folder.into();
+        config.photos.edited = true;
+        config.photos.edited_naming = EditedNaming::Suffix;
+        let shared = Arc::new(tokio::sync::RwLock::new(
+            crate::auth::session::Session::new(
+                root,
+                "synthetic@example.invalid",
+                "https://example.com",
+                None,
+            )
+            .await
+            .unwrap(),
+        ));
+        let result = Box::pin(crate::sync_cycle::run_cycle(
+            &[&library],
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        ))
+        .await?;
+        Ok((result, lookups.load(Ordering::SeqCst)))
+    }
+    const ASSETS: &str = "SELECT json_object('version',version_size,'status',status,'path',local_path,'checksum',checksum,'hash',metadata_hash,'marker',metadata_write_failed_at,'local',local_checksum,'source',download_checksum,'capture_hash',capture_repair_metadata_hash,'capture_checksum',capture_repair_output_checksum,'capture_size',capture_repair_output_size) FROM assets WHERE library='PrimarySync' AND id='asset-501' ORDER BY version_size";
+    const PATHS: &str = "SELECT json_object('version',version_size,'path',local_path,'checksum',provider_checksum,'local',local_checksum,'download',download_checksum,'source',source_checksum,'marker',metadata_write_failed_at,'capture_hash',capture_repair_metadata_hash,'capture_checksum',capture_repair_output_checksum,'capture_size',capture_repair_output_size,'preserved',preserved_path_key) FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' ORDER BY version_size,local_path";
+    fn stable(root: &Path) -> Vec<Vec<Vec<SqlValue>>> {
+        ["SELECT * FROM primary_layout_operations ORDER BY operation","SELECT * FROM primary_layout_members ORDER BY operation,member","SELECT * FROM primary_layout_preserved ORDER BY operation,member","SELECT * FROM primary_layout_bindings ORDER BY family","SELECT * FROM primary_layout_claims ORDER BY path_key","SELECT * FROM primary_layout_superseded_paths ORDER BY library,child,version,provider_checksum,native_path","SELECT * FROM download_receipts ORDER BY id","SELECT * FROM asset_metadata_paths ORDER BY library,id,version_size,local_path","SELECT * FROM asset_albums ORDER BY library,asset_id,album_name","SELECT * FROM album_containers ORDER BY library,container_id","SELECT * FROM asset_album_memberships ORDER BY library,asset_record_name,container_id"].map(|sql|rows(root,sql)).to_vec()
+    }
+    async fn snapshot(root: &Path, db: &state::SqliteStateDb, phase: &str) -> Value {
+        let queue=match db.get_pending_metadata_rewrites_page_for_queue(state::db::MetadataRewriteQueue::Ordinary,Some(&["PrimarySync"]),0,100).await {
+            Ok(items)=>json!(items.into_iter().map(|q|json!({"asset":q.asset,"source":q.source_checksum,"capture":q.capture_repair_receipt.map(|r|format!("{r:?}")),"selection":q.selection_receipt.map(|r|format!("{r:?}"))})).collect::<Vec<_>>()),Err(e)=>json!({"error":format!("{e:?}")})};
+        let g = state::MembershipStore::get_asset_groupings(db, "PrimarySync", &["asset-501"])
+            .await
+            .unwrap();
+        let packet = json!({"phase":phase,"assets":json_rows(root,ASSETS),"paths":json_rows(root,PATHS),"queue":queue,"groupings":{"albums":g.albums,"people":g.people},"proofs":format!("{:?}",stable(root)),"media":tree(&root.join("media"))});
+        std::fs::write(
+            root.join(format!("phase-{phase}.json")),
+            serde_json::to_vec_pretty(&packet).unwrap(),
+        )
+        .unwrap();
+        packet
+    }
+    fn verify(file: &LayoutFile) {
+        let path = file.path.to_path();
+        let handle = std::fs::File::open(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len() as u64, file.fingerprint.size);
+        assert_eq!(
+            Sha256::digest(&bytes).as_slice(),
+            file.fingerprint.sha256.as_slice()
+        );
+        assert_eq!(
+            crate::fs_util::file_identity(&handle).unwrap(),
+            file.fingerprint.identity
+        );
+        assert!(file.sidecar.is_none());
+        assert_eq!(
+            file.source_checksum.as_deref(),
+            Some(format!("{:x}", Sha256::digest(&bytes)).as_str())
+        );
+    }
+    fn require_current_debt(packet: &Value, expected: &BTreeMap<String, Value>, parent: &Path) {
+        let queue = packet["queue"].as_array().unwrap();
+        for row in packet["assets"].as_array().unwrap() {
+            let version = row["version"].as_str().unwrap();
+            assert_eq!(row["marker"], expected[version]);
+            let filename = if version == "original" {
+                "IMG_0501.JPG"
+            } else {
+                assert_eq!(version, "adjusted");
+                "IMG_0501_edited.JPG"
+            };
+            let path = parent.join(filename);
+            assert_eq!(row["path"], path.to_str().unwrap());
+            let proof = packet["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["version"] == version && p["path"] == row["path"])
+                .unwrap();
+            assert_eq!(proof["marker"], expected[version]);
+            assert_eq!(proof["checksum"], row["checksum"]);
+            assert_eq!(proof["source"], row["source"]);
+            assert_eq!(proof["local"], row["local"]);
+            let selected: Vec<_> = queue
+                .iter()
+                .filter(|q| {
+                    q["asset"]["version_size"]
+                        .as_str()
+                        .unwrap()
+                        .eq_ignore_ascii_case(version)
+                        && q["asset"]["local_path"] == row["path"]
+                })
+                .collect();
+            if expected[version].is_null() {
+                assert!(selected.is_empty());
+            } else {
                 assert_eq!(
-                    requests
-                        .iter()
-                        .filter(|request| request.url.path() == endpoint)
-                        .count(),
+                    selected.len(),
                     1,
-                    "unexpected GET count: {endpoint}, {directory}/{template}, {naming:?}; events {:?}",
-                    capture
-                        .events()
-                        .into_iter()
-                        .filter(|event| event.level == tracing::Level::WARN
-                            || event.level == tracing::Level::ERROR)
-                        .collect::<Vec<_>>()
+                    "installed exact-resource metadata work must remain rediscoverable"
+                );
+                let q = selected[0];
+                assert_eq!(q["asset"]["checksum"], row["checksum"]);
+                assert_eq!(q["asset"]["metadata"]["metadata_hash"], row["hash"]);
+                assert_eq!(q["source"], proof["source"]);
+                assert!(q["capture"].is_null());
+            }
+        }
+        for key in ["assets", "paths"] {
+            for row in packet[key].as_array().unwrap() {
+                for field in ["capture_hash", "capture_checksum", "capture_size"] {
+                    assert!(row[field].is_null());
+                }
+            }
+        }
+    }
+    for group in [Some("GroupName"), None] {
+        for folder in ["", "new-parent"] {
+            let server = server().await;
+            let mut fixture = tempfile::tempdir().unwrap();
+            if std::env::var_os("KEI_ZERO_WRITE_DEBT_RETAIN_FIXTURES").is_some() {
+                fixture.disable_cleanup(true);
+            }
+            let root = fixture.path();
+            eprintln!(
+                "ZERO_WRITE_DEBT_FIXTURE root={} folder={folder:?} group={group:?}",
+                root.display()
+            );
+            let media = root.join("media");
+            let current = records(&server, Some(("edit-one", EDIT_ONE)));
+            let (initial, _) = cycle(root, current.clone(), "", false).await.unwrap();
+            assert_eq!(initial.failed_count, 0, "{initial:?}");
+            assert_eq!(initial.stats.downloaded, 2);
+            assert!(initial.db_sync_token_advance_safe);
+            let db = Arc::new(
+                state::SqliteStateDb::open_owned(&root.join("state.db"), &owner())
+                    .await
+                    .unwrap(),
+            );
+            let baseline = snapshot(root, &db, "initial").await;
+            assert_eq!(baseline["queue"], json!([]));
+            assert_eq!(baseline["groupings"], json!({"albums":[],"people":[]}));
+            for key in ["assets", "paths"] {
+                assert_eq!(baseline[key].as_array().unwrap().len(), 2);
+                for row in baseline[key].as_array().unwrap() {
+                    assert!(row["marker"].is_null());
+                }
+            }
+            let original_tree = tree(&media);
+            assert_eq!(original_tree.len(), 2);
+            let original_receipts = rows(root, "SELECT * FROM download_receipts ORDER BY id");
+            assert_eq!(original_receipts.len(), 2);
+            if let Some(group) = group {
+                let container = state::MembershipStore::upsert_album_container(
+                    db.as_ref(),
+                    "PrimarySync",
+                    "genuine-group-501",
+                    group,
+                    "Album",
+                )
+                .await;
+                std::fs::write(root.join("container-result.txt"), format!("{container:?}"))
+                    .unwrap();
+                container.unwrap();
+                let membership = state::MembershipStore::upsert_album_membership_delta(
+                    db.as_ref(),
+                    "PrimarySync",
+                    "genuine-group-501",
+                    "asset-501",
+                    Some("501"),
+                    "icloud",
+                )
+                .await;
+                std::fs::write(
+                    root.join("membership-result.txt"),
+                    format!("{membership:?}"),
+                )
+                .unwrap();
+                assert!(membership.unwrap());
+            }
+            let debt = snapshot(root, &db, "before-plan").await;
+            let expected: BTreeMap<_, _> = debt["assets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    (
+                        r["version"].as_str().unwrap().to_owned(),
+                        r["marker"].clone(),
+                    )
+                })
+                .collect();
+            for marker in expected.values() {
+                if group.is_some() {
+                    assert!(marker.is_number());
+                } else {
+                    assert!(marker.is_null());
+                }
+            }
+            assert_eq!(
+                debt["queue"].as_array().unwrap().len(),
+                if group.is_some() { 2 } else { 0 }
+            );
+            require_current_debt(&debt, &expected, &media);
+            assert_eq!(tree(&media), original_tree);
+            assert_eq!(
+                rows(root, "SELECT * FROM download_receipts ORDER BY id"),
+                original_receipts
+            );
+            drop(db);
+            let (op, scope, preparation_start, preparation_end) = {
+                let (db, pass, config, _) = context(root, current.clone(), folder, false).await;
+                let actual = config.with_pass(&pass);
+                assert_eq!(actual.album_name.as_deref(), Some(""));
+                let (_, scope, _) = pass
+                    .album
+                    .publication_scope("PrimarySync")
+                    .unwrap()
+                    .unwrap();
+                let preparation_start = chrono::Utc::now().timestamp();
+                let op = download::seed_prepared_edited_compat(&config, &pass).await;
+                let prepared = snapshot(root, &db, "after-prepare").await;
+                std::fs::write(root.join("prepared-operation.json"),serde_json::to_vec_pretty(&json!({"operation":op,"scope":scope,"group":group,"folder":folder,"metadata":format!("{:?}",actual.metadata),"capture_timestamp_repair":format!("{:?}",actual.capture_timestamp_repair)})).unwrap()).unwrap();
+                assert_eq!(op.metadata_flags, 0);
+                assert_eq!(op.phase, "prepared");
+                assert_eq!(op.policy, "suffix");
+                assert!(!op.refresh_metadata);
+                assert_eq!(op.pass, actual.primary_layout_pass.as_deref().unwrap());
+                assert_eq!(
+                    op.root,
+                    SelectionPath::from_path(&std::path::absolute(&media).unwrap())
+                );
+                assert_eq!(prepared["paths"], debt["paths"]);
+                assert_eq!(prepared["assets"], debt["assets"]);
+                assert_eq!(prepared["groupings"], debt["groupings"]);
+                let asset = pass
+                    .album
+                    .confirm_layout_asset("asset-501", "PrimarySync")
+                    .await
+                    .unwrap()
+                    .asset;
+                let mut payloads = Vec::new();
+                for member in &op.members {
+                    let record = member.record.as_ref().unwrap();
+                    let selected = download::filter::metadata_for_selected_version(
+                        &asset,
+                        &actual,
+                        record.version_size,
+                    );
+                    assert_eq!(
+                        serde_json::to_value(&record.metadata).unwrap(),
+                        serde_json::to_value(&selected).unwrap()
+                    );
+                    assert!(selected.keywords.is_none());
+                    let keywords = actual
+                        .asset_groupings
+                        .albums
+                        .get("asset-501")
+                        .cloned()
+                        .unwrap_or_default();
+                    assert_eq!(
+                        keywords,
+                        group.into_iter().map(str::to_owned).collect::<Vec<_>>()
+                    );
+                    let payload = json!({"timezone_offset":selected.timezone_offset,"rating":selected.rating,"latitude":selected.latitude,"longitude":selected.longitude,"altitude":selected.altitude,"title":selected.title,"description":selected.description.as_ref().or(selected.title.as_ref()),"keywords":keywords,"people":[],"is_hidden":selected.is_hidden,"is_archived":selected.is_archived,"media_subtype":selected.media_subtype,"burst_id":selected.burst_id});
+                    let decision = format!(
+                        "{:x}",
+                        Sha256::digest(
+                            serde_json::to_vec(&json!([
+                                1,
+                                record.version_size.as_str(),
+                                record.checksum,
+                                0,
+                                "Preserve",
+                                asset.created(),
+                                payload
+                            ]))
+                            .unwrap()
+                        )
+                    );
+                    let file = member.prepared.as_ref().unwrap();
+                    assert_eq!(file.metadata_decision.as_deref(), Some(decision.as_str()));
+                    verify(file);
+                    if let Some(old) = &member.old {
+                        verify(old);
+                    }
+                    assert!(member.installed.is_none());
+                    assert_eq!(
+                        member.destination.as_ref().unwrap().to_path().parent(),
+                        Some(media.join(folder).as_path())
+                    );
+                    payloads.push(json!({"version":record.version_size.as_str(),"hash":record.metadata.metadata_hash,"payload":payload,"decision":decision}));
+                }
+                std::fs::write(
+                    root.join("prepared-payloads.json"),
+                    serde_json::to_vec_pretty(&payloads).unwrap(),
+                )
+                .unwrap();
+                for (path, proof) in &original_tree {
+                    assert_eq!(tree(&media).get(path), Some(proof));
+                }
+                assert!(
+                    db.capture_layout_recovery(op.clone())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                let preparation_end = chrono::Utc::now().timestamp();
+                (op, scope, preparation_start, preparation_end)
+            };
+            let db = state::SqliteStateDb::open_owned(&root.join("state.db"), &owner())
+                .await
+                .unwrap();
+            let before = snapshot(root, &db, "before-recovery-reopened").await;
+            assert_eq!(before["paths"], debt["paths"]);
+            // The real preparation owner upserts each selected record. Validate
+            // only that observation-time transition; all other queue evidence
+            // stays byte-for-byte equal, including its exact native resource.
+            assert!(preparation_start <= preparation_end);
+            let canonical = json_rows(
+                root,
+                "SELECT json_object('library',library,'id',id,'version',version_size,'path',local_path,'checksum',checksum,'size',size_bytes,'hash',metadata_hash,'local',local_checksum,'download',download_checksum,'last_seen_at',last_seen_at) FROM assets WHERE library='PrimarySync' AND id='asset-501' AND status='downloaded' ORDER BY version_size",
+            );
+            let queue_key = |q: &Value| {
+                json!([
+                    q["asset"]["library"],
+                    q["asset"]["id"],
+                    q["asset"]["version_size"],
+                    q["asset"]["local_path"],
+                    q["asset"]["checksum"],
+                    q["asset"]["size_bytes"],
+                    q["asset"]["metadata"]["metadata_hash"],
+                    q["asset"]["local_checksum"],
+                    q["asset"]["download_checksum"],
+                    q["source"]
+                ])
+            };
+            let original_queue = debt["queue"].as_array().unwrap();
+            let actual_queue = before["queue"].as_array().unwrap();
+            assert_eq!(actual_queue.len(), original_queue.len());
+            let mut paired = BTreeSet::new();
+            let mut updates = Vec::new();
+            let mut observation_proof = Vec::new();
+            for actual in actual_queue {
+                let key = queue_key(actual);
+                let expected_entries: Vec<_> = original_queue
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, q)| queue_key(q) == key)
+                    .collect();
+                assert_eq!(
+                    expected_entries.len(),
+                    1,
+                    "queued resource must have one exact pre-preparation peer"
+                );
+                let (index, original) = expected_entries[0];
+                assert!(paired.insert(index), "duplicate queued resource");
+                let asset = &actual["asset"];
+                let matching: Vec<_> = canonical
+                    .iter()
+                    .filter(|row| {
+                        row["library"] == asset["library"]
+                            && row["id"] == asset["id"]
+                            && row["version"]
+                                .as_str()
+                                .unwrap()
+                                .eq_ignore_ascii_case(asset["version_size"].as_str().unwrap())
+                            && row["path"] == asset["local_path"]
+                            && row["checksum"] == asset["checksum"]
+                            && row["size"] == asset["size_bytes"]
+                            && row["hash"] == asset["metadata"]["metadata_hash"]
+                            && row["local"] == asset["local_checksum"]
+                            && row["download"] == asset["download_checksum"]
+                    })
+                    .collect();
+                assert_eq!(
+                    matching.len(),
+                    1,
+                    "observation must belong to the exact canonical resource/path"
+                );
+                let canonical_row = matching[0];
+                let seconds = canonical_row["last_seen_at"].as_i64().unwrap();
+                let observed: chrono::DateTime<chrono::Utc> =
+                    serde_json::from_value(asset["last_seen_at"].clone()).unwrap();
+                assert_eq!(observed.timestamp_subsec_nanos(), 0);
+                assert_eq!(
+                    observed.timestamp(),
+                    seconds,
+                    "queue observation must equal its actual canonical row"
+                );
+                assert!(
+                    (preparation_start..=preparation_end).contains(&seconds),
+                    "canonical upsert observation must fall inside actual preparation calls"
+                );
+                updates.push((index, asset["last_seen_at"].clone()));
+                observation_proof.push(json!({"resource":key,"canonical":canonical_row,"before":original["asset"]["last_seen_at"],"after":asset["last_seen_at"]}));
+            }
+            let mut expected_queue = debt["queue"].clone();
+            for (index, observed) in updates {
+                expected_queue[index]["asset"]["last_seen_at"] = observed;
+            }
+            assert_eq!(before["queue"], expected_queue);
+            std::fs::write(root.join("preparation-observation-proof.json"),serde_json::to_vec_pretty(&json!({"operation":op.operation,"start_utc_seconds":preparation_start,"end_utc_seconds":preparation_end,"observations":observation_proof,"all_other_queue_fields_exact":true})).unwrap()).unwrap();
+            assert!(
+                db.primary_layout_binding(op.family.clone())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            drop(db);
+            let recovery = cycle(root, current.clone(), folder, false).await;
+            std::fs::write(root.join("recovery-result.txt"), format!("{recovery:?}")).unwrap();
+            let db = state::SqliteStateDb::open_owned(&root.join("state.db"), &owner())
+                .await
+                .unwrap();
+            let after = snapshot(root, &db, "after-recovery").await;
+            let (recovered, _) = recovery.unwrap();
+            assert_eq!(recovered.failed_count, 0, "{recovered:?}");
+            assert_eq!(recovered.stats.downloaded, 0);
+            assert!(recovered.db_sync_token_advance_safe);
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+            require_current_debt(&after, &expected, &media.join(folder));
+            assert_eq!(after["groupings"], debt["groupings"]);
+            for old in debt["paths"].as_array().unwrap() {
+                let retained = after["paths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|p| p["path"] == old["path"] && p["version"] == old["version"])
+                    .unwrap();
+                for field in [
+                    "marker",
+                    "checksum",
+                    "source",
+                    "local",
+                    "download",
+                    "capture_hash",
+                    "capture_checksum",
+                    "capture_size",
+                ] {
+                    assert_eq!(
+                        retained[field], old[field],
+                        "old native-path evidence: {field}"
+                    );
+                }
+            }
+            let receipts = rows(root, "SELECT * FROM download_receipts ORDER BY id");
+            for receipt in &original_receipts {
+                assert!(
+                    receipts.contains(receipt),
+                    "historical receipt packet changed"
                 );
             }
+            assert_eq!(
+                rows(
+                    root,
+                    "SELECT operation,phase FROM primary_layout_operations ORDER BY operation"
+                ),
+                vec![vec![
+                    SqlValue::Text(op.operation.clone()),
+                    SqlValue::Text("committed".into())
+                ]]
+            );
+            let binding = db
+                .primary_layout_binding(op.family.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            let expected_binding = LayoutBinding {
+                family: op.family.clone(),
+                library: op.library.clone(),
+                source_library: op.source_library.clone(),
+                child: op.child.clone(),
+                generation: op.generation + 1,
+                decision: op.decision.clone(),
+                policy: op.policy.clone(),
+                qualifier: op.qualifier.clone(),
+                files: op
+                    .members
+                    .iter()
+                    .map(|m| {
+                        let mut f = m.prepared.as_ref().unwrap().clone();
+                        f.path = m.destination.clone().unwrap();
+                        f
+                    })
+                    .collect(),
+            };
+            assert_eq!(
+                serde_json::to_value(&binding).unwrap(),
+                serde_json::to_value(&expected_binding).unwrap()
+            );
+            let members: Vec<LayoutMember> = rows(
+                root,
+                "SELECT evidence FROM primary_layout_members ORDER BY operation,member",
+            )
+            .into_iter()
+            .map(|r| {
+                let [SqlValue::Blob(bytes)] = r.as_slice() else {
+                    panic!("missing member evidence")
+                };
+                serde_json::from_slice(bytes).unwrap()
+            })
+            .collect();
+            let mut accounted = BTreeSet::new();
+            let final_tree = tree(&media);
+            for (member, recorded) in members.iter().zip(&op.members) {
+                assert_eq!(
+                    serde_json::to_value(&member.prepared).unwrap(),
+                    serde_json::to_value(&recorded.prepared).unwrap()
+                );
+                assert_eq!(
+                    serde_json::to_value(&member.record).unwrap(),
+                    serde_json::to_value(&recorded.record).unwrap()
+                );
+                let installed = member.installed.as_ref().unwrap();
+                verify(installed);
+                assert_eq!(
+                    installed.fingerprint,
+                    recorded.prepared.as_ref().unwrap().fingerprint
+                );
+                if let Some(old) = &recorded.old {
+                    let preserved = member.preserved.as_ref().unwrap();
+                    verify(preserved);
+                    assert_eq!(preserved.fingerprint.sha256, old.fingerprint.sha256);
+                    assert_ne!(preserved.fingerprint.identity, old.fingerprint.identity);
+                } else {
+                    assert!(member.preserved.is_none());
+                }
+                for path in [
+                    &member.destination,
+                    &member.stage,
+                    &member.preserved_path,
+                    &member.retirement,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if path.to_path().exists() {
+                        accounted.insert(path.to_path());
+                    }
+                }
+            }
+            for (path, proof) in &original_tree {
+                let placements: Vec<_> = final_tree.iter().filter(|(_, p)| *p == proof).collect();
+                assert!(
+                    !placements.is_empty(),
+                    "old identity/mtime lost: {}",
+                    path.display()
+                );
+                for (path, _) in placements {
+                    accounted.insert(path.clone());
+                }
+            }
+            assert_eq!(accounted, final_tree.keys().cloned().collect());
+            std::fs::write(root.join("committed-proof.json"),serde_json::to_vec_pretty(&json!({"operation":op.operation,"scope":scope,"binding":binding,"members":members,"files":final_tree,"expected_markers":expected,"source_finalized":true})).unwrap()).unwrap();
+            drop(db);
+            let db = state::SqliteStateDb::open_owned(&root.join("state.db"), &owner())
+                .await
+                .unwrap();
+            let reopened = snapshot(root, &db, "after-commit-reopened").await;
+            require_current_debt(&reopened, &expected, &media.join(folder));
+            assert_eq!(reopened["paths"], after["paths"]);
+            assert_eq!(reopened["queue"], after["queue"]);
+            drop(db);
+            let frozen = stable(root);
+            for round in 0..2 {
+                let (quiet, lookups) = cycle(root, current.clone(), folder, true).await.unwrap();
+                assert_eq!(quiet.failed_count, 0, "{quiet:?}");
+                assert_eq!((quiet.stats.downloaded, lookups), (0, 0));
+                assert!(quiet.db_sync_token_advance_safe);
+                assert_eq!(server.received_requests().await.unwrap().len(), 2);
+                let db = state::SqliteStateDb::open_owned(&root.join("state.db"), &owner())
+                    .await
+                    .unwrap();
+                let packet = snapshot(root, &db, &format!("quiet-{round}")).await;
+                require_current_debt(&packet, &expected, &media.join(folder));
+                assert_eq!(packet["queue"], reopened["queue"]);
+                assert_eq!(stable(root), frozen);
+                assert_eq!(tree(&media), final_tree);
+                assert_eq!(
+                    db.get_metadata("sync_token:PrimarySync")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some("zero-write-debt-token")
+                );
+            }
+            eprintln!(
+                "ZERO_WRITE_DEBT_COMPLETE root={} folder={folder:?} group={group:?} operation={} generation={} quiet_reopens=2",
+                root.display(),
+                op.operation,
+                binding.generation
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn recorded_old_root_finishes_before_new_resource_download() {
+    use crate::state::db::primary_layout::{
+        LayoutBinding, LayoutFile, LayoutFingerprint, LayoutOperation,
+    };
+    use crate::state::db::provider_selection::SelectionPath;
+    use rusqlite::types::Value as SqlValue;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    type Physical = (Vec<u8>, crate::fs_util::FileIdentity, std::time::SystemTime);
+    fn file(path: &Path) -> Physical {
+        let handle = std::fs::File::open(path).unwrap();
+        (
+            std::fs::read(path).unwrap(),
+            crate::fs_util::file_identity(&handle).unwrap(),
+            handle.metadata().unwrap().modified().unwrap(),
+        )
+    }
+    fn tree(root: &Path) -> BTreeMap<PathBuf, Physical> {
+        let mut files = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(parent) = pending.pop() {
+            for entry in std::fs::read_dir(parent).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    assert!(entry.file_type().unwrap().is_file());
+                    files.insert(entry.path(), file(&entry.path()));
+                }
+            }
+        }
+        files
+    }
+    fn xmp(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".xmp");
+        name.into()
+    }
+    fn fingerprint(path: &Path, expected: &LayoutFingerprint) {
+        let actual = file(path);
+        assert_eq!(actual.0.len() as u64, expected.size);
+        assert_eq!(
+            Sha256::digest(&actual.0).as_slice(),
+            expected.sha256.as_slice()
+        );
+        assert_eq!(actual.1, expected.identity);
+    }
+    fn verified(saved: &LayoutFile) {
+        fingerprint(&saved.path.to_path(), &saved.fingerprint);
+        #[cfg(feature = "xmp")]
+        assert!(saved.sidecar.is_some(), "recorded fixture must retain XMP");
+        if let Some(proof) = &saved.sidecar {
+            fingerprint(&xmp(&saved.path.to_path()), proof);
+        }
+    }
+    fn rows(root: &Path, sql: &str) -> Vec<Vec<SqlValue>> {
+        let conn = rusqlite::Connection::open_with_flags(
+            root.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut statement = conn.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |r| {
+                (0..columns)
+                    .map(|i| r.get(i))
+                    .collect::<Result<Vec<SqlValue>, _>>()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+    fn frozen_proofs(root: &Path) -> Vec<Vec<Vec<SqlValue>>> {
+        [
+            "SELECT operation,family,library,source_library,prior_generation,decision,policy,header,conflict FROM primary_layout_operations ORDER BY operation",
+            "SELECT * FROM primary_layout_members ORDER BY operation,member",
+            "SELECT * FROM primary_layout_preserved ORDER BY operation,member",
+            "SELECT * FROM primary_layout_superseded_paths ORDER BY library,child,version,provider_checksum,native_path",
+            "SELECT * FROM download_receipts WHERE child='asset-501' ORDER BY id",
+            "SELECT library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum,metadata_write_failed_at,capture_repair_metadata_hash,capture_repair_output_checksum,capture_repair_output_size,source_checksum FROM asset_metadata_paths WHERE id='asset-501' ORDER BY library,version_size,local_path",
+        ].map(|sql| rows(root,sql)).to_vec()
+    }
+    fn settled_proofs(root: &Path) -> Vec<Vec<Vec<SqlValue>>> {
+        let mut proof = frozen_proofs(root);
+        for sql in [
+            "SELECT * FROM primary_layout_operations ORDER BY operation",
+            "SELECT * FROM primary_layout_bindings ORDER BY family",
+            "SELECT * FROM primary_layout_claims ORDER BY path_key",
+            "SELECT * FROM download_receipts ORDER BY id",
+            "SELECT * FROM asset_metadata_paths ORDER BY library,id,version_size,local_path",
+            "SELECT * FROM owned_temp_files ORDER BY path",
+        ] {
+            proof.push(rows(root, sql));
+        }
+        proof
+    }
+    fn membership_custody(root: &Path) -> Vec<(String, Vec<String>, Vec<Vec<SqlValue>>)> {
+        let conn = rusqlite::Connection::open_with_flags(
+            root.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut stmt = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND (name IN ('assets','asset_metadata_paths','asset_metadata_capture_revisions','download_receipts','metadata','owned_temp_files') OR name LIKE 'provider_%' OR name LIKE 'primary_layout_%') ORDER BY name").unwrap();
+        let tables = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let mut schema = conn
+                    .prepare(&format!("PRAGMA table_info({table})"))
+                    .unwrap();
+                let columns = schema
+                    .query_map([], |r| r.get::<_, String>(1))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|name| {
+                        !(matches!(table.as_str(), "assets" | "asset_metadata_paths")
+                            && name == "metadata_write_failed_at")
+                    })
+                    .collect::<Vec<_>>();
+                let order = (1..=columns.len())
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let values = rows(
+                    root,
+                    &format!("SELECT {} FROM {table} ORDER BY {order}", columns.join(",")),
+                );
+                (table, columns, values)
+            })
+            .collect()
+    }
+    async fn metadata_queue(db: &state::SqliteStateDb) -> Value {
+        json!(db.get_pending_metadata_rewrites_page_for_queue(state::db::MetadataRewriteQueue::Ordinary,Some(&["PrimarySync"]),0,usize::MAX).await.unwrap().into_iter().map(|q|json!({"asset":q.asset,"source":q.source_checksum,"capture":q.capture_repair_receipt.map(|r|format!("{r:?}")),"selection":q.selection_receipt.map(|r|format!("{r:?}"))})).collect::<Vec<_>>())
+    }
+    fn queued_resources(queue: &Value) -> Vec<Value> {
+        queue
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|q| {
+                let a = &q["asset"];
+                json!([
+                    a["library"],
+                    a["id"],
+                    a["version_size"],
+                    a["local_path"],
+                    a["checksum"],
+                    a["size_bytes"],
+                    a["metadata"],
+                    a["local_checksum"],
+                    a["download_checksum"],
+                    q["source"],
+                    q["capture"],
+                    q["selection"]
+                ])
+            })
+            .collect()
+    }
+    fn prepared_metadata(
+        asset: &crate::icloud::photos::PhotoAsset,
+        config: &download::DownloadConfig,
+        op: &LayoutOperation,
+    ) -> Vec<Value> {
+        // Real trusted membership creates the debt; this fixture requests only
+        // sidecars, or no metadata writes in a build without XMP.
+        const SIDECAR_FLAG: u8 = 1 << 5;
+        let flags = if cfg!(feature = "xmp") {
+            SIDECAR_FLAG
+        } else {
+            0
+        };
+        assert_eq!(op.metadata_flags, flags);
+        assert!(
+            !config.metadata.set_exif_datetime
+                && !config.metadata.set_exif_rating
+                && !config.metadata.set_exif_gps
+                && !config.metadata.set_exif_description
+        );
+        #[cfg(feature = "xmp")]
+        assert!(!config.metadata.embed_xmp);
+        assert_eq!(format!("{:?}", config.capture_timestamp_repair), "Preserve");
+        assert_eq!(config.album_name.as_deref(), Some("TestAlbum"));
+        assert!(
+            config.asset_groupings.albums.is_empty() && config.asset_groupings.people.is_empty()
+        );
+        op.members.iter().map(|member| {
+            let record = member.record.as_ref().unwrap();
+            let prepared = member.prepared.as_ref().unwrap();
+            let selected = download::filter::metadata_for_selected_version(asset, config, record.version_size);
+            assert_eq!(serde_json::to_value(&record.metadata).unwrap(), serde_json::to_value(&selected).unwrap());
+            assert!(selected.metadata_hash.is_some());
+            assert!(selected.keywords.is_none());
+            let payload = json!({
+                "timezone_offset": selected.timezone_offset, "rating": selected.rating,
+                "latitude": selected.latitude, "longitude": selected.longitude, "altitude": selected.altitude,
+                "title": selected.title, "description": selected.description.as_ref().or(selected.title.as_ref()),
+                "keywords": ["TestAlbum"], "people": [], "is_hidden": selected.is_hidden,
+                "is_archived": selected.is_archived, "media_subtype": selected.media_subtype, "burst_id": selected.burst_id,
+            });
+            assert_eq!(payload, json!({
+                "timezone_offset": null, "rating": null, "latitude": null, "longitude": null, "altitude": null,
+                "title": null, "description": null, "keywords": ["TestAlbum"], "people": [],
+                "is_hidden": false, "is_archived": false, "media_subtype": null, "burst_id": null,
+            }), "new metadata obligations require reconciliation, not marker clearing");
+            let decision = format!("{:x}", Sha256::digest(serde_json::to_vec(&json!([
+                1, record.version_size.as_str(), record.checksum, flags, "Preserve", asset.created(), payload,
+            ])).unwrap()));
+            assert_eq!(prepared.metadata_decision.as_deref(), Some(decision.as_str()));
+            let bytes = match record.version_size {
+                state::VersionSizeKey::Original => ORIGINAL,
+                state::VersionSizeKey::Adjusted => EDIT_ONE,
+                other => panic!("unexpected recorded rendition {other:?}"),
+            };
+            assert_bytes(&prepared.path.to_path(), bytes);
+            verified(prepared);
+            #[cfg(feature = "xmp")]
+            {
+                let text = std::fs::read_to_string(xmp(&prepared.path.to_path())).unwrap();
+                let _: xmp_toolkit::XmpMeta = text.parse().unwrap();
+                let date = asset.created_local().format("%Y-%m-%dT%H:%M:%S").to_string();
+                for tag in ["xmp:CreateDate", "xmp:ModifyDate", "exif:DateTimeOriginal", "photoshop:DateCreated"] {
+                    assert!(text.contains(&format!("<{tag}>{date}</{tag}>")), "missing prepared {tag}");
+                }
+                assert!(text.contains("<rdf:li>TestAlbum</rdf:li>"));
+                assert!(text.contains("<kei:managedFields>"));
+            }
+            #[cfg(not(feature = "xmp"))]
+            {
+                assert!(prepared.sidecar.is_none());
+                assert!(!xmp(&prepared.path.to_path()).exists());
+            }
+            json!({"library": op.library, "child": op.child, "version": record.version_size.as_str(),
+                "path": member.destination.as_ref().unwrap(), "checksum": record.checksum,
+                "metadata_hash": selected.metadata_hash, "flags": flags, "decision": decision,
+                "prepared": prepared, "obligations_validated": true})
+        }).collect()
+    }
+    fn committed_proofs(
+        root: &Path,
+        op: &LayoutOperation,
+        preparation: &[Value],
+        fault: &[Vec<Vec<SqlValue>>],
+    ) -> Vec<Vec<Vec<SqlValue>>> {
+        // Caller must first prove this exact operation committed and its complete
+        // binding has generation + 1. Only its prepared record tuples can settle.
+        let actual = frozen_proofs(root);
+        let mut expected = fault.to_vec();
+        assert_eq!(preparation.len(), op.members.len());
+        let conn = rusqlite::Connection::open_with_flags(
+            root.join("state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut transitions = Vec::new();
+        for (member, proof) in op.members.iter().zip(preparation) {
+            let record = member.record.as_ref().unwrap();
+            let installed = member.installed.as_ref().unwrap();
+            let prepared = member.prepared.as_ref().unwrap();
+            assert_eq!(record.library.as_ref(), op.library);
+            assert_eq!(record.id.as_ref(), op.child);
+            assert_eq!(proof["metadata_hash"], json!(record.metadata.metadata_hash));
+            assert_eq!(proof["flags"], op.metadata_flags);
+            assert_eq!(proof["decision"], json!(installed.metadata_decision));
+            assert_eq!(proof["prepared"], serde_json::to_value(prepared).unwrap());
+            assert_eq!(installed.metadata_decision, prepared.metadata_decision);
+            assert_eq!(installed.fingerprint, prepared.fingerprint);
+            assert_eq!(installed.sidecar, prepared.sidecar);
+            assert_eq!(installed.source_checksum, prepared.source_checksum);
+            assert_eq!(member.destination.as_ref(), Some(&installed.path));
+            assert_eq!(installed.version, record.version_size.as_str());
+            assert_eq!(installed.provider_checksum, record.checksum.as_ref());
+            assert_eq!(
+                proof["path"],
+                serde_json::to_value(&installed.path).unwrap()
+            );
+            let native = installed.path.to_path();
+            let path = native.to_str().unwrap();
+            let key = vec![
+                SqlValue::Text(op.library.clone()),
+                SqlValue::Text(op.child.clone()),
+                SqlValue::Text(record.version_size.as_str().into()),
+                SqlValue::Text(path.into()),
+                SqlValue::Text(record.checksum.to_string()),
+            ];
+            let matching: Vec<_> = expected[5]
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, row)| row[..5] == key)
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "exact prepared tuple must have one frozen path row: {proof}"
+            );
+            let (index, row) = matching.into_iter().next().unwrap();
+            assert!(matches!(row[7], SqlValue::Null | SqlValue::Integer(_)));
+            let before_marker = row[7].clone();
+            if op.metadata_flags != 0 {
+                row[7] = SqlValue::Null;
+            }
+            let settled: bool = conn.query_row("SELECT count(*)=1 FROM assets WHERE library=?1 AND id=?2 AND version_size=?3 AND local_path=?4 AND checksum=?5 AND metadata_hash=?6 AND status='downloaded' AND metadata_write_failed_at IS ?7",rusqlite::params![op.library,op.child,record.version_size.as_str(),path,record.checksum.as_ref(),record.metadata.metadata_hash,row[7]], |r| r.get(0)).unwrap();
+            assert!(
+                settled,
+                "exact installed tuple must retain zero-write debt or settle prepared metadata: {proof}"
+            );
+            transitions.push(json!({"tuple":proof,"before":format!("{before_marker:?}"),"after":format!("{:?}",row[7])}));
+            assert_eq!(
+                actual[5][index][7], row[7],
+                "zero-write markers stay exact; prepared nonzero markers clear: {proof}"
+            );
+        }
+        assert_eq!(
+            actual, expected,
+            "only exact prepared metadata markers may change"
+        );
+        std::fs::write(root.join("marker-transition.json"), serde_json::to_vec_pretty(&json!({"operation":op.operation,"generation":op.generation+1,"transitions":transitions,"all_other_proofs_exact":true})).unwrap()).unwrap();
+        actual
+    }
+    let ledger_sql = "SELECT json_object('generation',g.id,'account',g.account_key,'provider',g.provider_key,'scope',g.scope,'format',json_extract(CAST(g.specification AS TEXT),'$.format'),'pass',d.pass_key,'child',d.child,'master',d.master,'state',d.asset_id,'library',d.library,'version',d.version_size,'path',d.path,'checksum',d.checksum,'size',d.size_bytes,'admitted',d.admitted,'verified',d.verified_media,'sealed',g.sealed,'ready',g.checkpoint_ready) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.child IN ('asset-501','asset-502') ORDER BY g.id,d.child,d.version_size,d.path";
+    for (directory, template) in [("new-root", ""), ("media", "new-template")] {
+        for naming in [EditedNaming::Primary, EditedNaming::Suffix] {
+            let server = server().await;
+            let root = tempfile::tempdir().unwrap().keep();
+            eprintln!(
+                "RECORDED_OLD_ROOT_FIXTURE root={} directory={directory} template={template} naming={naming:?}",
+                root.display()
+            );
+            let old_media = root.join("media");
+            let current = records(&server, Some(("edit-one", EDIT_ONE)));
+            let options = |media_directory, folder_structure, token, count| CycleOptions {
+                private: true,
+                media_directory,
+                folder_structure,
+                cycle_token: Some(token),
+                reported_count: Some(count),
+                #[cfg(feature = "xmp")]
+                sidecar: true,
+                ..CycleOptions::default()
+            };
+            let (initial, _) = cycle_options(
+                &root,
+                current.clone(),
+                false,
+                EditedNaming::Suffix,
+                options("media", "", "recorded-old-start", 1),
+            )
+            .await;
+            assert_eq!(initial.failed_count, 0, "{initial:?}");
+            assert_eq!(initial.stats.downloaded, 2);
+            assert!(initial.db_sync_token_advance_safe);
+            assert_bytes(&old_media.join("IMG_0501.JPG"), ORIGINAL);
+            assert_bytes(&old_media.join("IMG_0501_edited.JPG"), EDIT_ONE);
+            let requests = server.received_requests().await.unwrap().len();
+            assert_eq!(requests, 2);
+            let owner = state::db::account::AccountOwner::authenticated(
+                "synthetic@example.invalid",
+                "com",
+                &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-provider"}})).unwrap(),
+            )
+            .unwrap();
+            let (op, scope, old_store, preparation, membership_queue) = {
+                let db = Arc::new(
+                    state::SqliteStateDb::open_owned(&root.join("state.db"), &owner)
+                        .await
+                        .unwrap(),
+                );
+                let initial_files = tree(&old_media);
+                let initial_custody = membership_custody(&root);
+                let marker_rows = || {
+                    [
+                        rows(
+                            &root,
+                            "SELECT library,id,version_size,local_path,checksum,metadata_hash,metadata_write_failed_at FROM assets WHERE library='PrimarySync' AND id='asset-501' ORDER BY version_size",
+                        ),
+                        rows(
+                            &root,
+                            "SELECT library,id,version_size,local_path,provider_checksum,source_checksum,metadata_write_failed_at FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' ORDER BY version_size,local_path",
+                        ),
+                    ]
+                };
+                let initial_markers = marker_rows();
+                let initial_groups = state::MembershipStore::get_asset_groupings(
+                    db.as_ref(),
+                    "PrimarySync",
+                    &["asset-501"],
+                )
+                .await
+                .unwrap();
+                let initial_containers = rows(
+                    &root,
+                    "SELECT * FROM album_containers ORDER BY library,container_id",
+                );
+                let initial_relations = rows(
+                    &root,
+                    "SELECT * FROM asset_album_memberships ORDER BY library,asset_record_name,container_id",
+                );
+                let readiness = rows(
+                    &root,
+                    "SELECT g.id,g.metadata_enabled,g.sealed,g.checkpoint_ready,w.library,w.child,w.version_size,w.admitted,w.verified_media,w.verified_metadata,w.frozen_metadata,w.grouping_hash FROM provider_active_destinations w JOIN provider_active_generations g ON g.id=w.generation ORDER BY g.id,w.child,w.version_size,w.path",
+                );
+                std::fs::write(root.join("membership-before.json"),serde_json::to_vec_pretty(&json!({"files":initial_files,"custody":format!("{initial_custody:?}"),"markers":format!("{initial_markers:?}"),"containers":format!("{initial_containers:?}"),"relations":format!("{initial_relations:?}"),"albums":initial_groups.albums,"people":initial_groups.people,"guard_readiness":format!("{readiness:?}")})).unwrap()).unwrap();
+                assert!(
+                    initial_groups.albums.is_empty() && initial_groups.people.is_empty(),
+                    "Unfiled label is not album membership"
+                );
+                assert!(initial_containers.is_empty() && initial_relations.is_empty());
+                for group in &initial_markers {
+                    assert_eq!(group.len(), 2);
+                    assert!(group.iter().all(|row| row[6] == SqlValue::Null));
+                }
+                assert_eq!(readiness.len(), 2);
+                for row in &readiness {
+                    assert_eq!(row[7], SqlValue::Integer(1));
+                    assert_eq!(row[8], SqlValue::Integer(1));
+                    if row[1] == SqlValue::Integer(1) {
+                        assert_eq!(row[9], SqlValue::Integer(1));
+                    }
+                }
+                const CONTAINER: &str = "old-root-trusted-album-501";
+                let container = state::MembershipStore::upsert_album_container(
+                    db.as_ref(),
+                    "PrimarySync",
+                    CONTAINER,
+                    "TestAlbum",
+                    "Album",
+                )
+                .await;
+                std::fs::write(
+                    root.join("membership-container-result.txt"),
+                    format!("{container:?}"),
+                )
+                .unwrap();
+                container.unwrap();
+                let relation = state::MembershipStore::upsert_album_membership_delta(
+                    db.as_ref(),
+                    "PrimarySync",
+                    CONTAINER,
+                    "asset-501",
+                    Some("501"),
+                    "icloud",
+                )
+                .await;
+                let containers = rows(
+                    &root,
+                    "SELECT library,container_id,album_name,pass_kind,is_deleted FROM album_containers ORDER BY library,container_id",
+                );
+                let relations = rows(
+                    &root,
+                    "SELECT library,asset_record_name,master_record_name,container_id,generation,is_deleted,source FROM asset_album_memberships ORDER BY library,asset_record_name,container_id",
+                );
+                let observed =
+                    state::MembershipStore::get_live_selected_album_memberships_for_asset(
+                        db.as_ref(),
+                        "PrimarySync",
+                        "asset-501",
+                        &[CONTAINER],
+                    )
+                    .await
+                    .unwrap();
+                let groups = state::MembershipStore::get_asset_groupings(
+                    db.as_ref(),
+                    "PrimarySync",
+                    &["asset-501"],
+                )
+                .await
+                .unwrap();
+                let after_markers = marker_rows();
+                let after_custody = membership_custody(&root);
+                let after_files = tree(&old_media);
+                let membership_queue = metadata_queue(db.as_ref()).await;
+                std::fs::write(root.join("membership-update.json"),serde_json::to_vec_pretty(&json!({"producer":"synthetic trusted provider membership via MembershipStore","container_result":"Ok(())","relation_result":format!("{relation:?}"),"containers":format!("{containers:?}"),"relations":format!("{relations:?}"),"owner_relations":format!("{observed:?}"),"albums":groups.albums,"people":groups.people,"markers":format!("{after_markers:?}"),"custody":format!("{after_custody:?}"),"files":after_files,"queue":membership_queue})).unwrap()).unwrap();
+                assert!(
+                    relation.unwrap(),
+                    "trusted container must be known; no guard bypass"
+                );
+                assert_eq!(
+                    containers,
+                    vec![vec![
+                        SqlValue::Text("PrimarySync".into()),
+                        SqlValue::Text(CONTAINER.into()),
+                        SqlValue::Text("TestAlbum".into()),
+                        SqlValue::Text("Album".into()),
+                        SqlValue::Integer(0)
+                    ]]
+                );
+                assert_eq!(
+                    relations,
+                    vec![vec![
+                        SqlValue::Text("PrimarySync".into()),
+                        SqlValue::Text("asset-501".into()),
+                        SqlValue::Text("501".into()),
+                        SqlValue::Text(CONTAINER.into()),
+                        SqlValue::Integer(0),
+                        SqlValue::Integer(0),
+                        SqlValue::Text("icloud".into())
+                    ]]
+                );
+                assert_eq!(observed.len(), 1);
+                assert_eq!(
+                    (
+                        &*observed[0].library,
+                        &*observed[0].asset_record_name,
+                        observed[0].master_record_name.as_deref(),
+                        &*observed[0].container_id,
+                        observed[0].generation,
+                        &*observed[0].source
+                    ),
+                    (
+                        "PrimarySync",
+                        "asset-501",
+                        Some("501"),
+                        CONTAINER,
+                        0,
+                        "icloud"
+                    )
+                );
+                assert_eq!(
+                    groups.albums,
+                    vec![("asset-501".into(), "TestAlbum".into())]
+                );
+                assert!(groups.people.is_empty());
+                for group in &after_markers {
+                    assert_eq!(group.len(), 2);
+                    assert!(
+                        group
+                            .iter()
+                            .all(|row| matches!(row[6], SqlValue::Integer(_)))
+                    );
+                }
+                assert_eq!(
+                    after_custody, initial_custody,
+                    "membership may only add grouping and retry markers"
+                );
+                assert_eq!(
+                    after_files, initial_files,
+                    "trusted state update must not rewrite media or raw XMP"
+                );
+                assert_eq!(membership_queue.as_array().unwrap().len(), 2);
+                let weak = Arc::downgrade(&db);
+                let provider = Session {
+                    reported_count: None,
+                    records: current.clone(),
+                    quiet: true,
+                    lookups: Arc::new(AtomicUsize::new(0)),
+                    current: None,
+                    lookup_change: None,
+                    indexing: None,
+                    baseline_successor: None,
+                    cycle_token: None,
+                    trace: None,
+                };
+                let mut album = crate::icloud::photos::PhotoAlbum::new(
+                    crate::icloud::photos::PhotoAlbumConfig {
+                        params: Arc::default(),
+                        service_endpoint: Arc::from("https://example.com"),
+                        name: Arc::from("TestAlbum"),
+                        list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+                        obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+                        query_filter: None,
+                        page_size: 100,
+                        zone_id: Arc::new(
+                            json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
+                        ),
+                        retry_config: crate::retry::RetryConfig::default(),
+                        container_id: None,
+                        cross_zone_sources: Vec::new(),
+                    },
+                    Box::new(provider),
+                );
+                album.set_shadow_capture(
+                    crate::icloud::photos::inbox::ShadowCapture::new(
+                        db.clone(),
+                        owner.clone(),
+                        "com",
+                    ),
+                    Arc::from("private"),
+                );
+                let pass = AlbumPass {
+                    kind: PassKind::Unfiled,
+                    album,
+                    exclude_ids: Arc::default(),
+                };
+                let (capture, scope, _) = pass
+                    .album
+                    .publication_scope("PrimarySync")
+                    .unwrap()
+                    .unwrap();
+                assert!(Arc::ptr_eq(&db, &capture.db));
+                drop(capture);
+                let store: Arc<dyn download::DownloadStore> = db.clone();
+                let build = make_run_cycle_download_config_builder(&old_media, store);
+                let mut config = build(
+                    download::SyncMode::Full,
+                    Arc::default(),
+                    Arc::default(),
+                    Arc::from("PrimarySync"),
+                )
+                .as_ref()
+                .clone();
+                config.folder_structure = String::new();
+                config.folder_structure_albums = Arc::from("");
+                config.folder_structure_smart_folders = Arc::from("");
+                config.edited = true;
+                config.edited_naming = EditedNaming::Suffix;
+                #[cfg(feature = "xmp")]
+                {
+                    config.metadata.xmp_sidecar = true;
+                }
+                let actual = config.with_pass(&pass);
+                let op = download::seed_prepared_edited_compat(&config, &pass).await;
+                let asset = pass
+                    .album
+                    .confirm_layout_asset("asset-501", "PrimarySync")
+                    .await
+                    .unwrap()
+                    .asset;
+                let preparation = prepared_metadata(&asset, &actual, &op);
+                assert_eq!(op.phase, "prepared");
+                assert_eq!(op.policy, "suffix");
+                assert_eq!(
+                    op.root,
+                    SelectionPath::from_path(&std::path::absolute(&old_media).unwrap())
+                );
+                assert_eq!(op.pass, actual.primary_layout_pass.as_deref().unwrap());
+                assert_eq!(
+                    rows(
+                        &root,
+                        "SELECT DISTINCT json_extract(CAST(specification AS TEXT),'$.metadata_flags') FROM provider_active_generations ORDER BY 1"
+                    ),
+                    vec![vec![SqlValue::Integer(i64::from(op.metadata_flags))]],
+                    "recorded flags must match the actual owned baseline"
+                );
+                assert!(!op.refresh_metadata);
+                assert_eq!(
+                    (
+                        &*op.library,
+                        &*op.source_library,
+                        &*op.child,
+                        &*op.asset_record_name
+                    ),
+                    ("PrimarySync", "PrimarySync", "asset-501", "asset-501")
+                );
+                assert_eq!(op.members.len(), 2);
+                for member in &op.members {
+                    verified(member.old.as_ref().unwrap());
+                    verified(member.prepared.as_ref().unwrap());
+                    assert!(
+                        member.installed.is_none()
+                            && member.preserved.is_none()
+                            && member.retirement.is_none()
+                    );
+                    let record = member.record.as_ref().unwrap();
+                    let catalogue:(String,i64)=db.acquire_lock("verify real recorded catalogue").unwrap().query_row("SELECT checksum,size_bytes FROM assets WHERE library='PrimarySync' AND id='asset-501' AND version_size=?1",[record.version_size.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                    assert_eq!(catalogue.0, record.checksum.as_ref());
+                    assert_eq!(catalogue.1, record.size_bytes as i64);
+                }
+                assert!(
+                    db.primary_layout_binding(op.family.clone())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    db.capture_layout_recovery(op.clone())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    db.primary_layout_operations("PrimarySync".into())
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                std::fs::write(root.join("prepared.json"),serde_json::to_vec_pretty(&json!({"operation":op,"scope":scope,"catalogue":format!("{:?}",rows(&root,"SELECT * FROM assets ORDER BY version_size")),"checkpoint":format!("{:?}",rows(&root,"SELECT value FROM metadata WHERE key='sync_token:PrimarySync'")),"capture_layout_recovery":"None; matching real catalogue"})).unwrap()).unwrap();
+                (op, scope, weak, preparation, membership_queue)
+            };
+            assert!(
+                old_store.upgrade().is_none(),
+                "setup handles must close before recovery"
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+            let checkpoint = rows(
+                &root,
+                "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'",
+            );
+            assert_eq!(
+                checkpoint,
+                vec![vec![SqlValue::Text("recorded-old-start".into())]]
+            );
+            rusqlite::Connection::open(root.join("state.db")).unwrap().execute_batch("CREATE TRIGGER fail_old_root_binding BEFORE INSERT ON primary_layout_bindings BEGIN SELECT RAISE(FAIL,'recorded old-root binding fault'); END").unwrap();
+            let outcome = try_cycle_options(
+                &root,
+                current.clone(),
+                false,
+                EditedNaming::Suffix,
+                options("media", "", "fault-attempt-token", 1),
+            )
+            .await;
+            std::fs::write(root.join("fault-attempt.json"),serde_json::to_vec_pretty(&json!({"outcome":format!("{outcome:?}"),"operations":format!("{:?}",rows(&root,"SELECT * FROM primary_layout_operations")),"GETs":server.received_requests().await.unwrap().len(),"checkpoint":format!("{:?}",rows(&root,"SELECT value FROM metadata WHERE key='sync_token:PrimarySync'"))})).unwrap()).unwrap();
+            let error = outcome.expect_err("normal dispatch must propagate the binding trigger");
+            assert!(
+                matches!(error.downcast_ref::<state::error::StateError>(),Some(state::error::StateError::Migration(rusqlite::Error::SqliteFailure(code,Some(message)))) if code.extended_code==rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER && message=="recorded old-root binding fault"),
+                "{error:#}"
+            );
+            let publishing = {
+                let db = state::SqliteStateDb::open_owned(&root.join("state.db"), &owner)
+                    .await
+                    .unwrap();
+                let pending = db
+                    .primary_layout_operations("PrimarySync".into())
+                    .await
+                    .unwrap();
+                assert_eq!(pending.len(), 1);
+                assert!(
+                    db.primary_layout_binding(op.family.clone())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    db.capture_layout_recovery(pending[0].clone())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                pending.into_iter().next().unwrap()
+            };
+            assert_eq!(publishing.operation, op.operation);
+            assert_eq!(publishing.phase, "publishing");
+            for key in [
+                "family",
+                "root",
+                "pass",
+                "generation",
+                "decision",
+                "policy",
+                "metadata_flags",
+                "library",
+                "source_library",
+                "child",
+                "asset_record_name",
+            ] {
+                assert_eq!(
+                    serde_json::to_value(&publishing).unwrap()[key],
+                    serde_json::to_value(&op).unwrap()[key],
+                    "{key}"
+                );
+            }
+            for member in &publishing.members {
+                verified(member.installed.as_ref().unwrap());
+                verified(member.preserved.as_ref().unwrap());
+            }
+            assert_eq!(
+                rows(
+                    &root,
+                    "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'"
+                ),
+                checkpoint
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), requests);
+            let fault_tree = tree(&old_media);
+            let fault_proofs = frozen_proofs(&root);
+            let stage_presence: Vec<_> = publishing
+                .members
+                .iter()
+                .map(|m| {
+                    let p = m.stage.as_ref().unwrap().to_path();
+                    let exists = p.exists();
+                    if exists {
+                        let actual = file(&p);
+                        let expected =
+                            if actual.1 == m.prepared.as_ref().unwrap().fingerprint.identity {
+                                &m.prepared.as_ref().unwrap().fingerprint
+                            } else {
+                                &m.old.as_ref().unwrap().fingerprint
+                            };
+                        fingerprint(&p, expected);
+                    }
+                    (p, exists)
+                })
+                .collect();
+            std::fs::write(
+                root.join("fault-files.json"),
+                serde_json::to_vec_pretty(&fault_tree).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(root.join("fault-state.json"),serde_json::to_vec_pretty(&json!({"operation":publishing,"scope":scope,"error":format!("{error:#}"),"proofs":format!("{fault_proofs:?}"),"stages":stage_presence,"checkpoint":format!("{checkpoint:?}"),"GETs":requests})).unwrap()).unwrap();
+            assert_eq!(
+                frozen_proofs(&root),
+                fault_proofs,
+                "fault-time evidence stays strict while trigger is installed"
+            );
+            rusqlite::Connection::open(root.join("state.db"))
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_old_root_binding")
+                .unwrap();
+            let expected_binding = LayoutBinding {
+                family: publishing.family.clone(),
+                library: publishing.library.clone(),
+                source_library: publishing.source_library.clone(),
+                child: publishing.child.clone(),
+                generation: publishing.generation + 1,
+                decision: publishing.decision.clone(),
+                policy: publishing.policy.clone(),
+                qualifier: publishing.qualifier.clone(),
+                files: publishing
+                    .members
+                    .iter()
+                    .map(|m| m.installed.as_ref().unwrap().clone())
+                    .collect(),
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = calls.clone();
+            let callback_root = root.clone();
+            let callback_op = publishing.clone();
+            let callback_binding = serde_json::to_value(&expected_binding).unwrap();
+            let callback_proofs = fault_proofs.clone();
+            let callback_preparation = preparation.clone();
+            let committed_snapshot = Arc::new(std::sync::Mutex::new(None));
+            let callback_snapshot = committed_snapshot.clone();
+            let callback_files = fault_tree.clone();
+            let callback_owner = owner
+                .authenticated_keys()
+                .map(|(a, p)| (a.to_owned(), p.to_owned()))
+                .unwrap();
+            Mock::given(method("GET")).and(path("/new-resource")).respond_with(move |_:&wiremock::Request| {
+                let conn=rusqlite::Connection::open_with_flags(callback_root.join("state.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+                let phase:String=conn.query_row("SELECT phase FROM primary_layout_operations WHERE operation=?1",[&callback_op.operation],|r|r.get(0)).unwrap();
+                let encoded:Vec<u8>=conn.query_row("SELECT binding FROM primary_layout_bindings WHERE family=?1 AND generation=?2 AND library=?3 AND source_library=?4 AND child=?5 AND decision=?6 AND policy=?7",rusqlite::params![callback_op.family,callback_op.generation+1,callback_op.library,callback_op.source_library,callback_op.child,callback_op.decision,callback_op.policy],|r|r.get(0)).unwrap();
+                let binding:LayoutBinding=serde_json::from_slice(&encoded).unwrap();
+                let owner:(String,String)=conn.query_row("SELECT account_key,provider_key FROM account_owner WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                std::fs::write(callback_root.join("new-GET-ordering.json"),serde_json::to_vec_pretty(&json!({"operation":callback_op.operation,"phase":phase,"binding":binding,"expected_generation":callback_op.generation+1,"owner":owner})).unwrap()).unwrap();
+                assert_eq!(owner,callback_owner);
+                assert_eq!(phase,"committed","old journal must commit before new502 GET");
+                assert_eq!(serde_json::to_value(&binding).unwrap(),callback_binding);
+                let committed = committed_proofs(&callback_root, &callback_op, &callback_preparation, &callback_proofs);
+                for member in &callback_op.members {verified(member.installed.as_ref().unwrap());verified(member.preserved.as_ref().unwrap());}
+                for (path,snapshot) in &callback_files {assert_eq!(&file(path),snapshot);}
+                *callback_snapshot.lock().unwrap() = Some((committed, rows(&callback_root,"SELECT * FROM asset_metadata_paths WHERE id='asset-501' ORDER BY library,version_size,local_path")));
+                std::fs::write(callback_root.join("new-GET-200.json"),serde_json::to_vec_pretty(&json!({"operation":callback_op.operation,"generation":binding.generation,"all_ordering_and_custody_assertions_passed":true,"response_status":200})).unwrap()).unwrap();
+                seen.fetch_add(1,Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_bytes(EDIT_TWO)
+            }).expect(1).mount(&server).await;
+            let mut page = full_album_page_with_download(
+                "PrimarySync",
+                "502",
+                "selected-token",
+                &format!("{}/new-resource", server.uri()),
+                EDIT_TWO.len() as u64,
+                &provider_hash(EDIT_TWO),
+            );
+            page["records"][0]["fields"]["filenameEnc"]["value"] = json!("IMG_0502.JPG");
+            let mut complete = current.clone();
+            complete.extend(page["records"].as_array().unwrap().iter().cloned());
+            let new_root = root.join(directory);
+            let new_path = new_root.join(template).join("IMG_0502.JPG");
+            let (recovered, _) = cycle_options(
+                &root,
+                complete.clone(),
+                false,
+                naming,
+                options(directory, template, "new-resource-token", 2),
+            )
+            .await;
+            std::fs::write(root.join("recovered-state.json"),serde_json::to_vec_pretty(&json!({"result":format!("{recovered:?}"),"GET_callbacks":calls.load(Ordering::SeqCst),"ledger":format!("{:?}",rows(&root,ledger_sql)),"proofs":format!("{:?}",settled_proofs(&root))})).unwrap()).unwrap();
+            assert_eq!(
+                recovered.failed_count, 0,
+                "{directory}/{template} {naming:?}: {recovered:?}"
+            );
+            assert!(recovered.db_sync_token_advance_safe);
+            assert_eq!(recovered.stats.downloaded, 1);
+            assert!(recovered.stats.assets_seen >= 2);
+            assert!(!recovered.stats.enumeration_incomplete);
+            assert_eq!(
+                recovered.stats.full_enumeration_reason,
+                Some(download::FullEnumerationReason::DownloadConfigHashDrift)
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "ordering responder must actually execute"
+            );
+            assert_bytes(&new_path, EDIT_TWO);
+            let (committed, committed_paths) = committed_snapshot.lock().unwrap().clone().unwrap();
+            assert_eq!(frozen_proofs(&root), committed);
+            assert_eq!(
+                rows(
+                    &root,
+                    "SELECT * FROM asset_metadata_paths WHERE id='asset-501' ORDER BY library,version_size,local_path"
+                ),
+                committed_paths
+            );
+            assert_eq!(
+                rows(&root, "SELECT phase FROM primary_layout_operations"),
+                vec![vec![SqlValue::Text("committed".into())]]
+            );
+            assert_eq!(
+                db_count(&root, "SELECT count(*) FROM primary_layout_operations"),
+                1
+            );
+            assert_eq!(
+                db_count(&root, "SELECT count(*) FROM primary_layout_bindings"),
+                1
+            );
+            assert_eq!(
+                db_count(
+                    &root,
+                    "SELECT count(*) FROM primary_layout_claims WHERE operation IS NOT NULL"
+                ),
+                0
+            );
+            let mut expected_tree = fault_tree.clone();
+            expected_tree.insert(new_path.clone(), file(&new_path));
+            #[cfg(feature = "xmp")]
+            {
+                expected_tree.insert(xmp(&new_path), file(&xmp(&new_path)));
+            }
+            let mut actual_tree = tree(&old_media);
+            if new_root != old_media {
+                actual_tree.extend(tree(&new_root));
+            }
+            assert_eq!(actual_tree, expected_tree, "only new502 may add media/XMP");
+            for (path, existed) in &stage_presence {
+                assert_eq!(path.exists(), *existed, "recorded stage custody changed");
+            }
+            let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+            let ledger: Vec<Value> = rows(&root, ledger_sql)
+                .into_iter()
+                .map(|r| {
+                    let [SqlValue::Text(text)] = r.as_slice() else {
+                        panic!("invalid ledger projection")
+                    };
+                    serde_json::from_str(text).unwrap()
+                })
+                .collect();
+            let mut new_generations = std::collections::BTreeSet::new();
+            for d in &ledger {
+                assert_eq!(d["account"], account_key);
+                assert_eq!(d["provider"], provider_key);
+                assert_eq!(d["scope"], scope);
+                assert_eq!(d["format"], 2);
+                assert_eq!(d["pass"], op.pass);
+                assert_eq!(d["library"], "PrimarySync");
+                for key in ["admitted", "verified", "sealed", "ready"] {
+                    assert_eq!(d[key], 1, "{key}: {d:?}");
+                }
+                let native: SelectionPath =
+                    serde_json::from_str(d["path"].as_str().unwrap()).unwrap();
+                if d["child"] == "asset-502" {
+                    assert_eq!(d["master"], "502");
+                    assert_eq!(d["state"], "asset-502");
+                    assert_eq!(d["version"], "original");
+                    assert_eq!(d["checksum"], provider_hash(EDIT_TWO));
+                    assert_eq!(d["size"], EDIT_TWO.len());
+                    assert_eq!(native.to_path(), new_path);
+                    new_generations.insert(d["generation"].as_str().unwrap().to_owned());
+                } else {
+                    assert_eq!(d["child"], "asset-501");
+                    assert_eq!(d["master"], "501");
+                    assert_eq!(d["state"], "asset-501");
+                    let (path, bytes) = if d["version"] == "original" {
+                        (old_media.join("IMG_0501.JPG"), ORIGINAL)
+                    } else {
+                        assert_eq!(d["version"], "adjusted");
+                        (old_media.join("IMG_0501_edited.JPG"), EDIT_ONE)
+                    };
+                    assert_eq!(native.to_path(), path);
+                    assert_eq!(d["checksum"], provider_hash(bytes));
+                    assert_eq!(d["size"], bytes.len());
+                }
+            }
+            assert!(!new_generations.is_empty());
+            assert!(
+                new_generations.iter().any(|g| ledger
+                    .iter()
+                    .filter(|d| d["generation"] == *g && d["child"] == "asset-501")
+                    .count()
+                    == 2),
+                "complete unchanged501 inventory must be admitted with new502"
+            );
+            let db = state::SqliteStateDb::open_owned(&root.join("state.db"), &owner)
+                .await
+                .unwrap();
+            let recovered_queue = metadata_queue(&db).await;
+            std::fs::write(
+                root.join("metadata-queue-recovered.json"),
+                serde_json::to_vec_pretty(&recovered_queue).unwrap(),
+            )
+            .unwrap();
+            if op.metadata_flags == 0 {
+                assert_eq!(
+                    queued_resources(&recovered_queue),
+                    queued_resources(&membership_queue)
+                );
+            } else {
+                assert_eq!(recovered_queue, json!([]));
+            }
+            assert_eq!(
+                serde_json::to_value(
+                    db.primary_layout_binding(op.family.clone())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(&expected_binding).unwrap()
+            );
+            assert!(
+                db.primary_layout_operations("PrimarySync".into())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(db.get_pending().await.unwrap().is_empty());
+            let new_binding = state::db::PublicationBinding {
+                account_key: account_key.into(),
+                provider_key: provider_key.into(),
+                scope: scope.clone(),
+                library: "PrimarySync".into(),
+                child: "asset-502".into(),
+                master: "502".into(),
+                state_id: "asset-502".into(),
+                origin_pass: op.pass.clone(),
+            };
+            let receipts = db
+                .bound_download_receipts(
+                    new_binding.clone(),
+                    "original".into(),
+                    provider_hash(EDIT_TWO),
+                    EDIT_TWO.len() as u64,
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].native_path.to_path(), new_path);
+            assert_eq!(
+                receipts[0].source_checksum,
+                format!("{:x}", Sha256::digest(EDIT_TWO))
+            );
+            assert_eq!(receipts[0].local_checksum, receipts[0].source_checksum);
+            drop(db);
+            for row in rows(
+                &root,
+                "SELECT local_path,preserved_path_key FROM asset_metadata_paths WHERE id='asset-501' ORDER BY version_size",
+            ) {
+                let [SqlValue::Text(path), marker] = row.as_slice() else {
+                    panic!("invalid old path marker")
+                };
+                assert!(
+                    matches!(marker, SqlValue::Null)
+                        || *marker
+                            == SqlValue::Text(
+                                state::db::primary_layout::path_key(Path::new(path)).unwrap()
+                            ),
+                    "only exact read-only path marker may be filled"
+                );
+            }
+            let settled = settled_proofs(&root);
+            let settled_ledger = rows(&root, ledger_sql);
+            let after_requests = server.received_requests().await.unwrap().len();
+            assert_eq!(after_requests, requests + 1);
+            for round in 0..2 {
+                let (result, lookups) = cycle_options(
+                    &root,
+                    complete.clone(),
+                    true,
+                    naming,
+                    options(directory, template, "new-resource-token", 2),
+                )
+                .await;
+                assert_eq!(result.failed_count, 0, "{result:?}");
+                assert!(result.db_sync_token_advance_safe);
+                assert_eq!((result.stats.downloaded, lookups), (0, 0));
+                assert_eq!(
+                    server.received_requests().await.unwrap().len(),
+                    after_requests
+                );
+                assert_eq!(settled_proofs(&root), settled);
+                assert_eq!(rows(&root, ledger_sql), settled_ledger);
+                let mut actual = tree(&old_media);
+                if new_root != old_media {
+                    actual.extend(tree(&new_root));
+                }
+                assert_eq!(actual, expected_tree);
+                assert_eq!(
+                    rows(
+                        &root,
+                        "SELECT value FROM metadata WHERE key='sync_token:PrimarySync'"
+                    ),
+                    vec![vec![SqlValue::Text("new-resource-token".into())]]
+                );
+                let db = state::SqliteStateDb::open_owned(&root.join("state.db"), &owner)
+                    .await
+                    .unwrap();
+                let quiet_queue = metadata_queue(&db).await;
+                std::fs::write(
+                    root.join(format!("metadata-queue-quiet-{round}.json")),
+                    serde_json::to_vec_pretty(&quiet_queue).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(quiet_queue, recovered_queue);
+                assert!(db.get_pending().await.unwrap().is_empty());
+                assert_eq!(
+                    db.bound_download_receipts(
+                        new_binding.clone(),
+                        "original".into(),
+                        provider_hash(EDIT_TWO),
+                        EDIT_TWO.len() as u64
+                    )
+                    .await
+                    .unwrap(),
+                    receipts
+                );
+                std::fs::write(root.join(format!("quiet-{round}.json")),serde_json::to_vec_pretty(&json!({"result":format!("{result:?}"),"proofs_unchanged":true,"physical_unchanged":true,"GETs":after_requests,"operation":op.operation,"generation":expected_binding.generation})).unwrap()).unwrap();
+            }
+            let received = server.received_requests().await.unwrap();
+            for endpoint in ["/original", "/edit-one", "/new-resource"] {
+                assert_eq!(
+                    received
+                        .iter()
+                        .filter(|r| r.method == "GET" && r.url.path() == endpoint)
+                        .count(),
+                    1
+                );
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            std::fs::write(
+                root.join("final-files.json"),
+                serde_json::to_vec_pretty(&expected_tree).unwrap(),
+            )
+            .unwrap();
+            eprintln!(
+                "RECORDED_OLD_ROOT_COMPLETE root={} operation={} prior_generation={} committed_generation={} ordering_GET=1 quiet_reopens=2",
+                root.display(),
+                op.operation,
+                op.generation,
+                expected_binding.generation
+            );
         }
     }
 }
@@ -14225,6 +16061,64 @@ async fn recorded_authorized_metadata_refresh_recovers_without_repeating_flag() 
         .collect()
     }
 
+    async fn snapshot(
+        root: &std::path::Path,
+        db: &state::SqliteStateDb,
+        operation: &crate::state::db::primary_layout::LayoutOperation,
+        phase: &str,
+    ) -> Value {
+        let durable = {
+            let conn = rusqlite::Connection::open_with_flags(
+                root.join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let mut tables = serde_json::Map::new();
+            for (table, order) in [
+                ("assets", "library,id,version_size"),
+                ("asset_metadata_paths", "library,id,version_size,local_path"),
+                ("asset_albums", "library,asset_id,album_name"),
+                ("primary_layout_operations", "operation"),
+                ("primary_layout_members", "operation,member"),
+                ("primary_layout_bindings", "family"),
+                ("primary_layout_preserved", "operation,member"),
+                ("primary_layout_claims", "path_key"),
+                ("download_receipts", "id"),
+            ] {
+                let mut stmt = conn
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))
+                    .unwrap();
+                let names: Vec<_> = stmt.column_names().into_iter().map(str::to_owned).collect();
+                let values = stmt.query_map([], |row| {
+                    let mut fields = serde_json::Map::new();
+                    for (index, name) in names.iter().enumerate() {
+                        let value = match row.get_ref(index)? {
+                            rusqlite::types::ValueRef::Null => Value::Null,
+                            rusqlite::types::ValueRef::Integer(n) => json!(n),
+                            rusqlite::types::ValueRef::Real(n) => json!(n),
+                            rusqlite::types::ValueRef::Text(s) => json!(std::str::from_utf8(s).unwrap()),
+                            rusqlite::types::ValueRef::Blob(b) => json!({"hex":data_encoding::HEXLOWER.encode(b),"json":serde_json::from_slice::<Value>(b).ok()}),
+                        };
+                        fields.insert(name.clone(), value);
+                    }
+                    Ok(Value::Object(fields))
+                }).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                tables.insert(table.to_owned(), json!(values));
+            }
+            tables
+        };
+        let queue = db.get_pending_metadata_rewrites_page_for_queue(
+            state::db::MetadataRewriteQueue::Ordinary,None,0,usize::MAX,
+        ).await.unwrap().into_iter().map(|q|json!({"asset":q.asset,"source":q.source_checksum,"capture":q.capture_repair_receipt.map(|r|format!("{r:?}")),"selection":q.selection_receipt.map(|r|format!("{r:?}"))})).collect::<Vec<_>>();
+        let packet = json!({"phase":phase,"operation":operation,"durable":durable,"queue":queue,"files":tree(&root.join("media")),"checkpoint":db.get_metadata("sync_token:PrimarySync").await.unwrap()});
+        std::fs::write(
+            root.join(format!("refresh-{phase}.json")),
+            serde_json::to_vec_pretty(&packet).unwrap(),
+        )
+        .unwrap();
+        packet
+    }
+
     #[cfg(feature = "xmp")]
     let modes = [false, true];
     #[cfg(not(feature = "xmp"))]
@@ -14373,6 +16267,8 @@ async fn recorded_authorized_metadata_refresh_recovers_without_repeating_flag() 
         let old_files = tree(&media);
         let requests = server.received_requests().await.unwrap().len();
 
+        snapshot(root.path(), &db, &family, "before-plan").await;
+
         // Authentic provider metadata is decoded by confirm_layout_asset in the
         // compatibility owner. Capture those exact records through upsert_seen,
         // just as seed_prepared_edited_compat does. No hash or proof is invented.
@@ -14418,6 +16314,7 @@ async fn recorded_authorized_metadata_refresh_recovers_without_repeating_flag() 
         let checkpoint = db.get_metadata("sync_token:PrimarySync").await.unwrap();
         assert!(checkpoint.is_some());
         let protected_rows = rows(root.path());
+        let planned = snapshot(root.path(), &db, &operation, "planned").await;
         assert_eq!(tree(&media), old_files);
         eprintln!(
             "RECORDED_REFRESH_PLANNED sidecar={sidecar} operation={} stages={} all_absent=true",
@@ -14480,6 +16377,9 @@ async fn recorded_authorized_metadata_refresh_recovers_without_repeating_flag() 
         eprintln!(
             "RECORDED_REFRESH_FAULT_PROVEN sidecar={sidecar} same_operation=true typed_trigger=true stages_absent=true custody_checkpoint_unchanged=true"
         );
+        let before_recovery = snapshot(root.path(), &db, &operation, "after-fault").await;
+        assert_eq!(before_recovery["durable"], planned["durable"]);
+        assert_eq!(before_recovery["queue"], planned["queue"]);
         drop(db);
         let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
         conn.execute_batch("DROP TRIGGER fail_recorded_refresh_planned")
@@ -14487,6 +16387,7 @@ async fn recorded_authorized_metadata_refresh_recovers_without_repeating_flag() 
         drop(conn);
 
         // Reopen the same owned state, without repeating current authorization.
+        let recovery_start = chrono::Utc::now().timestamp();
         let (refreshed, _) = cycle_options(
             root.path(),
             current.clone(),
@@ -14495,6 +16396,7 @@ async fn recorded_authorized_metadata_refresh_recovers_without_repeating_flag() 
             options(),
         )
         .await;
+        let recovery_end = chrono::Utc::now().timestamp();
         assert_eq!(refreshed.failed_count, 0, "{:?}", refreshed.stats);
         assert!(refreshed.can_advance_database_checkpoint());
         assert_eq!(refreshed.stats.downloaded, 0);
@@ -14502,6 +16404,7 @@ async fn recorded_authorized_metadata_refresh_recovers_without_repeating_flag() 
         let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
             .await
             .unwrap();
+        let recovered = snapshot(root.path(), &db, &operation, "after-recovery").await;
         assert!(
             db.primary_layout_operations("PrimarySync".into())
                 .await
@@ -14521,12 +16424,6 @@ async fn recorded_authorized_metadata_refresh_recovers_without_repeating_flag() 
         }
         assert_bytes(&media.join("IMG_0501.JPG"), VALID_EDIT);
         assert_bytes(&media.join("IMG_0501_original.JPG"), VALID_ORIGINAL);
-        assert!(
-            db.get_pending_metadata_rewrites(usize::MAX)
-                .await
-                .unwrap()
-                .is_empty()
-        );
         let conn = rusqlite::Connection::open_with_flags(
             root.path().join("state.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -14595,6 +16492,142 @@ async fn recorded_authorized_metadata_refresh_recovers_without_repeating_flag() 
             assert_eq!(hash, record.metadata.metadata_hash);
         }
         drop(conn);
+        let mut expected_assets = before_recovery["durable"]["assets"].clone();
+        let mut expected_paths = before_recovery["durable"]["asset_metadata_paths"].clone();
+        let mut expected_queue = before_recovery["queue"].clone();
+        let mut transitions = Vec::new();
+        for member in &committed_members {
+            let record = member.record.as_ref().unwrap();
+            let prepared = member.prepared.as_ref().unwrap();
+            let installed = member.installed.as_ref().unwrap();
+            assert_eq!(prepared.fingerprint, installed.fingerprint);
+            assert_eq!(prepared.sidecar, installed.sidecar);
+            assert_eq!(prepared.metadata_decision, installed.metadata_decision);
+            assert_eq!(prepared.source_checksum, installed.source_checksum);
+            assert_eq!(member.destination.as_ref(), Some(&installed.path));
+            let path = installed.path.to_path();
+            let path = path.to_str().unwrap();
+            let owns_asset = |row: &&mut Value| {
+                row["library"] == record.library.as_ref()
+                    && row["id"] == record.id.as_ref()
+                    && row["version_size"] == record.version_size.as_str()
+                    && row["local_path"] == path
+                    && row["checksum"] == record.checksum.as_ref()
+                    && row["metadata_hash"] == json!(record.metadata.metadata_hash)
+            };
+            let assets: Vec<_> = expected_assets
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .filter(owns_asset)
+                .collect();
+            assert_eq!(assets.len(), 1);
+            let asset = assets.into_iter().next().unwrap();
+            let actual: Vec<_> = recovered["durable"]["assets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| {
+                    row["library"] == asset["library"]
+                        && row["id"] == asset["id"]
+                        && row["version_size"] == asset["version_size"]
+                })
+                .collect();
+            assert_eq!(actual.len(), 1);
+            let actual = actual[0];
+            for field in ["last_seen_at", "downloaded_at"] {
+                let seconds = actual[field].as_i64().unwrap();
+                assert!((recovery_start..=recovery_end).contains(&seconds));
+                asset[field] = actual[field].clone();
+            }
+            let before_marker = asset["metadata_write_failed_at"].clone();
+            if operation.metadata_flags != 0 {
+                asset["metadata_write_failed_at"] = Value::Null;
+            }
+            let paths: Vec<_> = expected_paths
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .filter(|row| {
+                    row["library"] == record.library.as_ref()
+                        && row["id"] == record.id.as_ref()
+                        && row["version_size"] == record.version_size.as_str()
+                        && row["local_path"] == path
+                        && row["provider_checksum"] == record.checksum.as_ref()
+                })
+                .collect();
+            assert_eq!(paths.len(), 1);
+            let path_row = paths.into_iter().next().unwrap();
+            let before_path_marker = path_row["metadata_write_failed_at"].clone();
+            if operation.metadata_flags != 0 {
+                path_row["metadata_write_failed_at"] = Value::Null;
+            }
+            assert_eq!(
+                path_row["source_checksum"],
+                json!(installed.source_checksum)
+            );
+            assert_eq!(
+                path_row["local_checksum"],
+                format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()))
+            );
+            transitions.push(json!({"version":record.version_size.as_str(),"path":path,"asset_before":before_marker,"asset_after":asset["metadata_write_failed_at"],"path_before":before_path_marker,"path_after":path_row["metadata_write_failed_at"],"prepared":prepared,"installed":installed}));
+        }
+        // The entire cohort must be owned; an unknown resource/path is not an
+        // excuse to clear it or silently exempt it from this control.
+        for pending in expected_queue.as_array_mut().unwrap() {
+            let asset = &mut pending["asset"];
+            let matching: Vec<_> = committed_members
+                .iter()
+                .filter(|member| {
+                    let record = member.record.as_ref().unwrap();
+                    asset["library"] == record.library.as_ref()
+                        && asset["id"] == record.id.as_ref()
+                        && asset["version_size"] == json!(record.version_size)
+                        && asset["local_path"]
+                            == member
+                                .destination
+                                .as_ref()
+                                .unwrap()
+                                .to_path()
+                                .to_str()
+                                .unwrap()
+                        && asset["checksum"] == record.checksum.as_ref()
+                        && asset["metadata"]["metadata_hash"]
+                            == json!(record.metadata.metadata_hash)
+                })
+                .collect();
+            assert_eq!(matching.len(), 1, "unexpected queued peer or native path");
+            let canonical: Vec<_> = recovered["durable"]["assets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| {
+                    row["library"] == asset["library"]
+                        && row["id"] == asset["id"]
+                        && row["version_size"]
+                            .as_str()
+                            .unwrap()
+                            .eq_ignore_ascii_case(asset["version_size"].as_str().unwrap())
+                })
+                .collect();
+            assert_eq!(canonical.len(), 1);
+            for field in ["last_seen_at", "downloaded_at"] {
+                asset[field] = json!(
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(
+                        canonical[0][field].as_i64().unwrap(),
+                        0
+                    )
+                    .unwrap()
+                );
+            }
+        }
+        assert_eq!(recovered["durable"]["assets"], expected_assets);
+        assert_eq!(recovered["durable"]["asset_metadata_paths"], expected_paths);
+        if operation.metadata_flags != 0 {
+            expected_queue = json!([]);
+        }
+        assert_eq!(recovered["queue"], expected_queue);
+        std::fs::write(root.path().join("refresh-settlement.json"),serde_json::to_vec_pretty(&json!({"operation":operation.operation,"SQL_phase":phase,"generation":fresh_binding.generation,"flags":operation.metadata_flags,"start_utc_seconds":recovery_start,"end_utc_seconds":recovery_end,"transitions":transitions,"queue":recovered["queue"],"all_other_asset_and_path_fields_exact":true})).unwrap()).unwrap();
         #[cfg(feature = "xmp")]
         if let Some(previous_xmp) = &previous_xmp {
             let fresh_xmp = std::fs::read(media.join("IMG_0501.JPG.xmp")).unwrap();
@@ -14657,7 +16690,7 @@ async fn recorded_authorized_metadata_refresh_recovers_without_repeating_flag() 
             );
         }
         let settled_rows = rows(root.path());
-        for _ in 0..2 {
+        for round in 0..2 {
             let (quiet, lookups) = cycle_options(
                 root.path(),
                 current.clone(),
@@ -14681,17 +16714,27 @@ async fn recorded_authorized_metadata_refresh_recovers_without_repeating_flag() 
                 settled_rows,
                 "quiet reopen grew history or changed proofs/metadata"
             );
+            let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+                .await
+                .unwrap();
+            let quiet = snapshot(root.path(), &db, &operation, &format!("quiet-{round}")).await;
+            assert_eq!(quiet["queue"], recovered["queue"]);
             eprintln!(
                 "RECORDED_REFRESH_QUIET sidecar={sidecar} physical_rows_stable=true downloads=0 lookups=0 new_GETs=0"
             );
             let db = state::SqliteStateDb::open_owned(&root.path().join("state.db"), &owner)
                 .await
                 .unwrap();
-            assert!(
-                db.get_pending_metadata_rewrites(usize::MAX)
-                    .await
-                    .unwrap()
-                    .is_empty()
+            let owned_queue = db.get_pending_metadata_rewrites(usize::MAX).await.unwrap();
+            let recovered_assets: Vec<_> = recovered["queue"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pending| pending["asset"].clone())
+                .collect();
+            assert_eq!(
+                serde_json::to_value(owned_queue).unwrap(),
+                json!(recovered_assets)
             );
         }
     }
@@ -14795,6 +16838,74 @@ async fn interrupted_unprepared_embedded_refresh_remains_held() {
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 #[tokio::test]
 async fn interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync() {
+    async fn snapshot(
+        root: &std::path::Path,
+        db: &state::SqliteStateDb,
+        operation: &crate::state::db::primary_layout::LayoutOperation,
+        phase: &str,
+    ) -> Value {
+        let durable = {
+            let conn = rusqlite::Connection::open_with_flags(
+                root.join("state.db"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let mut assets = conn.prepare("SELECT json_object('library',library,'id',id,'version',version_size,'path',local_path,'checksum',checksum,'size',size_bytes,'hash',metadata_hash,'rating',rating,'marker',metadata_write_failed_at,'local',local_checksum,'source',download_checksum,'capture_hash',capture_repair_metadata_hash,'capture_checksum',capture_repair_output_checksum,'capture_size',capture_repair_output_size) FROM assets ORDER BY library,id,version_size").unwrap();
+            let assets = assets
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| serde_json::from_str::<Value>(&r.unwrap()).unwrap())
+                .collect::<Vec<_>>();
+            let mut paths = conn.prepare("SELECT json_object('library',library,'id',id,'version',version_size,'path',local_path,'checksum',provider_checksum,'local',local_checksum,'download',download_checksum,'source',source_checksum,'marker',metadata_write_failed_at,'capture_hash',capture_repair_metadata_hash,'capture_checksum',capture_repair_output_checksum,'capture_size',capture_repair_output_size,'preserved',preserved_path_key) FROM asset_metadata_paths ORDER BY library,id,version_size,local_path").unwrap();
+            let paths = paths
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| serde_json::from_str::<Value>(&r.unwrap()).unwrap())
+                .collect::<Vec<_>>();
+            let (sql_phase, header): (String, Vec<u8>) = conn
+                .query_row(
+                    "SELECT phase,header FROM primary_layout_operations WHERE operation=?1",
+                    [&operation.operation],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            let mut members = conn.prepare("SELECT evidence FROM primary_layout_members WHERE operation=?1 ORDER BY member").unwrap();
+            let members = members
+                .query_map([&operation.operation], |r| r.get::<_, Vec<u8>>(0))
+                .unwrap()
+                .map(|r| {
+                    serde_json::from_slice::<crate::state::db::primary_layout::LayoutMember>(
+                        &r.unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            json!({"assets":assets,"paths":paths,"SQL_phase":sql_phase,"header":serde_json::from_slice::<Value>(&header).unwrap(),"members":members})
+        };
+        let mut files = serde_json::Map::new();
+        let mut pending = vec![root.join("media")];
+        while let Some(parent) = pending.pop() {
+            for entry in std::fs::read_dir(parent).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    assert!(entry.file_type().unwrap().is_file());
+                    let file = std::fs::File::open(entry.path()).unwrap();
+                    files.insert(entry.path().to_str().unwrap().to_owned(),json!({"bytes":std::fs::read(entry.path()).unwrap(),"identity":crate::fs_util::file_identity(&file).unwrap(),"mtime":file.metadata().unwrap().modified().unwrap()}));
+                }
+            }
+        }
+        let queue=db.get_pending_metadata_rewrites_page_for_queue(state::db::MetadataRewriteQueue::Ordinary,None,0,usize::MAX).await.unwrap().into_iter().map(|q|json!({"asset":q.asset,"source":q.source_checksum,"capture":q.capture_repair_receipt.map(|r|format!("{r:?}")),"selection":q.selection_receipt.map(|r|format!("{r:?}"))})).collect::<Vec<_>>();
+        let packet = json!({"phase":phase,"operation":operation.operation,"flags":operation.metadata_flags,"durable":durable,"binding":db.primary_layout_binding(operation.family.clone()).await.unwrap(),"queue":queue,"files":files});
+        std::fs::write(
+            root.join(format!("embedded-{phase}.json")),
+            serde_json::to_vec_pretty(&packet).unwrap(),
+        )
+        .unwrap();
+        packet
+    }
+
     let cases: &[(&str, &[u8], bool)] = &[
         ("IMG_0501.JPG", VALID_ORIGINAL, false),
         #[cfg(feature = "xmp")]
@@ -14806,7 +16917,14 @@ async fn interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync() {
     ];
     for &(filename, original_bytes, is_heif) in cases {
         let server = server_with_media(original_bytes, VALID_EDIT, EDIT_TWO).await;
-        let root = tempfile::tempdir().unwrap();
+        let mut root = tempfile::tempdir().unwrap();
+        if std::env::var_os("KEI_RECORDED_EMBED_RETAIN_FIXTURE").is_some() {
+            root.disable_cleanup(true);
+        }
+        eprintln!(
+            "RECORDED_EMBED_FIXTURE root={} filename={filename}",
+            root.path().display()
+        );
         let media = root.path().join("media");
         let mut current = records_with_original(&server, original_bytes, None);
         current[0]["fields"]["filenameEnc"]["value"] = json!(filename);
@@ -14814,7 +16932,6 @@ async fn interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync() {
             current[0]["fields"]["itemType"] = json!({"value":"public.heic"});
             current[0]["fields"]["resOriginalFileType"] = json!({"value":"public.heic"});
         }
-        current[1]["fields"]["isFavorite"] = json!({"value":1});
         let (initial, _) = cycle_options(
             root.path(),
             current.clone(),
@@ -14829,6 +16946,10 @@ async fn interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync() {
         let sidecar = media.join(format!("{filename}.xmp"));
         let old_sidecar = b"independent synthetic sidecar";
         std::fs::write(&sidecar, old_sidecar).unwrap();
+        // Capture genuine provider rating drift through the same upsert owner;
+        // do not manufacture retry markers or add unrelated grouping authority.
+        current[1]["fields"]["isFavorite"] = json!({"value":1});
+        current[1]["recordChangeTag"] = json!("recorded-embedded-favorite");
         let provider = Session {
             reported_count: None,
             records: current.clone(),
@@ -14869,6 +16990,22 @@ async fn interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync() {
         config.refresh_metadata = true;
         config.metadata.set_exif_rating = true;
         let operation = download::seed_unprepared_refresh(&config, &pass).await;
+        let before_upsert = snapshot(root.path(), &db, &operation, "before-upsert").await;
+        for record in operation
+            .members
+            .iter()
+            .filter_map(|member| member.record.as_ref())
+        {
+            db.upsert_seen(record).await.unwrap();
+        }
+        let before = snapshot(root.path(), &db, &operation, "before-recovery").await;
+        assert_ne!(operation.metadata_flags, 0);
+        assert!(
+            operation
+                .members
+                .iter()
+                .all(|member| member.prepared.is_none())
+        );
         let stage = operation
             .members
             .iter()
@@ -14891,6 +17028,11 @@ async fn interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync() {
             options(),
         )
         .await;
+        let proof_db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let after = snapshot(root.path(), &proof_db, &operation, "after-recovery").await;
+        drop(proof_db);
         assert_eq!(
             recovered.failed_count, 0,
             "{filename}: {:?}",
@@ -14898,6 +17040,99 @@ async fn interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync() {
         );
         assert!(recovered.db_sync_token_advance_safe);
         assert_eq!(recovered.stats.downloaded, 0);
+        assert_eq!(after["durable"]["SQL_phase"], "committed");
+        assert_eq!(after["binding"]["generation"], operation.generation + 1);
+        assert_eq!(after["binding"]["decision"], operation.decision);
+        let mut transitions = Vec::new();
+        for saved in after["durable"]["members"].as_array().unwrap() {
+            let member: crate::state::db::primary_layout::LayoutMember =
+                serde_json::from_value(saved.clone()).unwrap();
+            let record = member.record.as_ref().unwrap();
+            let prepared = member.prepared.as_ref().unwrap();
+            let installed = member.installed.as_ref().unwrap();
+            assert_eq!(member.destination.as_ref(), Some(&installed.path));
+            assert_eq!(prepared.fingerprint, installed.fingerprint);
+            assert_eq!(prepared.metadata_decision, installed.metadata_decision);
+            assert_eq!(prepared.source_checksum, installed.source_checksum);
+            let output = std::fs::read(installed.path.to_path()).unwrap();
+            assert_eq!(
+                installed.fingerprint.sha256.as_slice(),
+                Sha256::digest(&output).as_slice()
+            );
+            assert_eq!(installed.fingerprint.size, output.len() as u64);
+            assert_eq!(
+                installed.fingerprint.identity,
+                crate::fs_util::file_identity(
+                    &std::fs::File::open(installed.path.to_path()).unwrap()
+                )
+                .unwrap()
+            );
+            assert_eq!(installed.provider_checksum, record.checksum.as_ref());
+            assert_eq!(
+                installed.source_checksum,
+                Some(format!("{:x}", Sha256::digest(original_bytes)))
+            );
+            let matches = |row: &&Value| {
+                row["library"] == record.library.as_ref()
+                    && row["id"] == record.id.as_ref()
+                    && row["version"] == record.version_size.as_str()
+                    && row["path"] == installed.path.to_path().to_str().unwrap()
+                    && row["checksum"] == record.checksum.as_ref()
+            };
+            let old: Vec<_> = before["durable"]["assets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(matches)
+                .collect();
+            let new: Vec<_> = after["durable"]["assets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(matches)
+                .collect();
+            assert_eq!(old.len(), 1);
+            assert_eq!(new.len(), 1);
+            assert_eq!(old[0]["hash"], json!(record.metadata.metadata_hash));
+            assert_eq!(old[0]["rating"], 5);
+            assert_eq!(new[0]["marker"], Value::Null);
+            assert_eq!(new[0]["hash"], old[0]["hash"]);
+            assert_eq!(new[0]["local"], format!("{:x}", Sha256::digest(&output)));
+            assert_eq!(new[0]["source"], json!(installed.source_checksum));
+            let old_paths: Vec<_> = before["durable"]["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(matches)
+                .collect();
+            let new_paths: Vec<_> = after["durable"]["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(matches)
+                .collect();
+            assert_eq!(old_paths.len(), 1);
+            assert_eq!(new_paths.len(), 1);
+            assert_eq!(new_paths[0]["marker"], Value::Null);
+            assert_eq!(new_paths[0]["local"], new[0]["local"]);
+            assert_eq!(new_paths[0]["source"], new[0]["source"]);
+            for field in ["capture_hash", "capture_checksum", "capture_size"] {
+                assert_eq!(new[0][field], old[0][field]);
+                assert_eq!(new_paths[0][field], old_paths[0][field]);
+            }
+            let initial_hash = &before_upsert["durable"]["assets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["version"] == record.version_size.as_str())
+                .unwrap()["hash"];
+            assert_ne!(
+                initial_hash, &old[0]["hash"],
+                "provider rating must create an actual metadata transition"
+            );
+            transitions.push(json!({"record":record,"asset_before":old[0],"asset_after":new[0],"path_before":old_paths[0],"path_after":new_paths[0],"prepared":prepared,"installed":installed,"nonvacuous_marker_clear":!old[0]["marker"].is_null() && !old_paths[0]["marker"].is_null()}));
+        }
+        std::fs::write(root.path().join("embedded-settlement.json"),serde_json::to_vec_pretty(&json!({"operation":operation.operation,"SQL_phase":after["durable"]["SQL_phase"],"generation":after["binding"]["generation"],"flags":operation.metadata_flags,"transitions":transitions})).unwrap()).unwrap();
         assert_ne!(std::fs::read(&original).unwrap(), original_bytes);
         assert_eq!(std::fs::read(&sidecar).unwrap(), old_sidecar);
         #[cfg(feature = "xmp")]
@@ -14983,6 +17218,18 @@ async fn interrupted_unprepared_embedded_refresh_retries_on_ordinary_sync() {
         assert_eq!(lookups, 0);
         assert_eq!(std::fs::read(&original).unwrap(), output);
         assert_eq!(std::fs::read(&sidecar).unwrap(), old_sidecar);
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        let quiet = snapshot(root.path(), &db, &operation, "quiet").await;
+        assert_eq!(quiet["durable"], after["durable"]);
+        assert_eq!(quiet["queue"], after["queue"]);
+        assert_eq!(quiet["files"], after["files"]);
+        eprintln!(
+            "RECORDED_EMBED_COMPLETE root={} filename={filename} operation={} SQL_phase=committed parsed_rating=5",
+            root.path().display(),
+            operation.operation
+        );
     }
 }
 
