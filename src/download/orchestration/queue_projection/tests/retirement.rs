@@ -3161,8 +3161,25 @@ async fn explicit_refresh_reuse_is_writable_and_completion_is_bound_to_recorded_
         .find(|pending| pending.asset.local_path.as_deref() == Some(path.as_path()))
         .expect("the authorized selected metadata work remains pending");
     let old_local = pending.asset.local_checksum.clone().unwrap();
-    let output = data_encoding::HEXLOWER.encode(&Sha256::digest(b"rewritten metadata"));
-    let output_size = b"rewritten metadata".len() as u64;
+    // Admit the same-path generation while the recorded source bytes are still
+    // present, then reuse the measured prepared output after completion.
+    let cross = db
+        .begin_selection_generation(owner(), spec(), BUDGET)
+        .await
+        .unwrap();
+    let (cross_manifest, cross_tasks, _) =
+        admission(&db, &cross.id, &dir.path().join("media"), 1, false, BUDGET).await;
+    let cross_path = cross_tasks[0].download_path.clone();
+    assert_eq!(
+        cross_path, path,
+        "the cross generation must reuse the same recorded output path"
+    );
+    // The prepared output is a real file change. Materialize it and measure
+    // the actual bytes before recording or finalizing that output.
+    std::fs::write(&path, b"prepared-metadata").unwrap();
+    let prepared_physical = std::fs::read(&path).unwrap();
+    let output = data_encoding::HEXLOWER.encode(&Sha256::digest(&prepared_physical));
+    let output_size = prepared_physical.len() as u64;
     pending.selection_receipt = db
         .record_selection_metadata_prepared(&pending, &output, output_size)
         .await
@@ -3186,6 +3203,21 @@ async fn explicit_refresh_reuse_is_writable_and_completion_is_bound_to_recorded_
         .await,
         Err(crate::state::error::StateError::ProviderWorkConflict)
     ));
+    assert_eq!(
+        db.acquire_lock("contradictory receipt rollback")
+            .unwrap()
+            .query_row::<i64, _, _>(
+                "SELECT verified_metadata FROM provider_active_destinations WHERE generation=?1 AND pass_key='pass' AND child=?2",
+                rusqlite::params![root.id, manifest.decision.child],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        0,
+        "a contradictory receipt must roll back without completing metadata"
+    );
+    db.record_metadata_write_failure("PrimarySync", manifest.decision.child.as_str(), "original")
+        .await
+        .unwrap();
     assert!(
         db.finish_metadata_rewrite(
             &pending,
@@ -3205,18 +3237,26 @@ async fn explicit_refresh_reuse_is_writable_and_completion_is_bound_to_recorded_
         ).unwrap(),
         1
     );
-
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        prepared_physical,
+        "the final file must contain the measured prepared output"
+    );
+    let (receipt_local, receipt_source) = db
+        .acquire_lock("explicit refresh receipt")
+        .unwrap()
+        .query_row::<(String, String), _, _>(
+            "SELECT local_checksum, source_checksum FROM download_receipts WHERE library='PrimarySync' AND state_id=?1 AND version_size='original' AND native_path=?2",
+            rusqlite::params![manifest.decision.child, SelectionPath::from_path(&path).key().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(receipt_local, output);
+    assert_eq!(receipt_source, sha);
     // A same-path generation with different metadata options cannot borrow
     // the first generation's refresh authorization.
-    let cross = db
-        .begin_selection_generation(owner(), spec(), BUDGET)
-        .await
-        .unwrap();
-    let (cross_manifest, cross_tasks, _) =
-        admission(&db, &cross.id, &dir.path().join("media"), 1, false, BUDGET).await;
-    let cross_path = cross_tasks[0].download_path.clone();
-    publish(&db, &cross_tasks[0]).await;
-    let cross_sha = data_encoding::HEXLOWER.encode(&Sha256::digest(RAW));
+    // Reuse the measured prepared output instead of republishing RAW over the
+    // verified path; the explicit generation's receipt and local bytes agree.
     assert!(db.guard_primary_writer(&cross_path).await.is_ok());
     assert!(
         db.reuse_selection_publication(
@@ -3225,7 +3265,7 @@ async fn explicit_refresh_reuse_is_writable_and_completion_is_bound_to_recorded_
             "pass".into(),
             cross_manifest.decision.child.clone(),
             SelectionPath::from_path(&cross_path),
-            (cross_sha, RAW.len() as u64),
+            (output.clone(), output_size),
             authorization(
                 &cross.spec.scope,
                 &cross.id,

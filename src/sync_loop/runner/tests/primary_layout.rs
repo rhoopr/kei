@@ -226,6 +226,7 @@ struct CycleOptions {
     state_file: &'static str,
     folder_structure: &'static str,
     pass_kind: PassKind,
+    album_name: &'static str,
     resolution: crate::types::PhotoResolution,
     private: bool,
     disable_capture: bool,
@@ -253,6 +254,7 @@ impl Default for CycleOptions {
             state_file: "state.db",
             folder_structure: "",
             pass_kind: PassKind::Unfiled,
+            album_name: "TestAlbum",
             resolution: crate::types::PhotoResolution::Original,
             private: false,
             disable_capture: false,
@@ -321,7 +323,7 @@ async fn try_cycle_options(
             crate::icloud::photos::PhotoAlbumConfig {
                 params: Arc::default(),
                 service_endpoint: Arc::from("https://example.com"),
-                name: Arc::from("TestAlbum"),
+                name: Arc::from(options.album_name),
                 list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
                 obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
                 query_filter: None,
@@ -18993,9 +18995,33 @@ async fn ordinary_template_preserves_recorded_paths(pass_kind: PassKind) {
         assert_eq!(row[5], hash);
         assert_eq!(row[6], hash);
         assert_eq!(row[7], hash);
-        assert!(row[8].as_i64().is_some_and(|time| time > 0));
+        if pass_kind == PassKind::Unfiled {
+            assert!(row[8].is_null(), "{pass_kind:?}: {row:?}");
+        } else {
+            assert!(
+                row[8].as_i64().is_some_and(|time| time > 0),
+                "{pass_kind:?}: {row:?}"
+            );
+        }
         assert!(row[9].is_null());
     }
+    let downloaded_at: Vec<Option<i64>> = rusqlite::Connection::open(root.path().join("state.db"))
+        .unwrap()
+        .prepare(
+            "SELECT downloaded_at FROM assets WHERE library='PrimarySync' AND id='asset-501' ORDER BY version_size",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(downloaded_at.len(), 2);
+    assert!(
+        downloaded_at
+            .iter()
+            .all(|time| time.is_some_and(|value| value > 0)),
+        "{pass_kind:?}: both recorded rows must have positive downloaded_at: {downloaded_at:?}"
+    );
     let parsed: Vec<Value> = receipts
         .iter()
         .map(|r| serde_json::from_str(r).unwrap())
@@ -19057,20 +19083,27 @@ async fn ordinary_template_preserves_recorded_paths(pass_kind: PassKind) {
         .await
         .unwrap();
     let metadata_before = metadata_work(&db).await;
-    let mut expected_work = vec![
-        (
-            original.clone(),
-            provider_hash(ORIGINAL),
-            data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL)),
-        ),
-        (
-            edited.clone(),
-            provider_hash(EDIT_ONE),
-            data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_ONE)),
-        ),
-    ];
-    expected_work.sort();
-    assert_eq!(metadata_before, expected_work);
+    if pass_kind == PassKind::Unfiled {
+        assert!(
+            metadata_before.is_empty(),
+            "writer-disabled Unfiled success must not queue metadata work: {metadata_before:?}"
+        );
+    } else {
+        let mut expected_work = vec![
+            (
+                original.clone(),
+                provider_hash(ORIGINAL),
+                data_encoding::HEXLOWER.encode(&Sha256::digest(ORIGINAL)),
+            ),
+            (
+                edited.clone(),
+                provider_hash(EDIT_ONE),
+                data_encoding::HEXLOWER.encode(&Sha256::digest(EDIT_ONE)),
+            ),
+        ];
+        expected_work.sort();
+        assert_eq!(metadata_before, expected_work);
+    }
     drop(db);
     let requests = server.received_requests().await.unwrap().len();
     assert_eq!(requests, 2);
@@ -19899,10 +19932,49 @@ async fn root_change_does_not_settle_independent_unfinished_asset() {
         let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
         conn.prepare("SELECT json_array(generation,pass_key,child,version_size,path,checksum,size_bytes,admitted,verified_media,verified_metadata) FROM provider_active_destinations WHERE child='asset-502' AND verified_media=0 ORDER BY generation,version_size,path").unwrap().query_map([], |r|r.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
     };
+    let metadata_state = || {
+        let conn = rusqlite::Connection::open(root.path().join("state.db")).unwrap();
+        conn.prepare("SELECT json_array(version_size,local_path,provider_checksum,local_checksum,download_checksum,source_checksum,metadata_write_failed_at) FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-501' ORDER BY version_size,local_path").unwrap().query_map([], |r|r.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+    };
+    async fn pending_metadata_state(
+        db: &state::SqliteStateDb,
+    ) -> Vec<(std::path::PathBuf, String, String)> {
+        db.get_pending_metadata_rewrites(100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|asset| asset.id.as_ref() == "asset-501")
+            .map(|asset| {
+                (
+                    asset.local_path.unwrap(),
+                    asset.checksum.into_string(),
+                    asset.local_checksum.unwrap(),
+                )
+            })
+            .collect()
+    }
     let pending_before = snapshot();
     assert!(
         !pending_before.is_empty(),
         "a real failed transfer must leave independent selected work: {failed:?}"
+    );
+    let metadata_before = metadata_state();
+    assert_eq!(metadata_before.len(), 2);
+    assert!(
+        metadata_before
+            .iter()
+            .all(|row| { serde_json::from_str::<Value>(row).unwrap()[6].is_null() }),
+        "writer-disabled Unfiled success must not fabricate metadata debt: {metadata_before:?}"
+    );
+    let pending_metadata_before: Vec<(std::path::PathBuf, String, String)> = {
+        let db = state::SqliteStateDb::open_read_only(&root.path().join("state.db"))
+            .await
+            .unwrap();
+        pending_metadata_state(&db).await
+    };
+    assert!(
+        pending_metadata_before.is_empty(),
+        "writer-disabled Unfiled success must not queue metadata work: {pending_metadata_before:?}"
     );
     let (changed, _) = cycle_options(
         root.path(),
@@ -19929,6 +20001,11 @@ async fn root_change_does_not_settle_independent_unfinished_asset() {
             "independent obligation disappeared: {prior}; after={pending_after:?}"
         );
     }
+    assert_eq!(
+        metadata_state(),
+        metadata_before,
+        "unrelated root change altered asset-501 metadata state"
+    );
     assert!(
         !root
             .path()
@@ -19953,14 +20030,11 @@ async fn root_change_does_not_settle_independent_unfinished_asset() {
         states.iter().all(|status| status != "downloaded"),
         "unfinished destination was reported downloaded: {states:?}"
     );
+    let pending_metadata_after: Vec<(std::path::PathBuf, String, String)> =
+        pending_metadata_state(&db).await;
     assert_eq!(
-        db.get_pending_metadata_rewrites(100)
-            .await
-            .unwrap()
-            .iter()
-            .filter(|asset| asset.id.as_ref() == "asset-501")
-            .count(),
-        2
+        pending_metadata_after, pending_metadata_before,
+        "unrelated root change settled or created asset-501 metadata debt"
     );
 }
 
@@ -20763,6 +20837,9 @@ async fn selected_metadata_preprobe_and_gps_errors_do_not_suppress_ordinary_retr
             private: true,
             sidecar: true,
             refresh_metadata: true,
+            // An empty Unfiled display name keeps the immediate and queued
+            // metadata packets equal: no album keyword is invented here.
+            album_name: "",
             baseline_successor: Some("initial-token"),
             cycle_token: Some("cycle-token"),
             ..CycleOptions::default()

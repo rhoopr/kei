@@ -2429,11 +2429,17 @@ async fn unknown_measurements_idle_cycle_does_not_queue_metadata_rewrites() {
         .unwrap();
         assert!(db.get_pending().await.unwrap().is_empty());
         let context = preload_download_context(&config).await;
-        assert!(!context.has_provider_metadata_drift(
+        let drift = context.has_provider_metadata_drift(
             "PrimarySync",
             asset.state_id(),
-            &crate::download::filter::metadata_capture(&asset)
-        ));
+            &crate::download::filter::metadata_capture(&asset),
+        );
+        assert_eq!(
+            drift,
+            checksum.is_empty(),
+            "checksum {checksum:?}: blank identity is visible uncertainty; a retained \
+             nonblank historical generation keeps quiet metadata"
+        );
         db.fail_provider_metadata_refresh_for_test();
         for _ in 0..2 {
             let result = stream_and_download_from_stream_with_context(
@@ -2447,9 +2453,14 @@ async fn unknown_measurements_idle_cycle_does_not_queue_metadata_rewrites() {
             )
             .await
             .unwrap();
+            // The injected metadata-hash write failure must remain visible on
+            // every attempted path. Blank identity additionally attempts the
+            // drift refresh; the quiet retained branch only reaches refusal.
+            let expected_state_write_failures = if checksum.is_empty() { 2 } else { 1 };
             assert_eq!(
-                result.state_write_failures, 1,
-                "checksum {checksum:?}: {result:?}"
+                result.state_write_failures, expected_state_write_failures,
+                "checksum {checksum:?}: injected metadata-write failures must remain visible; \
+                 {result:?}"
             );
             assert_eq!(result.downloaded, 0);
             assert_eq!(result.skip_summary.on_disk, 0);
@@ -2459,6 +2470,17 @@ async fn unknown_measurements_idle_cycle_does_not_queue_metadata_rewrites() {
             // it must not rewrite or relabel the historical downloaded row.
             assert!(result.failed.is_empty());
             assert!(db.get_metadata_retry_markers().await.unwrap().is_empty());
+            assert!(
+                db.get_pending().await.unwrap().is_empty(),
+                "checksum {checksum:?}: the refused row must not become pending"
+            );
+            assert!(
+                db.get_pending_metadata_rewrites(10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "checksum {checksum:?}: no metadata rewrite may be queued"
+            );
             let row = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
             assert_eq!(row.metadata.metadata_hash, record.metadata.metadata_hash);
             assert_eq!(
@@ -2470,6 +2492,8 @@ async fn unknown_measurements_idle_cycle_does_not_queue_metadata_rewrites() {
                 (None, None, None)
             );
             assert_eq!(row.checksum, record.checksum);
+            assert_eq!(row.size_bytes, record.size_bytes);
+            assert_eq!(row.filename.as_ref(), record.filename.as_ref());
             assert_eq!(row.local_checksum.as_deref(), Some(local_checksum.as_str()));
             assert_eq!(row.local_path.as_ref(), Some(&derived.path));
             assert_eq!(fs::read(&derived.path).unwrap(), bytes);
