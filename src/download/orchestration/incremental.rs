@@ -1234,6 +1234,18 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             skip_breakdown.on_disk += 1;
         }
 
+        // Validate prior-publication choices before changing their canonical source facts.
+        if controls.run_mode.downloads_files()
+            && let Some(db) = &config.state_db
+        {
+            task_planner
+                .persist_execution_publication_choices(asset, effective_config, &plan.tasks)
+                .await?;
+            task_planner
+                .persist_download_reservations(db.as_ref(), &plan.tasks)
+                .await?;
+        }
+
         // Upsert state records so mark_downloaded/mark_failed can find them.
         // Without this, the UPDATE in mark_downloaded matches 0 rows and the
         // file ends up on disk but untracked in the state DB.
@@ -1270,17 +1282,6 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                     "Failed to record album membership after retries"
                 );
             }
-        }
-
-        if controls.run_mode.downloads_files()
-            && let Some(db) = &config.state_db
-        {
-            task_planner
-                .persist_execution_publication_choices(asset, effective_config, &plan.tasks)
-                .await?;
-            task_planner
-                .persist_download_reservations(db.as_ref(), &plan.tasks)
-                .await?;
         }
 
         for task in &mut plan.tasks {

@@ -8444,6 +8444,438 @@ async fn v027_prepared_operation_upgrade_normal_runner_and_quiet_reopen() {
 
 mod observation_commits;
 
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn collecting_fallback_reserves_before_upsert_and_reopens() {
+    use crate::download::metadata::{MetadataWrite, apply_metadata, probe_exif};
+    use crate::download::metadata_rewrite::CaptureTimestampRepair;
+    use crate::download::orchestration::test_support::seed_complete_album_snapshot;
+    use crate::download::orchestration::{generation, incremental, selection};
+    use crate::state::db::PublicationBinding;
+    use crate::state::db::download_receipts::DownloadReceipt;
+    use crate::state::{
+        ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
+        ReconciliationStateStore, VersionSizeKey,
+    };
+    use rusqlite::types::Value;
+    use sha2::{Digest, Sha256};
+    use std::path::Path;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn public(f: &Fixture) -> anyhow::Result<crate::download::SyncResult> {
+        eprintln!("ORDERING_PUBLIC_CALL");
+        crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            std::slice::from_ref(&f.pass),
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+    }
+    async fn receipt(f: &Fixture, id: &str, bytes: &[u8], path: &Path) {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        let expected_owner = owner();
+        let (account, provider) = expected_owner.authenticated_keys().unwrap();
+        let album = &f.pass.album;
+        let (_, scope, _) = album.publication_scope("PrimarySync").unwrap().unwrap();
+        let binding = PublicationBinding {
+            account_key: account.into(),
+            provider_key: provider.into(),
+            scope,
+            library: "PrimarySync".into(),
+            child: format!("asset-{id}"),
+            master: id.into(),
+            state_id: format!("asset-{id}"),
+            origin_pass: generation::pass_key(&f.pass),
+        };
+        let checksum = data_encoding::BASE64.encode(&Sha256::digest(bytes));
+        let db = &f.db;
+        let size = bytes.len() as u64;
+        let receipts = db
+            .bound_download_receipts(binding.clone(), "original".into(), checksum.clone(), size)
+            .await
+            .unwrap();
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let expected = DownloadReceipt {
+            account_key: binding.account_key,
+            provider_key: binding.provider_key,
+            scope: binding.scope,
+            library: binding.library,
+            child: binding.child,
+            master: binding.master,
+            state_id: binding.state_id,
+            origin_pass: binding.origin_pass,
+            version_size: "original".into(),
+            provider_checksum: checksum,
+            provider_size: bytes.len() as u64,
+            native_path: SelectionPath::from_path(path),
+            source_checksum: hash.clone(),
+            local_checksum: hash,
+        };
+        assert_eq!(receipts, [expected]);
+    }
+    let execute = |f: &Fixture, sql: &str| {
+        let conn = f.db.acquire_lock("ordering fixture SQL").unwrap();
+        conn.execute_batch(sql).unwrap();
+    };
+    let query = |f: &Fixture, sql: &str| -> Vec<Vec<Value>> {
+        let conn = f.db.acquire_lock("ordering oracle").unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        stmt.query_map([], |r| (0..columns).map(|i| r.get(i)).collect())
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let identity =
+        |path: &Path| crate::fs_util::file_identity(&std::fs::File::open(path).unwrap()).unwrap();
+    let key = |path: &Path| ReconciliationPathKey(crate::fs_util::confined_path_key(path).unwrap());
+    for case in [
+        "healthy",
+        "bound_choice_insert",
+        "ordinary_insert_after_choice",
+        "upsert_after_choice",
+    ] {
+        let mut f = Fixture::new().await;
+        let media = f.config.directory.clone();
+        let ranks = f.session.rank_calls.clone();
+        let lookups = f.session.calls.clone();
+        let cursors = f.session.changes_cursors.clone();
+        let upsert_fault = case == "upsert_after_choice";
+        let reservation_fault =
+            matches!(case, "bound_choice_insert" | "ordinary_insert_after_choice");
+        let downloaded = match case {
+            "healthy" => 2,
+            "upsert_after_choice" => 1,
+            _ => 0,
+        };
+        let input = f.dir.path().join("provider.jpg");
+        let pattern = include_bytes!("../../../../tests/data/media/pattern.jpg");
+        std::fs::write(&input, pattern).unwrap();
+        let datetime = "2023:11:14 22:13:20";
+        let mut tags = MetadataWrite {
+            datetime: Some(datetime.into()),
+            offset_time_original: Some("+00:00".into()),
+            ..Default::default()
+        };
+        apply_metadata(&input, &tags, ".part").unwrap();
+        let old = std::fs::read(&input).unwrap();
+        tags.title = Some("changed provider input".into());
+        apply_metadata(&input, &tags, ".part").unwrap();
+        let changed = std::fs::read(&input).unwrap();
+        assert_ne!(old, changed);
+        let checksum = |bytes: &[u8]| data_encoding::BASE64.encode(&Sha256::digest(bytes));
+        let current_debt = |f: &Fixture, id: &str, bytes: &[u8], path: &Path| {
+            let hash = checksum(bytes);
+            let size = bytes.len();
+            let path = path.to_str().unwrap().replace('\'', "''");
+            let rows = query(
+                f,
+                &format!(
+                    "SELECT a.metadata_write_failed_at,p.metadata_write_failed_at FROM assets a JOIN asset_metadata_paths p ON p.library=a.library AND p.id=a.id AND p.version_size=a.version_size AND p.local_path=a.local_path WHERE a.library='PrimarySync' AND a.id='asset-{id}' AND a.version_size='original' AND a.is_deleted=0 AND a.local_path='{path}' AND a.checksum='{hash}' AND a.size_bytes={size} AND p.provider_checksum='{hash}' AND EXISTS(SELECT 1 FROM asset_album_memberships m JOIN album_containers c ON c.library=m.library AND c.container_id=m.container_id WHERE m.library=a.library AND m.asset_record_name=a.id AND m.master_record_name='{id}' AND m.container_id='A' AND m.is_deleted=0 AND m.source='icloud' AND c.album_name='A' AND c.pass_kind='album' AND c.is_deleted=0)"
+                ),
+            );
+            assert_eq!(rows.len(), 1);
+            assert!(matches!(rows[0][0], Value::Integer(t) if t > 0));
+            assert_eq!(rows[0][0], rows[0][1]);
+            rows[0][0].clone()
+        };
+        let server = MockServer::start().await;
+        for (endpoint, bytes) in [("old", &old), ("changed", &changed), ("healthy", &old)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{endpoint}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let resource = |id: &str, filename: &str, endpoint: &str, bytes: &[u8]| {
+            let mut rows = records(id, &checksum(bytes), "unchanged provider metadata");
+            rows[0]["fields"]["filenameEnc"]["value"] = json!(filename);
+            rows[0]["fields"]["resOriginalRes"]["value"] = json!({"downloadURL":format!("{}/{endpoint}",server.uri()),"size":bytes.len(),"fileChecksum":checksum(bytes)});
+            rows[1]["fields"]["timeZoneOffset"] = json!({"value":0,"type":"INT64"});
+            rows
+        };
+        f.config.folder_structure_albums = Arc::from("{album}");
+        f.config.metadata.set_exif_datetime = true;
+        f.pass = destination_pass(&f, "A");
+        *f.session.records.lock().unwrap() = resource("m", "paired.jpg", "old", &old);
+        seed_complete_album_snapshot(&f.db, "A", "A", &[("asset-m", "m")]).await;
+        assert_eq!(public(&f).await.unwrap().stats.downloaded, 1);
+        let original = media.join("A/paired.JPG");
+        let old_identity = identity(&original);
+        let probe = probe_exif(&original).unwrap();
+        let expected_datetime = "2023-11-14T22:13:20";
+        assert_eq!(probe.datetime_original.as_deref(), Some(expected_datetime));
+        assert_eq!(probe.offset_time_original.as_deref(), Some("+00:00"));
+        receipt(&f, "m", &old, &original).await;
+        let tm = current_debt(&f, "m", &old, &original);
+        let healthy_path = media.join("A/healthy.JPG");
+        let h_absence = "SELECT (SELECT count(*) FROM assets WHERE library='PrimarySync' AND id='asset-h' AND version_size='original')+(SELECT count(*) FROM asset_metadata_paths WHERE library='PrimarySync' AND id='asset-h' AND version_size='original')+(SELECT count(*) FROM download_receipts WHERE library='PrimarySync' AND child='asset-h' AND version_size='original')";
+        assert_eq!(query(&f, h_absence), vec![vec![0.into()]]);
+        assert!(!healthy_path.exists());
+        let old_media = historical_watch_media_snapshot(&media);
+        let old_rows_sql = "SELECT * FROM asset_metadata_paths WHERE id='asset-m' AND local_path LIKE '%/A/paired.JPG'";
+        let old_rows = query(&f, old_rows_sql);
+        assert_eq!(old_rows.len(), 1);
+        let receipt_sql = format!(
+            "SELECT * FROM download_receipts WHERE child='asset-m' AND provider_checksum='{}'",
+            checksum(&old)
+        );
+        let immutable_receipt = query(&f, &receipt_sql);
+        let mapping_sql = "SELECT library,asset_record_name,master_record_name FROM asset_master_mappings WHERE asset_record_name='asset-m'";
+        let mapping = query(&f, mapping_sql);
+        assert_eq!(mapping.len(), 1);
+        let canonical_sql = "SELECT checksum,size_bytes,status,local_path,metadata_write_failed_at FROM assets WHERE library='PrimarySync' AND id='asset-m' AND version_size='original'";
+        let old_canonical = query(&f, canonical_sql);
+        let debt_path = media.join("ordering-debt.jpg");
+        let debt_key = key(&debt_path);
+        let debt = ReconciliationReservation {
+            content: Some(ReconciliationContent {
+                checksum: "unrelated-content".into(),
+                size: 17,
+            }),
+            library: "OtherZone".into(),
+            asset_id: "ordering-debt".into(),
+            version_size: VersionSizeKey::Original,
+            requested_path_key: debt_key.clone(),
+            destination_path_key: debt_key,
+            destination_path: debt_path,
+        };
+        f.db.reserve_reconciliation_paths(std::slice::from_ref(&debt), None)
+            .await
+            .unwrap();
+        seed_complete_album_snapshot(&f.db, "A", "A", &[("asset-m", "m"), ("asset-h", "h")]).await;
+        let m = resource("m", "paired.jpg", "changed", &changed);
+        let h = resource("h", "healthy.jpg", "healthy", &old);
+        let expected_hashes: Vec<_> = [&m, &h]
+            .into_iter()
+            .map(|r| {
+                crate::icloud::photos::PhotoAsset::new(r[0].clone(), r[1].clone())
+                    .metadata_arc(VersionSizeKey::Original)
+                    .metadata_hash
+                    .clone()
+                    .unwrap()
+            })
+            .collect();
+        *f.session.records.lock().unwrap() = m.iter().chain(&h).cloned().collect();
+        *f.session.changes_records.lock().unwrap() = vec![m[1].clone(), h[1].clone()];
+        f = reopen_destination_fixture(f).await;
+        f.config.capture_timestamp_repair = CaptureTimestampRepair::ReplaceWithCaptureLocal;
+        assert!(!f.config.refresh_metadata && !f.config.retry_only && f.config.recent.is_none());
+        let passes = std::slice::from_ref(&f.pass);
+        let context = generation::context(passes, &f.config, controls())
+            .await
+            .unwrap();
+        assert!(context.is_none());
+        assert!(matches!(
+            selection::determine_incremental_routing_decision(passes, &f.config, controls()).await,
+            selection::IncrementalRoutingDecision::Safe
+        ));
+        let generations = f.count("provider_active_generations");
+        let initial_ranks = ranks.load(Ordering::SeqCst);
+        let c1 = checksum(&changed);
+        let content = Some(ReconciliationContent {
+            checksum: c1.clone().into(),
+            size: changed.len() as u64,
+        });
+        let changed_choice = |r: &ReconciliationReservation| {
+            r.library.as_ref() == "PrimarySync"
+                && r.asset_id.as_ref() == "asset-m"
+                && r.content == content
+        };
+        let has_choice = format!(
+            "EXISTS(SELECT 1 FROM reconciliation_paths WHERE library='PrimarySync' AND id='asset-m' AND version_size='original' AND provider_checksum='{c1}' AND provider_size={})",
+            changed.len()
+        );
+        let upsert_refusal = if upsert_fault {
+            "SELECT RAISE(ABORT,'ordering upsert_after_choice');"
+        } else {
+            ""
+        };
+        let trigger = format!(
+            "CREATE TRIGGER ordering_upsert BEFORE INSERT ON assets WHEN NEW.library='PrimarySync' AND NEW.id='asset-m' AND NEW.checksum='{c1}' BEGIN SELECT CASE WHEN NOT {has_choice} THEN RAISE(ABORT,'ordering missing choice') END; {upsert_refusal} END;"
+        );
+        execute(&f, &trigger);
+        if reservation_fault {
+            let (id, hash, size) = if case == "bound_choice_insert" {
+                ("asset-m", c1.clone(), changed.len())
+            } else {
+                ("asset-h", checksum(&old), old.len())
+            };
+            let fault = format!(
+                "CREATE TRIGGER ordering_reservation BEFORE INSERT ON reconciliation_paths WHEN NEW.library='PrimarySync' AND NEW.id='{id}' AND NEW.version_size='original' AND NEW.provider_checksum='{hash}' AND NEW.provider_size={size} BEGIN SELECT CASE WHEN NEW.id='asset-h' AND NOT {has_choice} THEN RAISE(ABORT,'ordering missing committed choice') END; SELECT RAISE(ABORT,'ordering {case}'); END;"
+            );
+            execute(&f, &fault);
+            eprintln!("ORDERING_INCREMENTAL_CALL {case}");
+            let error = incremental::download_photos_incremental(
+                &reqwest::Client::new(),
+                passes,
+                &Arc::new(f.config.clone()),
+                "old-cursor",
+                controls(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(&format!("ordering {case}")));
+        } else {
+            let result = public(&f).await.unwrap();
+            eprintln!("ORDERING_RESULT {case} {result:?}");
+            assert_eq!(result.stats.downloaded, downloaded);
+            assert_eq!(
+                result.checkpoint.state_write_failures,
+                usize::from(upsert_fault)
+            );
+            if case == "healthy" {
+                assert_eq!(ranks.load(Ordering::SeqCst), initial_ranks);
+            }
+        }
+        f = reopen_destination_fixture(f).await;
+        let reservations = f.db.get_reconciliation_reservations().await.unwrap();
+        assert!(reservations.contains(&debt));
+        let choices: Vec<_> = reservations.iter().filter(|r| changed_choice(r)).collect();
+        assert_eq!(choices.len(), usize::from(case != "bound_choice_insert"));
+        let committed = choices.first().map(|r| (**r).clone());
+        if let Some(choice) = &committed {
+            assert_ne!(choice.destination_path, original);
+            assert!(choice.destination_path.starts_with(&*media));
+            let expected = ReconciliationReservation {
+                content: content.clone(),
+                library: "PrimarySync".into(),
+                asset_id: "asset-m".into(),
+                version_size: VersionSizeKey::Original,
+                requested_path_key: key(&original),
+                destination_path_key: key(&choice.destination_path),
+                destination_path: choice.destination_path.clone(),
+            };
+            assert_eq!(choice, &expected);
+        }
+        let healthy_intents = reservations
+            .iter()
+            .filter(|r| r.asset_id.as_ref() == "asset-h")
+            .count();
+        assert_eq!(healthy_intents, usize::from(!reservation_fault));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1 + downloaded);
+        assert_eq!(identity(&original), old_identity);
+        assert_eq!(query(&f, &receipt_sql), immutable_receipt);
+        assert_eq!(query(&f, old_rows_sql), old_rows);
+        assert_eq!(query(&f, mapping_sql), mapping);
+        let current_media = historical_watch_media_snapshot(&media);
+        for row in old_media.iter().filter(|row| !row.1) {
+            assert!(current_media.contains(row));
+        }
+        let prefix_th = if reservation_fault {
+            assert_eq!(query(&f, h_absence), vec![vec![0.into()]]);
+            assert!(!healthy_path.exists());
+            None
+        } else {
+            receipt(&f, "h", &old, &healthy_path).await;
+            Some(current_debt(&f, "h", &old, &healthy_path))
+        };
+        if case != "healthy" {
+            let mut expected = old_canonical.clone();
+            if case == "ordinary_insert_after_choice" {
+                expected[0][0] = c1.clone().into();
+                expected[0][1] = (changed.len() as i64).into();
+                expected[0][2] = "pending".to_owned().into();
+            }
+            assert_eq!(query(&f, canonical_sql), expected);
+            f.preserved().await;
+            let fault = match case {
+                "upsert_after_choice" => "ordering_upsert",
+                _ => "ordering_reservation",
+            };
+            execute(&f, &format!("DROP TRIGGER {fault}"));
+            let before_recovery = ranks.load(Ordering::SeqCst);
+            let recovered = public(&f).await.unwrap();
+            assert_eq!(recovered.stats.downloaded, 2 - usize::from(upsert_fault));
+            assert_eq!(recovered.checkpoint.state_write_failures, 0);
+            assert_eq!(ranks.load(Ordering::SeqCst), before_recovery);
+        }
+        f = reopen_destination_fixture(f).await;
+        let reservations = f.db.get_reconciliation_reservations().await.unwrap();
+        assert!(reservations.contains(&debt));
+        let choice = reservations.iter().find(|r| changed_choice(r)).unwrap();
+        assert_eq!(identity(&original), old_identity);
+        if let Some(committed) = committed {
+            assert_eq!(choice, &committed);
+        }
+        assert_ne!(choice.destination_path, original);
+        for (id, bytes, path) in [
+            ("m", &old, original.clone()),
+            ("m", &changed, choice.destination_path.clone()),
+            ("h", &old, media.join("A/healthy.JPG")),
+        ] {
+            receipt(&f, id, bytes, &path).await;
+        }
+        assert_eq!(f.count("download_receipts"), 3);
+        assert_eq!(
+            current_debt(&f, "m", &changed, &choice.destination_path),
+            tm
+        );
+        let th = current_debt(&f, "h", &old, &healthy_path);
+        if let Some(prefix_th) = prefix_th {
+            assert_eq!(th, prefix_th);
+        }
+        assert_eq!(query(&f, old_rows_sql), old_rows);
+        let marker_truth = format!(
+            "SELECT count(*) FROM assets a JOIN asset_metadata_paths p ON p.library=a.library AND p.id=a.id AND p.version_size=a.version_size AND p.local_path=a.local_path WHERE a.library='PrimarySync' AND a.id IN ('asset-m','asset-h') AND a.version_size='original' AND a.status='downloaded' AND a.download_attempts=0 AND a.last_error IS NULL AND a.metadata_hash=CASE a.id WHEN 'asset-m' THEN '{}' ELSE '{}' END AND a.capture_repair_metadata_hash=a.metadata_hash AND a.capture_repair_output_checksum IS NULL AND a.capture_repair_output_size IS NULL AND p.capture_repair_metadata_hash=a.metadata_hash AND p.capture_repair_output_checksum IS NULL AND p.capture_repair_output_size IS NULL",
+            expected_hashes[0], expected_hashes[1]
+        );
+        assert_eq!(query(&f, &marker_truth), vec![vec![2.into()]]);
+        let stable_media = historical_watch_media_snapshot(&media);
+        let identities: Vec<_> = stable_media
+            .iter()
+            .filter(|r| !r.1)
+            .map(|r| (r.0.clone(), identity(&media.join(&r.0))))
+            .collect();
+        let debt_sql = "SELECT a.library,a.id,a.version_size,a.local_path,a.checksum,a.size_bytes,a.metadata_write_failed_at,p.local_path,p.provider_checksum,p.metadata_write_failed_at FROM assets a JOIN asset_metadata_paths p ON p.library=a.library AND p.id=a.id AND p.version_size=a.version_size WHERE a.library='PrimarySync' AND a.id IN ('asset-m','asset-h') AND a.version_size='original' ORDER BY a.id,p.local_path";
+        let stable_debts = query(&f, debt_sql);
+        assert_eq!(stable_debts.len(), 3);
+        let stable_assets = f.queue();
+        let receipts_sql = "SELECT * FROM download_receipts ORDER BY id";
+        let stable_receipts = query(&f, receipts_sql);
+        let quiet_lookups = lookups.load(Ordering::SeqCst);
+        let quiet_ranks = ranks.load(Ordering::SeqCst);
+        f.session.changes_records.lock().unwrap().clear();
+        for _ in 0..2 {
+            f = reopen_destination_fixture(f).await;
+            let quiet = public(&f).await.unwrap();
+            assert_eq!(quiet.stats.downloaded, 0);
+            assert_eq!(quiet.checkpoint.state_write_failures, 0);
+            assert_eq!(historical_watch_media_snapshot(&media), stable_media);
+            for (path, expected) in &identities {
+                assert_eq!(identity(&media.join(path)), *expected);
+            }
+            assert_eq!(query(&f, old_rows_sql), old_rows);
+            assert_eq!(query(&f, &receipt_sql), immutable_receipt);
+            assert_eq!(query(&f, mapping_sql), mapping);
+            assert_eq!(query(&f, &marker_truth), vec![vec![2.into()]]);
+            assert_eq!(query(&f, debt_sql), stable_debts);
+            assert_eq!(f.queue(), stable_assets);
+            assert_eq!(query(&f, receipts_sql), stable_receipts);
+            let actual = f.db.get_reconciliation_reservations().await.unwrap();
+            assert_eq!(actual, reservations);
+            f.preserved().await;
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        assert_eq!(lookups.load(Ordering::SeqCst), quiet_lookups);
+        assert_eq!(ranks.load(Ordering::SeqCst), quiet_ranks);
+        assert_eq!(f.count("provider_active_generations"), generations);
+        let observed_cursors = cursors.lock().unwrap();
+        assert!(!observed_cursors.is_empty());
+        let all_old = observed_cursors
+            .iter()
+            .all(|c| c.as_deref() == Some("old-cursor"));
+        assert!(all_old);
+        eprintln!("ORDERING_CASE {case} PASS");
+    }
+}
+
 #[tokio::test]
 async fn collecting_scoped_paired_change_preserves_child_and_receipts_after_reopen() {
     use sha2::{Digest, Sha256};
