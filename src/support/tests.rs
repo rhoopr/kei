@@ -64,7 +64,7 @@ fn snapshot_concurrency_matches_runtime_configuration() {
         let Ok(parsed) = toml::from_str::<crate::config::TomlConfig>(&body) else {
             assert!(expected.is_none());
             assert!(super::configuration(Err(()), true)["threads"].is_null());
-            eprintln!("SNAPSHOT_CONCURRENCY_RUNTIME case={index} input=unparseable threads=null");
+            eprintln!("SNAPSHOT_CONCURRENCY_RUNTIME case={index} input=unparsable threads=null");
             continue;
         };
         let projected = super::configuration(Ok(Some(&parsed)), true);
