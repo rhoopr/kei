@@ -710,6 +710,15 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
         files
     };
 
+    let json_rows = |conn: &rusqlite::Connection, sql: &str| -> Vec<serde_json::Value> {
+        let mut statement = conn.prepare(sql).unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+            .collect()
+    };
+
     let legacy_snapshot = |database: &std::path::Path| {
         let conn = rusqlite::Connection::open(database).unwrap();
         [
@@ -757,7 +766,18 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
         Mock::given(method("GET"))
             .and(path("/valid.jpg"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
-            .expect(u64::try_from(size).unwrap())
+            .expect(
+                u64::try_from(
+                    size + usize::from(
+                        recent.is_none()
+                            && !matches!(
+                                evidence,
+                                EvidenceCase::DeletedDelta | EvidenceCase::HardDeletedDelta
+                            ),
+                    ),
+                )
+                .unwrap(),
+            )
             .mount(&server)
             .await;
         let valid: Vec<_> = (0..size)
@@ -937,6 +957,13 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             }
         }
         let before = snapshot_files(&media);
+        let recovered_path = media
+            .join(run_cycle_expected_date_dir())
+            .join(if size == 1 {
+                "cGhvdG8uanBn-unresolved-child.JPG"
+            } else {
+                "cGhvdG8uanBn.JPG"
+            });
         let legacy_before = (evidence == EvidenceCase::Sparse).then(|| legacy_snapshot(&database));
         if let Some(rows) = &legacy_before {
             assert_eq!(
@@ -962,7 +989,10 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
         let mut quiet_counts = None;
         let mut quiet_debt = None;
         let mut quiet_state = None;
-        for cycle in 0..(5
+        let mut recovered_receipts_snapshot = None;
+        let mut recovered_destinations_snapshot = None;
+        let mut expected_media_gets = 0usize;
+        for cycle in 0..(6
             + usize::from(marker_failure)
             + usize::from(deletion_delta)
             + usize::from(extra_quiet))
@@ -972,6 +1002,8 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                 .saturating_sub(usize::from(extra_quiet && cycle >= 3));
             let fail_marker = marker_failure && cycle == 0;
             let fail_deletion = deletion_delta && phase == 3;
+            let recovery_publication =
+                phase == recovery_phase && recent.is_none() && !deletion_delta;
             let inner = Arc::new(
                 state::SqliteStateDb::open_owned(&database, &owner)
                     .await
@@ -1504,9 +1536,154 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
                     "healthy materialization never clears unrelated source identity debt"
                 );
             }
+            {
+                let conn = inner.acquire_lock("verify recovered receipt").unwrap();
+                let receipts = json_rows(
+                    &conn,
+                    "SELECT json_array(account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,json(native_path),source_checksum,local_checksum) FROM download_receipts WHERE library='PrimarySync' AND (child='unresolved-child' OR master='recovered') ORDER BY child,master",
+                );
+                let valid = json_rows(
+                    &conn,
+                    "SELECT json_array(account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,json(native_path),source_checksum,local_checksum) FROM download_receipts WHERE library='PrimarySync' AND child LIKE 'asset-valid-new%' ORDER BY child,master",
+                );
+                let destinations = json_rows(
+                    &conn,
+                    "SELECT json_array(d.generation,g.account_key,g.provider_key,g.scope,d.pass_key,d.child,d.master,d.version_size,json(d.path),d.checksum,d.size_bytes,d.admitted,d.verified_media,d.verified_metadata,d.source_checksum,d.local_checksum,d.metadata_hash) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.library='PrimarySync' AND (d.child='unresolved-child' OR d.master='recovered') ORDER BY d.generation,d.pass_key,d.version_size",
+                );
+                drop(conn);
+                let mut valid_sorted = valid.clone();
+                valid_sorted.sort_by_key(|value| value.to_string());
+                if let Some(prior) = &selected_receipts {
+                    let mut prior_sorted = prior.clone();
+                    prior_sorted.sort_by_key(|value| value.to_string());
+                    assert_eq!(
+                        valid_sorted, prior_sorted,
+                        "previously published valid receipt changed"
+                    );
+                } else {
+                    selected_receipts = Some(valid.clone());
+                }
+                if phase == recovery_phase && recent.is_none() && !deletion_delta {
+                    assert_eq!(
+                        destinations.len(),
+                        1,
+                        "one recovered destination recent={recent:?} evidence={evidence:?} size={size} cycle={cycle} phase={phase} stats={:?}",
+                        result.stats
+                    );
+                    assert_eq!(
+                        receipts.len(),
+                        1,
+                        "one recovered receipt recent={recent:?} evidence={evidence:?} size={size} cycle={cycle} phase={phase} stats={:?}",
+                        result.stats
+                    );
+                    let destination = destinations[0].as_array().unwrap();
+                    let receipt = receipts[0].as_array().unwrap();
+                    let (expected_account, expected_provider) = owner.authenticated_keys().unwrap();
+                    let expected_scope = crate::icloud::photos::inbox::ShadowCapture::new(
+                        inner.clone(),
+                        owner.clone(),
+                        "com",
+                    )
+                    .scope(
+                        "private",
+                        &serde_json::json!({
+                            "zoneName": "PrimarySync",
+                            "ownerRecordName": "_defaultOwner"
+                        }),
+                    )
+                    .unwrap();
+                    let expected_pass = format!(
+                        "{:x}",
+                        Sha256::digest(
+                            serde_json::json!({
+                                "kind": format!("{:?}", primary.plan.passes[0].kind),
+                                "scope": primary.plan.passes[0].album.selection_scope(),
+                                "excludes": Vec::<String>::new(),
+                            })
+                            .to_string()
+                            .as_bytes()
+                        )
+                    );
+                    let content_hash = format!("{:x}", Sha256::digest(&bytes));
+                    assert!(!destination[0].as_str().unwrap_or_default().is_empty());
+                    let expected_destination = serde_json::json!([
+                        destination[0],
+                        expected_account,
+                        expected_provider,
+                        expected_scope.clone(),
+                        expected_pass.clone(),
+                        "unresolved-child",
+                        "recovered",
+                        "original",
+                        crate::state::db::provider_selection::SelectionPath::from_path(
+                            &recovered_path
+                        ),
+                        checksum.clone(),
+                        bytes.len(),
+                        1,
+                        1,
+                        1,
+                        content_hash.clone(),
+                        content_hash.clone(),
+                    ]);
+                    assert_eq!(&destination[..16], expected_destination.as_array().unwrap());
+                    assert_eq!(&receipt[0..3], &destination[1..4]);
+                    assert_eq!(receipt[4], destination[5]);
+                    assert_eq!(receipt[5], destination[6]);
+                    assert_eq!(receipt[6], destination[5]);
+                    assert_eq!(receipt[7], destination[4]);
+                    assert_eq!(receipt[8], destination[7]);
+                    assert_eq!(receipt[9], destination[9]);
+                    assert_eq!(receipt[10], destination[10]);
+                    assert_eq!(receipt[11], destination[8]);
+                    assert_eq!(receipt[12], destination[14]);
+                    assert_eq!(receipt[13], destination[15]);
+                    recovered_destinations_snapshot = Some(destinations.clone());
+                    recovered_receipts_snapshot = Some(receipts.clone());
+                } else if phase > recovery_phase && recent.is_none() && !deletion_delta {
+                    assert_eq!(
+                        Some(&destinations),
+                        recovered_destinations_snapshot.as_ref(),
+                        "recovered destination changed after recovery"
+                    );
+                    assert_eq!(
+                        Some(&receipts),
+                        recovered_receipts_snapshot.as_ref(),
+                        "recovered receipt changed after recovery"
+                    );
+                } else {
+                    assert!(
+                        receipts.is_empty() && destinations.is_empty(),
+                        "held, deleted or recent-only identity has recovered state: {receipts:?} {destinations:?}"
+                    );
+                }
+            }
+            let media_gets = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.url.path() == "/valid.jpg")
+                .count();
+            if cycle == 0 {
+                expected_media_gets += size;
+            }
+            if recovery_publication {
+                expected_media_gets += 1;
+            }
+            assert_eq!(
+                media_gets, expected_media_gets,
+                "recent={recent:?} evidence={evidence:?} cycle={cycle} phase={phase}"
+            );
             assert_eq!(
                 result.stats.downloaded,
-                if cycle == 0 { size } else { 0 },
+                if cycle == 0 {
+                    size
+                } else if recovery_publication {
+                    1
+                } else {
+                    0
+                },
                 "recent={recent:?} evidence={evidence:?} cycle={cycle}: {:?}",
                 result.stats
             );
@@ -1516,7 +1693,22 @@ async fn unresolved_identity_survives_restart_and_other_zone_success_then_recove
             }
             if cycle == 0 {
                 assert!(files.values().any(|contents| contents == &bytes));
-                after_download = Some(files);
+                after_download = Some(files.clone());
+            }
+            if recovery_publication {
+                assert_eq!(
+                    files.len(),
+                    after_download.as_ref().unwrap().len() + 1,
+                    "successful recovery must add exactly one branch-scoped file"
+                );
+                assert_eq!(std::fs::read(&recovered_path).unwrap(), bytes);
+                let prior = after_download.as_ref().unwrap();
+                assert!(
+                    prior
+                        .iter()
+                        .all(|(path, contents)| files.get(path) == Some(contents))
+                );
+                after_download = Some(files.clone());
             } else {
                 assert_eq!(Some(files), after_download);
             }
