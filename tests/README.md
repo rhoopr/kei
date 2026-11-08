@@ -298,52 +298,32 @@ fixtures use synthetic provider data and media, not a reporter-state replay.
 
 ### Mixed library provider response equivalence
 
-The current-child seed records verified source explicitly; historical legacy and
-other generic receipts keep unknown source. The fixture asserts these initial
-source facts before running its unchanged progress and preservation oracles.
+The current-child seed records verified source rows explicitly. Historical B/C numbered metadata-path records and legacy records keep unknown source. The fixture asserts these initial facts before its progress and preservation oracles.
 
-`mixed_library_provider_shapes` composes long-lived synthetic families in two
-zones with reused raw IDs, distinct dates and checksums, independent current
-children, unattributed legacy files, and numbered Live Photo publications in
-two zone-local albums. Two fixed histories each run six production cycles through
-`run_cycle`, reopening real SQLite after every cycle. One withholds the final
-inventory while another zone progresses; the other changes still-only selection
-to both renditions and changes album selection and order during identity debt.
-Both retain complete-evidence recovery and two quiet cycles. The recovery
-cycle makes any synthetic discovery retry eligible by changing only its due
-timestamp; it retains the retry signature, identity debt and all receipts.
-This models elapsed scheduling time without sleeping or bypassing proof gates.
+The test uses synthetic provider payloads and PhotosSession doubles. It drives actual owned SQLite, capture and format-2 production entrypoints; it is not live-provider verification.
 
-Each history runs through baseline responses, independent-family reordering and
-alternate page cuts, then those same cuts with exact duplicate observations and
-an empty continuation page. These are equivalent snapshots, not reordered causal
-updates or tombstones. Normalized state comparisons include identity, ownership,
-publication receipts, membership, retry and deletion state, and active and staged
-zone checkpoints. Independent oracles check legacy bytes, existing numbered paths,
-new-child ownership and subsequent stability, request bounds, and quiet hydration,
-download, metadata-repair and file counts. New collision suffix spelling is not
-part of response equivalence. Mock-server bind failures fail the test.
+`mixed_library_provider_shapes` runs two histories (`IncompleteInventory`, `SelectionChange`) through three response encodings (`Baseline`, `PageCuts`, `DuplicateEmpty`). Each combination runs one priming cycle plus six cycles through `run_cycle`, so the full parent performs 42 production cycle invocations and 12 owned SQLite-reopened tail observations.
 
-The cap is 36 production cycles per feature configuration. Replay JSON selects
-one complete six-cycle history and encoding; a non-baseline encoding also runs its
-baseline, for at most 12 cycles. It preserves prerequisites and recovery/quiet
-tails; no fault-deleting reducer is applied to these fixed histories:
+`IncompleteInventory` serves all logical change record pages, then its terminal changes page omits the successor in cycles 0 and 1 for `PrimarySync` while `SharedSync-MIXED` progresses. Recovery follows the synthetic fault only: no new selected-album admission is invented, and both reopened tails have zero pending rows and zero lookups. This history does not combine the missing-successor fault with selected Unknown-source refusal.
+
+`SelectionChange` applies the real `ImageOnly` to `Both` app configuration, changes album selection and order from `B` to `C+B` to `B+C`, and keeps exactly four Unknown renditions pending in cycles 1 through 5, with NULL source and no scoped download receipt. No unsupported proof is promoted.
+
+Both reopened tails permit bounded retry lookups only for the exact Unknown asset: child, then child plus master, with exact zone and owner. The cap is 16 lookups per zone and 32 per tail, derived from 2 selected album passes, 2 replay roots, 2 confirmations and 2 lookups. All other work stays quiet: one empty changes delta and three `CheckIndexingState` queries per zone are retained read-only protocol, with no DATA pages, media GETs, metadata repairs, file byte changes, receipt changes or checkpoint changes. No retry is forced by a timestamp; known selected decisions keep zero attempts and zero deadlines.
+
+The frozen graph, provenance and `created_at` stay fixed. Permitted bookkeeping is explicit: replay cursor within the frozen Unknown pass and child universe, monotonic `last_replayed_at`, monotonic diagnostic `observed_at`, and root rotation within the frozen roots. This is not a claim that every diagnostic scalar or file mtime is identical.
+
+Durable state is equivalent across transports, including duplicate and empty page consumption. Collision suffix spelling is not part of equivalence, and this small matrix does not qualify whole-library inventory memory or request cost at production scale.
+
+Replay JSON selects one complete history and encoding. `Baseline` runs one priming plus six cycles, 7 calls. A non-baseline encoding also runs baseline, 14 calls.
 
 ```sh
 KEI_MIXED_REPLAY='{"history":"SelectionChange","encoding":"DuplicateEmpty"}' \
   cargo test --all-features --lib mixed_library_provider_shapes -- --nocapture
 ```
 
-`mixed_numbered_album_mode_transition_repro` reduces the discovered receipt-reuse
-bug to two production cycles, one zone, two album publications, and no legacy or
-identity debt. `mixed_legacy_reservation_blocks_preparation_repro` reduces the
-second bug to one zone and one reconciliation call: missing sibling evidence
-must not create a master reservation, claim an owner, or disqualify later
-preservation. The full history proves subsequent recovery and quiet cycles.
-The existing pagination, tombstone, hidden-sibling, configuration
-reactivation, single-survivor, multi-album and restarted Live Photo proofs remain
-separate lower-level coverage. This small composition matrix does not qualify
-whole-library inventory memory or request cost at production library scale.
+`mixed_numbered_album_mode_transition_repro` keeps two Unknown-source renditions pending as a refusal control, without invented owners, new files or reuse. `mixed_recorded_recovery_preserves_legacy_debt_without_new_reservations` makes one `recover_recorded_sources` call and preserves legacy debt; it does not claim missing sibling ownership.
+
+Pagination, tombstones, hidden siblings, configuration reactivation, single-survivor, multi-album and restarted Live Photo proofs remain separate lower-level coverage.
 
 ### Abrupt process-death recovery
 
