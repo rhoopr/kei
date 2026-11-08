@@ -14,6 +14,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use anyhow::Result;
+use base64::Engine as _;
 use reqwest::Client;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -195,7 +196,6 @@ fn test_set_file_mtime_nonexistent_file() {
 #[tokio::test]
 async fn different_byte_destination_race_keeps_loser_failed_without_metadata_write() {
     use crate::state::{MediaType, SqliteStateDb};
-    use base64::Engine as _;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
 
@@ -377,7 +377,6 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
 
 #[tokio::test]
 async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() {
-    use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
@@ -517,7 +516,6 @@ async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() 
 #[tokio::test]
 async fn unscoped_publication_proof_survives_finalization_and_other_transfer_interruption() {
     use crate::state::db::TempFileOwnershipStore;
-    use base64::Engine as _;
 
     let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
     let client = StaticDownloadClient {
@@ -668,7 +666,6 @@ async fn unscoped_publication_proof_survives_finalization_and_other_transfer_int
 
 #[tokio::test]
 async fn truncated_task_retires_ownership_after_settled_prefix_and_resumes() {
-    use base64::Engine as _;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let exercise = async {
@@ -786,162 +783,928 @@ async fn truncated_task_retires_ownership_after_settled_prefix_and_resumes() {
 }
 
 #[cfg(feature = "xmp")]
-#[tokio::test]
-async fn contract_xmp_gps_accuracy_requires_matching_location_download_and_reopen() {
-    use crate::icloud::photos::PhotoAsset;
-    use crate::state::SqliteStateDb;
-    use base64::Engine as _;
-    use futures_util::stream;
+#[derive(Clone)]
+struct GpsPhotosSession {
+    records: Arc<Vec<serde_json::Value>>,
+    next_token: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(feature = "xmp")]
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for GpsPhotosSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        use std::sync::atomic::Ordering;
+
+        let request: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+            anyhow::anyhow!("invalid Photos request body: {error}; body={body}")
+        })?;
+        if url.contains("/internal/records/query/batch") {
+            anyhow::ensure!(
+                request["batch"].is_array(),
+                "unexpected count request body: {body}"
+            );
+            return Ok(serde_json::json!({
+                "batch": [{"records": [{"fields": {"itemCount": {"value": 1}}}]}]
+            }));
+        }
+        if url.contains("/records/query?") {
+            let zone = request["query"]["zoneID"]["zoneName"]
+                .as_str()
+                .or_else(|| request["zoneID"]["zoneName"].as_str())
+                .ok_or_else(|| anyhow::anyhow!("records/query missing zone: {body}"))?;
+            anyhow::ensure!(zone == "PrimarySync", "records/query wrong zone: {body}");
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
+            let records = if offset == 0 {
+                self.records.as_ref().clone()
+            } else {
+                Vec::new()
+            };
+            return Ok(serde_json::json!({
+                "records": records,
+                "syncToken": "full-token"
+            }));
+        }
+        if url.contains("/changes/zone?") {
+            let zone = request["zones"][0]["zoneID"]["zoneName"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("changes/zone missing zone: {body}"))?;
+            anyhow::ensure!(zone == "PrimarySync", "changes/zone wrong zone: {body}");
+            anyhow::ensure!(
+                request["zones"][0]["syncToken"].is_string(),
+                "changes/zone missing requested token: {body}"
+            );
+            let token = self.next_token.fetch_add(1, Ordering::SeqCst);
+            return Ok(serde_json::json!({
+                "zones": [{
+                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                    "syncToken": format!("delta-token-{token}"),
+                    "moreComing": false,
+                    "records": []
+                }]
+            }));
+        }
+        if url.contains("/records/lookup?") {
+            let zone = request["zoneID"]["zoneName"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("records/lookup missing zone: {body}"))?;
+            anyhow::ensure!(zone == "PrimarySync", "records/lookup wrong zone: {body}");
+            let requested: Vec<&str> = request["records"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|record| record["recordName"].as_str())
+                .collect();
+            anyhow::ensure!(!requested.is_empty(), "records/lookup no names: {body}");
+            let selected: Vec<serde_json::Value> = self
+                .records
+                .iter()
+                .filter(|record| {
+                    requested.contains(&record["recordName"].as_str().unwrap_or_default())
+                })
+                .cloned()
+                .collect();
+            return Ok(serde_json::json!({"records": selected}));
+        }
+        anyhow::bail!("unexpected PhotosSession route: {url}; body={body}")
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(feature = "xmp")]
+fn gps_provider_checksum(source: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    data_encoding::BASE64.encode(&Sha256::digest(source))
+}
+
+#[cfg(feature = "xmp")]
+fn gps_records(source: &[u8], url: &str) -> Vec<serde_json::Value> {
+    use serde_json::json;
+
+    vec![
+        json!({
+            "recordName": "GPS_MASTER",
+            "recordType": "CPLMaster",
+            "fields": {
+                "filenameEnc": {
+                    "value": data_encoding::BASE64.encode(b"source.jpg"),
+                    "type": "STRING"
+                },
+                "resOriginalRes": {
+                    "value": {
+                        "downloadURL": url,
+                        "size": source.len(),
+                        "fileChecksum": gps_provider_checksum(source)
+                    }
+                },
+                "resOriginalWidth": {"value": 100, "type": "INT64"},
+                "resOriginalHeight": {"value": 100, "type": "INT64"},
+                "resOriginalFileType": {"value": "public.jpeg"},
+                "itemType": {"value": "public.jpeg"},
+                "adjustmentRenderType": {"value": 0, "type": "INT64"}
+            },
+            "recordChangeTag": "ct-master"
+        }),
+        json!({
+            "recordName": "asset-GPS_CHILD",
+            "recordType": "CPLAsset",
+            "fields": {
+                "masterRef": {
+                    "value": {
+                        "recordName": "GPS_MASTER",
+                        "zoneID": {"zoneName": "PrimarySync"}
+                    },
+                    "type": "REFERENCE"
+                },
+                "assetDate": {"value": 1736899200000.0, "type": "TIMESTAMP"},
+                "addedDate": {"value": 1736899200000.0, "type": "TIMESTAMP"},
+                "locationLatitude": {"value": 1.5},
+                "locationLongitude": {"value": 2.5}
+            },
+            "recordChangeTag": "ct-asset"
+        }),
+    ]
+}
+
+#[cfg(feature = "xmp")]
+fn gps_pass(
+    db: Arc<crate::state::SqliteStateDb>,
+    owner: crate::state::db::account::AccountOwner,
+    session: GpsPhotosSession,
+) -> crate::commands::AlbumPass {
+    use serde_json::json;
+
+    let mut album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from(""),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({
+                "zoneName": "PrimarySync",
+                "ownerRecordName": "_defaultOwner"
+            })),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(session),
+    );
+    album.set_shadow_capture(
+        crate::icloud::photos::inbox::ShadowCapture::new(db, owner, "com"),
+        Arc::from("private"),
+    );
+    crate::commands::AlbumPass {
+        kind: crate::commands::PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::default(),
+    }
+}
+
+#[cfg(feature = "xmp")]
+fn gps_plain_pass(session: GpsPhotosSession) -> crate::commands::AlbumPass {
+    use serde_json::json;
+
+    let album = crate::icloud::photos::PhotoAlbum::new(
+        crate::icloud::photos::PhotoAlbumConfig {
+            params: Arc::new(std::collections::HashMap::new()),
+            service_endpoint: Arc::from("https://example.com"),
+            name: Arc::from(""),
+            list_type: Arc::from("CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted"),
+            obj_type: Arc::from("CPLAssetByAssetDateWithoutHiddenOrDeleted"),
+            query_filter: None,
+            page_size: 100,
+            zone_id: Arc::new(json!({
+                "zoneName": "PrimarySync",
+                "ownerRecordName": "_defaultOwner"
+            })),
+            retry_config: crate::retry::RetryConfig::default(),
+            container_id: None,
+            cross_zone_sources: Vec::new(),
+        },
+        Box::new(session),
+    );
+    crate::commands::AlbumPass {
+        kind: crate::commands::PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::default(),
+    }
+}
+
+#[cfg(feature = "xmp")]
+fn gps_config(
+    directory: &std::path::Path,
+    db: Arc<crate::state::SqliteStateDb>,
+    pass: &crate::commands::AlbumPass,
+    embed: bool,
+    refresh: bool,
+    sync_mode: crate::download::SyncMode,
+) -> Arc<crate::download::DownloadConfig> {
+    let mut config = crate::download::DownloadConfig::test_default();
+    config.directory = Arc::from(directory);
+    config.library = Arc::from("PrimarySync");
+    config.state_db = Some(db);
+    config.metadata.set_exif_gps = embed;
+    config.metadata.xmp_sidecar = true;
+    config.refresh_metadata = refresh;
+    config.sync_mode = sync_mode;
+    config.concurrent_downloads = 1;
+    Arc::new(config.with_pass(pass))
+}
+
+#[cfg(feature = "xmp")]
+async fn assert_bound_receipt(
+    db: &crate::state::SqliteStateDb,
+    binding: &crate::state::db::PublicationBinding,
+    provider_checksum: &str,
+    source_size: u64,
+    source_checksum: &str,
+    local_checksum: &str,
+    media: &std::path::Path,
+) -> crate::state::db::download_receipts::DownloadReceipt {
+    let receipts = db
+        .bound_download_receipts(
+            binding.clone(),
+            "original".into(),
+            provider_checksum.to_owned(),
+            source_size,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipts.len(), 1);
+    let receipt = receipts.into_iter().next().unwrap();
+    assert_eq!(receipt.account_key, binding.account_key);
+    assert_eq!(receipt.provider_key, binding.provider_key);
+    assert_eq!(receipt.scope, binding.scope);
+    assert_eq!(receipt.library, binding.library);
+    assert_eq!(receipt.child, binding.child);
+    assert_eq!(receipt.master, binding.master);
+    assert_eq!(receipt.state_id, binding.state_id);
+    assert_eq!(receipt.origin_pass, binding.origin_pass);
+    assert_eq!(receipt.version_size, "original");
+    assert_eq!(receipt.provider_checksum, provider_checksum);
+    assert_eq!(receipt.provider_size, source_size);
+    assert_eq!(receipt.native_path.to_path(), media);
+    assert_eq!(receipt.source_checksum, source_checksum);
+    assert_eq!(receipt.local_checksum, local_checksum);
+    receipt
+}
+
+#[cfg(feature = "xmp")]
+struct GpsProof<'a> {
+    binding: &'a crate::state::db::PublicationBinding,
+    pass_key: &'a str,
+    provider_checksum: &'a str,
+    source_size: u64,
+    source_checksum: &'a str,
+    local_checksum: &'a str,
+    media: &'a std::path::Path,
+    metadata_flags: u8,
+}
+
+#[cfg(feature = "xmp")]
+async fn assert_generation(
+    db: &crate::state::SqliteStateDb,
+    binding: &crate::state::db::PublicationBinding,
+    pass_key: &str,
+    metadata_flags: u8,
+    explicit_refresh: Option<bool>,
+) -> serde_json::Value {
+    let conn = db.acquire_lock("gps selection generation").unwrap();
+    let rows: Vec<String> = conn
+        .prepare("SELECT json_object('id',id,'spec',CAST(specification AS TEXT)) FROM provider_active_generations ORDER BY created_at DESC, id DESC")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(!rows.is_empty(), "no selection generation");
+    let latest: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+    let spec: serde_json::Value = serde_json::from_str(latest["spec"].as_str().unwrap()).unwrap();
+    assert_eq!(spec["format"], 2);
+    assert_eq!(spec["metadata_enabled"], true);
+    assert_eq!(spec["metadata_flags"], metadata_flags);
+    assert_eq!(spec["scope"].as_str(), Some(binding.scope.as_str()));
+    assert!(
+        spec["profile"]["passes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pass| pass["key"].as_str() == Some(pass_key)),
+        "generation lost the captured pass key: {spec:?}"
+    );
+    match explicit_refresh {
+        Some(expected) => assert_eq!(
+            spec["profile"]["explicit_metadata_refresh"],
+            i64::from(expected)
+        ),
+        None => assert!(spec["profile"]["explicit_metadata_refresh"].is_null()),
+    }
+    serde_json::json!({"generations": rows.len()})
+}
+
+#[cfg(feature = "xmp")]
+async fn assert_refresh_destination(
+    db: &crate::state::SqliteStateDb,
+    proof: &GpsProof<'_>,
+) -> serde_json::Value {
+    let binding = proof.binding;
+    let pass_key = proof.pass_key;
+    let provider_checksum = proof.provider_checksum;
+    let source_size = proof.source_size;
+    let source_checksum = proof.source_checksum;
+    let local_checksum = proof.local_checksum;
+    let media = proof.media;
+    let metadata_flags = proof.metadata_flags;
+    let path_key = crate::state::db::provider_selection::SelectionPath::from_path(media)
+        .key()
+        .unwrap();
+    let conn = db.acquire_lock("gps refresh destination").unwrap();
+    let row: String = conn
+        .query_row(
+            "SELECT json_object('generation',d.generation,'pass',d.pass_key,'child',d.child,'master',d.master,'state',d.asset_id,'library',d.library,'version',d.version_size,'path',d.path,'checksum',d.checksum,'size',d.size_bytes,'admitted',d.admitted,'verified_media',d.verified_media,'verified_metadata',d.verified_metadata,'source',d.source_checksum,'local',d.local_checksum,'account',g.account_key,'provider',g.provider_key,'scope',g.scope,'metadata_enabled',g.metadata_enabled,'metadata_flags',json_extract(CAST(g.specification AS TEXT),'$.metadata_flags'),'format',json_extract(CAST(g.specification AS TEXT),'$.format'),'explicit_refresh',json_extract(CAST(g.specification AS TEXT),'$.profile.explicit_metadata_refresh')) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.library='PrimarySync' AND d.child=?1 AND d.master=?2 AND d.asset_id=?3 AND d.version_size='original' AND d.pass_key=?4 AND d.path=?5 AND d.checksum=?6 AND d.size_bytes=?7 AND d.admitted=1 ORDER BY d.generation DESC LIMIT 1",
+            rusqlite::params![
+                binding.child,
+                binding.master,
+                binding.state_id,
+                pass_key,
+                path_key,
+                provider_checksum,
+                i64::try_from(source_size).unwrap(),
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&row).unwrap();
+    assert_eq!(value["pass"], pass_key);
+    assert_eq!(value["child"], binding.child);
+    assert_eq!(value["master"], binding.master);
+    assert_eq!(value["state"], binding.state_id);
+    assert_eq!(value["library"], "PrimarySync");
+    assert_eq!(value["version"], "original");
+    assert_eq!(value["path"], path_key);
+    assert_eq!(value["checksum"], provider_checksum);
+    assert_eq!(value["size"], source_size);
+    assert_eq!(value["admitted"], 1);
+    assert_eq!(value["verified_media"], 1);
+    assert_eq!(value["verified_metadata"], 1);
+    assert_eq!(value["source"], source_checksum);
+    assert_eq!(value["local"], local_checksum);
+    assert_eq!(value["account"], binding.account_key);
+    assert_eq!(value["provider"], binding.provider_key);
+    assert_eq!(value["scope"], binding.scope);
+    assert_eq!(value["metadata_enabled"], 1);
+    assert_eq!(value["metadata_flags"], metadata_flags);
+    assert_eq!(value["format"], 2);
+    assert_eq!(value["explicit_refresh"], 1);
+    let generation = value["generation"].as_str().unwrap();
+    let decisions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3 AND admission='admitted' AND outcome='selected'",
+            rusqlite::params![generation, pass_key, binding.child],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(decisions, 1);
+    value
+}
+
+#[cfg(feature = "xmp")]
+async fn preserved_path_count(db: &crate::state::SqliteStateDb) -> i64 {
+    db.acquire_lock("gps preserved path count")
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM asset_metadata_paths WHERE preserved_path_key IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[cfg(feature = "xmp")]
+async fn gps_bound_case(native_location: bool, embed: bool) {
+    use crate::download::pipeline::test_support::sidecar_path_for;
+    use crate::state::db::PublicationBinding;
+    use crate::state::db::account::AccountOwner;
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::method;
     use wiremock::{Mock, ResponseTemplate};
     use xmp_toolkit::{XmpMeta, xmp_ns};
 
-    for (native_location, embed) in [(false, true), (true, false), (true, true)] {
-        let source = if native_location {
-            crate::test_helpers::minimal_jpeg_with_source_gps_and_location()
-        } else {
-            crate::test_helpers::minimal_jpeg_with_source_gps()
-        };
-        let original_checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(&source));
-        let server = crate::start_wiremock_or_skip!();
-        Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_bytes(source.clone())
-                    .insert_header("content-type", "image/jpeg"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let asset = PhotoAsset::new(
-            json!({
-                "recordName": "GPS_MASTER",
-                "fields": {
-                    "filenameEnc": {"value": "source.jpg", "type": "STRING"},
-                    "itemType": {"value": "public.jpeg"},
-                    "resOriginalRes": {"value": {
-                        "size": source.len(), "downloadURL": format!("{}/source.jpg", server.uri()),
-                        "fileChecksum": base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&source))
-                    }},
-                    "resOriginalFileType": {"value": "public.jpeg"}
-                }
-            }),
-            json!({
-                "recordName": "asset-GPS_CHILD",
-                "fields": {
-                    "assetDate": {"value": 1736899200000.0},
-                    "locationLatitude": {"value": 1.5}, "locationLongitude": {"value": 2.5}
-                }
-            }),
+    let source = if native_location {
+        crate::test_helpers::minimal_jpeg_with_source_gps_and_location()
+    } else {
+        crate::test_helpers::minimal_jpeg_with_source_gps()
+    };
+    let original_checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(&source));
+    let provider_checksum = gps_provider_checksum(&source);
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(source.clone())
+                .insert_header("content-type", "image/jpeg"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = TempDir::new().unwrap();
+    let media_dir = dir.path().join("downloads");
+    let db_path = dir.path().join("state.db");
+    let owner = AccountOwner::authenticated(
+        "writer@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"synthetic-gps-normal"}})).unwrap(),
+    )
+    .unwrap();
+    let records = Arc::new(gps_records(
+        &source,
+        &format!("{}/source.jpg", server.uri()),
+    ));
+    let session = GpsPhotosSession {
+        records: Arc::clone(&records),
+        next_token: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+    };
+    let db = Arc::new(
+        crate::state::SqliteStateDb::open_owned(&db_path, &owner)
+            .await
+            .unwrap(),
+    );
+    let pass = gps_pass(db.clone(), owner.clone(), session.clone());
+    let config = gps_config(
+        &media_dir,
+        db.clone(),
+        &pass,
+        embed,
+        false,
+        crate::download::SyncMode::Full,
+    );
+    let pass_key = config.primary_layout_pass.clone().unwrap().to_string();
+    let initial = crate::download::download_photos_with_sync(
+        &Client::new(),
+        std::slice::from_ref(&pass),
+        config.clone(),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(initial.stats.downloaded, 1, "{initial:?}");
+    assert_eq!(initial.stats.failed, 0, "{initial:?}");
+    assert_eq!(initial.stats.exif_failures, 0, "{initial:?}");
+    assert_eq!(initial.stats.state_write_failures, 0, "{initial:?}");
+    assert!(initial.full_enumeration_ran, "{initial:?}");
+    let initial_token = initial.sync_token.clone().expect("initial full boundary");
+    let asset = crate::icloud::photos::PhotoAsset::new(records[0].clone(), records[1].clone())
+        .with_source_zone(Arc::from("PrimarySync"))
+        .with_state_record_name(Arc::from("asset-GPS_CHILD"));
+    let rows = db.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].download_checksum.as_deref(),
+        Some(original_checksum.as_str())
+    );
+    let media = rows[0].local_path.as_ref().unwrap().clone();
+    let sidecar = sidecar_path_for(&media);
+    let media_bytes = fs::read(&media).unwrap();
+    let sidecar_bytes = fs::read(&sidecar).unwrap();
+    if native_location {
+        assert_eq!(media_bytes, source);
+    } else {
+        assert_ne!(media_bytes, source);
+    }
+    let local_checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(&media_bytes));
+    assert_eq!(original_checksum == local_checksum, native_location);
+    let xmp: XmpMeta = fs::read_to_string(&sidecar).unwrap().parse().unwrap();
+    assert_eq!(
+        xmp.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
+        native_location
+    );
+    let native = crate::download::metadata::read_source_gps(&media).unwrap();
+    assert!(native.horizontal_positioning_error.is_some());
+    let (capture, scope, _zone) = pass
+        .album
+        .publication_scope("PrimarySync")
+        .unwrap()
+        .unwrap();
+    drop(capture);
+    let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+    let binding = PublicationBinding {
+        account_key: account_key.to_owned(),
+        provider_key: provider_key.to_owned(),
+        scope,
+        library: "PrimarySync".into(),
+        child: asset.asset_record_name().into(),
+        master: asset.id().into(),
+        state_id: asset.state_id().into(),
+        origin_pass: pass_key.clone(),
+    };
+    let metadata_flags = crate::download::pipeline::MetadataFlags::from(config.as_ref()).bits();
+    let proof = GpsProof {
+        binding: &binding,
+        pass_key: &pass_key,
+        provider_checksum: &provider_checksum,
+        source_size: source.len() as u64,
+        source_checksum: &original_checksum,
+        local_checksum: &local_checksum,
+        media: &media,
+        metadata_flags,
+    };
+    let receipt = assert_bound_receipt(
+        &db,
+        &binding,
+        &provider_checksum,
+        source.len() as u64,
+        &original_checksum,
+        &local_checksum,
+        &media,
+    )
+    .await;
+    assert_generation(&db, &binding, &pass_key, metadata_flags, None).await;
+    assert_eq!(preserved_path_count(&db).await, 0);
+    db.record_metadata_write_failure("PrimarySync", asset.state_id(), "original")
+        .await
+        .unwrap();
+    assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
+    drop(pass);
+    drop(config);
+    drop(db);
+
+    let db = Arc::new(
+        crate::state::SqliteStateDb::open_owned(&db_path, &owner)
+            .await
+            .unwrap(),
+    );
+    let pass = gps_pass(db.clone(), owner.clone(), session.clone());
+    let config = gps_config(
+        &media_dir,
+        db.clone(),
+        &pass,
+        embed,
+        false,
+        crate::download::SyncMode::Incremental {
+            zone_sync_token: initial_token.clone(),
+        },
+    );
+    assert_eq!(
+        config.primary_layout_pass.as_deref(),
+        Some(pass_key.as_str())
+    );
+    let delta = crate::download::download_photos_with_sync(
+        &Client::new(),
+        std::slice::from_ref(&pass),
+        config.clone(),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(delta.stats.downloaded, 0, "{delta:?}");
+    assert_eq!(delta.stats.failed, 0, "{delta:?}");
+    assert_eq!(delta.stats.exif_failures, 0, "{delta:?}");
+    assert_eq!(delta.stats.state_write_failures, 0, "{delta:?}");
+    assert!(!delta.full_enumeration_ran, "{delta:?}");
+    assert!(delta.checkpoint.completed_delta_replay, "{delta:?}");
+    assert!(delta.sync_token.is_some(), "{delta:?}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 1);
+    assert_eq!(fs::read(&media).unwrap(), media_bytes);
+    assert_eq!(fs::read(&sidecar).unwrap(), sidecar_bytes);
+    let current: XmpMeta = fs::read_to_string(&sidecar).unwrap().parse().unwrap();
+    assert_eq!(
+        current.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
+        native_location
+    );
+    assert_bound_receipt(
+        &db,
+        &binding,
+        &provider_checksum,
+        source.len() as u64,
+        &original_checksum,
+        &local_checksum,
+        &media,
+    )
+    .await;
+    assert_generation(&db, &binding, &pass_key, metadata_flags, None).await;
+    assert_eq!(preserved_path_count(&db).await, 0);
+    drop(pass);
+    drop(config);
+    drop(db);
+
+    let db = Arc::new(
+        crate::state::SqliteStateDb::open_owned(&db_path, &owner)
+            .await
+            .unwrap(),
+    );
+    let pass = gps_pass(db.clone(), owner.clone(), session.clone());
+    let config = gps_config(
+        &media_dir,
+        db.clone(),
+        &pass,
+        embed,
+        true,
+        crate::download::SyncMode::Full,
+    );
+    assert_eq!(
+        config.primary_layout_pass.as_deref(),
+        Some(pass_key.as_str())
+    );
+    let refresh = crate::download::download_photos_with_sync(
+        &Client::new(),
+        std::slice::from_ref(&pass),
+        config.clone(),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refresh.stats.downloaded, 0, "{refresh:?}");
+    assert_eq!(refresh.stats.failed, 0, "{refresh:?}");
+    assert_eq!(refresh.stats.exif_failures, 0, "{refresh:?}");
+    assert_eq!(refresh.stats.state_write_failures, 0, "{refresh:?}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert!(
+        db.get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fs::read(&media).unwrap(), media_bytes);
+    assert_eq!(fs::read(&sidecar).unwrap(), sidecar_bytes);
+    let current: XmpMeta = fs::read_to_string(&sidecar).unwrap().parse().unwrap();
+    assert_eq!(
+        current.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
+        native_location
+    );
+    let refreshed_receipt = assert_bound_receipt(
+        &db,
+        &binding,
+        &provider_checksum,
+        source.len() as u64,
+        &original_checksum,
+        &local_checksum,
+        &media,
+    )
+    .await;
+    assert_eq!(refreshed_receipt, receipt);
+    let refresh_generation =
+        assert_generation(&db, &binding, &pass_key, metadata_flags, Some(true)).await;
+    let refresh_destination = assert_refresh_destination(&db, &proof).await;
+    assert_eq!(preserved_path_count(&db).await, 0);
+    let refresh_token = refresh.sync_token.clone().expect("refresh boundary");
+    eprintln!(
+        "GPS_NORMAL_ONE_CASE pass_key={pass_key} initial_token={initial_token:?} delta_token={:?} refresh_token={refresh_token:?} receipt={receipt:?} refresh_generation={refresh_generation} refresh_destination={refresh_destination}",
+        delta.sync_token
+    );
+    drop(pass);
+    drop(config);
+    drop(db);
+
+    let mut quiet_token = refresh_token;
+    for quiet in 0..2 {
+        let db = Arc::new(
+            crate::state::SqliteStateDb::open_owned(&db_path, &owner)
+                .await
+                .unwrap(),
         );
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("state.db");
-        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
-        let download_dir = dir.path().join("downloads");
-        let mut config = DownloadConfig::test_default();
-        config.directory = Arc::from(download_dir.as_path());
-        config.metadata.set_exif_gps = embed;
-        config.metadata.xmp_sidecar = true;
-        config.state_db = Some(db.clone());
-        let config = Arc::new(config);
-        let result = stream_and_download_from_stream(
+        let pass = gps_pass(db.clone(), owner.clone(), session.clone());
+        let config = gps_config(
+            &media_dir,
+            db.clone(),
+            &pass,
+            embed,
+            false,
+            crate::download::SyncMode::Incremental {
+                zone_sync_token: quiet_token.clone(),
+            },
+        );
+        assert_eq!(
+            config.primary_layout_pass.as_deref(),
+            Some(pass_key.as_str())
+        );
+        let quiet_result = crate::download::download_photos_with_sync(
             &Client::new(),
-            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
-            &config,
+            std::slice::from_ref(&pass),
+            config.clone(),
             DownloadControls::download_hidden(),
-            1,
             CancellationToken::new(),
-            StreamRuntime::new(None, None),
         )
         .await
         .unwrap();
-        assert_eq!(result.downloaded, 1);
-        assert!(result.failed.is_empty());
-        assert_eq!(result.exif_failures, 0);
-        let rows = db.get_downloaded_page(0, 10).await.unwrap();
-        assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].download_checksum.as_deref(),
-            Some(original_checksum.as_str())
+            quiet_result.stats.downloaded, 0,
+            "quiet {quiet}: {quiet_result:?}"
         );
-        let media = rows[0].local_path.as_ref().unwrap().clone();
-        let sidecar = sidecar_path_for(&media);
-        let xmp: XmpMeta = fs::read_to_string(&sidecar).unwrap().parse().unwrap();
         assert_eq!(
-            xmp.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
+            quiet_result.stats.failed, 0,
+            "quiet {quiet}: {quiet_result:?}"
+        );
+        assert_eq!(
+            quiet_result.stats.exif_failures, 0,
+            "quiet {quiet}: {quiet_result:?}"
+        );
+        assert!(
+            !quiet_result.full_enumeration_ran,
+            "quiet {quiet}: {quiet_result:?}"
+        );
+        assert!(
+            quiet_result.checkpoint.completed_delta_replay,
+            "quiet {quiet}: {quiet_result:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert!(
+            db.get_pending_metadata_rewrites(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(&media).unwrap(), media_bytes);
+        assert_eq!(fs::read(&sidecar).unwrap(), sidecar_bytes);
+        let current: XmpMeta = fs::read_to_string(&sidecar).unwrap().parse().unwrap();
+        assert_eq!(
+            current.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
             native_location
         );
-        let media_bytes = fs::read(&media).unwrap();
-        if native_location {
-            assert_eq!(media_bytes, source);
-        } else {
-            assert_ne!(media_bytes, source);
-        }
-        let native = crate::download::metadata::read_source_gps(&media).unwrap();
-        assert!(native.horizontal_positioning_error.is_some());
-        db.record_metadata_write_failure("PrimarySync", asset.state_id(), "original")
-            .await
-            .unwrap();
+        assert_bound_receipt(
+            &db,
+            &binding,
+            &provider_checksum,
+            source.len() as u64,
+            &original_checksum,
+            &local_checksum,
+            &media,
+        )
+        .await;
+        assert_eq!(preserved_path_count(&db).await, 0);
+        quiet_token = quiet_result
+            .sync_token
+            .clone()
+            .unwrap_or_else(|| quiet_token.clone());
+        drop(pass);
         drop(config);
         drop(db);
-
-        let db = Arc::new(SqliteStateDb::open(&db_path).await.unwrap());
-        let mut config = DownloadConfig::test_default();
-        config.directory = Arc::from(download_dir.as_path());
-        config.metadata.xmp_sidecar = true;
-        config.state_db = Some(db.clone());
-        let config = Arc::new(config);
-        let mut previous_sidecar = None;
-        for _ in 0..2 {
-            let result = stream_and_download_from_stream(
-                &Client::new(),
-                stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset.clone())]),
-                &config,
-                DownloadControls::download_hidden(),
-                1,
-                CancellationToken::new(),
-                StreamRuntime::new(None, None),
-            )
-            .await
-            .unwrap();
-            assert_eq!(result.downloaded, 0);
-            assert!(result.failed.is_empty());
-            assert_eq!(result.exif_failures, 0);
-            assert_eq!(fs::read(&media).unwrap(), media_bytes);
-            let sidecar_bytes = fs::read(&sidecar).unwrap();
-            if let Some(previous) = previous_sidecar.replace(sidecar_bytes.clone()) {
-                assert_eq!(
-                    sidecar_bytes, previous,
-                    "steady state must not repeat sidecar work"
-                );
-            }
-            let rows = db.get_downloaded_page(0, 10).await.unwrap();
-            assert_eq!(
-                rows[0].download_checksum.as_deref(),
-                Some(original_checksum.as_str())
-            );
-            let current: XmpMeta = fs::read_to_string(&sidecar).unwrap().parse().unwrap();
-            assert_eq!(
-                current.contains_property(xmp_ns::EXIF, "GPSHPositioningError"),
-                native_location
-            );
-            assert!(
-                db.get_pending_metadata_rewrites(10)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-        }
-        server.verify().await;
     }
+    server.verify().await;
+}
+
+#[cfg(feature = "xmp")]
+async fn gps_unbound_case() {
+    use crate::download::pipeline::test_support::sidecar_path_for;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, ResponseTemplate};
+    use xmp_toolkit::{XmpMeta, xmp_ns};
+
+    let source = crate::test_helpers::minimal_jpeg_with_source_gps();
+    let original_checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(&source));
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(source.clone())
+                .insert_header("content-type", "image/jpeg"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = TempDir::new().unwrap();
+    let media_dir = dir.path().join("downloads");
+    let db_path = dir.path().join("state.db");
+    let records = Arc::new(gps_records(
+        &source,
+        &format!("{}/source.jpg", server.uri()),
+    ));
+    let session = GpsPhotosSession {
+        records: Arc::clone(&records),
+        next_token: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+    };
+    let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+    let pass = gps_plain_pass(session.clone());
+    let mut config = crate::download::DownloadConfig::test_default();
+    config.directory = Arc::from(media_dir.as_path());
+    config.library = Arc::from("PrimarySync");
+    config.state_db = Some(db.clone());
+    config.metadata.set_exif_gps = true;
+    config.metadata.xmp_sidecar = true;
+    config.refresh_metadata = false;
+    config.sync_mode = crate::download::SyncMode::Full;
+    config.concurrent_downloads = 1;
+    let config = Arc::new(config);
+    let initial = crate::download::download_photos_with_sync(
+        &Client::new(),
+        std::slice::from_ref(&pass),
+        config.clone(),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(initial.stats.downloaded, 1, "{initial:?}");
+    assert_eq!(initial.stats.failed, 0, "{initial:?}");
+    assert_eq!(initial.stats.exif_failures, 0, "{initial:?}");
+    let rows = db.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].download_checksum.as_deref(),
+        Some(original_checksum.as_str())
+    );
+    let media = rows[0].local_path.as_ref().unwrap().clone();
+    let sidecar = sidecar_path_for(&media);
+    let media_bytes = fs::read(&media).unwrap();
+    let sidecar_bytes = fs::read(&sidecar).unwrap();
+    assert_ne!(media_bytes, source);
+    let receipts: i64 = db
+        .acquire_lock("unbound transfer cannot mint a scoped receipt")
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM download_receipts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(receipts, 0);
+    let asset = crate::icloud::photos::PhotoAsset::new(records[0].clone(), records[1].clone())
+        .with_state_record_name(Arc::from("asset-GPS_CHILD"));
+    db.record_metadata_write_failure("PrimarySync", asset.state_id(), "original")
+        .await
+        .unwrap();
+    drop(pass);
+    drop(config);
+    drop(db);
+
+    let db = Arc::new(crate::state::SqliteStateDb::open(&db_path).await.unwrap());
+    let pass = gps_plain_pass(session.clone());
+    let mut config = crate::download::DownloadConfig::test_default();
+    config.directory = Arc::from(media_dir.as_path());
+    config.library = Arc::from("PrimarySync");
+    config.state_db = Some(db.clone());
+    config.metadata.set_exif_gps = true;
+    config.metadata.xmp_sidecar = true;
+    config.refresh_metadata = false;
+    config.sync_mode = crate::download::SyncMode::Full;
+    config.concurrent_downloads = 1;
+    let config = Arc::new(config);
+    let refused = crate::download::download_photos_with_sync(
+        &Client::new(),
+        std::slice::from_ref(&pass),
+        config,
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused.stats.downloaded, 0, "{refused:?}");
+    assert_eq!(refused.stats.skipped.uncertain, 1, "{refused:?}");
+    let refused_rows = db.get_downloaded_page(0, 10).await.unwrap();
+    assert_eq!(refused_rows.len(), 1);
+    assert_eq!(
+        refused_rows[0].download_checksum.as_deref(),
+        Some(original_checksum.as_str())
+    );
+    assert_eq!(
+        db.get_pending_metadata_rewrites(10).await.unwrap().len(),
+        1,
+        "the real metadata marker remains the visible debt"
+    );
+    assert!(
+        db.get_pending().await.unwrap().is_empty(),
+        "the downloaded row is retained; its debt is the metadata marker"
+    );
+    assert_eq!(fs::read(&media).unwrap(), media_bytes);
+    assert_eq!(fs::read(&sidecar).unwrap(), sidecar_bytes);
+    let current: XmpMeta = fs::read_to_string(&sidecar).unwrap().parse().unwrap();
+    assert!(!current.contains_property(xmp_ns::EXIF, "GPSHPositioningError"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    server.verify().await;
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn contract_xmp_gps_accuracy_requires_matching_location_download_and_reopen() {
+    for (native_location, embed) in [(false, true), (true, false), (true, true)] {
+        gps_bound_case(native_location, embed).await;
+    }
+    gps_unbound_case().await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn resumed_task_rejects_symlink_and_preserves_regular_resume() {
-    use base64::Engine as _;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, ResponseTemplate};
 
@@ -1167,7 +1930,6 @@ async fn resumed_task_rejects_symlink_and_preserves_regular_resume() {
 #[cfg(unix)]
 #[tokio::test]
 async fn bound_embedded_resume_records_source_and_local_proof_then_reopens_quietly() {
-    use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, ResponseTemplate};
@@ -1399,7 +2161,6 @@ async fn bound_embedded_resume_records_source_and_local_proof_then_reopens_quiet
 
 #[tokio::test]
 async fn complete_part_416_recovers_persists_and_skips_after_reopen() {
-    use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
@@ -1503,7 +2264,6 @@ async fn complete_part_416_recovers_persists_and_skips_after_reopen() {
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn restricted_new_media_preserves_sidecar_and_metadata_debt_after_reopen() {
-    use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
