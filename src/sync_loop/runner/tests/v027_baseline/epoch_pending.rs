@@ -130,7 +130,7 @@ impl Fixture {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
             conn.execute(
                 "INSERT OR REPLACE INTO metadata(key,value) VALUES(?1,'v36-token')",
-                [format!("sync_token:v27:{ZONE}")],
+                [format!("sync_token:{ZONE}")],
             )
             .unwrap();
             if stage_ready {
@@ -305,6 +305,22 @@ impl Fixture {
         cancel: bool,
         legal_repair: bool,
     ) -> CycleResult {
+        self.run_with_options_and_passes(retry_failed, cancel, legal_repair, true)
+            .await
+    }
+
+    async fn run_without_active_passes(&self, retry_failed: bool) -> CycleResult {
+        self.run_with_options_and_passes(retry_failed, false, false, false)
+            .await
+    }
+
+    async fn run_with_options_and_passes(
+        &self,
+        retry_failed: bool,
+        cancel: bool,
+        legal_repair: bool,
+        include_pass: bool,
+    ) -> CycleResult {
         let db = self.open().await;
         let session = ResetCycleSession {
             zone: ZONE,
@@ -330,11 +346,15 @@ impl Fixture {
             baseline_owner(),
             "com",
         ));
-        let passes = vec![AlbumPass {
-            kind: PassKind::Unfiled,
-            album: library.all(),
-            exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
-        }];
+        let passes = if include_pass {
+            vec![AlbumPass {
+                kind: PassKind::Unfiled,
+                album: library.all(),
+                exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+            }]
+        } else {
+            Vec::new()
+        };
         let mut selected =
             make_run_cycle_library_state_with_passes(ZONE, &sync_token_key(ZONE), passes);
         selected.library = library;
@@ -1671,6 +1691,8 @@ async fn epoch_hold_reports_partial_failure_without_fabricated_counts() {
     );
     let hold = &held.holds[0];
     assert_eq!(hold.label, "SharedSync-v027-syn");
+    assert_eq!(hold.source, ZONE);
+    assert_eq!(hold.ordinal, 0);
     assert_eq!(
         hold.kind,
         crate::sync_cycle::LibraryHoldKind::BaselinePending
@@ -1688,9 +1710,15 @@ async fn epoch_hold_reports_partial_failure_without_fabricated_counts() {
 
     let partial = crate::sync_loop::runner::one_shot_partial_error(&held)
         .expect("a one-shot epoch hold must exit partial");
-    assert_eq!(partial.to_string(), "1 library held incomplete");
+    let partial_text = partial.to_string();
     assert!(
-        !partial.to_string().contains("0 sync failures"),
+        partial_text.contains("1 library held incomplete")
+            && partial_text.contains("SharedSync-v027-syn")
+            && partial_text.contains("epoch_backoff"),
+        "the one-shot error must carry safe scope and reason: {partial_text}"
+    );
+    assert!(
+        !partial_text.contains("0 sync failures"),
         "a hold must never fabricate a zero failure count"
     );
     let exit_error: anyhow::Error = partial.into();
@@ -1809,4 +1837,295 @@ async fn reset_sync_token_failure_rolls_back_every_component() {
         token
     };
     assert_eq!(current_token, before_token);
+}
+
+fn hold_fact(
+    label: &str,
+    source: &str,
+    ordinal: usize,
+    kind: crate::sync_cycle::LibraryHoldKind,
+    reason: &'static str,
+) -> crate::sync_cycle::LibraryHoldFact {
+    crate::sync_cycle::LibraryHoldFact {
+        label: label.to_owned(),
+        source: source.to_owned(),
+        ordinal,
+        kind,
+        reason,
+    }
+}
+
+#[tokio::test]
+async fn identity_hold_keeps_zero_failed_count_and_real_hold() {
+    let fixture = Fixture::new(true).await;
+    fixture.install_promotion_abort().await;
+    let baseline = fixture.run(false, false).await;
+    assert_eq!(baseline.failed_count, 1, "{baseline:?}");
+    fixture.drop_trigger("fail_epoch_promotion_clear").await;
+    assert_eq!(fixture.snapshot().await.state, "ready");
+    {
+        let db = fixture.open().await;
+        db.set_metadata(&crate::state::unresolved_identity_key(ZONE), "1")
+            .await
+            .unwrap();
+    }
+
+    let held = fixture.run(false, false).await;
+    assert_eq!(
+        held.failed_count, 0,
+        "a current identity hold must not invent a failure count: {held:?}"
+    );
+    assert_eq!(held.stats.failed, 0, "{held:?}");
+    assert_eq!(held.stats.state_write_failures, 0, "{held:?}");
+    let hold = held
+        .holds
+        .iter()
+        .find(|hold| hold.kind == crate::sync_cycle::LibraryHoldKind::IdentityUnresolved)
+        .expect("actual identity hold fact");
+    assert_eq!(hold.source, ZONE);
+    assert_eq!(hold.ordinal, 0);
+    let facts = crate::cycle_reporter::CycleFacts::from_cycle_result(
+        &held,
+        std::time::Duration::from_secs(1),
+    );
+    assert_eq!(facts.status, crate::cycle_reporter::CycleStatus::Failed);
+}
+
+#[tokio::test]
+async fn retained_hold_keeps_zero_failed_count_and_real_hold() {
+    let fixture = Fixture::new(false).await;
+    let baseline = fixture.run(false, false).await;
+    assert_eq!(baseline.stats.downloaded, 1, "{baseline:?}");
+    {
+        let db = fixture.open().await;
+        db.set_metadata(
+            "last_recovery_action",
+            "retained_checkpoint_retry_exhausted",
+        )
+        .await
+        .unwrap();
+    }
+
+    let held = fixture.run_without_active_passes(false).await;
+    assert_eq!(
+        held.failed_count, 0,
+        "a retained checkpoint hold must not invent a failure count: {held:?}"
+    );
+    assert_eq!(held.stats.failed, 0, "{held:?}");
+    let hold = held
+        .holds
+        .iter()
+        .find(|hold| hold.kind == crate::sync_cycle::LibraryHoldKind::RetainedCheckpoint)
+        .expect("actual retained checkpoint hold fact");
+    assert_eq!(hold.source, ZONE);
+    assert_eq!(hold.ordinal, 0);
+    assert_eq!(hold.reason, "retained_checkpoint_retry_exhausted");
+    assert!(held.stats.sync_token_blocked);
+    let facts = crate::cycle_reporter::CycleFacts::from_cycle_result(
+        &held,
+        std::time::Duration::from_secs(1),
+    );
+    assert_eq!(facts.status, crate::cycle_reporter::CycleStatus::Failed);
+}
+
+#[tokio::test]
+async fn preservation_pending_keeps_current_token_truth_and_partial_report() {
+    let fixture = Fixture::new(false).await;
+    let baseline = fixture.run(false, false).await;
+    assert_eq!(baseline.stats.downloaded, 1, "{baseline:?}");
+    {
+        let db = fixture.open().await;
+        let conn = db.acquire_lock("seed pending preservation").unwrap();
+        conn.execute(
+            "INSERT INTO unattributed_legacy(library,asset_id,evidence_version,original_evidence,files,prepared_at) \
+             VALUES(?1,?2,1,'{}','[]',0)",
+            rusqlite::params![ZONE, "legacy-preservation-pending"],
+        )
+        .unwrap();
+    }
+
+    let held = fixture.run(false, false).await;
+    assert_eq!(held.stats.unattributed_legacy_pending, 1, "{held:?}");
+    assert_eq!(held.failed_count, 0, "{held:?}");
+    assert_eq!(held.stats.failed, 0, "{held:?}");
+    assert!(
+        !held.stats.sync_token_blocked,
+        "pending preservation must not fabricate a token-block fact: {held:?}"
+    );
+    assert!(
+        held.can_advance_database_checkpoint(),
+        "current source checkpoint authority stays separate from historical pending: {held:?}"
+    );
+    let hold = held
+        .holds
+        .iter()
+        .find(|hold| hold.kind == crate::sync_cycle::LibraryHoldKind::PreservationPending)
+        .expect("actual preservation hold fact");
+    assert_eq!(hold.source, ZONE);
+    assert_eq!(hold.ordinal, 0);
+
+    let db = fixture.open().await;
+    let report_path = fixture.dir().join("preservation_report.json");
+    let notifier = crate::notifications::Notifier::new(None);
+    let run_config = make_run_cycle_config();
+    let reporter =
+        crate::cycle_reporter::CycleReporter::new(crate::cycle_reporter::CycleReporterConfig {
+            watch_mode: false,
+            report_path: Some(&report_path),
+            run_options: crate::report::RunOptions::from_config(&run_config),
+            health_dir: fixture.dir(),
+            personality_mode: crate::personality::Mode::Off,
+            state_db: Some(db.as_ref()),
+            metrics_handle: None,
+            notifier: &notifier,
+        });
+    let mut health = crate::health::HealthStatus::new();
+    reporter
+        .report_completed_cycle(
+            &mut health,
+            crate::cycle_reporter::CycleFacts::from_cycle_result(
+                &held,
+                std::time::Duration::from_secs(1),
+            ),
+        )
+        .await;
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).expect("preservation report"))
+            .expect("preservation report json");
+    assert_eq!(report["status"], "partial_failure");
+    assert_eq!(report["stats"]["failed"], 0, "{report}");
+    assert_eq!(report["stats"]["sync_token_blocked"], false, "{report}");
+    assert!(
+        health
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("legacy_preservation_pending")),
+        "{:?}",
+        health.last_error
+    );
+}
+
+#[tokio::test]
+async fn one_shot_hold_error_uses_distinct_sources_and_lists_every_reason() {
+    let holds = vec![
+        hold_fact(
+            "SharedSync-A1B2C3D4",
+            "SharedSync-A1B2C3D4-EEEE",
+            0,
+            crate::sync_cycle::LibraryHoldKind::BaselinePending,
+            "epoch_backoff",
+        ),
+        hold_fact(
+            "SharedSync-A1B2C3D4",
+            "SharedSync-A1B2C3D4-EEEE",
+            0,
+            crate::sync_cycle::LibraryHoldKind::IdentityUnresolved,
+            "asset_delta_hydration_incomplete",
+        ),
+        hold_fact(
+            "SharedSync-A1B2C3D4",
+            "SharedSync-A1B2C3D4-FFFF",
+            1,
+            crate::sync_cycle::LibraryHoldKind::PreservationPending,
+            "legacy_preservation_pending",
+        ),
+    ];
+    let result = CycleResult {
+        failed_count: 0,
+        session_expired: false,
+        stats: download::SyncStats::default(),
+        db_sync_token_advance_safe: false,
+        holds,
+    };
+    assert_eq!(
+        result.held_source_count(),
+        2,
+        "two facts from one source are one held library"
+    );
+    assert_eq!(
+        crate::cycle_reporter::CycleFacts::from_cycle_result(&result, std::time::Duration::ZERO)
+            .status,
+        crate::cycle_reporter::CycleStatus::Failed
+    );
+    let partial = crate::sync_loop::runner::one_shot_partial_error(&result)
+        .expect("two held sources must exit partial");
+    let text = partial.to_string();
+    assert!(
+        text.contains("2 libraries held incomplete")
+            && text.contains("epoch_backoff")
+            && text.contains("asset_delta_hydration_incomplete")
+            && text.contains("legacy_preservation_pending"),
+        "{text}"
+    );
+    assert!(!text.contains("3 libraries"), "{text}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let report_path = dir.path().join("holds_report.json");
+    let notifier = crate::notifications::Notifier::new(None);
+    let run_config = make_run_cycle_config();
+    let reporter: crate::cycle_reporter::CycleReporter<'_, crate::state::SqliteStateDb> =
+        crate::cycle_reporter::CycleReporter::new(crate::cycle_reporter::CycleReporterConfig {
+            watch_mode: false,
+            report_path: Some(&report_path),
+            run_options: crate::report::RunOptions::from_config(&run_config),
+            health_dir: dir.path(),
+            personality_mode: crate::personality::Mode::Off,
+            state_db: None,
+            metrics_handle: None,
+            notifier: &notifier,
+        });
+    let mut health = crate::health::HealthStatus::new();
+    reporter
+        .report_completed_cycle(
+            &mut health,
+            crate::cycle_reporter::CycleFacts::from_cycle_result(
+                &result,
+                std::time::Duration::ZERO,
+            ),
+        )
+        .await;
+    assert!(
+        health
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("epoch_backoff")
+                && error.contains("asset_delta_hydration_incomplete")
+                && error.contains("legacy_preservation_pending")),
+        "{:?}",
+        health.last_error
+    );
+
+    let auth = CycleResult {
+        failed_count: 0,
+        session_expired: true,
+        stats: download::SyncStats::default(),
+        db_sync_token_advance_safe: false,
+        holds: result.holds.clone(),
+    };
+    assert_eq!(
+        crate::cycle_reporter::CycleFacts::from_cycle_result(&auth, std::time::Duration::ZERO)
+            .status,
+        crate::cycle_reporter::CycleStatus::SessionExpired
+    );
+    assert!(crate::sync_loop::runner::one_shot_partial_error(&auth).is_none());
+
+    let interrupted = CycleResult {
+        failed_count: 0,
+        session_expired: false,
+        stats: download::SyncStats {
+            interrupted: true,
+            ..download::SyncStats::default()
+        },
+        db_sync_token_advance_safe: false,
+        holds: result.holds.clone(),
+    };
+    assert_eq!(
+        crate::cycle_reporter::CycleFacts::from_cycle_result(
+            &interrupted,
+            std::time::Duration::ZERO
+        )
+        .status,
+        crate::cycle_reporter::CycleStatus::Interrupted
+    );
+    assert!(crate::sync_loop::runner::one_shot_partial_error(&interrupted).is_none());
 }

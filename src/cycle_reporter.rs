@@ -199,19 +199,6 @@ fn classify_cycle_with_holds(
     }
 }
 
-fn selected_hold_message(holds: &[crate::sync_cycle::LibraryHoldFact]) -> Option<String> {
-    if holds.is_empty() {
-        return None;
-    }
-    Some(
-        holds
-            .iter()
-            .map(|hold| format!("{}: {} ({})", hold.label, hold.kind.as_str(), hold.reason))
-            .collect::<Vec<_>>()
-            .join(", "),
-    )
-}
-
 fn cycle_failure_message(input: &CycleFacts<'_>) -> String {
     let mut parts = Vec::new();
     if input.stats.identity_incomplete {
@@ -220,7 +207,7 @@ fn cycle_failure_message(input: &CycleFacts<'_>) -> String {
     if input.stats.unattributed_legacy_pending > 0 {
         parts.push("legacy current-work certification remains incomplete".to_string());
     }
-    if let Some(holds) = selected_hold_message(input.holds) {
+    if let Some(holds) = crate::sync_cycle::selected_hold_summary(input.holds) {
         parts.push(format!("held incomplete: {holds}"));
     }
     if input.failed_count > 0 {
@@ -474,7 +461,7 @@ where
                 self.report_path,
             ),
             CycleStatus::Failed => {
-                let message = match selected_hold_message(input.holds) {
+                let message = match crate::sync_cycle::selected_hold_summary(input.holds) {
                     Some(holds) if input.failed_count == 0 => {
                         format!("Sync incomplete: {holds}")
                     }

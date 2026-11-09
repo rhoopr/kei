@@ -324,22 +324,24 @@ const EXIT_TERMINAL_AUTH: u8 = 4;
 /// occurred during a one-shot cycle. Holds are reported separately so the exit
 /// remains truthful without fabricating failed assets or counts.
 #[derive(Debug, thiserror::Error)]
-#[error("{}", partial_sync_message(*failures, *holds))]
+#[error("{}", partial_sync_message(*failures, *held_libraries, hold_summary))]
 struct PartialSyncError {
     failures: usize,
-    holds: usize,
+    held_libraries: usize,
+    hold_summary: String,
 }
 
-fn partial_sync_message(failures: usize, holds: usize) -> String {
-    match (failures, holds) {
-        (0, 0) => "sync incomplete".to_string(),
-        (0, 1) => "1 library held incomplete".to_string(),
-        (0, holds) => format!("{holds} libraries held incomplete"),
-        (failures, 0) => format!("{failures} sync failures"),
-        (failures, 1) => format!("{failures} sync failures; 1 library held incomplete"),
-        (failures, holds) => {
-            format!("{failures} sync failures; {holds} libraries held incomplete")
-        }
+fn partial_sync_message(failures: usize, held_libraries: usize, hold_summary: &str) -> String {
+    let held = match held_libraries {
+        0 => None,
+        1 => Some("1 library held incomplete".to_string()),
+        count => Some(format!("{count} libraries held incomplete")),
+    };
+    match (failures, held) {
+        (0, None) => "sync incomplete".to_string(),
+        (0, Some(held)) => format!("{held}: {hold_summary}"),
+        (failures, None) => format!("{failures} sync failures"),
+        (failures, Some(held)) => format!("{failures} sync failures; {held}: {hold_summary}"),
     }
 }
 
@@ -1866,7 +1868,8 @@ mod tests {
     fn classify_exit_error_partial_sync_uses_exit_partial() {
         let e: anyhow::Error = PartialSyncError {
             failures: 7,
-            holds: 0,
+            held_libraries: 0,
+            hold_summary: String::new(),
         }
         .into();
         let c = classify_exit_error(&e);
@@ -1922,7 +1925,8 @@ mod tests {
 
         let e: anyhow::Error = anyhow::Error::from(PartialSyncError {
             failures: 3,
-            holds: 0,
+            held_libraries: 0,
+            hold_summary: String::new(),
         })
         .context("after final retry pass");
         assert_eq!(classify_exit_error(&e), ExitClassification::Partial);

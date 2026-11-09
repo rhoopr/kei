@@ -45,13 +45,15 @@ fn one_shot_partial_error(
     // Session expiry and interruption keep their existing priority. A hold is
     // only an exit reason for an otherwise completed ordinary cycle.
     let holds = if cycle_result.session_expired || cycle_result.stats.interrupted {
-        0
+        &[][..]
     } else {
-        cycle_result.holds.len()
+        cycle_result.holds.as_slice()
     };
-    (cycle_result.failed_count > 0 || holds > 0).then_some(PartialSyncError {
+    let held_libraries = cycle_result.held_source_count();
+    (cycle_result.failed_count > 0 || !holds.is_empty()).then_some(PartialSyncError {
         failures: cycle_result.failed_count,
-        holds,
+        held_libraries: if holds.is_empty() { 0 } else { held_libraries },
+        hold_summary: crate::sync_cycle::selected_hold_summary(holds).unwrap_or_default(),
     })
 }
 
@@ -825,7 +827,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             let cycle_started_at = std::time::Instant::now();
             let cycle_wall_started_at = chrono::Utc::now();
             let metadata_witness = Arc::new(download::MetadataWriterWitness::default());
-            let mut cycle_result = crate::sync_cycle::run_cycle_with_witness(
+            let mut cycle_result = Box::pin(crate::sync_cycle::run_cycle_with_witness(
                 &cycle_library_states,
                 &config,
                 state_db.as_deref(),
@@ -835,7 +837,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &shared_session,
                 &shutdown_token,
                 Arc::clone(&metadata_witness),
-            )
+            ))
             .await?;
             // Drain tagged rewrites now so the one-shot --refresh-metadata repair finishes in this run.
             let refresh_tail = if config.runtime.refresh_metadata {
@@ -1054,7 +1056,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     if cumulative_failed_count > 0 {
         Err(PartialSyncError {
             failures: cumulative_failed_count,
-            holds: 0,
+            held_libraries: 0,
+            hold_summary: String::new(),
         }
         .into())
     } else {

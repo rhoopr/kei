@@ -360,9 +360,30 @@ impl LibraryHoldKind {
 /// fact, not a new report/JSON/metric contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LibraryHoldFact {
+    /// Safe display label derived from the configured `{library}` token.
     pub(crate) label: String,
+    /// Exact non-public selected source identity. Used only for deduplication
+    /// and distinct-source counting; never rendered into reports or errors.
+    pub(crate) source: String,
+    /// Stable selected-source ordinal in the cycle's library list.
+    pub(crate) ordinal: usize,
     pub(crate) kind: LibraryHoldKind,
     pub(crate) reason: &'static str,
+}
+
+/// Human-safe joined hold summary. It exposes only the safe label, bounded kind
+/// and configured reason, never a provider zone or record identifier.
+pub(crate) fn selected_hold_summary(holds: &[LibraryHoldFact]) -> Option<String> {
+    if holds.is_empty() {
+        return None;
+    }
+    Some(
+        holds
+            .iter()
+            .map(|hold| format!("{}: {} ({})", hold.label, hold.kind.as_str(), hold.reason))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// Record a hold for one selected library and retain the existing singular
@@ -372,29 +393,33 @@ pub(crate) struct LibraryHoldFact {
 fn record_selected_hold(
     holds: &mut Vec<LibraryHoldFact>,
     stats: &mut download::SyncStats,
-    zone_name: &str,
+    source: &str,
+    ordinal: usize,
     kind: LibraryHoldKind,
     reason: &'static str,
     explanation: &'static str,
+    project_token_hold: bool,
 ) {
-    let label = download::paths::truncate_library_zone(zone_name).to_owned();
+    let label = download::paths::truncate_library_zone(source).to_owned();
     if holds
         .iter()
-        .any(|hold| hold.label == label && hold.kind == kind && hold.reason == reason)
+        .any(|hold| hold.source == source && hold.kind == kind && hold.reason == reason)
     {
         return;
     }
     holds.push(LibraryHoldFact {
         label,
+        source: source.to_owned(),
+        ordinal,
         kind,
         reason,
     });
-    if stats.sync_token_blocked_zone.is_none() {
+    if project_token_hold && stats.sync_token_blocked_zone.is_none() {
         stats.sync_token_blocked = true;
         stats.sync_token_blocked_reason = Some(reason);
         stats.sync_token_blocked_source = Some("kei");
         stats.sync_token_blocked_explanation = Some(explanation);
-        stats.sync_token_blocked_zone = Some(zone_name.to_owned());
+        stats.sync_token_blocked_zone = Some(source.to_owned());
     }
 }
 
@@ -426,6 +451,17 @@ impl CycleResult {
     #[must_use]
     pub(crate) fn has_selected_holds(&self) -> bool {
         !self.holds.is_empty()
+    }
+
+    /// Distinct exact selected sources with at least one hold. One source may
+    /// carry several reasons and must never count as several libraries.
+    #[must_use]
+    pub(crate) fn held_source_count(&self) -> usize {
+        self.holds
+            .iter()
+            .map(|hold| hold.source.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
     }
 }
 
@@ -1318,7 +1354,7 @@ pub(crate) async fn run_cycle_with_witness(
     };
     let mut active_cursor_fences = Vec::new();
 
-    for lib_state in library_states.iter().copied() {
+    for (library_ordinal, lib_state) in library_states.iter().copied().enumerate() {
         if shutdown_token.is_cancelled() {
             break;
         }
@@ -1421,9 +1457,11 @@ pub(crate) async fn run_cycle_with_witness(
                             &mut library_holds,
                             &mut cycle_stats,
                             &lib_state.zone_name,
+                            library_ordinal,
                             LibraryHoldKind::BaselinePending,
                             reason,
                             explanation,
+                            true,
                         );
                         // A pending selected baseline is an aggregate database
                         // checkpoint hold even when a healthy peer progressed.
@@ -1646,7 +1684,21 @@ pub(crate) async fn run_cycle_with_witness(
                         cycle_stats.state_write_failures =
                             cycle_stats.state_write_failures.saturating_add(1);
                     }
-                    cycle_failed_count = cycle_failed_count.saturating_add(1);
+                    let reason = if exhausted {
+                        "retained_checkpoint_retry_exhausted"
+                    } else {
+                        "retained_checkpoint_expired"
+                    };
+                    record_selected_hold(
+                        &mut library_holds,
+                        &mut cycle_stats,
+                        &lib_state.zone_name,
+                        library_ordinal,
+                        LibraryHoldKind::RetainedCheckpoint,
+                        reason,
+                        download::sync_token_blocked_explanation(reason),
+                        true,
+                    );
                     db_sync_token_advance_safe = false;
                     checkpoint_hold_action = Some(if exhausted {
                         RecoveryAction::RetainedCheckpointRetryExhausted.as_str()
@@ -1746,7 +1798,16 @@ pub(crate) async fn run_cycle_with_witness(
             .await?;
             if unresolved {
                 download::block_sync_token_for_unresolved_identity(&mut cycle_stats);
-                cycle_failed_count = cycle_failed_count.max(1);
+                record_selected_hold(
+                    &mut library_holds,
+                    &mut cycle_stats,
+                    &lib_state.zone_name,
+                    library_ordinal,
+                    LibraryHoldKind::IdentityUnresolved,
+                    "asset_delta_hydration_incomplete",
+                    download::sync_token_blocked_explanation("asset_delta_hydration_incomplete"),
+                    true,
+                );
                 db_sync_token_advance_safe = false;
             }
             // Keep the exact staged token, descriptor and proof in place. The
@@ -2498,9 +2559,11 @@ pub(crate) async fn run_cycle_with_witness(
                 &mut library_holds,
                 &mut cycle_stats,
                 &lib_state.zone_name,
+                library_ordinal,
                 LibraryHoldKind::IndexingReconciliation,
                 "indexing_reconciliation_required",
                 "a selected library's indexing readiness regressed during enumeration; deletions and checkpoint promotion are disabled",
+                true,
             );
             db_sync_token_advance_safe = false;
         }
@@ -2653,9 +2716,11 @@ pub(crate) async fn run_cycle_with_witness(
                 &mut library_holds,
                 &mut cycle_stats,
                 &lib_state.zone_name,
+                library_ordinal,
                 LibraryHoldKind::IndexingReconciliation,
                 reason,
                 explanation,
+                true,
             );
         }
 
@@ -2938,7 +3003,18 @@ pub(crate) async fn run_cycle_with_witness(
         }
 
         if sync_result.checkpoint.identity_incomplete {
-            cycle_failed_count += 1;
+            // The checkpoint owner retains unresolved current identity; report
+            // it as a hold label instead of fabricating a failed-asset count.
+            record_selected_hold(
+                &mut library_holds,
+                &mut cycle_stats,
+                &lib_state.zone_name,
+                library_ordinal,
+                LibraryHoldKind::IdentityUnresolved,
+                "asset_delta_hydration_incomplete",
+                download::sync_token_blocked_explanation("asset_delta_hydration_incomplete"),
+                true,
+            );
         }
 
         if sync_result.stats.unattributed_legacy_assets > 0
@@ -2959,9 +3035,11 @@ pub(crate) async fn run_cycle_with_witness(
                 &mut library_holds,
                 &mut cycle_stats,
                 &lib_state.zone_name,
+                library_ordinal,
                 LibraryHoldKind::PreservationPending,
                 "legacy_preservation_pending",
                 "legacy current-work certification remains incomplete",
+                false,
             );
         }
 
@@ -3138,10 +3216,11 @@ pub(crate) async fn run_cycle_with_witness(
     if let Some(db) = state_db {
         let summary = db.get_summary().await?;
         let mut current_identity_hold = false;
-        for library in library_states
+        for (library_ordinal, library) in library_states
             .iter()
             .copied()
-            .filter(|library| has_active_passes(library))
+            .enumerate()
+            .filter(|(_, library)| has_active_passes(library))
         {
             let held = sparse_identity_holds_current(
                 db,
@@ -3154,16 +3233,17 @@ pub(crate) async fn run_cycle_with_witness(
                     &mut library_holds,
                     &mut cycle_stats,
                     &library.zone_name,
+                    library_ordinal,
                     LibraryHoldKind::IdentityUnresolved,
                     "asset_delta_hydration_incomplete",
                     download::sync_token_blocked_explanation("asset_delta_hydration_incomplete"),
+                    true,
                 );
             }
             current_identity_hold |= held;
         }
         if current_identity_hold {
             download::block_sync_token_for_unresolved_identity(&mut cycle_stats);
-            cycle_failed_count = cycle_failed_count.max(1);
             db_sync_token_advance_safe = false;
         }
         if summary
@@ -3202,17 +3282,27 @@ pub(crate) async fn run_cycle_with_witness(
                 Some("repair_retained_checkpoint_evidence") => "retained_checkpoint_hold_invalid",
                 _ => "retained_checkpoint_expired",
             };
-            if let Some(zone_name) = cycle_stats.sync_token_blocked_zone.clone() {
+            let retained_zone = cycle_stats.sync_token_blocked_zone.clone().or_else(|| {
+                library_states
+                    .first()
+                    .map(|library| library.zone_name.clone())
+            });
+            if let Some(zone_name) = retained_zone {
+                let library_ordinal = library_states
+                    .iter()
+                    .position(|library| library.zone_name == zone_name)
+                    .unwrap_or(0);
                 record_selected_hold(
                     &mut library_holds,
                     &mut cycle_stats,
                     &zone_name,
+                    library_ordinal,
                     LibraryHoldKind::RetainedCheckpoint,
                     reason,
                     download::sync_token_blocked_explanation(reason),
+                    true,
                 );
             }
-            cycle_failed_count = cycle_failed_count.max(1);
             db_sync_token_advance_safe = false;
         }
     }
@@ -3920,5 +4010,68 @@ mod tests {
             no_token.full_enumeration_reason,
             Some(download::FullEnumerationReason::NoStoredToken)
         );
+    }
+
+    #[test]
+    fn selected_hold_deduplicates_exact_source_not_display_label() {
+        let mut holds = Vec::new();
+        let mut stats = download::SyncStats::default();
+        record_selected_hold(
+            &mut holds,
+            &mut stats,
+            "SharedSync-A1B2C3D4-EEEE",
+            0,
+            LibraryHoldKind::BaselinePending,
+            "epoch_backoff",
+            "deferred baseline",
+            true,
+        );
+        record_selected_hold(
+            &mut holds,
+            &mut stats,
+            "SharedSync-A1B2C3D4-FFFF",
+            1,
+            LibraryHoldKind::BaselinePending,
+            "epoch_backoff",
+            "deferred baseline",
+            true,
+        );
+        record_selected_hold(
+            &mut holds,
+            &mut stats,
+            "SharedSync-A1B2C3D4-EEEE",
+            0,
+            LibraryHoldKind::BaselinePending,
+            "epoch_backoff",
+            "deferred baseline",
+            true,
+        );
+        assert_eq!(holds.len(), 2, "prefix-colliding sources stay distinct");
+        assert_eq!(holds[0].label, holds[1].label);
+        assert_ne!(holds[0].source, holds[1].source);
+        assert_eq!(holds[0].ordinal, 0);
+        assert_eq!(holds[1].ordinal, 1);
+        assert!(stats.sync_token_blocked);
+        assert_eq!(
+            stats.sync_token_blocked_zone.as_deref(),
+            Some(holds[0].source.as_str())
+        );
+
+        let mut preservation_stats = download::SyncStats::default();
+        record_selected_hold(
+            &mut holds,
+            &mut preservation_stats,
+            "SharedSync-A1B2C3D4-EEEE",
+            0,
+            LibraryHoldKind::PreservationPending,
+            "legacy_preservation_pending",
+            "pending preservation",
+            false,
+        );
+        assert!(
+            !preservation_stats.sync_token_blocked,
+            "preservation alone must not project a token block"
+        );
+        assert!(preservation_stats.sync_token_blocked_zone.is_none());
     }
 }
