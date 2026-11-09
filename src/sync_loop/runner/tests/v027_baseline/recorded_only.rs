@@ -273,6 +273,16 @@ fn decision_state(db: &SqliteStateDb, child: &str) -> (String, i64, i64, i64) {
     .unwrap()
 }
 
+fn generation_count(db: &SqliteStateDb) -> i64 {
+    let conn = db.acquire_lock("count generations").unwrap();
+    conn.query_row(
+        "SELECT count(*) FROM provider_active_generations",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
 fn downloaded_path(db: &SqliteStateDb, zone: &str, child: &str) -> std::path::PathBuf {
     let conn = db.acquire_lock("read downloaded path").unwrap();
     let path: String = conn
@@ -1196,6 +1206,45 @@ async fn unchanged_reader_preserves_injected_download_failed_across_replay_and_t
     assert_eq!(injected.5, None);
     assert_eq!(injected.6, 0);
     let calls_before = calls.load(Ordering::SeqCst);
+    let generations_before = generation_count(db.as_ref());
+    let spec: crate::state::db::provider_generations::GenerationSpec = {
+        let conn = db
+            .acquire_lock("read invalid generation specification")
+            .unwrap();
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT specification FROM provider_active_generations WHERE id=?1",
+                [&generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    let begin = db
+        .begin_selection_generation(
+            baseline_owner(),
+            spec,
+            crate::state::db::provider_generations::MAX_GENERATION_BYTES,
+        )
+        .await;
+    let generations_after_state = generation_count(db.as_ref());
+    eprintln!(
+        "L7 old-reader state boundary: begin={begin:?} generations {generations_before}->{generations_after_state} row={:?}",
+        snapshot(db.as_ref())
+    );
+    assert!(
+        begin.is_ok(),
+        "the ordinary generation boundary must run without treating the unverified row as complete"
+    );
+    assert!(
+        generations_after_state > generations_before,
+        "begin_selection_generation must create the new root and exercise its compaction/retirement boundary"
+    );
+    assert_eq!(
+        snapshot(db.as_ref()),
+        injected,
+        "begin/compaction/retirement must not mutate the invalid decision"
+    );
 
     drop(selected);
     drop(db);
@@ -1214,11 +1263,13 @@ async fn unchanged_reader_preserves_injected_download_failed_across_replay_and_t
         )
         .await;
         let replay = run_stock36_cycle(&db, &[&selected], &root, &shared, &config).await;
+        let generations = generation_count(db.as_ref());
         eprintln!(
-            "L7 old-reader replay reopen={reopen} result={replay:?} calls={} row={:?}",
+            "L7 old-reader replay reopen={reopen} result={replay:?} calls={} generations={generations} row={:?}",
             calls.load(Ordering::SeqCst),
             snapshot(db.as_ref()),
         );
+        assert!(generations >= generations_after_state);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             calls_before,
