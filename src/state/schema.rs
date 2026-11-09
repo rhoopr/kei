@@ -8,7 +8,7 @@ use super::error::StateError;
 /// Current application-data schema version. Increment when changing its shape.
 /// The preflight account-owner header has an independent format version and
 /// is validated before this schema can be read or migrated.
-pub(crate) const SCHEMA_VERSION: i32 = 43;
+pub(crate) const SCHEMA_VERSION: i32 = 44;
 
 fn migrate_active_selection(conn: &Connection) -> Result<(), StateError> {
     conn.execute_batch(r"CREATE TABLE IF NOT EXISTS provider_active_generations (
@@ -1494,6 +1494,13 @@ fn migrate_to_version_with_origin(
         }
         40 => conn.execute_batch(super::db::source_revalidation::DDL)?,
         43 => super::db::sync_epoch::establish_epoch(conn, origin)?,
+        44 => {
+            if !column_exists(conn, "source_revalidation_rounds", "mode")? {
+                conn.execute_batch(
+                    "ALTER TABLE source_revalidation_rounds ADD COLUMN mode TEXT NOT NULL DEFAULT 'legacy_unfiled_v1';",
+                )?;
+            }
+        }
         42 => {}
         41 => {
             if !column_exists(conn, "download_receipts", "trust_receipt")? {
@@ -4120,5 +4127,84 @@ mod sparse_origin_migration_tests {
         migrate(&conn).unwrap();
         assert_eq!(epoch(&conn), 0);
         assert_old_marker(&conn);
+    }
+
+    #[test]
+    fn schema_43_to_44_adds_source_revalidation_mode_and_preserves_state() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        let epoch_before: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_epoch:v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute_batch(
+            r"
+            DROP TABLE source_revalidation_debt;
+            DROP TABLE source_revalidation_rounds;
+            CREATE TABLE source_revalidation_rounds (
+              id TEXT PRIMARY KEY, library TEXT NOT NULL, scope TEXT NOT NULL,
+              enum_hash TEXT NOT NULL, boundary TEXT NOT NULL, high_id TEXT NOT NULL,
+              after_id TEXT NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('marking','observing','active','abandoned'))
+            );
+            CREATE TABLE source_revalidation_debt (
+              round TEXT NOT NULL REFERENCES source_revalidation_rounds(id),
+              id TEXT NOT NULL, next_retry_at INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY(round,id)
+            );
+            INSERT INTO source_revalidation_rounds VALUES('old-round','PrimarySync','scope','policy','boundary','high','after','marking');
+            INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES('old-round','debt-old',1234);
+            INSERT INTO metadata(key,value) VALUES('schema43:sentinel','keep') ON CONFLICT(key) DO UPDATE SET value='keep';
+            PRAGMA user_version=43;
+            ",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(get_schema_version(&conn).unwrap(), 44);
+        assert!(column_exists(&conn, "source_revalidation_rounds", "mode").unwrap());
+        let (mode, phase, debt_next): (String, String, i64) = conn
+            .query_row(
+                "SELECT r.mode,r.phase,d.next_retry_at FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.id='old-round'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(mode, "legacy_unfiled_v1");
+        assert_eq!(phase, "marking");
+        assert_eq!(debt_next, 1234);
+        let epoch_after: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='sync_epoch:v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(epoch_after, epoch_before);
+        let sentinel: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key='schema43:sentinel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sentinel, "keep");
+
+        conn.execute(
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode)              VALUES('catalog','PrimarySync','catalog:v2:plan:epoch:attempt:nonce','policy','boundary','','','marking','catalog_v2')",
+            [],
+        )
+        .unwrap();
+        let catalog_mode: String = conn
+            .query_row(
+                "SELECT mode FROM source_revalidation_rounds WHERE id='catalog'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(catalog_mode, "catalog_v2");
     }
 }

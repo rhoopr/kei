@@ -27,7 +27,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` in support to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 43;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 44;
     let production_schema = include_str!("../../src/state/schema.rs");
     assert!(
         production_schema.contains(&format!(
@@ -95,6 +95,11 @@ fn behavioral_source_revalidation_schema_matches_migration() {
         .0;
     let expected = rusqlite::Connection::open_in_memory().unwrap();
     expected.execute_batch(ddl).unwrap();
+    expected
+        .execute_batch(
+            "ALTER TABLE source_revalidation_rounds ADD COLUMN mode TEXT NOT NULL DEFAULT 'legacy_unfiled_v1';",
+        )
+        .unwrap();
     let shapes = |db: &rusqlite::Connection| {
         db.prepare("SELECT type,name,sql FROM sqlite_master WHERE name GLOB 'source_revalidation_*' ORDER BY type,name")
             .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))

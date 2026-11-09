@@ -154,10 +154,11 @@ impl SqliteStateDb {
                     expected: schema::SCHEMA_VERSION,
                 });
             }
-            // A current-version database must prove its epoch before any WAL or
-            // migration work. This makes a same-number schema 43 without an
-            // epoch fail closed instead of silently acquiring one.
-            if start_version == schema::SCHEMA_VERSION {
+            // Every supported already-epoch-bearing schema must prove its epoch
+            // before any WAL or migration work. A 43 database is validated
+            // before the 43->44 migration, and a same-number 44 database cannot
+            // silently acquire an epoch.
+            if start_version >= 43 {
                 schema::validate_sync_epoch(&opened.conn)?;
             }
             if let Err(error) = schema::validate_metadata_activity_evidence(&opened.conn) {

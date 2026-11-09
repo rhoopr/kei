@@ -137,7 +137,7 @@ impl SqliteStateDb {
                 let high:Option<String>=tx.query_row(
                     "SELECT MAX(id) FROM assets WHERE library=?1 AND (status='downloaded' OR downloaded_at IS NOT NULL) AND is_deleted=0",
                     [&library],|r|r.get(0))?;
-                tx.execute("INSERT INTO source_revalidation_rounds VALUES(?1,?2,?3,?4,?5,?6,'','marking')",
+                tx.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES(?1,?2,?3,?4,?5,?6,'','marking')",
                     params![id,library,scope,enum_hash,boundary,high.unwrap_or_default()])?;
                 id
             };
@@ -316,7 +316,7 @@ mod tests {
         .unwrap();
         let mut candidate = {
             let conn = db.acquire_lock("synthetic source debt").unwrap();
-            conn.execute("INSERT INTO source_revalidation_rounds VALUES('round','PrimarySync','scope','policy','boundary','item','item','active')", []).unwrap();
+            conn.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('round','PrimarySync','scope','policy','boundary','item','item','active')", []).unwrap();
             conn.execute(
                 "INSERT INTO source_revalidation_debt(round,id) VALUES('round','item')",
                 [],

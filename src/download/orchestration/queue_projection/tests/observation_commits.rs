@@ -471,7 +471,7 @@ async fn staged_baseline_revalidation_survives_delta_and_reopen() {
     let boundary = format!("{:x}", Sha256::digest(b"before"));
     {
         let conn = db.acquire_lock("synthetic baseline round").unwrap();
-        conn.execute("INSERT INTO source_revalidation_rounds VALUES('round','PrimarySync',?1,'next-enum',?2,'','','observing')", rusqlite::params![selected.scope, boundary]).unwrap();
+        conn.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('round','PrimarySync',?1,'next-enum',?2,'','','observing')", rusqlite::params![selected.scope, boundary]).unwrap();
     }
     let root = db
         .begin_selection_generation(owner(), selected.clone(), BUDGET)
@@ -599,8 +599,8 @@ async fn staged_baseline_revalidation_survives_delta_and_reopen() {
         .unwrap();
     {
         let conn = reopened.acquire_lock("seed status scope drift").unwrap();
-        conn.execute("INSERT INTO source_revalidation_rounds VALUES('stale-scope','PrimarySync','other-scope','next-enum','stale-boundary','','','active')", []).unwrap();
-        conn.execute("INSERT INTO source_revalidation_rounds VALUES('stale-policy','PrimarySync',?1,'old-enum','stale-boundary','','','active')", [&selected.scope]).unwrap();
+        conn.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('stale-scope','PrimarySync','other-scope','next-enum','stale-boundary','','','active')", []).unwrap();
+        conn.execute("INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('stale-policy','PrimarySync',?1,'old-enum','stale-boundary','','','active')", [&selected.scope]).unwrap();
         conn.execute("INSERT INTO source_revalidation_debt(round,id) VALUES('stale-scope','same-asset'),('stale-policy','same-asset')", []).unwrap();
         conn.execute("UPDATE source_revalidation_debt SET next_retry_at=?1 WHERE round='round' AND id='candidate-129'", [chrono::Utc::now().timestamp()+3600]).unwrap();
     }

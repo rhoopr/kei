@@ -1789,6 +1789,7 @@ mod tests {
                 [],
             )
             .unwrap();
+            conn.execute_batch("PRAGMA user_version=43").unwrap();
         }
         drop(db);
         let error = SqliteStateDb::open_owned(&path, &owner())
@@ -1812,7 +1813,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn future_schema_44_is_refused_before_writes() {
+    async fn same_number_44_without_epoch_fails_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let db = SqliteStateDb::open_owned(&path, &owner()).await.unwrap();
+        {
+            let conn = db.acquire_lock("prepare bare 44").unwrap();
+            conn.execute("DELETE FROM metadata WHERE key=?1", [SYNC_EPOCH_KEY])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO metadata(key,value) VALUES('sentinel:v1','keep')",
+                [],
+            )
+            .unwrap();
+        }
+        drop(db);
+        let error = SqliteStateDb::open_owned(&path, &owner())
+            .await
+            .expect_err("schema 44 without an epoch must fail closed");
+        assert!(matches!(error, StateError::SyncEpochMissing { .. }));
+        let conn = Connection::open(&path).unwrap();
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 44);
+        let sentinel: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='sentinel:v1')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sentinel, "refusal must not delete existing state");
+        assert!(read_epoch(&conn).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn future_schema_45_is_refused_before_writes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let db = SqliteStateDb::open_owned(&path, &owner()).await.unwrap();
@@ -1823,17 +1860,17 @@ mod tests {
                 [],
             )
             .unwrap();
-            conn.execute_batch("PRAGMA user_version=44").unwrap();
+            conn.execute_batch("PRAGMA user_version=45").unwrap();
         }
         drop(db);
         let error = SqliteStateDb::open_owned(&path, &owner())
             .await
-            .expect_err("schema 44 must be refused");
+            .expect_err("schema 45 must be refused");
         assert!(matches!(
             error,
             StateError::UnsupportedSchemaVersion {
-                found: 44,
-                expected: 43
+                found: 45,
+                expected: 44
             }
         ));
         let conn = Connection::open(&path).unwrap();
@@ -1943,7 +1980,7 @@ mod tests {
             schema::migrate_to_version(&conn, 0, version).unwrap();
         }
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES('r1','PrimarySync','scope','policy','boundary','high','after','active')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('r1','PrimarySync','scope','policy','boundary','high','after','active')",
             [],
         )
         .unwrap();
@@ -1976,7 +2013,7 @@ mod tests {
             schema::migrate_to_version(&conn, 0, version).unwrap();
         }
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES('r1','PrimarySync','scope','policy','boundary','high','after','active')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('r1','PrimarySync','scope','policy','boundary','high','after','active')",
             [],
         )
         .unwrap();
@@ -2102,7 +2139,7 @@ mod tests {
                 .unwrap();
                 if version >= 40 {
                     conn.execute(
-                        "INSERT INTO source_revalidation_rounds VALUES('r1','PrimarySync','scope','policy','boundary','high','after','active')",
+                        "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('r1','PrimarySync','scope','policy','boundary','high','after','active')",
                         [],
                     )
                     .unwrap();

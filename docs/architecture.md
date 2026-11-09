@@ -1968,11 +1968,12 @@ unowned schema 0 file fails before migration. A crash after ownership binding
 is treated as existing on the next open. The epoch records the origin. A crash
 after the epoch but before the first sync still enrolls a fresh install clean.
 
-Every owned open at schema 43 validates the epoch before WAL setup, migration
-or any substantive write. A same-number schema 43 database without a valid
-epoch fails closed. Schema 44 and newer are refused. Older binaries refuse
-schema 43, and stopping every writer before the upgrade remains an operator
-prerequisite for already-running processes.
+Every owned open at schema 43 or 44 validates the epoch before WAL setup,
+migration or any substantive write. A schema 43 database without a valid epoch
+fails closed before the 43->44 migration, and a same-number schema 44 database
+without a valid epoch fails closed. Schema 45 and newer are refused. Older
+binaries refuse schema 43, and stopping every writer before the upgrade remains
+an operator prerequisite for already-running processes.
 
 Schema 42 is a no-op. New work never creates the retired metadata-activity
 prerequisite tables and does not import their rows. A populated

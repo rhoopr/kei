@@ -90,7 +90,7 @@ pub(super) fn bind_synthetic_owner(conn: &rusqlite::Connection, username: &str) 
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-pub(super) const HELPER_SCHEMA_VERSION: i32 = 43;
+pub(super) const HELPER_SCHEMA_VERSION: i32 = 44;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -772,6 +772,10 @@ CREATE TABLE IF NOT EXISTS source_revalidation_debt (
 );
 CREATE INDEX IF NOT EXISTS source_revalidation_due ON source_revalidation_debt(next_retry_at,round,id);
 ").unwrap();
+    conn.execute_batch(
+        "ALTER TABLE source_revalidation_rounds ADD COLUMN mode TEXT NOT NULL DEFAULT 'legacy_unfiled_v1';",
+    )
+    .unwrap();
     conn.execute(
         "INSERT INTO metadata(key,value) SELECT 'sync_epoch:v1', json_object(
            'version',1,

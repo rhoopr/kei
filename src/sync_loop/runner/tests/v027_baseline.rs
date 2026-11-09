@@ -2691,7 +2691,7 @@ async fn reset_cycle_stores_one_baseline_then_rediscovers_quietly() {
         let conn = db.acquire_lock("seed historical reset state").unwrap();
         clear_test_epoch(&conn);
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
             [ZONE],
         )
         .unwrap();
@@ -2974,7 +2974,7 @@ async fn reset_cycle_changed_root_keeps_old_verified_file() {
         let conn = db.acquire_lock("seed historical reset state").unwrap();
         clear_test_epoch(&conn);
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
             [ZONE],
         )
         .unwrap();
@@ -3102,7 +3102,7 @@ async fn reset_cycle_keeps_healthy_peer_incremental() {
         let conn = db.acquire_lock("seed peer and reset state").unwrap();
         clear_test_epoch(&conn);
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
             [ZONE],
         )
         .unwrap();
@@ -3278,7 +3278,7 @@ async fn reset_cycle_failure_backs_off_without_tight_loop() {
         let conn = db.acquire_lock("seed failing reset state").unwrap();
         clear_test_epoch(&conn);
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
             [ZONE],
         )
         .unwrap();
@@ -3526,7 +3526,7 @@ async fn epoch_config_drift_stages_then_promotes_without_repeating_full() {
         let conn = db.acquire_lock("seed epoch config drift state").unwrap();
         clear_test_epoch(&conn);
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
             [ZONE],
         )
         .unwrap();
@@ -3679,7 +3679,7 @@ async fn pending_enum_promotion_binds_exact_staged_proof() {
             .unwrap();
         clear_test_epoch(&conn);
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
             [ZONE],
         )
         .unwrap();
@@ -3884,7 +3884,7 @@ async fn reset_promotion_abort_preserves_evidence_after_reopen() {
         let conn = db.acquire_lock("seed reset promotion abort").unwrap();
         clear_test_epoch(&conn);
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
             [ZONE],
         )
         .unwrap();
@@ -4611,7 +4611,7 @@ async fn seed_abort_ready_state(db_path: &std::path::Path, enum_hash: &str) {
         let conn = db.acquire_lock("seed aborted ready state").unwrap();
         clear_test_epoch(&conn);
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('old-round',?1,'scope','policy','boundary','high','after','active')",
             [ZONE],
         )
         .unwrap();
