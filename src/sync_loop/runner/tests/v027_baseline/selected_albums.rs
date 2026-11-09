@@ -1335,8 +1335,22 @@ async fn v027_mixed_shared_hidden_baseline_censuses_preboundary_deleted_live_pai
                 |row| row.get(0),
             )
             .unwrap();
+        let descriptor: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [format!("observed_selection:v27:{ZONE}")],
+                |row| row.get(0),
+            )
+            .ok();
+        let primary_descriptor: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [format!("observed_selection:v27:{PRIMARY}")],
+                |row| row.get(0),
+            )
+            .ok();
         eprintln!(
-            "B-PREREQ epoch={epoch} rounds={rounds} debt={debt} lookups={} token_present={} downloaded={} failed={}",
+            "B-PREREQ epoch={epoch} rounds={rounds} debt={debt} lookups={} token_present={} downloaded={} failed={} descriptor={descriptor:?} primary_descriptor={primary_descriptor:?}",
             shared_lookups.load(Ordering::SeqCst),
             token.is_some(),
             result.stats.downloaded,
@@ -1347,6 +1361,66 @@ async fn v027_mixed_shared_hidden_baseline_censuses_preboundary_deleted_live_pai
             token.is_some(),
             "the mixed baseline must complete its ordinary checkpoint: {result:?}"
         );
+
+        let canonical = |descriptor: &Value, passes: &[AlbumPass]| {
+            let plans = descriptor["plans"].as_array().unwrap();
+            assert_eq!(
+                plans.len(),
+                1,
+                "a source ACTIVE descriptor must own one full plan"
+            );
+            let plan = &plans[0];
+            let descriptor_scope = plan["scope"].as_str().unwrap().to_owned();
+            let mut descriptor_entries: Vec<Value> = plan["profile"]["passes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pass| {
+                    json!({
+                        "kind":pass["kind"],
+                        "scope":pass["scope"],
+                        "excludes":pass["excludes"]
+                    })
+                })
+                .collect();
+            descriptor_entries.sort_by_key(|entry| serde_json::to_string(entry).unwrap());
+            let source_scope = passes
+                .iter()
+                .find_map(|pass| pass.album.download_scope().ok().flatten())
+                .map(|(_, scope, _)| scope)
+                .unwrap();
+            let mut pass_entries: Vec<Value> = passes
+                .iter()
+                .map(|pass| {
+                    let mut excludes: Vec<String> = pass.exclude_ids.iter().cloned().collect();
+                    excludes.sort_unstable();
+                    json!({
+                        "kind":format!("{:?}", pass.kind),
+                        "scope":pass.album.selection_scope(),
+                        "excludes":excludes
+                    })
+                })
+                .collect();
+            pass_entries.sort_by_key(|entry| serde_json::to_string(entry).unwrap());
+            assert_eq!(descriptor_scope, source_scope);
+            assert_eq!(descriptor_entries, pass_entries);
+            (
+                plans.len(),
+                pass_entries.len(),
+                descriptor_scope,
+                descriptor_entries,
+            )
+        };
+        let shared_probe = canonical(
+            &serde_json::from_str(descriptor.as_ref().unwrap()).unwrap(),
+            &shared_state.plan.passes,
+        );
+        let primary_probe = canonical(
+            &serde_json::from_str(primary_descriptor.as_ref().unwrap()).unwrap(),
+            &primary_state.plan.passes,
+        );
+        eprintln!("B-CANON shared{shared_probe:?} primary{primary_probe:?}");
+
         assert_eq!(
             debt, 1,
             "mixed-source Shared+Hidden baseline must record one strict source census obligation for the downloaded still+motion family"
@@ -1405,5 +1479,274 @@ async fn v027_mixed_shared_hidden_baseline_censuses_preboundary_deleted_live_pai
         std::fs::read(root.join("primary-current.JPG")).unwrap(),
         MEDIA
     );
+    server.verify().await;
+}
+
+/// B token-expiry counterexample on unchanged product.
+///
+/// Cycle 0 is an ordinary fresh baseline and creates the active token. Cycle 1
+/// reopens with that token, the provider rejects it, and dispatch silently
+/// falls back to an inventory. The cycle was Incremental, so no fresh
+/// `fresh_baseline_cursor` and no mixed-plan catalog seed can run. The request
+/// order and the missing catalog round are recorded without hand-installing a
+/// token, completing an epoch, or forcing a boundary.
+#[tokio::test]
+async fn v027_expired_active_token_fallback_omits_catalog_origin() {
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct ExpirySession {
+        zone_id: Value,
+        cycle: usize,
+        boundary: String,
+        expire: bool,
+        current: Arc<Vec<Value>>,
+        order: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl PhotosSession for ExpirySession {
+        async fn post(
+            &self,
+            url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            let request: Value = serde_json::from_str(&body)?;
+            if url.contains("/zones/list") {
+                self.order.lock().unwrap().push("zones/list".into());
+                return Ok(
+                    json!({"zones":[{"zoneID":self.zone_id,"syncToken":self.boundary,"deleted":false}]}),
+                );
+            }
+            if request.pointer("/query/recordType").and_then(Value::as_str)
+                == Some("CheckIndexingState")
+            {
+                return Ok(
+                    json!({"records":[{"recordName":"index","recordType":"CheckIndexingState","fields":{"state":{"value":"FINISHED"}}}]}),
+                );
+            }
+            if url.contains("/internal/records/query/batch") {
+                let batch: Vec<Value> = request["batch"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|query| {
+                        let record_type = query
+                            .pointer("/query/recordType")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let count = u64::from(
+                            record_type.contains("WithoutHiddenOrDeleted") && self.cycle == 0,
+                        );
+                        json!({"records":[{"fields":{"itemCount":{"value":count}}}]})
+                    })
+                    .collect();
+                return Ok(json!({"batch":batch}));
+            }
+            if url.contains("/records/query?") {
+                let record_type = request
+                    .pointer("/query/recordType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                self.order
+                    .lock()
+                    .unwrap()
+                    .push(format!("query:{record_type}"));
+                if record_type.contains("WithoutHiddenOrDeleted") && self.cycle == 0 {
+                    return Ok(
+                        json!({"records":self.current.as_ref().clone(),"syncToken":"inventory"}),
+                    );
+                }
+                return Ok(json!({"records":[],"syncToken":"inventory"}));
+            }
+            if url.contains("/changes/zone?") {
+                let token = request["zones"][0]["syncToken"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_owned();
+                self.order.lock().unwrap().push(format!("changes:{token}"));
+                if self.expire {
+                    return Ok(
+                        json!({"zones":[{"zoneID":self.zone_id,"serverErrorCode":"BAD_REQUEST"}]}),
+                    );
+                }
+                return Ok(json!({"zones":[{"zoneID":self.zone_id,"records":[],
+                    "syncToken":"current-after-baseline","moreComing":false}]}));
+            }
+            if url.contains("/records/lookup?") {
+                self.order.lock().unwrap().push("lookup".into());
+                let requested = request["records"].as_array().unwrap();
+                let records: Vec<Value> = self
+                    .current
+                    .iter()
+                    .filter(|record| {
+                        requested
+                            .iter()
+                            .any(|query| query["recordName"] == record["recordName"])
+                    })
+                    .cloned()
+                    .collect();
+                return Ok(json!({"records":records}));
+            }
+            anyhow::bail!("unexpected token-expiry endpoint {url}")
+        }
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/expiry-current"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("media");
+    std::fs::create_dir(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    let zone_id = json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"});
+    let mut current = crate::sync_loop::test_support::full_album_page_with_download(
+        ZONE,
+        "expiry-current",
+        "inventory",
+        &format!("{}/expiry-current", server.uri()),
+        MEDIA.len() as u64,
+        &super::generation(93),
+    )["records"]
+        .as_array()
+        .unwrap()
+        .clone();
+    current[0]["zoneID"] = zone_id.clone();
+    current[1]["zoneID"] = zone_id.clone();
+    current[1]["fields"]["masterRef"]["value"]["zoneID"] = zone_id.clone();
+    let current = Arc::new(current);
+
+    let mut token = None;
+    for cycle in 0..2 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let session = ExpirySession {
+            zone_id: zone_id.clone(),
+            cycle,
+            boundary: "baseline-boundary".into(),
+            expire: cycle == 1,
+            current: Arc::clone(&current),
+            order: Arc::clone(&order),
+        };
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/private".into(),
+            Arc::default(),
+            Box::new(session),
+            Arc::new(zone_id.clone()),
+            "shared".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            baseline_owner(),
+            "com",
+        ));
+        let mut albums = library.albums().await.unwrap();
+        let hidden = albums.remove("Hidden").unwrap();
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::SmartFolder,
+                album: hidden,
+                exclude_ids: Arc::default(),
+            },
+            AlbumPass {
+                kind: PassKind::Unfiled,
+                album: library.all(),
+                exclude_ids: Arc::default(),
+            },
+        ];
+        let mut selected =
+            make_run_cycle_library_state_with_passes(ZONE, &sync_token_key(ZONE), passes);
+        selected.library = library;
+        let builder = make_run_cycle_download_config_builder(&root, db.clone());
+        let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+        let result = run_cycle(
+            &[&selected],
+            &make_run_cycle_config(),
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let active = db.get_metadata(&sync_token_key(ZONE)).await.unwrap();
+        if cycle == 0 {
+            assert!(
+                active.is_some(),
+                "baseline must create the active token: {result:?}"
+            );
+            assert_eq!(result.stats.downloaded, 1, "{result:?}");
+            token = active;
+            continue;
+        }
+        let order = order.lock().unwrap().clone();
+        let changes = order
+            .iter()
+            .position(|entry| entry.starts_with("changes:"))
+            .expect("next cycle must attempt the existing token");
+        assert!(
+            !order[..changes].iter().any(|entry| entry == "zones/list"),
+            "cycle 1 must not refresh a boundary before the stale-token attempt"
+        );
+        assert!(
+            order[changes].contains(token.as_deref().unwrap()),
+            "the next cycle must present the baseline-created token: {order:?}"
+        );
+        assert!(
+            order[changes + 1..]
+                .iter()
+                .any(|entry| entry.starts_with("query:")),
+            "the rejected token must fall back to an inventory: {order:?}"
+        );
+        assert!(
+            !order[changes..].iter().any(|entry| entry == "zones/list"),
+            "the fallback inventory must not establish a fresh cycle-owned boundary: {order:?}"
+        );
+        let conn = db
+            .acquire_lock("inspect expired-token catalog omission")
+            .unwrap();
+        let rounds: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_revalidation_rounds WHERE library=?1",
+                [ZONE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let debt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round WHERE r.library=?1",
+                [ZONE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        eprintln!(
+            "B-EXPIRY full_enumeration_reason={:?} sync_token_blocked={} rounds={rounds} debt={debt} order={order:?} token_present={}",
+            result.stats.full_enumeration_reason,
+            result.stats.sync_token_blocked,
+            token.is_some()
+        );
+        assert_eq!(
+            (rounds, debt),
+            (0, 0),
+            "unchanged product omits the mixed-source catalog origin on token expiry"
+        );
+    }
     server.verify().await;
 }

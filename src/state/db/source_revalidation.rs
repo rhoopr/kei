@@ -368,4 +368,104 @@ mod tests {
         assert!(when > chrono::Utc::now().timestamp());
         assert_eq!((deleted, other), (0, 1));
     }
+
+    #[tokio::test]
+    async fn repeated_boundary_new_attempt_abandons_old_origin_and_stale_settle_cannot_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_owned(&dir.path().join("db"), &owner())
+            .await
+            .unwrap();
+        let path = dir.path().join("catalog");
+        std::fs::write(&path, b"catalog bytes").unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new("catalog-asset")
+            .library("PrimarySync")
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "catalog-asset",
+            "original",
+            &path,
+            "synthetic",
+            None,
+        )
+        .await
+        .unwrap();
+        let plan = "a".repeat(64);
+        let epoch = "11111111-1111-1111-1111-111111111111";
+        let attempt_a = "22222222-2222-2222-2222-222222222222";
+        let attempt_b = "33333333-3333-3333-3333-333333333333";
+        let nonce_a = "44444444-4444-4444-4444-444444444444";
+        let nonce_b = "55555555-5555-5555-5555-555555555555";
+        let boundary = "b".repeat(64);
+        let scope_a = format!("catalog:v2:{plan}:{epoch}:{attempt_a}:{nonce_a}");
+        let scope_b = format!("catalog:v2:{plan}:{epoch}:{attempt_b}:{nonce_b}");
+        let candidate = {
+            let conn = db.acquire_lock("seed old catalog origin").unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_rounds VALUES(?1,'PrimarySync',?2,'policy',?3,'catalog-asset','catalog-asset','active')",
+                rusqlite::params![nonce_a, scope_a, boundary],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_debt(round,id) VALUES(?1,'catalog-asset')",
+                [nonce_a],
+            )
+            .unwrap();
+            let snapshot = snapshot(&conn, nonce_a, "catalog-asset", "catalog-asset").unwrap();
+            SourceCandidate {
+                round: nonce_a.into(),
+                library: "PrimarySync".into(),
+                id: "catalog-asset".into(),
+                master: "catalog-asset".into(),
+                child: None,
+                owned_child: false,
+                snapshot,
+            }
+        };
+        {
+            let conn = db
+                .acquire_lock("install repeated-boundary new attempt origin")
+                .unwrap();
+            // Same provider boundary text, new epoch attempt. The old origin is
+            // superseded and retained; the new origin has a new nonce round id.
+            conn.execute(
+                "UPDATE source_revalidation_rounds SET phase='abandoned' WHERE id=?1",
+                [nonce_a],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_rounds VALUES(?1,'PrimarySync',?2,'policy',?3,'catalog-asset','catalog-asset','observing')",
+                rusqlite::params![nonce_b, scope_b, boundary],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_debt(round,id) VALUES(?1,'catalog-asset')",
+                [nonce_b],
+            )
+            .unwrap();
+        }
+        assert!(
+            !db.settle_source_revalidation(owner(), candidate, Some((true, None)), false)
+                .await
+                .unwrap(),
+            "a stale nonce from the prior attempt cannot settle after a repeated boundary"
+        );
+        let conn = db.acquire_lock("verify old origin did not delete").unwrap();
+        let (deleted, old_phase, old_debt, new_debt): (i64, String, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id='catalog-asset'),
+                        (SELECT phase FROM source_revalidation_rounds WHERE id=?1),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?1),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round=?2)",
+                rusqlite::params![nonce_a, nonce_b],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (deleted, old_phase.as_str(), old_debt, new_debt),
+            (0, "abandoned", 1, 1)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"catalog bytes");
+    }
 }
