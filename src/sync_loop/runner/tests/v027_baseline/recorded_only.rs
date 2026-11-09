@@ -853,7 +853,7 @@ async fn stock36_cleanup_success_leaves_no_item_retry_backoff() {
     let selected = stock36_library_state(
         db.clone(),
         ZONE,
-        inventory,
+        inventory.clone(),
         Arc::clone(&full_queries),
         Arc::clone(&changes),
     )
@@ -881,6 +881,44 @@ async fn stock36_cleanup_success_leaves_no_item_retry_backoff() {
         (reason.as_str(), attempts, deadline),
         ("", 0, 0),
         "a resolved cleanup failure must not leave item retry evidence"
+    );
+
+    drop(selected);
+    drop(db);
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let selected = stock36_library_state(
+        db.clone(),
+        ZONE,
+        inventory,
+        Arc::clone(&full_queries),
+        Arc::clone(&changes),
+    )
+    .await;
+    let quiet = run_stock36_cycle(&db, &[&selected], &root, &shared, &config)
+        .await
+        .expect("quiet reopen must complete");
+    let (reason, attempts, deadline, verified) = decision_state(&db, "asset-recovered");
+    eprintln!(
+        "L7 cleanup success quiet reopen: failed={} full_queries={} calls={} verified_media={verified} reason={reason} attempts={attempts} deadline={deadline}",
+        quiet.failed_count,
+        full_queries.load(Ordering::SeqCst),
+        calls.load(Ordering::SeqCst),
+    );
+    assert_eq!(quiet.failed_count, 0);
+    assert_eq!(full_queries.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "verified media must not GET again"
+    );
+    assert_eq!(
+        (reason.as_str(), attempts, deadline, verified),
+        ("", 0, 0, 1),
+        "quiet reopen must preserve the resolved media with no retry evidence"
     );
 }
 
