@@ -708,6 +708,31 @@ fn pending_upgrade_tagged_outcome_roundtrips_through_compiled_baseline_reader_an
     let prior_deadline = 1_700_000_000;
     let reserved_deadline = 1_800_000_000;
     let outcome = qualification_outcome(nonce, prior_deadline);
+    let payload = outcome
+        .strip_prefix("qualification_in_progress:v1:")
+        .unwrap();
+    let parsed: Value = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed.as_object().unwrap().len(), 3);
+    assert!(!outcome.contains("prior_last_outcome"));
+    let bounded_len = outcome.len();
+    for n in 0..64 {
+        let next_nonce = format!("00000000-0000-4000-8000-{n:012}");
+        let next = qualification_outcome(&next_nonce, prior_deadline);
+        assert_eq!(
+            next.len(),
+            bounded_len,
+            "repeated reservations must keep the durable outcome bounded"
+        );
+        let next_payload = next.strip_prefix("qualification_in_progress:v1:").unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(next_payload)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
     let mut reserved = before.clone();
     reserved.next_attempt_at = reserved_deadline;
     reserved.last_outcome = Some(outcome.clone());
