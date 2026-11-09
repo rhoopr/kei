@@ -649,14 +649,12 @@ async fn v027_pending_existing_upgrade_running_then_finished_qualifies_then_base
     assert_eq!(std::fs::read(&old).unwrap(), old_bytes);
 }
 
-/// Executed old-reader control for the exact proposed qualification outcome.
-///
-/// This is deliberately separate from the faithful stock upgrade regression and
-/// uses an in-memory enrolled record only. It inserts the proposed versioned
-/// `last_outcome` payload and decodes/validates it with the compiled baseline
-/// reader and gate in this worktree. It is not upgrade setup.
+/// Current strict reader/gate control for the exact proposed qualification
+/// outcome. This is separate from the faithful stock upgrade regression and
+/// uses an in-memory enrolled record only. It proves the new reader defers
+/// before the deadline and blocks ordinary claim at the deadline.
 #[test]
-fn pending_upgrade_tagged_outcome_roundtrips_through_compiled_baseline_reader_and_gate() {
+fn pending_upgrade_tagged_outcome_roundtrips_through_strict_reader_and_gate() {
     use crate::state::SyncEpochGate;
     use crate::state::db::sync_epoch::{
         EpochOrigin, backoff, enroll_library, establish_epoch, gate, has_pending_work, library_key,
@@ -714,13 +712,11 @@ fn pending_upgrade_tagged_outcome_roundtrips_through_compiled_baseline_reader_an
     let parsed: Value = serde_json::from_str(payload).unwrap();
     assert_eq!(parsed.as_object().unwrap().len(), 3);
     assert!(!outcome.contains("prior_last_outcome"));
-    let bounded_len = outcome.len();
     for n in 0..64 {
         let next_nonce = format!("00000000-0000-4000-8000-{n:012}");
         let next = qualification_outcome(&next_nonce, prior_deadline);
-        assert_eq!(
-            next.len(),
-            bounded_len,
+        assert!(
+            next.len() <= 160,
             "repeated reservations must keep the durable outcome bounded"
         );
         let next_payload = next.strip_prefix("qualification_in_progress:v1:").unwrap();
@@ -733,6 +729,18 @@ fn pending_upgrade_tagged_outcome_roundtrips_through_compiled_baseline_reader_an
             3
         );
     }
+    for prior in [i64::MIN, -1, 0, 1, i64::MAX] {
+        let next = qualification_outcome(nonce, prior);
+        assert!(
+            next.len() <= 160,
+            "serialized outcome must stay bounded across i64 widths"
+        );
+        let next_payload = next.strip_prefix("qualification_in_progress:v1:").unwrap();
+        let parsed: Value = serde_json::from_str(next_payload).unwrap();
+        assert_eq!(parsed.as_object().unwrap().len(), 3);
+        assert_eq!(parsed["prior_next_attempt_at"], json!(prior));
+    }
+
     let mut reserved = before.clone();
     reserved.next_attempt_at = reserved_deadline;
     reserved.last_outcome = Some(outcome.clone());
@@ -747,7 +755,6 @@ fn pending_upgrade_tagged_outcome_roundtrips_through_compiled_baseline_reader_an
     )
     .unwrap();
 
-    // Exact compiled baseline decoder and shape validator.
     let decoded = read_library(&conn, ZONE).unwrap().unwrap();
     assert_eq!(decoded.version, reserved.version);
     assert_eq!(decoded.epoch, reserved.epoch);
@@ -760,9 +767,6 @@ fn pending_upgrade_tagged_outcome_roundtrips_through_compiled_baseline_reader_an
     assert_eq!(decoded.last_outcome.as_deref(), Some(outcome.as_str()));
     assert!(decoded.binding.is_none());
 
-    // Before the deadline the baseline gate holds and does not rewrite the
-    // record, so an older binary preserves the reserved attempt/count/binding/
-    // deadline and the opaque private outcome.
     let stored_before: String = conn
         .query_row(
             "SELECT value FROM metadata WHERE key=?1",
@@ -787,18 +791,27 @@ fn pending_upgrade_tagged_outcome_roundtrips_through_compiled_baseline_reader_an
     assert!(backoff(&conn, ZONE, prior_deadline).unwrap());
     assert!(has_pending_work(&conn, ZONE).unwrap());
 
-    // At the deadline the baseline gate may claim its ordinary baseline, but it
-    // must not treat the tagged outcome as completion/staging: state stays
-    // pending, binding stays absent, attempts/count stay unchanged, the hold
-    // remains, and no replay/token is invented.
-    let claimed = gate(&conn, ZONE, "scope", reserved_deadline, None).unwrap();
-    assert!(matches!(claimed, SyncEpochGate::Baseline { .. }));
-    let after = read_library(&conn, ZONE).unwrap().unwrap();
-    assert_eq!(after.state, "pending");
-    assert!(after.binding.is_none());
-    assert_ne!(after.attempt, before.attempt);
-    assert_eq!(after.attempts, before.attempts);
-    assert_eq!(after.last_outcome.as_deref(), Some("baseline_claimed"));
+    let stored_at_deadline: String = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [library_key(ZONE)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        gate(&conn, ZONE, "scope", reserved_deadline, None).unwrap(),
+        SyncEpochGate::Blocked {
+            reason: "qualification_reservation_pending"
+        }
+    );
+    let stored_after_deadline: String = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [library_key(ZONE)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_after_deadline, stored_at_deadline);
     let hold: Option<String> = conn
         .query_row(
             "SELECT value FROM metadata WHERE key=?1",
@@ -815,4 +828,109 @@ fn pending_upgrade_tagged_outcome_roundtrips_through_compiled_baseline_reader_an
         .ok();
     assert_eq!(hold.as_deref(), Some("1"));
     assert_eq!(replay, None);
+}
+
+/// Baseline v2 decoder/gate control retained separately from production.
+///
+/// This test does not call the new strict reader. It copies the released v2
+/// record shape and the baseline gate behavior so the old-reader compatibility
+/// property remains executable after the production reader becomes strict. It
+/// is not upgrade setup.
+#[test]
+fn pending_upgrade_tagged_outcome_roundtrips_through_baseline_v2_decoder_and_gate() {
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BaselineV2Record {
+        version: u8,
+        epoch: String,
+        library: String,
+        state: String,
+        reason: String,
+        attempt: String,
+        attempts: u32,
+        next_attempt_at: i64,
+        last_outcome: Option<String>,
+        baseline_scope: String,
+        enrolled_at: i64,
+        completed_at: Option<i64>,
+        #[serde(default)]
+        binding: Option<Value>,
+    }
+
+    #[derive(serde::Serialize)]
+    struct QualificationOutcome<'a> {
+        version: u8,
+        nonce: &'a str,
+        prior_next_attempt_at: i64,
+    }
+
+    fn qualification_outcome(nonce: &str, prior_next_attempt_at: i64) -> String {
+        let payload = QualificationOutcome {
+            version: 1,
+            nonce,
+            prior_next_attempt_at,
+        };
+        format!(
+            "qualification_in_progress:v1:{}",
+            serde_json::to_string(&payload).unwrap()
+        )
+    }
+
+    fn baseline_gate(record: &BaselineV2Record, now: i64) -> &'static str {
+        if record.state != "pending" || record.binding.is_some() {
+            return "not_pending";
+        }
+        if now < record.next_attempt_at {
+            "defer"
+        } else {
+            "baseline_claim"
+        }
+    }
+
+    let nonce = "5154f8f1-7e3b-4c5a-9f2d-6a1b0c9d8e7f";
+    let prior_deadline = 1_700_000_000;
+    let reserved_deadline = 1_800_000_000;
+    let outcome = qualification_outcome(nonce, prior_deadline);
+    let record = json!({
+        "version": 2,
+        "epoch": "epoch-id",
+        "library": ZONE,
+        "state": "pending",
+        "reason": "existing_upgrade",
+        "attempt": "attempt-id",
+        "attempts": 0,
+        "next_attempt_at": reserved_deadline,
+        "last_outcome": outcome,
+        "baseline_scope": "scope",
+        "enrolled_at": prior_deadline,
+        "completed_at": null
+    });
+    let decoded: BaselineV2Record = serde_json::from_value(record).unwrap();
+    assert_eq!(decoded.version, 2);
+    assert_eq!(decoded.epoch, "epoch-id");
+    assert_eq!(decoded.library, ZONE);
+    assert_eq!(decoded.state, "pending");
+    assert_eq!(decoded.reason, "existing_upgrade");
+    assert_eq!(decoded.attempt, "attempt-id");
+    assert_eq!(decoded.attempts, 0);
+    assert_eq!(decoded.next_attempt_at, reserved_deadline);
+    assert_eq!(decoded.last_outcome.as_deref(), Some(outcome.as_str()));
+    assert_eq!(decoded.baseline_scope, "scope");
+    assert_eq!(decoded.enrolled_at, prior_deadline);
+    assert!(decoded.completed_at.is_none());
+    assert!(decoded.binding.is_none());
+
+    assert_eq!(baseline_gate(&decoded, prior_deadline), "defer");
+    assert_eq!(baseline_gate(&decoded, reserved_deadline), "baseline_claim");
+    assert_eq!(decoded.last_outcome.as_deref(), Some(outcome.as_str()));
+    assert!(decoded.binding.is_none());
+
+    for prior in [i64::MIN, -1, 0, 1, i64::MAX] {
+        let next = qualification_outcome(nonce, prior);
+        assert!(next.len() <= 160);
+        let payload = next.strip_prefix("qualification_in_progress:v1:").unwrap();
+        let parsed: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.as_object().unwrap().len(), 3);
+        assert_eq!(parsed["prior_next_attempt_at"], json!(prior));
+    }
 }

@@ -30,6 +30,11 @@ const INITIAL_RETRY_SECONDS: i64 = 60 * 60;
 pub(crate) const MAX_RETRY_SECONDS: i64 = 24 * 60 * 60;
 const MAX_BACKOFF_SHIFT: u32 = 5;
 
+const QUALIFICATION_OUTCOME_PREFIX: &str = "qualification_in_progress:";
+const QUALIFICATION_OUTCOME_VERSION: u8 = 1;
+const QUALIFICATION_QUALIFIED_OUTCOME: &str = "indexing_inventory_qualified";
+const QUALIFICATION_INCOMPLETE_PREFIX: &str = "qualification_incomplete:v1:";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EpochOrigin {
     FreshInstall,
@@ -112,6 +117,88 @@ pub(crate) struct EpochCompletion {
     pub(crate) library: String,
     pub(crate) attempt: String,
     pub(crate) baseline_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum QualificationReserve {
+    Reserved(Box<QualificationReservation>),
+    NotDue { next_attempt_at: i64 },
+    NotPending,
+    StaleFence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum QualificationFinish {
+    Finished,
+    NotOwner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "constructed by the L1 shared-seam qualification classifier"
+)]
+pub(crate) enum QualificationFailure {
+    EnumerationIncomplete,
+    ProofIncomplete,
+    ReadinessRegressed,
+    StalePlan,
+    NotFullEnumeration,
+    FailedTransfers,
+    MetadataFailures,
+}
+
+impl QualificationFailure {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::EnumerationIncomplete => "enumeration_incomplete",
+            Self::ProofIncomplete => "proof_incomplete",
+            Self::ReadinessRegressed => "readiness_regressed",
+            Self::StalePlan => "stale_plan",
+            Self::NotFullEnumeration => "not_full_enumeration",
+            Self::FailedTransfers => "failed_transfers",
+            Self::MetadataFailures => "metadata_failures",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QualificationReservation {
+    pub(crate) epoch: String,
+    pub(crate) library: String,
+    pub(crate) attempt: String,
+    pub(crate) nonce: String,
+    #[allow(
+        dead_code,
+        reason = "exact prior record retained for the L1 success transaction"
+    )]
+    pub(crate) prior_record: String,
+    pub(crate) reserved_record: String,
+    #[allow(
+        dead_code,
+        reason = "consumed by commit_indexing_qualification once the L1 helper lands"
+    )]
+    pub(crate) restored_record: String,
+    pub(crate) reserved_outcome: String,
+    pub(crate) expected_metadata: Vec<(String, Option<String>)>,
+    #[allow(
+        dead_code,
+        reason = "consumed by commit_indexing_qualification once the L1 helper lands"
+    )]
+    pub(crate) indexing_key: String,
+    #[allow(
+        dead_code,
+        reason = "consumed by commit_indexing_qualification once the L1 helper lands"
+    )]
+    pub(crate) replay_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualificationOutcomeV1 {
+    version: u8,
+    nonce: String,
+    prior_next_attempt_at: i64,
 }
 
 pub(crate) fn library_key(library: &str) -> String {
@@ -255,6 +342,54 @@ pub(crate) fn establish_epoch(conn: &Connection, origin: EpochOrigin) -> Result<
     Ok(())
 }
 
+#[allow(
+    dead_code,
+    reason = "consumed by the L1 shared-seam qualification integration"
+)]
+fn encode_qualification_outcome(
+    nonce: &str,
+    prior_next_attempt_at: i64,
+) -> Result<String, StateError> {
+    let payload = QualificationOutcomeV1 {
+        version: QUALIFICATION_OUTCOME_VERSION,
+        nonce: nonce.to_owned(),
+        prior_next_attempt_at,
+    };
+    let body = serde_json::to_string(&payload).map_err(|_error| StateError::SyncEpochMismatch)?;
+    Ok(format!(
+        "{QUALIFICATION_OUTCOME_PREFIX}v{QUALIFICATION_OUTCOME_VERSION}:{body}"
+    ))
+}
+
+fn parse_qualification_outcome(
+    value: Option<&str>,
+) -> Result<Option<QualificationOutcomeV1>, StateError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(rest) = value.strip_prefix(QUALIFICATION_OUTCOME_PREFIX) else {
+        return Ok(None);
+    };
+    let Some((version, body)) = rest.split_once(':') else {
+        return Err(StateError::SyncEpochMismatch);
+    };
+    if version != "v1" {
+        return Err(StateError::SyncEpochMismatch);
+    }
+    let payload: QualificationOutcomeV1 =
+        serde_json::from_str(body).map_err(|_error| StateError::SyncEpochMismatch)?;
+    if payload.version != QUALIFICATION_OUTCOME_VERSION
+        || uuid::Uuid::parse_str(&payload.nonce).is_err()
+    {
+        return Err(StateError::SyncEpochMismatch);
+    }
+    Ok(Some(payload))
+}
+
+fn encode_library(record: &SyncEpochLibrary) -> Result<String, StateError> {
+    serde_json::to_string(record).map_err(|_error| StateError::SyncEpochMismatch)
+}
+
 /// The single shape guard for a per-library record. Phase and binding are one
 /// invariant: a ready record owns exactly one binding and no other phase does.
 fn validate_library_record(record: &SyncEpochLibrary, library: &str) -> Result<(), StateError> {
@@ -271,6 +406,7 @@ fn validate_library_record(record: &SyncEpochLibrary, library: &str) -> Result<(
     {
         return Err(StateError::SyncEpochMismatch);
     }
+    parse_qualification_outcome(record.last_outcome.as_deref())?;
     Ok(())
 }
 
@@ -319,8 +455,16 @@ pub(crate) fn read_library(
 }
 
 fn write_library(conn: &Connection, record: &SyncEpochLibrary) -> Result<(), StateError> {
+    let encoded = encode_library(record)?;
+    write_library_encoded(conn, record, &encoded)
+}
+
+fn write_library_encoded(
+    conn: &Connection,
+    record: &SyncEpochLibrary,
+    encoded: &str,
+) -> Result<(), StateError> {
     validate_library_record(record, &record.library)?;
-    let encoded = serde_json::to_string(record).map_err(|_error| StateError::SyncEpochMismatch)?;
     conn.execute(
         "INSERT INTO metadata(key,value) VALUES(?1,?2) \
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -505,6 +649,7 @@ pub(crate) fn gate(
     if record.epoch != epoch.epoch {
         return Err(StateError::SyncEpochMismatch);
     }
+    let qualification = parse_qualification_outcome(record.last_outcome.as_deref())?;
     match record.state.as_str() {
         "complete" => return Ok(SyncEpochGate::Open),
         "blocked" => {
@@ -524,6 +669,16 @@ pub(crate) fn gate(
         rotate_attempt(conn, &mut record, now, watch_interval, "stale_staged_proof")?;
         return Ok(SyncEpochGate::Baseline {
             attempt: record.attempt,
+        });
+    }
+    if qualification.is_some() {
+        if now < record.next_attempt_at {
+            return Ok(SyncEpochGate::Defer {
+                reason: "epoch_backoff",
+            });
+        }
+        return Ok(SyncEpochGate::Blocked {
+            reason: "qualification_reservation_pending",
         });
     }
     if now < record.next_attempt_at {
@@ -604,6 +759,11 @@ pub(crate) fn recover_attempt(
     if record.state != "pending" {
         return Ok(());
     }
+    if parse_qualification_outcome(record.last_outcome.as_deref())?.is_some() {
+        // A committed qualification guard owns its deadline and outcome.
+        // Ordinary baseline recovery must not overwrite or rearm it.
+        return Ok(());
+    }
     let now = chrono::Utc::now().timestamp();
     if provider_failure {
         record.attempts = record.attempts.saturating_add(1);
@@ -633,12 +793,233 @@ pub(crate) fn defer_without_attempt(
     if record.state != "pending" && record.state != "ready" {
         return Ok(());
     }
+    if parse_qualification_outcome(record.last_outcome.as_deref())?.is_some() {
+        // Preserve the qualification guard exactly.
+        return Ok(());
+    }
     if record.next_attempt_at > now {
         return Ok(());
     }
     record.next_attempt_at = now.saturating_add(retry_floor(watch_interval));
     record.last_outcome = Some(outcome.to_owned());
     write_library(conn, &record)
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by the L1 shared-seam qualification integration"
+)]
+fn fence_matches(
+    conn: &Connection,
+    expected: &[(String, Option<String>)],
+) -> Result<bool, StateError> {
+    for (key, expected_value) in expected {
+        if metadata_value(conn, key)? != *expected_value {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by the L1 shared-seam qualification integration"
+)]
+pub(crate) fn reserve_indexing_qualification(
+    conn: &Connection,
+    library: &str,
+    indexing_key: &str,
+    replay_key: &str,
+    expected_metadata: &[(String, Option<String>)],
+    now: i64,
+    watch_interval: Option<u64>,
+) -> Result<QualificationReserve, StateError> {
+    let epoch = match validate(conn) {
+        Ok(epoch) => epoch,
+        Err(StateError::SyncEpochMismatch) => return Ok(QualificationReserve::StaleFence),
+        Err(error) => return Err(error),
+    };
+    let Some(raw_epoch) = metadata_value(conn, SYNC_EPOCH_KEY)? else {
+        return Ok(QualificationReserve::StaleFence);
+    };
+    let Some((_, expected_epoch)) = expected_metadata
+        .iter()
+        .find(|(key, _)| key == SYNC_EPOCH_KEY)
+    else {
+        return Ok(QualificationReserve::StaleFence);
+    };
+    if expected_epoch.as_deref() != Some(raw_epoch.as_str()) {
+        return Ok(QualificationReserve::StaleFence);
+    }
+    if !fence_matches(conn, expected_metadata)? {
+        return Ok(QualificationReserve::StaleFence);
+    }
+    let record_key = library_key(library);
+    if expected_metadata.iter().any(|(key, _)| key == &record_key) {
+        // The owner adds the exact reserved record itself.
+        return Ok(QualificationReserve::StaleFence);
+    }
+    let record = match read_library(conn, library) {
+        Ok(Some(record)) => record,
+        Ok(None) => return Ok(QualificationReserve::StaleFence),
+        Err(StateError::SyncEpochMismatch) => return Ok(QualificationReserve::StaleFence),
+        Err(error) => return Err(error),
+    };
+    if record.epoch != epoch.epoch {
+        return Ok(QualificationReserve::StaleFence);
+    }
+    match record.state.as_str() {
+        "pending" => {}
+        "ready" | "blocked" | "complete" => return Ok(QualificationReserve::NotPending),
+        _ => return Ok(QualificationReserve::StaleFence),
+    }
+    if record.binding.is_some() {
+        return Ok(QualificationReserve::StaleFence);
+    }
+    parse_qualification_outcome(record.last_outcome.as_deref())?;
+    if now < record.next_attempt_at {
+        return Ok(QualificationReserve::NotDue {
+            next_attempt_at: record.next_attempt_at,
+        });
+    }
+
+    let prior_record = encode_library(&record)?;
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let prior_next_attempt_at = record.next_attempt_at;
+    let reserved_next_attempt_at = now.saturating_add(retry_floor(watch_interval));
+    let reserved_outcome = encode_qualification_outcome(&nonce, prior_next_attempt_at)?;
+
+    let mut reserved = record.clone();
+    reserved.next_attempt_at = reserved_next_attempt_at;
+    reserved.last_outcome = Some(reserved_outcome.clone());
+    let reserved_record = encode_library(&reserved)?;
+
+    let mut restored = record.clone();
+    restored.next_attempt_at = prior_next_attempt_at;
+    restored.last_outcome = Some(QUALIFICATION_QUALIFIED_OUTCOME.to_owned());
+    let restored_record = encode_library(&restored)?;
+
+    let mut expected = expected_metadata.to_vec();
+    expected.push((record_key, Some(reserved_record.clone())));
+
+    write_library_encoded(conn, &reserved, &reserved_record)?;
+    Ok(QualificationReserve::Reserved(Box::new(
+        QualificationReservation {
+            epoch: epoch.epoch,
+            library: library.to_owned(),
+            attempt: record.attempt,
+            nonce,
+            prior_record,
+            reserved_record,
+            restored_record,
+            reserved_outcome,
+            expected_metadata: expected,
+            indexing_key: indexing_key.to_owned(),
+            replay_key: replay_key.to_owned(),
+        },
+    )))
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by the L1 shared-seam qualification integration"
+)]
+fn qualification_record_for_finish(
+    conn: &Connection,
+    reservation: &QualificationReservation,
+) -> Result<Option<SyncEpochLibrary>, StateError> {
+    let epoch = match validate(conn) {
+        Ok(epoch) => epoch,
+        Err(StateError::SyncEpochMismatch) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if epoch.epoch != reservation.epoch {
+        return Ok(None);
+    }
+    if !fence_matches(conn, &reservation.expected_metadata)? {
+        return Ok(None);
+    }
+    let Some(actual) = metadata_value(conn, &library_key(&reservation.library))? else {
+        return Ok(None);
+    };
+    if actual != reservation.reserved_record {
+        return Ok(None);
+    }
+    let record = match read_library(conn, &reservation.library) {
+        Ok(Some(record)) => record,
+        Ok(None) => return Ok(None),
+        Err(StateError::SyncEpochMismatch) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if record.epoch != reservation.epoch
+        || record.attempt != reservation.attempt
+        || record.state != "pending"
+        || record.binding.is_some()
+        || record.last_outcome.as_deref() != Some(reservation.reserved_outcome.as_str())
+    {
+        return Ok(None);
+    }
+    Ok(Some(record))
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by the L1 shared-seam qualification integration"
+)]
+pub(crate) fn finish_qualification_nonqualified(
+    conn: &Connection,
+    reservation: &QualificationReservation,
+    reason: QualificationFailure,
+) -> Result<QualificationFinish, StateError> {
+    let Some(mut record) = qualification_record_for_finish(conn, reservation)? else {
+        return Ok(QualificationFinish::NotOwner);
+    };
+    record.last_outcome = Some(format!(
+        "{QUALIFICATION_INCOMPLETE_PREFIX}{}",
+        reason.as_str()
+    ));
+    write_library(conn, &record)?;
+    Ok(QualificationFinish::Finished)
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by the L1 shared-seam qualification integration"
+)]
+pub(crate) fn finish_qualification_provider_failure(
+    conn: &Connection,
+    reservation: &QualificationReservation,
+    now: i64,
+    watch_interval: Option<u64>,
+) -> Result<QualificationFinish, StateError> {
+    let Some(mut record) = qualification_record_for_finish(conn, reservation)? else {
+        return Ok(QualificationFinish::NotOwner);
+    };
+    record.attempts = record.attempts.saturating_add(1);
+    record.next_attempt_at = now.saturating_add(retry_delay(watch_interval, record.attempts));
+    record.last_outcome = Some("provider_failure".to_owned());
+    write_library(conn, &record)?;
+    Ok(QualificationFinish::Finished)
+}
+
+#[allow(
+    dead_code,
+    reason = "consumed by the L1 shared-seam qualification integration"
+)]
+pub(crate) fn finish_qualification_auth_or_cancel(
+    conn: &Connection,
+    reservation: &QualificationReservation,
+    now: i64,
+    watch_interval: Option<u64>,
+) -> Result<QualificationFinish, StateError> {
+    let Some(mut record) = qualification_record_for_finish(conn, reservation)? else {
+        return Ok(QualificationFinish::NotOwner);
+    };
+    let floor = now.saturating_add(retry_floor(watch_interval));
+    record.next_attempt_at = record.next_attempt_at.max(floor);
+    record.last_outcome = Some("auth_cancel_or_shutdown".to_owned());
+    write_library(conn, &record)?;
+    Ok(QualificationFinish::Finished)
 }
 
 /// Stage the single ready transition. The binding is validated and written with
@@ -919,6 +1300,99 @@ impl SqliteStateDb {
             )?;
             tx.commit()?;
             Ok(())
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by the L1 shared-seam qualification integration"
+    )]
+    pub(crate) async fn reserve_indexing_qualification(
+        &self,
+        library: String,
+        indexing_key: String,
+        replay_key: String,
+        expected_metadata: Vec<(String, Option<String>)>,
+        watch_interval: Option<u64>,
+    ) -> Result<QualificationReserve, StateError> {
+        self.with_conn_mut("reserving indexing qualification", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let outcome = reserve_indexing_qualification(
+                &tx,
+                &library,
+                &indexing_key,
+                &replay_key,
+                &expected_metadata,
+                chrono::Utc::now().timestamp(),
+                watch_interval,
+            )?;
+            tx.commit()?;
+            Ok(outcome)
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by the L1 shared-seam qualification integration"
+    )]
+    pub(crate) async fn finish_indexing_qualification_nonqualified(
+        &self,
+        reservation: QualificationReservation,
+        reason: QualificationFailure,
+    ) -> Result<QualificationFinish, StateError> {
+        self.with_conn_mut("finishing indexing qualification", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let outcome = finish_qualification_nonqualified(&tx, &reservation, reason)?;
+            tx.commit()?;
+            Ok(outcome)
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by the L1 shared-seam qualification integration"
+    )]
+    pub(crate) async fn finish_indexing_qualification_provider_failure(
+        &self,
+        reservation: QualificationReservation,
+        watch_interval: Option<u64>,
+    ) -> Result<QualificationFinish, StateError> {
+        self.with_conn_mut("finishing indexing qualification", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let outcome = finish_qualification_provider_failure(
+                &tx,
+                &reservation,
+                chrono::Utc::now().timestamp(),
+                watch_interval,
+            )?;
+            tx.commit()?;
+            Ok(outcome)
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by the L1 shared-seam qualification integration"
+    )]
+    pub(crate) async fn finish_indexing_qualification_auth_or_cancel(
+        &self,
+        reservation: QualificationReservation,
+        watch_interval: Option<u64>,
+    ) -> Result<QualificationFinish, StateError> {
+        self.with_conn_mut("finishing indexing qualification", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let outcome = finish_qualification_auth_or_cancel(
+                &tx,
+                &reservation,
+                chrono::Utc::now().timestamp(),
+                watch_interval,
+            )?;
+            tx.commit()?;
+            Ok(outcome)
         })
         .await
     }
@@ -1725,5 +2199,474 @@ mod tests {
         let record = read_library(&conn, "PrimarySync").unwrap().unwrap();
         assert_eq!(record.attempts, 1);
         assert!(record.next_attempt_at > chrono::Utc::now().timestamp());
+    }
+
+    const TEST_LIBRARY: &str = "PrimarySync";
+    const TEST_INDEXING_KEY: &str = "indexing_reconciliation_required:PrimarySync";
+    const TEST_REPLAY_KEY: &str = "indexing_replay_required:v27:PrimarySync";
+    const TEST_MATERIALIZATION_KEY: &str = "indexing_materialization_required:PrimarySync";
+    const TEST_SYNC_TOKEN_KEY: &str = "sync_token:v27:PrimarySync";
+    const TEST_HOLD_KEY: &str = "retained_checkpoint_hold:v27:PrimarySync";
+
+    fn qualification_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE assets(library TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(library,id));
+             CREATE TABLE account_owner (
+                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                 version INTEGER NOT NULL,
+                 account_key TEXT NOT NULL,
+                 provider_key TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute_batch(super::super::source_revalidation::DDL)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO account_owner VALUES(1,1,'account-a',?1)",
+            ["a".repeat(64)],
+        )
+        .unwrap();
+        establish_epoch(&conn, EpochOrigin::ExistingUpgrade).unwrap();
+        conn.execute(
+            "INSERT INTO assets(library,id) VALUES(?1,'historical')",
+            [TEST_LIBRARY],
+        )
+        .unwrap();
+        enroll_library(&conn, TEST_LIBRARY, "scope").unwrap();
+        let mut record = read_library(&conn, TEST_LIBRARY).unwrap().unwrap();
+        record.next_attempt_at = 1_000;
+        write_library(&conn, &record).unwrap();
+        for (key, value) in [
+            (crate::sync_cycle::ENUM_CONFIG_HASH_KEY, "enum-hash"),
+            (
+                crate::sync_cycle::PENDING_ENUM_CONFIG_HASH_KEY,
+                "pending-enum-hash",
+            ),
+            (crate::download::DOWNLOAD_CONFIG_HASH_KEY, "config-hash"),
+            (
+                crate::sync_cycle::PENDING_DOWNLOAD_CONFIG_HASH_KEY,
+                "pending-config-hash",
+            ),
+            (TEST_MATERIALIZATION_KEY, "materialization"),
+            (TEST_INDEXING_KEY, "1"),
+            (TEST_REPLAY_KEY, "retained-replay"),
+            (TEST_SYNC_TOKEN_KEY, "retained-token"),
+            (TEST_HOLD_KEY, "retained-hold"),
+        ] {
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key,value) VALUES(?1,?2)",
+                params![key, value],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn qualification_fence(conn: &Connection) -> Vec<(String, Option<String>)> {
+        let mut fence: Vec<(String, Option<String>)> = [
+            crate::sync_cycle::ENUM_CONFIG_HASH_KEY,
+            crate::sync_cycle::PENDING_ENUM_CONFIG_HASH_KEY,
+            crate::download::DOWNLOAD_CONFIG_HASH_KEY,
+            crate::sync_cycle::PENDING_DOWNLOAD_CONFIG_HASH_KEY,
+            TEST_MATERIALIZATION_KEY,
+            TEST_INDEXING_KEY,
+            TEST_REPLAY_KEY,
+            TEST_SYNC_TOKEN_KEY,
+            TEST_HOLD_KEY,
+        ]
+        .into_iter()
+        .map(|key| (key.to_owned(), metadata_value(conn, key).unwrap()))
+        .collect();
+        fence.push((
+            SYNC_EPOCH_KEY.to_owned(),
+            metadata_value(conn, SYNC_EPOCH_KEY).unwrap(),
+        ));
+        fence
+    }
+
+    fn reserve_qualification(
+        conn: &Connection,
+        fence: &[(String, Option<String>)],
+        now: i64,
+    ) -> QualificationReserve {
+        reserve_indexing_qualification(
+            conn,
+            TEST_LIBRARY,
+            TEST_INDEXING_KEY,
+            TEST_REPLAY_KEY,
+            fence,
+            now,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn reserved_or_panic(outcome: QualificationReserve) -> QualificationReservation {
+        match outcome {
+            QualificationReserve::Reserved(reservation) => *reservation,
+            other => panic!("expected reservation, got {other:?}"),
+        }
+    }
+
+    fn current_record(conn: &Connection) -> SyncEpochLibrary {
+        read_library(conn, TEST_LIBRARY).unwrap().unwrap()
+    }
+
+    fn stored_record(conn: &Connection) -> Option<String> {
+        metadata_value(conn, &library_key(TEST_LIBRARY)).unwrap()
+    }
+
+    fn write_raw_record(conn: &Connection, record: &SyncEpochLibrary) {
+        conn.execute(
+            "UPDATE metadata SET value=?1 WHERE key=?2",
+            params![
+                serde_json::to_string(record).unwrap(),
+                library_key(TEST_LIBRARY)
+            ],
+        )
+        .unwrap();
+    }
+
+    fn mutate_owner_and_epoch_consistently(conn: &Connection) {
+        let provider = "b".repeat(64);
+        conn.execute(
+            "UPDATE account_owner SET account_key='account-b', provider_key=?1 WHERE singleton=1",
+            [&provider],
+        )
+        .unwrap();
+        let raw = metadata_value(conn, SYNC_EPOCH_KEY).unwrap().unwrap();
+        let mut epoch: SyncEpoch = serde_json::from_str(&raw).unwrap();
+        epoch.account_key = "account-b".to_owned();
+        epoch.provider_key = provider;
+        conn.execute(
+            "UPDATE metadata SET value=?1 WHERE key=?2",
+            params![serde_json::to_string(&epoch).unwrap(), SYNC_EPOCH_KEY],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn qualification_reservation_preserves_phase_and_captures_fences() {
+        let conn = qualification_db();
+        let before = current_record(&conn);
+        let fence = qualification_fence(&conn);
+        let raw_epoch = metadata_value(&conn, SYNC_EPOCH_KEY).unwrap().unwrap();
+        let reservation = reserved_or_panic(reserve_qualification(&conn, &fence, 10_000));
+        let record = current_record(&conn);
+
+        assert_eq!(record.state, "pending");
+        assert!(record.binding.is_none());
+        assert_eq!(record.attempt, before.attempt);
+        assert_eq!(record.attempts, before.attempts);
+        assert_eq!(
+            record.next_attempt_at,
+            10_000_i64.saturating_add(retry_floor(None))
+        );
+        let outcome = parse_qualification_outcome(record.last_outcome.as_deref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.version, 1);
+        assert_eq!(outcome.nonce, reservation.nonce);
+        assert_eq!(outcome.prior_next_attempt_at, before.next_attempt_at);
+        assert_eq!(
+            reservation.reserved_record,
+            encode_library(&record).unwrap()
+        );
+        assert!(reservation.expected_metadata.iter().any(|(key, value)| {
+            key == SYNC_EPOCH_KEY && value.as_deref() == Some(raw_epoch.as_str())
+        }));
+        assert!(reservation.expected_metadata.iter().any(|(key, value)| {
+            key == &library_key(TEST_LIBRARY)
+                && value.as_deref() == Some(reservation.reserved_record.as_str())
+        }));
+        let restored: SyncEpochLibrary =
+            serde_json::from_str(&reservation.restored_record).unwrap();
+        assert_eq!(restored.state, "pending");
+        assert!(restored.binding.is_none());
+        assert_eq!(restored.attempt, before.attempt);
+        assert_eq!(restored.attempts, before.attempts);
+        assert_eq!(restored.next_attempt_at, before.next_attempt_at);
+        assert_eq!(
+            restored.last_outcome.as_deref(),
+            Some(QUALIFICATION_QUALIFIED_OUTCOME)
+        );
+    }
+
+    #[test]
+    fn qualification_not_due_and_not_pending_do_not_enter_lane() {
+        let conn = qualification_db();
+        let mut record = current_record(&conn);
+        record.next_attempt_at = 100_000;
+        write_library(&conn, &record).unwrap();
+        let before = stored_record(&conn);
+        let fence = qualification_fence(&conn);
+        assert_eq!(
+            reserve_qualification(&conn, &fence, 99_999),
+            QualificationReserve::NotDue {
+                next_attempt_at: 100_000
+            }
+        );
+        assert_eq!(stored_record(&conn), before);
+
+        record.state = "complete".to_owned();
+        write_library(&conn, &record).unwrap();
+        assert_eq!(
+            reserve_qualification(&conn, &qualification_fence(&conn), 200_000),
+            QualificationReserve::NotPending
+        );
+    }
+
+    #[test]
+    fn qualification_stale_fence_refuses_finish_and_reentry() {
+        let conn = qualification_db();
+        let fence = qualification_fence(&conn);
+        let reservation = reserved_or_panic(reserve_qualification(&conn, &fence, 10_000));
+        let reserved = stored_record(&conn);
+        conn.execute(
+            "UPDATE metadata SET value='changed' WHERE key=?1",
+            [crate::download::DOWNLOAD_CONFIG_HASH_KEY],
+        )
+        .unwrap();
+
+        assert_eq!(
+            finish_qualification_nonqualified(
+                &conn,
+                &reservation,
+                QualificationFailure::ProofIncomplete
+            )
+            .unwrap(),
+            QualificationFinish::NotOwner
+        );
+        assert_eq!(stored_record(&conn), reserved);
+        assert_eq!(
+            reserve_qualification(&conn, &fence, 20_000),
+            QualificationReserve::StaleFence
+        );
+        assert_eq!(stored_record(&conn), reserved);
+    }
+
+    #[test]
+    fn qualification_consistent_owner_and_epoch_mutation_refuses() {
+        let conn = qualification_db();
+        let fence = qualification_fence(&conn);
+        let reservation = reserved_or_panic(reserve_qualification(&conn, &fence, 10_000));
+        let reserved = stored_record(&conn);
+        mutate_owner_and_epoch_consistently(&conn);
+        validate(&conn).unwrap();
+
+        assert_eq!(
+            finish_qualification_nonqualified(
+                &conn,
+                &reservation,
+                QualificationFailure::ProofIncomplete
+            )
+            .unwrap(),
+            QualificationFinish::NotOwner
+        );
+        assert_eq!(stored_record(&conn), reserved);
+        assert_eq!(
+            reserve_qualification(&conn, &fence, 20_000),
+            QualificationReserve::StaleFence
+        );
+        assert_eq!(stored_record(&conn), reserved);
+    }
+
+    #[test]
+    fn qualification_new_nonce_supersedes_stale_finisher_and_reset_refuses() {
+        let conn = qualification_db();
+        let fence = qualification_fence(&conn);
+        let first = reserved_or_panic(reserve_qualification(&conn, &fence, 10_000));
+        let first_deadline = current_record(&conn).next_attempt_at;
+        let second = reserved_or_panic(reserve_qualification(&conn, &fence, first_deadline));
+        assert_ne!(first.nonce, second.nonce);
+
+        assert_eq!(
+            finish_qualification_nonqualified(&conn, &first, QualificationFailure::ProofIncomplete)
+                .unwrap(),
+            QualificationFinish::NotOwner
+        );
+        assert_eq!(stored_record(&conn), Some(second.reserved_record.clone()));
+        let second_deadline = current_record(&conn).next_attempt_at;
+        assert_eq!(
+            finish_qualification_nonqualified(
+                &conn,
+                &second,
+                QualificationFailure::ProofIncomplete
+            )
+            .unwrap(),
+            QualificationFinish::Finished
+        );
+        assert_eq!(
+            finish_qualification_nonqualified(
+                &conn,
+                &second,
+                QualificationFailure::ProofIncomplete
+            )
+            .unwrap(),
+            QualificationFinish::NotOwner,
+            "the same nonce cannot finish twice"
+        );
+
+        let third = reserved_or_panic(reserve_qualification(&conn, &fence, second_deadline));
+        reset_libraries_for_token_reset(&conn, 2_000_000).unwrap();
+        assert_eq!(
+            finish_qualification_nonqualified(&conn, &third, QualificationFailure::ProofIncomplete)
+                .unwrap(),
+            QualificationFinish::NotOwner
+        );
+    }
+
+    #[test]
+    fn qualification_finish_paths_keep_floor_or_bounded_backoff() {
+        let conn = qualification_db();
+        let fence = qualification_fence(&conn);
+        let nonqualified = reserved_or_panic(reserve_qualification(&conn, &fence, 10_000));
+        let floor = current_record(&conn).next_attempt_at;
+        assert_eq!(
+            finish_qualification_nonqualified(
+                &conn,
+                &nonqualified,
+                QualificationFailure::EnumerationIncomplete
+            )
+            .unwrap(),
+            QualificationFinish::Finished
+        );
+        let record = current_record(&conn);
+        assert_eq!(
+            record.last_outcome.as_deref(),
+            Some("qualification_incomplete:v1:enumeration_incomplete")
+        );
+        assert_eq!(record.next_attempt_at, floor);
+        assert_eq!(record.attempts, 0);
+
+        let conn = qualification_db();
+        let fence = qualification_fence(&conn);
+        let provider = reserved_or_panic(reserve_qualification(&conn, &fence, 20_000));
+        assert_eq!(
+            finish_qualification_provider_failure(&conn, &provider, 30_000, None).unwrap(),
+            QualificationFinish::Finished
+        );
+        let record = current_record(&conn);
+        assert_eq!(record.attempts, 1);
+        assert_eq!(
+            record.next_attempt_at,
+            30_000_i64.saturating_add(retry_delay(None, 1))
+        );
+        assert_eq!(record.last_outcome.as_deref(), Some("provider_failure"));
+
+        let conn = qualification_db();
+        let fence = qualification_fence(&conn);
+        let auth = reserved_or_panic(reserve_qualification(&conn, &fence, 30_000));
+        let reserved_deadline = current_record(&conn).next_attempt_at;
+        assert_eq!(
+            finish_qualification_auth_or_cancel(&conn, &auth, 40_000, None).unwrap(),
+            QualificationFinish::Finished
+        );
+        let record = current_record(&conn);
+        assert_eq!(record.attempts, 0);
+        assert_eq!(
+            record.next_attempt_at,
+            reserved_deadline.max(40_000_i64.saturating_add(retry_floor(None)))
+        );
+        assert_eq!(
+            record.last_outcome.as_deref(),
+            Some("auth_cancel_or_shutdown")
+        );
+    }
+
+    #[test]
+    fn qualification_valid_in_progress_gate_defers_then_blocks() {
+        let conn = qualification_db();
+        let fence = qualification_fence(&conn);
+        let reservation = reserved_or_panic(reserve_qualification(&conn, &fence, 10_000));
+        let deadline = current_record(&conn).next_attempt_at;
+        assert_eq!(
+            gate(&conn, TEST_LIBRARY, "scope", deadline - 1, None).unwrap(),
+            SyncEpochGate::Defer {
+                reason: "epoch_backoff"
+            }
+        );
+        assert_eq!(
+            gate(&conn, TEST_LIBRARY, "scope", deadline, None).unwrap(),
+            SyncEpochGate::Blocked {
+                reason: "qualification_reservation_pending"
+            }
+        );
+        assert_eq!(stored_record(&conn), Some(reservation.reserved_record));
+    }
+
+    #[test]
+    fn qualification_unknown_namespace_blocks_gate_and_reserve() {
+        let conn = qualification_db();
+        let fence = qualification_fence(&conn);
+        let _reservation = reserved_or_panic(reserve_qualification(&conn, &fence, 10_000));
+        let mut record = current_record(&conn);
+        record.last_outcome = Some("qualification_in_progress:v1:{not-json}".to_owned());
+        write_raw_record(&conn, &record);
+        let stored = stored_record(&conn);
+
+        assert!(read_library(&conn, TEST_LIBRARY).is_err());
+        assert!(gate(&conn, TEST_LIBRARY, "scope", 9_999_999, None).is_err());
+        assert_eq!(
+            reserve_qualification(&conn, &fence, 9_999_999),
+            QualificationReserve::StaleFence
+        );
+        assert_eq!(stored_record(&conn), stored);
+
+        record.last_outcome = Some(
+            "qualification_in_progress:v2:{\"version\":2,\"nonce\":\"5154f8f1-7e3b-4c5a-9f2d-6a1b0c9d8e7f\",\"prior_next_attempt_at\":0}"
+                .to_owned(),
+        );
+        write_raw_record(&conn, &record);
+        assert!(gate(&conn, TEST_LIBRARY, "scope", 9_999_999, None).is_err());
+        assert_eq!(
+            reserve_qualification(&conn, &fence, 9_999_999),
+            QualificationReserve::StaleFence
+        );
+    }
+
+    #[test]
+    fn qualification_outcome_codec_is_strict_and_bounded() {
+        let nonce = "5154f8f1-7e3b-4c5a-9f2d-6a1b0c9d8e7f";
+        let encoded = encode_qualification_outcome(nonce, 0).unwrap();
+        let parsed = parse_qualification_outcome(Some(&encoded))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.version, QUALIFICATION_OUTCOME_VERSION);
+        assert_eq!(parsed.nonce, nonce);
+        assert_eq!(parsed.prior_next_attempt_at, 0);
+        assert_eq!(
+            parse_qualification_outcome(Some("baseline_claimed")).unwrap(),
+            None
+        );
+
+        for invalid in [
+            "qualification_in_progress:v2:{}",
+            "qualification_in_progress:v1:{not-json}",
+            "qualification_in_progress:v1:{\"version\":2,\"nonce\":\"5154f8f1-7e3b-4c5a-9f2d-6a1b0c9d8e7f\",\"prior_next_attempt_at\":0}",
+            "qualification_in_progress:v1:{\"version\":1,\"nonce\":\"not-a-uuid\",\"prior_next_attempt_at\":0}",
+        ] {
+            assert!(
+                parse_qualification_outcome(Some(invalid)).is_err(),
+                "must reject {invalid}"
+            );
+        }
+
+        let mut lengths = Vec::new();
+        for prior in [i64::MIN, -1, 0, 1, i64::MAX] {
+            let value = encode_qualification_outcome(nonce, prior).unwrap();
+            lengths.push(value.len());
+            let parsed = parse_qualification_outcome(Some(&value)).unwrap().unwrap();
+            assert_eq!(parsed.prior_next_attempt_at, prior);
+        }
+        let max = *lengths.iter().max().unwrap();
+        let min = *lengths.iter().min().unwrap();
+        assert!(max >= min);
+        assert!(
+            max <= QUALIFICATION_OUTCOME_PREFIX.len() + 128,
+            "serialized qualification outcome must stay bounded: {max}"
+        );
     }
 }
