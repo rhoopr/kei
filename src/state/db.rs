@@ -48,8 +48,8 @@ pub(crate) use sync_epoch::{
 pub(crate) mod support;
 pub(crate) use metadata_capture_retry::MetadataCaptureRetryGeneration;
 pub(crate) use sparse_identity::{
-    SparseAttemptOutcome, SparseDeletionCheckpoint, SparseEvidence, SparseIdentity,
-    SparseIdentityProof, SparseIdentityStore, SparseSourceId, SparseTargetState,
+    SparseAttemptOutcome, SparseCurrentWitness, SparseDeletionCheckpoint, SparseEvidence,
+    SparseIdentity, SparseIdentityProof, SparseIdentityStore, SparseSourceId, SparseTargetState,
 };
 mod rows;
 mod temp_files;

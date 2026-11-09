@@ -388,6 +388,7 @@ async fn download_photos_incremental_streaming(
         sync_token,
         stats,
         delta_summary.sparse_identity_proofs,
+        delta_summary.sparse_current.clone(),
         completed_delta_replay,
         delta_summary.inventory_rank_changed,
     ))
@@ -879,6 +880,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             None,
             stats,
             delta_summary.sparse_identity_proofs,
+            delta_summary.sparse_current.clone(),
             completed_delta_replay,
             delta_summary.inventory_rank_changed,
         ));
@@ -943,6 +945,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 None,
                 stats,
                 delta_summary.sparse_identity_proofs,
+                delta_summary.sparse_current.clone(),
                 completed_delta_replay,
                 delta_summary.inventory_rank_changed,
             ));
@@ -988,6 +991,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             None,
             delta_stats,
             delta_summary.sparse_identity_proofs,
+            delta_summary.sparse_current.clone(),
             completed_delta_replay,
             delta_summary.inventory_rank_changed,
         );
@@ -1084,6 +1088,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             sync_token,
             stats,
             delta_summary.sparse_identity_proofs,
+            delta_summary.sparse_current.clone(),
             completed_delta_replay,
             delta_summary.inventory_rank_changed,
         ));
@@ -1365,6 +1370,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             sync_token,
             stats,
             delta_summary.sparse_identity_proofs,
+            delta_summary.sparse_current.clone(),
             completed_delta_replay,
             delta_summary.inventory_rank_changed,
         ));
@@ -1415,6 +1421,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             None,
             stats,
             delta_summary.sparse_identity_proofs,
+            delta_summary.sparse_current.clone(),
             completed_delta_replay,
             delta_summary.inventory_rank_changed,
         ));
@@ -1604,6 +1611,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 .flatten(),
             stats,
             delta_summary.sparse_identity_proofs,
+            delta_summary.sparse_current.clone(),
             completed_delta_replay,
             delta_summary.inventory_rank_changed,
         ));
@@ -1637,6 +1645,7 @@ pub(super) async fn download_photos_incremental_collecting_inner(
             .flatten(),
         stats,
         delta_summary.sparse_identity_proofs,
+        delta_summary.sparse_current.clone(),
         completed_delta_replay,
         delta_summary.inventory_rank_changed,
     ))

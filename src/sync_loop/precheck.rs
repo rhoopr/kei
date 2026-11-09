@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
-use crate::sync_cycle::LibraryState;
+use crate::sync_cycle::{LibraryState, SkipAuthority};
 use crate::{config, download, state};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -52,6 +52,15 @@ impl WatchPrecheck {
                 changed_zones: None,
                 ..
             } => true,
+        }
+    }
+
+    /// Same-wake skip authority after provider precheck and pending inspections.
+    pub(super) fn skip_authority(&self, zone_name: &str) -> SkipAuthority {
+        if self.should_sync_zone(zone_name) {
+            SkipAuthority::Reached
+        } else {
+            SkipAuthority::NoChanges
         }
     }
 

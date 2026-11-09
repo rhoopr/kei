@@ -16,7 +16,9 @@ use crate::commands::{AlbumPass, PassKind};
 use crate::download;
 use crate::icloud::photos::{PhotoLibrary, PhotosSession};
 use crate::state::{SparseIdentityStore, SqliteStateDb};
-use crate::sync_cycle::{CycleResult, run_cycle, sync_token_key};
+use crate::sync_cycle::{
+    CycleResult, ExpectedSource, SkipAuthority, run_cycle, run_cycle_with_witness, sync_token_key,
+};
 use crate::sync_loop::test_support::{
     album_count_response, make_run_cycle_config, make_run_cycle_download_config_builder,
     make_run_cycle_library_state_with_passes, make_shared_session_for_run_cycle,
@@ -222,6 +224,17 @@ impl Fixture {
     }
 
     async fn run(&self, cycle: usize, fail_inventory: bool, provider_error: bool) -> CycleResult {
+        self.run_with_expected_sources(cycle, fail_inventory, provider_error, &[])
+            .await
+    }
+
+    async fn run_with_expected_sources(
+        &self,
+        cycle: usize,
+        fail_inventory: bool,
+        provider_error: bool,
+        extra_sources: &[ExpectedSource],
+    ) -> CycleResult {
         let session = Session {
             baseline: Arc::clone(&self.baseline),
             progress: Arc::clone(&self.progress),
@@ -264,7 +277,14 @@ impl Fixture {
             download.retry.max_retries = 0;
             Arc::new(download)
         };
-        run_cycle(
+        let mut expected_sources = vec![ExpectedSource {
+            zone_name: ZONE.to_owned(),
+            baseline_scope: selected.library.baseline_scope(),
+            active_passes: !selected.plan.passes.is_empty(),
+            skip_authority: SkipAuthority::Reached,
+        }];
+        expected_sources.extend_from_slice(extra_sources);
+        run_cycle_with_witness(
             &[&selected],
             &self.config,
             Some(self.db.as_ref()),
@@ -273,6 +293,8 @@ impl Fixture {
             download::DownloadControls::download_hidden(),
             &self.shared,
             &CancellationToken::new(),
+            Arc::new(download::MetadataWriterWitness::default()),
+            &expected_sources,
         )
         .await
         .unwrap()
@@ -763,4 +785,88 @@ async fn operational_safe_hold_refuses_peer_bad_request_peer_first() {
         "the peer error must veto the Primary safe hold in either source order"
     );
     assert!(health.consecutive_failures > 0);
+}
+
+async fn report_health_expect_failure(fixture: &Fixture, result: &CycleResult) {
+    let report_path = fixture.root.join("hold-refusal-report.json");
+    let notifier = crate::notifications::Notifier::new(None);
+    let reporter =
+        crate::cycle_reporter::CycleReporter::new(crate::cycle_reporter::CycleReporterConfig {
+            watch_mode: false,
+            report_path: Some(&report_path),
+            run_options: crate::report::RunOptions::from_config(&fixture.config),
+            health_dir: fixture.root.as_path(),
+            personality_mode: crate::personality::Mode::Off,
+            state_db: Some(fixture.db.as_ref()),
+            metrics_handle: None,
+            notifier: &notifier,
+        });
+    let mut health = crate::health::HealthStatus::new();
+    reporter
+        .report_completed_cycle(
+            &mut health,
+            crate::cycle_reporter::CycleFacts::from_cycle_result(
+                result,
+                std::time::Duration::from_secs(1),
+            ),
+        )
+        .await;
+    assert!(health.last_success_at.is_none());
+    assert!(health.consecutive_failures > 0);
+}
+
+#[tokio::test]
+async fn operational_safe_hold_refuses_unvisited_active_source() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let baseline = fixture.run(0, false, false).await;
+    assert_eq!(baseline.stats.downloaded, 1, "{}", cycle_facts(&baseline));
+    let held = fixture
+        .run_with_expected_sources(
+            1,
+            false,
+            false,
+            &[ExpectedSource {
+                zone_name: "SharedSync-unvisited".to_owned(),
+                baseline_scope: "unvisited-scope".to_owned(),
+                active_passes: true,
+                skip_authority: SkipAuthority::Reached,
+            }],
+        )
+        .await;
+    assert!(
+        !held.operational_safe_holds,
+        "an unvisited active source must veto even beside a safe hold: {}",
+        cycle_facts(&held)
+    );
+    report_health_expect_failure(&fixture, &held).await;
+}
+
+#[tokio::test]
+async fn operational_safe_hold_allows_authorized_no_changes_peer() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let baseline = fixture.run(0, false, false).await;
+    assert_eq!(baseline.stats.downloaded, 1, "{}", cycle_facts(&baseline));
+    let held = fixture
+        .run_with_expected_sources(
+            1,
+            false,
+            false,
+            &[ExpectedSource {
+                zone_name: "SharedSync-no-changes".to_owned(),
+                baseline_scope: "no-changes-scope".to_owned(),
+                active_passes: true,
+                skip_authority: SkipAuthority::NoChanges,
+            }],
+        )
+        .await;
+    assert!(
+        held.operational_safe_holds,
+        "same-wake successful no-changes authority may be skipped: {}",
+        cycle_facts(&held)
+    );
+    report_health(&fixture, &held).await;
 }

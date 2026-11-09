@@ -384,7 +384,9 @@ impl SparseCurrentWitness {
         ] {
             match (slot.as_deref(), incoming.as_deref()) {
                 (None, Some(value)) => *slot = Some(value.to_owned()),
-                (Some(existing), Some(value)) if existing != value => self.conflict = true,
+                (Some(existing), Some(value)) if existing != value => {
+                    self.conflict = true;
+                }
                 _ => {}
             }
         }
@@ -402,7 +404,12 @@ impl SparseCurrentWitness {
                     self.rows.insert(source.clone(), row.clone());
                 }
                 Some(existing) if existing == row => {}
-                Some(_) => self.conflict = true,
+                Some(_) => {
+                    // The same execution may observe a retained row more than
+                    // once across revalidation. The later observation wins; the
+                    // owner read still validates the exact final durable set.
+                    self.rows.insert(source.clone(), row.clone());
+                }
             }
         }
     }
@@ -1136,6 +1143,10 @@ mod tests {
     };
     use chrono::{TimeDelta, Utc};
 
+    /// The interleave hook is process-global; keep witness tests from consuming
+    /// another test's hook while running in parallel.
+    static WITNESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn sparse_target_path_authority_rechecks_competing_catalog_owner() {
         let db = SqliteStateDb::open_in_memory().unwrap();
@@ -1705,6 +1716,7 @@ mod tests {
 
     #[tokio::test]
     async fn sparse_current_witness_attests_exact_current_retained_set() {
+        let _guard = WITNESS_TEST_LOCK.lock().await;
         let (_dir, db, scope, owner, epoch, attempt) = owned_sparse_db().await;
         let evidence = SparseEvidence::new(r#"[2,"source_only"]"#.into());
         let source = SparseSourceId::new("source");
@@ -1765,6 +1777,7 @@ mod tests {
 
     #[tokio::test]
     async fn sparse_current_witness_refuses_unaccounted_origin_and_failure() {
+        let _guard = WITNESS_TEST_LOCK.lock().await;
         let (_dir, db, scope, owner, epoch, attempt) = owned_sparse_db().await;
         let evidence = SparseEvidence::new(r#"[2,"source_only"]"#.into());
         let source = SparseSourceId::new("source");
@@ -1844,6 +1857,7 @@ mod tests {
 
     #[tokio::test]
     async fn sparse_current_witness_binds_prework_owner_epoch_attempt_and_scope() {
+        let _guard = WITNESS_TEST_LOCK.lock().await;
         let (dir, db, scope, owner, epoch, attempt) = owned_sparse_db().await;
         let evidence = SparseEvidence::new(r#"[2,"source_only"]"#.into());
         let source = SparseSourceId::new("source");
@@ -1954,6 +1968,7 @@ mod tests {
 
     #[tokio::test]
     async fn sparse_current_witness_reads_one_transaction_snapshot() {
+        let _guard = WITNESS_TEST_LOCK.lock().await;
         let (dir, db, scope, owner, epoch, attempt) = owned_sparse_db().await;
         let evidence = SparseEvidence::new(r#"[2,"source_only"]"#.into());
         let source = SparseSourceId::new("source");

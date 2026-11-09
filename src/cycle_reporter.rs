@@ -86,6 +86,8 @@ pub(crate) struct CycleFacts<'a> {
     /// Selected libraries retaining real incomplete work this cycle. These are
     /// labels/reasons only, never fabricated failed assets or counts.
     pub(crate) holds: &'a [crate::sync_cycle::LibraryHoldFact],
+    /// Cycle owner attestation for the narrow H1 operational-safe hold slice.
+    pub(crate) operational_safe_holds: bool,
     accounted_transfer_failures: bool,
 }
 
@@ -102,6 +104,7 @@ impl<'a> CycleFacts<'a> {
             elapsed,
         );
         facts.holds = &result.holds;
+        facts.operational_safe_holds = result.operational_safe_holds;
         facts.status = classify_cycle_with_holds(
             &result.stats,
             result.failed_count,
@@ -137,6 +140,7 @@ impl<'a> CycleFacts<'a> {
             elapsed,
             status: classify_cycle(stats, failed_count, session_expired),
             holds: &[],
+            operational_safe_holds: false,
             accounted_transfer_failures: false,
         }
     }
@@ -344,6 +348,7 @@ where
         health.unattributed_legacy_pending = input.stats.unattributed_legacy_pending;
         match input.status {
             CycleStatus::Success => health.record_success(),
+            CycleStatus::Failed if input.operational_safe_holds => health.record_success(),
             CycleStatus::Failed if input.accounted_transfer_failures => health.record_success(),
             CycleStatus::Failed => health.record_failure(&cycle_failure_message(input)),
             CycleStatus::SessionExpired => health.record_failure("session expired"),
@@ -1565,6 +1570,8 @@ mod tests {
                     ..SyncStats::default()
                 },
                 holds: Vec::new(),
+                sources: Vec::new(),
+                operational_safe_holds: false,
             };
             match kind {
                 "state_write" => result.stats.state_write_failures = 1,

@@ -435,6 +435,51 @@ fn record_selected_hold(
     }
 }
 
+/// How this wake treated one expected source before the cycle body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkipAuthority {
+    Reached,
+    NoChanges,
+}
+
+/// Complete expected active source universe for this wake. Never rendered.
+#[derive(Clone)]
+pub(crate) struct ExpectedSource {
+    pub(crate) zone_name: String,
+    pub(crate) baseline_scope: String,
+    pub(crate) active_passes: bool,
+    pub(crate) skip_authority: SkipAuthority,
+}
+
+#[derive(Clone)]
+pub(crate) struct SourceOutcome {
+    pub(crate) zone_name: String,
+    pub(crate) baseline_scope: String,
+    pub(crate) reached: bool,
+    /// This source's own ordinary checkpoint transition committed.
+    pub(crate) ordinary_committed: bool,
+    /// Actual outcome/checkpoint/provider failure, never a positive count.
+    pub(crate) genuine_error: bool,
+    pub(crate) sparse: Option<SparseHeldWitness>,
+}
+
+impl std::fmt::Debug for SourceOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceOutcome")
+            .field("reached", &self.reached)
+            .field("ordinary_committed", &self.ordinary_committed)
+            .field("genuine_error", &self.genuine_error)
+            .field("has_sparse_witness", &self.sparse.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SparseHeldWitness {
+    pub(crate) witness: crate::state::db::SparseCurrentWitness,
+    pub(crate) completed_delta_replay: bool,
+}
+
 /// Outcome of a single sync cycle across all libraries.
 #[derive(Debug)]
 pub(crate) struct CycleResult {
@@ -444,6 +489,8 @@ pub(crate) struct CycleResult {
     pub(crate) db_sync_token_advance_safe: bool,
     /// Selected libraries that retained real incomplete work this cycle.
     pub(crate) holds: Vec<LibraryHoldFact>,
+    pub(crate) sources: Vec<SourceOutcome>,
+    pub(crate) operational_safe_holds: bool,
 }
 
 impl CycleResult {
@@ -474,6 +521,31 @@ impl CycleResult {
             .map(|hold| hold.source.as_str())
             .collect::<std::collections::BTreeSet<_>>()
             .len()
+    }
+
+    /// Recheck every held sparse witness after a tail that may have changed
+    /// owner-read state. Any refusal clears the operational exception.
+    pub(crate) async fn revalidate_sparse_holds(
+        &mut self,
+        db: Option<&dyn download::DownloadStore>,
+    ) {
+        let Some(db) = db else {
+            self.operational_safe_holds = false;
+            return;
+        };
+        for source in &self.sources {
+            if !self.holds.iter().any(|hold| {
+                hold.source == source.zone_name && hold.kind == LibraryHoldKind::IdentityUnresolved
+            }) {
+                continue;
+            }
+            if let Some(sparse) = &source.sparse
+                && db.attest_current_sparse(&sparse.witness).await.is_err()
+            {
+                self.operational_safe_holds = false;
+                return;
+            }
+        }
     }
 }
 
@@ -850,6 +922,9 @@ pub(crate) enum EnumConfigHashOutcome {
     /// a first-run DB must not invalidate tokens another process may
     /// have written.
     Initial,
+    /// No prior hash and the initial hash write failed; the effective hash is
+    /// not durable, so this cycle is not a clean operational success.
+    InitialWriteFailed,
     Unchanged,
     /// Hash drifted; the candidate hash was staged while active tokens and
     /// the active hash remain unchanged until reconciliation succeeds.
@@ -866,7 +941,10 @@ impl EnumConfigHashOutcome {
     fn must_force_full_sync(self) -> bool {
         matches!(
             self,
-            Self::Changed | Self::ChangedTokenPurgeFailed | Self::ReadFailed
+            Self::Changed
+                | Self::ChangedTokenPurgeFailed
+                | Self::InitialWriteFailed
+                | Self::ReadFailed
         )
     }
 }
@@ -964,6 +1042,9 @@ where
         tracing::warn!(error = %e, key, "Failed to persist enum config hash state");
         if matches!(outcome, EnumConfigHashOutcome::Changed) {
             return EnumConfigHashOutcome::ChangedTokenPurgeFailed;
+        }
+        if matches!(outcome, EnumConfigHashOutcome::Initial) {
+            return EnumConfigHashOutcome::InitialWriteFailed;
         }
     }
     outcome
@@ -1167,6 +1248,15 @@ pub(crate) async fn run_cycle(
     shared_session: &auth::SharedSession,
     shutdown_token: &CancellationToken,
 ) -> anyhow::Result<CycleResult> {
+    let expected_sources: Vec<ExpectedSource> = library_states
+        .iter()
+        .map(|state| ExpectedSource {
+            zone_name: state.zone_name.clone(),
+            baseline_scope: state.library.baseline_scope(),
+            active_passes: has_active_passes(state),
+            skip_authority: SkipAuthority::Reached,
+        })
+        .collect();
     let metadata_witness = Arc::new(download::MetadataWriterWitness::default());
     run_cycle_with_witness(
         library_states,
@@ -1178,6 +1268,7 @@ pub(crate) async fn run_cycle(
         shared_session,
         shutdown_token,
         metadata_witness,
+        &expected_sources,
     )
     .await
 }
@@ -1196,6 +1287,7 @@ pub(crate) async fn run_cycle_with_witness(
     shared_session: &auth::SharedSession,
     shutdown_token: &CancellationToken,
     metadata_witness: Arc<download::MetadataWriterWitness>,
+    expected_sources: &[ExpectedSource],
 ) -> anyhow::Result<CycleResult> {
     let sync_epoch = match state_db {
         Some(db) => db.sync_epoch_id().await?,
@@ -1205,6 +1297,17 @@ pub(crate) async fn run_cycle_with_witness(
     let mut cycle_session_expired = false;
     let mut cycle_stats = download::SyncStats::default();
     let mut library_holds: Vec<LibraryHoldFact> = Vec::new();
+    let mut sources: Vec<SourceOutcome> = expected_sources
+        .iter()
+        .map(|expected| SourceOutcome {
+            zone_name: expected.zone_name.clone(),
+            baseline_scope: expected.baseline_scope.clone(),
+            reached: false,
+            ordinary_committed: false,
+            genuine_error: false,
+            sparse: None,
+        })
+        .collect();
     let mut sparse_identity_proofs = Vec::new();
 
     let cycle_has_stale_plan = library_states.iter().any(|s| s.plan_is_stale);
@@ -1231,6 +1334,7 @@ pub(crate) async fn run_cycle_with_witness(
             .any(|pass| pass.kind == crate::commands::PassKind::SmartFolder)
     });
     let mut checkpoint_hold_action: Option<&'static str> = None;
+    let mut operational_state_fault = false;
     let enum_config_hash = download::compute_config_hash(config);
 
     // Check if token-unsafe eligibility config changed since last sync. If
@@ -1263,10 +1367,13 @@ pub(crate) async fn run_cycle_with_witness(
         }
         if matches!(
             enum_config_hash_outcome,
-            EnumConfigHashOutcome::ChangedTokenPurgeFailed | EnumConfigHashOutcome::ReadFailed
+            EnumConfigHashOutcome::ChangedTokenPurgeFailed
+                | EnumConfigHashOutcome::InitialWriteFailed
+                | EnumConfigHashOutcome::ReadFailed
         ) {
             checkpoint_transition_state_safe = false;
             db_sync_token_advance_safe = false;
+            operational_state_fault = true;
         }
     }
 
@@ -1329,9 +1436,11 @@ pub(crate) async fn run_cycle_with_witness(
         if matches!(outcome, DownloadConfigHashOutcome::Changed) {
             pending_download_config_hash = Some(download_config_hash);
         }
-        if outcome.token_purge_failed() {
+        if outcome.token_purge_failed() || matches!(outcome, DownloadConfigHashOutcome::ReadFailed)
+        {
             checkpoint_transition_state_safe = false;
             db_sync_token_advance_safe = false;
+            operational_state_fault = true;
         }
     }
 
@@ -2252,6 +2361,27 @@ pub(crate) async fn run_cycle_with_witness(
                 continue;
             }
         }
+        // Capture the pre-dispatch epoch/attempt identity for the one current
+        // sparse witness. Never derive the expected identity from a final read.
+        let expected_epoch = sync_epoch.clone();
+        let mut expected_attempt = epoch_attempt.clone();
+        if expected_attempt.is_none()
+            && let Some(db) = state_db
+            && let Some(raw) = db
+                .get_metadata(&state::db::sync_epoch::library_key(&lib_state.zone_name))
+                .await?
+        {
+            expected_attempt =
+                serde_json::from_str::<state::db::sync_epoch::SyncEpochLibrary>(&raw)
+                    .ok()
+                    .map(|record| record.attempt);
+        }
+        if let Some(source) = sources
+            .iter_mut()
+            .find(|source| source.zone_name == lib_state.zone_name)
+        {
+            source.reached = true;
+        }
         let mut sync_result = Box::pin(download::download_photos_with_sync(
             &download_client,
             &lib_state.plan.passes,
@@ -3133,6 +3263,41 @@ pub(crate) async fn run_cycle_with_witness(
             sync_result.stats.state_write_failures =
                 sync_result.stats.state_write_failures.saturating_add(1);
         }
+        let blocked_non_sparse = sync_result
+            .stats
+            .sync_token_blocked_reason
+            .is_some_and(|reason| reason != "asset_delta_hydration_incomplete");
+        let genuine_error = matches!(
+            sync_result.outcome,
+            download::DownloadOutcome::SessionExpired { .. }
+                | download::DownloadOutcome::PartialFailure { .. }
+        ) || sync_result.checkpoint.enumeration_errors > 0
+            || sync_result.checkpoint.state_write_failures > 0
+            || sync_result.checkpoint.retained_token_rejected
+            || blocked_non_sparse
+            || checkpoint_persistence == "failed";
+        let sparse = match (&expected_epoch, &expected_attempt) {
+            (Some(epoch), Some(attempt)) => {
+                let mut witness = sync_result.checkpoint.sparse_current.clone();
+                witness.bind_epoch(epoch, attempt);
+                witness.bind_baseline_scope(&lib_state.library.baseline_scope());
+                Some(SparseHeldWitness {
+                    witness,
+                    completed_delta_replay: sync_result.checkpoint.completed_delta_replay,
+                })
+            }
+            _ => None,
+        };
+        if let Some(source) = sources
+            .iter_mut()
+            .find(|source| source.zone_name == lib_state.zone_name)
+        {
+            source.reached = true;
+            source.ordinary_committed = checkpoint_persistence == "stored";
+            source.genuine_error =
+                genuine_error || source.baseline_scope != lib_state.library.baseline_scope();
+            source.sparse = sparse;
+        }
         if let Some(fields) = checkpoint_evidence.as_object_mut() {
             fields.insert(
                 "persistence".into(),
@@ -3359,6 +3524,7 @@ pub(crate) async fn run_cycle_with_witness(
             {
                 db_sync_token_advance_safe = false;
                 path_reconciliation_cycle_safe = false;
+                operational_state_fault = true;
                 tracing::warn!(error = %e, "Failed to atomically promote checkpoint reconciliation");
             }
         }
@@ -3384,6 +3550,7 @@ pub(crate) async fn run_cycle_with_witness(
             })
             .await
     {
+        operational_state_fault = true;
         tracing::warn!(error = %e, "Failed to promote completed local path reconciliation");
     }
 
@@ -3481,6 +3648,91 @@ pub(crate) async fn run_cycle_with_witness(
         }
     }
 
+    let operational_safe_holds = {
+        let eligible = !config.runtime.dry_run
+            && !config.runtime.only_print_filenames
+            && !is_retry_failed
+            && state_db.is_some()
+            && !cycle_session_expired
+            && !cycle_stats.interrupted
+            && !cycle_has_stale_plan
+            && !operational_state_fault;
+        let clean_aggregate = cycle_stats.failed == 0
+            && cycle_stats.exif_failures == 0
+            && cycle_stats.state_write_failures == 0
+            && cycle_stats.enumeration_errors == 0
+            && !cycle_stats.enumeration_incomplete
+            && cycle_stats.count_probe_failures == 0;
+        if !(eligible && clean_aggregate) {
+            false
+        } else {
+            let mut safe = true;
+            for expected in expected_sources
+                .iter()
+                .filter(|source| source.active_passes)
+            {
+                let Some(source) = sources
+                    .iter()
+                    .find(|source| source.zone_name == expected.zone_name)
+                else {
+                    safe = false;
+                    break;
+                };
+                if source.baseline_scope != expected.baseline_scope {
+                    safe = false;
+                    break;
+                }
+                if expected.skip_authority == SkipAuthority::NoChanges {
+                    continue;
+                }
+                if !source.reached || source.genuine_error {
+                    safe = false;
+                    break;
+                }
+                let source_holds: Vec<&LibraryHoldFact> = library_holds
+                    .iter()
+                    .filter(|hold| hold.source == source.zone_name)
+                    .collect();
+                if source_holds
+                    .iter()
+                    .any(|hold| hold.kind != LibraryHoldKind::IdentityUnresolved)
+                {
+                    safe = false;
+                    break;
+                }
+                if source_holds.is_empty() {
+                    if !source.ordinary_committed {
+                        safe = false;
+                        break;
+                    }
+                    continue;
+                }
+                let Some(held) = &source.sparse else {
+                    safe = false;
+                    break;
+                };
+                if held.witness.baseline_scope() != Some(expected.baseline_scope.as_str()) {
+                    safe = false;
+                    break;
+                }
+                if !held.completed_delta_replay {
+                    safe = false;
+                    break;
+                }
+                let Some(db) = state_db else {
+                    safe = false;
+                    break;
+                };
+                let attest = db.attest_current_sparse(&held.witness).await;
+                if attest.is_err() {
+                    safe = false;
+                    break;
+                }
+            }
+            safe
+        }
+    };
+
     #[cfg(all(test, target_os = "linux"))]
     crate::test_helpers::process_death_point("checkpoint-persisted");
 
@@ -3490,6 +3742,8 @@ pub(crate) async fn run_cycle_with_witness(
         stats: cycle_stats,
         db_sync_token_advance_safe,
         holds: library_holds,
+        sources,
+        operational_safe_holds,
     })
 }
 

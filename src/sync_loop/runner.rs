@@ -827,6 +827,15 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             let cycle_started_at = std::time::Instant::now();
             let cycle_wall_started_at = chrono::Utc::now();
             let metadata_witness = Arc::new(download::MetadataWriterWitness::default());
+            let expected_sources: Vec<crate::sync_cycle::ExpectedSource> = library_states
+                .iter()
+                .map(|state| crate::sync_cycle::ExpectedSource {
+                    zone_name: state.zone_name.clone(),
+                    baseline_scope: state.library.baseline_scope(),
+                    active_passes: !state.plan.passes.is_empty(),
+                    skip_authority: watch_precheck.skip_authority(&state.zone_name),
+                })
+                .collect();
             let mut cycle_result = Box::pin(crate::sync_cycle::run_cycle_with_witness(
                 &cycle_library_states,
                 &config,
@@ -837,6 +846,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &shared_session,
                 &shutdown_token,
                 Arc::clone(&metadata_witness),
+                &expected_sources,
             ))
             .await?;
             // Drain tagged rewrites now so the one-shot --refresh-metadata repair finishes in this run.
@@ -888,6 +898,15 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             {
                 drain_source_revalidation(&cycle_library_states, &shutdown_token).await?;
             }
+            if refresh_tail.new_failures > 0
+                || refresh_tail.witnessed_blocked > 0
+                || shutdown_token.is_cancelled()
+            {
+                cycle_result.operational_safe_holds = false;
+            }
+            cycle_result
+                .revalidate_sparse_holds(state_db.as_deref())
+                .await;
             super::reporting::record_cycle_run(
                 state_db.as_deref(),
                 &cycle_result,

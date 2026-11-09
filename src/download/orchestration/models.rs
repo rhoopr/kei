@@ -226,6 +226,8 @@ pub(crate) struct CheckpointEvidence {
     pub(crate) retry_passes: Vec<PassKey>,
     pub(crate) revalidate_records: Vec<ProviderRecordId>,
     pub(crate) sparse_identity_proofs: Vec<crate::state::SparseIdentityProof>,
+    /// Exact producer-bound current sparse witness, if this producer owned one.
+    pub(crate) sparse_current: crate::state::db::SparseCurrentWitness,
     /// Complete changes/zone replay ran for this result, even when current
     /// selection also ran or source progress remains held. Any offered successor
     /// belongs to that replay. A rank query never sets this evidence.
@@ -281,6 +283,12 @@ impl CheckpointEvidence {
             .extend(other.revalidate_records.iter().cloned());
         self.sparse_identity_proofs
             .extend(other.sparse_identity_proofs.iter().cloned());
+        // Later executions observe the final producer generation. Replacing a
+        // non-empty witness keeps the owner read's exact final-row check as the
+        // authority instead of merging intermediate retry rows.
+        if other.sparse_current != crate::state::db::SparseCurrentWitness::default() {
+            self.sparse_current = other.sparse_current.clone();
+        }
     }
 
     pub(crate) fn project(&self, stats: &mut SyncStats) {
@@ -303,11 +311,13 @@ impl SyncResult {
         sync_token: Option<String>,
         stats: SyncStats,
         proofs: Vec<crate::state::SparseIdentityProof>,
+        sparse_current: crate::state::db::SparseCurrentWitness,
         completed_delta_replay: bool,
         inventory_rank_changed: bool,
     ) -> Self {
         let mut result = Self::from_execution(outcome, sync_token, stats);
         result.checkpoint.sparse_identity_proofs = proofs;
+        result.checkpoint.sparse_current = sparse_current;
         result.checkpoint.completed_delta_replay = completed_delta_replay;
         result.checkpoint.inventory_rank_changed = inventory_rank_changed;
         result

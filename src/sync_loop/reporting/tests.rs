@@ -13,6 +13,8 @@ fn refresh_tail_outcome_feeds_ledger_and_cycle_reporting() {
         },
         db_sync_token_advance_safe: true,
         holds: Vec::new(),
+        sources: Vec::new(),
+        operational_safe_holds: false,
     };
 
     merge_refresh_tail_outcome(&mut cycle_result, 2, false);
@@ -50,6 +52,8 @@ async fn cycle_ledger_preserves_interrupted_facts_across_reopen_and_clean_cycle(
         },
         db_sync_token_advance_safe: false,
         holds: Vec::new(),
+        sources: Vec::new(),
+        operational_safe_holds: false,
     };
     super::record_cycle_run(Some(&db), &interrupted, chrono::Utc::now()).await;
     drop(db);
@@ -68,6 +72,8 @@ async fn cycle_ledger_preserves_interrupted_facts_across_reopen_and_clean_cycle(
         stats: download::SyncStats::default(),
         db_sync_token_advance_safe: true,
         holds: Vec::new(),
+        sources: Vec::new(),
+        operational_safe_holds: false,
     };
     super::record_cycle_run(Some(&db), &clean, chrono::Utc::now()).await;
     assert_eq!(

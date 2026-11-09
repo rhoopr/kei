@@ -546,6 +546,7 @@ async fn sparse_receipts_survive_report_changes_and_inventory_bridge_composition
         Some("after".into()),
         SyncStats::default(),
         vec![proof.clone()],
+        crate::state::db::SparseCurrentWitness::default(),
         true,
         true,
     );
@@ -608,6 +609,7 @@ fn mixed_delta_completion_provenance_preserves_vetoes_and_does_not_invent_succes
                 ..SyncStats::default()
             },
             Vec::new(),
+            crate::state::db::SparseCurrentWitness::default(),
             complete,
             true,
         );

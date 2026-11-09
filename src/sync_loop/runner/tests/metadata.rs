@@ -2475,6 +2475,15 @@ async fn run_full_enumeration_metadata_cycle(
         &shared_session,
         &CancellationToken::new(),
         witness,
+        &states
+            .iter()
+            .map(|state| crate::sync_cycle::ExpectedSource {
+                zone_name: state.zone_name.clone(),
+                baseline_scope: state.library.baseline_scope(),
+                active_passes: !state.plan.passes.is_empty(),
+                skip_authority: crate::sync_cycle::SkipAuthority::Reached,
+            })
+            .collect::<Vec<_>>(),
     ))
     .await
     .expect("run cycle");
@@ -2717,6 +2726,12 @@ async fn runner_outer_witness_keeps_source_revalidation_closed_for_blocked_debt(
         &shared_session,
         &CancellationToken::new(),
         Arc::clone(&witness),
+        &[crate::sync_cycle::ExpectedSource {
+            zone_name: lib_state.zone_name.clone(),
+            baseline_scope: lib_state.library.baseline_scope(),
+            active_passes: !lib_state.plan.passes.is_empty(),
+            skip_authority: crate::sync_cycle::SkipAuthority::Reached,
+        }],
     )
     .await
     .expect("run witnessed cycle");
@@ -6284,6 +6299,12 @@ async fn run_full_enumeration_metadata_cycle_authenticated(
         &shared_session,
         &CancellationToken::new(),
         witness,
+        &[crate::sync_cycle::ExpectedSource {
+            zone_name: lib_state.zone_name.clone(),
+            baseline_scope: lib_state.library.baseline_scope(),
+            active_passes: !lib_state.plan.passes.is_empty(),
+            skip_authority: crate::sync_cycle::SkipAuthority::Reached,
+        }],
     ))
     .await
     .expect("authenticated witnessed run cycle");

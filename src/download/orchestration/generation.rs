@@ -516,6 +516,12 @@ impl SelectionContext {
         (self.format == 2).then_some(self.scope.as_str())
     }
 
+    /// Pre-dispatch authenticated owner for the one current-sparse witness.
+    /// Crate-private and never logged.
+    pub(super) fn current_sparse_owner(&self) -> Option<crate::state::db::account::AccountOwner> {
+        (self.format == 2).then(|| self.capture.owner.clone())
+    }
+
     async fn inventory_proof_matches(
         &self,
         config: &DownloadConfig,
@@ -3541,6 +3547,7 @@ pub(super) async fn after_delta(
         None,
         stats,
         delta.sparse_identity_proofs,
+        delta.sparse_current.clone(),
         completed_delta_replay,
         delta.inventory_rank_changed,
     );

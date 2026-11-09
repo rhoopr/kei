@@ -2036,6 +2036,8 @@ async fn one_shot_hold_error_uses_distinct_sources_and_lists_every_reason() {
         stats: download::SyncStats::default(),
         db_sync_token_advance_safe: false,
         holds,
+        sources: Vec::new(),
+        operational_safe_holds: false,
     };
     assert_eq!(
         result.held_source_count(),
@@ -2101,6 +2103,8 @@ async fn one_shot_hold_error_uses_distinct_sources_and_lists_every_reason() {
         stats: download::SyncStats::default(),
         db_sync_token_advance_safe: false,
         holds: result.holds.clone(),
+        sources: Vec::new(),
+        operational_safe_holds: false,
     };
     assert_eq!(
         crate::cycle_reporter::CycleFacts::from_cycle_result(&auth, std::time::Duration::ZERO)
@@ -2118,6 +2122,8 @@ async fn one_shot_hold_error_uses_distinct_sources_and_lists_every_reason() {
         },
         db_sync_token_advance_safe: false,
         holds: result.holds.clone(),
+        sources: Vec::new(),
+        operational_safe_holds: false,
     };
     assert_eq!(
         crate::cycle_reporter::CycleFacts::from_cycle_result(
