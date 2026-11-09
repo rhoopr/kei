@@ -175,7 +175,7 @@ impl QualificationFailure {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct QualificationReservation {
     pub(crate) epoch: String,
     pub(crate) library: String,
@@ -192,6 +192,15 @@ pub(crate) struct QualificationReservation {
     pub(crate) expected_metadata: Vec<(String, Option<String>)>,
     pub(crate) indexing_key: String,
     pub(crate) replay_key: String,
+}
+
+impl std::fmt::Debug for QualificationReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QualificationReservation")
+            .field("fence_entries", &self.expected_metadata.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2882,6 +2891,62 @@ mod tests {
             Some(reservation.reserved_record),
             "ordinary recovery must not overwrite the qualification guard"
         );
+    }
+
+    #[test]
+    fn qualification_reservation_debug_redacts_provider_material() {
+        let conn = qualification_db();
+        let fence = qualification_fence(&conn);
+        let mut reservation = reserved_or_panic(reserve_qualification(&conn, &fence, 10_000));
+        reservation.epoch = "provider-epoch-secret".to_owned();
+        reservation.library = "provider-library-secret".to_owned();
+        reservation.attempt = "provider-attempt-secret".to_owned();
+        reservation.nonce = "provider-nonce-secret".to_owned();
+        reservation.prior_record = "provider-prior-record-secret".to_owned();
+        reservation.reserved_record = "provider-reserved-record-secret".to_owned();
+        reservation.restored_record = "provider-restored-record-secret".to_owned();
+        reservation.reserved_outcome = "provider-outcome-secret".to_owned();
+        reservation.indexing_key = "provider-indexing-key-secret".to_owned();
+        reservation.replay_key = "provider-replay-key-secret".to_owned();
+        reservation.expected_metadata = vec![(
+            "provider-scope-cursor-secret".to_owned(),
+            Some("provider-token-secret".to_owned()),
+        )];
+
+        let secrets = [
+            "provider-epoch-secret",
+            "provider-library-secret",
+            "provider-attempt-secret",
+            "provider-nonce-secret",
+            "provider-prior-record-secret",
+            "provider-reserved-record-secret",
+            "provider-restored-record-secret",
+            "provider-outcome-secret",
+            "provider-indexing-key-secret",
+            "provider-replay-key-secret",
+            "provider-scope-cursor-secret",
+            "provider-token-secret",
+        ];
+        let debug = format!("{reservation:?}");
+        assert!(debug.contains("QualificationReservation"));
+        assert!(debug.contains("fence_entries"));
+        for secret in secrets {
+            assert!(
+                !debug.contains(secret),
+                "reservation debug leaked {secret}: {debug}"
+            );
+        }
+        let wrapped = format!(
+            "{:?}",
+            QualificationReserve::Reserved(Box::new(reservation))
+        );
+        assert!(wrapped.contains("Reserved"));
+        for secret in secrets {
+            assert!(
+                !wrapped.contains(secret),
+                "reserve debug leaked {secret}: {wrapped}"
+            );
+        }
     }
 
     #[test]
