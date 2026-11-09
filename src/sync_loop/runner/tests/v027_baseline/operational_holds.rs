@@ -260,6 +260,16 @@ impl Fixture {
     }
 }
 
+fn cycle_facts(result: &CycleResult) -> String {
+    format!(
+        "failed_count={} stats.failed={} held={} blocked={:?}",
+        result.failed_count,
+        result.stats.failed,
+        !result.holds.is_empty(),
+        result.stats.sync_token_blocked_reason
+    )
+}
+
 async fn report_health(fixture: &Fixture, result: &CycleResult) {
     let report_path = fixture.root.join("hold-report.json");
     let notifier = crate::notifications::Notifier::new(None);
@@ -359,24 +369,37 @@ async fn operational_safe_current_sparse_hold_advances_health_only_after_h1() {
         return;
     };
     let baseline = fixture.run(0, false, false).await;
-    assert_eq!(baseline.stats.downloaded, 1, "{baseline:?}");
-    assert!(baseline.can_advance_database_checkpoint(), "{baseline:?}");
+    assert_eq!(baseline.stats.downloaded, 1, "{}", cycle_facts(&baseline));
+    assert!(
+        baseline.can_advance_database_checkpoint(),
+        "{}",
+        cycle_facts(&baseline)
+    );
     let held = fixture.run(1, false, false).await;
-    assert!(!held.can_advance_database_checkpoint(), "{held:?}");
-    assert_eq!(
-        held.stats.failed, 0,
-        "no transfer failure is allowed: {held:?}"
+    assert!(
+        !held.can_advance_database_checkpoint(),
+        "{}",
+        cycle_facts(&held)
     );
     assert_eq!(
-        held.stats.downloaded, 1,
-        "peer progress must download: {held:?}"
+        held.stats.failed,
+        0,
+        "no transfer failure is allowed: {}",
+        cycle_facts(&held)
+    );
+    assert_eq!(
+        held.stats.downloaded,
+        1,
+        "peer progress must download: {}",
+        cycle_facts(&held)
     );
     assert!(
         held.holds.iter().any(|hold| {
             hold.source == ZONE
                 && hold.kind == crate::sync_cycle::LibraryHoldKind::IdentityUnresolved
         }),
-        "one exact current identity hold must be visible: {held:?}"
+        "one exact current identity hold must be visible: {}",
+        cycle_facts(&held)
     );
     report_health(&fixture, &held).await;
 }
@@ -387,7 +410,7 @@ async fn operational_safe_hold_refuses_a_mixed_state_fault() {
         return;
     };
     let baseline = fixture.run(0, false, false).await;
-    assert_eq!(baseline.stats.downloaded, 1, "{baseline:?}");
+    assert_eq!(baseline.stats.downloaded, 1, "{}", cycle_facts(&baseline));
     fixture
         .db
         .acquire_lock("install hold checkpoint fault")
@@ -399,7 +422,11 @@ async fn operational_safe_hold_refuses_a_mixed_state_fault() {
         )
         .unwrap();
     let held = fixture.run(1, false, false).await;
-    assert!(!held.can_advance_database_checkpoint(), "{held:?}");
+    assert!(
+        !held.can_advance_database_checkpoint(),
+        "{}",
+        cycle_facts(&held)
+    );
     let report_path = fixture.root.join("mixed-hold-report.json");
     let notifier = crate::notifications::Notifier::new(None);
     let reporter =
@@ -436,32 +463,40 @@ async fn operational_safe_hold_refuses_real_provider_bad_request() {
         return;
     };
     let baseline = fixture.run(0, false, false).await;
-    assert_eq!(baseline.stats.downloaded, 1, "{baseline:?}");
+    assert_eq!(baseline.stats.downloaded, 1, "{}", cycle_facts(&baseline));
     let safe_hold = fixture.run(1, false, false).await;
     assert!(
         !safe_hold.can_advance_database_checkpoint(),
-        "{safe_hold:?}"
+        "{}",
+        cycle_facts(&safe_hold)
     );
     let held = fixture.run(2, false, true).await;
     assert!(
         held.stats.enumeration_errors == 0,
-        "the baseline counter can miss the real provider error: {held:?}"
+        "the baseline counter can miss the real provider error: {}",
+        cycle_facts(&held)
     );
-    assert!(!held.can_advance_database_checkpoint(), "{held:?}");
+    assert!(
+        !held.can_advance_database_checkpoint(),
+        "{}",
+        cycle_facts(&held)
+    );
     assert!(
         held.failed_count >= 1
             || held
                 .stats
                 .sync_token_blocked_reason
                 .is_some_and(|reason| reason != "asset_delta_hydration_incomplete"),
-        "the real provider error must remain in the cycle failure facts: {held:?}"
+        "the real provider error must remain in the cycle failure facts: {}",
+        cycle_facts(&held)
     );
     assert!(
         held.holds.iter().any(|hold| {
             hold.source == ZONE
                 && hold.kind != crate::sync_cycle::LibraryHoldKind::IdentityUnresolved
         }),
-        "the provider error adds a genuine non-sparse hold: {held:?}"
+        "the provider error adds a genuine non-sparse hold: {}",
+        cycle_facts(&held)
     );
     let report_path = fixture.root.join("provider-error-report.json");
     let notifier = crate::notifications::Notifier::new(None);
