@@ -318,7 +318,7 @@ async fn observation_commit_staged_proof_activates_only_with_configuration() {
     ];
     promote
         .expected_metadata
-        .push((staged.into(), Some("quiet".into())));
+        .push((staged.into(), Some("after".into())));
     db.commit_observation_transition(promote, None, true)
         .await
         .unwrap();
@@ -954,7 +954,7 @@ async fn catalog_tag_scope_survives_baseline_unfiled_reader_paths() {
     {
         let conn = db.acquire_lock("seed catalog-tag reader evidence").unwrap();
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES('catalog-round','PrimarySync',?1,'policy','boundary','','','observing')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES('catalog-round','PrimarySync',?1,'policy','boundary','','','observing','catalog_v2')",
             [catalog],
         )
         .unwrap();
@@ -1059,7 +1059,7 @@ async fn old_writer_baseline_key_aba_leaves_observing_catalog_origin_indistingui
     {
         let conn = db.acquire_lock("seed surviving catalog origin").unwrap();
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES(?1,'PrimarySync',?2,'policy',?3,'','','observing')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES(?1,'PrimarySync',?2,'policy',?3,'','','observing')",
             rusqlite::params![nonce, scope, boundary],
         )
         .unwrap();
@@ -1171,7 +1171,7 @@ async fn catalog_v2_linked_staged_promotion_reopen_rollback_and_quarantine() {
             .acquire_lock("seed linked staged catalog origin")
             .unwrap();
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES('catalog','PrimarySync',?1,'next-enum',?2,'','','observing')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES('catalog','PrimarySync',?1,'next-enum',?2,'','','observing','catalog_v2')",
             rusqlite::params![catalog, boundary],
         )
         .unwrap();
@@ -1355,11 +1355,9 @@ async fn catalog_v2_linked_active_delta_keeps_debt_and_ordinary_producer_cannot_
     let path = dir.path().join("state.db");
     let (db, baseline) = fixture(dir.path()).await;
     let save = transition(&db, "after").await;
-    eprintln!("B-ACTIVE-BASELINE-COMMIT");
     db.commit_observation_transition(save.clone(), Some(baseline), false)
         .await
         .unwrap();
-    eprintln!("B-ACTIVE-BASELINE-COMMIT-OK");
     let boundary = format!("{:x}", Sha256::digest(b"before"));
     let catalog = format!(
         "catalog:v2:{}:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:44444444-4444-4444-4444-444444444444",
@@ -1370,7 +1368,7 @@ async fn catalog_v2_linked_active_delta_keeps_debt_and_ordinary_producer_cannot_
             .acquire_lock("seed linked active catalog origin")
             .unwrap();
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES('active-catalog','PrimarySync',?1,'policy',?2,'','','active')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES('active-catalog','PrimarySync',?1,'policy',?2,'','','active','catalog_v2')",
             rusqlite::params![catalog, boundary],
         )
         .unwrap();
@@ -1416,10 +1414,6 @@ async fn catalog_v2_linked_active_delta_keeps_debt_and_ordinary_producer_cannot_
         .delta("after", "quiet")
         .unwrap();
     let advance = transition(&db, "quiet").await;
-    eprintln!(
-        "B-ACTIVE-DELTA updates={:?} expected={:?}",
-        advance.metadata_updates, advance.expected_metadata
-    );
     db.commit_observation_transition(advance.clone(), Some(delta), false)
         .await
         .unwrap();
@@ -1481,7 +1475,7 @@ async fn catalog_v2_linked_active_delta_keeps_debt_and_ordinary_producer_cannot_
 }
 
 #[tokio::test]
-async fn catalog_v2_missing_link_old_guard_conservatively_blocks_checkpoint() {
+async fn catalog_v2_missing_link_does_not_veto_checkpoint_and_preserves_debt() {
     use sha2::{Digest, Sha256};
 
     let dir = tempfile::tempdir().unwrap();
@@ -1522,7 +1516,7 @@ async fn catalog_v2_missing_link_old_guard_conservatively_blocks_checkpoint() {
     {
         let conn = db.acquire_lock("seed missing-link catalog origin").unwrap();
         conn.execute(
-            "INSERT INTO source_revalidation_rounds VALUES('missing-link','PrimarySync',?1,'policy',?2,'','','observing')",
+            "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES('missing-link','PrimarySync',?1,'policy',?2,'','','observing','catalog_v2')",
             rusqlite::params![catalog, boundary],
         )
         .unwrap();
@@ -1536,11 +1530,9 @@ async fn catalog_v2_missing_link_old_guard_conservatively_blocks_checkpoint() {
     attempt
         .expected_metadata
         .push((baseline_key.into(), Some("before".into())));
-    let error = db
-        .commit_observation_transition(attempt, Some(baseline), false)
+    db.commit_observation_transition(attempt, Some(baseline), false)
         .await
-        .expect_err("old reader must conservatively block a checkpoint without a matching link");
-    eprintln!("B-MISSING-LINK-BLOCK error={error}");
+        .expect("known missing catalog link must not veto a legitimate checkpoint");
     {
         let conn = db
             .acquire_lock("verify conservative missing-link block")

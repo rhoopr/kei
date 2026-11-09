@@ -59,17 +59,17 @@ impl CatalogOrigin {
                     detail: "unknown catalog scope version".into(),
                 })?;
         let parts: Vec<&str> = rest.split(':').collect();
-        if parts.len() != 4 {
+        let [plan_digest, epoch, attempt, nonce] = parts.as_slice() else {
             return Err(StateError::Invariant {
                 operation: "catalog_origin",
                 detail: "catalog scope must have four identity components".into(),
             });
-        }
+        };
         Self::new(
-            parts[0].to_owned(),
-            parts[1].to_owned(),
-            parts[2].to_owned(),
-            parts[3].to_owned(),
+            (*plan_digest).to_owned(),
+            (*epoch).to_owned(),
+            (*attempt).to_owned(),
+            (*nonce).to_owned(),
         )
     }
 
@@ -123,6 +123,25 @@ pub(crate) enum CatalogClaimOutcome {
         reason: &'static str,
     },
     Open,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // L1 catalog precheck/report integration is pending.
+pub(crate) struct CatalogPendingSignal {
+    pub(crate) round: String,
+    pub(crate) library: String,
+    pub(crate) scope: String,
+    pub(crate) phase: String,
+    pub(crate) due_at: i64,
+    pub(crate) pending_debt: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // L1 catalog report/hold integration is pending.
+pub(crate) struct CatalogSourceOutcome {
+    pub(crate) pending: bool,
+    pub(crate) retained: u64,
+    pub(crate) next_due_at: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -210,7 +229,7 @@ fn snapshot(
           (SELECT json_group_array(json_array(id,version_size,state,reason,checked_at)) FROM (SELECT * FROM asset_verifications WHERE library=r.library AND (id=?2 OR id=?3 OR id IN (SELECT asset_record_name FROM asset_master_mappings WHERE library=r.library AND master_record_name=?3)) ORDER BY id,version_size)),
           (SELECT json_array(asset_record_name,claimed_at) FROM legacy_master_state_owners WHERE library=r.library AND master_record_name=?3),
           (SELECT next_retry_at FROM source_revalidation_debt WHERE round=r.id AND id=?2),
-          r.scope,r.enum_hash,r.boundary,r.phase,
+          r.scope,r.enum_hash,r.boundary,r.phase,r.mode,
           (SELECT value FROM metadata WHERE key='sync_token:v27:'||r.library),
           (SELECT value FROM metadata WHERE key='observed_selection:v27:'||r.library),
           (SELECT value FROM metadata WHERE key='enum_config_hash'),
@@ -222,9 +241,58 @@ fn snapshot(
     )?)
 }
 
+fn catalog_signals(
+    conn: &Connection,
+    library: &str,
+) -> Result<Vec<CatalogPendingSignal>, StateError> {
+    let rows: Vec<(String, String, String, String, i64, Option<i64>)> = conn
+        .prepare(
+            "SELECT r.id,r.library,r.scope,r.phase,COUNT(d.id),MIN(d.next_retry_at)
+             FROM source_revalidation_rounds r
+             LEFT JOIN source_revalidation_debt d ON d.round=r.id
+             WHERE r.library=?1 AND r.mode=?2
+               AND r.phase IN ('marking','observing','active')
+             GROUP BY r.id,r.library,r.scope,r.phase
+             ORDER BY r.id",
+        )?
+        .query_map(params![library, CATALOG_MODE], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut signals = Vec::new();
+    for (round, library, scope, phase, debt, next_retry) in rows {
+        if phase == "active" && debt == 0 {
+            continue;
+        }
+        let pending_debt =
+            u64::try_from(debt).map_err(|_error| StateError::ProviderSelectionInvalid)?;
+        let due_at = if phase == "marking" {
+            0
+        } else {
+            next_retry.unwrap_or(0)
+        };
+        signals.push(CatalogPendingSignal {
+            round,
+            library,
+            scope,
+            phase,
+            due_at,
+            pending_debt,
+        });
+    }
+    Ok(signals)
+}
+
 pub(crate) fn has_due(conn: &rusqlite::Connection, library: &str) -> Result<bool, StateError> {
-    let scopes: Vec<(String, String)> = conn.prepare("SELECT DISTINCT r.scope,r.enum_hash FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.library=?1 AND r.phase='active' AND r.enum_hash=COALESCE((SELECT value FROM metadata WHERE key='pending_enum_config_hash'),(SELECT value FROM metadata WHERE key='enum_config_hash')) AND d.next_retry_at<=?2")?
-        .query_map(params![library, chrono::Utc::now().timestamp()], |r| Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
+    let scopes: Vec<(String, String)> = conn.prepare("SELECT DISTINCT r.scope,r.enum_hash FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.library=?1 AND r.phase='active' AND r.mode=?3 AND r.enum_hash=COALESCE((SELECT value FROM metadata WHERE key='pending_enum_config_hash'),(SELECT value FROM metadata WHERE key='enum_config_hash')) AND d.next_retry_at<=?2")?
+        .query_map(params![library, chrono::Utc::now().timestamp(), LEGACY_MODE], |r| Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
     for (scope, policy) in scopes {
         if super::provider_generations::observation::revalidation_scope_current(
             conn, library, &scope, &policy,
@@ -239,17 +307,18 @@ pub(crate) fn has_due(conn: &rusqlite::Connection, library: &str) -> Result<bool
 /// Deferred obligations remain eligible; unfinished rounds and stale scopes remain retained.
 /// Superseded abandoned rounds remain durable but are not future obligations.
 pub(crate) fn summary_counts(conn: &rusqlite::Connection) -> Result<(u64, u64), StateError> {
-    let groups: Vec<(String, String, String, String, i64)> = conn.prepare(
-        "SELECT r.library,r.scope,r.enum_hash,r.phase,COUNT(*) FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.phase != 'abandoned' GROUP BY r.library,r.scope,r.enum_hash,r.phase"
-    )?.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?.collect::<Result<_,_>>()?;
+    let groups: Vec<(String, String, String, String, String, i64)> = conn.prepare(
+        "SELECT r.library,r.mode,r.scope,r.enum_hash,r.phase,COUNT(*) FROM source_revalidation_rounds r JOIN source_revalidation_debt d ON d.round=r.id WHERE r.phase != 'abandoned' GROUP BY r.library,r.mode,r.scope,r.enum_hash,r.phase"
+    )?.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))?.collect::<Result<_,_>>()?;
     let effective: Option<String> = conn.query_row(
         "SELECT COALESCE((SELECT value FROM metadata WHERE key='pending_enum_config_hash'),(SELECT value FROM metadata WHERE key='enum_config_hash'))", [], |row| row.get(0)
     )?;
     let mut eligible = 0u64;
     let mut retained = 0u64;
-    for (library, scope, policy, phase, count) in groups {
+    for (library, mode, scope, policy, phase, count) in groups {
         let count = u64::try_from(count).map_err(|_error| StateError::ProviderSelectionInvalid)?;
-        if phase == "active"
+        if mode == LEGACY_MODE
+            && phase == "active"
             && effective.as_deref() == Some(policy.as_str())
             && super::provider_generations::observation::revalidation_scope_current(
                 conn, &library, &scope, &policy,
@@ -547,6 +616,49 @@ impl SqliteStateDb {
         }).await
     }
 
+    /// Bounded catalog pending-origin signal for the watch precheck. Marking
+    /// resumes at the next normal wake; observing/active debt reports its
+    /// earliest saved deadline. The caller must still apply its configured
+    /// cadence, so this is not an immediate rescan loop.
+    #[allow(dead_code)] // L1 precheck integration is pending.
+    pub(crate) async fn catalog_pending_signals(
+        &self,
+        owner: account::AccountOwner,
+        library: String,
+    ) -> Result<Vec<CatalogPendingSignal>, StateError> {
+        self.with_conn("reading catalog pending signals", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            catalog_signals(conn, &library)
+        })
+        .await
+    }
+
+    /// Typed per-source retained/pending outcome for the private report/hold
+    /// seam. Catalog debt is visible but never a checkpoint veto or a fake
+    /// failed-asset count.
+    #[allow(dead_code)] // L1 report/hold integration is pending.
+    pub(crate) async fn catalog_source_outcome(
+        &self,
+        owner: account::AccountOwner,
+        library: String,
+    ) -> Result<CatalogSourceOutcome, StateError> {
+        self.with_conn("reading catalog source outcome", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let signals = catalog_signals(conn, &library)?;
+            let retained = signals
+                .iter()
+                .map(|signal| signal.pending_debt)
+                .sum::<u64>();
+            let next_due_at = signals.iter().map(|signal| signal.due_at).min();
+            Ok(CatalogSourceOutcome {
+                pending: !signals.is_empty(),
+                retained,
+                next_due_at,
+            })
+        })
+        .await
+    }
+
     pub(crate) async fn due_source_revalidation(
         &self,
         owner: account::AccountOwner,
@@ -557,8 +669,8 @@ impl SqliteStateDb {
             account::validate_authenticated(conn,&owner)?;
             let pairs:Vec<(String,String,String)>=conn.prepare(
                 "SELECT d.round,d.id,r.enum_hash FROM source_revalidation_debt d JOIN source_revalidation_rounds r ON r.id=d.round
-                 WHERE r.library=?1 AND r.scope=?2 AND r.phase='active' AND r.enum_hash=COALESCE((SELECT value FROM metadata WHERE key='pending_enum_config_hash'),(SELECT value FROM metadata WHERE key='enum_config_hash')) AND d.next_retry_at<=?3 ORDER BY d.next_retry_at,d.round,d.id LIMIT 64")?
-                .query_map(params![library,scope,chrono::Utc::now().timestamp()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
+                 WHERE r.library=?1 AND r.scope=?2 AND r.phase='active' AND r.mode=?4 AND r.enum_hash=COALESCE((SELECT value FROM metadata WHERE key='pending_enum_config_hash'),(SELECT value FROM metadata WHERE key='enum_config_hash')) AND d.next_retry_at<=?3 ORDER BY d.next_retry_at,d.round,d.id LIMIT 64")?
+                .query_map(params![library,scope,chrono::Utc::now().timestamp(),LEGACY_MODE],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<Result<_,_>>()?;
             let mut output=Vec::new();
             for (round,id,enum_hash) in pairs {
                 if !super::provider_generations::observation::revalidation_scope_current(conn, &library, &scope, &enum_hash)? { continue; }
@@ -836,6 +948,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_mode_seen_due_summary_unknown_and_quarantine_are_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_owned(&dir.path().join("db"), &owner())
+            .await
+            .unwrap();
+        let catalog = format!(
+            "catalog:v2:{}:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:66666666-6666-6666-6666-666666666666",
+            "d".repeat(64)
+        );
+        {
+            let conn = db.acquire_lock("seed mode isolation").unwrap();
+            ensure_catalog_mode_column_for_test(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase) VALUES('legacy','PrimarySync','ordinary-scope','policy','legacy-boundary','','','observing')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_debt(round,id) VALUES('legacy','legacy-asset')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES('catalog','PrimarySync',?1,'policy','catalog-boundary','','','active','catalog_v2')",
+                [&catalog],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES('catalog','catalog-asset',0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES('unknown','PrimarySync','future-scope','policy','future-boundary','','','active','future_mode')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_debt(round,id) VALUES('unknown','future-asset')",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            !has_due(
+                &db.acquire_lock("catalog due isolation").unwrap(),
+                "PrimarySync"
+            )
+            .unwrap()
+        );
+        assert!(
+            db.due_source_revalidation(owner(), "PrimarySync".into(), catalog.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        db.source_revalidation_seen(
+            owner(),
+            "PrimarySync".into(),
+            catalog,
+            "catalog-asset".into(),
+        )
+        .await
+        .unwrap();
+        // Unknown mode is not eligible, but the debt is retained.
+        assert!(
+            !has_due(
+                &db.acquire_lock("unknown due isolation").unwrap(),
+                "PrimarySync"
+            )
+            .unwrap()
+        );
+        // Legacy Unfiled behavior is unchanged: ordinary observing scope can
+        // still retire its own debt.
+        db.source_revalidation_seen(
+            owner(),
+            "PrimarySync".into(),
+            "ordinary-scope".into(),
+            "legacy-asset".into(),
+        )
+        .await
+        .unwrap();
+        {
+            let conn = db.acquire_lock("mode summary isolation").unwrap();
+            let (legacy, catalog_debt, unknown_debt): (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='legacy'),
+                            (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='catalog'),
+                            (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='unknown')",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!((legacy, catalog_debt, unknown_debt), (0, 1, 1));
+            let (eligible, retained) = summary_counts(&conn).unwrap();
+            assert_eq!((eligible, retained), (0, 2));
+            let quarantined = quarantine_all_rounds(&conn).unwrap();
+            assert_eq!(quarantined.0, 3);
+            let phases: (String, String, String) = conn
+                .query_row(
+                    "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id='legacy'),
+                            (SELECT phase FROM source_revalidation_rounds WHERE id='catalog'),
+                            (SELECT phase FROM source_revalidation_rounds WHERE id='unknown')",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (phases.0.as_str(), phases.1.as_str(), phases.2.as_str()),
+                ("abandoned", "abandoned", "abandoned")
+            );
+            let debts: i64 = conn
+                .query_row("SELECT COUNT(*) FROM source_revalidation_debt", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(debts, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_pending_signals_expose_marking_and_saved_deadlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_owned(&dir.path().join("db"), &owner())
+            .await
+            .unwrap();
+        let plan = "e".repeat(64);
+        let epoch = "11111111-1111-1111-1111-111111111111";
+        let attempt = "22222222-2222-2222-2222-222222222222";
+        let marking =
+            format!("catalog:v2:{plan}:{epoch}:{attempt}:77777777-7777-7777-7777-777777777777");
+        let observing =
+            format!("catalog:v2:{plan}:{epoch}:{attempt}:88888888-8888-8888-8888-888888888888");
+        {
+            let conn = db.acquire_lock("seed catalog pending signals").unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES('marking-origin','PrimarySync',?1,'policy','boundary','high','after','marking','catalog_v2')",
+                [&marking],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES('observing-origin','PrimarySync',?1,'policy','boundary','','','observing','catalog_v2')",
+                [&observing],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES('observing-origin','asset',123)",
+                [],
+            )
+            .unwrap();
+        }
+        let signals = db
+            .catalog_pending_signals(owner(), "PrimarySync".into())
+            .await
+            .unwrap();
+        assert_eq!(signals.len(), 2);
+        let marking = signals
+            .iter()
+            .find(|signal| signal.phase == "marking")
+            .unwrap();
+        assert_eq!((marking.due_at, marking.pending_debt), (0, 0));
+        let observing = signals
+            .iter()
+            .find(|signal| signal.phase == "observing")
+            .unwrap();
+        assert_eq!((observing.due_at, observing.pending_debt), (123, 1));
+        let outcome = db
+            .catalog_source_outcome(owner(), "PrimarySync".into())
+            .await
+            .unwrap();
+        assert!(outcome.pending);
+        assert_eq!(outcome.retained, 1);
+        assert_eq!(outcome.next_due_at, Some(0));
+    }
+
+    #[tokio::test]
     async fn pending_catalog_claim_transfers_marking_progress_to_new_attempt_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let db = SqliteStateDb::open_owned(&dir.path().join("db"), &owner())
@@ -966,6 +1254,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_epoch_catalog_claim_is_open_without_transfer_or_attempt_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteStateDb::open_owned(&dir.path().join("db"), &owner())
+            .await
+            .unwrap();
+        db.set_metadata("enum_config_hash", "policy").await.unwrap();
+        db.enroll_sync_epoch(vec![("PrimarySync".into(), "scope".into())])
+            .await
+            .unwrap();
+        let plan = "f".repeat(64);
+        let old_attempt = "99999999-9999-9999-9999-999999999999";
+        let catalog = format!(
+            "catalog:v2:{plan}:11111111-1111-1111-1111-111111111111:{old_attempt}:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        );
+        let cursor = "complete-cursor";
+        let baseline_key = "baseline_cursor:v27:synthetic:policy:";
+        let (epoch_json, library_json, epoch_id) = {
+            let conn = db.acquire_lock("prepare complete epoch claim").unwrap();
+            conn.execute(
+                "UPDATE metadata SET value=json_set(value,'$.state','complete','$.attempt',?2,'$.next_attempt_at',0,'$.binding',NULL,'$.completed_at',1,'$.last_outcome','qualified') WHERE key=?1",
+                rusqlite::params![
+                    crate::state::db::sync_epoch::library_key("PrimarySync"),
+                    old_attempt
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key,value) VALUES(?1,?2)",
+                rusqlite::params![baseline_key, cursor],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES('complete-origin','PrimarySync',?1,'policy',?2,'high','after','active','catalog_v2')",
+                rusqlite::params![catalog, CatalogOrigin::boundary(cursor)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO source_revalidation_debt(round,id,next_retry_at) VALUES('complete-origin','asset',0)",
+                [],
+            )
+            .unwrap();
+            let epoch = crate::state::db::sync_epoch::validate(&conn).unwrap();
+            let library = crate::state::db::sync_epoch::read_library(&conn, "PrimarySync")
+                .unwrap()
+                .unwrap();
+            (
+                serde_json::to_string(&epoch).unwrap(),
+                serde_json::to_string(&library).unwrap(),
+                epoch.epoch,
+            )
+        };
+        let outcome = db
+            .claim_catalog_baseline(
+                owner(),
+                CatalogBaselineClaim {
+                    library: "PrimarySync".into(),
+                    baseline_key: baseline_key.into(),
+                    expected_baseline: Some(cursor.into()),
+                    plan_digest: plan,
+                    expected_enum_hash: "policy".into(),
+                    expected_epoch: epoch_id,
+                    expected_epoch_json: epoch_json,
+                    expected_library_json: library_json,
+                    expected_metadata: vec![],
+                    now: chrono::Utc::now().timestamp(),
+                    watch_interval: Some(3600),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, CatalogClaimOutcome::Open);
+        let conn = db
+            .acquire_lock("verify complete epoch no transfer")
+            .unwrap();
+        let (phase, debt, attempt): (String, i64, String) = conn
+            .query_row(
+                "SELECT (SELECT phase FROM source_revalidation_rounds WHERE id='complete-origin'),
+                        (SELECT COUNT(*) FROM source_revalidation_debt WHERE round='complete-origin'),
+                        (SELECT json_extract(value,'$.attempt') FROM metadata WHERE key=?1)",
+                [crate::state::db::sync_epoch::library_key("PrimarySync")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((phase.as_str(), debt), ("active", 1));
+        assert_eq!(attempt, old_attempt);
+    }
+
+    #[tokio::test]
     async fn catalog_claim_copy_failure_rolls_back_epoch_claim_and_origin() {
         let dir = tempfile::tempdir().unwrap();
         let db = SqliteStateDb::open_owned(&dir.path().join("db"), &owner())
@@ -1045,7 +1421,7 @@ mod tests {
         let candidate = {
             let conn = db.acquire_lock("seed old catalog origin").unwrap();
             conn.execute(
-                "INSERT INTO source_revalidation_rounds VALUES(?1,'PrimarySync',?2,'policy',?3,'catalog-asset','catalog-asset','active')",
+                "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES(?1,'PrimarySync',?2,'policy',?3,'catalog-asset','catalog-asset','active','catalog_v2')",
                 rusqlite::params![nonce_a, scope_a, boundary],
             )
             .unwrap();
@@ -1077,7 +1453,7 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO source_revalidation_rounds VALUES(?1,'PrimarySync',?2,'policy',?3,'catalog-asset','catalog-asset','observing')",
+                "INSERT INTO source_revalidation_rounds(id,library,scope,enum_hash,boundary,high_id,after_id,phase,mode) VALUES(?1,'PrimarySync',?2,'policy',?3,'catalog-asset','catalog-asset','observing','catalog_v2')",
                 rusqlite::params![nonce_b, scope_b, boundary],
             )
             .unwrap();

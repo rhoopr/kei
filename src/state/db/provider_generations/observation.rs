@@ -641,9 +641,6 @@ pub(in crate::state::db) fn prepare(
                             params![saved_round, zone],
                             |r| r.get(0),
                         )?;
-                        eprintln!(
-                            "B-PREPARE-STAGED saved_round={saved_round} old_key={old_key} target={target} catalog={catalog}"
-                        );
                         if catalog {
                             if round.is_none() {
                                 round = Some(saved_round);
