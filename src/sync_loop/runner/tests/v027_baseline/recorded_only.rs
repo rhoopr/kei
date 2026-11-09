@@ -233,6 +233,16 @@ fn epoch_state(db: &SqliteStateDb, zone: &str) -> String {
     .unwrap()
 }
 
+fn epoch_next_attempt(db: &SqliteStateDb, zone: &str) -> i64 {
+    let conn = db.acquire_lock("read epoch deadline").unwrap();
+    conn.query_row(
+        "SELECT json_extract(value,'$.next_attempt_at') FROM metadata WHERE key=?1",
+        [crate::state::db::sync_epoch::library_key(zone)],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
 fn token(db: &SqliteStateDb, zone: &str) -> Option<String> {
     let conn = db.acquire_lock("read zone token").unwrap();
     conn.query_row(
@@ -526,13 +536,14 @@ async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inven
 
     let first_support_state = epoch_state(&db, SUPPORT);
     let first_support_token = token(&db, SUPPORT);
+    let first_support_epoch_next = epoch_next_attempt(&db, SUPPORT);
     let first_fail = decision_state(&db, "asset-fail");
     let first_progress = destination_state(&db, "asset-progress");
     let first_peer_state = epoch_state(&db, PEER);
     let first_peer_token = token(&db, PEER);
     let first_support_full = support_full.load(Ordering::SeqCst);
     eprintln!(
-        "L7 held first cycle: failed={} support_epoch={first_support_state} support_token={first_support_token:?} fail={first_fail:?} progress={first_progress:?} support_full={first_support_full} support_blocked={} reason={:?} peer_epoch={first_peer_state} peer_token={first_peer_token:?} peer_full={}",
+        "L7 held first cycle: failed={} support_epoch={first_support_state} support_token={first_support_token:?} support_epoch_next={first_support_epoch_next} fail={first_fail:?} progress={first_progress:?} support_full={first_support_full} support_blocked={} reason={:?} peer_epoch={first_peer_state} peer_token={first_peer_token:?} peer_full={}",
         first.failed_count,
         first.stats.sync_token_blocked,
         first.stats.sync_token_blocked_reason,
@@ -590,6 +601,10 @@ async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inven
     db.make_selection_retry_due(baseline_owner(), "asset-fail".to_owned())
         .await
         .unwrap();
+    assert!(
+        epoch_next_attempt(&db, SUPPORT) > chrono::Utc::now().timestamp(),
+        "the due item must be ahead of the future epoch deadline"
+    );
 
     let second = run_stock36_cycle(&db, &[&support, &peer], &root, &shared, &config)
         .await
