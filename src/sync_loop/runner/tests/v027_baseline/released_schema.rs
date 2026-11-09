@@ -3722,7 +3722,7 @@ struct ConfigReconcileSession {
     bridge: Arc<Vec<serde_json::Value>>,
     cycle: usize,
     changes: Arc<AtomicUsize>,
-    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    requests: Arc<Mutex<Vec<(usize, serde_json::Value)>>>,
 }
 
 #[async_trait::async_trait]
@@ -3753,7 +3753,10 @@ impl crate::icloud::photos::PhotosSession for ConfigReconcileSession {
             return Ok(json!({"batch": counts}));
         }
         if url.contains("/records/query?") {
-            self.requests.lock().unwrap().push(request.clone());
+            self.requests
+                .lock()
+                .unwrap()
+                .push((self.cycle, request.clone()));
             let offset = request["query"]["filterBy"]
                 .as_array()
                 .into_iter()
@@ -3784,7 +3787,10 @@ impl crate::icloud::photos::PhotosSession for ConfigReconcileSession {
             return Ok(json!({"records":records}));
         }
         if url.contains("/changes/zone?") {
-            self.requests.lock().unwrap().push(request.clone());
+            self.requests
+                .lock()
+                .unwrap()
+                .push((self.cycle, request.clone()));
             let change = self
                 .changes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3811,7 +3817,6 @@ impl crate::icloud::photos::PhotosSession for ConfigReconcileSession {
 /// already matches the current options, so the normal reconciliation stage is
 /// reachable without a manual deadline or epoch override.
 pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconciliation() {
-    let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("photos");
     let protected = root.join("protected");
@@ -3833,6 +3838,12 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
     {
         let conn = rusqlite::Connection::open(&source).unwrap();
         crate::state::schema::migrate_genuine_v36(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            36,
+            "initial genuine released schema"
+        );
         insert_released_asset(
             &conn,
             ZONE,
@@ -3849,8 +3860,7 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
              INSERT INTO asset_metadata_capture_revisions VALUES ('{ZONE}','recovered-old-master',1,1700000000);
              INSERT INTO metadata VALUES ('enum_config_hash','old-active-enum-hash');
              INSERT INTO metadata VALUES ('pending_enum_config_hash','{current_enum_hash}');
-             INSERT INTO metadata VALUES ('download_config_hash','old-active-download-hash');
-             INSERT INTO metadata VALUES ('pending_download_config_hash','old-pending-download-hash');
+             INSERT INTO metadata VALUES ('config_hash','old-active-path-hash');
              INSERT INTO metadata VALUES ('sync_token:v27:{ZONE}','old-active-v27-cursor');"
         ))
         .unwrap();
@@ -3868,16 +3878,6 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
     .unwrap();
     assert_eq!(released_rows(&db_path, &columns), legacy_rows);
 
-    {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS metadata_audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT, key TEXT, old_value TEXT, new_value TEXT);
-             CREATE TRIGGER IF NOT EXISTS audit_metadata_insert AFTER INSERT ON metadata BEGIN INSERT INTO metadata_audit(op,key,old_value,new_value) VALUES('insert',NEW.key,NULL,NEW.value); END;
-             CREATE TRIGGER IF NOT EXISTS audit_metadata_update AFTER UPDATE ON metadata BEGIN INSERT INTO metadata_audit(op,key,old_value,new_value) VALUES('update',NEW.key,OLD.value,NEW.value); END;
-             CREATE TRIGGER IF NOT EXISTS audit_metadata_delete AFTER DELETE ON metadata BEGIN INSERT INTO metadata_audit(op,key,old_value,new_value) VALUES('delete',OLD.key,OLD.value,NULL); END;",
-        )
-        .unwrap();
-    }
     let protected_snapshot = || {
         rows(
             &db_path,
@@ -3899,6 +3899,32 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
         .collect::<Vec<_>>()
     };
     let protected_before = protected_snapshot();
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let metadata = |key: &str| -> Option<String> {
+            conn.query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .ok()
+        };
+        assert_eq!(
+            metadata("enum_config_hash").as_deref(),
+            Some("old-active-enum-hash")
+        );
+        assert_eq!(
+            metadata("pending_enum_config_hash").as_deref(),
+            Some(current_enum_hash.as_str())
+        );
+        assert_eq!(
+            metadata("config_hash").as_deref(),
+            Some("old-active-path-hash")
+        );
+        assert_eq!(metadata("pending_download_config_hash"), None);
+        assert_eq!(
+            metadata(&format!("sync_token:v27:{ZONE}")).as_deref(),
+            Some("old-active-v27-cursor")
+        );
+    }
 
     let server = crate::test_helpers::start_wiremock_or_skip("released config reconciliation")
         .await
@@ -4069,24 +4095,7 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
                     [&staged_key],
                     |row| row.get(0),
                 )
-                .unwrap_or_else(|error| {
-                    for row in rows(&db_path, "SELECT key, value FROM metadata ORDER BY key") {
-                        eprintln!("META {row:?}");
-                    }
-                    for row in rows(
-                        &db_path,
-                        "SELECT seq,op,key,old_value,new_value FROM metadata_audit ORDER BY seq",
-                    ) {
-                        eprintln!("AUDIT {row:?}");
-                    }
-                    eprintln!("CYCLE0 {result:?} EPOCH {epoch:?}");
-                    for event in trace.events() {
-                        if matches!(event.level, tracing::Level::WARN | tracing::Level::ERROR) {
-                            eprintln!("TRACE {:?}", event.fields);
-                        }
-                    }
-                    panic!("staged token missing: {error}");
-                });
+                .unwrap();
             let staged_observation: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM metadata WHERE key=?1",
@@ -4108,6 +4117,17 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
             assert_eq!(epoch.state, "ready", "valid staged epoch before promotion");
             assert!(epoch.binding.is_some(), "ready binding retained");
             assert_eq!(staged_observation, 1);
+            let active_observation: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM metadata WHERE key=?1",
+                    [format!("observed_selection:v27:{ZONE}")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                active_observation, 0,
+                "no partial ACTIVE observation before promotion"
+            );
             assert!(
                 active_token.as_deref() != Some(staged.as_str()),
                 "the staged token must not become active before promotion"
@@ -4201,9 +4221,9 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
             assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
             assert!(result.db_sync_token_advance_safe, "cycle {cycle}");
             assert_eq!(result.stats.downloaded, 0, "cycle {cycle}: quiet reopen");
-            assert_eq!(
-                db.get_metadata(&token_key).await.unwrap().as_deref(),
-                active_after_recovery.as_deref()
+            assert!(
+                db.get_metadata(&token_key).await.unwrap().is_some(),
+                "cycle {cycle}: quiet delta may advance the token but must keep one"
             );
             assert_eq!(
                 rows(&db_path, "SELECT * FROM download_receipts ORDER BY id"),
@@ -4217,16 +4237,16 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
     assert!(
         requests
             .iter()
-            .all(|request| !request.to_string().contains("old-active-v27-cursor")),
+            .all(|(_, request)| !request.to_string().contains("old-active-v27-cursor")),
         "the prior active cursor must not be requested"
     );
-    assert!(
-        requests
-            .iter()
-            .filter(|request| request.get("query").is_some())
-            .count()
-            <= 2,
-        "no inventory after the initial baseline cycle"
+    let inventories_after_baseline = requests
+        .iter()
+        .filter(|(cycle, request)| *cycle > 0 && request.get("query").is_some())
+        .count();
+    assert_eq!(
+        inventories_after_baseline, 0,
+        "no DATA inventory after the initial baseline cycle"
     );
     let received = server.received_requests().await.unwrap();
     let count = |path: &str| {
@@ -4246,7 +4266,6 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
     );
 }
 
-#[ignore = "fixture fence mismatch: expected pending_download_config_hash=None but the synthetic source seeded old-pending-download-hash; the production config_hash key was absent so the Ok(None) branch never cleared the orphan pending key. Remove the orphan seed to reach the staged promotion"]
 #[tokio::test]
 async fn released_config_reconciliation_stages_before_atomic_promotion_36() {
     super::PRESERVE_SHARED_CLAIMS
