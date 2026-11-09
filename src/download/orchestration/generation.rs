@@ -1176,7 +1176,6 @@ impl SelectionRun {
         config: &DownloadConfig,
     ) -> Result<()> {
         let mut sources = Vec::new();
-        let mut deferred = std::collections::HashSet::new();
         for task in tasks {
             let run = if self.root.spec.zone.get("zoneName").and_then(Value::as_str)
                 == Some(task.library.as_ref())
@@ -1212,29 +1211,6 @@ impl SelectionRun {
                     })
                 {
                     continue;
-                }
-                if (run.root.spec.format == 2 || run.retained_retry)
-                    && deferred.insert((key.clone(), task.asset_record_name.to_string()))
-                    && run
-                        .capture
-                        .db
-                        .selection_attempt_due(
-                            run.capture.owner.clone(),
-                            run.root.id.clone(),
-                            key.clone(),
-                            task.asset_record_name.to_string(),
-                        )
-                        .await?
-                {
-                    self.capture
-                        .db
-                        .defer_selection_confirmation(
-                            run.capture.owner.clone(),
-                            run.root.id.clone(),
-                            key.clone(),
-                            task.asset_record_name.to_string(),
-                        )
-                        .await?;
                 }
                 let (Some(body), Some(master)) =
                     (&manifest.decision.confirmation, &manifest.decision.master)

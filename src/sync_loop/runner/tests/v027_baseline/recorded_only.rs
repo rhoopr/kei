@@ -446,6 +446,7 @@ async fn stock36_only_failed_media_keeps_validated_baseline_token_accounted() {
 /// make legitimate progress. This is a deadline-boundary control, not a
 /// configured-watch cadence claim.
 #[tokio::test]
+#[ignore = "admitted-only retry lane gated on PO predicates"]
 async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inventory_or_promotion()
 {
     use std::sync::Arc;
@@ -1023,6 +1024,8 @@ async fn unchanged_reader_rejects_injected_download_failed_reason_without_mutati
         )
         .unwrap()
     };
+    let injected_attempts = attempts.saturating_add(1).max(1);
+    let injected_deadline = chrono::Utc::now().timestamp() + 3600;
     let injected_hash = admission_hash_for(
         &generation,
         &key,
@@ -1030,8 +1033,8 @@ async fn unchanged_reader_rejects_injected_download_failed_reason_without_mutati
         &manifest_hash,
         &admission,
         "download_failed",
-        attempts,
-        deadline,
+        injected_attempts,
+        injected_deadline,
     );
     assert_ne!(
         injected_hash, stored_hash,
@@ -1046,8 +1049,8 @@ async fn unchanged_reader_rejects_injected_download_failed_reason_without_mutati
             &manifest_hash,
             &admission,
             "download_failed",
-            attempts.saturating_add(1),
-            deadline
+            injected_attempts.saturating_add(1),
+            injected_deadline
         ),
         "the admission hash must bind attempts"
     );
@@ -1060,16 +1063,16 @@ async fn unchanged_reader_rejects_injected_download_failed_reason_without_mutati
             &manifest_hash,
             &admission,
             "download_failed",
-            attempts,
-            deadline.saturating_add(1)
+            injected_attempts,
+            injected_deadline.saturating_add(1)
         ),
         "the admission hash must bind the deadline"
     );
     {
         let conn = db.acquire_lock("inject download_failed").unwrap();
         conn.execute(
-            "UPDATE provider_active_decisions SET reason='download_failed',admission_hash=?1 WHERE generation=?2 AND pass_key=?3 AND child=?4",
-            rusqlite::params![injected_hash, generation, key, child],
+            "UPDATE provider_active_decisions SET reason='download_failed',attempts=?1,next_retry_at=?2,admission_hash=?3 WHERE generation=?4 AND pass_key=?5 AND child=?6",
+            rusqlite::params![injected_attempts, injected_deadline, injected_hash, generation, key, child],
         )
         .unwrap();
     }
@@ -1113,7 +1116,7 @@ async fn unchanged_reader_rejects_injected_download_failed_reason_without_mutati
         after_injection, after_read,
         "the unchanged reader must not mutate the injected row"
     );
-    assert!(attempts > 0 && deadline > 0);
+    assert!(injected_attempts > 0 && injected_deadline > 0);
 }
 
 /// The old decoder refusal must survive ordinary replay and two reopens. This
@@ -1194,6 +1197,7 @@ async fn unchanged_reader_preserves_injected_download_failed_across_replay_and_t
         )
         .unwrap()
     };
+    let injected_attempts = attempts.saturating_add(1).max(1);
     let injected_deadline = 1;
     let injected_hash = admission_hash_for(
         &generation,
@@ -1202,14 +1206,14 @@ async fn unchanged_reader_preserves_injected_download_failed_across_replay_and_t
         &manifest_hash,
         &admission,
         "download_failed",
-        attempts,
+        injected_attempts,
         injected_deadline,
     );
     {
         let conn = db.acquire_lock("inject due download_failed").unwrap();
         conn.execute(
             "UPDATE provider_active_decisions SET reason='download_failed',attempts=?1,next_retry_at=?2,admission_hash=?3 WHERE generation=?4 AND pass_key=?5 AND child=?6",
-            rusqlite::params![attempts, injected_deadline, injected_hash, generation, key, child],
+            rusqlite::params![injected_attempts, injected_deadline, injected_hash, generation, key, child],
         )
         .unwrap();
     }

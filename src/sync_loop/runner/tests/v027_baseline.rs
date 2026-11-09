@@ -1405,22 +1405,23 @@ async fn baseline_contract(
             assert_eq!(unresolved.len(), 1);
             assert_eq!(unresolved[0].id.as_ref(), "asset-current-missing");
             assert_eq!(unresolved[0].library.as_ref(), ZONE);
-            let retained: bool = db
+            let retained: (i64, i64, String, i64) = db
                 .acquire_lock("assert durable failed transfer retry")
                 .unwrap()
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM provider_active_decisions d
+                    "SELECT w.admitted,w.verified_media,d.reason,d.next_retry_at
+                     FROM provider_active_decisions d
                      JOIN provider_active_destinations w ON w.generation=d.generation
                        AND w.pass_key=d.pass_key AND w.child=d.child
-                     WHERE d.child='asset-current-missing' AND d.next_retry_at>0
-                       AND w.admitted=1 AND w.verified_media=0)",
+                     WHERE d.child='asset-current-missing'",
                     [],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .unwrap();
-            assert!(
+            assert_eq!(
                 retained,
-                "failed transfer must retain its admitted destination and retry deadline"
+                (1, 0, String::new(), 0),
+                "failed transfer must retain its admitted destination without a premature confirmation backoff"
             );
         } else {
             assert!(pending.is_empty());
