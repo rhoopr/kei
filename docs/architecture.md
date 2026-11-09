@@ -1755,6 +1755,22 @@ still retain debt. When a naming-template change leaves no exact requested-path
 choice, targeted retry may replay a unique saved destination for the same owner
 and provider generation. Multiple destinations remain pending, and replay
 remains confined to the current root.
+An explicit truncated-file repair can leave a verified prepared publication
+beside a replacement-journal rollback of the exact old bytes. Targeted retry may
+complete that prepared part only when the current task still carries the same
+provider resource, recorded native path, publication binding, allowed
+destination and create-permission state, and the prepared proof matches the same
+account, scope, child, master, state, pass, version and path. Recovery reopens
+and hashes the prepared part, then replaces only the exact restored old
+fingerprint through the existing conditional publication owner. Missing,
+changed or unauthorized evidence leaves the old file, prepared proof and claim
+intact. When the target is already complete and the prepared proof still owns
+the exact two-link temporary, recovery may remove only that link after
+revalidating the prepared owner, exact inode, full checksum and both parent
+directories. Changed, symlinked or unexpectedly linked parts retain the proof and
+are not finalized. A missing part permits only a fully bound, verified
+complete-target retry that syncs both parents before finalization; a durability
+failure retains the proof even if the part was already removed.
 The file is hashed beneath the current root without following links. A retained
 file and namespace, plus the process's
 destination guard, remain live through immediate conditional state finalization.
@@ -2199,67 +2215,15 @@ matching child, and full-evidence matching child counts. It contains no IDs,
 paths, checksums, or provider metadata. These counts do not authorize identity
 selection, even when only one child matches every stored rendition.
 
-Schema v28 can preserve an unclaimed legacy master receipt with at least two
-historical child mappings without assigning it to a child. A complete current
-inventory must contain at least one live child. A sole survivor must satisfy the
-same independent current-child receipt and file checks as a multi-child family;
-historical siblings missing from that inventory do not establish ownership or
-authorize source deletion. Zero-current-child families and saved legacy owners
-remain excluded. `download/legacy_preservation.rs` owns eligibility and
-file validation; `state/db/legacy_preservation.rs` owns immutable evidence and
-generation-fenced receipts. Migration creates empty tables and protection
-triggers only. It does not classify or rewrite existing records. Schema-27
-binaries reject a migrated database; read-only reports require the current
-schema and never migrate it.
+Schema v28 introduced immutable records for unattributed legacy masters without assigning them to a child. The current binary retains that historical evidence and its path protection. `download/legacy_preservation.rs` owns read-only file and path guards; `state/db/legacy_preservation.rs` owns retained evidence, protection and legacy checkpoint validation. Migration creates empty tables and protection triggers only. It does not classify or rewrite existing records. Schema-27 binaries reject a migrated database; read-only reports require the current schema and never migrate it.
 
-Preparation protects the original catalogue rows, capture revisions, retry
-receipts, relationship history, media paths and sidecar presence. It preserves
-the old checkpoint. A valid original path already claimed by another catalogue
-asset defers that family without creating preservation receipts or changing its
-ownership, retries or checkpoint. Independent families in the same preparation
-scan can still progress; malformed evidence remains an error. Before preparation,
-unclaimed masters with multiple historical children already protect every
-catalogued original path and its exact `.xmp` sidecar across libraries. Pending
-metadata debt does not remove that protection. Ordinary writers, import adoption,
-publication proofs, layout handovers and replacement recovery share this path
-census; deferred originals retain their rewrite markers. A complete
-unfiltered zone inventory must cover hidden children, all pages, an explicit
-completion marker and a nonblank final cursor.
-Each scan is limited to 10,000 pages and 1,000,000 observed records. It retains
-compact latest identity/reference/deletion evidence for unrelated records and
-full latest records for candidate masters and children, then hydrates those
-families after the final page. Historical child mappings cannot replace complete
-family discovery. Later updates and tombstones replace earlier evidence, including
-references that enter or leave a candidate family.
+Automatic preservation discovery and preparation are retired. Normal sync does not run a separate family-discovery inventory, create new preservation records or schedule a one-hour discovery retry across restart. Preparation snapshots and insertion helpers remain test-only. Historical mappings or a missing sibling do not establish current ownership or authorize source deletion. Current generation validation checks retained receipts and freshly selected work; it does not prepare or certify historical families.
 
-The byte guards allow at most 64 MiB for one serialized response page and 256 MiB
-for retained record representations, identity storage and pagination cursors.
-Cumulative transferred bytes are counted separately and do not consume the
-retained-evidence budget. These counts are representation bounds, not process RSS;
-one response is decoded before its page-size guard. A cycle considers at most 64
-new candidates. Exhausting a limit retains the hold. Sparse, malformed,
-cross-library or incomplete evidence cannot activate preservation. No diagnostic
-count is ownership proof.
+Retained preservation records protect original catalogue rows, capture revisions, retry receipts, relationship history, media paths and sidecar presence. Unclaimed masters with multiple historical children also protect every catalogued original path and its exact `.xmp` sidecar across libraries, even without a preservation record. Pending metadata debt does not remove that protection. Ordinary writers, import adoption, publication proofs, layout handovers and replacement recovery share this path census; protected originals retain their rewrite markers. No diagnostic count supplies ownership or provider proof.
 
-Failed preparation discovery records a versioned, library-scoped
-`legacy_preservation_inventory_retry:` receipt in the metadata table. An unchanged
-configuration and durable original-family evidence defer another preparation scan
-for at most one hour across restart. Retry scheduling, capture cycle counters and
-unchanged relation refresh timestamps do not reset that delay. Changed
-configuration or original-family evidence permits
-a new attempt; malformed, unsupported or out-of-range retry receipts never defer
-work. Deferral supplies no provider evidence or checkpoint permission. Prepared
-records still require fresh certification, and metadata-capture retry scheduling
-remains independent. Successful discovery clears its failure delay.
+The retired discovery limits, failure-delay receipts and separate preparation/certification scans are not current runtime scheduling or coverage guarantees. Retained records do not trigger those scans or supply permission to advance a current checkpoint. Current provider observation, durable selected work and checkpoint guards remain authoritative.
 
-Preparation and certification use separate complete scans; a preparation result
-cannot certify work performed later. Failure warnings expose only a fixed stage
-and category plus aggregate page, record, transferred-byte and retained-byte
-counts. Provider error text, record identities, paths and URLs remain private.
-
-Activation requires a normal completed current inventory and, when a retained
-cursor exists, a successful delta bridge. Independently identified current
-children need separate, finalized receipts and verified files for every selected
+For source-backed recovery, independently identified current children need separate, finalized receipts and verified files for every selected
 rendition. Qualification requires independently verified per-path source
 provenance for the exact child, rendition, provider generation and catalogue
 path, with a freshly verified current local SHA-256. Provider MMCS signatures
@@ -2271,25 +2235,9 @@ receipt. Exact-byte relocation can reuse an unambiguous source receipt bound
 to the same library, child, rendition and provider generation. Pending
 rewrite, capture-repair or recorded-source recovery debt keeps this conservative
 qualification blocked. Retained reconciliation destination choices are naming
-evidence, not pending work, and remain part of the dependency comparison. No metadata writer is enabled automatically. A replay
-that creates debt holds the cursor; a later cycle may qualify after configured
-current-child work completes.
+evidence, not pending work, and remain part of the dependency comparison. No metadata writer is enabled automatically. Current checkpoints do not promote these historical records into attribution proof.
 
-Original media and sidecars are fingerprinted through confined paths. Symlinks,
-pending temporary writes, replacement journals, shared paths and changed bytes
-reject qualification. Multiple hard links also reject qualification by default. Preparation warnings retain the aggregate
-`invalid_original_files` candidate count and expose `shared_file_links` as a subset,
-counting each candidate once at its first rejected media or sidecar. Typed shared-link
-errors also expose only the fixed reason `shared_file_links` at certification and
-checkpoint stages. The TOML-only `[download].legacy_preservation_allow_hardlinks`
-flag defaults to false. True waives only the hard-link-count check for original
-and current-child media and sidecars during legacy qualification and revalidation.
-Actual use emits one redacted aggregate warning per library cycle, deduplicated
-by evidence path; enabling the flag without linked evidence emits no warning.
-Other confined-path, byte, receipt, debt and checkpoint validation stays intact.
-Preparation, certification and checkpoint validation consume the same flag.
-Its value is bound into the separate legacy policy hash; ordinary download and
-enumeration hashes remain unchanged. False retains the previous legacy hash.
+Current file guards reject unsafe namespaces, pending temporary writes, replacement journals and changed bytes. The TOML-only `[download].legacy_preservation_allow_hardlinks` flag defaults to false. Explicit Trusted Legacy File acceptance and current generation revalidation honor it only for the link-count check on the accepted current-child file; confined-path, byte, receipt, debt and checkpoint checks remain intact. This local-byte acceptance does not create provider-source provenance. Strict sparse-target recovery still requires independent single-link media and sidecars. The flag remains bound into the separate legacy policy hash; ordinary download and enumeration hashes remain unchanged. It does not restore original-file preparation, discovery scans or their former aggregate warnings.
 
 The opt-in assumes external tools are coordinated so they do not change linked
 contents, metadata, or kei-managed names during the operation. It does not prove
@@ -2324,40 +2272,19 @@ Source metadata recovery distinguishes protected legacy originals from healthy
 managed primary-layout sources. Managed sources continue through their layout
 owner; pending media or sidecar replacement journals still hold reconciliation.
 
-The final SQLite transaction compares the original snapshot, current child and
-family evidence, receipt generation, configuration metadata and prior cursor.
-It appends the proof and commits the cursor together. Staged config-reconciliation
-cursors use the same transaction. Invalid or stale proof, incomplete current work,
-interruption and write failure retain the prior cursor. Existing current-provider
-identity and checkpoint guards remain independent and are never cleared to permit
-preservation. An unchanged activated receipt can support ordinary incremental
-cycles without another full inventory. Changed family, configuration, file or
-receipt evidence reactivates the hold while retaining every original snapshot and
-prior proof. Reactivation does not authorize historical attribution or rewriting.
+The retained legacy checkpoint transaction compares the original snapshot, dependency evidence, receipt generation, configuration metadata and prior cursor before appending a proof and committing its cursor. Normal sync supplies no historical activation proofs. Current v27 observed-work checkpoints use their own provider, selected-work and sparse-identity guards without certifying historical attribution or deleting its evidence. Changed dependencies invalidate retained legacy coverage; they do not authorize historical rewriting or release protected paths.
 
 `status`, cycle reports and health JSON expose `unattributed_legacy_assets` and
 `unattributed_legacy_pending` separately from download failures. Pending current
 proof makes one-shot exit status, cycle reports and health incomplete, including
 idle health for unselected libraries. Certified but unattributed history alone
-does not fail current sync. Certification refusals include the fixed-label
-`legacy_certification_refusal_v1` diagnostic and a bounded `subreason`; unknown
-errors use `unclassified`, without logging their private source text. The first counts
+does not fail current sync. The first counts
 legacy records still needing attribution; the second counts records awaiting
 valid current-work preservation proof. Original capture revision and retry history
 remain stored. Advancing current sync does not claim a complete historical backup;
 backup safety remains false while attribution is unresolved.
 
-A missing selected receipt also emits `legacy_receipt_prerequisite_v1` with
-one fixed `prerequisite`: child readiness, absent rendition or scoped path receipt,
-binding mismatch, or missing/invalid verified source. This is a read-only snapshot
-after refusal, not acceptance evidence. A newly eligible snapshot reports
-`receipt_state_changed`; failed or unsupported inspection reports
-`diagnostic_unavailable`. Both retain the original `child_receipt_missing` hold.
-The lookup cannot grant qualification, retry work, write state or inspect media.
-It emits no child/library identifiers, paths, hashes or private database errors;
-support diagnostics retain only the enumerated prerequisite. One refusal does not
-establish how many families lack proof. Primary sparse-identity recovery remains
-independent.
+The former automatic-certification refusal and receipt-prerequisite diagnostics are not emitted by current sync. Retained diagnostic allowlists and test-only inspection helpers do not restore that orchestration. Current sparse-identity recovery remains independent.
 
 Automatic repair processes at most 500 stale assets per library in one sync
 cycle. When a clean batch makes progress and work remains, watch and service
@@ -2386,13 +2313,20 @@ without downloading the media again. Full enumeration, single-pass incremental,
 and collecting incremental sync all commit changed catalogue metadata and its
 configured rewrite marker together, before filtering, album routing, or
 deciding whether unchanged media needs downloading. A failed commit preserves
-the provider checkpoint. Queued rewrites drain once per cycle, after every
-producer has finished, so a single writer owns each file. Read-only runs never
-drain. Only that drain retires a marker on success, because it writes the file
-from the same row it then clears. Each bounded rewrite batch loads current
-album and people rows for its library-scoped asset IDs. A grouping-read failure
-leaves the affected markers pending. A completed download writes the snapshot
-it was planned from, so it records a marker on failure but never retires one.
+the provider checkpoint. The existing per-producer and outer refresh drains
+retain their order and paging. Within one composed watch-cycle operation, a
+receiptless Ordinary sidecar request whose actual destination probe failed is
+not physically attempted again while its effective payload, flags, capture
+policy, source provenance, media evidence, namespace, and sidecar destination
+evidence remain identical. The witness is transient, bounded by descriptor and
+heap budgets, and falls back to normal guarded retry when it cannot retain or
+revalidate the exact evidence. Read-only runs never drain. Only the existing
+drain retires a marker on success, because it writes the file from the same row
+it then clears. A suppressed duplicate does not retire the marker or add a new
+failure. Each bounded rewrite batch loads current album and people rows for its
+library-scoped asset IDs. A grouping-read failure leaves the affected markers
+pending. A completed download writes the snapshot it was planned from, so it
+records a marker on failure but never retires one.
 
 The first task payload includes its concrete pass album, even when the cycle's
 grouping preload is empty. Provider membership changes update the

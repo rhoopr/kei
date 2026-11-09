@@ -13,6 +13,7 @@ lint settings, and dependency lockfile entries are not counted. There are no
 | --- | --- | --- | --- |
 | `src/lib.rs::harden_process` | `libc::prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)` in `harden_process`. | Disables Linux core dumps before secrets can leak into a dump. The call takes integer arguments only, so the local memory-safety risk is limited to correct FFI signature and constants. Failure is logged and ignored. | No safe `std` equivalent. It can be moved out of repo-local `unsafe` by adding a direct `rustix` dependency with the process APIs and calling `rustix::process::set_dumpable_behavior(DumpableBehavior::NotDumpable)`. Dropping the call would weaken credential hardening. |
 | `src/lib.rs::harden_process` | `libc::setrlimit(RLIMIT_CORE, &rlim)` in `harden_process`. | Sets the core-file size limit to zero on Unix. The `rlimit` value is stack-allocated, initialized before the call, and the kernel only reads it during the syscall. Failure is logged and ignored. | No safe `std` equivalent. A direct `rustix` process dependency can replace this with `setrlimit(Resource::Core, Rlimit { current: 0, maximum: 0 })`. Dropping it would weaken the same hardening path. |
+| `src/download/metadata_rewrite/queued.rs::process_fd_limit` | `libc::getrlimit(RLIMIT_NOFILE, &mut limits)` in the transient sidecar witness budget. | `limits` is a valid, properly aligned, initialized `libc::rlimit`; `getrlimit` writes only through that pointer; the return code is checked before reading; no Rust reference aliases it during the call. The function is read-only: it never calls `setrlimit`, never raises a limit, and has no host-service effect. Failure returns `None`, making the witness inert and leaving normal guarded retry. | No safe `std` equivalent exposes the descriptor limit. A safe process-resource wrapper could replace it; the read-only call is small and confined to one function. |
 | `src/lib.rs::available_disk_space` (Unix) | `std::mem::zeroed::<libc::statvfs>()` in `available_disk_space`. | Creates an output buffer for `statvfs`. The struct is integer fields on supported Unix targets, and the following syscall overwrites it on success. | Removable. `fs4` is already a direct dependency and exposes safe `fs4::available_space(path)`, which would remove both this initialization and the raw `statvfs` call below. |
 | `src/lib.rs::available_disk_space` (Unix) | `libc::statvfs(c_path.as_ptr(), &raw mut stat)` in `available_disk_space`. | Reads filesystem free-space data through a NUL-terminated path and a valid output pointer that outlives the call. | Removable with the same `fs4::available_space(path).ok()` rewrite as `src/lib.rs::available_disk_space` (Unix). |
 | `src/lib.rs::available_disk_space` (Windows) | `GetDiskFreeSpaceExW(...)` in `available_disk_space`. | Reads filesystem free-space data through a NUL-terminated UTF-16 path and a valid output pointer. The API permits null pointers for the unused totals. | Removable with the same `fs4::available_space(path).ok()` rewrite. |
@@ -113,17 +114,16 @@ only inside an exclusive disposable test child. It is compiled locally and
 passed through that child's `LD_PRELOAD`; production executables do not load it.
 `pthread_once` resolves matching libc forwarding signatures before concurrent
 calls. `fstat` and bounded `/proc/self/fd` reads restrict injected failures to
-regular `.part` files beneath the immutable child-owned root, or the existing
-`.kei-reconcile-*.kei-tmp` copy files for the reconciliation file-sync case.
-Directory cases restrict failures to child-owned paths; strict reconciliation
-matches the recorded target parent only after target bytes exist, and strict
-replacement matches the sidecar parent only after a synced journal commit marker.
+regular `.part` files beneath the immutable child-owned root. Directory cases
+restrict failures to child-owned paths. The current sidecar exchange parent case
+matches only the exact `media/A` parent after a newly installed sidecar; it does
+not require a `.kei-replace-*` journal or a commit marker. The success marker is
+written only after the real forwarded `fsync` succeeds.
 Successful prefix writes precede injected write errors. Atomically renamed audit
 markers contain only operation, errno and byte progress. A monotonic ten-second
 child-local rendezvous holds EIO writes until transport shutdown/cancellation;
-polling waits do not claim physical storage timing or durability. The existing
-Rust test-only terminal selector forces the journal fallback without constructing
-a sync error; the preload fixture supplies the actual syscall error.
+polling waits do not claim physical storage timing or durability. The preload
+fixture supplies the actual syscall error.
 
 The fixture never changes a running host service or fault setting. Its parent
 runs one child per case and checks the actual syscall marker plus filesystem

@@ -155,6 +155,26 @@ pub(crate) struct ConfinedPath {
 }
 
 impl ConfinedPath {
+    /// Conservative owned-heap accounting for a retained confined path.
+    #[cfg(all(unix, feature = "xmp"))]
+    pub(crate) fn retained_heap_bytes(&self) -> usize {
+        self.root
+            .capacity()
+            .saturating_add(self.path.capacity())
+            .saturating_add(
+                self.parent_components
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<std::ffi::OsString>()),
+            )
+            .saturating_add(
+                self.parent_components
+                    .iter()
+                    .map(std::ffi::OsString::capacity)
+                    .sum::<usize>(),
+            )
+            .saturating_add(self.name.as_bytes_with_nul().len())
+    }
+
     pub(crate) fn open(
         root: &Path,
         path: &Path,

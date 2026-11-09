@@ -21,6 +21,7 @@ mod retry;
 
 pub(crate) use limiter::BandwidthLimiter;
 pub(crate) use metadata_rewrite::CaptureTimestampRepair;
+pub(crate) use metadata_rewrite::MetadataWriterWitness;
 
 use filter::DownloadTask;
 
@@ -39,7 +40,9 @@ pub use orchestration::dispatch::download_photos_with_sync;
 pub(crate) use orchestration::generation::{
     has_current_observation, has_due as has_due_selection_work,
 };
-pub(crate) use orchestration::maintenance::drain_pending_metadata_rewrites;
+pub(crate) use orchestration::maintenance::{
+    RefreshTailOutcome, drain_pending_metadata_rewrites, drain_pending_metadata_rewrites_witnessed,
+};
 use orchestration::models::PENDING_RETRY_UNMATCHED_REASON;
 pub(super) use orchestration::models::PRODUCER_ENUMERATION_INCOMPLETE_REASON;
 pub(crate) use orchestration::models::{

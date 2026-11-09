@@ -23,6 +23,24 @@ pub(super) struct PendingRetryTarget {
     pub(super) version_size: VersionSizeKey,
 }
 
+/// Exact pending-retry evidence for completing one current prepared repair.
+///
+/// The pending-retry owner constructs this only after revalidating the durable
+/// truncation reason, recorded native path, current provider resource,
+/// destination rules, and the task's publication binding. Recovery rechecks
+/// every field before replacing the exact old target bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PreparedReplaceAuthorization {
+    pub(super) library: Arc<str>,
+    pub(super) asset_id: Arc<str>,
+    pub(super) version_size: VersionSizeKey,
+    pub(super) native_path: crate::state::db::provider_selection::SelectionPath,
+    pub(super) provider_checksum: String,
+    pub(super) provider_size: u64,
+    pub(super) expected: file::ExistingFileFingerprint,
+    pub(super) binding: crate::state::db::PublicationBinding,
+}
+
 impl PendingRetryTarget {
     pub(super) fn from_record(record: &crate::state::AssetRecord) -> Self {
         Self {
@@ -123,6 +141,77 @@ impl PendingRetryEvidence {
             .map(|file| file.path.as_path())
             .filter(|path| path.starts_with(directory))
     }
+}
+
+/// Bind one pending retry task to the exact prepared-publication replacement
+/// recovery may complete. This stays in the retry owner: the task must already
+/// carry the current provider resource, recorded native path, destination
+/// rules, and authenticated publication binding.
+async fn prepared_replace_authorization(
+    planner: &planner::TaskPlanner,
+    task: &DownloadTask,
+    asset: &PhotoAsset,
+    target: &PendingRetryTarget,
+    evidence: &PendingRetryEvidence,
+    pass_config: &DownloadConfig,
+) -> Result<Option<PreparedReplaceAuthorization>> {
+    if !pass_config.repair_truncated
+        || !evidence.matches_provider_version(task)
+        || task.require_created_entry
+        || task.library.as_ref() != target.library.as_ref()
+        || task.asset_id.as_ref() != target.asset_id.as_ref()
+        || task.version_size != target.version_size
+        || task.asset_id.as_ref() != asset.state_id()
+        || task.asset_record_name.as_ref() != asset.asset_record_name()
+        || task.library.as_ref() != asset.source_zone().unwrap_or(pass_config.library.as_ref())
+    {
+        return Ok(None);
+    }
+    let Some(binding) = task.publication_binding.as_deref() else {
+        return Ok(None);
+    };
+    if binding.library != task.library.as_ref()
+        || binding.child != task.asset_record_name.as_ref()
+        || binding.master != asset.id()
+        || binding.state_id != task.asset_id.as_ref()
+        || binding.account_key.trim().is_empty()
+        || binding.provider_key.trim().is_empty()
+        || pass_config.primary_layout_pass.as_deref() != Some(binding.origin_pass.as_str())
+    {
+        return Ok(None);
+    }
+    let Some(native_path) = evidence.local_path_under(&pass_config.directory) else {
+        return Ok(None);
+    };
+    if crate::fs_util::confined_path_key(native_path).is_err()
+        || !planner.retry_path_allowed(
+            &task.library,
+            &task.asset_id,
+            task.asset_record_name.as_ref(),
+            task.version_size,
+            &task.checksum,
+            task.size,
+            native_path,
+        )
+    {
+        return Ok(None);
+    }
+    let Some(expected) = evidence
+        .truncated_repair_fingerprint(pass_config.repair_truncated)
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PreparedReplaceAuthorization {
+        library: Arc::clone(&task.library),
+        asset_id: Arc::clone(&task.asset_id),
+        version_size: task.version_size,
+        native_path: crate::state::db::provider_selection::SelectionPath::from_path(native_path),
+        provider_checksum: task.checksum.to_string(),
+        provider_size: task.size,
+        expected,
+        binding: binding.clone(),
+    }))
 }
 
 #[derive(Debug)]
@@ -296,12 +385,31 @@ impl PendingRetryPlanning<'_> {
                     && plan.filter_reason.is_none()
                     && plan.malformed_resource.is_none()
                 {
+                    let replace = match plan
+                        .tasks
+                        .iter()
+                        .find(|task| PendingRetryTarget::from_task(task) == target)
+                    {
+                        Some(task) => {
+                            prepared_replace_authorization(
+                                self.task_planner,
+                                task,
+                                asset,
+                                &target,
+                                evidence,
+                                pass_config,
+                            )
+                            .await?
+                        }
+                        None => None,
+                    };
                     pipeline::recover_current_pending_publication(
                         self.db,
                         pass_config,
                         asset,
                         self.task_planner,
                         target.version_size,
+                        replace.as_ref(),
                         self.shutdown,
                     )
                     .await?

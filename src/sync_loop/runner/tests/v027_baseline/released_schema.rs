@@ -12,13 +12,28 @@ use crate::sync_loop::test_support::{
 use base64::Engine as _;
 use serde_json::json;
 use sha1::{Digest, Sha1};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 const MOTION: &[u8] = b"\0\0\0ftypqt  \0\0\0\0qt  ";
+
+#[derive(Clone, Copy, Debug)]
+pub(in crate::sync_loop::runner::tests) enum ReleasedSchemaCase {
+    /// A foreign ambiguous Primary family plus the selected Shared child.
+    /// The selected child must materialize its own native Shared destinations.
+    ForeignOwnerNegative,
+    /// The selected Shared child owns its separated still/motion history.
+    /// Exact local bytes must verify reuse without a provider GET.
+    CurrentIdentityReuse,
+    /// The own still history is correct but the last byte is corrupt beyond
+    /// the old 64 KiB prefix. Reuse must refuse without rewriting the candidate.
+    TailCorruption,
+}
 
 fn signature(bytes: &[u8]) -> String {
     let mut hash = Sha1::new();
@@ -29,20 +44,229 @@ fn signature(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(value)
 }
 
-pub(in crate::sync_loop::runner::tests) async fn exercise_released_schema(failure: Option<&str>) {
+fn sha256_hex(bytes: &[u8]) -> String {
+    data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(bytes))
+}
+
+fn rows(path: &Path, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let mut statement = conn.prepare(sql).unwrap();
+    let count = statement.column_count();
+    statement
+        .query_map([], |row| {
+            (0..count)
+                .map(|index| row.get(index))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+fn released_rows(
+    path: &Path,
+    columns: &[(String, Vec<String>)],
+) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+    columns
+        .iter()
+        .map(|(table, names)| {
+            let sql = format!(
+                "SELECT {} FROM {} ORDER BY 1,2,3",
+                names
+                    .iter()
+                    .map(|name| format!("\"{name}\""))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                table
+            );
+            rows(path, &sql)
+        })
+        .collect()
+}
+
+fn released_columns(path: &Path) -> Vec<(String, Vec<String>)> {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    [
+        "assets",
+        "asset_metadata_paths",
+        "asset_master_mappings",
+        "asset_metadata_capture_revisions",
+        "legacy_master_state_owners",
+    ]
+    .into_iter()
+    .map(|table| {
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+            ))
+            .unwrap();
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        (table.to_owned(), names)
+    })
+    .collect()
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "fixture columns stay explicit for the schema-25 reconstruction"
+)]
+fn insert_released_asset(
+    conn: &rusqlite::Connection,
+    library: &str,
+    id: &str,
+    version: &str,
+    filename: &str,
+    local_path: &Path,
+    record_bytes: &[u8],
+    provider_checksum: &str,
+    source_backed: bool,
+) {
+    let local = sha256_hex(record_bytes);
+    let source = source_backed.then_some(local.as_str());
+    conn.execute(
+        "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,added_at,size_bytes,media_type,status,downloaded_at,local_path,last_seen_at,local_checksum,download_checksum,source) \
+         VALUES (?1,?2,?3,?4,?5,1700000000,1700000002,?6,'photo','downloaded',1700000003,?7,1700000004,?8,?8,'icloud')",
+        rusqlite::params![
+            library,
+            id,
+            version,
+            provider_checksum,
+            filename,
+            record_bytes.len() as i64,
+            local_path.to_str().unwrap(),
+            local
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum,source_checksum) \
+         VALUES (?1,?2,?3,?4,?5,?6,?6,?7)",
+        rusqlite::params![
+            library,
+            id,
+            version,
+            local_path.to_str().unwrap(),
+            provider_checksum,
+            local,
+            source
+        ],
+    )
+    .unwrap();
+}
+
+fn identity_snapshot(database: &Path) -> Vec<Vec<rusqlite::types::Value>> {
+    [
+        "SELECT * FROM assets WHERE library='SharedSync-v027-synthetic' AND id='shared-old-master' ORDER BY version_size",
+        "SELECT * FROM asset_metadata_paths WHERE library='SharedSync-v027-synthetic' AND id='shared-old-master' ORDER BY version_size",
+        "SELECT * FROM legacy_master_state_owners WHERE library='SharedSync-v027-synthetic' AND master_record_name='shared-old-master' ORDER BY master_record_name",
+        "SELECT * FROM asset_metadata_capture_revisions WHERE library='SharedSync-v027-synthetic' AND asset_id='shared-old-master' ORDER BY asset_id",
+    ]
+    .into_iter()
+    .flat_map(|sql| rows(database, sql))
+    .collect()
+}
+
+fn receipt_rows(database: &Path, child: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    rows(
+        database,
+        &format!(
+            "SELECT account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash \
+             FROM download_receipts WHERE library='{ZONE}' AND child='{child}' ORDER BY version_size"
+        ),
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the complete scoped receipt is asserted field by field"
+)]
+fn assert_receipt(
+    row: &[rusqlite::types::Value],
+    account_key: &str,
+    provider_key: &str,
+    expected_scope: &str,
+    child: &str,
+    master: &str,
+    expected_pass: &str,
+    version: &str,
+    provider_checksum: &str,
+    bytes: &[u8],
+    native: &Path,
+) {
+    use rusqlite::types::Value as SqlValue;
+    let digest = sha256_hex(bytes);
+    let expected = vec![
+        SqlValue::Text(account_key.into()),
+        SqlValue::Text(provider_key.into()),
+        SqlValue::Text(expected_scope.into()),
+        SqlValue::Text(ZONE.into()),
+        SqlValue::Text(child.into()),
+        SqlValue::Text(master.into()),
+        SqlValue::Text(child.into()),
+        SqlValue::Text(expected_pass.into()),
+        SqlValue::Text(version.into()),
+        SqlValue::Text(provider_checksum.into()),
+        SqlValue::Integer(i64::try_from(bytes.len()).unwrap()),
+        SqlValue::Text(
+            crate::state::db::provider_selection::SelectionPath::from_path(native)
+                .key()
+                .unwrap(),
+        ),
+        SqlValue::Text(digest.clone()),
+        SqlValue::Text(digest),
+    ];
+    assert_eq!(
+        &row[..14],
+        expected.as_slice(),
+        "incorrect scoped current receipt"
+    );
+    assert!(
+        matches!(&row[14], SqlValue::Text(proof)
+            if proof.len() == 64
+                && proof.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))),
+        "current receipt proof hash must be 64 lowercase hex characters"
+    );
+}
+
+pub(in crate::sync_loop::runner::tests) async fn exercise_released_schema(
+    case: ReleasedSchemaCase,
+) {
     let database = "shared";
-    let server = crate::test_helpers::start_wiremock_or_skip("issue853 acceptance")
+    let foreign = matches!(case, ReleasedSchemaCase::ForeignOwnerNegative);
+    let tail = matches!(case, ReleasedSchemaCase::TailCorruption);
+
+    let mut provider_bytes = MEDIA.to_vec();
+    provider_bytes.resize(provider_bytes.len().max(65_537), 42);
+    assert_eq!(provider_bytes.len(), 65_537, "tail proof is above 64 KiB");
+    let checksum = signature(&provider_bytes);
+    let mut corrupt_still = provider_bytes.clone();
+    *corrupt_still.last_mut().unwrap() ^= 1;
+    let provider_filename = if foreign {
+        "existing.JPG"
+    } else {
+        "shared-only.JPG"
+    };
+
+    let server = crate::test_helpers::start_wiremock_or_skip("released schema acceptance")
         .await
         .expect("acceptance server must bind");
-    for (endpoint, expected) in [("/existing", 0), ("/missing", 1), ("/concurrent", 1)] {
+    for (endpoint, expected, body) in [
+        ("/existing", usize::from(foreign), provider_bytes.clone()),
+        ("/missing", 1, MEDIA.to_vec()),
+        ("/concurrent", 1, MEDIA.to_vec()),
+    ] {
         Mock::given(method("GET"))
             .and(path(endpoint))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_bytes(MEDIA)
+                    .set_body_bytes(body)
                     .insert_header("content-type", "image/jpeg"),
             )
-            .expect(expected)
+            .expect(expected as u64)
             .mount(&server)
             .await;
     }
@@ -53,48 +277,75 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_schema(failur
                 .set_body_bytes(MOTION)
                 .insert_header("content-type", "video/quicktime"),
         )
-        .expect(0)
+        .expect(u64::from(foreign))
         .mount(&server)
         .await;
+
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("photos");
     std::fs::create_dir_all(&root).unwrap();
+
     let old_path = root.join("existing.JPG");
-    let motion_path = root.join("existing.MOV");
+    let old_motion = root.join("existing.MOV");
     let sidecar_path = root.join("existing.JPG.xmp");
-    std::fs::write(&motion_path, MOTION).unwrap();
-    std::fs::write(&sidecar_path, b"historical sidecar evidence").unwrap();
-    let motion_mtime = std::fs::metadata(&motion_path).unwrap().modified().unwrap();
-    let sidecar_mtime = std::fs::metadata(&sidecar_path)
-        .unwrap()
-        .modified()
-        .unwrap();
-    // The tail control is deliberately beyond the old 64KiB prefix limit.
-    let mut provider_bytes = MEDIA.to_vec();
-    provider_bytes.resize(provider_bytes.len().max(65_537), 42);
-    let mut old_bytes = provider_bytes.clone();
-    if failure == Some("tail") {
-        *old_bytes.last_mut().unwrap() ^= 1;
-    }
-    if failure == Some("edited") {
-        old_bytes[32] ^= 1;
-    }
-    let mut checksum = signature(&provider_bytes);
-    if failure == Some("unsupported") {
-        let mut decoded = base64::engine::general_purpose::STANDARD
-            .decode(&checksum)
-            .unwrap();
-        decoded[0] = 4;
-        checksum = base64::engine::general_purpose::STANDARD.encode(decoded);
-    }
-    std::fs::write(&old_path, &old_bytes).unwrap();
+    let own_still = if foreign {
+        root.join("existing_YXNzZXQ.JPG")
+    } else {
+        root.join("shared-only.JPG")
+    };
+    let own_motion = if foreign {
+        root.join("existing_YXNzZXQ.MOV")
+    } else {
+        root.join("shared-only.MOV")
+    };
     let foreign_path = root.join("foreign-shared.JPG");
-    if failure == Some("foreign") {
+
+    let (
+        own_still_bytes,
+        own_still_mtime,
+        own_motion_mtime,
+        old_mtime,
+        old_motion_mtime,
+        sidecar_mtime,
+    ) = if foreign {
+        std::fs::write(&old_path, &provider_bytes).unwrap();
+        std::fs::write(&old_motion, MOTION).unwrap();
+        std::fs::write(&sidecar_path, b"historical sidecar evidence").unwrap();
+        (
+            provider_bytes.clone(),
+            None,
+            None,
+            Some(std::fs::metadata(&old_path).unwrap().modified().unwrap()),
+            Some(std::fs::metadata(&old_motion).unwrap().modified().unwrap()),
+            Some(
+                std::fs::metadata(&sidecar_path)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+            ),
+        )
+    } else {
+        let still = if tail {
+            corrupt_still.clone()
+        } else {
+            provider_bytes.clone()
+        };
+        std::fs::write(&own_still, &still).unwrap();
+        std::fs::write(&own_motion, MOTION).unwrap();
+        (
+            still,
+            Some(std::fs::metadata(&own_still).unwrap().modified().unwrap()),
+            Some(std::fs::metadata(&own_motion).unwrap().modified().unwrap()),
+            None,
+            None,
+            None,
+        )
+    };
+    if foreign {
         std::fs::write(&foreign_path, &provider_bytes).unwrap();
     }
-    let old_mtime = std::fs::metadata(&old_path).unwrap().modified().unwrap();
-    // Schema was emitted by v0.24.0; the inserted catalogue and files are
-    // synthetic reconstructions, not rows written by a released provider sync.
+
+    // Synthetic schema-25 reconstruction. No released producer run is claimed.
     let source = dir.path().join("released.db");
     let db_path = dir.path().join("state.db");
     {
@@ -108,98 +359,96 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_schema(failur
                 .unwrap(),
             25
         );
-        for (library, id, version, filename, path, content, provider) in [
-            (
+        if foreign {
+            insert_released_asset(
+                &conn,
                 "PrimarySync",
                 "old-primary-master",
                 "original",
                 "existing.JPG",
                 &old_path,
-                old_bytes.as_slice(),
-                checksum.clone(),
-            ),
-            (
+                &provider_bytes,
+                &checksum,
+                false,
+            );
+            insert_released_asset(
+                &conn,
                 "PrimarySync",
                 "old-primary-master",
                 "live_original",
                 "existing.MOV",
-                &motion_path,
+                &old_motion,
                 MOTION,
-                signature(MOTION),
-            ),
-        ] {
-            let local = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(content));
-            conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,added_at,size_bytes,media_type,status,downloaded_at,local_path,last_seen_at,local_checksum,download_checksum) VALUES (?1,?2,?3,?4,?5,1700000000,1700000002,?6,'photo','downloaded',1700000003,?7,1700000004,?8,?8)", rusqlite::params![library,id,version,provider,filename,content.len() as i64,path.to_str().unwrap(),local]).unwrap();
-            conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum) VALUES (?1,?2,?3,?4,?5,?6,?6)", rusqlite::params![library,id,version,path.to_str().unwrap(),provider,local]).unwrap();
+                &signature(MOTION),
+                false,
+            );
+            let local = sha256_hex(&provider_bytes);
+            conn.execute(
+                "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,local_path,last_seen_at,local_checksum,download_checksum) \
+                 VALUES (?1,'asset-other-shared','original',?2,'foreign-shared.JPG',1700000000,?3,'photo','downloaded',?4,1700000000,?5,?5)",
+                rusqlite::params![
+                    ZONE,
+                    checksum,
+                    provider_bytes.len() as i64,
+                    foreign_path.to_str().unwrap(),
+                    local
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum) \
+                 VALUES (?1,'asset-other-shared','original',?2,?3,?4,?4)",
+                rusqlite::params![
+                    ZONE,
+                    foreign_path.to_str().unwrap(),
+                    checksum,
+                    local
+                ],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO asset_master_mappings VALUES ('PrimarySync','historical-child-a','old-primary-master',1700000000),('PrimarySync','historical-child-b','old-primary-master',1700000000);
+                 INSERT INTO asset_metadata_capture_revisions VALUES ('PrimarySync','old-primary-master',0,1700000000);",
+            )
+            .unwrap();
+        } else {
+            insert_released_asset(
+                &conn,
+                ZONE,
+                "shared-old-master",
+                "original",
+                "shared-only.JPG",
+                &own_still,
+                &provider_bytes,
+                &checksum,
+                true,
+            );
+            insert_released_asset(
+                &conn,
+                ZONE,
+                "shared-old-master",
+                "live_original",
+                "shared-only.MOV",
+                &own_motion,
+                MOTION,
+                &signature(MOTION),
+                true,
+            );
+            conn.execute_batch(&format!(
+                "INSERT INTO legacy_master_state_owners VALUES ('{ZONE}','shared-old-master','asset-current-existing',1700000000);
+                 INSERT INTO asset_master_mappings VALUES ('{ZONE}','asset-current-existing','current-existing',1700000000);
+                 INSERT INTO asset_metadata_capture_revisions VALUES ('{ZONE}','shared-old-master',1,1700000000);"
+            ))
+            .unwrap();
         }
-        if failure == Some("foreign") {
-            let local = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(&provider_bytes));
-            conn.execute("INSERT INTO assets(library,id,version_size,checksum,filename,created_at,size_bytes,media_type,status,local_path,last_seen_at,local_checksum,download_checksum) VALUES (?1,'asset-other-shared','original',?2,'foreign-shared.JPG',1700000000,?3,'photo','downloaded',?4,1700000000,?5,?5)", rusqlite::params![ZONE,checksum,provider_bytes.len() as i64,foreign_path.to_str().unwrap(),local]).unwrap();
-            conn.execute("INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum,download_checksum) VALUES (?1,'asset-other-shared','original',?2,?3,?4,?4)", rusqlite::params![ZONE,foreign_path.to_str().unwrap(),checksum,local]).unwrap();
-        }
-        conn.execute_batch("INSERT INTO asset_master_mappings VALUES ('PrimarySync','historical-child-a','old-primary-master',1700000000),('PrimarySync','historical-child-b','old-primary-master',1700000000); INSERT INTO asset_metadata_capture_revisions VALUES ('PrimarySync','old-primary-master',0,1700000000);").unwrap();
         conn.execute(
             "INSERT INTO metadata VALUES (?1,?2)",
             rusqlite::params![format!("sync_token:{ZONE}"), OLD_TOKEN],
         )
         .unwrap();
     }
-    // Compare every released column, not only the post-migration snapshot.
-    // Additional current-schema columns do not weaken this preservation check.
-    fn released_rows(
-        path: &std::path::Path,
-        columns: &[(String, Vec<String>)],
-    ) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
-        let conn = rusqlite::Connection::open(path).unwrap();
-        columns
-            .iter()
-            .map(|(table, names)| {
-                let sql = format!(
-                    "SELECT {} FROM {} ORDER BY 1,2,3",
-                    names
-                        .iter()
-                        .map(|n| format!("\"{n}\""))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    table
-                );
-                let mut statement = conn.prepare(&sql).unwrap();
-                statement
-                    .query_map([], |row| {
-                        (0..names.len())
-                            .map(|i| row.get(i))
-                            .collect::<rusqlite::Result<Vec<_>>>()
-                    })
-                    .unwrap()
-                    .collect::<rusqlite::Result<Vec<_>>>()
-                    .unwrap()
-            })
-            .collect()
-    }
-    let columns: Vec<_> = {
-        let conn = rusqlite::Connection::open(&source).unwrap();
-        [
-            "assets",
-            "asset_metadata_paths",
-            "asset_master_mappings",
-            "asset_metadata_capture_revisions",
-        ]
-        .into_iter()
-        .map(|table| {
-            let mut statement = conn
-                .prepare(&format!(
-                    "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
-                ))
-                .unwrap();
-            let names = statement
-                .query_map([], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            (table.to_owned(), names)
-        })
-        .collect()
-    };
+
+    let columns = released_columns(&source);
     let legacy_rows = released_rows(&source, &columns);
     let legacy_bytes = std::fs::read(&source).unwrap();
     crate::state::db::account::adopt_legacy(
@@ -217,7 +466,8 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_schema(failur
         legacy_rows,
         "released columns must survive authenticated adoption"
     );
-    {
+
+    if foreign {
         let db = SqliteStateDb::open_owned(&db_path, &baseline_owner())
             .await
             .unwrap();
@@ -232,45 +482,92 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_schema(failur
                 .unwrap()
         );
     }
-    let original_rows = historical_rows(&db_path);
-    let foreign_snapshot = || {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let mut result = Vec::new();
-        for table in ["assets", "asset_metadata_paths"] {
-            let mut stmt = conn
-                .prepare(&format!(
-                    "SELECT * FROM {table} WHERE library=?1 AND id=?2 ORDER BY version_size"
-                ))
-                .unwrap();
-            let count = stmt.column_count();
-            result.extend(
-                stmt.query_map([ZONE, "asset-other-shared"], |row| {
-                    (0..count)
-                        .map(|i| row.get::<_, rusqlite::types::Value>(i))
-                        .collect::<rusqlite::Result<Vec<_>>>()
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap(),
-            );
+
+    if !foreign {
+        assert!(
+            receipt_rows(&db_path, "asset-current-existing").is_empty(),
+            "current selected child starts without a current receipt"
+        );
+        assert!(
+            rows(
+                &db_path,
+                &format!(
+                    "SELECT id,version_size,local_path FROM asset_metadata_paths WHERE library='{ZONE}' AND id='asset-current-existing'"
+                ),
+            )
+            .is_empty(),
+            "current selected child starts without a current path proof"
+        );
+        let identity_history = rows(
+            &db_path,
+            &format!(
+                "SELECT version_size,local_path,local_checksum,source_checksum FROM asset_metadata_paths WHERE library='{ZONE}' AND id='shared-old-master' ORDER BY version_size"
+            ),
+        );
+        assert_eq!(identity_history.len(), 2, "same-identity source history");
+        use rusqlite::types::Value as SqlValue;
+        let expected_history = std::collections::BTreeSet::from([
+            (
+                "live_original".to_owned(),
+                own_motion.to_str().unwrap().to_owned(),
+                sha256_hex(MOTION),
+                sha256_hex(MOTION),
+            ),
+            (
+                "original".to_owned(),
+                own_still.to_str().unwrap().to_owned(),
+                sha256_hex(&provider_bytes),
+                sha256_hex(&provider_bytes),
+            ),
+        ]);
+        let mut actual_history = std::collections::BTreeSet::new();
+        for row in &identity_history {
+            let (
+                SqlValue::Text(version),
+                SqlValue::Text(path),
+                SqlValue::Text(local),
+                SqlValue::Text(source),
+            ) = (&row[0], &row[1], &row[2], &row[3])
+            else {
+                panic!("historical identity row must carry text proof");
+            };
+            actual_history.insert((version.clone(), path.clone(), local.clone(), source.clone()));
         }
-        result
+        assert_eq!(
+            actual_history, expected_history,
+            "exact still/motion same-identity source history"
+        );
+    }
+
+    let original_rows = historical_rows(&db_path);
+    let identity_rows = identity_snapshot(&db_path);
+    let foreign_snapshot = || {
+        rows(
+            &db_path,
+            &format!(
+                "SELECT * FROM assets WHERE library='{ZONE}' AND id='asset-other-shared' ORDER BY version_size"
+            ),
+        )
+        .into_iter()
+        .chain(rows(
+            &db_path,
+            &format!(
+                "SELECT * FROM asset_metadata_paths WHERE library='{ZONE}' AND id='asset-other-shared' ORDER BY version_size"
+            ),
+        ))
+        .collect::<Vec<_>>()
     };
     let foreign_rows = foreign_snapshot();
-    let foreign_mtime = if failure == Some("foreign") {
-        assert!(!foreign_rows.is_empty());
-        Some(
-            std::fs::metadata(&foreign_path)
-                .unwrap()
-                .modified()
-                .unwrap(),
-        )
-    } else {
-        None
-    };
+    let foreign_mtime = foreign.then(|| {
+        std::fs::metadata(&foreign_path)
+            .unwrap()
+            .modified()
+            .unwrap()
+    });
+
     let mut existing = pair(
         "current-existing",
-        "existing.JPG",
+        provider_filename,
         &format!("{}/existing", server.uri()),
         1,
     );
@@ -294,9 +591,9 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_schema(failur
         &format!("{}/concurrent", server.uri()),
         3,
     );
+
     let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
     let token_key = sync_token_key(ZONE);
-    let mut durable_snapshot = None;
     let pass_scope = json!({"zone":zone(),"name":"",
         "list_type":"CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
         "obj_type":"CPLAssetByAssetDateWithoutHiddenOrDeleted",
@@ -314,6 +611,39 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_schema(failur
     .to_string();
     let account = baseline_owner();
     let (account_key, provider_key) = account.authenticated_keys().unwrap();
+
+    // Precompute the complete tree before any cycle runs.
+    let mut expected_tree = BTreeMap::from([
+        ("missing_YXNzZXQ.JPG".to_owned(), MEDIA.to_vec()),
+        ("concurrent_YXNzZXQ.JPG".to_owned(), MEDIA.to_vec()),
+        (
+            own_still
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            own_still_bytes.clone(),
+        ),
+        (
+            own_motion
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            MOTION.to_vec(),
+        ),
+    ]);
+    if foreign {
+        expected_tree.insert("existing.JPG".to_owned(), provider_bytes.clone());
+        expected_tree.insert("existing.MOV".to_owned(), MOTION.to_vec());
+        expected_tree.insert(
+            "existing.JPG.xmp".to_owned(),
+            b"historical sidecar evidence".to_vec(),
+        );
+        expected_tree.insert("foreign-shared.JPG".to_owned(), provider_bytes.clone());
+    }
+
+    let mut durable_snapshot = None;
     for cycle in 0..3 {
         let db = Arc::new(
             SqliteStateDb::open_owned(&db_path, &baseline_owner())
@@ -374,30 +704,63 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_schema(failur
         )
         .await
         .unwrap();
-        assert_eq!(std::fs::read(&old_path).unwrap(), old_bytes);
-        assert_eq!(
-            std::fs::metadata(&old_path).unwrap().modified().unwrap(),
-            old_mtime
-        );
+
+        if foreign {
+            assert_eq!(std::fs::read(&old_path).unwrap(), provider_bytes);
+            assert_eq!(
+                std::fs::metadata(&old_path).unwrap().modified().unwrap(),
+                old_mtime.unwrap()
+            );
+            assert_eq!(std::fs::read(&old_motion).unwrap(), MOTION);
+            assert_eq!(
+                std::fs::metadata(&old_motion).unwrap().modified().unwrap(),
+                old_motion_mtime.unwrap()
+            );
+            assert_eq!(
+                std::fs::read(&sidecar_path).unwrap(),
+                b"historical sidecar evidence"
+            );
+            assert_eq!(
+                std::fs::metadata(&sidecar_path)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                sidecar_mtime.unwrap()
+            );
+            assert_eq!(passed_foreign_rows(&db_path), foreign_rows);
+            assert_eq!(
+                std::fs::read(&foreign_path).unwrap(),
+                provider_bytes,
+                "foreign Shared owner bytes must stay intact"
+            );
+            assert_eq!(
+                std::fs::metadata(&foreign_path)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                foreign_mtime.unwrap()
+            );
+        }
+        assert_eq!(std::fs::read(&own_still).unwrap(), own_still_bytes);
+        if let Some(mtime) = own_still_mtime {
+            assert_eq!(
+                std::fs::metadata(&own_still).unwrap().modified().unwrap(),
+                mtime
+            );
+        }
+        assert_eq!(std::fs::read(&own_motion).unwrap(), MOTION);
+        if let Some(mtime) = own_motion_mtime {
+            assert_eq!(
+                std::fs::metadata(&own_motion).unwrap().modified().unwrap(),
+                mtime
+            );
+        }
         assert_eq!(historical_rows(&db_path), original_rows);
-        assert_eq!(std::fs::read(&motion_path).unwrap(), MOTION);
-        assert_eq!(
-            std::fs::metadata(&motion_path).unwrap().modified().unwrap(),
-            motion_mtime
-        );
-        assert_eq!(
-            std::fs::read(&sidecar_path).unwrap(),
-            b"historical sidecar evidence"
-        );
-        assert_eq!(
-            std::fs::metadata(&sidecar_path)
-                .unwrap()
-                .modified()
-                .unwrap(),
-            sidecar_mtime
-        );
-        // Every possible extra entry, including a directory or symlink, fails.
-        let mut actual_tree = std::collections::BTreeMap::new();
+        if !foreign {
+            assert_eq!(identity_snapshot(&db_path), identity_rows);
+        }
+
+        let mut actual_tree = BTreeMap::new();
         for entry in std::fs::read_dir(&root).unwrap() {
             let entry = entry.unwrap();
             assert!(
@@ -411,78 +774,394 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_schema(failur
                     .is_none()
             );
         }
-        let mut expected_tree = std::collections::BTreeMap::from([
-            ("existing.JPG".to_owned(), old_bytes.clone()),
-            ("existing.MOV".to_owned(), MOTION.to_vec()),
-            (
-                "existing.JPG.xmp".to_owned(),
-                b"historical sidecar evidence".to_vec(),
-            ),
-            ("missing_YXNzZXQ.JPG".to_owned(), MEDIA.to_vec()),
-            ("concurrent_YXNzZXQ.JPG".to_owned(), MEDIA.to_vec()),
-        ]);
-        if failure == Some("foreign") {
-            expected_tree.insert("foreign-shared.JPG".to_owned(), provider_bytes.clone());
-        }
         assert_eq!(
             actual_tree, expected_tree,
             "complete media tree changed or gained an entry"
         );
-        assert_eq!(
-            db.get_metadata(&format!("sync_token:{ZONE}"))
-                .await
-                .unwrap()
-                .as_deref(),
-            Some(OLD_TOKEN)
-        );
+
         let completed = db.get_downloaded_page(0, 100).await.unwrap();
-        let independent = completed
-            .iter()
-            .find(|r| {
-                r.library.as_ref() == ZONE
-                    && r.id.as_ref() == "asset-current-missing"
-                    && r.version_size.as_str() == "original"
-            })
-            .expect("independent eligible file must progress");
-        let independent_path = independent.local_path.as_ref().unwrap();
-        assert_eq!(std::fs::read(independent_path).unwrap(), MEDIA);
+        let current = completed.iter().find(|row| {
+            row.library.as_ref() == ZONE
+                && row.id.as_ref() == "asset-current-existing"
+                && row.version_size.as_str() == "original"
+        });
+        let motion = completed.iter().find(|row| {
+            row.library.as_ref() == ZONE
+                && row.id.as_ref() == "asset-current-existing"
+                && row.version_size.as_str() == "live_original"
+        });
+        if tail {
+            assert!(current.is_none(), "corrupt own still must not complete");
+            let motion = motion.expect("valid own motion must reuse");
+            assert_eq!(motion.local_path.as_ref(), Some(&own_motion));
+            assert_eq!(std::fs::read(&own_motion).unwrap(), MOTION);
+        } else {
+            let current = current.expect("selected child must complete");
+            assert_eq!(current.local_path.as_ref(), Some(&own_still));
+            assert_eq!(std::fs::read(&own_still).unwrap(), own_still_bytes);
+            let motion = motion.expect("selected motion child must complete");
+            assert_eq!(motion.local_path.as_ref(), Some(&own_motion));
+        }
+
         let connection = rusqlite::Connection::open(&db_path).unwrap();
-        let guessed: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM legacy_master_state_owners WHERE library=?1 AND master_record_name=?2",
-            ["PrimarySync", "old-primary-master"], |r| r.get(0)).unwrap();
+        let guessed: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM legacy_master_state_owners WHERE library='PrimarySync' AND master_record_name='old-primary-master'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(
             guessed, 0,
             "current coverage cannot invent historical sibling ownership"
         );
-        let current = completed.iter().find(|r| {
-            r.library.as_ref() == ZONE
-                && r.id.as_ref() == "asset-current-existing"
-                && r.version_size.as_str() == "original"
-        });
-        // Snapshot every compact receipt and admitted-destination column.
-        fn rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
-            let mut stmt = conn.prepare(sql).unwrap();
-            let count = stmt.column_count();
-            stmt.query_map([], |row| {
-                (0..count)
-                    .map(|i| row.get(i))
-                    .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap()
+        drop(connection);
+
+        if foreign {
+            let receipts = receipt_rows(&db_path, "asset-current-existing");
+            assert_eq!(receipts.len(), 2, "selected still and motion receipts");
+            assert_receipt(
+                &receipts[0],
+                account_key,
+                provider_key,
+                &expected_scope,
+                "asset-current-existing",
+                "current-existing",
+                &expected_pass,
+                "live_original",
+                &signature(MOTION),
+                MOTION,
+                &own_motion,
+            );
+            assert_receipt(
+                &receipts[1],
+                account_key,
+                provider_key,
+                &expected_scope,
+                "asset-current-existing",
+                "current-existing",
+                &expected_pass,
+                "original",
+                &checksum,
+                &provider_bytes,
+                &own_still,
+            );
+            assert_eq!(result.failed_count, 0, "{result:?}");
+            assert!(result.db_sync_token_advance_safe, "{result:?}");
+            assert_eq!(result.stats.downloaded, if cycle == 0 { 4 } else { 0 });
+            assert_eq!(
+                db.get_metadata(&token_key).await.unwrap().as_deref(),
+                Some(format!("v27-after-cycle-{}", cycle + 1).as_str())
+            );
+        } else {
+            let receipts = receipt_rows(&db_path, "asset-current-existing");
+            if tail {
+                assert_eq!(
+                    receipts.len(),
+                    0,
+                    "no current receipt may bless the corrupt still or the reused motion"
+                );
+                let still_obligation = rows(
+                    &db_path,
+                    &format!(
+                        "SELECT status,local_path,local_checksum,checksum,size_bytes,download_checksum FROM assets WHERE library='{ZONE}' AND id='asset-current-existing' AND version_size='original'"
+                    ),
+                );
+                assert_eq!(still_obligation.len(), 1, "current still debt row");
+                use rusqlite::types::Value as SqlValue;
+                assert!(
+                    matches!(
+                        &still_obligation[0][0],
+                        SqlValue::Text(status) if status == "pending" || status == "failed"
+                    ),
+                    "current still must stay pending or failed"
+                );
+                assert_eq!(still_obligation[0][1], SqlValue::Null);
+                assert_eq!(still_obligation[0][2], SqlValue::Null);
+                assert_eq!(
+                    still_obligation[0][3],
+                    SqlValue::Text(checksum.clone()),
+                    "current still row keeps the fixture provider checksum"
+                );
+                assert_eq!(
+                    still_obligation[0][4],
+                    SqlValue::Integer(65_537),
+                    "current still row keeps the fixture provider size"
+                );
+                assert_eq!(
+                    still_obligation[0][5],
+                    SqlValue::Null,
+                    "current still row has no download checksum"
+                );
+                assert!(
+                    rows(
+                        &db_path,
+                        &format!(
+                            "SELECT id FROM asset_metadata_paths WHERE library='{ZONE}' AND id='asset-current-existing' AND version_size='original'"
+                        ),
+                    )
+                    .is_empty(),
+                    "no current still path proof may exist"
+                );
+                let historical_still = rows(
+                    &db_path,
+                    &format!(
+                        "SELECT status,local_path,local_checksum FROM assets WHERE library='{ZONE}' AND id='shared-old-master' AND version_size='original'"
+                    ),
+                );
+                assert_eq!(historical_still.len(), 1, "before-corruption proof row");
+                assert_eq!(historical_still[0][0], SqlValue::Text("downloaded".into()));
+                assert_eq!(
+                    historical_still[0][1],
+                    SqlValue::Text(own_still.to_str().unwrap().into())
+                );
+                assert_eq!(
+                    historical_still[0][2],
+                    SqlValue::Text(sha256_hex(&provider_bytes))
+                );
+                let historical_still_path = rows(
+                    &db_path,
+                    &format!(
+                        "SELECT local_checksum,source_checksum FROM asset_metadata_paths WHERE library='{ZONE}' AND id='shared-old-master' AND version_size='original'"
+                    ),
+                );
+                assert_eq!(historical_still_path.len(), 1);
+                assert_eq!(
+                    historical_still_path[0][0],
+                    SqlValue::Text(sha256_hex(&provider_bytes))
+                );
+                assert_eq!(
+                    historical_still_path[0][1],
+                    SqlValue::Text(sha256_hex(&provider_bytes))
+                );
+                let active_destinations = rows(
+                    &db_path,
+                    &format!(
+                        "SELECT d.generation,d.pass_key,g.scope,g.sealed,g.checkpoint_ready,d.version_size,d.path,d.checksum,d.size_bytes,d.admitted,d.verified_media,d.source_checksum,d.local_checksum \
+                         FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation \
+                         WHERE d.library='{ZONE}' AND d.child='asset-current-existing' ORDER BY d.generation,d.version_size"
+                    ),
+                );
+                assert_eq!(
+                    active_destinations.len(),
+                    4,
+                    "two retained roots times still and motion"
+                );
+                let mut generations = std::collections::BTreeSet::new();
+                let literal_candidate = root.join("shared-only_YXNzZXQ.JPG");
+                for row in &active_destinations {
+                    let SqlValue::Text(generation) = &row[0] else {
+                        panic!("generation must be text");
+                    };
+                    generations.insert(generation.clone());
+                    assert_eq!(row[1], SqlValue::Text(expected_pass.clone()));
+                    assert_eq!(row[2], SqlValue::Text(expected_scope.clone()));
+                    assert_eq!(row[3], SqlValue::Integer(1));
+                    assert_eq!(row[4], SqlValue::Integer(1));
+                    let SqlValue::Text(version) = &row[5] else {
+                        panic!("version must be text");
+                    };
+                    if version == "original" {
+                        assert_eq!(
+                            row[6],
+                            SqlValue::Text(
+                                crate::state::db::provider_selection::SelectionPath::from_path(
+                                    &literal_candidate
+                                )
+                                .key()
+                                .unwrap()
+                            ),
+                            "literal pending candidate path"
+                        );
+                        assert_eq!(row[7], SqlValue::Text(checksum.clone()));
+                        assert_eq!(row[8], SqlValue::Integer(65_537));
+                        assert_eq!(row[9], SqlValue::Integer(1));
+                        assert_eq!(row[10], SqlValue::Integer(0));
+                        assert_eq!(row[11], SqlValue::Null);
+                        assert_eq!(row[12], SqlValue::Null);
+                    } else {
+                        assert_eq!(version, "live_original");
+                        assert_eq!(
+                            row[6],
+                            SqlValue::Text(
+                                crate::state::db::provider_selection::SelectionPath::from_path(
+                                    &own_motion
+                                )
+                                .key()
+                                .unwrap()
+                            )
+                        );
+                        assert_eq!(row[7], SqlValue::Text(signature(MOTION)));
+                        assert_eq!(row[8], SqlValue::Integer(20));
+                        assert_eq!(row[9], SqlValue::Integer(1));
+                        assert_eq!(row[10], SqlValue::Integer(1));
+                        assert_eq!(row[11], SqlValue::Text(sha256_hex(MOTION)));
+                        assert_eq!(row[12], SqlValue::Text(sha256_hex(MOTION)));
+                    }
+                }
+                assert_eq!(generations.len(), 2, "two explicit retained roots");
+                let motion = motion.expect("valid own motion must reuse");
+                assert_eq!(motion.local_path.as_ref(), Some(&own_motion));
+                assert_eq!(std::fs::read(&own_motion).unwrap(), MOTION);
+                let motion_path = rows(
+                    &db_path,
+                    &format!(
+                        "SELECT local_checksum,source_checksum FROM asset_metadata_paths WHERE library='{ZONE}' AND id='asset-current-existing' AND version_size='live_original'"
+                    ),
+                );
+                assert_eq!(motion_path.len(), 1, "current motion path proof");
+                assert_eq!(motion_path[0][0], SqlValue::Text(sha256_hex(MOTION)));
+                assert_eq!(motion_path[0][1], SqlValue::Text(sha256_hex(MOTION)));
+                assert_eq!(result.stats.downloaded, if cycle == 0 { 2 } else { 0 });
+            } else {
+                assert_eq!(
+                    receipts.len(),
+                    2,
+                    "exactly the current still and motion receipts"
+                );
+                let mut actual = std::collections::BTreeSet::new();
+                for receipt in &receipts {
+                    use rusqlite::types::Value as SqlValue;
+                    let SqlValue::Text(version) = &receipt[8] else {
+                        panic!("receipt version must be text");
+                    };
+                    let SqlValue::Text(path) = &receipt[11] else {
+                        panic!("receipt native path must be text");
+                    };
+                    actual.insert((version.clone(), path.clone()));
+                }
+                let native = |path: &Path| {
+                    crate::state::db::provider_selection::SelectionPath::from_path(path)
+                        .key()
+                        .unwrap()
+                };
+                assert_eq!(
+                    actual,
+                    std::collections::BTreeSet::from([
+                        ("live_original".to_owned(), native(&own_motion)),
+                        ("original".to_owned(), native(&own_still)),
+                    ]),
+                    "current receipt identities are still and motion"
+                );
+                for receipt in &receipts {
+                    let path: String = match &receipt[11] {
+                        rusqlite::types::Value::Text(path) => path.clone(),
+                        other => panic!("receipt native path must be text: {other:?}"),
+                    };
+                    let expected = if path == native(&own_motion) {
+                        ("live_original", &signature(MOTION), MOTION, &own_motion)
+                    } else {
+                        assert_eq!(path, native(&own_still));
+                        (
+                            "original",
+                            &checksum,
+                            own_still_bytes.as_slice(),
+                            &own_still,
+                        )
+                    };
+                    assert_receipt(
+                        receipt,
+                        account_key,
+                        provider_key,
+                        &expected_scope,
+                        "asset-current-existing",
+                        "current-existing",
+                        &expected_pass,
+                        expected.0,
+                        expected.1,
+                        expected.2,
+                        expected.3,
+                    );
+                }
+                let active_destinations = rows(
+                    &db_path,
+                    &format!(
+                        "SELECT d.generation,d.pass_key,g.scope,g.sealed,g.checkpoint_ready,d.version_size,d.path,d.checksum,d.size_bytes,d.admitted,d.verified_media,d.source_checksum,d.local_checksum \
+                         FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation \
+                         WHERE d.library='{ZONE}' AND d.child='asset-current-existing' ORDER BY d.generation,d.version_size"
+                    ),
+                );
+                assert_eq!(
+                    active_destinations.len(),
+                    2,
+                    "one active root times still and motion"
+                );
+                let mut generations = std::collections::BTreeSet::new();
+                use rusqlite::types::Value as SqlValue;
+                for row in &active_destinations {
+                    let SqlValue::Text(generation) = &row[0] else {
+                        panic!("generation must be text");
+                    };
+                    generations.insert(generation.clone());
+                    assert_eq!(row[1], SqlValue::Text(expected_pass.clone()));
+                    assert_eq!(row[2], SqlValue::Text(expected_scope.clone()));
+                    assert_eq!(row[3], SqlValue::Integer(1));
+                    assert_eq!(row[4], SqlValue::Integer(1));
+                    let SqlValue::Text(version) = &row[5] else {
+                        panic!("version must be text");
+                    };
+                    let (path, checksum, size, source) = if version == "original" {
+                        (
+                            own_still.as_path(),
+                            checksum.clone(),
+                            65_537,
+                            sha256_hex(&provider_bytes),
+                        )
+                    } else {
+                        assert_eq!(version, "live_original");
+                        (
+                            own_motion.as_path(),
+                            signature(MOTION),
+                            i64::try_from(MOTION.len()).unwrap(),
+                            sha256_hex(MOTION),
+                        )
+                    };
+                    assert_eq!(
+                        row[6],
+                        SqlValue::Text(
+                            crate::state::db::provider_selection::SelectionPath::from_path(path)
+                                .key()
+                                .unwrap()
+                        )
+                    );
+                    assert_eq!(row[7], SqlValue::Text(checksum));
+                    assert_eq!(row[8], SqlValue::Integer(size));
+                    assert_eq!(row[9], SqlValue::Integer(1));
+                    assert_eq!(row[10], SqlValue::Integer(1));
+                    assert_eq!(row[11], SqlValue::Text(source.clone()));
+                    assert_eq!(row[12], SqlValue::Text(source));
+                }
+                assert_eq!(generations.len(), 1, "one explicit active root");
+                assert_eq!(
+                    result.stats.downloaded,
+                    if cycle == 0 { 2 } else { 0 },
+                    "verified reuse completes the two owned renditions once"
+                );
+            }
+            assert_eq!(
+                result.failed_count,
+                if tail {
+                    if cycle == 0 { 6 } else { 2 }
+                } else {
+                    0
+                },
+                "{result:?}"
+            );
+            assert!(result.db_sync_token_advance_safe, "{result:?}");
+            assert_eq!(
+                db.get_metadata(&token_key).await.unwrap().as_deref(),
+                Some(format!("v27-after-cycle-{}", cycle + 1).as_str())
+            );
         }
-        let receipts = rows(&connection, "SELECT * FROM download_receipts ORDER BY id");
-        let destinations = rows(
-            &connection,
-            "SELECT * FROM provider_active_destinations ORDER BY generation,pass_key,child,version_size,path",
-        );
-        assert_eq!(receipts.len(), if failure == Some("tail") { 2 } else { 4 });
-        assert_eq!(
-            destinations.len(),
-            if failure == Some("tail") { 6 } else { 4 }
-        );
+
         if let Some((old_receipts, old_destinations)) = &durable_snapshot {
+            let connection = rusqlite::Connection::open(&db_path).unwrap();
+            let receipts = rows(&db_path, "SELECT * FROM download_receipts ORDER BY id");
+            let destinations = rows(
+                &db_path,
+                "SELECT * FROM provider_active_destinations ORDER BY generation,pass_key,child,version_size,path",
+            );
+            drop(connection);
             assert_eq!(
                 &receipts, old_receipts,
                 "compact receipts changed on reopen"
@@ -492,191 +1171,19 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_schema(failur
                 "admitted destinations changed on reopen"
             );
         } else {
-            durable_snapshot = Some((receipts.clone(), destinations.clone()));
+            let receipts = rows(&db_path, "SELECT * FROM download_receipts ORDER BY id");
+            let destinations = rows(
+                &db_path,
+                "SELECT * FROM provider_active_destinations ORDER BY generation,pass_key,child,version_size,path",
+            );
+            durable_snapshot = Some((receipts, destinations));
         }
-        use rusqlite::types::Value as SqlValue;
-        let mut stmt = connection.prepare(
-            "SELECT account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,proof_hash FROM download_receipts WHERE library=?1 AND child=?2 ORDER BY version_size"
-        ).unwrap();
-        let selected_receipts = stmt
-            .query_map([ZONE, "asset-current-existing"], |row| {
-                (0..15)
-                    .map(|i| row.get::<_, SqlValue>(i))
-                    .collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        if failure == Some("tail") {
-            assert!(
-                selected_receipts.is_empty(),
-                "ambiguous pair must not obtain compact completion"
-            );
-        } else {
-            assert_eq!(selected_receipts.len(), 2);
-            for (row, (version, path, content, provider)) in selected_receipts.iter().zip([
-                ("live_original", &motion_path, MOTION, signature(MOTION)),
-                (
-                    "original",
-                    &old_path,
-                    provider_bytes.as_slice(),
-                    checksum.clone(),
-                ),
-            ]) {
-                let digest = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(content));
-                let native = crate::state::db::provider_selection::SelectionPath::from_path(path)
-                    .key()
-                    .unwrap();
-                let expected = vec![
-                    SqlValue::Text(account_key.into()),
-                    SqlValue::Text(provider_key.into()),
-                    SqlValue::Text(expected_scope.clone()),
-                    SqlValue::Text(ZONE.into()),
-                    SqlValue::Text("asset-current-existing".into()),
-                    SqlValue::Text("current-existing".into()),
-                    SqlValue::Text("asset-current-existing".into()),
-                    SqlValue::Text(expected_pass.clone()),
-                    SqlValue::Text(version.into()),
-                    SqlValue::Text(provider),
-                    SqlValue::Integer(i64::try_from(content.len()).unwrap()),
-                    SqlValue::Text(native),
-                    SqlValue::Text(digest.clone()),
-                    SqlValue::Text(digest),
-                ];
-                assert_eq!(
-                    &row[..14],
-                    expected.as_slice(),
-                    "incorrect scoped current receipt"
-                );
-                assert!(matches!(&row[14], SqlValue::Text(proof) if proof.len() == 64));
-            }
-        }
-        let mut stmt = connection.prepare(
-            "SELECT DISTINCT version_size,path,checksum,admitted,verified_media,source_checksum,local_checksum FROM provider_active_destinations WHERE library=?1 AND child=?2 ORDER BY version_size"
-        ).unwrap();
-        let selected_destinations = stmt
-            .query_map([ZONE, "asset-current-existing"], |row| {
-                (0..7)
-                    .map(|i| row.get::<_, SqlValue>(i))
-                    .collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        let native = |path: &std::path::Path| {
-            crate::state::db::provider_selection::SelectionPath::from_path(path)
-                .key()
-                .unwrap()
-        };
-        let motion_hash = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(MOTION));
-        let still_hash = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(&provider_bytes));
-        let pending = failure == Some("tail");
-        let pending_path = root.join("existing_YXNzZXQ.JPG");
-        let expected_destinations = vec![
-            vec![
-                SqlValue::Text("live_original".into()),
-                SqlValue::Text(native(&motion_path)),
-                SqlValue::Text(signature(MOTION)),
-                SqlValue::Integer(1),
-                SqlValue::Integer(1),
-                SqlValue::Text(motion_hash.clone()),
-                SqlValue::Text(motion_hash),
-            ],
-            vec![
-                SqlValue::Text("original".into()),
-                SqlValue::Text(native(if pending { &pending_path } else { &old_path })),
-                SqlValue::Text(checksum.clone()),
-                SqlValue::Integer(1),
-                SqlValue::Integer(i64::from(!pending)),
-                if pending {
-                    SqlValue::Null
-                } else {
-                    SqlValue::Text(still_hash.clone())
-                },
-                if pending {
-                    SqlValue::Null
-                } else {
-                    SqlValue::Text(still_hash)
-                },
-            ],
-        ];
-        assert_eq!(
-            selected_destinations, expected_destinations,
-            "unexpected selected destination or verification"
-        );
-        if failure == Some("foreign") {
-            assert_eq!(std::fs::read(&foreign_path).unwrap(), provider_bytes);
-            assert_eq!(
-                std::fs::metadata(&foreign_path)
-                    .unwrap()
-                    .modified()
-                    .unwrap(),
-                foreign_mtime.unwrap()
-            );
-            assert_eq!(
-                foreign_snapshot(),
-                foreign_rows,
-                "separate Shared owner evidence must remain intact"
-            );
-            let other = completed
-                .iter()
-                .find(|r| {
-                    r.library.as_ref() == ZONE
-                        && r.id.as_ref() == "asset-other-shared"
-                        && r.version_size.as_str() == "original"
-                })
-                .expect("other Shared owner must remain recorded");
-            assert_eq!(other.local_path.as_ref(), Some(&foreign_path));
-            assert_eq!(
-                current
-                    .expect("selected Shared child must complete")
-                    .local_path
-                    .as_ref(),
-                Some(&old_path),
-                "the selected child must use the independently proven Primary path"
-            );
-        } else if failure.is_some() {
-            assert!(
-                current.is_none(),
-                "negative provider proof must not complete"
-            );
-            let connection = rusqlite::Connection::open(&db_path).unwrap();
-            let pending: i64 = connection.query_row(
-                "SELECT count(*) FROM assets WHERE library=?1 AND id='asset-current-existing' AND version_size='original' AND status IN ('pending','failed')",
-                [ZONE], |r| r.get(0)).unwrap();
-            assert_eq!(
-                pending, 1,
-                "uncertainty must retain independently visible work"
-            );
-        } else {
-            assert_eq!(current.unwrap().local_path.as_ref(), Some(&old_path));
-            let motion = completed
-                .iter()
-                .find(|r| {
-                    r.library.as_ref() == ZONE
-                        && r.id.as_ref() == "asset-current-existing"
-                        && r.version_size.as_str() == "live_original"
-                })
-                .unwrap();
-            assert_eq!(motion.local_path.as_ref(), Some(&motion_path));
-            assert_eq!(result.failed_count, 0, "{result:?}");
-            assert!(result.db_sync_token_advance_safe, "{result:?}");
-            assert_eq!(result.stats.downloaded, if cycle == 0 { 2 } else { 0 });
-            assert_eq!(
-                db.get_metadata(&token_key).await.unwrap().as_deref(),
-                Some(format!("v27-after-cycle-{}", cycle + 1).as_str())
-            );
-            if cycle > 0 {
-                assert_eq!(session.inventory_queries.load(Ordering::SeqCst), 0);
-            } else {
-                assert_eq!(session.inventory_starts.load(Ordering::SeqCst), 2);
-            }
-        }
+
         let requests = server.received_requests().await.unwrap();
         let count = |path: &str| {
             requests
                 .iter()
-                .filter(|r| r.method.as_str() == "GET" && r.url.path() == path)
+                .filter(|request| request.method.as_str() == "GET" && request.url.path() == path)
                 .count()
         };
         assert_eq!(
@@ -686,14 +1193,32 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_schema(failur
                 count("/missing"),
                 count("/concurrent")
             ),
-            (0, 0, 1, 1)
+            (usize::from(foreign), usize::from(foreign), 1, 1)
         );
         eprintln!(
-            "RELEASED_SCHEMA_REACHED scenario={failure:?} cycle={cycle} selected_receipts={} active_destinations={} media_files={} existing_gets=0 companion_gets=0 independent_gets=2",
-            selected_receipts.len(),
-            destinations.len(),
-            actual_tree.len()
+            "RELEASED_SCHEMA_REACHED case={case:?} cycle={cycle} selected_receipts={} media_files={} existing_gets={} companion_gets={}",
+            receipt_rows(&db_path, "asset-current-existing").len(),
+            actual_tree.len(),
+            usize::from(foreign),
+            usize::from(foreign)
         );
     }
     server.verify().await;
+}
+
+fn passed_foreign_rows(database: &Path) -> Vec<Vec<rusqlite::types::Value>> {
+    rows(
+        database,
+        &format!(
+            "SELECT * FROM assets WHERE library='{ZONE}' AND id='asset-other-shared' ORDER BY version_size"
+        ),
+    )
+    .into_iter()
+    .chain(rows(
+        database,
+        &format!(
+            "SELECT * FROM asset_metadata_paths WHERE library='{ZONE}' AND id='asset-other-shared' ORDER BY version_size"
+        ),
+    ))
+    .collect()
 }

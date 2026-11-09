@@ -523,11 +523,12 @@ async fn run_collecting_metadata_rewrite_batch(
     if !metadata.has_any_write() {
         return 0;
     }
-    metadata_rewrite::run_pending(
+    metadata_rewrite::run_pending_witnessed(
         db.as_ref(),
         metadata,
         Arc::clone(&config.temp_suffix),
         shutdown_token,
+        config.metadata_write_witness.clone(),
     )
     .await
     .failed

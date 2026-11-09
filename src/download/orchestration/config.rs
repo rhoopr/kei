@@ -539,6 +539,10 @@ pub(crate) struct DownloadConfig {
     pub(crate) prior_sparse_bridge_proofs: Arc<[crate::state::SparseIdentityProof]>,
     pub(crate) prior_inventory_proof:
         Option<Box<crate::state::db::provider_generations::observation::ObservationProof>>,
+    /// Transient per-operation sidecar witness. Never hashed, serialized or
+    /// persisted; dropped with the operation.
+    pub(crate) metadata_write_witness:
+        Option<Arc<crate::download::metadata_rewrite::MetadataWriterWitness>>,
     pub(crate) selection_run: Option<Arc<super::generation::SelectionRun>>,
     pub(crate) selection_pass: Option<String>,
     /// Behind `Arc` so per-pass clones (`with_album_name`, `with_pass`,
@@ -841,6 +845,7 @@ impl DownloadConfig {
             selection_context: None,
             prior_sparse_bridge_proofs: Arc::from([]),
             prior_inventory_proof: None,
+            metadata_write_witness: None,
             selection_run: None,
             selection_pass: None,
             retry_only: false,

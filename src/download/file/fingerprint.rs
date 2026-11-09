@@ -65,7 +65,7 @@ pub(in crate::download) struct RetainedPendingFile {
 }
 
 impl RetainedPendingFile {
-    pub(super) fn identity(&self) -> std::io::Result<crate::fs_util::FileIdentity> {
+    pub(in crate::download) fn identity(&self) -> std::io::Result<crate::fs_util::FileIdentity> {
         crate::fs_util::file_identity(&self.file)
     }
 

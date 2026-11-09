@@ -1917,11 +1917,12 @@ pub(super) async fn download_photos_full_with_token_policy(
         && metadata_flags.has_any_write()
         && let Some(db) = &config.state_db
     {
-        streaming_result.exif_failures += metadata_rewrite::run_pending(
+        streaming_result.exif_failures += metadata_rewrite::run_pending_witnessed(
             db.as_ref(),
             metadata_flags,
             Arc::clone(&config.temp_suffix),
             &shutdown_token,
+            config.metadata_write_witness.clone(),
         )
         .await
         .failed;

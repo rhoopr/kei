@@ -44,8 +44,6 @@ fn private_actual_late_io_faults_preserve_owned_work_and_recover_after_reopen() 
         "flush_cancel",
         "file_sync",
         "directory_sync",
-        "reconcile_sync",
-        "reconcile_parent",
         #[cfg(feature = "xmp")]
         "sidecar_sync",
         #[cfg(feature = "xmp")]
@@ -54,11 +52,6 @@ fn private_actual_late_io_faults_preserve_owned_work_and_recover_after_reopen() 
         let root = directory.path().join(case);
         std::fs::create_dir(&root).unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-        let test_name = if case.starts_with("reconcile_") {
-            "sync_loop::runner::tests::configuration::late_io::actual_reconciliation_fault_child"
-        } else {
-            TEST_NAME
-        };
         if case == "sidecar_parent" {
             // Reuse the existing test-only fallback selector. This mode adds no
             // Rust error: the preload fixture fails the real parent fsync.
@@ -66,7 +59,7 @@ fn private_actual_late_io_faults_preserve_owned_work_and_recover_after_reopen() 
             child.env("KEI_TEST_TERMINAL_MODE", "late-io");
         }
         let output = child
-            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
             .env("LD_PRELOAD", &shim)
             .env("KEI_TEST_LATE_IO_ROOT", &root)
             .env("KEI_TEST_LATE_IO_CASE", case)
@@ -78,6 +71,12 @@ fn private_actual_late_io_faults_preserve_owned_work_and_recover_after_reopen() 
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        for line in String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter(|line| line.contains("KEI_LATE_IO_PHASE"))
+        {
+            eprintln!("{line}");
+        }
         let reached = std::fs::read_to_string(root.join("fault-reached")).unwrap();
         assert!(reached.contains("progress="), "{case}: {reached}");
         assert!(
@@ -247,6 +246,17 @@ async fn run_case(root: &Path, case: &str) {
         .unwrap();
     }
     let old_sidecar = std::fs::read(media_root.join("A/changed.JPG.xmp")).ok();
+    #[cfg(all(feature = "xmp", target_os = "linux"))]
+    if case == "sidecar_parent" {
+        use std::os::unix::fs::MetadataExt;
+        let sidecar = media_root.join("A/changed.JPG.xmp");
+        let identity = std::fs::symlink_metadata(&sidecar).unwrap();
+        std::fs::write(
+            root.join("sidecar-original-identity"),
+            format!("{} {}", identity.dev(), identity.ino()),
+        )
+        .unwrap();
+    }
     std::fs::write(root.join("fault-enabled"), b"enabled").unwrap();
     let first = crate::download::download_photos_with_sync(
         &reqwest::Client::new(),
@@ -292,6 +302,15 @@ async fn run_case(root: &Path, case: &str) {
             "{case}: {reached}"
         );
         assert!(!reached.contains("progress=0\n"), "{case}: {reached}");
+        eprintln!(
+            "KEI_LATE_IO_PHASE case={case} phase=first fault={:?} downloaded={} failed={} exif_failures={} token={:?} blocked={}",
+            reached.trim(),
+            first.stats.downloaded,
+            first.stats.failed,
+            first.stats.exif_failures,
+            first.sync_token,
+            first.checkpoint.sync_token_blocked
+        );
     }
     let enumeration_pending = fixture
         .db
@@ -311,24 +330,81 @@ async fn run_case(root: &Path, case: &str) {
             "{case}: unexpected interrupted enumeration"
         );
     }
-    assert_eq!(
-        fixture
-            .db
-            .get_metadata("active_selection_metadata_retry_offset")
-            .await
-            .unwrap(),
-        matches!(case, "sidecar_sync" | "sidecar_parent").then(|| "1".to_owned()),
-        "{case}: metadata retry work must survive reopening"
-    );
+    if !matches!(case, "sidecar_sync" | "sidecar_parent") {
+        assert_eq!(
+            fixture
+                .db
+                .get_metadata("active_selection_metadata_retry_offset")
+                .await
+                .unwrap(),
+            None,
+            "{case}: unexpected selected metadata retry offset"
+        );
+    }
     let selected = media_root.join("A/changed.JPG");
     if case == "directory_sync" {
         assert_eq!(first.stats.downloaded, 1, "{case}: {first:?}");
         assert_eq!(std::fs::read(&selected).unwrap(), media);
     } else if matches!(case, "sidecar_sync" | "sidecar_parent") {
         assert_eq!(first.stats.downloaded, 1, "{first:?}");
-        assert!(
-            first.checkpoint.sync_token_blocked,
-            "metadata debt cannot be forgotten: {first:?}"
+        assert!(first.stats.exif_failures >= 1, "{case}: {first:?}");
+        assert_eq!(
+            first.sync_token.as_deref(),
+            Some("destination-rank-proof"),
+            "{case}: {first:?}"
+        );
+        assert!(!first.checkpoint.sync_token_blocked, "{case}: {first:?}");
+        let (sealed, ready, veto_null, format, current_metadata): (i64, i64, i64, i64, i64) =
+            fixture
+                .db
+                .acquire_lock("sidecar sealed candidate")
+                .unwrap()
+                .query_row(
+                    "SELECT sealed,checkpoint_ready,checkpoint_veto IS NULL,
+                            json_extract(CAST(specification AS TEXT),'$.format'),
+                            json_extract(CAST(specification AS TEXT),'$.profile.current_download_metadata')
+                     FROM provider_active_generations
+                     WHERE id=(SELECT generation FROM provider_active_destinations
+                               WHERE child='asset-m' AND verified_media=1 AND verified_metadata=0)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap();
+        assert_eq!(
+            (sealed, ready, veto_null, format, current_metadata),
+            (1, 1, 1, 2, 1),
+            "{case}: {first:?}"
+        );
+        let (admitted, verified_media, verified_metadata, metadata_enabled, metadata_flags): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = fixture
+            .db
+            .acquire_lock("sidecar pending metadata debt")
+            .unwrap()
+            .query_row(
+                "SELECT d.admitted,d.verified_media,d.verified_metadata,
+                        g.metadata_enabled,json_extract(CAST(g.specification AS TEXT),'$.metadata_flags')
+                 FROM provider_active_destinations d
+                 JOIN provider_active_generations g ON g.id=d.generation
+                 WHERE d.child='asset-m' AND d.verified_media=1 AND d.verified_metadata=0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                admitted,
+                verified_media,
+                verified_metadata,
+                metadata_enabled,
+                metadata_flags
+            ),
+            (1, 1, 0, 1, 32),
+            "{case}: {first:?}"
         );
         if case == "sidecar_sync" {
             assert_eq!(
@@ -336,22 +412,134 @@ async fn run_case(root: &Path, case: &str) {
                 old_sidecar
             );
         } else {
-            // The strict failure follows installed bytes and a synced commit
-            // marker. Changed target bytes are truthful unfinished metadata.
             assert_ne!(
                 std::fs::read(media_root.join("A/changed.JPG.xmp")).ok(),
                 old_sidecar
             );
-            assert!(file_census(&media_root).iter().any(
-                |entry| entry.0.contains(".kei-replace-") && entry.0.ends_with("manifest.json")
-            ));
+            assert!(
+                !file_census(&media_root)
+                    .iter()
+                    .any(|entry| entry.0.contains(".kei-replace-")),
+                "{case}: unexpected replacement journal"
+            );
         }
         assert_eq!(std::fs::read(&selected).unwrap(), media);
-        assert_eq!(fixture.db.acquire_lock("failed strict sidecar receipt").unwrap().query_row::<i64,_,_>("SELECT count(*) FROM provider_active_destinations WHERE verified_media=1 AND verified_metadata=0",[],|r|r.get(0)).unwrap(),1);
+        assert!(
+            !file_census(&media_root)
+                .iter()
+                .any(|entry| entry.0.ends_with(".part"))
+        );
+        assert_eq!(fixture.count("owned_temp_files"), 0);
+        if case == "sidecar_parent" {
+            let pending_before = fixture.db.get_pending_metadata_rewrites(10).await.unwrap();
+            assert!(
+                !pending_before.is_empty(),
+                "a failed parent fsync must leave unchanged-packet metadata debt: {first:?}"
+            );
+            let failed =
+                crate::download::orchestration::maintenance::drain_pending_metadata_rewrites(
+                    fixture.config.state_db.as_deref().unwrap(),
+                    &media_root,
+                    &fixture.config.metadata,
+                    fixture.config.capture_timestamp_repair,
+                    &["PrimarySync"],
+                    fixture.config.temp_suffix.clone(),
+                    &CancellationToken::new(),
+                )
+                .await;
+            assert!(
+                failed >= 1,
+                "the same active parent fault must fail the unchanged retry: {first:?}"
+            );
+            let pending_after = fixture.db.get_pending_metadata_rewrites(10).await.unwrap();
+            assert!(
+                !pending_after.is_empty(),
+                "a failed unchanged retry must keep metadata debt"
+            );
+            let metadata_unverified = fixture
+                .db
+                .acquire_lock("unchanged retry keeps unverified metadata")
+                .unwrap()
+                .query_row::<i64, _, _>(
+                    "SELECT count(*) FROM provider_active_destinations
+                     WHERE verified_media=1 AND verified_metadata=0",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                metadata_unverified, 1,
+                "the failed unchanged retry must keep destination metadata unverified"
+            );
+            eprintln!(
+                "KEI_LATE_IO_PHASE case={case} phase=unchanged-retry failed={failed} pending_before={} pending_after={} metadata_unverified={metadata_unverified}",
+                pending_before.len(),
+                pending_after.len()
+            );
+        }
     } else {
         assert_eq!(first.stats.downloaded, 0, "{case}: {first:?}");
-        assert!(first.sync_token.is_none());
-        assert!(first.checkpoint.sync_token_blocked || first.checkpoint.interrupted);
+        if case == "flush_cancel" {
+            assert!(first.sync_token.is_none(), "{case}: {first:?}");
+            assert!(
+                first.checkpoint.sync_token_blocked && first.checkpoint.interrupted,
+                "{case}: cancellation must hold the candidate: {first:?}"
+            );
+        } else {
+            assert_eq!(
+                first.sync_token.as_deref(),
+                Some("destination-rank-proof"),
+                "{case}: {first:?}"
+            );
+            assert!(!first.checkpoint.sync_token_blocked, "{case}: {first:?}");
+            assert!(!first.checkpoint.interrupted, "{case}: {first:?}");
+            assert_eq!(
+                first.checkpoint.state_write_failures, 0,
+                "{case}: {first:?}"
+            );
+            assert_eq!(first.checkpoint.enumeration_errors, 0, "{case}: {first:?}");
+            assert!(
+                !first.checkpoint.enumeration_incomplete,
+                "{case}: {first:?}"
+            );
+            assert!(
+                first.checkpoint.observation.is_some(),
+                "{case}: a candidate token requires a sealed observation: {first:?}"
+            );
+            let pass_key = crate::download::orchestration::generation::pass_key(&fixture.pass);
+            let (row, raw_path, path) = {
+                let conn = fixture.db.acquire_lock("bound late io candidate").unwrap();
+                let raw: String = conn.query_row("SELECT json_array(d.path,d.admitted,d.verified_media,d.verified_metadata,d.local_checksum IS NULL,d.source_checksum IS NULL,g.sealed,g.checkpoint_ready,g.checkpoint_veto IS NULL,json_extract(CAST(g.specification AS TEXT),'$.format'),json_extract(CAST(g.specification AS TEXT),'$.profile.current_download_metadata'),(SELECT count(*) FROM provider_active_decisions x WHERE x.generation=g.id AND x.pass_key=d.pass_key AND x.child='asset-m' AND x.outcome='selected' AND x.admission='admitted')) FROM provider_active_destinations d JOIN provider_active_generations g ON g.id=d.generation WHERE d.child='asset-m' AND d.pass_key=?1 AND d.verified_media=0", [&pass_key], |r| r.get(0)).unwrap();
+                let row: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                let raw_path = row[0].as_str().unwrap().to_owned();
+                let path = serde_json::from_str::<
+                    crate::state::db::provider_selection::SelectionPath,
+                >(&raw_path)
+                .unwrap()
+                .to_path();
+                (row, raw_path, path)
+            };
+            assert_eq!(
+                row,
+                serde_json::json!([raw_path, 1, 0, 0, 1, 1, 1, 1, 1, 2, 1, 1]),
+                "{case}: failed transfer must retain one admitted pending destination: {first:?}"
+            );
+            assert_eq!(
+                path,
+                std::path::absolute(&selected).unwrap(),
+                "{case}: failed transfer must target the admitted destination"
+            );
+            assert_eq!(
+                fixture
+                    .db
+                    .get_metadata("sync_token:PrimarySync")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("old-cursor"),
+                "{case}: candidate token is not a durable checkpoint"
+            );
+        }
         assert!(!selected.exists(), "disk failure must precede publication");
         let error = fixture
             .db
@@ -426,33 +614,20 @@ async fn run_case(root: &Path, case: &str) {
         "all transfer claims retire"
     );
     let failed_files = file_census(&media_root);
-    if !matches!(case, "sidecar_parent") {
-        assert!(
-            failed_files.iter().all(|entry| !entry.0.ends_with(".part")),
-            "{case}: {failed_files:?}"
-        );
-    }
-    let retained_preparation = failed_files
-        .iter()
-        .filter(|entry| entry.0.ends_with(".part"))
-        .cloned()
-        .collect::<Vec<_>>();
-    assert_eq!(
-        retained_preparation.len(),
-        usize::from(case == "sidecar_parent")
+    assert!(
+        failed_files.iter().all(|entry| !entry.0.ends_with(".part")),
+        "{case}: {failed_files:?}"
     );
-    if case == "sidecar_parent" {
-        let installed = failed_files
-            .iter()
-            .find(|entry| entry.0 == "A/changed.JPG.xmp")
-            .unwrap();
-        assert_eq!(retained_preparation[0].1, installed.1);
-        assert_eq!(retained_preparation[0].2, installed.2);
-        assert_eq!(retained_preparation[0].3, 2);
-    }
     // Remove only the exact fault after the independent failure oracle.
     std::fs::remove_file(root.join("fault-enabled")).unwrap();
     if case != "directory_sync" {
+        // The selection retry backoff is production state; advance only the
+        // synthetic test clock so the real recovery run is due.
+        fixture
+            .db
+            .make_selection_retry_due(super::owner(), "asset-m".into())
+            .await
+            .unwrap();
         let recovered = crate::download::download_photos_with_sync(
             &reqwest::Client::new(),
             std::slice::from_ref(&fixture.pass),
@@ -471,6 +646,39 @@ async fn run_case(root: &Path, case: &str) {
             usize::from(!matches!(case, "sidecar_sync" | "sidecar_parent"))
         );
         assert_eq!(std::fs::read(&selected).unwrap(), media);
+        if matches!(case, "sidecar_sync" | "sidecar_parent") {
+            assert_eq!(
+                fixture
+                    .db
+                    .acquire_lock("completed sidecar metadata")
+                    .unwrap()
+                    .query_row::<i64, _, _>(
+                        "SELECT count(*) FROM provider_active_destinations
+                         WHERE verified_media=1 AND verified_metadata=1",
+                        [],
+                        |r| r.get(0)
+                    )
+                    .unwrap(),
+                1,
+                "{case}: completed metadata must reach the destination"
+            );
+            assert!(
+                !file_census(&media_root)
+                    .iter()
+                    .any(|entry| entry.0.ends_with(".part"))
+            );
+            if case == "sidecar_parent" {
+                let success = std::fs::read_to_string(root.join("parent-fsync-success"))
+                    .expect("a successful exact parent fsync must be observed");
+                assert!(success.contains("progress="), "{case}: {success}");
+                assert!(!success.contains("progress=0\n"), "{case}: {success}");
+            }
+        }
+        eprintln!(
+            "KEI_LATE_IO_PHASE case={case} phase=recovery downloaded={} parent_sync={}",
+            recovered.stats.downloaded,
+            root.join("parent-fsync-success").is_file()
+        );
     }
     fixture = reopen_destination_fixture(fixture).await;
     assert_eq!(fixture.count("owned_temp_files"), 0);
@@ -490,16 +698,6 @@ async fn run_case(root: &Path, case: &str) {
             .iter()
             .all(|entry| !entry.0.contains(".kei-replace-")),
         "{case}: {completed_files:?}"
-    );
-    // Recovery has no persisted name/ownership for the writer's prepared
-    // sidecar hardlink. Retain that exact historical entry; never grow it.
-    assert_eq!(
-        completed_files
-            .iter()
-            .filter(|entry| entry.0.ends_with(".part"))
-            .cloned()
-            .collect::<Vec<_>>(),
-        retained_preparation
     );
     assert_eq!(
         fixture
@@ -587,6 +785,7 @@ async fn run_case(root: &Path, case: &str) {
         );
         fixture.preserved().await;
     }
+    eprintln!("KEI_LATE_IO_PHASE case={case} phase=quiet");
     transport_stop.cancel();
     if let Some(transport_task) = transport_task {
         transport_task.await.unwrap();

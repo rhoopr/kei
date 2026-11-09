@@ -12,7 +12,7 @@ use crate::download::DownloadConfig;
 /// Carried separately from the rest of `AssetMetadata` so the download layer
 /// only sees fields a writer can actually use. Fields are owned (not borrowed)
 /// because the task moves across async boundaries.
-#[derive(serde::Serialize, Debug, Clone, Default)]
+#[derive(serde::Serialize, Debug, Clone, Default, PartialEq)]
 #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
 pub(in crate::download) struct MetadataPayload {
     /// Source capture offset in seconds from UTC, when valid.

@@ -3882,3 +3882,434 @@ async fn legacy_ordinary_drain_restores_root_none_while_capture_and_selected_sta
         1
     );
 }
+
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn witnessed_legacy_sidecar_budget_bounds_more_than_500_blocked_and_keeps_healthy_progress() {
+    if crate::test_helpers::isolate_process_fds(
+        "download::metadata_rewrite::queued::tests::witnessed_legacy_sidecar_budget_bounds_more_than_500_blocked_and_keeps_healthy_progress",
+    ).await {
+        return;
+    }
+    use crate::download::MetadataWriterWitness;
+    use crate::state::SqliteStateDb;
+    use crate::state::types::AssetMetadata;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = SqliteStateDb::open(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+    let template = dir.path().join("template.jpg");
+    std::fs::write(&template, minimal_jpeg_bytes()).unwrap();
+    let checksum = crate::download::file::compute_sha256(&template)
+        .await
+        .unwrap();
+    std::fs::remove_file(&template).unwrap();
+
+    let mut blocked = Vec::new();
+    for index in 0..550usize {
+        let id: &'static str = Box::leak(format!("blocked-{index:03}").into_boxed_str());
+        let filename = format!("{id}.jpg");
+        let path = dir.path().join(&filename);
+        std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
+        seed_downloaded_marker(
+            &db,
+            id,
+            &filename,
+            &path,
+            &checksum,
+            AssetMetadata::default(),
+            None,
+        )
+        .await;
+        std::fs::create_dir(path.with_file_name(format!("{filename}.xmp"))).unwrap();
+        let attempts = crate::download::metadata_rewrite::test_sidecar_attempts(&path);
+        blocked.push((path, attempts));
+    }
+    let healthy_dir = dir.path().join("healthy");
+    std::fs::create_dir(&healthy_dir).unwrap();
+    for index in 0..50usize {
+        let id: &'static str = Box::leak(format!("healthy-{index:03}").into_boxed_str());
+        let filename = format!("{id}.jpg");
+        let path = healthy_dir.join(&filename);
+        std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
+        seed_downloaded_marker(
+            &db,
+            id,
+            &filename,
+            &path,
+            &checksum,
+            AssetMetadata::default(),
+            None,
+        )
+        .await;
+    }
+
+    let metadata = crate::config::MetadataConfig {
+        xmp_sidecar: true,
+        ..crate::config::MetadataConfig::default()
+    };
+    let witness = Arc::new(MetadataWriterWitness::with_test_budget(
+        256,
+        2 * 1024 * 1024,
+    ));
+    let token = CancellationToken::new();
+    let first = crate::download::drain_pending_metadata_rewrites_witnessed(
+        &db as &dyn crate::download::DownloadStore,
+        dir.path(),
+        &metadata,
+        CaptureTimestampRepair::Preserve,
+        &["PrimarySync"],
+        Arc::from(".kei-tmp"),
+        &token,
+        Some(Arc::clone(&witness)),
+    )
+    .await;
+    let (admitted, heap_used) = witness.test_retained();
+    assert!(
+        admitted > 0,
+        "the test budget must admit at least one entry"
+    );
+    assert!(admitted < 550, "the test budget must refuse overflow");
+    assert!(
+        heap_used <= 2 * 1024 * 1024 - 256 * 1024,
+        "retained heap must leave the scratch reserve"
+    );
+    assert_eq!(first.witnessed_blocked, 0);
+    assert_eq!(first.new_failures, 550);
+    assert_eq!(
+        db.get_pending_metadata_rewrites(1_000).await.unwrap().len(),
+        550,
+        "healthy sidecars retired; blocked markers remain"
+    );
+
+    let second = crate::download::drain_pending_metadata_rewrites_witnessed(
+        &db as &dyn crate::download::DownloadStore,
+        dir.path(),
+        &metadata,
+        CaptureTimestampRepair::Preserve,
+        &["PrimarySync"],
+        Arc::from(".kei-tmp"),
+        &token,
+        Some(Arc::clone(&witness)),
+    )
+    .await;
+    let (calls, matches, unchanged) = witness.test_suppression_counts();
+    eprintln!(
+        "BUDGET_DEBUG admitted={admitted} suppress_calls={calls} entry_matches={matches} unchanged={unchanged} second_blocked={}",
+        second.witnessed_blocked
+    );
+    assert_eq!(second.witnessed_blocked, admitted);
+    assert_eq!(second.new_failures, 550 - admitted);
+    assert_eq!(
+        db.get_pending_metadata_rewrites(1_000).await.unwrap().len(),
+        550,
+        "no marker is retired by suppression or by a failed retry"
+    );
+    let mut once = 0usize;
+    let mut twice = 0usize;
+    for (_, attempts) in &blocked {
+        match attempts.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => once += 1,
+            2 => twice += 1,
+            other => panic!("unexpected physical attempt count {other}"),
+        }
+    }
+    assert_eq!(once, admitted, "admitted rows suppress the second attempt");
+    assert_eq!(
+        twice,
+        550 - admitted,
+        "unadmitted rows use normal guarded retry"
+    );
+    assert!(
+        blocked.iter().all(|(path, _)| {
+            let filename = path.file_name().unwrap().to_string_lossy();
+            path.with_file_name(format!("{filename}.xmp")).is_dir()
+        }),
+        "blocked sidecar directories remain untouched"
+    );
+    eprintln!(
+        "BUDGET admitted={admitted} blocked=550 healthy=50 first_failures={} second_failures={} second_suppressed={} heap={heap_used}",
+        first.new_failures, second.new_failures, second.witnessed_blocked
+    );
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[test]
+fn legacy_request_equality_covers_every_effective_identity_field() {
+    use super::LegacyRequest;
+    use crate::download::filter::MetadataPayload;
+
+    let base = LegacyRequest {
+        library: Arc::from("PrimarySync"),
+        asset_id: "asset".into(),
+        version_size: crate::state::VersionSizeKey::Original,
+        provider_checksum: "provider".into(),
+        recorded_path: PathBuf::from("/media/asset.jpg"),
+        created_local: now_local(),
+        created_offset: *now_local().offset(),
+        local_checksum: Some("local".into()),
+        download_checksum: None,
+        source_checksum: None,
+        metadata_flags: MetadataFlags::XMP_SIDECAR,
+        capture_timestamp_repair: CaptureTimestampRepair::Preserve,
+        archive_root: None,
+        temp_suffix: Arc::from(".kei-tmp"),
+        payload: Arc::new(MetadataPayload::default()),
+    };
+    let mut changed = base.clone();
+    changed.payload = Arc::new(MetadataPayload {
+        rating: Some(3),
+        ..MetadataPayload::default()
+    });
+    assert_ne!(base, changed);
+    let mut changed = base.clone();
+    changed.metadata_flags = MetadataFlags::RATING | MetadataFlags::XMP_SIDECAR;
+    assert_ne!(base, changed);
+    let mut changed = base.clone();
+    changed.capture_timestamp_repair = CaptureTimestampRepair::ReplaceWithCaptureLocal;
+    assert_ne!(base, changed);
+    let mut changed = base.clone();
+    changed.source_checksum = Some("source".into());
+    assert_ne!(base, changed);
+    let mut changed = base.clone();
+    changed.local_checksum = None;
+    assert_ne!(base, changed);
+    let mut changed = base.clone();
+    changed.recorded_path = PathBuf::from("/media/other.jpg");
+    assert_ne!(base, changed);
+    let mut changed = base.clone();
+    changed.version_size = crate::state::VersionSizeKey::Medium;
+    assert_ne!(base, changed);
+    let mut changed = base.clone();
+    changed.provider_checksum = "other".into();
+    assert_ne!(base, changed);
+    let mut changed = base.clone();
+    changed.archive_root = Some(PathBuf::from("/root"));
+    assert_ne!(base, changed);
+    let mut changed = base.clone();
+    changed.temp_suffix = Arc::from(".other");
+    assert_ne!(base, changed);
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn witnessed_legacy_sidecar_retries_changed_resolved_offset_at_the_same_instant() {
+    if crate::test_helpers::isolate_process_fds(
+        "download::metadata_rewrite::queued::tests::witnessed_legacy_sidecar_retries_changed_resolved_offset_at_the_same_instant",
+    ).await {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (db, path, checksum) = seed_marked_jpeg(dir.path(), "RESOLVED_OFFSET", None).await;
+    let before = std::fs::read(&path).unwrap();
+    let sidecar = path.with_file_name("RESOLVED_OFFSET.jpg.xmp");
+    std::fs::create_dir(&sidecar).unwrap();
+    let physical = crate::download::metadata_rewrite::test_sidecar_attempts(&path);
+    let witness = Arc::new(super::MetadataWriterWitness::with_test_budget(
+        256,
+        1024 * 1024,
+    ));
+    let mut attempts = super::TailAttempts::with_witness(Some(witness));
+    // Inject the resolved clock only; repair and quiet follow blocked retries.
+    for (offset, blocked, failures, suppressed, count) in [
+        (0, true, 1, 0, 1),
+        (0, true, 0, 1, 1),
+        (3600, true, 1, 0, 2),
+        (3600, true, 0, 1, 2),
+        (3600, false, 0, 0, 3),
+        (3600, false, 0, 0, 3),
+    ] {
+        attempts.test_capture_offset = FixedOffset::east_opt(offset);
+        if !blocked && sidecar.is_dir() {
+            std::fs::remove_dir(&sidecar).unwrap();
+        }
+        let pass = super::run_pending_budget_tracked(
+            &db,
+            MetadataFlags::XMP_SIDECAR,
+            CaptureTimestampRepair::Preserve,
+            Arc::from(".kei-tmp"),
+            &CancellationToken::new(),
+            None,
+            None,
+            (0, METADATA_REWRITE_BATCH, &mut attempts),
+        )
+        .await;
+        assert_eq!(
+            (pass.failed, pass.witnessed_blocked),
+            (failures, suppressed)
+        );
+        assert_eq!(physical.load(std::sync::atomic::Ordering::SeqCst), count);
+        assert_eq!(
+            db.get_pending_metadata_rewrites(10).await.unwrap().len(),
+            usize::from(blocked)
+        );
+    }
+    let times = &attempts.test_writer_times;
+    assert_eq!(times.len(), 3);
+    assert_eq!(times[0], times[1], "same instant, different wall clock");
+    let rendered =
+        |time: &chrono::DateTime<FixedOffset>| time.format("%Y-%m-%dT%H:%M:%S%.f").to_string();
+    assert_ne!(rendered(&times[0]), rendered(&times[1]));
+    let xmp: XmpMeta = std::fs::read_to_string(&sidecar).unwrap().parse().unwrap();
+    assert!(
+        xmp.property(xmp_ns::EXIF, "DateTimeOriginal")
+            .unwrap()
+            .value
+            .starts_with(&rendered(&times[1]))
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        stored_checksums(&db).await.0.as_deref(),
+        Some(checksum.as_str())
+    );
+    eprintln!(
+        "RESOLVED_OFFSET first={} retry={} physical=3 debt=0 quiet=true",
+        times[0], times[1]
+    );
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn witnessed_legacy_sidecar_revalidates_media_content_before_suppression() {
+    if crate::test_helpers::isolate_process_fds(
+        "download::metadata_rewrite::queued::tests::witnessed_legacy_sidecar_revalidates_media_content_before_suppression",
+    ).await {
+        return;
+    }
+    use crate::download::MetadataWriterWitness;
+    use crate::state::SqliteStateDb;
+    use crate::state::types::AssetMetadata;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("photo.jpg");
+    std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
+    let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+    let db = SqliteStateDb::open(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+    seed_downloaded_marker(
+        &db,
+        "MEDIA_INVALIDATION",
+        "photo.jpg",
+        &path,
+        &checksum,
+        AssetMetadata::default(),
+        None,
+    )
+    .await;
+    std::fs::create_dir(path.with_file_name("photo.jpg.xmp")).unwrap();
+    let attempts = crate::download::metadata_rewrite::test_sidecar_attempts(&path);
+    let witness = Arc::new(MetadataWriterWitness::with_test_budget(256, 1024 * 1024));
+    let token = CancellationToken::new();
+
+    let first = crate::download::metadata_rewrite::run_pending_witnessed(
+        &db,
+        MetadataFlags::XMP_SIDECAR,
+        Arc::from(".kei-tmp"),
+        &token,
+        Some(Arc::clone(&witness)),
+    )
+    .await;
+    assert_eq!(first.failed, 1);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let (retained, _) = witness.test_retained();
+    assert_eq!(retained, 1);
+
+    let second = crate::download::metadata_rewrite::run_pending_witnessed(
+        &db,
+        MetadataFlags::XMP_SIDECAR,
+        Arc::from(".kei-tmp"),
+        &token,
+        Some(Arc::clone(&witness)),
+    )
+    .await;
+    assert_eq!(second.failed, 0);
+    assert_eq!(second.witnessed_blocked, 1);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    std::fs::write(&path, b"changed media bytes").unwrap();
+    let third = crate::download::metadata_rewrite::run_pending_witnessed(
+        &db,
+        MetadataFlags::XMP_SIDECAR,
+        Arc::from(".kei-tmp"),
+        &token,
+        Some(Arc::clone(&witness)),
+    )
+    .await;
+    assert_eq!(third.failed, 1, "changed media must retry");
+    assert_eq!(third.witnessed_blocked, 0);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn witnessed_legacy_sidecar_revalidates_destination_before_suppression() {
+    if crate::test_helpers::isolate_process_fds(
+        "download::metadata_rewrite::queued::tests::witnessed_legacy_sidecar_revalidates_destination_before_suppression",
+    ).await {
+        return;
+    }
+    use crate::download::MetadataWriterWitness;
+    use crate::state::SqliteStateDb;
+    use crate::state::types::AssetMetadata;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("photo.jpg");
+    std::fs::write(&path, minimal_jpeg_bytes()).unwrap();
+    let checksum = crate::download::file::compute_sha256(&path).await.unwrap();
+    let db = SqliteStateDb::open(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+    seed_downloaded_marker(
+        &db,
+        "TARGET_INVALIDATION",
+        "photo.jpg",
+        &path,
+        &checksum,
+        AssetMetadata::default(),
+        None,
+    )
+    .await;
+    let sidecar = path.with_file_name("photo.jpg.xmp");
+    std::fs::create_dir(&sidecar).unwrap();
+    let attempts = crate::download::metadata_rewrite::test_sidecar_attempts(&path);
+    let witness = Arc::new(MetadataWriterWitness::with_test_budget(256, 1024 * 1024));
+    let token = CancellationToken::new();
+
+    let first = crate::download::metadata_rewrite::run_pending_witnessed(
+        &db,
+        MetadataFlags::XMP_SIDECAR,
+        Arc::from(".kei-tmp"),
+        &token,
+        Some(Arc::clone(&witness)),
+    )
+    .await;
+    assert_eq!(first.failed, 1);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let second = crate::download::metadata_rewrite::run_pending_witnessed(
+        &db,
+        MetadataFlags::XMP_SIDECAR,
+        Arc::from(".kei-tmp"),
+        &token,
+        Some(Arc::clone(&witness)),
+    )
+    .await;
+    assert_eq!(second.failed, 0);
+    assert_eq!(second.witnessed_blocked, 1);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    std::fs::remove_dir(&sidecar).unwrap();
+    std::fs::write(&sidecar, b"blocker changed").unwrap();
+    let third = crate::download::metadata_rewrite::run_pending_witnessed(
+        &db,
+        MetadataFlags::XMP_SIDECAR,
+        Arc::from(".kei-tmp"),
+        &token,
+        Some(Arc::clone(&witness)),
+    )
+    .await;
+    assert_eq!(third.failed, 1, "changed destination must retry");
+    assert_eq!(third.witnessed_blocked, 0);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+}

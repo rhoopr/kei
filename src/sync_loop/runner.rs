@@ -6,7 +6,7 @@ use anyhow::Context;
 
 use crate::notifications::Notifier;
 use crate::password::{ExposeSecret, SecretString};
-use crate::sync_cycle::{LibraryState, run_cycle};
+use crate::sync_cycle::LibraryState;
 use crate::sync_loop::planning::{maybe_notify_shared_libraries, refresh_needed_library_plans};
 use crate::sync_loop::precheck::{
     DbPrecheckScope, WatchPrecheck, check_changes_database, include_pending_local_work,
@@ -27,6 +27,13 @@ use crate::{
     PartialSyncError, PidFileGuard, available_disk_space, check_min_disk_space, config, credential,
     download, health, make_password_provider, notifications, password, retry, shutdown, state,
 };
+
+/// A suppressed duplicate is not a new failure, but the outstanding witnessed
+/// debt must still keep source revalidation closed.
+#[must_use]
+fn refresh_tail_allows_source_revalidation(tail: &download::RefreshTailOutcome) -> bool {
+    tail.new_failures == 0 && tail.witnessed_blocked == 0
+}
 
 /// Revalidate one bounded page after all cycle producers and the metadata tail have joined.
 async fn drain_source_revalidation(
@@ -560,6 +567,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             selection_context: None,
             prior_sparse_bridge_proofs: Arc::from([]),
             prior_inventory_proof: None,
+            metadata_write_witness: None,
             selection_run: None,
             selection_pass: None,
             retry_only: is_retry_failed,
@@ -796,7 +804,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
             let cycle_started_at = std::time::Instant::now();
             let cycle_wall_started_at = chrono::Utc::now();
-            let mut cycle_result = run_cycle(
+            let metadata_witness = Arc::new(download::MetadataWriterWitness::default());
+            let mut cycle_result = crate::sync_cycle::run_cycle_with_witness(
                 &cycle_library_states,
                 &config,
                 state_db.as_deref(),
@@ -805,16 +814,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 download_controls,
                 &shared_session,
                 &shutdown_token,
+                Arc::clone(&metadata_witness),
             )
             .await?;
             // Drain tagged rewrites now so the one-shot --refresh-metadata repair finishes in this run.
-            let refresh_tail_failures = if config.runtime.refresh_metadata {
+            let refresh_tail = if config.runtime.refresh_metadata {
                 if let Some(db) = state_db.as_deref() {
                     let library_scope: Vec<&str> = libraries
                         .iter()
                         .map(|library| library.zone_name())
                         .collect();
-                    download::drain_pending_metadata_rewrites(
+                    download::drain_pending_metadata_rewrites_witnessed(
                         db,
                         &config.download.directory,
                         &config.metadata,
@@ -822,30 +832,37 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         &library_scope,
                         Arc::clone(&cfg_temp_suffix),
                         &shutdown_token,
+                        Some(metadata_witness),
                     )
                     .await
                 } else {
-                    0
+                    download::RefreshTailOutcome::default()
                 }
             } else {
-                0
+                download::RefreshTailOutcome::default()
             };
             if config.runtime.refresh_metadata {
                 merge_refresh_tail_outcome(
                     &mut cycle_result,
-                    refresh_tail_failures,
+                    refresh_tail.new_failures,
                     shutdown_token.is_cancelled(),
                 );
             }
-            if refresh_tail_failures > 0 {
+            if refresh_tail.new_failures > 0 {
                 tracing::warn!(
-                    failed = refresh_tail_failures,
+                    failed = refresh_tail.new_failures,
                     "Some --refresh-metadata rewrites did not complete; sync will exit non-zero"
+                );
+            }
+            if refresh_tail.witnessed_blocked > 0 {
+                tracing::warn!(
+                    witnessed_blocked = refresh_tail.witnessed_blocked,
+                    "Witnessed blocked metadata debt remains; source revalidation deferred"
                 );
             }
             if !shutdown_token.is_cancelled()
                 && !cycle_result.session_expired
-                && refresh_tail_failures == 0
+                && refresh_tail_allows_source_revalidation(&refresh_tail)
             {
                 drain_source_revalidation(&cycle_library_states, &shutdown_token).await?;
             }

@@ -2619,7 +2619,9 @@ async fn metadata_tail(
     } else {
         current
     };
-    let mut attempts = crate::download::metadata_rewrite::TailAttempts::default();
+    let mut attempts = crate::download::metadata_rewrite::TailAttempts::with_witness(
+        config.metadata_write_witness.clone(),
+    );
     let priority = Box::pin(crate::download::metadata_rewrite::run_pending_rows_tracked(
         db.as_ref(),
         flags,

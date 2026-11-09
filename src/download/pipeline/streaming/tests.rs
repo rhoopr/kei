@@ -72,6 +72,7 @@ async fn test_producer_panic_propagates_as_error() {
         selection_context: None,
         prior_sparse_bridge_proofs: Arc::from([]),
         prior_inventory_proof: None,
+        metadata_write_witness: None,
         selection_run: None,
         selection_pass: None,
         retry_only: false,

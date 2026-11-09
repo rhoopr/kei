@@ -14,9 +14,10 @@ use xmp_toolkit::{FromStrOptions, XmpErrorType, XmpMeta};
 struct DestinationProbeFailure(#[from] std::io::Error);
 
 #[cfg(test)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TestPreparationFault {
     UnchangedValidation,
+    UnchangedSync,
     TempCreate,
     TempWrite,
     TempSync,
@@ -148,6 +149,75 @@ impl ReconciledSidecarSnapshot {
         self.path.validate_identity(identity)?;
         Ok(())
     }
+
+    /// An unchanged packet is already content-correct, but it still owes the
+    /// same durability boundary as a rewrite before any queue may retire it.
+    /// Windows retains the existing validate-only behavior because a read-only
+    /// handle cannot call `FlushFileBuffers`; the parent sync there is a no-op.
+    fn sync_and_validate(&self) -> Result<()> {
+        #[cfg(test)]
+        test_preparation_failure(self.path.path(), TestPreparationFault::UnchangedSync)?;
+        #[cfg(unix)]
+        {
+            self.file.sync_all()?;
+            self.path.sync_parent()?;
+        }
+        #[cfg(windows)]
+        {
+            self.path.sync_parent()?;
+        }
+        self.validate()
+    }
+}
+
+/// Remove only a temporary this owner exclusively created and has not handed
+/// to publication. Publication failures may leave displaced user bytes there,
+/// so the guard must be disarmed before the publication call.
+struct UnpublishedSidecarTemp {
+    path: Option<crate::fs_util::ConfinedPath>,
+    identity: crate::fs_util::FileIdentity,
+    armed: bool,
+}
+
+impl UnpublishedSidecarTemp {
+    fn new(path: crate::fs_util::ConfinedPath, identity: crate::fs_util::FileIdentity) -> Self {
+        Self {
+            path: Some(path),
+            identity,
+            armed: true,
+        }
+    }
+
+    fn path(&self) -> Option<&crate::fs_util::ConfinedPath> {
+        self.path.as_ref()
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn into_path(mut self) -> Option<crate::fs_util::ConfinedPath> {
+        self.armed = false;
+        self.path.take()
+    }
+}
+
+impl Drop for UnpublishedSidecarTemp {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(path) = &self.path else {
+            return;
+        };
+        if let Err(error) = path.remove_regular(self.identity) {
+            tracing::warn!(
+                path = %path.path().display(),
+                error = %error,
+                "Could not remove unpublished sidecar temporary; leaving it for recovery"
+            );
+        }
+    }
 }
 
 /// Write `write` as a `.xmp` sidecar next to the media file with guarded publication.
@@ -245,9 +315,9 @@ pub(crate) async fn write_sidecar_reported(
     let prepared = match prepared {
         PreparedSidecar::Publish(prepared) => prepared,
         PreparedSidecar::Unchanged(snapshot) => {
-            let result = tokio::task::spawn_blocking(move || snapshot.validate())
+            let result = tokio::task::spawn_blocking(move || snapshot.sync_and_validate())
                 .await
-                .context("Unchanged XMP sidecar validation task panicked")
+                .context("Unchanged XMP sidecar durability task panicked")
                 .and_then(|result| result);
             return SidecarWriteReport {
                 result,
@@ -334,9 +404,19 @@ pub(in crate::download) async fn create_layout_sidecar(
             meta.to_string().into_bytes()
         };
         let (mut temp, part) = create_unique_sidecar_temp(&target, &temp_suffix)?;
+        let identity = crate::fs_util::file_identity(&temp).with_context(|| {
+            format!(
+                "Could not read temporary XMP sidecar identity {}; leaving it for recovery",
+                part.path().display()
+            )
+        })?;
+        let mut guard = UnpublishedSidecarTemp::new(part, identity);
+        #[cfg(test)]
+        test_preparation_failure(target.path(), TestPreparationFault::TempWrite)?;
         std::io::Write::write_all(&mut temp, &bytes)?;
+        #[cfg(test)]
+        test_preparation_failure(target.path(), TestPreparationFault::TempSync)?;
         temp.sync_all()?;
-        let identity = crate::fs_util::file_identity(&temp)?;
         let output = fingerprint_bytes(&bytes)?;
         if let Some((path, mut file, bytes, expected)) = source {
             use std::io::{Read, Seek};
@@ -350,7 +430,11 @@ pub(in crate::download) async fn create_layout_sidecar(
                 "Recorded sidecar changed during preparation"
             );
         }
-        crate::download::file::publish_sidecar_confined(&part, &target, None, output, identity)?;
+        guard.disarm();
+        let Some(part) = guard.path() else {
+            anyhow::bail!("Prepared layout sidecar lost its temporary path");
+        };
+        crate::download::file::publish_sidecar_confined(part, &target, None, output, identity)?;
         target.validate_identity(identity)?;
         Ok(Some(LayoutFingerprint {
             size: output.size,
@@ -480,7 +564,14 @@ fn prepare_sidecar_write(
     #[cfg(test)]
     test_preparation_failure(media_path, TestPreparationFault::TempCreate)?;
     let (mut temp, temporary) = create_unique_sidecar_temp(&target, temp_suffix)?;
-    let tmp_path = temporary.path();
+    let identity = crate::fs_util::file_identity(&temp).with_context(|| {
+        format!(
+            "Could not read temporary XMP sidecar identity {}; leaving it for recovery",
+            temporary.path().display()
+        )
+    })?;
+    let tmp_path = temporary.path().to_owned();
+    let mut guard = UnpublishedSidecarTemp::new(temporary, identity);
     #[cfg(test)]
     test_preparation_failure(media_path, TestPreparationFault::TempWrite)?;
     std::io::Write::write_all(&mut temp, &bytes).with_context(|| {
@@ -497,12 +588,17 @@ fn prepare_sidecar_write(
             tmp_path.display()
         )
     })?;
+    let output = fingerprint_bytes(&bytes)?;
+    guard.disarm();
+    let Some(temp_path) = guard.into_path() else {
+        anyhow::bail!("Prepared XMP sidecar lost its temporary path");
+    };
     Ok(Some(PreparedSidecar::Publish(SidecarPublication {
-        temp: temporary,
+        temp: temp_path,
         target,
         expected,
-        output: fingerprint_bytes(&bytes)?,
-        identity: crate::fs_util::file_identity(&temp)?,
+        output,
+        identity,
     })))
 }
 
@@ -626,6 +722,7 @@ mod tests {
         };
         for fault in [
             TestPreparationFault::UnchangedValidation,
+            TestPreparationFault::UnchangedSync,
             TestPreparationFault::TempCreate,
             TestPreparationFault::TempWrite,
             TestPreparationFault::TempSync,
@@ -633,6 +730,8 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let media = dir.path().join("photo.jpg");
             fs::write(&media, b"media").unwrap();
+            let unrelated = dir.path().join("unrelated.part");
+            fs::write(&unrelated, b"keep").unwrap();
             let original = MetadataWrite {
                 rating: Some(1),
                 ..MetadataWrite::default()
@@ -645,8 +744,16 @@ mod tests {
             );
             let sidecar = dir.path().join("photo.jpg.xmp");
             let before = fs::read(&sidecar).unwrap();
-            test_fail_sidecar_preparation_once(&media, fault);
-            let requested = if fault == TestPreparationFault::UnchangedValidation {
+            let fault_path = if fault == TestPreparationFault::UnchangedSync {
+                &sidecar
+            } else {
+                &media
+            };
+            test_fail_sidecar_preparation_once(fault_path, fault);
+            let requested = if matches!(
+                fault,
+                TestPreparationFault::UnchangedValidation | TestPreparationFault::UnchangedSync
+            ) {
                 original
             } else {
                 MetadataWrite {
@@ -658,6 +765,20 @@ mod tests {
             assert!(failed.result.is_err());
             assert_eq!(failed.failure_boundary, None);
             assert_eq!(fs::read(&sidecar).unwrap(), before);
+            let owned_temps: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with(".kei-xmp-") && name.ends_with(".part")
+                        })
+                })
+                .collect();
+            assert!(owned_temps.is_empty(), "{fault:?}: {owned_temps:?}");
+            assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
             assert!(
                 write_sidecar_reported(&media, None, false, &requested, ".part")
                     .await
@@ -694,6 +815,46 @@ mod tests {
         assert_eq!(publication.failure_boundary, None);
         assert!(!target.exists());
         assert_eq!(fs::read(&media).unwrap(), b"media");
+    }
+
+    #[tokio::test]
+    async fn layout_sidecar_temp_failure_cleans_only_owned_temp() {
+        use super::{TestPreparationFault, test_fail_sidecar_preparation_once};
+        use crate::fs_util::{ConfinedParents, ConfinedPath};
+        for fault in [
+            TestPreparationFault::TempWrite,
+            TestPreparationFault::TempSync,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let target_path = dir.path().join("layout.jpg.xmp");
+            let target =
+                ConfinedPath::open(dir.path(), &target_path, ConfinedParents::Existing).unwrap();
+            let unrelated = dir.path().join("unrelated.part");
+            fs::write(&unrelated, b"keep").unwrap();
+            let write = MetadataWrite {
+                rating: Some(1),
+                ..MetadataWrite::default()
+            };
+            test_fail_sidecar_preparation_once(&target_path, fault);
+            let result =
+                super::create_layout_sidecar(dir.path(), target, None, &write, ".part").await;
+            assert!(result.is_err(), "{fault:?}");
+            assert!(!target_path.exists(), "{fault:?}");
+            assert_eq!(fs::read(&unrelated).unwrap(), b"keep");
+            let owned_temps: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with(".kei-xmp-") && name.ends_with(".part")
+                        })
+                })
+                .collect();
+            assert!(owned_temps.is_empty(), "{fault:?}: {owned_temps:?}");
+        }
     }
 
     #[tokio::test]
@@ -869,6 +1030,22 @@ mod tests {
             fs::metadata(&sidecar).unwrap().modified().unwrap(),
             modified
         );
+        #[cfg(windows)]
+        {
+            // Read-only unchanged packets must not need a writable handle.
+            let mut permissions = fs::metadata(&sidecar).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&sidecar, permissions).unwrap();
+            write_sidecar(&media, &write, ".meta-tmp").await.unwrap();
+            assert_eq!(fs::read(&sidecar).unwrap(), bytes);
+            assert_eq!(
+                crate::fs_util::file_identity(&fs::File::open(&sidecar).unwrap()).unwrap(),
+                identity
+            );
+            let mut permissions = fs::metadata(&sidecar).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&sidecar, permissions).unwrap();
+        }
         assert_eq!(
             fs::read_dir(dir.path()).unwrap().count(),
             2,

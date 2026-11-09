@@ -6710,9 +6710,56 @@ async fn v027_multi_destination_raw_edited_alternative_and_companion_failure_reo
 #[tokio::test]
 async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflicts_then_recover() {
     use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::symlink;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+    type DestinationRow = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        i64,
+        i64,
+        i64,
+        Option<String>,
+        Option<String>,
+    );
+    fn load_destinations(f: &Fixture) -> Vec<DestinationRow> {
+        let conn = f.db.acquire_lock("selected path destinations").unwrap();
+        let mut query = conn
+            .prepare(
+                "SELECT generation,pass_key,library,asset_id,version_size,checksum,size_bytes,
+                        path,admitted,verified_media,verified_metadata,local_checksum,source_checksum
+                 FROM provider_active_destinations WHERE child='asset-m' ORDER BY pass_key",
+            )
+            .unwrap();
+        query
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                    r.get(10)?,
+                    r.get(11)?,
+                    r.get(12)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
     for kind in ["regular", "leaf", "parent"] {
         let server = MockServer::start().await;
         let media = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0\xff\xd9";
@@ -6733,7 +6780,7 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
         std::fs::create_dir(&outside).unwrap();
         let outside_media = outside.join("confined.JPG");
         std::fs::write(&outside_media, b"outside-owned-media").unwrap();
-        let outside_sidecar = outside.join("confined.xmp");
+        let outside_sidecar = outside.join("confined.JPG.xmp");
         std::fs::write(&outside_sidecar, b"outside-owned-sidecar").unwrap();
         let album = f.config.directory.join("A");
         let conflict = album.join("confined.JPG");
@@ -6747,6 +6794,29 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
                 std::fs::write(&conflict, b"different-existing-media").unwrap();
             }
         }
+        let outside_probe = |path: &std::path::Path| {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.nlink(),
+                metadata.mtime(),
+                std::fs::read(path).unwrap(),
+            )
+        };
+        let outside_census = || {
+            let mut names: Vec<_> = std::fs::read_dir(&outside)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let outside_before = [
+            outside_probe(&outside_media),
+            outside_probe(&outside_sidecar),
+        ];
+        let outside_entries_before = outside_census();
         let passes = vec![destination_pass(&f, "A"), destination_pass(&f, "B")];
         let first = crate::download::download_photos_with_sync(
             &reqwest::Client::new(),
@@ -6757,18 +6827,37 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
         )
         .await
         .unwrap();
-        assert_eq!(
-            first.stats.downloaded,
-            if kind == "parent" { 1 } else { 2 },
+        assert_eq!(first.stats.downloaded, 1, "{kind}: {first:?}");
+        assert_eq!(first.stats.failed, 0, "{kind}: {first:?}");
+        assert_eq!(first.stats.skipped.uncertain, 1, "{kind}: {first:?}");
+        assert!(
+            matches!(
+                first.outcome,
+                crate::download::DownloadOutcome::PartialFailure { failed_count: 1 }
+            ),
             "{kind}: {first:?}"
         );
         assert_eq!(
-            std::fs::read(&outside_media).unwrap(),
-            b"outside-owned-media"
+            first.sync_token.as_deref(),
+            Some("destination-rank-proof"),
+            "{kind}: {first:?}"
+        );
+        assert!(!first.checkpoint.sync_token_blocked, "{kind}: {first:?}");
+        assert!(!first.checkpoint.interrupted, "{kind}: {first:?}");
+        assert_eq!(
+            first.checkpoint.state_write_failures, 0,
+            "{kind}: {first:?}"
+        );
+        assert!(
+            first.checkpoint.observation.is_some(),
+            "{kind}: a candidate token requires a sealed observation: {first:?}"
         );
         assert_eq!(
-            std::fs::read(&outside_sidecar).unwrap(),
-            b"outside-owned-sidecar"
+            [
+                outside_probe(&outside_media),
+                outside_probe(&outside_sidecar)
+            ],
+            outside_before
         );
         if kind == "regular" {
             assert_eq!(
@@ -6778,68 +6867,237 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
         }
         if kind == "leaf" {
             assert!(std::fs::symlink_metadata(&conflict).unwrap().is_symlink());
+            assert_eq!(std::fs::read_link(&conflict).unwrap(), outside_media);
         }
-        if kind == "parent" {
-            assert!(first.checkpoint.sync_token_blocked);
-            assert!(first.sync_token.is_none());
-            assert_eq!(
-                f.db.acquire_lock("parent symlink cannot receive proof")
+        let a_key = crate::download::orchestration::generation::pass_key(&passes[0]);
+        let b_key = crate::download::orchestration::generation::pass_key(&passes[1]);
+        let expected_checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(media));
+        let provider_checksum = data_encoding::BASE64.encode(&Sha256::digest(media));
+        let first_rows = load_destinations(&f);
+        assert_eq!(
+            first_rows.len(),
+            2,
+            "{kind}: unexpected destination cardinality"
+        );
+        let a_row = first_rows
+            .iter()
+            .find(|row| row.1 == a_key)
+            .expect("selected A destination");
+        let b_row = first_rows
+            .iter()
+            .find(|row| row.1 == b_key)
+            .expect("healthy B destination");
+        assert_eq!(
+            a_row.0, b_row.0,
+            "{kind}: both destinations share one generation"
+        );
+        for row in [a_row, b_row] {
+            assert_eq!(row.2.as_str(), "PrimarySync");
+            assert_eq!(row.3.as_str(), "asset-m");
+            assert_eq!(row.4.as_str(), "original");
+            assert_eq!(row.5.as_str(), provider_checksum.as_str());
+            assert_eq!(row.6, media.len() as i64);
+        }
+        let admitted_a = serde_json::from_str::<SelectionPath>(&a_row.7)
+            .unwrap()
+            .to_path();
+        assert_ne!(admitted_a, conflict);
+        assert_eq!((a_row.8, a_row.9, a_row.10), (1, 0, 0));
+        assert_eq!((a_row.11.as_deref(), a_row.12.as_deref()), (None, None));
+        assert_eq!(
+            serde_json::from_str::<SelectionPath>(&b_row.7)
+                .unwrap()
+                .to_path(),
+            f.config.directory.join("B/confined.JPG")
+        );
+        assert_eq!((b_row.8, b_row.9, b_row.10), (1, 1, 1));
+        assert_eq!(
+            (b_row.11.as_deref(), b_row.12.as_deref()),
+            (
+                Some(expected_checksum.as_str()),
+                Some(expected_checksum.as_str())
+            )
+        );
+        let (sealed, ready, veto_null, format, current_metadata): (i64, i64, i64, i64, i64) = {
+            let conn = f.db.acquire_lock("selected sealed candidate").unwrap();
+            conn.query_row(
+                "SELECT sealed,checkpoint_ready,checkpoint_veto IS NULL,
+                        json_extract(CAST(specification AS TEXT),'$.format'),
+                        json_extract(CAST(specification AS TEXT),'$.profile.current_download_metadata')
+                 FROM provider_active_generations WHERE id=?1",
+                [&a_row.0],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            (sealed, ready, veto_null, format, current_metadata),
+            (1, 1, 1, 2, 1),
+            "{kind}: {first:?}"
+        );
+        let decisions: i64 =
+            f.db.acquire_lock("selected admitted decisions")
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM provider_active_decisions
+                 WHERE generation=?1 AND child='asset-m'
+                   AND outcome='selected' AND admission='admitted'",
+                    [&a_row.0],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(decisions, 2, "{kind}: {first:?}");
+        let reason = if kind == "regular" {
+            "unsupported_provider_proof_without_valid_receipt"
+        } else {
+            "candidate_unreadable_unsafe_or_changed"
+        };
+        let diagnostics = {
+            let raw: Option<String> =
+                f.db.acquire_lock("selected path refusal diagnostic")
                     .unwrap()
-                    .query_row::<i64, _, _>(
-                        "SELECT count(*) FROM provider_active_destinations WHERE verified_media=0",
+                    .query_row(
+                        "SELECT last_error FROM assets WHERE id='asset-m'",
                         [],
-                        |r| r.get(0)
+                        |r| r.get(0),
                     )
-                    .unwrap(),
-                1
-            );
+                    .unwrap();
+            crate::state::db::match_diagnostics::MatchDiagnostics::decode(
+                raw.as_deref().expect("selected path diagnostic"),
+            )
+            .expect("decodable selected path diagnostic")
+        };
+        let attempt = diagnostics
+            .attempts
+            .iter()
+            .find(|attempt| attempt.pass.as_deref() == Some(a_key.as_str()))
+            .expect("selected A attempt");
+        assert!(
+            attempt
+                .explanation
+                .candidates
+                .iter()
+                .any(|candidate| candidate.reason == reason
+                    && candidate
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| path.to_path() == conflict)),
+            "{kind}: {:?}",
+            attempt
+                .explanation
+                .candidates
+                .iter()
+                .map(|candidate| (&candidate.path, &candidate.reason))
+                .collect::<Vec<_>>()
+        );
+        if kind == "parent" {
             // Remove only the owned fixture link. No existing target is changed.
+            assert!(std::fs::symlink_metadata(&album).unwrap().is_symlink());
+            assert_eq!(std::fs::read_link(&album).unwrap(), outside);
             std::fs::remove_file(&album).unwrap();
             std::fs::create_dir(&album).unwrap();
-            drop(passes);
-            f = reopen_destination_fixture(f).await;
-            let recovered = crate::download::download_photos_with_sync(
-                &reqwest::Client::new(),
-                &[destination_pass(&f, "A"), destination_pass(&f, "B")],
-                Arc::new(f.config.clone()),
-                controls(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(recovered.stats.downloaded, 1, "{recovered:?}");
         } else {
-            drop(passes);
+            std::fs::remove_file(&conflict).unwrap();
         }
-        let verified: Vec<(String, String)> = {
-            let conn =
-                f.db.acquire_lock("every destination has actual confined bytes")
-                    .unwrap();
-            let mut query=conn.prepare("SELECT path,local_checksum FROM provider_active_destinations WHERE verified_media=1 ORDER BY path").unwrap();
+        drop(passes);
+        f = reopen_destination_fixture(f).await;
+        let recovered = crate::download::download_photos_with_sync(
+            &reqwest::Client::new(),
+            &[destination_pass(&f, "A"), destination_pass(&f, "B")],
+            Arc::new(f.config.clone()),
+            controls(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.stats.downloaded, 1, "{kind}: {recovered:?}");
+        let final_rows = load_destinations(&f);
+        assert_eq!(
+            final_rows.len(),
+            2,
+            "{kind}: unexpected completed destination cardinality"
+        );
+        let a_final = final_rows
+            .iter()
+            .find(|row| row.1 == a_key)
+            .expect("completed A destination");
+        let b_final = final_rows
+            .iter()
+            .find(|row| row.1 == b_key)
+            .expect("completed B destination");
+        assert!(
+            final_rows.iter().all(|row| row.0 == a_row.0),
+            "{kind}: no stale or extra generation"
+        );
+        assert_eq!(
+            (a_final.8, a_final.9, a_final.10),
+            (1, 1, 1),
+            "{kind}: A must be fully verified"
+        );
+        assert_eq!(
+            (b_final.8, b_final.9, b_final.10),
+            (1, 1, 1),
+            "{kind}: B must be fully verified"
+        );
+        assert_eq!(
+            serde_json::from_str::<SelectionPath>(&a_final.7)
+                .unwrap()
+                .to_path(),
+            admitted_a
+        );
+        assert_eq!(
+            serde_json::from_str::<SelectionPath>(&b_final.7)
+                .unwrap()
+                .to_path(),
+            f.config.directory.join("B/confined.JPG")
+        );
+        for row in [a_final, b_final] {
+            assert_eq!(row.11.as_deref(), Some(expected_checksum.as_str()));
+            assert_eq!(row.12.as_deref(), Some(expected_checksum.as_str()));
+        }
+        for row in &final_rows {
+            let path = serde_json::from_str::<SelectionPath>(&row.7)
+                .unwrap()
+                .to_path();
+            assert_eq!(std::fs::read(&path).unwrap(), media);
+            assert!(!std::fs::symlink_metadata(&path).unwrap().is_symlink());
+            assert!(path.starts_with(&f.config.directory));
+        }
+        let receipts: Vec<(String, String)> = {
+            let conn = f.db.acquire_lock("selected completed receipts").unwrap();
+            let mut query = conn
+                .prepare(
+                    "SELECT native_path,local_checksum FROM download_receipts
+                     WHERE child='asset-m' ORDER BY native_path",
+                )
+                .unwrap();
             query
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
                 .unwrap()
                 .map(Result::unwrap)
                 .collect()
         };
-        assert_eq!(verified.len(), 2);
-        for (path, checksum) in &verified {
-            let path: SelectionPath = serde_json::from_str(path).unwrap();
-            let path = path.to_path();
-            assert_eq!(std::fs::read(&path).unwrap(), media);
-            assert_eq!(
-                *checksum,
-                data_encoding::HEXLOWER.encode(&Sha256::digest(media))
-            );
-            assert!(!std::fs::symlink_metadata(&path).unwrap().is_symlink());
-            assert!(path.starts_with(&f.config.directory));
-            if kind != "parent" {
-                assert_ne!(
-                    path, conflict,
-                    "ordinary collision cannot overwrite the conflicting entry"
-                );
-            }
-        }
+        assert_eq!(receipts.len(), 2, "{kind}: {receipts:?}");
+        let parse = |raw: &str| {
+            serde_json::from_str::<SelectionPath>(raw)
+                .unwrap()
+                .to_path()
+        };
+        let b_path = f.config.directory.join("B/confined.JPG");
+        assert!(
+            receipts
+                .iter()
+                .any(|(raw, local)| { parse(raw) == admitted_a && local == &expected_checksum })
+        );
+        assert!(
+            receipts
+                .iter()
+                .any(|(raw, local)| { parse(raw) == b_path && local == &expected_checksum })
+        );
+        assert!(
+            !receipts.iter().any(|(raw, _)| parse(raw) == conflict),
+            "{kind}: no receipt may claim the foreign conflict occupant"
+        );
         let lookups = f.session.calls.load(Ordering::SeqCst);
         let ranks = f.session.rank_calls.load(Ordering::SeqCst);
         for _ in 0..2 {
@@ -6859,13 +7117,13 @@ async fn private_selected_paths_preserve_regular_leaf_and_parent_symlink_conflic
             f.preserved().await;
         }
         assert_eq!(
-            std::fs::read(&outside_media).unwrap(),
-            b"outside-owned-media"
+            [
+                outside_probe(&outside_media),
+                outside_probe(&outside_sidecar)
+            ],
+            outside_before
         );
-        assert_eq!(
-            std::fs::read(&outside_sidecar).unwrap(),
-            b"outside-owned-sidecar"
-        );
+        assert_eq!(outside_census(), outside_entries_before);
     }
 }
 

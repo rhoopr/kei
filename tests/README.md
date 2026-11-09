@@ -345,16 +345,15 @@ same-ID asset and private sidecar in an unselected zone.
 Restart promotes interrupted runs through the same owner used by production
 startup, then enters `run_cycle` with reopened SQLite. The first valid cycle must
 restore correct media, exact publication receipts and ownership, metadata retry
-state, and the source checkpoint. A committed replacement can retain a recent
-prepared-file claim under the existing cleanup grace period. The fixture verifies
-those bytes, then ages only that exact claim and file; the next production cycle
-must retire them through normal cleanup. Two further cycles must perform no
+state, and the source checkpoint, with no new media GET and no remaining
+prepared-file claim. Recovery does not age claims or files to trigger cleanup.
+Two further cycles must perform no
 hydration, download or metadata repair and leave durable state, file bytes,
 identities and modification times stable. Identity/time checks also detect
 metadata rewrites that reproduce identical bytes.
-The matrix has at most 28 production cycles including prerequisites, six killed
-cycles, recovery, eligible cleanup and quiet tails. Warm execution initially took 4.7 seconds with all features and 4.5 seconds
-without default features; compilation is excluded.
+The `journal-committed` case also admits one healthy peer with exactly one new
+media GET, verifies its native publication proof and new checkpoint successor,
+then checks two quiet reopens.
 
 Replay one complete case, retaining its prerequisite and recovery/quiet tail:
 
@@ -1249,8 +1248,8 @@ native publication proof.
 runs on Linux with `cc` and libc dynamic loading. It compiles
 `fixtures/late_io_fixture.c` into a disposable shim and launches one exclusive
 child per case. Only that child receives `LD_PRELOAD` and a child-owned root.
-The existing seven cases remain, with a distinct second-write boundary and two
-strict parent-directory cases. XMP cases require the `xmp` feature.
+Eight applicable cases remain: six without XMP and the two XMP sidecar cases.
+The former proactive config-path reconciliation cases are retired below.
 
 | Case | Actual operation and errno | Route and failure boundary |
 | --- | --- | --- |
@@ -1260,10 +1259,8 @@ strict parent-directory cases. XMP cases require the `xmp` feature.
 | `flush_cancel` | `write`, EIO (5), after a successful prefix | Terminal flush must settle the pending syscall and override cancellation |
 | `file_sync` | `fdatasync`, EIO (5), after complete media writes | Ordinary download, before publication |
 | `directory_sync` | directory `fsync`, EIO (5) | Ordinary publication retains its warning-only policy and completed receipt |
-| `reconcile_sync` | regular-file `fsync`, EIO (5) | Local config-path reconciliation, after copying media to its private temporary file |
-| `reconcile_parent` | directory `fsync`, EIO (5) | Local config-path reconciliation, after no-overwrite publication and before state finalization |
-| `sidecar_sync` | regular-file `fsync`, EIO (5) | XMP preparation, before guarded replacement of an existing sidecar |
-| `sidecar_parent` | directory `fsync`, EIO (5) | Existing journaled guarded-replacement fallback, after installation and synced commit-marker writes |
+| `sidecar_sync` | regular-file `fsync`, EIO (5) | XMP preparation; the old sidecar remains, the created temp is cleaned, and destination metadata stays unverified |
+| `sidecar_parent` | directory `fsync`, EIO (5) | Current sidecar exchange; the new merged sidecar is installed before the exact `media/A` parent fsync, with no `.kei-replace-*` journal |
 
 EOF/cancellation cases use an atomic fault marker and bounded child-local
 release handshake. The syscall stays pending until the child closes transport
@@ -1281,34 +1278,53 @@ are dropped and SQLite is independently reopened while the fault remains active,
 before asserting catalogue paths, ownership, receipts, failed/metadata work and
 config/provider checkpoints. Permanent disk errors may remove their partial
 prefix; the test requires retired transfer claims and exact original/unrelated
-bytes rather than incorrectly requiring resumability. Strict sidecar failure
-after publication may leave changed target bytes and a recovery journal, but
-cannot complete metadata receipts or forget debt. Journal recovery retires its
-manifest and preserves the writer's prepared sidecar hardlink: the manifest does
-not persist that temporary name or authorize deleting it. The test requires that
-single historical entry's exact bytes, inode, link count and mtime through
-recovery and quiet restarts.
+bytes rather than incorrectly requiring resumability.
 
-Reconciliation enters the production `run_cycle` config-drift path, including
-reservation, copy, durable finalization, source-dispatch suppression and atomic
-path-hash promotion. A strict copy/parent-sync failure preserves the old catalogue
-path, active config hash and provider token, with the new path hash pending.
-Only the fault switch is removed before recovery. An ambiguous reconciliation
-temporary file is retained byte-for-byte under the existing inspection policy.
+The sidecar cases assert the current exchange and retry contract. A failed
+sidecar parent fsync may leave the complete merged sidecar installed
+(`sidecar_parent`), or the old sidecar in place with no new sidecar
+(`sidecar_sync`), and leaves destination metadata unverified. The failure does
+not create a `.kei-replace-*` journal. Created but unpublished temporary files
+are removed only when the retained identity and namespace still match. If
+identity acquisition or cleanup cannot be proven safe, the temp is retained and
+the cleanup failure is reported; it is not blindly removed. Publication
+failures may retain displaced bytes and are not cleaned by a generic drop. On
+Unix, an unchanged packet syncs the retained file and its parent before
+success; Windows retains the existing validate-only behavior with a no-op
+parent sync. A second retry under the same active fault fails and keeps the
+metadata debt. The queue finishes and marks metadata verified only after the
+fault is removed and a successful exact parent fsync is observed. The guard is
+disarmed at publication handoff. The existing bounded child-local cancellation
+and transport handoff rules remain; this is not a general cancellation
+guarantee. The writer still requires its source and target proof and refuses
+changed or unsafe bytes; an unchanged retry does not rewrite the packet or
+create a new write authority. The returned sync token is a candidate, not a
+durable checkpoint; the checkpoint keys are asserted separately.
+
+The two proactive config-path reconciliation child cases (`reconcile_sync` and
+`reconcile_parent`) are retired. They assumed forward layout migration that the
+current contract no longer performs. Current config-drift coverage is
+`root_drift_without_recorded_operation_does_not_backfill_historical_file` and
+`run_cycle_download_config_hash_drift_keeps_source_incremental`; recorded
+operation recovery is covered by the `v027_*` publishing and journal tests in
+`normal_boundary_tests`. Those tests have different purposes and are not
+equivalent syscall replacements. The retired cases are not counted as passing
+coverage.
 
 Recovery and two independently reopened quiet cycles compare full path and
 selection receipts and the recursive file census: exact media/sidecar bytes,
 inode, link count, mtime and operation-owned temporary entries. Completed writes
-do not repeat and the temporary census does not grow. The partial TCP endpoint
-remains alive and serves complete bytes after only the fault is removed, so
-changed transport identity cannot masquerade as recovery.
+do not repeat, the temporary census does not grow, and no unregistered `.part`
+remains. The partial TCP endpoint remains alive and serves complete bytes after
+only the fault is removed, so changed transport identity cannot masquerade as
+recovery.
 
-Normal download and exchange replacement parent-sync warnings remain distinct
-from strict reconciliation and journaled replacement sync failures. No production
-policy changes. These local synthetic syscall proofs do not qualify another OS,
-physical NFS, sudden power loss, every disk fault, provider snapshots, reporter
-data or a stronger SQLite durability guarantee. Physical NFS confirmation stays
-with #858.
+Normal download directory-sync keeps its warning-only policy. The sidecar
+metadata parent-sync failure is a strict metadata debt, not that warning path.
+No normal download warning policy changed. These local synthetic syscall proofs
+do not qualify another OS, physical NFS, sudden power loss, every disk fault,
+provider snapshots, reporter data or a stronger SQLite durability guarantee.
+Physical NFS confirmation stays with #858.
 
 Repeated-source controls retain every duplicate ordinal while measuring actual
 strict page decodes. Exact-fit and below-fit byte budgets, zero-capacity refusal,

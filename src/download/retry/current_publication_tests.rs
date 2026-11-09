@@ -572,3 +572,203 @@ async fn deferred_compact_retry_keeps_target_while_peer_completes_then_recovers_
         receipts_before
     );
 }
+
+#[tokio::test]
+async fn prepared_replace_authorization_requires_exact_current_retry_evidence() {
+    use super::prepared_replace_authorization;
+    use crate::commands::{AlbumPass, PassKind};
+    use crate::download::file::ExistingFileFingerprint;
+
+    let root = TempDir::new().unwrap();
+    let db_path = root.path().join("state.db");
+    let owner = compact_owner();
+    let db = Arc::new(SqliteStateDb::open_owned(&db_path, &owner).await.unwrap());
+    let mut config = DownloadConfig::test_default();
+    config.directory = root.path().join("media").into();
+    config.folder_structure = "none".into();
+    config.repair_truncated = true;
+    config.state_db = Some(db.clone());
+    config.ownership_check = Some(
+        crate::download::planner::OwnershipCheck::inspect(db.as_ref())
+            .await
+            .unwrap(),
+    );
+    let album = compact_album(db.clone(), owner.clone());
+    config.primary_layout_source = Some(Arc::new(album.clone()));
+    let pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album,
+        exclude_ids: Arc::default(),
+    };
+    let config = Arc::new(config.with_pass(&pass));
+
+    let media = b"0123456789abcdefghij";
+    let asset = TestPhotoAsset::new("retry-prepared")
+        .filename("retry-prepared.jpg")
+        .orig_file_type("public.jpeg")
+        .orig_url("http://127.0.0.1:1/must-not-download")
+        .orig_size(media.len() as u64)
+        .orig_checksum(&data_encoding::BASE64.encode(&[0xcd; 32]))
+        .build();
+    let derived = derive_expected_paths(&asset, config.as_ref())
+        .into_iter()
+        .find(|path| path.version_size == VersionSizeKey::Original)
+        .unwrap();
+    fs::create_dir_all(derived.path.parent().unwrap()).unwrap();
+    fs::write(&derived.path, b"old").unwrap();
+    let record = AssetRecord::new_pending(
+        Arc::from("PrimarySync"),
+        asset.state_id().to_owned(),
+        VersionSizeKey::Original,
+        derived.checksum.to_string(),
+        derived.filename.clone(),
+        asset.created(),
+        Some(asset.added_date()),
+        derived.size,
+        crate::download::filter::determine_media_type(VersionSizeKey::Original, &asset),
+    )
+    .with_metadata_arc(crate::download::filter::metadata_for_selected_version(
+        &asset,
+        config.as_ref(),
+        VersionSizeKey::Original,
+    ));
+    let media_hash = data_encoding::HEXLOWER.encode(&Sha256::digest(media));
+    db.upsert_seen(&record).await.unwrap();
+    db.mark_downloaded(
+        "PrimarySync",
+        asset.state_id(),
+        "original",
+        &derived.path,
+        &media_hash,
+        Some(&media_hash),
+    )
+    .await
+    .unwrap();
+    db.mark_failed(
+        "PrimarySync",
+        asset.state_id(),
+        "original",
+        crate::commands::reconcile::FILE_TRUNCATED_REASON,
+    )
+    .await
+    .unwrap();
+    db.prepare_for_retry(
+        Some("PrimarySync"),
+        RetryErrorRetention::Preserve(crate::commands::reconcile::FILE_TRUNCATED_REASON),
+    )
+    .await
+    .unwrap();
+    let record = db
+        .get_pending()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.id.as_ref() == asset.state_id())
+        .unwrap();
+
+    let evidence = PendingRetryEvidence::from_record(&record);
+    let target = PendingRetryTarget::from_record(&record);
+    let mut planner = TaskPlanner::for_download(Some(db.as_ref())).await.unwrap();
+    planner.reserve_explicit_retry_destinations();
+    let plan = planner
+        .plan_pending_retry_asset(&asset, &config)
+        .await
+        .unwrap();
+    let task = plan
+        .tasks
+        .iter()
+        .find(|task| task.version_size == VersionSizeKey::Original)
+        .unwrap();
+    let authorization =
+        prepared_replace_authorization(&planner, task, &asset, &target, &evidence, &config)
+            .await
+            .unwrap()
+            .expect("exact truncated repair authorization");
+    assert_eq!(authorization.library.as_ref(), "PrimarySync");
+    assert_eq!(authorization.asset_id.as_ref(), asset.state_id());
+    assert_eq!(authorization.version_size, VersionSizeKey::Original);
+    assert_eq!(
+        authorization.native_path,
+        SelectionPath::from_path(&derived.path)
+    );
+    assert_eq!(authorization.provider_checksum, derived.checksum.as_ref());
+    assert_eq!(authorization.provider_size, derived.size);
+    assert_eq!(
+        authorization.expected,
+        ExistingFileFingerprint {
+            size: b"old".len() as u64,
+            sha256: Sha256::digest(b"old").into(),
+        }
+    );
+    assert_eq!(
+        authorization.binding,
+        *task.publication_binding.as_deref().unwrap()
+    );
+
+    let mut disabled = config.as_ref().clone();
+    disabled.repair_truncated = false;
+    assert!(
+        prepared_replace_authorization(&planner, task, &asset, &target, &evidence, &disabled,)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let mut wrong_pass = config.as_ref().clone();
+    wrong_pass.primary_layout_pass = Some("other-pass".into());
+    assert!(
+        prepared_replace_authorization(&planner, task, &asset, &target, &evidence, &wrong_pass,)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let mut no_binding = task.clone();
+    no_binding.publication_binding = None;
+    assert!(
+        prepared_replace_authorization(&planner, &no_binding, &asset, &target, &evidence, &config,)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let mut wrong_target = target.clone();
+    wrong_target.asset_id = Arc::from("other-state");
+    assert!(
+        prepared_replace_authorization(&planner, task, &asset, &wrong_target, &evidence, &config,)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let mut wrong_evidence = PendingRetryEvidence::from_record(&record);
+    wrong_evidence.last_error = None;
+    assert!(
+        prepared_replace_authorization(&planner, task, &asset, &target, &wrong_evidence, &config,)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let mut outside = PendingRetryEvidence::from_record(&record);
+    outside.local_file.as_mut().unwrap().path = root.path().join("outside.jpg");
+    assert!(
+        prepared_replace_authorization(&planner, task, &asset, &target, &outside, &config,)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let mut changed_resource = PendingRetryEvidence::from_record(&record);
+    changed_resource.checksum = Arc::from("other-resource");
+    assert!(
+        prepared_replace_authorization(
+            &planner, task, &asset, &target, &changed_resource, &config,
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    drop(planner);
+    drop(db);
+}

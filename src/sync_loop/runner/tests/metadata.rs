@@ -7,7 +7,11 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 #[cfg(feature = "xmp")]
 use crate::sync_cycle::preload_asset_groupings;
+#[cfg(feature = "xmp")]
+use crate::sync_cycle::run_cycle_with_witness;
 use crate::sync_cycle::{ENUM_CONFIG_HASH_KEY, run_cycle};
+#[cfg(all(feature = "xmp", unix))]
+use crate::sync_loop::test_support::make_named_empty_full_album;
 #[cfg(feature = "xmp")]
 use crate::sync_loop::test_support::make_named_full_album_with_boxed_session;
 use crate::sync_loop::test_support::{
@@ -2415,20 +2419,30 @@ async fn run_full_enumeration_metadata_cycle(
     inner: &Arc<dyn download::DownloadStore>,
     download_dir: &std::path::Path,
     per_pass_paths: bool,
+    refresh: bool,
     controls: download::DownloadControls,
+    witness: Arc<download::MetadataWriterWitness>,
 ) -> crate::sync_cycle::CycleResult {
-    let config = make_run_cycle_config();
+    let mut config = make_run_cycle_config();
+    config.runtime.refresh_metadata = refresh;
+    config.metadata.xmp_sidecar = true;
     let db: Arc<dyn download::DownloadStore> = Arc::clone(inner);
-    let album = make_full_album_with_session(
+    let page = run_cycle_favourited_asset_page();
+    let album = make_full_album_with_boxed_session(
         "PrimarySync",
-        crate::test_helpers::MockPhotosSession::new()
-            .ok(album_count_response(1))
-            .ok(run_cycle_favourited_asset_page()),
+        Box::new(crate::sync_loop::test_support::MutableCaptureSession {
+            zone: "PrimarySync",
+            cancel_after_lookup: None,
+            records: Arc::new(std::sync::Mutex::new(
+                page["records"].as_array().unwrap().clone(),
+            )),
+            repair_requests: Arc::default(),
+        }),
     );
     let lib_state =
         make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
     let states = vec![&lib_state];
-    let build_download_config = make_run_cycle_download_config_builder_with_options(
+    let base = make_run_cycle_download_config_builder_with_options(
         download_dir,
         Arc::clone(&db),
         RunCycleDownloadConfigOptions {
@@ -2438,9 +2452,20 @@ async fn run_full_enumeration_metadata_cycle(
             ..RunCycleDownloadConfigOptions::default()
         },
     );
+    let observed_modes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&observed_modes);
+    let build_download_config = move |mode: download::SyncMode, excluded, groupings, library| {
+        let mut config = (*base(mode.clone(), excluded, groupings, library)).clone();
+        config.refresh_metadata = refresh;
+        recorder
+            .lock()
+            .unwrap()
+            .push(format!("{mode:?}:refresh={}", config.refresh_metadata));
+        Arc::new(config)
+    };
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
-    Box::pin(run_cycle(
+    let result = Box::pin(run_cycle_with_witness(
         &states,
         &config,
         Some(db.as_ref()),
@@ -2449,18 +2474,299 @@ async fn run_full_enumeration_metadata_cycle(
         controls,
         &shared_session,
         &CancellationToken::new(),
+        witness,
     ))
     .await
-    .expect("run cycle")
+    .expect("run cycle");
+    let modes = observed_modes.lock().unwrap().clone();
+    assert!(!modes.is_empty(), "the builder must be exercised");
+    assert!(
+        modes.iter().all(|mode| mode.ends_with("refresh=true")),
+        "every observed sync mode must receive refresh, modes={modes:?}"
+    );
+    if refresh {
+        assert!(
+            modes.iter().any(|mode| mode.starts_with("Full")),
+            "the normal full producer must be observed, modes={modes:?}"
+        );
+    }
+    eprintln!("REFRESH_MODES {modes:?}");
+    result
 }
 
-/// #707 review: both enumeration branches defer their queue, so a full
-/// enumeration drains once. A second drain in the same cycle would retry a
-/// failed rewrite immediately and report it twice.
+/// A real normal `run_cycle` creates a fresh operation witness: one
+/// pre-existing receiptless Ordinary sidecar debt is physically attempted once
+/// across full inventory, bridge, and bridge fallback, with the marker intact.
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn run_cycle_eligible_ordinary_sidecar_reports_one_physical_attempt() {
+    let inner = make_state_db();
+    let download_dir = tempfile::tempdir().expect("download tempdir");
+    seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
+    let media_path = download_dir
+        .path()
+        .join(run_cycle_expected_date_dir())
+        .join("photo.jpg");
+    let local_sha = crate::download::file::compute_sha256(&media_path)
+        .await
+        .expect("hash seeded media");
+    inner
+        .mark_downloaded(
+            "PrimarySync",
+            "master-PrimarySync",
+            "original",
+            &media_path,
+            &local_sha,
+            None,
+        )
+        .await
+        .expect("record measured local checksum");
+    inner
+        .record_metadata_write_failure("PrimarySync", "master-PrimarySync", "original")
+        .await
+        .expect("queue pre-existing Ordinary debt");
+    let sidecar_path = media_path.with_file_name("photo.jpg.xmp");
+    std::fs::create_dir(&sidecar_path).expect("block sidecar path");
+    let attempts = download::metadata_rewrite::test_sidecar_attempts(&media_path);
+
+    let db: Arc<dyn download::DownloadStore> = Arc::clone(&inner);
+    let album = make_named_empty_full_album("PrimarySync", "TestAlbum", "zone-tok-new");
+    let lib_state =
+        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+    let base = make_run_cycle_download_config_builder_with_options(
+        download_dir.path(),
+        Arc::clone(&db),
+        RunCycleDownloadConfigOptions {
+            media: media_without_photo_downloads(),
+            xmp_sidecar: true,
+            ..RunCycleDownloadConfigOptions::default()
+        },
+    );
+    let build = move |mode, excluded, groupings, library| {
+        let mut config = (*base(mode, excluded, groupings, library)).clone();
+        config.refresh_metadata = true;
+        Arc::new(config)
+    };
+    let mut config = make_run_cycle_config();
+    config.runtime.refresh_metadata = true;
+    config.metadata.xmp_sidecar = true;
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+    let result = run_cycle(
+        &[&lib_state],
+        &config,
+        Some(db.as_ref()),
+        false,
+        &build,
+        download::DownloadControls::download_hidden(),
+        &shared_session,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("run causality cycle");
+
+    assert_eq!(
+        result.stats.exif_failures, 1,
+        "the physical failure is reported once"
+    );
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let pending_rows = inner
+        .get_pending_metadata_rewrites_page_for_queue(
+            crate::state::db::MetadataRewriteQueue::Ordinary,
+            None,
+            0,
+            10,
+        )
+        .await
+        .expect("read markers");
+    assert_eq!(pending_rows.len(), 1);
+    let pending_row = &pending_rows[0];
+    assert_eq!(pending_row.asset.library.as_ref(), "PrimarySync");
+    assert_eq!(pending_row.asset.id.as_ref(), "master-PrimarySync");
+    assert_eq!(
+        pending_row.asset.version_size,
+        state::VersionSizeKey::Original
+    );
+    assert_eq!(pending_row.source_checksum, None);
+    assert_eq!(pending_row.asset.download_checksum, None);
+    assert!(pending_row.asset.local_checksum.is_some());
+    assert!(pending_row.selection_receipt.is_none());
+    assert!(pending_row.capture_repair_receipt.is_none());
+
+    std::fs::remove_dir(media_path.with_file_name("photo.jpg.xmp")).expect("remove blocker");
+    let repaired = run_cycle(
+        &[&lib_state],
+        &config,
+        Some(db.as_ref()),
+        false,
+        &build,
+        download::DownloadControls::download_hidden(),
+        &shared_session,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("run repair cycle");
+    assert_eq!(repaired.stats.exif_failures, 0);
+    assert!(media_path.with_file_name("photo.jpg.xmp").is_file());
+    assert!(
+        inner
+            .get_pending_metadata_rewrites_page_for_queue(
+                crate::state::db::MetadataRewriteQueue::Ordinary,
+                None,
+                0,
+                10,
+            )
+            .await
+            .expect("read markers")
+            .is_empty()
+    );
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the repair cycle retries the marker and writes the sidecar"
+    );
+
+    let quiet = run_cycle(
+        &[&lib_state],
+        &config,
+        Some(db.as_ref()),
+        false,
+        &build,
+        download::DownloadControls::download_hidden(),
+        &shared_session,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("run quiet cycle");
+    assert_eq!(quiet.stats.exif_failures, 0);
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the quiet cycle performs no additional writer attempt"
+    );
+    eprintln!(
+        "ONE_ATTEMPT pre=1 post=1 exif_failures=1 marker=pending repaired=sidecar quiet=no_writer"
+    );
+}
+
+/// The actual runner carrier extends the same witness through the outer
+/// refresh maintenance. Suppression is a zero new-failure tail with
+/// outstanding witnessed debt, so source revalidation stays closed.
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn runner_outer_witness_keeps_source_revalidation_closed_for_blocked_debt() {
+    let inner = make_state_db();
+    let download_dir = tempfile::tempdir().expect("download tempdir");
+    seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
+    let media_path = download_dir
+        .path()
+        .join(run_cycle_expected_date_dir())
+        .join("photo.jpg");
+    let local_sha = crate::download::file::compute_sha256(&media_path)
+        .await
+        .expect("hash seeded media");
+    inner
+        .mark_downloaded(
+            "PrimarySync",
+            "master-PrimarySync",
+            "original",
+            &media_path,
+            &local_sha,
+            None,
+        )
+        .await
+        .expect("record measured local checksum");
+    inner
+        .record_metadata_write_failure("PrimarySync", "master-PrimarySync", "original")
+        .await
+        .expect("queue pre-existing Ordinary debt");
+    std::fs::create_dir(media_path.with_file_name("photo.jpg.xmp")).expect("block sidecar path");
+    let attempts = download::metadata_rewrite::test_sidecar_attempts(&media_path);
+
+    let db: Arc<dyn download::DownloadStore> = Arc::clone(&inner);
+    let album = make_named_empty_full_album("PrimarySync", "TestAlbum", "zone-tok-new");
+    let lib_state =
+        make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+    let base = make_run_cycle_download_config_builder_with_options(
+        download_dir.path(),
+        Arc::clone(&db),
+        RunCycleDownloadConfigOptions {
+            media: media_without_photo_downloads(),
+            xmp_sidecar: true,
+            ..RunCycleDownloadConfigOptions::default()
+        },
+    );
+    let build = move |mode, excluded, groupings, library| {
+        let mut config = (*base(mode, excluded, groupings, library)).clone();
+        config.refresh_metadata = true;
+        Arc::new(config)
+    };
+    let mut config = make_run_cycle_config();
+    config.runtime.refresh_metadata = true;
+    config.metadata.xmp_sidecar = true;
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    let witness = Arc::new(download::MetadataWriterWitness::default());
+
+    let result = run_cycle_with_witness(
+        &[&lib_state],
+        &config,
+        Some(db.as_ref()),
+        false,
+        &build,
+        download::DownloadControls::download_hidden(),
+        &shared_session,
+        &CancellationToken::new(),
+        Arc::clone(&witness),
+    )
+    .await
+    .expect("run witnessed cycle");
+    let tail = download::drain_pending_metadata_rewrites_witnessed(
+        db.as_ref(),
+        download_dir.path(),
+        &config.metadata,
+        download::CaptureTimestampRepair::Preserve,
+        &["PrimarySync"],
+        Arc::from(".kei-tmp"),
+        &CancellationToken::new(),
+        Some(witness),
+    )
+    .await;
+
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the composed operation makes one physical attempt"
+    );
+    assert_eq!(result.stats.exif_failures, 1);
+    assert_eq!(tail.new_failures, 0);
+    assert!(
+        tail.witnessed_blocked > 0,
+        "the outer drain suppressed the already-witnessed blocked attempt"
+    );
+    assert!(
+        !crate::sync_loop::runner::refresh_tail_allows_source_revalidation(&tail),
+        "source revalidation must remain closed while witnessed debt is outstanding"
+    );
+    assert!(
+        crate::sync_loop::runner::refresh_tail_allows_source_revalidation(
+            &download::RefreshTailOutcome::default()
+        ),
+        "a clean tail still allows source revalidation"
+    );
+    eprintln!(
+        "OUTER_GATE pre=1 new_failures=0 witnessed_blocked={} source_revalidation=closed clean_positive=open",
+        tail.witnessed_blocked
+    );
+}
+
+/// #707: each producer drains once. Unix witnesses suppress a duplicate across
+/// full + bridge producers; unavailable witnesses preserve normal guarded retry.
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn run_cycle_full_enumeration_reports_a_failed_rewrite_once() {
-    for per_pass_paths in [false, true] {
+    for (per_pass_paths, unavailable) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
         let inner = make_state_db();
         let download_dir = tempfile::tempdir().expect("download tempdir");
         seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
@@ -2472,18 +2778,46 @@ async fn run_cycle_full_enumeration_reports_a_failed_rewrite_once() {
                 .join("photo.jpg.xmp"),
         )
         .expect("block the sidecar path");
+        let path = download_dir
+            .path()
+            .join(run_cycle_expected_date_dir())
+            .join("photo.jpg");
+        let physical = download::metadata_rewrite::test_sidecar_attempts(&path);
+        let counting = FailingMetadataSetDb::without_set_failure(Arc::clone(&inner), "unused");
+        let drains = counting.drain_counter();
+        let db: Arc<dyn download::DownloadStore> = Arc::new(counting);
+        #[cfg(unix)]
+        let witness = if unavailable {
+            download::MetadataWriterWitness::with_test_budget(0, 0)
+        } else {
+            download::MetadataWriterWitness::default()
+        };
+        #[cfg(not(unix))]
+        let witness = download::MetadataWriterWitness::default();
+        let expected = if cfg!(unix) && !unavailable { 1 } else { 2 };
 
         let result = run_full_enumeration_metadata_cycle(
-            &inner,
+            &db,
             download_dir.path(),
             per_pass_paths,
+            true,
             download::DownloadControls::download_hidden(),
+            Arc::new(witness),
         )
         .await;
 
         assert_eq!(
-            result.stats.exif_failures, 1,
-            "one failing rewrite must be attempted and reported once (per_pass_paths = {per_pass_paths})"
+            result.stats.exif_failures, expected,
+            "composed attempts (per_pass_paths={per_pass_paths}, unavailable={unavailable})"
+        );
+        assert_eq!(physical.load(std::sync::atomic::Ordering::SeqCst), expected);
+        assert_eq!(
+            drains.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one drain per producer"
+        );
+        eprintln!(
+            "PRODUCER_RETRY per_pass={per_pass_paths} unavailable={unavailable} physical={expected} drains=2"
         );
         assert!(
             !inner
@@ -2509,7 +2843,9 @@ async fn run_cycle_full_enumeration_reports_a_failed_rewrite_once() {
 #[cfg(feature = "xmp")]
 #[tokio::test]
 async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row() {
-    let config = make_run_cycle_config();
+    let mut config = make_run_cycle_config();
+    config.runtime.refresh_metadata = true;
+    config.metadata.xmp_sidecar = true;
     let inner = make_state_db();
     let download_dir = tempfile::tempdir().expect("download tempdir");
     seed_run_cycle_metadata_drift_asset(&inner, download_dir.path()).await;
@@ -2541,7 +2877,7 @@ async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row(
             pass("Captioned", run_cycle_captioned_asset_page()),
         ],
     );
-    let build_download_config = make_run_cycle_download_config_builder_with_options(
+    let base = make_run_cycle_download_config_builder_with_options(
         download_dir.path(),
         Arc::clone(&db),
         RunCycleDownloadConfigOptions {
@@ -2552,6 +2888,11 @@ async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row(
             ..RunCycleDownloadConfigOptions::default()
         },
     );
+    let build_download_config = move |mode: download::SyncMode, excluded, groupings, library| {
+        let mut config = (*base(mode, excluded, groupings, library)).clone();
+        config.refresh_metadata = true;
+        Arc::new(config)
+    };
     let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
 
     run_cycle(
@@ -2582,8 +2923,8 @@ async fn run_cycle_two_passes_over_one_asset_leave_the_sidecar_matching_the_row(
 
     assert_eq!(
         drains.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "the passes must share one drain, so a single writer owns the file"
+        2,
+        "each producer drains once: the two passes share the full-enumeration drain and the bridge is the second producer"
     );
     assert_eq!(
         sidecar.contains("<xmp:Rating>5</xmp:Rating>"),
@@ -3137,7 +3478,15 @@ async fn run_cycle_full_enumeration_writes_no_metadata_in_read_only_modes() {
             .await
             .expect("queue a rewrite");
 
-        run_full_enumeration_metadata_cycle(&inner, download_dir.path(), false, controls).await;
+        run_full_enumeration_metadata_cycle(
+            &inner,
+            download_dir.path(),
+            false,
+            true,
+            controls,
+            Arc::new(download::MetadataWriterWitness::default()),
+        )
+        .await;
 
         assert!(
             !download_dir
@@ -5468,4 +5817,1115 @@ async fn exercise_two_pass_preservation(prior_debt: bool) {
     );
     assert!(server.received_requests().await.unwrap().is_empty());
     eprintln!("PRESERVATION_REACHED prior_debt={prior_debt} quiet_reopen=true");
+}
+
+// ---------------------------------------------------------------------------
+// Authenticated Phase 2 post-proof.
+//
+// The same owned full+bridge fixture from Phase 1 now runs through the
+// production `MetadataWriterWitness` carrier. One physical Destination attempt
+// is expected; the bridge and the outer Ordinary drain suppress the identical
+// retained request without a second physical write.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "xmp", unix))]
+fn prime_support_callsites() {
+    // Tracing callsite interest is process-global. Prime the production support
+    // diagnostics under a live layerless subscriber so later capture layers
+    // receive the DEBUG phase and checkpoint events.
+    tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+        crate::support::observe(
+            "support_pass_completion_v1",
+            serde_json::json!({"component": "initial", "phase": "full"}),
+        );
+        crate::support::observe(
+            "support_checkpoint_v1",
+            serde_json::json!({"phase": "probe"}),
+        );
+    });
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[derive(Clone, Debug)]
+struct WitnessEvent {
+    fields: std::collections::HashMap<String, String>,
+}
+
+#[cfg(all(feature = "xmp", unix))]
+impl WitnessEvent {
+    fn field(&self, name: &str) -> Option<&str> {
+        self.fields.get(name).map(String::as_str)
+    }
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[derive(Clone, Default)]
+struct WitnessLog {
+    events: Arc<std::sync::Mutex<Vec<WitnessEvent>>>,
+}
+
+#[cfg(all(feature = "xmp", unix))]
+impl WitnessLog {
+    fn layer(&self) -> WitnessLayer {
+        WitnessLayer {
+            events: Arc::clone(&self.events),
+        }
+    }
+
+    fn events(&self) -> Vec<WitnessEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[cfg(all(feature = "xmp", unix))]
+struct WitnessLayer {
+    events: Arc<std::sync::Mutex<Vec<WitnessEvent>>>,
+}
+
+#[cfg(all(feature = "xmp", unix))]
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WitnessLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = WitnessVisitor::default();
+        event.record(&mut visitor);
+        let interesting = visitor.fields.contains_key("diagnostic")
+            || visitor.fields.values().any(|value| {
+                value.contains("baseline source revalidation")
+                    || value.contains("inventory_delta_bridge_failed")
+                    || value.contains("Invalid changes/zone cardinality")
+            });
+        if interesting {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(WitnessEvent {
+                    fields: visitor.fields,
+                });
+        }
+    }
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[derive(Default)]
+struct WitnessVisitor {
+    fields: std::collections::HashMap<String, String>,
+}
+
+#[cfg(all(feature = "xmp", unix))]
+impl tracing::field::Visit for WitnessVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.fields
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+}
+
+#[cfg(all(feature = "xmp", unix))]
+async fn seed_verified_queued_sidecar(
+    inner: &Arc<dyn download::DownloadStore>,
+    download_dir: &std::path::Path,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    seed_run_cycle_metadata_drift_asset(inner, download_dir).await;
+    let path = download_dir
+        .join(run_cycle_expected_date_dir())
+        .join("photo.jpg");
+    let checksum = data_encoding::HEXLOWER.encode(&Sha256::digest(std::fs::read(&path).unwrap()));
+    inner
+        .mark_downloaded(
+            "PrimarySync",
+            "master-PrimarySync",
+            "original",
+            &path,
+            &checksum,
+            None,
+        )
+        .await
+        .unwrap();
+    checksum
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[derive(Clone)]
+struct AuthenticatedQueuedSession {
+    zone: serde_json::Value,
+    predecessor: &'static str,
+    successor: &'static str,
+    records: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+    lookups: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(all(feature = "xmp", unix))]
+impl AuthenticatedQueuedSession {
+    fn record(&self, label: String) {
+        self.requests.lock().unwrap().push(label);
+    }
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for AuthenticatedQueuedSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        let request: serde_json::Value = serde_json::from_str(&body)?;
+        if url.ends_with("/zones/list") {
+            self.record("zones/list".into());
+            return Ok(serde_json::json!({"zones": [{
+                "zoneID": self.zone,
+                "syncToken": self.predecessor,
+                "moreComing": false,
+                "records": []
+            }]}));
+        }
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            self.record("readiness".into());
+            return Ok(serde_json::json!({"records": [{
+                "recordName": "index",
+                "recordType": "CheckIndexingState",
+                "fields": {"state": {"value": "FINISHED"}}
+            }]}));
+        }
+        if url.contains("/internal/records/query/batch") {
+            self.record("count".into());
+            let count = (self.records.lock().unwrap().len() / 2) as u64;
+            return Ok(album_count_response(count));
+        }
+        if url.contains("/changes/zone?") {
+            let has_token = request["zones"][0]["syncToken"].is_string();
+            self.record(if has_token {
+                "bridge-delta".into()
+            } else {
+                "inventory-delta".into()
+            });
+            let records = if has_token {
+                Vec::new()
+            } else {
+                self.records.lock().unwrap().clone()
+            };
+            return Ok(serde_json::json!({"zones": [{
+                "zoneID": self.zone,
+                "syncToken": self.successor,
+                "moreComing": false,
+                "records": records
+            }]}));
+        }
+        if url.contains("/records/lookup?") {
+            self.lookups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.record("lookup".into());
+            let requested = request["records"].as_array().cloned().unwrap_or_default();
+            let selected: Vec<_> = self
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|record| {
+                    requested
+                        .iter()
+                        .any(|item| item["recordName"] == record["recordName"])
+                })
+                .cloned()
+                .collect();
+            return Ok(serde_json::json!({"records": selected}));
+        }
+        if url.contains("/records/query?") {
+            let rank = request["query"]["filterBy"].as_array().and_then(|filters| {
+                filters
+                    .iter()
+                    .find(|filter| filter["fieldName"] == "startRank")
+                    .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+            });
+            if let Some(offset) = rank {
+                self.record(format!("rank:{offset}"));
+                let records = if offset == 0 {
+                    self.records.lock().unwrap().clone()
+                } else {
+                    Vec::new()
+                };
+                return Ok(serde_json::json!({"records": records, "syncToken": self.successor}));
+            }
+            self.record("records/query".into());
+            return Ok(serde_json::json!({"records": [], "syncToken": self.successor}));
+        }
+        anyhow::bail!("authenticated queued fixture: unexpected endpoint {url}")
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(all(feature = "xmp", unix))]
+struct HeldPathSnapshot {
+    path: std::path::PathBuf,
+    held: std::fs::File,
+    identity: (u64, u64),
+    mode: u32,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    sha256: Option<[u8; 32]>,
+    parent: std::fs::File,
+    parent_identity: (u64, u64),
+    parent_mtime: (i64, i64),
+    parent_ctime: (i64, i64),
+}
+
+#[cfg(all(feature = "xmp", unix))]
+impl HeldPathSnapshot {
+    fn hold(path: &std::path::Path, hash_contents: bool) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        let held = std::fs::File::open(path).expect("hold snapshot entry");
+        let meta = held.metadata().expect("snapshot entry metadata");
+        let parent_path = path.parent().expect("snapshot parent");
+        let parent = std::fs::File::open(parent_path).expect("hold snapshot parent");
+        let parent_meta = parent.metadata().expect("snapshot parent metadata");
+        let sha256 = hash_contents.then(|| {
+            use sha2::Digest as _;
+            let bytes = std::fs::read(path).expect("snapshot contents");
+            <[u8; 32]>::from(sha2::Sha256::digest(&bytes))
+        });
+        Self {
+            path: path.to_path_buf(),
+            identity: (meta.dev(), meta.ino()),
+            mode: meta.mode(),
+            size: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+            sha256,
+            held,
+            parent,
+            parent_identity: (parent_meta.dev(), parent_meta.ino()),
+            parent_mtime: (parent_meta.mtime(), parent_meta.mtime_nsec()),
+            parent_ctime: (parent_meta.ctime(), parent_meta.ctime_nsec()),
+        }
+    }
+
+    fn unchanged(&self) -> bool {
+        use sha2::Digest as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let Ok(meta) = std::fs::symlink_metadata(&self.path) else {
+            return false;
+        };
+        let Ok(held_meta) = self.held.metadata() else {
+            return false;
+        };
+        let Ok(parent_held) = self.parent.metadata() else {
+            return false;
+        };
+        let Ok(parent_meta) = std::fs::metadata(self.path.parent().unwrap()) else {
+            return false;
+        };
+        let identity_matches = (meta.dev(), meta.ino()) == self.identity
+            && (held_meta.dev(), held_meta.ino()) == self.identity
+            && (parent_held.dev(), parent_held.ino()) == self.parent_identity
+            && (parent_meta.dev(), parent_meta.ino()) == self.parent_identity;
+        let content_matches = self.sha256.is_none_or(|expected| {
+            std::fs::read(&self.path)
+                .ok()
+                .is_some_and(|bytes| <[u8; 32]>::from(sha2::Sha256::digest(&bytes)) == expected)
+        });
+        identity_matches
+            && meta.mode() == self.mode
+            && meta.len() == self.size
+            && (meta.mtime(), meta.mtime_nsec()) == self.mtime
+            && (meta.ctime(), meta.ctime_nsec()) == self.ctime
+            && (parent_meta.mtime(), parent_meta.mtime_nsec()) == self.parent_mtime
+            && (parent_meta.ctime(), parent_meta.ctime_nsec()) == self.parent_ctime
+            && content_matches
+    }
+
+    /// The entry itself stays byte- and identity-identical. The parent
+    /// directory is allowed to change when the legitimate sidecar entry is
+    /// created after the owned blocker is removed.
+    fn entry_unchanged(&self) -> bool {
+        use sha2::Digest as _;
+        use std::os::unix::fs::MetadataExt as _;
+        let Ok(meta) = std::fs::symlink_metadata(&self.path) else {
+            return false;
+        };
+        let Ok(held_meta) = self.held.metadata() else {
+            return false;
+        };
+        let content_matches = self.sha256.is_none_or(|expected| {
+            std::fs::read(&self.path)
+                .ok()
+                .is_some_and(|bytes| <[u8; 32]>::from(sha2::Sha256::digest(&bytes)) == expected)
+        });
+        (meta.dev(), meta.ino()) == self.identity
+            && (held_meta.dev(), held_meta.ino()) == self.identity
+            && meta.mode() == self.mode
+            && meta.len() == self.size
+            && (meta.mtime(), meta.mtime_nsec()) == self.mtime
+            && (meta.ctime(), meta.ctime_nsec()) == self.ctime
+            && content_matches
+    }
+}
+
+#[cfg(all(feature = "xmp", unix))]
+async fn run_full_enumeration_metadata_cycle_authenticated(
+    sqlite: &Arc<state::SqliteStateDb>,
+    inner: &Arc<dyn download::DownloadStore>,
+    owner: &state::db::account::AccountOwner,
+    download_dir: &std::path::Path,
+    inventory: Vec<serde_json::Value>,
+    refresh: bool,
+    witness: Arc<download::MetadataWriterWitness>,
+) -> (
+    crate::sync_cycle::CycleResult,
+    AuthenticatedQueuedSession,
+    bool,
+) {
+    use crate::commands::{AlbumPass, PassKind};
+    use crate::icloud::photos::PhotoLibrary;
+    use crate::icloud::photos::inbox::ShadowCapture;
+
+    let zone = serde_json::json!({
+        "zoneName": "PrimarySync",
+        "ownerRecordName": "_defaultOwner"
+    });
+    let session = AuthenticatedQueuedSession {
+        zone: zone.clone(),
+        predecessor: "zone-history-predecessor",
+        successor: "zone-history-successor",
+        records: Arc::new(std::sync::Mutex::new(inventory)),
+        requests: Arc::default(),
+        lookups: Arc::default(),
+    };
+    let mut library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(session.clone()),
+        Arc::new(zone),
+        "private".into(),
+        retry::RetryConfig::default(),
+    )
+    .await
+    .expect("authenticated photo library");
+    assert!(
+        library.is_qualified_private_primary(),
+        "fixture must own the full private primary zone"
+    );
+    let indexing_finished = library.last_indexing_finished();
+    library.shadow_capture = Some(ShadowCapture::new(Arc::clone(sqlite), owner.clone(), "com"));
+    let mut lib_state = make_run_cycle_library_state_with_passes(
+        "PrimarySync",
+        "sync_token:PrimarySync",
+        vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: library.all(),
+            exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+        }],
+    );
+    lib_state.library = library;
+
+    let mut config = make_run_cycle_config();
+    config.runtime.refresh_metadata = refresh;
+    config.metadata.xmp_sidecar = true;
+    let base = make_run_cycle_download_config_builder_with_options(
+        download_dir,
+        Arc::clone(inner),
+        RunCycleDownloadConfigOptions {
+            media: crate::config::MediaSelection::default(),
+            xmp_sidecar: true,
+            per_pass_paths: false,
+            ..RunCycleDownloadConfigOptions::default()
+        },
+    );
+    let build_download_config = |mode, excluded, groupings, library| {
+        let mut config = (*base(mode, excluded, groupings, library)).clone();
+        config.refresh_metadata = refresh;
+        Arc::new(config)
+    };
+    let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+    let result = Box::pin(run_cycle_with_witness(
+        &[&lib_state],
+        &config,
+        Some(inner.as_ref()),
+        false,
+        &build_download_config,
+        download::DownloadControls::download_hidden(),
+        &shared_session,
+        &CancellationToken::new(),
+        witness,
+    ))
+    .await
+    .expect("authenticated witnessed run cycle");
+    (result, session, indexing_finished)
+}
+
+#[cfg(all(feature = "xmp", unix))]
+fn assert_auth_route_and_phases(
+    session: &AuthenticatedQueuedSession,
+    events: &[WitnessEvent],
+    require_bridge: bool,
+    require_zones_list: bool,
+) {
+    let requests = session.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.first().map(String::as_str),
+        Some("readiness"),
+        "authenticated readiness is the first provider route: {requests:?}"
+    );
+    if require_zones_list {
+        assert!(requests.iter().any(|request| request == "zones/list"));
+    }
+    assert!(requests.iter().any(|request| request == "count"));
+    if require_bridge {
+        assert!(requests.iter().any(|request| request == "bridge-delta"));
+    }
+    let phases: Vec<(String, String)> = events
+        .iter()
+        .filter(|event| event.field("diagnostic") == Some("support_pass_completion_v1"))
+        .filter_map(|event| event.field("support_fields"))
+        .filter_map(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .map(|fields| {
+            (
+                fields["component"].as_str().unwrap_or("").to_owned(),
+                fields["phase"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect::<Vec<(String, String)>>();
+    assert!(
+        phases
+            .iter()
+            .any(|(component, phase)| component == "initial" && phase == "full"),
+        "full inventory component missing: {phases:?}"
+    );
+    if require_bridge {
+        assert!(
+            phases
+                .iter()
+                .any(|(component, phase)| component == "delta_bridge" && phase == "incremental"),
+            "authenticated bridge component missing: {phases:?}"
+        );
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.fields.values().any(|value| {
+                value.contains("inventory_delta_bridge_failed")
+                    || value.contains("Invalid changes/zone cardinality")
+            })),
+        "the bridge must not fall back to a full inventory"
+    );
+}
+
+#[cfg(all(feature = "xmp", unix))]
+fn checkpoint_refused(events: &[WitnessEvent]) -> bool {
+    events.iter().any(|event| {
+        event
+            .fields
+            .values()
+            .any(|value| value.contains("baseline source revalidation lacks completed proof"))
+    })
+}
+
+#[cfg(all(feature = "xmp", unix))]
+fn physical_request_count(events: &[WitnessEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| event.field("diagnostic") == Some("test_queued_writer_request_v1"))
+        .count()
+}
+
+#[cfg(all(feature = "xmp", unix))]
+fn physical_outcomes(events: &[WitnessEvent]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter(|event| event.field("diagnostic") == Some("test_queued_writer_outcome_v1"))
+        .filter_map(|event| {
+            event
+                .field("test_writer_fields")
+                .and_then(|value| serde_json::from_str(value).ok())
+        })
+        .collect()
+}
+
+#[cfg(all(feature = "xmp", unix))]
+async fn authenticated_fixture(
+    temp: &std::path::Path,
+) -> (
+    Arc<state::SqliteStateDb>,
+    Arc<dyn download::DownloadStore>,
+    state::db::account::AccountOwner,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    String,
+) {
+    let owner = crate::sync_loop::test_support::run_cycle_account_owner();
+    let sqlite = Arc::new(
+        state::SqliteStateDb::open_owned(&temp.join("state.db"), &owner)
+            .await
+            .unwrap(),
+    );
+    let inner: Arc<dyn download::DownloadStore> = sqlite.clone();
+    let checksum = seed_verified_queued_sidecar(&inner, temp).await;
+    sqlite
+        .record_metadata_write_failure("PrimarySync", "master-PrimarySync", "original")
+        .await
+        .unwrap();
+    let media = temp.join(run_cycle_expected_date_dir()).join("photo.jpg");
+    let sidecar = media.with_file_name("photo.jpg.xmp");
+    std::fs::create_dir(&sidecar).expect("block the sidecar path");
+    (sqlite, inner, owner, media, sidecar, checksum)
+}
+
+#[cfg(all(feature = "xmp", unix))]
+async fn ordinary_pending(
+    inner: &Arc<dyn download::DownloadStore>,
+) -> Vec<state::db::PendingMetadataRewrite> {
+    inner
+        .get_pending_metadata_rewrites_page_for_queue(
+            state::db::MetadataRewriteQueue::Ordinary,
+            None,
+            0,
+            10,
+        )
+        .await
+        .unwrap()
+}
+
+#[cfg(all(feature = "xmp", unix))]
+async fn receipts_count(sqlite: &Arc<state::SqliteStateDb>) -> i64 {
+    sqlite
+        .acquire_lock("phase2 receipts")
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM download_receipts", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[cfg(all(feature = "xmp", unix))]
+fn open_fd_count() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(std::fs::read_dir("/proc/self/fd").ok()?.count())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(std::fs::read_dir("/dev/fd").ok()?.count())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CheckpointSnapshot {
+    active: Option<String>,
+    baseline: Vec<(String, String)>,
+    status: Option<String>,
+    recovery: Option<String>,
+}
+
+#[cfg(all(feature = "xmp", unix))]
+async fn checkpoint_snapshot(
+    inner: &Arc<dyn download::DownloadStore>,
+    sqlite: &Arc<state::SqliteStateDb>,
+) -> CheckpointSnapshot {
+    let active = inner.get_metadata("sync_token:PrimarySync").await.unwrap();
+    let status = inner.get_metadata("last_checkpoint_status").await.unwrap();
+    let recovery = inner.get_metadata("last_recovery_action").await.unwrap();
+    let baseline: Vec<(String, String)> = sqlite
+        .acquire_lock("qualification checkpoint snapshot")
+        .unwrap()
+        .prepare(
+            "SELECT key, value FROM metadata \
+             WHERE key LIKE 'baseline_cursor:v27:%' ORDER BY key",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    CheckpointSnapshot {
+        active,
+        baseline,
+        status,
+        recovery,
+    }
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn run_cycle_authenticated_eligible_ordinary_sidecar_reports_one_physical_attempt() {
+    if crate::test_helpers::isolate_process_fds(
+        "sync_loop::runner::tests::metadata::run_cycle_authenticated_eligible_ordinary_sidecar_reports_one_physical_attempt",
+    ).await {
+        return;
+    }
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    prime_support_callsites();
+    let temp = tempfile::tempdir().expect("download tempdir").keep();
+    let (sqlite, inner, owner, media, sidecar, checksum) = authenticated_fixture(&temp).await;
+    let download_dir = temp.clone();
+    let media_hold = HeldPathSnapshot::hold(&media, true);
+    let sidecar_hold = HeldPathSnapshot::hold(&sidecar, false);
+    let attempts = download::metadata_rewrite::test_sidecar_attempts(&media);
+    let prior_checkpoint = checkpoint_snapshot(&inner, &sqlite).await;
+    eprintln!("PHASE2_CHECKPOINT_PRIOR {prior_checkpoint:?}");
+    assert_eq!(prior_checkpoint.active, None);
+    assert!(prior_checkpoint.baseline.is_empty());
+    assert_eq!(prior_checkpoint.status, None);
+    assert_eq!(prior_checkpoint.recovery, None);
+    let fds_before = open_fd_count();
+    eprintln!("PHASE2_FDS_BEFORE {fds_before:?}");
+
+    // First composed operation: one cycle and its own witness.
+    let witness = Arc::new(download::MetadataWriterWitness::default());
+    let log = WitnessLog::default();
+    let (result, session, indexing_finished) = run_full_enumeration_metadata_cycle_authenticated(
+        &sqlite,
+        &inner,
+        &owner,
+        &download_dir,
+        Vec::new(),
+        true,
+        Arc::clone(&witness),
+    )
+    .with_subscriber(
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with(log.layer()),
+    )
+    .await;
+    let events = log.events();
+    let first_checkpoint = checkpoint_snapshot(&inner, &sqlite).await;
+    eprintln!("PHASE2_CHECKPOINT_FIRST {first_checkpoint:?}");
+    assert_eq!(
+        first_checkpoint.active, None,
+        "the active provider checkpoint must not advance"
+    );
+    assert_eq!(first_checkpoint.status, None);
+    assert_eq!(first_checkpoint.recovery, None);
+    assert_eq!(first_checkpoint.baseline.len(), 1);
+    assert!(
+        first_checkpoint
+            .baseline
+            .iter()
+            .all(|(_, value)| value == "zone-history-predecessor"),
+        "the baseline cursor must retain the actual prior provider token"
+    );
+    let pending = ordinary_pending(&inner).await;
+    let receipts = receipts_count(&sqlite).await;
+    let (calls, matches, unchanged) = witness.test_suppression_counts();
+    let outcomes = physical_outcomes(&events);
+    eprintln!(
+        "PHASE2_FIRST attempts={} exif={} pending={} receipts={} suppress_calls={calls} matches={matches} unchanged={unchanged} physical_requests={}",
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        result.stats.exif_failures,
+        pending.len(),
+        receipts,
+        physical_request_count(&events),
+    );
+    eprintln!(
+        "PHASE2_FIRST_ROUTE {:?}",
+        session.requests.lock().unwrap().clone()
+    );
+    let fds_during = open_fd_count();
+    eprintln!("PHASE2_FDS_DURING {fds_during:?}");
+    drop(witness);
+    let fds_after = open_fd_count();
+    eprintln!("PHASE2_FDS_AFTER {fds_after:?}");
+    if let (Some(before), Some(during), Some(after)) = (fds_before, fds_during, fds_after) {
+        assert!(
+            during >= before + 4,
+            "the witness must retain its entry handles: before={before} during={during}"
+        );
+        assert!(
+            after <= before,
+            "dropping the operation must release every retained entry handle: \
+             before={before} after={after}"
+        );
+    }
+
+    assert!(
+        indexing_finished,
+        "authenticated readiness must be FINISHED"
+    );
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "full+bridge composed operation makes one physical attempt"
+    );
+    assert_eq!(
+        result.stats.exif_failures, 1,
+        "one physical failure reported"
+    );
+    assert_eq!(physical_request_count(&events), 1);
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0]["failed_sidecar_attempt"], "Destination");
+    assert_eq!(outcomes[0]["success"], false);
+    assert!(
+        matches >= 1,
+        "the bridge request must match the retained one"
+    );
+    assert_eq!(
+        unchanged, matches,
+        "retained media and entry must be unchanged"
+    );
+    assert_eq!(pending.len(), 1, "the Ordinary debt must survive");
+    assert_eq!(
+        pending[0].asset.local_checksum.as_deref(),
+        Some(checksum.as_str())
+    );
+    assert_eq!(pending[0].asset.download_checksum, None);
+    assert_eq!(pending[0].source_checksum, None);
+    assert!(pending[0].selection_receipt.is_none());
+    assert!(pending[0].capture_repair_receipt.is_none());
+    assert_eq!(receipts, 0);
+    assert!(media_hold.unchanged(), "media must remain unchanged");
+    assert!(
+        sidecar_hold.unchanged(),
+        "blocking entry must remain unchanged"
+    );
+    assert_eq!(std::fs::read(&media).unwrap(), vec![0u8; 1024]);
+    assert!(
+        checkpoint_refused(&events),
+        "missing source proof must refuse"
+    );
+    assert!(result.stats.state_write_failures >= 1);
+    assert_eq!(result.stats.downloaded, 0);
+    assert_eq!(
+        result.stats.full_enumeration_reason,
+        Some(download::FullEnumerationReason::MetadataBackfill)
+    );
+    assert_auth_route_and_phases(&session, &events, true, true);
+
+    // Fresh composed operation: a new witness must not inherit suppression.
+    let witness2 = Arc::new(download::MetadataWriterWitness::default());
+    let log2 = WitnessLog::default();
+    let (second, session2, _) = run_full_enumeration_metadata_cycle_authenticated(
+        &sqlite,
+        &inner,
+        &owner,
+        &download_dir,
+        Vec::new(),
+        true,
+        Arc::clone(&witness2),
+    )
+    .with_subscriber(
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with(log2.layer()),
+    )
+    .await;
+    let events2 = log2.events();
+    assert_auth_route_and_phases(&session2, &events2, true, false);
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a fresh composed operation gets a new physical attempt"
+    );
+    assert_eq!(second.stats.exif_failures, 1);
+    assert!(media_hold.unchanged());
+    assert!(sidecar_hold.unchanged());
+    assert_eq!(ordinary_pending(&inner).await.len(), 1);
+    assert!(
+        session2
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request == "bridge-delta")
+    );
+    let second_checkpoint = checkpoint_snapshot(&inner, &sqlite).await;
+    eprintln!("PHASE2_CHECKPOINT_SECOND {second_checkpoint:?}");
+    assert_eq!(
+        second_checkpoint, first_checkpoint,
+        "a fresh composed operation must not advance the checkpoint"
+    );
+    assert!(checkpoint_refused(&events2));
+    assert!(second.stats.state_write_failures >= 1);
+
+    // Remove only the owned blocker, then a fresh operation writes the sidecar
+    // and retires the Ordinary marker without touching media provenance.
+    std::fs::remove_dir(&sidecar).expect("remove the owned blocker directory");
+    let witness3 = Arc::new(download::MetadataWriterWitness::default());
+    let log3 = WitnessLog::default();
+    let (repair, session3, _) = run_full_enumeration_metadata_cycle_authenticated(
+        &sqlite,
+        &inner,
+        &owner,
+        &download_dir,
+        Vec::new(),
+        true,
+        Arc::clone(&witness3),
+    )
+    .with_subscriber(
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with(log3.layer()),
+    )
+    .await;
+    let events3 = log3.events();
+    assert_auth_route_and_phases(&session3, &events3, true, false);
+    let repaired_pending = ordinary_pending(&inner).await;
+    let repaired_receipts = receipts_count(&sqlite).await;
+    let rows = inner.get_downloaded_page(0, 10).await.unwrap();
+    eprintln!(
+        "PHASE2_REPAIR attempts={} exif={} pending={} receipts={} sidecar_file={}",
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        repair.stats.exif_failures,
+        repaired_pending.len(),
+        repaired_receipts,
+        sidecar.is_file(),
+    );
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "the repair operation makes exactly one new sidecar write attempt"
+    );
+    assert_eq!(repair.stats.exif_failures, 0);
+    assert!(sidecar.is_file(), "the sidecar must be written");
+    assert!(!std::fs::read(&sidecar).unwrap().is_empty());
+    assert!(
+        repaired_pending.is_empty(),
+        "the Ordinary marker must retire"
+    );
+    assert_eq!(repaired_receipts, 0);
+    assert_eq!(std::fs::read(&media).unwrap(), vec![0u8; 1024]);
+    assert!(
+        media_hold.entry_unchanged(),
+        "media identity and bytes stay unchanged"
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].local_checksum.as_deref(), Some(checksum.as_str()));
+    assert_eq!(rows[0].download_checksum, None);
+    assert!(
+        session3
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request == "bridge-delta")
+    );
+    let repair_checkpoint = checkpoint_snapshot(&inner, &sqlite).await;
+    eprintln!("PHASE2_CHECKPOINT_REPAIR {repair_checkpoint:?}");
+    assert_eq!(
+        repair_checkpoint, first_checkpoint,
+        "the sidecar repair must not advance the checkpoint"
+    );
+    assert!(checkpoint_refused(&events3));
+    assert!(repair.stats.state_write_failures >= 1);
+
+    // Quiet fresh operation: no writer attempt.
+    let witness4 = Arc::new(download::MetadataWriterWitness::default());
+    let quiet_log = WitnessLog::default();
+    let (quiet, session4, _) = run_full_enumeration_metadata_cycle_authenticated(
+        &sqlite,
+        &inner,
+        &owner,
+        &download_dir,
+        Vec::new(),
+        false,
+        Arc::clone(&witness4),
+    )
+    .with_subscriber(
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with(quiet_log.layer()),
+    )
+    .await;
+    let quiet_events = quiet_log.events();
+    let quiet_sidecar = std::fs::read(&sidecar).unwrap();
+    let quiet_checkpoint = checkpoint_snapshot(&inner, &sqlite).await;
+    eprintln!("PHASE2_CHECKPOINT_QUIET {quiet_checkpoint:?}");
+    assert_eq!(
+        quiet_checkpoint.active, None,
+        "quiet must not advance the durable provider checkpoint"
+    );
+    assert_eq!(quiet_checkpoint.status, None);
+    assert_eq!(quiet_checkpoint.recovery, None);
+    assert!(
+        quiet_checkpoint
+            .baseline
+            .iter()
+            .all(|(_, value)| value == "zone-history-predecessor"),
+        "quiet must not persist the provider successor as a baseline"
+    );
+    eprintln!(
+        "PHASE2_QUIET attempts={} exif={} state_write_failures={} refusal={} route={:?}",
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        quiet.stats.exif_failures,
+        quiet.stats.state_write_failures,
+        checkpoint_refused(&quiet_events),
+        session4.requests.lock().unwrap().clone(),
+    );
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "the quiet operation performs no writer attempt"
+    );
+    assert_eq!(quiet.stats.exif_failures, 0);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), quiet_sidecar);
+    assert_eq!(std::fs::read(&media).unwrap(), vec![0u8; 1024]);
+    assert!(media_hold.entry_unchanged());
+    assert!(ordinary_pending(&inner).await.is_empty());
+    // The source-revalidation checkpoint does not acquire proof from the empty
+    // inventory, so the quiet operation must still refuse honestly rather than
+    // pass a false clean advance.
+    assert!(
+        quiet.stats.state_write_failures > 0,
+        "the empty inventory still lacks completed source proof"
+    );
+    assert!(
+        checkpoint_refused(&quiet_events),
+        "quiet must keep the missing-source-proof refusal"
+    );
+    assert_auth_route_and_phases(&session4, &quiet_events, true, false);
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn runner_authenticated_outer_witness_keeps_source_revalidation_closed() {
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    prime_support_callsites();
+    let temp = tempfile::tempdir().expect("download tempdir").keep();
+    let (sqlite, inner, owner, media, sidecar, checksum) = authenticated_fixture(&temp).await;
+    let download_dir = temp.clone();
+    let media_hold = HeldPathSnapshot::hold(&media, true);
+    let sidecar_hold = HeldPathSnapshot::hold(&sidecar, false);
+    let attempts = download::metadata_rewrite::test_sidecar_attempts(&media);
+    let prior_checkpoint = checkpoint_snapshot(&inner, &sqlite).await;
+    eprintln!("PHASE2_OUTER_CHECKPOINT_PRIOR {prior_checkpoint:?}");
+    assert_eq!(prior_checkpoint.active, None);
+    assert!(prior_checkpoint.baseline.is_empty());
+    assert_eq!(prior_checkpoint.status, None);
+    assert_eq!(prior_checkpoint.recovery, None);
+    let witness = Arc::new(download::MetadataWriterWitness::default());
+    let log = WitnessLog::default();
+    let (result, session, _) = run_full_enumeration_metadata_cycle_authenticated(
+        &sqlite,
+        &inner,
+        &owner,
+        &download_dir,
+        Vec::new(),
+        true,
+        Arc::clone(&witness),
+    )
+    .with_subscriber(
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with(log.layer()),
+    )
+    .await;
+    let events = log.events();
+    let metadata = crate::config::MetadataConfig {
+        xmp_sidecar: true,
+        ..crate::config::MetadataConfig::default()
+    };
+    let tail = download::drain_pending_metadata_rewrites_witnessed(
+        inner.as_ref(),
+        &download_dir,
+        &metadata,
+        download::CaptureTimestampRepair::Preserve,
+        &["PrimarySync"],
+        Arc::from(".kei-tmp"),
+        &CancellationToken::new(),
+        Some(Arc::clone(&witness)),
+    )
+    .await;
+    let pending = ordinary_pending(&inner).await;
+    let receipts = receipts_count(&sqlite).await;
+    let after_checkpoint = checkpoint_snapshot(&inner, &sqlite).await;
+    eprintln!("PHASE2_OUTER_CHECKPOINT_AFTER {after_checkpoint:?}");
+    assert_eq!(
+        after_checkpoint.active, None,
+        "the composed outer operation must not advance the durable checkpoint"
+    );
+    assert_eq!(after_checkpoint.status, None);
+    assert_eq!(after_checkpoint.recovery, None);
+    assert!(
+        after_checkpoint
+            .baseline
+            .iter()
+            .all(|(_, value)| value == "zone-history-predecessor"),
+        "the outer drain must retain the actual prior provider token"
+    );
+    eprintln!(
+        "PHASE2_OUTER attempts={} exif={} new_failures={} witnessed_blocked={} pending={} receipts={}",
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        result.stats.exif_failures,
+        tail.new_failures,
+        tail.witnessed_blocked,
+        pending.len(),
+        receipts,
+    );
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the outer drain must not make a second physical attempt"
+    );
+    assert_eq!(result.stats.exif_failures, 1);
+    assert_eq!(tail.new_failures, 0, "suppression is not a new failure");
+    assert!(
+        tail.witnessed_blocked > 0,
+        "the outer drain must suppress the already-witnessed blocked attempt"
+    );
+    assert!(
+        !crate::sync_loop::runner::refresh_tail_allows_source_revalidation(&tail),
+        "source revalidation must remain closed while witnessed debt is outstanding"
+    );
+    assert!(
+        crate::sync_loop::runner::refresh_tail_allows_source_revalidation(
+            &download::RefreshTailOutcome::default()
+        ),
+        "a clean tail still allows source revalidation"
+    );
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].asset.local_checksum.as_deref(),
+        Some(checksum.as_str())
+    );
+    assert_eq!(pending[0].asset.download_checksum, None);
+    assert_eq!(pending[0].source_checksum, None);
+    assert_eq!(receipts, 0);
+    assert!(media_hold.unchanged());
+    assert!(sidecar_hold.unchanged());
+    assert!(checkpoint_refused(&events));
+    assert!(result.stats.state_write_failures >= 1);
+    assert_auth_route_and_phases(&session, &events, true, true);
 }

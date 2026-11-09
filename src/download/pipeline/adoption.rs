@@ -217,6 +217,7 @@ pub(super) async fn recover_pending_current_publications(
             asset,
             task_planner,
             derived.version_size,
+            None,
             shutdown,
         )
         .await?

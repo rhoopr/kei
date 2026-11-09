@@ -1030,6 +1030,10 @@ async fn run_epoch_local_recovery(
     })
 }
 
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "tests exercise the unchanged run_cycle entry")
+)]
 pub(crate) async fn run_cycle(
     library_states: &[&LibraryState],
     config: &config::Config,
@@ -1039,6 +1043,36 @@ pub(crate) async fn run_cycle(
     download_controls: download::DownloadControls,
     shared_session: &auth::SharedSession,
     shutdown_token: &CancellationToken,
+) -> anyhow::Result<CycleResult> {
+    let metadata_witness = Arc::new(download::MetadataWriterWitness::default());
+    run_cycle_with_witness(
+        library_states,
+        config,
+        state_db,
+        is_retry_failed,
+        build_download_config,
+        download_controls,
+        shared_session,
+        shutdown_token,
+        metadata_witness,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "keeps the unchanged run_cycle signature and adds only the transient witness"
+)]
+pub(crate) async fn run_cycle_with_witness(
+    library_states: &[&LibraryState],
+    config: &config::Config,
+    state_db: Option<&dyn download::DownloadStore>,
+    is_retry_failed: bool,
+    build_download_config: &BuildDownloadConfigFn<'_>,
+    download_controls: download::DownloadControls,
+    shared_session: &auth::SharedSession,
+    shutdown_token: &CancellationToken,
+    metadata_witness: Arc<download::MetadataWriterWitness>,
 ) -> anyhow::Result<CycleResult> {
     let sync_epoch = match state_db {
         Some(db) => db.sync_epoch_id().await?,
@@ -1768,6 +1802,8 @@ pub(crate) async fn run_cycle(
             Arc::from(lib_state.zone_name.as_str()),
         );
         download_config = Arc::new(download_config.check_ownership().await?);
+        Arc::make_mut(&mut download_config).metadata_write_witness =
+            Some(Arc::clone(&metadata_witness));
         if let Err(error) = download::prepare_retained_sources(
             &lib_state.plan.passes,
             &download_config,
@@ -2064,6 +2100,8 @@ pub(crate) async fn run_cycle(
                             zone = %lib_state.zone_name,
                             "Inventory reconciliation complete; bridging changes from the preserved provider checkpoint"
                         );
+                        Arc::make_mut(&mut bridge_config).metadata_write_witness =
+                            Some(Arc::clone(&metadata_witness));
                         Arc::make_mut(&mut bridge_config).sparse_targets =
                             Arc::clone(&download_config.sparse_targets);
                         Arc::make_mut(&mut bridge_config).prior_inventory_proof =

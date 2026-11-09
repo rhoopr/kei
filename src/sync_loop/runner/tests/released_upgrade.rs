@@ -237,12 +237,17 @@ async fn released_v0240_failed_history_recovers_after_upgrade_and_restart() {
     }
     server.verify().await;
     // Exercise the same authenticated migration boundary with reconstructed
-    // Primary still/motion history and a selected Shared child.
-    for scenario in [None, Some("tail"), Some("foreign")] {
+    // history. Each case is independent and owns its server, database and
+    // expected tree.
+    for case in [
+        super::v027_baseline::released_schema::ReleasedSchemaCase::ForeignOwnerNegative,
+        super::v027_baseline::released_schema::ReleasedSchemaCase::CurrentIdentityReuse,
+        super::v027_baseline::released_schema::ReleasedSchemaCase::TailCorruption,
+    ] {
         super::v027_baseline::PRESERVE_SHARED_CLAIMS
             .scope(
                 true,
-                super::v027_baseline::released_schema::exercise_released_schema(scenario),
+                super::v027_baseline::released_schema::exercise_released_schema(case),
             )
             .await;
     }

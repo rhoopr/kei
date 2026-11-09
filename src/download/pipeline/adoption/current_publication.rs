@@ -1,5 +1,7 @@
 //! Reuse a still-current publication whose rendition was left pending.
 
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, ensure};
@@ -9,11 +11,243 @@ use crate::download::filter::{
     derive_expected_paths, is_asset_filtered, stored_path_matches_download_family,
 };
 use crate::download::planner::TaskPlanner;
+use crate::download::retry::PreparedReplaceAuthorization;
 use crate::download::{DownloadConfig, DownloadStore};
 use crate::icloud::photos::PhotoAsset;
 use crate::state::VersionSizeKey;
+use crate::state::db::PreparedPublication;
 
 use super::{PendingOnDiskAdoption, asset_record_for_derived_path, effective_asset_library};
+
+fn authorization_matches(
+    authorization: &PreparedReplaceAuthorization,
+    proof: &PreparedPublication,
+    library: &str,
+    asset: &PhotoAsset,
+    version: VersionSizeKey,
+) -> bool {
+    authorization.version_size == version
+        && authorization.library.as_ref() == library
+        && proof.library == authorization.library.as_ref()
+        && proof.id == authorization.asset_id.as_ref()
+        && proof.id == asset.state_id()
+        && proof.version == authorization.version_size.as_str()
+        && proof.provider_checksum == authorization.provider_checksum
+        && proof.provider_size == authorization.provider_size
+        && proof.destination == authorization.native_path
+        && proof.binding.as_ref() == Some(&authorization.binding)
+        && authorization.binding.library == library
+        && authorization.binding.child == asset.asset_record_name()
+        && authorization.binding.master == asset.id()
+        && authorization.binding.state_id == asset.state_id()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) mod completed_link_test_hook {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use tokio::sync::Notify;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(super) enum Stage {
+        CleanupRetained,
+        CleanupPrechecked,
+        ReplaceReady,
+    }
+    type Pause = (PathBuf, Stage, Arc<Notify>, Arc<Notify>);
+    static PAUSES: Mutex<Vec<Pause>> = Mutex::new(Vec::new());
+
+    pub(super) fn arm_pause(path: &Path, stage: Stage) -> (Arc<Notify>, Arc<Notify>) {
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        PAUSES
+            .lock()
+            .unwrap()
+            .push((path.into(), stage, reached.clone(), resume.clone()));
+        (reached, resume)
+    }
+
+    pub(super) async fn pause(path: &Path, stage: Stage) {
+        let pause = {
+            let mut pauses = PAUSES.lock().unwrap();
+            pauses
+                .iter()
+                .position(|p| p.0 == path && p.1 == stage)
+                .map(|i| pauses.remove(i))
+        };
+        if let Some((_, _, reached, resume)) = pause {
+            reached.notify_one();
+            resume.notified().await;
+        }
+    }
+
+    static FAIL_PARENT_SYNC: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    pub(super) fn arm(target: &Path) {
+        if let Ok(mut guard) = FAIL_PARENT_SYNC.lock() {
+            *guard = Some(target.to_path_buf());
+        }
+    }
+
+    pub(super) fn disarm() {
+        if let Ok(mut guard) = FAIL_PARENT_SYNC.lock() {
+            *guard = None;
+        }
+    }
+
+    pub(super) fn should_fail(target: &Path) -> bool {
+        FAIL_PARENT_SYNC
+            .lock()
+            .is_ok_and(|guard| guard.as_deref() == Some(target))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn prepared_owner_matches(
+    proof: &PreparedPublication,
+    library: &str,
+    asset: &PhotoAsset,
+    version: VersionSizeKey,
+) -> bool {
+    let Some(binding) = proof.binding.as_ref() else {
+        return false;
+    };
+    proof.library == library
+        && proof.id == asset.state_id()
+        && proof.version == version.as_str()
+        && binding.library == library
+        && binding.child == asset.asset_record_name()
+        && binding.master == asset.id()
+        && binding.state_id == asset.state_id()
+        && !binding.account_key.trim().is_empty()
+        && !binding.provider_key.trim().is_empty()
+        && !binding.scope.trim().is_empty()
+        && !binding.origin_pass.trim().is_empty()
+}
+
+/// Idempotent directory durability for the completed prepared publication.
+/// The proof identifies both parents; a retry after a successful unlink must
+/// still prove those parents durable before retiring the proof.
+#[cfg(target_os = "linux")]
+async fn sync_completed_parents(root: &Path, part: &Path, target: &Path) -> Result<()> {
+    let (root, part, target) = (root.to_path_buf(), part.to_path_buf(), target.to_path_buf());
+    tokio::task::spawn_blocking(move || {
+        let part_path = crate::fs_util::ConfinedPath::open(
+            &root,
+            &part,
+            crate::fs_util::ConfinedParents::Existing,
+        )?;
+        let target_path = crate::fs_util::ConfinedPath::open(
+            &root,
+            &target,
+            crate::fs_util::ConfinedParents::Existing,
+        )?;
+        part_path.sync_parent()?;
+        target_path.sync_parent()?;
+        #[cfg(test)]
+        if completed_link_test_hook::should_fail(target_path.path()) {
+            return Err(std::io::Error::other("synthetic parent durability failure").into());
+        }
+        Ok(())
+    })
+    .await?
+}
+
+/// Remove only the exact published hardlink, then prove both parents durable.
+#[cfg(target_os = "linux")]
+async fn finish_completed_published_link(
+    root: &Path,
+    proof: &PreparedPublication,
+    retained: &Arc<crate::download::file::RetainedPendingFile>,
+    shutdown: &CancellationToken,
+) -> Result<()> {
+    let expected = retained.fingerprint;
+    let retained = Arc::clone(retained);
+    let part_path = proof.temporary.to_path();
+    let target_path = proof.destination.to_path();
+    #[cfg(test)]
+    completed_link_test_hook::pause(
+        &target_path,
+        completed_link_test_hook::Stage::CleanupRetained,
+    )
+    .await;
+    let (precheck_root, precheck_part) = (root.to_path_buf(), part_path.clone());
+    #[cfg(test)]
+    let precheck_target = target_path.clone();
+    let precheck = tokio::task::spawn_blocking(move || {
+        let part = crate::fs_util::ConfinedPath::open(
+            &precheck_root,
+            &precheck_part,
+            crate::fs_util::ConfinedParents::Existing,
+        )?;
+        let Some(file) = part.open_optional_regular()? else {
+            return Ok(None);
+        };
+        let links = crate::fs_util::file_link_count(&file)?;
+        anyhow::ensure!(
+            links == 2,
+            "Prepared part is not the exact published link; retaining evidence"
+        );
+        // Authority stays with the retained target, never a newly opened part.
+        let identity = retained.identity()?;
+        anyhow::ensure!(
+            crate::fs_util::file_identity(&file)? == identity,
+            "Prepared part no longer belongs to the retained target; retaining evidence"
+        );
+        #[cfg(test)]
+        tokio::runtime::Handle::current().block_on(completed_link_test_hook::pause(
+            &precheck_target,
+            completed_link_test_hook::Stage::CleanupPrechecked,
+        ));
+        Ok(Some((file, identity)))
+    })
+    .await??;
+    ensure!(
+        !shutdown.is_cancelled(),
+        "Prepared publication cleanup cancelled"
+    );
+    let Some((_part_handle, identity)) = precheck else {
+        return sync_completed_parents(root, &part_path, &target_path).await;
+    };
+    let layout = crate::state::db::primary_layout::LayoutFingerprint {
+        size: expected.size,
+        sha256: expected.sha256,
+        identity,
+    };
+    crate::download::file::primary_layout::recover_prepared_link(
+        root,
+        &part_path,
+        &target_path,
+        &layout,
+    )
+    .await?;
+    let (check_root, check_part) = (root.to_path_buf(), part_path.clone());
+    let exists = tokio::task::spawn_blocking(move || {
+        crate::fs_util::ConfinedPath::open(
+            &check_root,
+            &check_part,
+            crate::fs_util::ConfinedParents::Existing,
+        )?
+        .entry_exists()
+    })
+    .await??;
+    anyhow::ensure!(
+        !exists,
+        "Prepared part remained after verified completion; retaining evidence"
+    );
+    sync_completed_parents(root, &part_path, &target_path).await
+}
+
+#[cfg(target_os = "linux")]
+async fn prepared_part_exists(root: &Path, proof: &PreparedPublication) -> Result<bool> {
+    let (root, part) = (root.to_path_buf(), proof.temporary.to_path());
+    Ok(tokio::task::spawn_blocking(move || {
+        crate::fs_util::ConfinedPath::open(&root, &part, crate::fs_util::ConfinedParents::Existing)?
+            .entry_exists()
+    })
+    .await??)
+}
 
 pub(in crate::download) async fn recover_current_pending_publication(
     db: &dyn DownloadStore,
@@ -21,6 +255,7 @@ pub(in crate::download) async fn recover_current_pending_publication(
     asset: &PhotoAsset,
     planner: &mut TaskPlanner,
     version: VersionSizeKey,
+    replace: Option<&PreparedReplaceAuthorization>,
     shutdown: &CancellationToken,
 ) -> Result<Option<PendingOnDiskAdoption>> {
     ensure!(
@@ -68,13 +303,104 @@ pub(in crate::download) async fn recover_current_pending_publication(
                 let _guard =
                     crate::download::file::lock_download_destination(&destination, shutdown)
                         .await?;
+                let mut published_replace = false;
                 let retained = match crate::download::file::retain_pending_file(
                     &config.directory,
                     &destination,
                 )
                 .await?
                 {
-                    Some(retained) => retained,
+                    Some(retained) => {
+                        if data_encoding::HEXLOWER.encode(&retained.fingerprint.sha256)
+                            == proof.local_checksum
+                        {
+                            #[cfg(target_os = "linux")]
+                            if proof.binding.is_some() {
+                                anyhow::ensure!(
+                                    prepared_owner_matches(&proof, library, asset, version),
+                                    "Prepared publication owner changed; retaining evidence"
+                                );
+                                let temporary = proof.temporary.to_path();
+                                // Revalidate the durable owner before any unlink.
+                                // prepare_temp_publication alone does not compare
+                                // child/master fields; prepared_owner_matches does.
+                                db.prepare_temp_publication(&temporary, &proof).await?;
+                                retained.validate().await?;
+                                ensure!(
+                                    !shutdown.is_cancelled(),
+                                    "Prepared publication cleanup cancelled"
+                                );
+                                finish_completed_published_link(
+                                    &config.directory,
+                                    &proof,
+                                    &retained,
+                                    shutdown,
+                                )
+                                .await?;
+                                retained.validate().await?;
+                            } else {
+                                anyhow::ensure!(
+                                    !prepared_part_exists(&config.directory, &proof).await?,
+                                    "Unbound prepared part cannot be cleaned; retaining evidence"
+                                );
+                            }
+                            retained
+                        } else {
+                            // The replacement journal may have restored the exact
+                            // truncated original after the prepared part was
+                            // verified. Only an explicitly authorized repair for
+                            // this recorded path can replace those exact bytes.
+                            let Some(replace) = replace else {
+                                continue;
+                            };
+                            if !config.repair_truncated
+                                || !authorization_matches(replace, &proof, library, asset, version)
+                                || retained.fingerprint != replace.expected
+                            {
+                                continue;
+                            }
+                            let temporary = proof.temporary.to_path();
+                            // Revalidate the durable owner and current provider
+                            // generation before publishing. The conditional
+                            // publisher rechecks the old target immediately and
+                            // restores displaced bytes on failure.
+                            let mut completed = async {
+                                db.prepare_temp_publication(&temporary, &proof).await?;
+                                let completed =
+                                    crate::download::file::DownloadedFile::reopen_prepared(
+                                        &config.directory,
+                                        &temporary,
+                                        &proof.local_checksum,
+                                    )
+                                    .await?;
+                                #[cfg(all(test, target_os = "linux"))]
+                                completed_link_test_hook::pause(
+                                    &destination,
+                                    completed_link_test_hook::Stage::ReplaceReady,
+                                )
+                                .await;
+                                Ok::<_, anyhow::Error>(completed)
+                            }
+                            .await?;
+                            ensure!(
+                                !shutdown.is_cancelled(),
+                                "Prepared publication recovery cancelled"
+                            );
+                            completed
+                                .publish(
+                                    &destination,
+                                    crate::download::file::FinalPublication::ReplaceTruncated(
+                                        replace.expected,
+                                    ),
+                                )
+                                .await?;
+                            let retained = completed
+                                .retain_pending_publication(&config.directory, &destination)
+                                .await?;
+                            published_replace = true;
+                            retained
+                        }
+                    }
                     None => {
                         let temporary = proof.temporary.to_path();
                         // Recheck the existing owner and current provider generation
@@ -108,10 +434,12 @@ pub(in crate::download) async fn recover_current_pending_publication(
                     continue;
                 }
                 retained.validate().await?;
-                ensure!(
-                    !shutdown.is_cancelled(),
-                    "Prepared publication recovery cancelled"
-                );
+                if !published_replace {
+                    ensure!(
+                        !shutdown.is_cancelled(),
+                        "Prepared publication recovery cancelled"
+                    );
+                }
                 match db
                     .mark_verified_download(
                         library,

@@ -2268,57 +2268,152 @@ async fn rejected_capture_upserts_never_dispatch_streaming_or_collecting_tasks()
 }
 
 #[cfg(feature = "xmp")]
-#[tokio::test]
-async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stays_incremental() {
-    use xmp_toolkit::{XmpMeta, xmp_ns};
+#[derive(Clone)]
+struct LiveDatesSession {
+    records: Arc<Vec<serde_json::Value>>,
+    expected_changes_token: Option<Arc<str>>,
+    changes_successor: Arc<str>,
+    query_token: Arc<str>,
+    changes_calls: Arc<AtomicUsize>,
+    query_calls: Arc<AtomicUsize>,
+}
 
-    let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
-    let dir = TempDir::new().unwrap();
-    let still = include_bytes!("../../../../tests/data/sample.heic").as_slice();
-    let motion = b"\0\0\0\x14ftypqt  \0\0\0\0qt  ".as_slice();
-    let mut records = incremental_photo_records_with_url(
-        "LIVE_DATES",
-        "capture.HEIC",
-        "https://p01.icloud-content.com/capture.HEIC",
-        still.len() as u64,
-    );
-    records[0]["fields"]["itemType"] = json!({"value": "public.heic"});
-    records[0]["fields"]["resOriginalFileType"] = json!({"value": "public.heic"});
-    records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
-        "downloadURL": "https://p01.icloud-content.com/capture.MOV",
-        "fileChecksum": "provider-motion", "size": motion.len(),
-    }});
-    records[0]["fields"]["resOriginalVidComplFileType"] =
-        json!({"value": "com.apple.quicktime-movie"});
-    records[1]["fields"]["timeZoneOffset"] = json!({"value": 0});
-    let old = PhotoAsset::new(records[0].clone(), records[1].clone());
-    records[1]["fields"]["assetDate"]["value"] = json!(1_700_000_000_123_i64);
-    records[1]["fields"]["addedDate"]["value"] = json!(1_700_000_000_789_i64);
-    let current = PhotoAsset::new(records[0].clone(), records[1].clone());
-    assert_eq!(
-        old.metadata().metadata_hash,
-        current.metadata().metadata_hash
-    );
-    let session = changes_zone_session_with_query_page(
-        Arc::new(AtomicUsize::new(0)),
-        records.clone(),
-        json!({"records": records, "syncToken": "full-token"}),
-        1,
-    );
-    let pass = AlbumPass {
-        kind: PassKind::Unfiled,
-        album: changes_album("", session.clone()),
-        exclude_ids: Arc::new(FxHashSet::default()),
-    };
-    let mut config = test_config();
-    config.directory = Arc::from(dir.path());
-    config.state_db = Some(db.clone());
-    config.sync_mode = SyncMode::Full;
-    config.refresh_metadata = true;
-    config.metadata.xmp_sidecar = true;
-    let expected = filter::expected_paths_for(&old, &config);
-    assert_eq!(expected.len(), 2);
-    let capture = filter::metadata_capture(&old);
+#[cfg(feature = "xmp")]
+impl LiveDatesSession {
+    fn new(
+        records: Vec<serde_json::Value>,
+        expected_changes_token: Option<&str>,
+        changes_successor: &str,
+        query_token: &str,
+    ) -> Self {
+        Self {
+            records: Arc::new(records),
+            expected_changes_token: expected_changes_token.map(Arc::from),
+            changes_successor: Arc::from(changes_successor),
+            query_token: Arc::from(query_token),
+            changes_calls: Arc::new(AtomicUsize::new(0)),
+            query_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[cfg(feature = "xmp")]
+#[async_trait::async_trait]
+impl PhotosSession for LiveDatesSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        let request: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+            anyhow::anyhow!("invalid Live Dates request body: {error}; url={url} body={body}")
+        })?;
+        if url.contains("/internal/records/query/batch") {
+            anyhow::ensure!(
+                request["batch"].is_array(),
+                "unexpected count request: {body}"
+            );
+            return Ok(json!({
+                "batch": [{"records": [{"fields": {"itemCount": {"value": 1}}}]}]
+            }));
+        }
+        if url.contains("/records/query?") {
+            let zone = request["query"]["zoneID"]["zoneName"]
+                .as_str()
+                .or_else(|| request["zoneID"]["zoneName"].as_str())
+                .ok_or_else(|| anyhow::anyhow!("records/query missing zone: {body}"))?;
+            anyhow::ensure!(zone == "PrimarySync", "records/query wrong zone: {body}");
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
+            self.query_calls.fetch_add(1, Ordering::SeqCst);
+            let records = if offset == 0 {
+                self.records.as_ref().clone()
+            } else {
+                Vec::new()
+            };
+            return Ok(json!({
+                "records": records,
+                "syncToken": self.query_token.as_ref()
+            }));
+        }
+        if url.contains("/changes/zone?") {
+            let zone = request["zones"][0]["zoneID"]
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("changes/zone missing zoneID: {body}"))?;
+            anyhow::ensure!(
+                zone.get("zoneName").and_then(|value| value.as_str()) == Some("PrimarySync"),
+                "changes/zone wrong zone: {body}"
+            );
+            anyhow::ensure!(
+                zone.get("ownerRecordName").and_then(|value| value.as_str())
+                    == Some("_defaultOwner"),
+                "changes/zone wrong owner: {body}"
+            );
+            let token = request["zones"][0]["syncToken"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("changes/zone missing token: {body}"))?;
+            if let Some(expected) = &self.expected_changes_token {
+                anyhow::ensure!(
+                    token == expected.as_ref(),
+                    "changes/zone used unexpected token {token}: {body}"
+                );
+            }
+            self.changes_calls.fetch_add(1, Ordering::SeqCst);
+            return Ok(json!({
+                "zones": [{
+                    "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
+                    "syncToken": self.changes_successor.as_ref(),
+                    "moreComing": false,
+                    "records": self.records.as_ref()
+                }]
+            }));
+        }
+        if url.contains("/records/lookup?") {
+            let zone = request["zoneID"]["zoneName"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("records/lookup missing zone: {body}"))?;
+            anyhow::ensure!(zone == "PrimarySync", "records/lookup wrong zone: {body}");
+            let requested: Vec<&str> = request["records"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|record| record["recordName"].as_str())
+                .collect();
+            anyhow::ensure!(!requested.is_empty(), "records/lookup no names: {body}");
+            let selected: Vec<serde_json::Value> = self
+                .records
+                .iter()
+                .filter(|record| {
+                    requested.contains(&record["recordName"].as_str().unwrap_or_default())
+                })
+                .cloned()
+                .collect();
+            return Ok(json!({"records": selected}));
+        }
+        anyhow::bail!("unexpected Live Dates Photos route: {url}; body={body}")
+    }
+
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(feature = "xmp")]
+async fn seed_imported_live_photo_legacy(
+    db: &SqliteStateDb,
+    config: &DownloadConfig,
+    old: &PhotoAsset,
+    still: &[u8],
+    motion: &[u8],
+) -> Vec<filter::ExpectedAssetPath> {
+    let expected = filter::expected_paths_for(old, config);
+    let capture = filter::metadata_capture(old);
     for rendition in &expected {
         let bytes = if rendition.version_size == VersionSizeKey::Original {
             still
@@ -2360,111 +2455,1012 @@ async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stay
             .await;
         assert!(!outcome.any_failed());
     }
-    let before = db.get_downloaded_page(0, 10).await.unwrap();
-    let mut sidecars = HashMap::new();
-    let mut full_query_count = 0;
-    for refresh in [true, false] {
-        config.refresh_metadata = refresh;
-        let result = download_photos_with_sync(
+    expected
+}
+
+#[cfg(feature = "xmp")]
+type LiveDatesRawRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+);
+
+#[cfg(feature = "xmp")]
+fn live_dates_raw_rows(db: &SqliteStateDb, asset: &str) -> Vec<LiveDatesRawRow> {
+    let conn = db.acquire_lock("live dates raw rows").unwrap();
+    let mut statement = conn
+        .prepare(
+            "SELECT version_size,status,local_path,checksum,local_checksum, \
+                    download_checksum,metadata_write_failed_at FROM assets \
+             WHERE id=?1 ORDER BY version_size",
+        )
+        .unwrap();
+    statement
+        .query_map([asset], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+}
+
+#[cfg(feature = "xmp")]
+fn live_dates_debt_counts(db: &SqliteStateDb, asset: &str) -> (i64, i64, i64, i64) {
+    let conn = db.acquire_lock("live dates debt counts").unwrap();
+    let asset_marks: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assets WHERE id=?1 AND metadata_write_failed_at IS NOT NULL",
+            [asset],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let path_marks: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM asset_metadata_paths \
+             WHERE id=?1 AND metadata_write_failed_at IS NOT NULL",
+            [asset],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let source: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM asset_metadata_paths \
+             WHERE id=?1 AND source_checksum IS NOT NULL",
+            [asset],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let download: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assets WHERE id=?1 AND download_checksum IS NOT NULL",
+            [asset],
+            |row| row.get(0),
+        )
+        .unwrap();
+    (asset_marks, path_marks, source, download)
+}
+
+#[cfg(feature = "xmp")]
+fn live_dates_receipt_count(db: &SqliteStateDb) -> i64 {
+    db.acquire_lock("live dates receipt count")
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM download_receipts", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+#[cfg(feature = "xmp")]
+type LiveDatesReceiptRow = (String, String, String, Option<String>, String);
+
+#[cfg(feature = "xmp")]
+fn live_dates_receipt_snapshot(db: &SqliteStateDb) -> Vec<LiveDatesReceiptRow> {
+    let conn = db.acquire_lock("live dates receipt snapshot").unwrap();
+    let mut statement = conn
+        .prepare(
+            "SELECT version_size,native_path,provider_checksum,source_checksum,local_checksum \
+             FROM download_receipts ORDER BY native_path,version_size",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+}
+
+#[cfg(feature = "xmp")]
+#[tokio::test]
+async fn explicit_live_photo_refresh_repairs_legacy_dates_and_sidecars_then_stays_incremental() {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    use xmp_toolkit::{XmpMeta, xmp_ns};
+
+    let still = include_bytes!("../../../../tests/data/sample.heic").as_slice();
+    let motion = b"\0\0\0\x14ftypqt  \0\0\0\0qt  ".as_slice();
+    let provider_still = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(still));
+    let provider_motion = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(motion));
+    let hex_still = data_encoding::HEXLOWER.encode(&Sha256::digest(still));
+    let hex_motion = data_encoding::HEXLOWER.encode(&Sha256::digest(motion));
+    let old_ms = 1_700_000_000_000_i64;
+    let new_ms = 1_700_000_000_123_i64;
+    let new_added_ms = 1_700_000_000_789_i64;
+
+    let server = wiremock::MockServer::start().await;
+    for (name, body, content_type) in [
+        ("/capture.HEIC", still, "image/heic"),
+        ("/capture.MOV", motion, "video/quicktime"),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(name))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("content-type", content_type),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let mut old_records = incremental_photo_records_with_url(
+        "LIVE_DATES",
+        "capture.HEIC",
+        &format!("{}/capture.HEIC", server.uri()),
+        still.len() as u64,
+    );
+    old_records[0]["fields"]["itemType"] = json!({"value": "public.heic"});
+    old_records[0]["fields"]["resOriginalFileType"] = json!({"value": "public.heic"});
+    old_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(provider_still);
+    old_records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
+        "downloadURL": format!("{}/capture.MOV", server.uri()),
+        "fileChecksum": provider_motion, "size": motion.len(),
+    }});
+    old_records[0]["fields"]["resOriginalVidComplFileType"] =
+        json!({"value": "com.apple.quicktime-movie"});
+    old_records[1]["fields"]["assetDate"]["value"] = json!(old_ms);
+    old_records[1]["fields"]["addedDate"]["value"] = json!(old_ms);
+    old_records[1]["fields"]["timeZoneOffset"] = json!({"value": 0});
+    let old_asset = PhotoAsset::new(old_records[0].clone(), old_records[1].clone());
+    let mut new_records = old_records.clone();
+    new_records[1]["fields"]["assetDate"]["value"] = json!(new_ms);
+    new_records[1]["fields"]["addedDate"]["value"] = json!(new_added_ms);
+    let new_asset = PhotoAsset::new(new_records[0].clone(), new_records[1].clone());
+    assert_eq!(
+        old_asset.metadata().metadata_hash,
+        new_asset.metadata().metadata_hash
+    );
+
+    let dir = TempDir::new().unwrap();
+    let media_root = dir.path().join("media");
+    let db_path = dir.path().join("state.db");
+    let owner = AccountOwner::authenticated(
+        "live-dates@example.invalid",
+        "com",
+        &serde_json::from_value(json!({"dsInfo":{"dsid":"live-dates-fixture"}})).unwrap(),
+    )
+    .unwrap();
+    let db = Arc::new(SqliteStateDb::open_owned(&db_path, &owner).await.unwrap());
+    let capture = ShadowCapture::new(db.clone(), owner.clone(), "com");
+    let initial_session = LiveDatesSession::new(old_records.clone(), None, "unused", "full-token");
+    let initial_pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: bound_album("", None, initial_session.clone(), &capture),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let mut config = test_config();
+    config.directory = Arc::from(media_root.as_path());
+    config.state_db = Some(db.clone());
+    config.metadata.xmp_sidecar = true;
+    config.refresh_metadata = false;
+    config.sync_mode = SyncMode::Full;
+    config.concurrent_downloads = 1;
+    let expected = filter::expected_paths_for(&old_asset, &config.with_pass(&initial_pass));
+    assert_eq!(expected.len(), 2);
+    let still_path = expected
+        .iter()
+        .find(|entry| entry.version_size == VersionSizeKey::Original)
+        .unwrap()
+        .path
+        .clone();
+    let motion_path = expected
+        .iter()
+        .find(|entry| entry.version_size == VersionSizeKey::LiveOriginal)
+        .unwrap()
+        .path
+        .clone();
+    let sidecar_for = |media: &Path| {
+        media.with_file_name(format!(
+            "{}.xmp",
+            media.file_name().unwrap().to_str().unwrap()
+        ))
+    };
+    let date_of = |text: &str| {
+        let meta: XmpMeta = text.parse().unwrap();
+        meta.property(xmp_ns::EXIF, "DateTimeOriginal")
+            .unwrap()
+            .value
+            .clone()
+    };
+    let mtime =
+        |path: PathBuf| async move { tokio::fs::metadata(path).await.unwrap().modified().unwrap() };
+
+    let initial = download_photos_with_sync(
+        &Client::new(),
+        std::slice::from_ref(&initial_pass),
+        Arc::new(config.clone()),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(initial.outcome, DownloadOutcome::Success),
+        "{initial:?}"
+    );
+    assert_eq!(initial.stats.downloaded, 2, "{initial:?}");
+    assert_eq!(initial.stats.failed, 0, "{initial:?}");
+    assert_eq!(initial.stats.exif_failures, 0, "{initial:?}");
+    assert_eq!(initial.stats.state_write_failures, 0, "{initial:?}");
+    assert!(initial.full_enumeration_ran);
+    assert_eq!(initial.sync_token.as_deref(), Some("full-token"));
+    assert_eq!(still_path, expected[0].path);
+    assert_eq!(tokio::fs::read(&still_path).await.unwrap(), still);
+    assert_eq!(tokio::fs::read(&motion_path).await.unwrap(), motion);
+
+    let mut expected_proofs = vec![
+        (
+            still_path.clone(),
+            provider_still.clone(),
+            Some(hex_still.clone()),
+            Some(hex_still.clone()),
+        ),
+        (
+            motion_path.clone(),
+            provider_motion.clone(),
+            Some(hex_motion.clone()),
+            Some(hex_motion.clone()),
+        ),
+    ];
+    expected_proofs.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(album_proof_rows(&db), expected_proofs);
+    let receipts: i64 = db
+        .acquire_lock("live dates scoped receipts")
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM download_receipts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(receipts, 2);
+    let receipts_before = live_dates_receipt_snapshot(db.as_ref());
+    let child_name = new_records[1]["recordName"].as_str().unwrap().to_owned();
+    let admitted: i64 = db
+        .acquire_lock("live dates admitted destinations")
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM provider_active_destinations \
+             WHERE asset_id=?1 AND admitted=1 AND verified_media=1",
+            [&child_name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(admitted, 2);
+
+    let mut rows = db.get_downloaded_page(0, 10).await.unwrap();
+    rows.sort_by(|left, right| left.version_size.as_str().cmp(right.version_size.as_str()));
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(row.created_at, old_asset.created());
+        assert_eq!(row.added_at, Some(old_asset.added_date()));
+        assert_eq!(
+            row.local_path.as_deref(),
+            Some(if row.version_size == VersionSizeKey::Original {
+                still_path.as_path()
+            } else {
+                motion_path.as_path()
+            })
+        );
+    }
+    let old_sidecar = |media: &Path| tokio::fs::read_to_string(sidecar_for(media));
+    let still_sidecar_before = old_sidecar(&still_path).await.unwrap();
+    let motion_sidecar_before = old_sidecar(&motion_path).await.unwrap();
+    let old_still_date = date_of(&still_sidecar_before);
+    let old_motion_date = date_of(&motion_sidecar_before);
+    assert!(old_still_date.starts_with("2023-11-14T22:13:20"));
+    assert!(old_motion_date.starts_with("2023-11-14T22:13:20"));
+    assert_ne!(old_still_date, "2023-11-14T22:13:20.123+00:00");
+
+    let media_snapshot = |path: PathBuf| async move {
+        (
+            tokio::fs::read(&path).await.unwrap(),
+            tokio::fs::metadata(&path)
+                .await
+                .unwrap()
+                .modified()
+                .unwrap(),
+        )
+    };
+    let still_before = media_snapshot(still_path.clone()).await;
+    let motion_before = media_snapshot(motion_path.clone()).await;
+    let still_sidecar_mtime_before = mtime(sidecar_for(&still_path)).await;
+    let motion_sidecar_mtime_before = mtime(sidecar_for(&motion_path)).await;
+    let proofs_before = album_proof_rows(&db);
+
+    drop(initial_pass);
+    config.state_db = None;
+    drop(capture);
+    drop(db);
+    let db = Arc::new(SqliteStateDb::open_owned(&db_path, &owner).await.unwrap());
+    config.state_db = Some(db.clone());
+    let capture = ShadowCapture::new(db.clone(), owner.clone(), "com");
+    assert_eq!(album_proof_rows(&db), proofs_before);
+    assert_eq!(tokio::fs::read(&still_path).await.unwrap(), still_before.0);
+    assert_eq!(
+        tokio::fs::read(&motion_path).await.unwrap(),
+        motion_before.0
+    );
+    assert_eq!(mtime(still_path.clone()).await, still_before.1);
+    assert_eq!(mtime(motion_path.clone()).await, motion_before.1);
+    assert_eq!(
+        tokio::fs::read_to_string(sidecar_for(&still_path))
+            .await
+            .unwrap(),
+        still_sidecar_before
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(sidecar_for(&motion_path))
+            .await
+            .unwrap(),
+        motion_sidecar_before
+    );
+
+    let mut token = initial.sync_token.clone().expect("initial full token");
+    let no_refresh_session = LiveDatesSession::new(
+        new_records.clone(),
+        Some(token.as_str()),
+        "quiet-no-refresh",
+        "unused",
+    );
+    let no_refresh_pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: bound_album("", None, no_refresh_session.clone(), &capture),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    config.sync_mode = SyncMode::Incremental {
+        zone_sync_token: token.clone(),
+    };
+    config.refresh_metadata = false;
+    let no_refresh = download_photos_with_sync(
+        &Client::new(),
+        std::slice::from_ref(&no_refresh_pass),
+        Arc::new(config.clone()),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(no_refresh.outcome, DownloadOutcome::Success),
+        "{no_refresh:?}"
+    );
+    assert_eq!(no_refresh.stats.downloaded, 0, "{no_refresh:?}");
+    assert_eq!(no_refresh.stats.failed, 0, "{no_refresh:?}");
+    assert_eq!(no_refresh.stats.exif_failures, 0, "{no_refresh:?}");
+    assert!(!no_refresh.full_enumeration_ran);
+    assert_eq!(no_refresh_session.changes_calls.load(Ordering::SeqCst), 1);
+    drop(no_refresh_pass);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert_eq!(album_proof_rows(&db), proofs_before);
+    assert_eq!(tokio::fs::read(&still_path).await.unwrap(), still_before.0);
+    assert_eq!(
+        tokio::fs::read(&motion_path).await.unwrap(),
+        motion_before.0
+    );
+    assert_eq!(mtime(still_path.clone()).await, still_before.1);
+    assert_eq!(mtime(motion_path.clone()).await, motion_before.1);
+    assert_eq!(
+        tokio::fs::read_to_string(sidecar_for(&still_path))
+            .await
+            .unwrap(),
+        still_sidecar_before
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(sidecar_for(&motion_path))
+            .await
+            .unwrap(),
+        motion_sidecar_before
+    );
+    assert_eq!(
+        mtime(sidecar_for(&still_path)).await,
+        still_sidecar_mtime_before
+    );
+    assert_eq!(
+        mtime(sidecar_for(&motion_path)).await,
+        motion_sidecar_mtime_before
+    );
+    assert!(
+        db.get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(no_refresh.sync_token.as_deref(), Some("quiet-no-refresh"));
+
+    let refresh_session =
+        LiveDatesSession::new(new_records.clone(), None, "unused", "full-token-refresh");
+    let refresh_pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: bound_album("", None, refresh_session.clone(), &capture),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    config.sync_mode = SyncMode::Full;
+    config.refresh_metadata = true;
+    let refreshed = download_photos_with_sync(
+        &Client::new(),
+        std::slice::from_ref(&refresh_pass),
+        Arc::new(config.clone()),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(refreshed.outcome, DownloadOutcome::Success),
+        "{refreshed:?}"
+    );
+    assert_eq!(refreshed.stats.downloaded, 0, "{refreshed:?}");
+    assert_eq!(refreshed.stats.failed, 0, "{refreshed:?}");
+    assert_eq!(refreshed.stats.exif_failures, 0, "{refreshed:?}");
+    assert_eq!(refreshed.stats.state_write_failures, 0, "{refreshed:?}");
+    assert!(refreshed.full_enumeration_ran);
+    assert_eq!(refreshed.sync_token.as_deref(), Some("full-token-refresh"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert!(
+        db.get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "normal explicit refresh must settle its own sidecar work"
+    );
+    assert_eq!(album_proof_rows(&db), proofs_before);
+    assert_eq!(tokio::fs::read(&still_path).await.unwrap(), still_before.0);
+    assert_eq!(
+        tokio::fs::read(&motion_path).await.unwrap(),
+        motion_before.0
+    );
+    assert_eq!(mtime(still_path.clone()).await, still_before.1);
+    assert_eq!(mtime(motion_path.clone()).await, motion_before.1);
+    let mut refreshed_rows = db.get_downloaded_page(0, 10).await.unwrap();
+    refreshed_rows
+        .sort_by(|left, right| left.version_size.as_str().cmp(right.version_size.as_str()));
+    assert_eq!(refreshed_rows.len(), 2);
+    for row in &refreshed_rows {
+        let prior = rows
+            .iter()
+            .find(|prior| prior.version_size == row.version_size)
+            .unwrap();
+        assert_eq!(
+            row.metadata.metadata_hash, prior.metadata.metadata_hash,
+            "version {:?}",
+            row.version_size
+        );
+        assert_eq!(row.created_at, new_asset.created());
+        assert_eq!(row.added_at, Some(new_asset.added_date()));
+    }
+    assert_eq!(
+        date_of(
+            &tokio::fs::read_to_string(sidecar_for(&still_path))
+                .await
+                .unwrap()
+        ),
+        "2023-11-14T22:13:20.123+00:00"
+    );
+    assert_eq!(
+        date_of(
+            &tokio::fs::read_to_string(sidecar_for(&motion_path))
+                .await
+                .unwrap()
+        ),
+        "2023-11-14T22:13:20.123+00:00"
+    );
+    let still_after_refresh = tokio::fs::read_to_string(sidecar_for(&still_path))
+        .await
+        .unwrap();
+    let motion_after_refresh = tokio::fs::read_to_string(sidecar_for(&motion_path))
+        .await
+        .unwrap();
+    let still_sidecar_after_mtime = mtime(sidecar_for(&still_path)).await;
+    let motion_sidecar_after_mtime = mtime(sidecar_for(&motion_path)).await;
+    let unfinished: i64 = db
+        .acquire_lock("live dates unfinished metadata")
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM provider_active_destinations \
+             WHERE asset_id=?1 AND verified_metadata=0",
+            [&child_name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unfinished, 0);
+    let receipts_after: i64 = db
+        .acquire_lock("live dates receipts after refresh")
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM download_receipts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(receipts_after, 2);
+    drop(refresh_pass);
+    token = refreshed.sync_token.clone().expect("refresh successor");
+    let previous_db = Arc::downgrade(&db);
+    config.state_db = None;
+    drop(capture);
+    drop(db);
+    assert!(
+        previous_db.upgrade().is_none(),
+        "explicit refresh DB survived before the first quiet open"
+    );
+
+    for (index, successor) in ["quiet-one", "quiet-two"].into_iter().enumerate() {
+        config.state_db = None;
+        assert!(
+            config.state_db.is_none(),
+            "quiet {index}: prior state DB was not cleared before open"
+        );
+        let db = Arc::new(SqliteStateDb::open_owned(&db_path, &owner).await.unwrap());
+        config.state_db = Some(db.clone());
+        let capture = ShadowCapture::new(db.clone(), owner.clone(), "com");
+        let quiet_calls = Arc::new(AtomicUsize::new(0));
+        let quiet_session = QuietDeltaSession {
+            expected_token: Arc::from(token.as_str()),
+            successor: Arc::from(successor),
+            changes_zone_calls: Arc::clone(&quiet_calls),
+        };
+        let quiet_pass = AlbumPass {
+            kind: PassKind::Unfiled,
+            album: bound_album("", None, quiet_session.clone(), &capture),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        };
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: token.clone(),
+        };
+        config.refresh_metadata = false;
+        let quiet_config = Arc::new(config.clone());
+        let quiet = download_photos_with_sync(
             &Client::new(),
-            std::slice::from_ref(&pass),
-            Arc::new(config.clone()),
+            std::slice::from_ref(&quiet_pass),
+            quiet_config.clone(),
             DownloadControls::download_hidden(),
             CancellationToken::new(),
         )
         .await
         .unwrap();
         assert!(
-            matches!(result.outcome, DownloadOutcome::Success),
-            "{:?}",
-            result.stats
+            matches!(quiet.outcome, DownloadOutcome::Success),
+            "quiet {index}: {quiet:?}"
         );
-        assert_eq!(result.full_enumeration_ran, refresh);
-        assert_eq!(result.stats.downloaded, 0);
-        assert_eq!(result.stats.state_write_failures, 0);
-        assert_eq!(result.stats.exif_failures, 0);
-        assert!(!result.stats.sync_token_blocked);
+        assert_eq!(quiet.stats.downloaded, 0, "quiet {index}: {quiet:?}");
+        assert_eq!(quiet.stats.failed, 0, "quiet {index}: {quiet:?}");
+        assert_eq!(quiet.stats.exif_failures, 0, "quiet {index}: {quiet:?}");
         assert_eq!(
-            result.sync_token.as_deref(),
-            Some(if refresh {
-                "full-token"
-            } else {
-                "zone-token-next"
-            })
+            quiet.stats.state_write_failures, 0,
+            "quiet {index}: {quiet:?}"
         );
-        if refresh {
-            full_query_count = session.records_query_count();
-            assert!(full_query_count > 0);
-            assert_eq!(db.get_pending_metadata_rewrites(10).await.unwrap().len(), 2);
-            // The explicit sync owner drains only after the full producer has finished.
-            assert_eq!(
-                drain_pending_metadata_rewrites(
-                    db.as_ref(),
-                    &config.directory,
-                    &config.metadata,
-                    CaptureTimestampRepair::Preserve,
-                    &["PrimarySync"],
-                    config.temp_suffix.clone(),
-                    &CancellationToken::new(),
-                )
-                .await,
-                0
-            );
-        }
-        let rows = db.get_downloaded_page(0, 10).await.unwrap();
-        assert_eq!(rows.len(), 2);
-        for row in &rows {
-            let prior = before
-                .iter()
-                .find(|prior| prior.version_size == row.version_size)
-                .unwrap();
-            assert_eq!(row.created_at, current.created());
-            assert_eq!(row.added_at, Some(current.added_date()));
-            assert_eq!(row.metadata.metadata_hash, prior.metadata.metadata_hash);
-            assert_eq!(row.local_path, prior.local_path);
-            assert_eq!(row.local_checksum, prior.local_checksum);
-            assert_eq!(row.download_checksum, prior.download_checksum);
-            assert_eq!(row.checksum, prior.checksum);
-            assert_eq!(row.downloaded_at, prior.downloaded_at);
-            let path = row.local_path.as_ref().unwrap();
-            assert_eq!(
-                tokio::fs::read(path).await.unwrap(),
-                if row.version_size == VersionSizeKey::Original {
-                    still
-                } else {
-                    motion
-                }
-            );
-            let sidecar = path.with_file_name(format!(
-                "{}.xmp",
-                path.file_name().unwrap().to_str().unwrap()
-            ));
-            let text = tokio::fs::read_to_string(sidecar).await.unwrap();
-            if refresh {
-                let xmp: XmpMeta = text.parse().unwrap();
-                assert_eq!(
-                    xmp.property(xmp_ns::EXIF, "DateTimeOriginal")
-                        .unwrap()
-                        .value,
-                    "2023-11-14T22:13:20.123+00:00"
-                );
-                sidecars.insert(path.clone(), text);
-            } else {
-                assert_eq!(sidecars.get(path), Some(&text));
-            }
-        }
+        assert!(!quiet.full_enumeration_ran);
+        assert_eq!(quiet.sync_token.as_deref(), Some(successor));
+        assert_eq!(quiet_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        assert_eq!(album_proof_rows(&db), proofs_before);
+        assert_eq!(live_dates_receipt_snapshot(db.as_ref()), receipts_before);
+        assert_eq!(tokio::fs::read(&still_path).await.unwrap(), still_before.0);
+        assert_eq!(
+            tokio::fs::read(&motion_path).await.unwrap(),
+            motion_before.0
+        );
+        assert_eq!(mtime(still_path.clone()).await, still_before.1);
+        assert_eq!(mtime(motion_path.clone()).await, motion_before.1);
+        assert_eq!(
+            tokio::fs::read_to_string(sidecar_for(&still_path))
+                .await
+                .unwrap(),
+            still_after_refresh
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(sidecar_for(&motion_path))
+                .await
+                .unwrap(),
+            motion_after_refresh
+        );
+        assert_eq!(
+            mtime(sidecar_for(&still_path)).await,
+            still_sidecar_after_mtime
+        );
+        assert_eq!(
+            mtime(sidecar_for(&motion_path)).await,
+            motion_sidecar_after_mtime
+        );
         assert!(
             db.get_pending_metadata_rewrites(10)
                 .await
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(session.records_query_count(), full_query_count);
-        config.sync_mode = SyncMode::Incremental {
-            zone_sync_token: result.sync_token.unwrap(),
-        };
+        let previous_db = Arc::downgrade(&db);
+        config.state_db = None;
+        drop(quiet_config);
+        drop(quiet_pass);
+        drop(capture);
+        drop(db);
+        assert!(
+            previous_db.upgrade().is_none(),
+            "quiet {index}: previous DB survived before the next open"
+        );
+        token = quiet.sync_token.clone().expect("quiet successor");
     }
-    assert_eq!(session.changes_zone_calls.load(Ordering::SeqCst), 1);
+
+    // Contract A: imported local-only evidence remains a refusal.
+    let legacy_dir = TempDir::new().unwrap();
+    let legacy_db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+    let mut legacy_old_records = incremental_photo_records_with_url(
+        "LIVE_DATES_IMPORT",
+        "legacy.HEIC",
+        &format!("{}/capture.HEIC", server.uri()),
+        still.len() as u64,
+    );
+    legacy_old_records[0]["fields"]["itemType"] = json!({"value": "public.heic"});
+    legacy_old_records[0]["fields"]["resOriginalFileType"] = json!({"value": "public.heic"});
+    legacy_old_records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
+        "downloadURL": format!("{}/capture.MOV", server.uri()),
+        "fileChecksum": "provider-motion", "size": motion.len(),
+    }});
+    legacy_old_records[0]["fields"]["resOriginalVidComplFileType"] =
+        json!({"value": "com.apple.quicktime-movie"});
+    legacy_old_records[1]["fields"]["assetDate"]["value"] = json!(old_ms);
+    legacy_old_records[1]["fields"]["addedDate"]["value"] = json!(old_ms);
+    legacy_old_records[1]["fields"]["timeZoneOffset"] = json!({"value": 0});
+    let legacy_old = PhotoAsset::new(legacy_old_records[0].clone(), legacy_old_records[1].clone());
+    let mut legacy_current_records = legacy_old_records.clone();
+    legacy_current_records[1]["fields"]["assetDate"]["value"] = json!(new_ms);
+    legacy_current_records[1]["fields"]["addedDate"]["value"] = json!(new_added_ms);
+    let legacy_current = PhotoAsset::new(
+        legacy_current_records[0].clone(),
+        legacy_current_records[1].clone(),
+    );
+    assert_eq!(
+        legacy_old.metadata().metadata_hash,
+        legacy_current.metadata().metadata_hash
+    );
+    let mut legacy_config = test_config();
+    legacy_config.directory = Arc::from(legacy_dir.path().join("media").as_path());
+    legacy_config.state_db = Some(legacy_db.clone());
+    legacy_config.sync_mode = SyncMode::Full;
+    legacy_config.refresh_metadata = true;
+    legacy_config.metadata.xmp_sidecar = true;
+    let legacy_expected = seed_imported_live_photo_legacy(
+        legacy_db.as_ref(),
+        &legacy_config,
+        &legacy_old,
+        still,
+        motion,
+    )
+    .await;
+    assert_eq!(legacy_expected.len(), 2);
+    let legacy_still_path = legacy_expected
+        .iter()
+        .find(|entry| entry.version_size == VersionSizeKey::Original)
+        .unwrap()
+        .path
+        .clone();
+    let legacy_motion_path = legacy_expected
+        .iter()
+        .find(|entry| entry.version_size == VersionSizeKey::LiveOriginal)
+        .unwrap()
+        .path
+        .clone();
+    let legacy_still_before = tokio::fs::read(&legacy_still_path).await.unwrap();
+    let legacy_motion_before = tokio::fs::read(&legacy_motion_path).await.unwrap();
+    let legacy_still_mtime_before = mtime(legacy_still_path.clone()).await;
+    let legacy_motion_mtime_before = mtime(legacy_motion_path.clone()).await;
+    let legacy_still_sidecar_before = tokio::fs::read_to_string(sidecar_for(&legacy_still_path))
+        .await
+        .unwrap();
+    let legacy_motion_sidecar_before = tokio::fs::read_to_string(sidecar_for(&legacy_motion_path))
+        .await
+        .unwrap();
+    let legacy_still_sidecar_mtime_before = mtime(sidecar_for(&legacy_still_path)).await;
+    let legacy_motion_sidecar_mtime_before = mtime(sidecar_for(&legacy_motion_path)).await;
+
+    let legacy_pass = AlbumPass {
+        kind: PassKind::Unfiled,
+        album: changes_album(
+            "",
+            changes_zone_session_with_query_page(
+                Arc::new(AtomicUsize::new(0)),
+                legacy_current_records.clone(),
+                json!({"records": legacy_current_records, "syncToken": "full-token"}),
+                1,
+            ),
+        ),
+        exclude_ids: Arc::new(FxHashSet::default()),
+    };
+    let legacy_result = download_photos_with_sync(
+        &Client::new(),
+        std::slice::from_ref(&legacy_pass),
+        Arc::new(legacy_config.clone()),
+        DownloadControls::download_hidden(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    match legacy_result.outcome {
+        DownloadOutcome::PartialFailure { failed_count } => {
+            assert_eq!(failed_count, 3, "{legacy_result:?}")
+        }
+        ref other => panic!("imported local-only evidence must refuse, got {other:?}"),
+    }
+    assert_eq!(legacy_result.stats.downloaded, 0, "{legacy_result:?}");
+    assert_eq!(legacy_result.stats.failed, 2, "{legacy_result:?}");
+    assert_eq!(
+        legacy_result.stats.skipped.uncertain, 1,
+        "{legacy_result:?}"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    let legacy_child = legacy_old.asset_record_name();
+    let legacy_rows = live_dates_raw_rows(legacy_db.as_ref(), legacy_child);
+    assert_eq!(legacy_rows.len(), 2);
+    for (
+        version,
+        status,
+        local_path,
+        provider_checksum,
+        local_checksum,
+        download_checksum,
+        marker,
+    ) in &legacy_rows
+    {
+        let rendition = legacy_expected
+            .iter()
+            .find(|entry| entry.version_size.as_str() == version)
+            .unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(local_path, rendition.path.to_str().unwrap());
+        assert_eq!(provider_checksum, rendition.checksum.as_ref());
+        assert_eq!(
+            local_checksum,
+            &file::compute_sha256(&rendition.path).await.unwrap()
+        );
+        assert!(download_checksum.is_none());
+        assert!(marker.is_some());
+    }
+    let (raw_asset_marks, raw_path_marks, forged_source, legacy_downloads) =
+        live_dates_debt_counts(legacy_db.as_ref(), legacy_child);
+    let legacy_receipts = live_dates_receipt_count(legacy_db.as_ref());
+    assert_eq!(raw_asset_marks, 2, "both renditions retain raw debt");
+    assert_eq!(raw_path_marks, 2, "both native paths retain raw debt");
+    assert_eq!(forged_source, 0);
+    assert_eq!(legacy_downloads, 0);
+    assert_eq!(legacy_receipts, 0);
+    assert!(
+        legacy_db
+            .get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "imported local-only debt must not be eligible Ordinary"
+    );
+    assert_eq!(
+        tokio::fs::read(&legacy_still_path).await.unwrap(),
+        legacy_still_before
+    );
+    assert_eq!(
+        tokio::fs::read(&legacy_motion_path).await.unwrap(),
+        legacy_motion_before
+    );
+    assert_eq!(
+        mtime(legacy_still_path.clone()).await,
+        legacy_still_mtime_before
+    );
+    assert_eq!(
+        mtime(legacy_motion_path.clone()).await,
+        legacy_motion_mtime_before
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(sidecar_for(&legacy_still_path))
+            .await
+            .unwrap(),
+        legacy_still_sidecar_before
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(sidecar_for(&legacy_motion_path))
+            .await
+            .unwrap(),
+        legacy_motion_sidecar_before
+    );
+    assert_eq!(
+        mtime(sidecar_for(&legacy_still_path)).await,
+        legacy_still_sidecar_mtime_before
+    );
+    assert_eq!(
+        mtime(sidecar_for(&legacy_motion_path)).await,
+        legacy_motion_sidecar_mtime_before
+    );
+
+    // Contract C: imported sidecar-only debt retains the original external drain.
+    let drain_dir = TempDir::new().unwrap();
+    let drain_db_path = drain_dir.path().join("state.db");
+    let drain_db = Arc::new(SqliteStateDb::open(&drain_db_path).await.unwrap());
+    let mut drain_old_records = incremental_photo_records_with_url(
+        "LIVE_DATES_DRAIN",
+        "drain.HEIC",
+        &format!("{}/capture.HEIC", server.uri()),
+        still.len() as u64,
+    );
+    drain_old_records[0]["fields"]["itemType"] = json!({"value": "public.heic"});
+    drain_old_records[0]["fields"]["resOriginalFileType"] = json!({"value": "public.heic"});
+    drain_old_records[0]["fields"]["resOriginalVidComplRes"] = json!({"value": {
+        "downloadURL": format!("{}/capture.MOV", server.uri()),
+        "fileChecksum": "provider-motion", "size": motion.len(),
+    }});
+    drain_old_records[0]["fields"]["resOriginalVidComplFileType"] =
+        json!({"value": "com.apple.quicktime-movie"});
+    drain_old_records[1]["fields"]["assetDate"]["value"] = json!(old_ms);
+    drain_old_records[1]["fields"]["addedDate"]["value"] = json!(old_ms);
+    drain_old_records[1]["fields"]["timeZoneOffset"] = json!({"value": 0});
+    let drain_old = PhotoAsset::new(drain_old_records[0].clone(), drain_old_records[1].clone());
+    let mut drain_current_records = drain_old_records.clone();
+    drain_current_records[1]["fields"]["assetDate"]["value"] = json!(new_ms);
+    drain_current_records[1]["fields"]["addedDate"]["value"] = json!(new_added_ms);
+    let drain_current = PhotoAsset::new(
+        drain_current_records[0].clone(),
+        drain_current_records[1].clone(),
+    );
+    assert_eq!(
+        drain_old.metadata().metadata_hash,
+        drain_current.metadata().metadata_hash
+    );
+    let mut drain_config = test_config();
+    drain_config.directory = Arc::from(drain_dir.path().join("media").as_path());
+    drain_config.state_db = Some(drain_db.clone());
+    drain_config.refresh_metadata = true;
+    drain_config.metadata.xmp_sidecar = true;
+    let drain_expected = seed_imported_live_photo_legacy(
+        drain_db.as_ref(),
+        &drain_config,
+        &drain_old,
+        still,
+        motion,
+    )
+    .await;
+    assert_eq!(drain_expected.len(), 2);
+    let drain_still_path = drain_expected
+        .iter()
+        .find(|entry| entry.version_size == VersionSizeKey::Original)
+        .unwrap()
+        .path
+        .clone();
+    let drain_motion_path = drain_expected
+        .iter()
+        .find(|entry| entry.version_size == VersionSizeKey::LiveOriginal)
+        .unwrap()
+        .path
+        .clone();
+    let drain_still_before = tokio::fs::read(&drain_still_path).await.unwrap();
+    let drain_motion_before = tokio::fs::read(&drain_motion_path).await.unwrap();
+    let drain_still_mtime_before = mtime(drain_still_path.clone()).await;
+    let drain_motion_mtime_before = mtime(drain_motion_path.clone()).await;
+    for path in [&drain_still_path, &drain_motion_path] {
+        assert!(
+            date_of(&tokio::fs::read_to_string(sidecar_for(path)).await.unwrap())
+                .starts_with("2023-11-14T22:13:20")
+        );
+    }
+    let drain_child = drain_old.asset_record_name();
+    let updated = drain_db
+        .refresh_downloaded_asset_metadata(
+            "PrimarySync",
+            drain_child,
+            (
+                &filter::metadata_capture(&drain_current),
+                drain_current.created(),
+                Some(drain_current.added_date()),
+            ),
+            true,
+            false,
+            crate::state::METADATA_CAPTURE_REVISION,
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated, 2);
+    let drain_pending = drain_db.get_pending_metadata_rewrites(10).await.unwrap();
+    assert_eq!(drain_pending.len(), 2);
+    let mut pending_paths: Vec<PathBuf> = drain_pending
+        .iter()
+        .filter_map(|row| row.local_path.clone())
+        .collect();
+    pending_paths.sort();
+    let mut expected_paths = vec![drain_still_path.clone(), drain_motion_path.clone()];
+    expected_paths.sort();
+    assert_eq!(pending_paths, expected_paths);
+    let (_, _, drain_source, drain_download) =
+        live_dates_debt_counts(drain_db.as_ref(), drain_child);
+    let drain_receipts = live_dates_receipt_count(drain_db.as_ref());
+    assert_eq!(drain_source, 0);
+    assert_eq!(drain_download, 0);
+    assert_eq!(drain_receipts, 0);
+    let drain_failures = drain_pending_metadata_rewrites(
+        drain_db.as_ref(),
+        drain_config.directory.as_ref(),
+        &drain_config.metadata,
+        CaptureTimestampRepair::Preserve,
+        &["PrimarySync"],
+        drain_config.temp_suffix.clone(),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(drain_failures, 0);
+    assert!(
+        drain_db
+            .get_pending_metadata_rewrites(10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let (remaining_marks, remaining_path_marks, remaining_source, remaining_download) =
+        live_dates_debt_counts(drain_db.as_ref(), drain_child);
+    let remaining_receipts = live_dates_receipt_count(drain_db.as_ref());
+    assert_eq!(remaining_marks, 0);
+    assert_eq!(remaining_path_marks, 0);
+    assert_eq!(remaining_source, 0);
+    assert_eq!(remaining_download, 0);
+    assert_eq!(remaining_receipts, 0);
+    assert_eq!(
+        tokio::fs::read(&drain_still_path).await.unwrap(),
+        drain_still_before
+    );
+    assert_eq!(
+        tokio::fs::read(&drain_motion_path).await.unwrap(),
+        drain_motion_before
+    );
+    assert_eq!(
+        mtime(drain_still_path.clone()).await,
+        drain_still_mtime_before
+    );
+    assert_eq!(
+        mtime(drain_motion_path.clone()).await,
+        drain_motion_mtime_before
+    );
+    for path in [&drain_still_path, &drain_motion_path] {
+        assert_eq!(
+            date_of(&tokio::fs::read_to_string(sidecar_for(path)).await.unwrap()),
+            "2023-11-14T22:13:20.123+00:00"
+        );
+    }
+    let mut drain_rows = drain_db.get_downloaded_page(0, 10).await.unwrap();
+    drain_rows.sort_by(|left, right| left.version_size.as_str().cmp(right.version_size.as_str()));
+    assert_eq!(drain_rows.len(), 2);
+    for row in &drain_rows {
+        let rendition = drain_expected
+            .iter()
+            .find(|entry| entry.version_size == row.version_size)
+            .unwrap();
+        assert_eq!(row.created_at, drain_current.created());
+        assert_eq!(row.added_at, Some(drain_current.added_date()));
+        assert_eq!(row.checksum.as_ref(), rendition.checksum.as_ref());
+        assert!(row.download_checksum.is_none());
+        assert_eq!(
+            row.local_checksum.as_deref(),
+            Some(
+                file::compute_sha256(row.local_path.as_ref().unwrap())
+                    .await
+                    .unwrap()
+                    .as_str()
+            )
+        );
+    }
+
+    server.verify().await;
 }
 
 #[cfg(feature = "xmp")]

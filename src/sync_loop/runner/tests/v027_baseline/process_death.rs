@@ -8,6 +8,7 @@ use crate::download;
 use crate::icloud::photos::{PhotoLibrary, PhotosSession};
 use crate::state::DownloadStateStore;
 use crate::state::SqliteStateDb;
+use crate::state::db::provider_selection::SelectionPath;
 use crate::sync_cycle::{run_cycle, sync_token_key};
 use crate::sync_loop::test_support::{
     make_run_cycle_config, make_run_cycle_download_config_builder,
@@ -83,6 +84,15 @@ const CHANGED_MEDIA: &[u8] = include_bytes!(concat!(
     "/tests/data/media/metadata.jpg"
 ));
 async fn reference_cycle(root: &Path, url: &str, quiet: bool, reference: Option<u8>) -> usize {
+    reference_cycle_with_inventory(root, url, quiet, reference, true).await
+}
+async fn reference_cycle_with_inventory(
+    root: &Path,
+    url: &str,
+    quiet: bool,
+    reference: Option<u8>,
+    include_missing: bool,
+) -> usize {
     let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
     let mut inventory = pair(
         "current-existing",
@@ -90,12 +100,14 @@ async fn reference_cycle(root: &Path, url: &str, quiet: bool, reference: Option<
         &format!("{url}/existing"),
         1,
     );
-    inventory.extend(pair(
-        "current-missing",
-        "missing.JPG",
-        &format!("{url}/missing"),
-        2,
-    ));
+    if include_missing {
+        inventory.extend(pair(
+            "current-missing",
+            "missing.JPG",
+            &format!("{url}/missing"),
+            2,
+        ));
+    }
     if let Some(phase) = reference {
         inventory = pair(
             "current-missing",
@@ -195,7 +207,12 @@ async fn reference_cycle(root: &Path, url: &str, quiet: bool, reference: Option<
         trace.events()
     );
     assert!(result.db_sync_token_advance_safe, "{result:?}");
-    assert_eq!(db.get_metadata(&key).await.unwrap().as_deref(), Some(AFTER));
+    let token = db.get_metadata(&key).await.unwrap();
+    assert_eq!(
+        token.as_deref(),
+        Some(AFTER),
+        "recovery must commit the baseline token"
+    );
     if reference.is_some_and(|phase| phase > 0) {
         assert_eq!(
             provider.base.inventory_queries.load(Ordering::SeqCst),
@@ -268,10 +285,243 @@ async fn v027_sigkill_publication_reopens_then_two_quiet_cycles() {
         )
         .await
         .unwrap();
-        db.set_metadata(&format!("sync_token:{ZONE}"), OLD_TOKEN)
-            .await
-            .unwrap();
         drop(db);
+        let historical_before_prime = historical_rows(&db_path);
+        let prime = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/existing"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(1)
+            .mount(&prime)
+            .await;
+        assert_eq!(
+            reference_cycle_with_inventory(root.path(), &prime.uri(), false, None, false).await,
+            1,
+            "prime creates the current-owned existing publication"
+        );
+        let prime_urls: Vec<String> = prime
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|request| request.url.to_string())
+            .collect();
+        assert_eq!(
+            prime_urls.len(),
+            1,
+            "prime transfer identity: {prime_urls:?}"
+        );
+        assert!(
+            prime_urls[0].ends_with("/existing"),
+            "prime transfer identity: {prime_urls:?}"
+        );
+        prime.verify().await;
+        use rusqlite::types::Value as Sql;
+        let existing = media.join("existing.JPG");
+        let existing_sha = download::file::compute_sha256(&existing).await.unwrap();
+        let existing_bytes = std::fs::read(&existing).unwrap();
+        let existing_mtime = std::fs::metadata(&existing).unwrap().modified().unwrap();
+        assert_eq!(existing_bytes, MEDIA);
+        let expected_scope = serde_json::to_string(&json!({
+            "format": 1,
+            "realm": "com",
+            "container": "com.apple.photos.cloud",
+            "environment": "production",
+            "database": "private",
+            "zone": zone(),
+        }))
+        .unwrap();
+        let owner = baseline_owner();
+        let (account_key, provider_key) = owner.authenticated_keys().unwrap();
+        let native = SelectionPath::from_path(&existing).key().unwrap();
+        assert_eq!(
+            count_at(
+                &db_path,
+                &format!(
+                    "SELECT count(*) FROM assets WHERE library='{ZONE}' AND id='asset-current-existing' \
+                     AND version_size='original' AND status='downloaded' AND local_path='{}' \
+                     AND local_checksum='{existing_sha}' AND checksum='{}'",
+                    existing.display(),
+                    generation(1)
+                )
+            ),
+            1,
+            "prime asset receipt"
+        );
+        let decision = db_rows(
+            &db_path,
+            "SELECT generation,pass_key,child,outcome,admission,manifest,manifest_hash FROM provider_active_decisions WHERE child='asset-current-existing'",
+        );
+        assert_eq!(decision.len(), 1, "prime decision cardinality");
+        assert_eq!(
+            decision[0][2],
+            Sql::Text("asset-current-existing".to_owned())
+        );
+        assert_eq!(decision[0][3], Sql::Text("selected".to_owned()));
+        assert_eq!(decision[0][4], Sql::Text("admitted".to_owned()));
+        let Sql::Text(pass_key) = &decision[0][1] else {
+            panic!("prime pass key type");
+        };
+        assert_eq!(pass_key.len(), 64, "prime pass key length");
+        let Sql::Blob(manifest) = &decision[0][5] else {
+            panic!("prime decision manifest type");
+        };
+        let manifest: Value = serde_json::from_slice(manifest).unwrap();
+        assert_eq!(
+            manifest["state_id"],
+            json!("asset-current-existing"),
+            "prime decision root"
+        );
+        assert_eq!(manifest["sources"], json!([]), "prime decision sources");
+        assert_eq!(
+            manifest["decision"]["child"],
+            json!("asset-current-existing")
+        );
+        assert_eq!(manifest["decision"]["pass_key"], json!(pass_key));
+        assert_eq!(
+            manifest["decision"]["destinations"][0]["path"],
+            serde_json::to_value(SelectionPath::from_path(&existing)).unwrap(),
+            "prime manifest destination"
+        );
+        assert_eq!(
+            manifest["decision"]["destinations"][0]["checksum"],
+            json!(generation(1))
+        );
+        assert_eq!(
+            manifest["decision"]["destinations"][0]["size"],
+            json!(MEDIA.len())
+        );
+        let Sql::Text(manifest_hash) = &decision[0][6] else {
+            panic!("prime manifest hash type");
+        };
+        assert_eq!(manifest_hash.len(), 64, "prime manifest hash length");
+        let destination = db_rows(
+            &db_path,
+            "SELECT generation,pass_key,child,library,asset_id,master,version_size,path,compat_path,checksum,size_bytes,admitted,verified_media,local_checksum,source_checksum FROM provider_active_destinations WHERE child='asset-current-existing'",
+        );
+        assert_eq!(destination.len(), 1, "prime destination cardinality");
+        assert_eq!(destination[0][1], Sql::Text(pass_key.clone()));
+        assert_eq!(
+            destination[0][2],
+            Sql::Text("asset-current-existing".to_owned())
+        );
+        assert_eq!(destination[0][3], Sql::Text(ZONE.to_owned()));
+        assert_eq!(
+            destination[0][4],
+            Sql::Text("asset-current-existing".to_owned())
+        );
+        assert_eq!(destination[0][5], Sql::Text("current-existing".to_owned()));
+        assert_eq!(destination[0][6], Sql::Text("original".to_owned()));
+        assert_eq!(destination[0][7], Sql::Text(native.clone()));
+        assert_eq!(destination[0][8], Sql::Text(existing.display().to_string()));
+        assert_eq!(destination[0][9], Sql::Text(generation(1)));
+        assert_eq!(destination[0][10], Sql::Integer(MEDIA.len() as i64));
+        assert_eq!(destination[0][11], Sql::Integer(1));
+        assert_eq!(destination[0][12], Sql::Integer(1));
+        assert_eq!(destination[0][13], Sql::Text(existing_sha.clone()));
+        assert_eq!(destination[0][14], Sql::Text(existing_sha.clone()));
+        let generation_id = destination[0][0].clone();
+        let generations = db_rows(
+            &db_path,
+            "SELECT id,account_key,provider_key,scope,specification FROM provider_active_generations",
+        );
+        let generation_row = generations
+            .iter()
+            .find(|row| row[0] == generation_id)
+            .expect("prime generation binding");
+        assert_eq!(generation_row[1], Sql::Text(account_key.to_owned()));
+        assert_eq!(generation_row[2], Sql::Text(provider_key.to_owned()));
+        assert_eq!(generation_row[3], Sql::Text(expected_scope.clone()));
+        let Sql::Blob(specification) = &generation_row[4] else {
+            panic!("prime generation specification type");
+        };
+        let specification: Value = serde_json::from_slice(specification).unwrap();
+        assert_eq!(specification["zone"], zone(), "prime generation zone");
+        let sources = db_rows(
+            &db_path,
+            "SELECT generation,pass_key,child,page_id,ordinal FROM provider_active_sources WHERE child='asset-current-existing'",
+        );
+        assert!(
+            sources.is_empty(),
+            "synthetic inventory has no rank-page sources; the decision manifest is the root"
+        );
+        let receipt_sql = "SELECT account_key,provider_key,scope,library,child,master,state_id,origin_pass,version_size,provider_checksum,provider_size,native_path,source_checksum,local_checksum,generation_id FROM download_receipts WHERE state_id='asset-current-existing'";
+        let receipt = db_rows(&db_path, receipt_sql);
+        assert_eq!(receipt.len(), 1, "prime receipt cardinality");
+        assert_eq!(
+            receipt[0],
+            vec![
+                Sql::Text(account_key.to_owned()),
+                Sql::Text(provider_key.to_owned()),
+                Sql::Text(expected_scope),
+                Sql::Text(ZONE.to_owned()),
+                Sql::Text("asset-current-existing".to_owned()),
+                Sql::Text("current-existing".to_owned()),
+                Sql::Text("asset-current-existing".to_owned()),
+                Sql::Text(pass_key.clone()),
+                Sql::Text("original".to_owned()),
+                Sql::Text(generation(1)),
+                Sql::Integer(MEDIA.len() as i64),
+                Sql::Text(native),
+                Sql::Text(existing_sha.clone()),
+                Sql::Text(existing_sha.clone()),
+                Sql::Null,
+            ]
+        );
+        let metadata_sql = "SELECT library,id,version_size,local_path,provider_checksum,local_checksum,source_checksum FROM asset_metadata_paths WHERE library='SharedSync-v027-synthetic' AND id='asset-current-existing'";
+        let metadata = db_rows(&db_path, metadata_sql);
+        assert_eq!(
+            metadata,
+            vec![vec![
+                Sql::Text(ZONE.to_owned()),
+                Sql::Text("asset-current-existing".to_owned()),
+                Sql::Text("original".to_owned()),
+                Sql::Text(existing.display().to_string()),
+                Sql::Text(generation(1)),
+                Sql::Text(existing_sha.clone()),
+                Sql::Text(existing_sha.clone()),
+            ]],
+            "prime metadata receipt"
+        );
+        assert_eq!(
+            count_at(&db_path, "SELECT count(*) FROM download_receipts"),
+            1,
+            "one primed compact receipt"
+        );
+        assert_eq!(
+            count_at(
+                &db_path,
+                "SELECT count(*) FROM download_receipts WHERE state_id='asset-current-missing'"
+            ),
+            0,
+            "no receipt for the unprimed missing resource"
+        );
+        assert_eq!(
+            count_at(
+                &db_path,
+                "SELECT count(DISTINCT state_id) FROM download_receipts"
+            ),
+            1,
+            "prime receipt belongs to one distinct resource"
+        );
+        let primed_receipt = receipt[0].clone();
+        let primed_metadata = metadata[0].clone();
+        assert_eq!(
+            historical_rows(&db_path),
+            historical_before_prime,
+            "foreign Primary history unchanged by priming"
+        );
+        assert_eq!(std::fs::read(&old).unwrap(), MEDIA);
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            super::clear_test_epoch(&conn);
+            conn.execute(
+                "INSERT INTO metadata(key,value) VALUES(?1,?2) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                rusqlite::params![format!("sync_token:{ZONE}"), OLD_TOKEN],
+            )
+            .unwrap();
+        }
         let historical = historical_rows(&db_path);
         let log = std::fs::File::create(root.path().join("worker.log")).unwrap();
         let mut worker = Worker(
@@ -301,6 +551,12 @@ async fn v027_sigkill_publication_reopens_then_two_quiet_cycles() {
         );
         worker.0.kill().unwrap();
         assert_eq!(worker.0.wait().unwrap().signal(), Some(9));
+        // Model the watch interval elapsing while the killed process's crash
+        // guard remains: the production epoch gate then retries the baseline.
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            super::force_epoch_due(&conn, ZONE);
+        }
         let requests_before = server.received_requests().await.unwrap().len();
         assert_eq!(
             requests_before,
@@ -341,6 +597,71 @@ async fn v027_sigkill_publication_reopens_then_two_quiet_cycles() {
             .unwrap()
             .modified()
             .unwrap();
+        let missing = media.join("missing.JPG");
+        assert_eq!(std::fs::read(&existing).unwrap(), existing_bytes);
+        assert_eq!(
+            std::fs::metadata(&existing).unwrap().modified().unwrap(),
+            existing_mtime
+        );
+        assert_eq!(db_rows(&db_path, receipt_sql), vec![primed_receipt.clone()]);
+        assert_eq!(
+            db_rows(&db_path, metadata_sql),
+            vec![primed_metadata.clone()]
+        );
+        assert_eq!(std::fs::read(&old).unwrap(), MEDIA);
+        assert_eq!(std::fs::read(&missing).unwrap(), MEDIA);
+        assert_eq!(
+            std::fs::metadata(&old).unwrap().modified().unwrap(),
+            old_mtime
+        );
+        assert_eq!(
+            std::fs::metadata(&missing).unwrap().modified().unwrap(),
+            new_mtime
+        );
+        assert_eq!(historical_rows(&db_path), historical);
+        assert_eq!(
+            count_at(&db_path, "SELECT count(*) FROM download_receipts"),
+            2,
+            "two distinct completed resources after recovery"
+        );
+        assert_eq!(
+            count_at(
+                &db_path,
+                "SELECT count(*) FROM download_receipts WHERE state_id='asset-current-existing'"
+            ),
+            1,
+            "primed resource receipt cardinality"
+        );
+        assert_eq!(
+            count_at(
+                &db_path,
+                "SELECT count(*) FROM download_receipts WHERE state_id='asset-current-missing'"
+            ),
+            1,
+            "missing resource receipt cardinality"
+        );
+        assert_eq!(
+            count_at(
+                &db_path,
+                "SELECT count(DISTINCT state_id) FROM download_receipts"
+            ),
+            2,
+            "two distinct receipt identities"
+        );
+        let missing_native = SelectionPath::from_path(&missing).key().unwrap();
+        assert_eq!(
+            db_rows(
+                &db_path,
+                "SELECT provider_checksum,native_path,source_checksum,local_checksum FROM download_receipts WHERE state_id='asset-current-missing'"
+            ),
+            vec![vec![
+                Sql::Text(generation(2)),
+                Sql::Text(missing_native),
+                Sql::Text(existing_sha.clone()),
+                Sql::Text(existing_sha.clone()),
+            ]],
+            "missing compact receipt keeps its own resource identity"
+        );
         for _ in 0..2 {
             death_cycle(root.path(), &server.uri(), true).await;
             assert_eq!(historical_rows(&db_path), historical);
@@ -357,11 +678,36 @@ async fn v027_sigkill_publication_reopens_then_two_quiet_cycles() {
                     .unwrap(),
                 new_mtime
             );
+            assert_eq!(std::fs::read(&existing).unwrap(), existing_bytes);
+            assert_eq!(
+                std::fs::metadata(&existing).unwrap().modified().unwrap(),
+                existing_mtime
+            );
+            assert_eq!(db_rows(&db_path, receipt_sql), vec![primed_receipt.clone()]);
+            assert_eq!(
+                db_rows(&db_path, metadata_sql),
+                vec![primed_metadata.clone()]
+            );
+            assert_eq!(
+                count_at(&db_path, "SELECT count(*) FROM download_receipts"),
+                2
+            );
         }
+        let urls: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|request| request.url.to_string())
+            .collect();
         assert_eq!(
-            server.received_requests().await.unwrap().len(),
+            urls.len(),
             1,
-            "exactly one transfer across crash and recovery at {point}"
+            "exactly one transfer across crash and recovery at {point}: {urls:?}"
+        );
+        assert!(
+            urls[0].ends_with("/missing"),
+            "scenario transfer identity at {point}: {urls:?}"
         );
         server.verify().await;
     }
@@ -388,6 +734,19 @@ fn completed_reference_rows(root: &Path) -> Vec<Vec<rusqlite::types::Value>> {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
+}
+fn db_rows(path: &Path, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let mut stmt = conn.prepare(sql).unwrap();
+    let n = stmt.column_count();
+    stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+fn count_at(path: &Path, sql: &str) -> i64 {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.query_row(sql, [], |r| r.get(0)).unwrap()
 }
 #[tokio::test]
 async fn changed_reference_sigkill_transfers_new_bytes_without_repeating_completed_motion() {

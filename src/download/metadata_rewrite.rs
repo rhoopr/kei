@@ -30,9 +30,14 @@ pub(crate) use immediate::MetadataWriteOutcome;
 pub(super) use immediate::{MetadataWriteRequest, write_download_metadata};
 pub(crate) use planning::CaptureTimestampRepair;
 pub(super) use planning::MetadataFlags;
+pub(crate) use queued::MetadataWriterWitness;
+#[allow(
+    unused_imports,
+    reason = "tests retain the direct bounded drain entry points"
+)]
 pub(super) use queued::{
     RewritePass, TailAttempts, run_pending, run_pending_budget_tracked, run_pending_page,
-    run_pending_rows_tracked,
+    run_pending_page_witnessed, run_pending_rows_tracked, run_pending_witnessed,
 };
 #[cfg(feature = "xmp")]
 pub(in crate::download) use sidecar::create_layout_sidecar;

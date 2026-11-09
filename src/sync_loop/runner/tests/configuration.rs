@@ -3466,9 +3466,6 @@ async fn retained_checkpoint_candidate_changed_at_promotion_preserves_concurrent
     );
 }
 
-#[cfg(target_os = "linux")]
-mod late_io;
-
 #[tokio::test]
 async fn issue956_stale_mapping_confirms_current_pair_then_commits_and_reopens_quietly() {
     Box::pin(assert_issue956_pair_confirmation_reopens_quietly(None)).await;

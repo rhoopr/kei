@@ -203,11 +203,12 @@ pub(super) async fn finalize_streaming_download(
                 );
             }
         } else if metadata_flags.has_any_write() {
-            consumer.exif_failures += metadata_rewrite::run_pending(
+            consumer.exif_failures += metadata_rewrite::run_pending_witnessed(
                 db.as_ref(),
                 metadata_flags,
                 Arc::clone(&config.temp_suffix),
                 &pipeline_shutdown,
+                config.metadata_write_witness.clone(),
             )
             .await
             .failed;

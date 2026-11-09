@@ -15,6 +15,156 @@ use crate::icloud::photos::PhotoAsset;
 use crate::icloud::photos::session::PhotosSession;
 use crate::state::types::{AssetMetadata, AssetRecord, MediaType, VersionSizeKey};
 
+/// Keep process-global FD budgets and retention deltas independent of parallel tests.
+#[cfg(all(feature = "xmp", unix))]
+#[must_use]
+pub(crate) async fn isolate_process_fds(name: &str) -> bool {
+    const ROLE: &str = "KEI_TEST_ISOLATED_FD_CHILD";
+    let args = [name, "--exact", "--nocapture", "--test-threads=1"];
+    if let Some(role) = std::env::var_os(ROLE) {
+        assert!(role == name, "mismatched FD-isolation child role");
+        assert!(
+            std::env::args().skip(1).eq(args),
+            "invalid FD-isolation child argv"
+        );
+        eprintln!("FD_ISOLATION_BODY pid={} test={name}", std::process::id());
+        return false;
+    }
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(args)
+        .env(ROLE, name)
+        .env_remove("RUST_TEST_THREADS");
+    run_isolated_fd_child(command, name, std::time::Duration::from_secs(120))
+        .await
+        .expect("isolated FD test must pass");
+    true
+}
+
+#[cfg(all(feature = "xmp", unix))]
+async fn run_isolated_fd_child(
+    mut command: tokio::process::Command,
+    name: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let pid = child.id().expect("newly spawned child has a PID");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let captured = tokio::time::timeout(timeout, async {
+        tokio::join!(
+            stdout.read_to_end(&mut out),
+            stderr.read_to_end(&mut err),
+            child.wait()
+        )
+    })
+    .await;
+    let (reads, status, timed_out) = match captured {
+        Ok((out, err, status)) => ([out, err], status, false),
+        Err(_) => {
+            let killed = child.start_kill();
+            let status = child.wait().await;
+            let (out, err) =
+                tokio::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
+            killed?;
+            ([out, err], status, true)
+        }
+    };
+    let status = status?;
+    eprintln!(
+        "FD_ISOLATION_WAIT parent={} child={pid} test={name} reaped=true timed_out={timed_out} status={status}",
+        std::process::id()
+    );
+    let text = String::from_utf8_lossy(&out);
+    let diagnostic = String::from_utf8_lossy(&err);
+    let named = format!("test {name} ... ok");
+    let summaries: Vec<_> = text
+        .lines()
+        .filter(|line| line.starts_with("test result:"))
+        .collect();
+    let valid = summaries.len() == 1
+        && text.lines().rev().find(|line| !line.is_empty()) == summaries.first().copied()
+        && summaries[0]
+            .strip_prefix("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; ")
+            .and_then(|tail| tail.split_once(" filtered out; finished in "))
+            .is_some_and(|(count, time)| {
+                count.parse::<usize>().is_ok()
+                    && time.strip_suffix('s').is_some_and(|time| {
+                        time.parse::<f64>()
+                            .is_ok_and(|time| time.is_finite() && time >= 0.0)
+                    })
+            })
+        && text
+            .lines()
+            .filter(|line| line.starts_with("test ") && !line.starts_with("test result:"))
+            .eq([named.as_str()]);
+    anyhow::ensure!(
+        !timed_out && reads.iter().all(Result::is_ok) && status.success() && valid,
+        "isolated FD child {pid} reaped; timed_out={timed_out}; status={status}; reads={reads:?}\nstdout:\n{text}\nstderr:\n{diagnostic}"
+    );
+    // Do not forward nested libtest results as extra top-level passing cases.
+    for line in text
+        .lines()
+        .filter(|line| {
+            !line.is_empty() && !line.starts_with("test ") && !line.starts_with("running ")
+        })
+        .chain(diagnostic.lines())
+    {
+        eprintln!("FD_CHILD[{pid}] {line}");
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "xmp", unix))]
+#[tokio::test]
+async fn isolated_fd_child_rejects_false_success_and_reaps_timeout() {
+    use std::time::Duration;
+    use tokio::process::Command;
+
+    let mut zero = Command::new(std::env::current_exe().unwrap());
+    zero.args([
+        "no_such_fd_isolation_test",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    let error = run_isolated_fd_child(zero, "fd-fixture", Duration::from_secs(10))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("0 passed; 0 failed; 0 ignored"));
+    let summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s";
+    for output in [
+        format!("test fd-fixture ... ok\n{summary}\n{summary}\n"),
+        format!(
+            "test fd-fixture ... ok\n{}\n",
+            summary.replace("0 ignored", "1 ignored")
+        ),
+        format!("test fd-fixture ... ok\n{summary} malformed\n"),
+    ] {
+        let mut malformed = Command::new("/bin/sh");
+        malformed.args(["-c", "printf '%s\\n' \"$1\"", "fd-fixture", &output]);
+        assert!(
+            run_isolated_fd_child(malformed, "fd-fixture", Duration::from_secs(10))
+                .await
+                .is_err()
+        );
+    }
+    let mut parked = Command::new("/bin/sh");
+    parked.args(["-c", "exec sleep 60"]);
+    let error = run_isolated_fd_child(parked, "fd-fixture", Duration::from_millis(20))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("reaped; timed_out=true"));
+}
+
 /// Synthetic QuickTime track metadata without an ISO FullBox prefix.
 #[cfg(feature = "xmp")]
 pub(crate) fn bare_track_meta_movie() -> Vec<u8> {
