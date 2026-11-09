@@ -1713,6 +1713,55 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
             .unwrap();
         }
     }
+    for id in ["pending-hash-capture", "prepared-capture", "path-capture"] {
+        let path = dir.path().join(format!("{id}.jpg"));
+        std::fs::write(&path, b"catalog owner control").unwrap();
+        let record = crate::test_helpers::TestAssetRecord::new(id)
+            .library("PrimarySync")
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded("PrimarySync", id, "original", &path, "synthetic", None)
+            .await
+            .unwrap();
+        db.upsert_asset_master_mapping("PrimarySync", &format!("child-{id}"), id)
+            .await
+            .unwrap();
+        assert!(
+            db.claim_legacy_master_state_owner("PrimarySync", id, &format!("child-{id}"))
+                .await
+                .unwrap()
+        );
+        let conn = db.acquire_lock("seed catalog owner controls").unwrap();
+        conn.execute(
+            "INSERT INTO source_revalidation_debt(round,id) VALUES(?1,?2)",
+            rusqlite::params![nonce, id],
+        )
+        .unwrap();
+        match id {
+            "pending-hash-capture" => {
+                conn.execute(
+                    "UPDATE assets SET capture_repair_metadata_hash='pending' WHERE library='PrimarySync' AND id=?1",
+                    [id],
+                )
+                .unwrap();
+            }
+            "prepared-capture" => {
+                conn.execute(
+                    "UPDATE assets SET capture_repair_metadata_hash='prepared',capture_repair_output_checksum=?2,capture_repair_output_size=1 WHERE library='PrimarySync' AND id=?1",
+                    rusqlite::params![id, "c".repeat(64)],
+                )
+                .unwrap();
+            }
+            "path-capture" => {
+                conn.execute(
+                    "INSERT INTO asset_metadata_paths(library,id,version_size,local_path,provider_checksum,local_checksum,capture_repair_metadata_hash) VALUES('PrimarySync',?1,'original',?2,'provider','local','path-pending') ON CONFLICT(library,id,version_size,local_path) DO UPDATE SET capture_repair_metadata_hash='path-pending'",
+                    rusqlite::params![id, path.to_str().unwrap()],
+                )
+                .unwrap();
+            }
+            _ => {}
+        }
+    }
     let evidence = |deleted: bool| CatalogPairEvidence {
         database: "shared".into(),
         zone: serde_json::json!({"zoneName":"PrimarySync","ownerRecordName":"_defaultOwner"}),
@@ -1732,7 +1781,7 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
         )
         .await
         .unwrap();
-    assert_eq!(due.len(), 4);
+    assert_eq!(due.len(), 7);
     let master_due = due
         .iter()
         .find(|candidate| candidate.id == "master")
@@ -1762,13 +1811,20 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
         .unwrap();
     eprintln!("B-CATALOG-SETTLE-RESULT deleted={deleted_result}");
     assert!(deleted_result);
-    for control in ["missing-capture", "stale-capture", "retry-capture"] {
+    for (control, expect_settled) in [
+        ("missing-capture", true),
+        ("stale-capture", true),
+        ("retry-capture", false),
+        ("pending-hash-capture", false),
+        ("prepared-capture", false),
+        ("path-capture", false),
+    ] {
         let candidate = due
             .iter()
             .find(|candidate| candidate.id == control)
             .cloned()
             .unwrap();
-        let held = !db
+        let settled = db
             .settle_catalog_candidate(
                 owner(),
                 "PrimarySync".into(),
@@ -1786,8 +1842,8 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
             )
             .await
             .unwrap();
-        assert!(held, "{control} must remain held");
-        let conn = db.acquire_lock("verify capture control held").unwrap();
+        assert_eq!(settled, expect_settled, "{control}");
+        let conn = db.acquire_lock("verify capture control").unwrap();
         let (deleted, debt): (i64, i64) = conn
             .query_row(
                 "SELECT (SELECT is_deleted FROM assets WHERE library='PrimarySync' AND id=?1),
@@ -1796,7 +1852,40 @@ async fn catalog_due_and_strict_deleted_live_settlement_owner_transaction() {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!((deleted, debt), (0, 1), "{control}");
+        assert_eq!(
+            (deleted, debt),
+            (i64::from(expect_settled), i64::from(!expect_settled)),
+            "{control}"
+        );
+    }
+    {
+        let conn = db.acquire_lock("verify revision status unchanged").unwrap();
+        let (missing, stale): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM asset_metadata_capture_revisions WHERE asset_id='missing-capture'),
+                        (SELECT revision FROM asset_metadata_capture_revisions WHERE asset_id='stale-capture')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((missing, stale), (0, 0));
+        let (pending_hash, prepared_hash, path_hash): (String, String, String) = conn
+            .query_row(
+                "SELECT (SELECT capture_repair_metadata_hash FROM assets WHERE id='pending-hash-capture'),
+                        (SELECT capture_repair_metadata_hash FROM assets WHERE id='prepared-capture'),
+                        (SELECT capture_repair_metadata_hash FROM asset_metadata_paths WHERE id='path-capture')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                pending_hash.as_str(),
+                prepared_hash.as_str(),
+                path_hash.as_str()
+            ),
+            ("pending", "prepared", "path-pending")
+        );
     }
     {
         let conn = db
