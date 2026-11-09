@@ -218,138 +218,15 @@ impl SqliteStateDb {
         promote: bool,
     ) -> Result<(), StateError> {
         self.with_conn_mut("commit_checkpoint_transition", move |conn| {
-            let tx = conn
-                .transaction()
-                .map_err(|e| StateError::query("commit_checkpoint_transition::begin", e))?;
-            let old_policy = observation::policy(&tx)?;
-            let prepared_observation = observation::prepare(
-                &tx,
-                &transition.metadata_updates,
-                &transition.expected_metadata,
-                proof.as_ref(),
-                promote,
-            )?;
-            prepared_observation.guard_revalidation(
-                &tx,
-                &transition.metadata_updates,
-                &transition.expected_metadata,
-            )?;
-            let epoch_completions = if promote {
-                observation::validate_epoch_promotion(&tx, &prepared_observation, &transition)?
-            } else {
-                observation::record_epoch_stage(
-                    &tx,
-                    proof.as_ref(),
-                    &prepared_observation,
-                    &transition,
-                )?
-            };
-            let changed_keys = transition
-                .metadata_updates
-                .iter()
-                .map(|(k, _)| k.clone())
-                .chain(transition.metadata_deletes.iter().cloned())
-                .collect::<Vec<_>>();
-            for (key, expected) in &transition.expected_metadata {
-                let actual: Option<String> = tx
-                    .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
-                        row.get(0)
-                    })
-                    .optional()?;
-                if &actual != expected {
-                    return Err(StateError::Invariant {
-                        operation: "commit_checkpoint_transition",
-                        detail: "checkpoint planning facts changed".to_owned(),
-                    });
-                }
-            }
-            for proof in &transition.legacy_preservation_proofs {
-                let binds_cursor = transition.metadata_updates.iter().any(|(key, value)| {
-                    !crate::sync_cycle::is_current_zone_checkpoint(key)
-                        && super::legacy_preservation::checkpoint_library(key)
-                            == Some(proof.library.as_str())
-                        && value == &proof.next_cursor
-                });
-                if !binds_cursor {
-                    return Err(super::legacy_preservation::invalid_checkpoint());
-                }
-                super::legacy_preservation::activate(&tx, proof)?;
-            }
-            for (key, _) in &transition.metadata_updates {
-                if !crate::sync_cycle::is_current_zone_checkpoint(key)
-                    && let Some(library) = super::legacy_preservation::checkpoint_library(key)
-                {
-                    super::legacy_preservation::validate_checkpoint(
-                        &tx,
-                        library,
-                        transition.legacy_config_hash.as_deref(),
-                    )?;
-                }
-            }
-            // Recheck current obligations inside the token transaction. Historical
-            // evidence stays stored; no marker deletion certifies it.
-            for (key, _) in &transition.metadata_updates {
-                if crate::sync_cycle::is_current_zone_checkpoint(key)
-                    && let Some(library) = super::legacy_preservation::checkpoint_library(key)
-                {
-                    sparse_identity::clear_current_proven(
-                        &tx,
-                        library,
-                        &transition.sparse_identity_proofs,
-                    )?;
-                }
-            }
-            // Validate against the planning generation before this transaction promotes it.
-            // Any subsequent update failure rolls back these removals as well.
-            for key in &transition.metadata_deletes {
-                if let Some(library) = key.strip_prefix(crate::state::UNRESOLVED_IDENTITY_PREFIX) {
-                    sparse_identity::clear_proven(
-                        &tx,
-                        library,
-                        &transition.sparse_identity_proofs,
-                    )?;
-                }
-            }
             #[cfg(all(test, target_os = "linux"))]
             let writes_current_token = transition
                 .metadata_updates
                 .iter()
                 .any(|(key, _)| crate::sync_cycle::is_current_zone_checkpoint(key));
-            for (key, value) in transition.metadata_updates {
-                tx.execute(
-                    "INSERT INTO metadata (key, value) VALUES (?1, ?2) \
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    rusqlite::params![key, value],
-                )
-                .map_err(|e| StateError::query("commit_checkpoint_transition::update", e))?;
-            }
-            let staged_epoch_baselines = if !promote && epoch_completions.is_empty() {
-                super::sync_epoch::ready_proof_baseline_keys(&tx)?
-            } else {
-                rustc_hash::FxHashSet::default()
-            };
-            for key in transition.metadata_deletes {
-                if staged_epoch_baselines.contains(&key) {
-                    // Keep only the exact baseline bound by a currently ready
-                    // staged proof. Completed or unrelated baselines delete.
-                    continue;
-                }
-                tx.execute("DELETE FROM metadata WHERE key = ?1", [key])
-                    .map_err(|e| StateError::query("commit_checkpoint_transition::delete", e))?;
-            }
-            observation::invalidate(&tx, &changed_keys, old_policy)?;
-            observation::apply(&tx, prepared_observation)?;
-            for completion in epoch_completions {
-                super::sync_epoch::complete(&tx, &completion.library, &completion.attempt)?;
-                tx.execute(
-                    "DELETE FROM metadata WHERE key=?1",
-                    [completion.baseline_key],
-                )?;
-            }
-            #[cfg(all(test, target_os = "linux"))]
-            if writes_current_token {
-                crate::test_helpers::process_death_point("checkpoint-before-commit");
-            }
+            let tx = conn
+                .transaction()
+                .map_err(|e| StateError::query("commit_checkpoint_transition::begin", e))?;
+            commit_observation_transition_in_tx(&tx, transition, proof, promote)?;
             tx.commit()
                 .map_err(|e| StateError::query("commit_checkpoint_transition::commit", e))?;
             #[cfg(all(test, target_os = "linux"))]
@@ -436,6 +313,133 @@ impl SqliteStateDb {
         })
         .await
     }
+}
+
+/// Shared transaction body for ordinary and qualification checkpoint commits.
+/// The caller owns begin/commit and the post-commit process-death hook.
+pub(crate) fn commit_observation_transition_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    transition: CheckpointTransition,
+    proof: Option<ObservationProof>,
+    promote: bool,
+) -> Result<(), StateError> {
+    let old_policy = observation::policy(tx)?;
+    let prepared_observation = observation::prepare(
+        tx,
+        &transition.metadata_updates,
+        &transition.expected_metadata,
+        proof.as_ref(),
+        promote,
+    )?;
+    prepared_observation.guard_revalidation(
+        tx,
+        &transition.metadata_updates,
+        &transition.expected_metadata,
+    )?;
+    let epoch_completions = if promote {
+        observation::validate_epoch_promotion(tx, &prepared_observation, &transition)?
+    } else {
+        observation::record_epoch_stage(tx, proof.as_ref(), &prepared_observation, &transition)?
+    };
+    let changed_keys = transition
+        .metadata_updates
+        .iter()
+        .map(|(k, _)| k.clone())
+        .chain(transition.metadata_deletes.iter().cloned())
+        .collect::<Vec<_>>();
+    for (key, expected) in &transition.expected_metadata {
+        let actual: Option<String> = tx
+            .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if &actual != expected {
+            return Err(StateError::Invariant {
+                operation: "commit_checkpoint_transition",
+                detail: "checkpoint planning facts changed".to_owned(),
+            });
+        }
+    }
+    for proof in &transition.legacy_preservation_proofs {
+        let binds_cursor = transition.metadata_updates.iter().any(|(key, value)| {
+            !crate::sync_cycle::is_current_zone_checkpoint(key)
+                && super::legacy_preservation::checkpoint_library(key)
+                    == Some(proof.library.as_str())
+                && value == &proof.next_cursor
+        });
+        if !binds_cursor {
+            return Err(super::legacy_preservation::invalid_checkpoint());
+        }
+        super::legacy_preservation::activate(tx, proof)?;
+    }
+    for (key, _) in &transition.metadata_updates {
+        if !crate::sync_cycle::is_current_zone_checkpoint(key)
+            && let Some(library) = super::legacy_preservation::checkpoint_library(key)
+        {
+            super::legacy_preservation::validate_checkpoint(
+                tx,
+                library,
+                transition.legacy_config_hash.as_deref(),
+            )?;
+        }
+    }
+    // Recheck current obligations inside the token transaction. Historical
+    // evidence stays stored; no marker deletion certifies it.
+    for (key, _) in &transition.metadata_updates {
+        if crate::sync_cycle::is_current_zone_checkpoint(key)
+            && let Some(library) = super::legacy_preservation::checkpoint_library(key)
+        {
+            sparse_identity::clear_current_proven(tx, library, &transition.sparse_identity_proofs)?;
+        }
+    }
+    // Validate against the planning generation before this transaction promotes it.
+    // Any subsequent update failure rolls back these removals as well.
+    for key in &transition.metadata_deletes {
+        if let Some(library) = key.strip_prefix(crate::state::UNRESOLVED_IDENTITY_PREFIX) {
+            sparse_identity::clear_proven(tx, library, &transition.sparse_identity_proofs)?;
+        }
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    let writes_current_token = transition
+        .metadata_updates
+        .iter()
+        .any(|(key, _)| crate::sync_cycle::is_current_zone_checkpoint(key));
+    for (key, value) in transition.metadata_updates {
+        tx.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )
+        .map_err(|e| StateError::query("commit_checkpoint_transition::update", e))?;
+    }
+    let staged_epoch_baselines = if !promote && epoch_completions.is_empty() {
+        super::sync_epoch::ready_proof_baseline_keys(tx)?
+    } else {
+        rustc_hash::FxHashSet::default()
+    };
+    for key in transition.metadata_deletes {
+        if staged_epoch_baselines.contains(&key) {
+            // Keep only the exact baseline bound by a currently ready
+            // staged proof. Completed or unrelated baselines delete.
+            continue;
+        }
+        tx.execute("DELETE FROM metadata WHERE key = ?1", [key])
+            .map_err(|e| StateError::query("commit_checkpoint_transition::delete", e))?;
+    }
+    observation::invalidate(tx, &changed_keys, old_policy)?;
+    observation::apply(tx, prepared_observation)?;
+    for completion in epoch_completions {
+        super::sync_epoch::complete(tx, &completion.library, &completion.attempt)?;
+        tx.execute(
+            "DELETE FROM metadata WHERE key=?1",
+            [completion.baseline_key],
+        )?;
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    if writes_current_token {
+        crate::test_helpers::process_death_point("checkpoint-before-commit");
+    }
+    Ok(())
 }
 
 #[async_trait]
