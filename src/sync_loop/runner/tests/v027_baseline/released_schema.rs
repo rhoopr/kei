@@ -3199,3 +3199,518 @@ async fn released_unfinished_preservation_reports_partial_while_progressing_36()
         .scope(true, exercise_released_preservation_category(true))
         .await;
 }
+
+fn make_shared_hidden_app_config() -> crate::config::Config {
+    let data_dir = tempfile::tempdir().unwrap();
+    let globals = crate::config::GlobalArgs {
+        username: Some("baseline@example.invalid".to_string()),
+        domain: None,
+        data_dir: Some(data_dir.path().to_string_lossy().into_owned()),
+    };
+    let mut sync = crate::cli::SyncArgs::default();
+    sync.config_overrides.albums = vec!["none".to_string()];
+    sync.config_overrides.libraries = vec!["shared".to_string()];
+    sync.config_overrides.smart_folders = vec!["Hidden".to_string()];
+    sync.config_overrides.unfiled = Some(true);
+    sync.config_overrides.edited = Some(true);
+    crate::config::Config::build(&globals, &crate::cli::PasswordArgs::default(), sync, None)
+        .unwrap()
+}
+
+/// Shared library provider with separate Hidden and unfiled scopes.
+#[derive(Clone)]
+struct SharedHiddenSession {
+    hidden: Arc<Vec<serde_json::Value>>,
+    unfiled: Arc<Vec<serde_json::Value>>,
+    cycle: usize,
+    queries: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for SharedHiddenSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        let request: serde_json::Value = serde_json::from_str(&body)?;
+        if url.contains("/zones/list") {
+            return Ok(json!({"zones":[{"zoneID":zone(),
+                "syncToken":"shared-hidden-boundary","deleted":false}]}));
+        }
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(json!({"records":[{"recordName":"index",
+                "recordType":"CheckIndexingState",
+                "fields":{"state":{"value":"FINISHED"}}}]}));
+        }
+        if url.contains("/internal/records/query/batch") {
+            let batch = request["batch"].as_array().cloned().unwrap_or_default();
+            let counts: Vec<_> = batch
+                .iter()
+                .map(|entry| {
+                    let obj_type = entry["query"]["filterBy"]["fieldValue"]["value"][0]
+                        .as_str()
+                        .unwrap_or("");
+                    let count = if obj_type == "CPLAssetHiddenByAssetDate" {
+                        self.hidden.len() as u64 / 2
+                    } else if obj_type == "CPLAssetByAssetDateWithoutHiddenOrDeleted" {
+                        self.unfiled.len() as u64 / 2
+                    } else {
+                        0
+                    };
+                    json!({"records":[{"fields":{"itemCount":{"value":count}}}]})
+                })
+                .collect();
+            return Ok(json!({"batch": counts}));
+        }
+        if url.contains("/records/query?") {
+            self.queries.lock().unwrap().push(request.clone());
+            let record_type = request["query"]["recordType"].as_str().unwrap_or("");
+            let records = if record_type == "CPLAssetAndMasterHiddenByAssetDate" {
+                self.hidden.as_ref().clone()
+            } else if record_type == "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted" {
+                self.unfiled.as_ref().clone()
+            } else {
+                Vec::new()
+            };
+            return Ok(json!({"records":records,"syncToken":"query-not-checkpoint"}));
+        }
+        if url.contains("/records/lookup?") {
+            let requested = request["records"].as_array().cloned().unwrap_or_default();
+            let records: Vec<_> = self
+                .hidden
+                .iter()
+                .chain(self.unfiled.iter())
+                .filter(|record| {
+                    requested
+                        .iter()
+                        .any(|query| query["recordName"] == record["recordName"])
+                })
+                .cloned()
+                .collect();
+            return Ok(json!({"records":records}));
+        }
+        if url.contains("/changes/zone?") {
+            return Ok(json!({"zones":[{"zoneID":zone(),
+                "records":[],
+                "syncToken":format!("shared-hidden-after-{}", self.cycle),
+                "moreComing":false}]}));
+        }
+        anyhow::bail!("unexpected Shared+Hidden endpoint: {url}")
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+/// C03 current Shared+Hidden edited/original progress with protected old
+/// multiple-child history, plus the C08 ambiguous custom-sidecar no-repair
+/// control.
+pub(in crate::sync_loop::runner::tests) async fn exercise_released_shared_hidden_history() {
+    let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    let protected = root.join("protected");
+    std::fs::create_dir_all(&protected).unwrap();
+
+    let old_still = protected.join("old.JPG");
+    let old_sidecar = protected.join("old.JPG.xmp");
+    let custom_sidecar = protected.join("custom-notes.xmp");
+    let old_bytes = b"opaque old multiple-child bytes".to_vec();
+    std::fs::write(&old_still, &old_bytes).unwrap();
+    std::fs::write(&old_sidecar, b"opaque old sidecar bytes").unwrap();
+    std::fs::write(&custom_sidecar, b"opaque custom ambiguous sidecar").unwrap();
+    let old_mtimes = [
+        std::fs::metadata(&old_still).unwrap().modified().unwrap(),
+        std::fs::metadata(&old_sidecar).unwrap().modified().unwrap(),
+        std::fs::metadata(&custom_sidecar)
+            .unwrap()
+            .modified()
+            .unwrap(),
+    ];
+
+    let source = dir.path().join("released.db");
+    let db_path = dir.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        crate::state::schema::migrate_genuine_v28(&conn).unwrap();
+        insert_released_asset(
+            &conn,
+            ZONE,
+            "old-master",
+            "original",
+            "old.JPG",
+            &old_still,
+            &old_bytes,
+            &signature(&old_bytes),
+            false,
+        );
+        conn.execute_batch(&format!(
+            "INSERT INTO asset_master_mappings VALUES ('{ZONE}','old-child-a','old-master',1700000000);
+             INSERT INTO asset_master_mappings VALUES ('{ZONE}','old-child-b','old-master',1700000000);
+             INSERT INTO asset_metadata_capture_revisions VALUES ('{ZONE}','old-master',0,1700000000);
+             INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at,last_outcome)
+               VALUES('{ZONE}','ambiguous-source','[1,\"ambiguous-child\",\"SharedSync-absent\",\"owner-a\"]','[1,\"ambiguous-child\",\"SharedSync-absent\",\"owner-b\"]',7,1000,'[malformed outcome');
+             INSERT INTO asset_verifications VALUES('{ZONE}','old-master','original','unknown','multiple historical children',1700000000);"
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metadata VALUES (?1,?2)",
+            rusqlite::params![format!("sync_token:{ZONE}"), OLD_TOKEN],
+        )
+        .unwrap();
+    }
+    let columns = released_columns(&source);
+    let legacy_rows = released_rows(&source, &columns);
+    crate::state::db::account::adopt_legacy(
+        &source,
+        &db_path,
+        &baseline_owner(),
+        "baseline@example.invalid",
+        "com",
+    )
+    .await
+    .unwrap();
+    assert_eq!(released_rows(&db_path, &columns), legacy_rows);
+
+    let protected_snapshot = || {
+        rows(
+            &db_path,
+            &format!("SELECT * FROM assets WHERE library='{ZONE}' AND id='old-master' ORDER BY version_size"),
+        )
+        .into_iter()
+        .chain(rows(
+            &db_path,
+            &format!("SELECT * FROM asset_metadata_paths WHERE library='{ZONE}' AND id='old-master' ORDER BY version_size"),
+        ))
+        .chain(rows(
+            &db_path,
+            &format!("SELECT * FROM asset_master_mappings WHERE library='{ZONE}' AND asset_record_name IN ('old-child-a','old-child-b') ORDER BY asset_record_name"),
+        ))
+        .chain(rows(
+            &db_path,
+            &format!("SELECT * FROM asset_metadata_capture_revisions WHERE library='{ZONE}' AND asset_id='old-master' ORDER BY asset_id"),
+        ))
+        .chain(rows(
+            &db_path,
+            &format!("SELECT * FROM unresolved_sparse_identities WHERE library='{ZONE}' ORDER BY source_record_name"),
+        ))
+        .chain(rows(
+            &db_path,
+            &format!("SELECT * FROM asset_verifications WHERE library='{ZONE}' ORDER BY id,version_size"),
+        ))
+        .collect::<Vec<_>>()
+    };
+    let protected_before = protected_snapshot();
+    let mut config_hash_after = None;
+
+    let server = crate::test_helpers::start_wiremock_or_skip("released Shared Hidden history")
+        .await
+        .expect("acceptance server must bind");
+    for endpoint in ["/hidden-original", "/hidden-edited", "/peer"] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let hidden_bytes = MEDIA.to_vec();
+    let edited_bytes = MEDIA.to_vec();
+    let mut hidden = pair(
+        "hidden-master",
+        "hidden.JPG",
+        &format!("{}/hidden-original", server.uri()),
+        11,
+    );
+    hidden[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+        json!(signature(&hidden_bytes));
+    hidden[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(hidden_bytes.len());
+    hidden[0]["fields"]["resJPEGFullRes"] = json!({"value":{
+        "downloadURL":format!("{}/hidden-edited",server.uri()),
+        "size":edited_bytes.len(),
+        "fileChecksum":signature(&edited_bytes)}});
+    hidden[0]["fields"]["resJPEGFullFileType"] = json!({"value":"public.jpeg"});
+    hidden[0]["fields"]["isHidden"] = json!({"value":1,"type":"INT64"});
+    hidden[1]["fields"]["isHidden"] = json!({"value":1,"type":"INT64"});
+    let mut peer = pair(
+        "peer-master",
+        "peer.JPG",
+        &format!("{}/peer", server.uri()),
+        12,
+    );
+    peer[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(signature(MEDIA));
+    peer[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+
+    let token_key = sync_token_key(ZONE);
+    let app_config = make_shared_hidden_app_config();
+    let selection = &app_config.filters.selection;
+    let selected = [PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/shared".to_string(),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(SharedHiddenSession {
+            hidden: Arc::new(hidden.clone()),
+            unfiled: Arc::new(peer.clone()),
+            cycle: 0,
+            queries: Arc::new(Mutex::new(Vec::new())),
+        }),
+        Arc::new(zone()),
+        "shared".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap()];
+    let selected_zones = crate::commands::zone_name_set(&selected);
+    let collection_zones = crate::commands::zone_name_set(crate::commands::collection_libraries(
+        selection, &selected, &selected,
+    ));
+    let shared_scope =
+        crate::commands::pass_scope_for_zone(selection, ZONE, &selected_zones, &collection_zones);
+    assert!(shared_scope.include_unfiled);
+    assert!(!shared_scope.include_albums);
+    assert!(shared_scope.include_smart_folders);
+    let collection_context = crate::commands::build_collection_context(selection, &selected)
+        .await
+        .unwrap();
+    let plan = crate::commands::resolve_passes_for_scope(
+        &selected[0],
+        selection,
+        shared_scope,
+        &collection_context,
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.passes.len(), 2, "Hidden plus unfiled");
+    assert!(
+        plan.passes
+            .iter()
+            .any(|pass| pass.kind == PassKind::SmartFolder && pass.album.name.as_ref() == "Hidden")
+    );
+    assert!(
+        plan.passes
+            .iter()
+            .any(|pass| pass.kind == PassKind::Unfiled)
+    );
+
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let mut current_paths = None;
+    for cycle in 0..3 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        let session = SharedHiddenSession {
+            hidden: Arc::new(hidden.clone()),
+            unfiled: Arc::new(peer.clone()),
+            cycle,
+            queries: Arc::clone(&queries),
+        };
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/shared".to_string(),
+            Arc::new(std::collections::HashMap::new()),
+            Box::new(session.clone()),
+            Arc::new(zone()),
+            "shared".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            baseline_owner(),
+            "com",
+        ));
+        let resolved = crate::commands::resolve_passes_for_scope(
+            &library,
+            selection,
+            shared_scope,
+            &collection_context,
+            &[],
+        )
+        .await
+        .unwrap();
+        let mut selected =
+            make_run_cycle_library_state_with_passes(ZONE, &token_key, resolved.passes);
+        selected.library = library;
+        let base = make_run_cycle_download_config_builder(&root, db.clone());
+        let builder = |mode, exclude, groups, zone| {
+            let mut config = (*base(mode, exclude, groups, zone)).clone();
+            config.folder_structure = "none".into();
+            config.file_match_policy = crate::types::FileMatchPolicy::NameId7;
+            config.edited = true;
+            config.retry.max_retries = 0;
+            Arc::new(config)
+        };
+        let result = run_cycle(
+            &[&selected],
+            &app_config,
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        if result.failed_count != 0 {
+            for event in trace.events() {
+                if matches!(event.level, tracing::Level::WARN | tracing::Level::ERROR) {
+                    eprintln!("TRACE {:?}", event.fields);
+                }
+            }
+            for request in server.received_requests().await.unwrap() {
+                if request.method.as_str() == "GET" {
+                    eprintln!("GET {}", request.url.path());
+                }
+            }
+        }
+        assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
+        assert!(result.db_sync_token_advance_safe, "cycle {cycle}");
+        assert_eq!(
+            db.get_metadata(&token_key).await.unwrap().as_deref(),
+            Some(format!("shared-hidden-after-{cycle}").as_str())
+        );
+        assert_eq!(
+            result.stats.unattributed_legacy_pending, 0,
+            "cycle {cycle}: no preservation row"
+        );
+        assert_eq!(
+            crate::cycle_reporter::classify_cycle(
+                &result.stats,
+                result.failed_count,
+                result.session_expired
+            ),
+            crate::cycle_reporter::CycleStatus::Success,
+            "cycle {cycle}: no fake failed-asset count"
+        );
+        assert_eq!(
+            protected_snapshot(),
+            protected_before,
+            "cycle {cycle}: protected multiple-child history mutated"
+        );
+        assert_eq!(
+            [
+                std::fs::metadata(&old_still).unwrap().modified().unwrap(),
+                std::fs::metadata(&old_sidecar).unwrap().modified().unwrap(),
+                std::fs::metadata(&custom_sidecar)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+            ],
+            old_mtimes,
+            "cycle {cycle}: protected sidecar mtimes"
+        );
+        assert_eq!(std::fs::read(&old_still).unwrap(), old_bytes);
+        assert_eq!(
+            std::fs::read(&old_sidecar).unwrap(),
+            b"opaque old sidecar bytes"
+        );
+        assert_eq!(
+            std::fs::read(&custom_sidecar).unwrap(),
+            b"opaque custom ambiguous sidecar"
+        );
+        let config_hash = rows(
+            &db_path,
+            "SELECT value FROM metadata WHERE key='config_hash'",
+        );
+        if let Some(expected) = &config_hash_after {
+            assert_eq!(
+                &config_hash, expected,
+                "cycle {cycle}: ordinary metadata options unchanged"
+            );
+        } else {
+            config_hash_after = Some(config_hash);
+        }
+        assert_eq!(result.stats.downloaded, if cycle == 0 { 3 } else { 0 });
+        let completed = db.get_downloaded_page(0, 100).await.unwrap();
+        let hidden_row = completed
+            .iter()
+            .find(|row| {
+                row.id.as_ref() == "asset-hidden-master" && row.version_size.as_str() == "original"
+            })
+            .expect("current hidden original");
+        let edited_row = completed
+            .iter()
+            .find(|row| {
+                row.id.as_ref() == "asset-hidden-master" && row.version_size.as_str() == "adjusted"
+            })
+            .expect("current hidden edited");
+        if let Some((original, edited)) = &current_paths {
+            assert_eq!(hidden_row.local_path.as_ref(), Some(original));
+            assert_eq!(edited_row.local_path.as_ref(), Some(edited));
+        } else {
+            current_paths = Some((
+                hidden_row.local_path.clone().unwrap(),
+                edited_row.local_path.clone().unwrap(),
+            ));
+        }
+        assert_eq!(
+            std::fs::read(hidden_row.local_path.as_ref().unwrap()).unwrap(),
+            hidden_bytes
+        );
+        assert_eq!(
+            std::fs::read(edited_row.local_path.as_ref().unwrap()).unwrap(),
+            edited_bytes
+        );
+    }
+    let records = rows(
+        &db_path,
+        "SELECT child FROM provider_active_decisions ORDER BY child",
+    );
+    assert!(
+        records
+            .iter()
+            .all(|row| row[0] != rusqlite::types::Value::Text("old-master".into())),
+        "old historical master must not become current work"
+    );
+    let lookups = queries.lock().unwrap().clone();
+    assert!(
+        lookups.iter().all(|body| {
+            let text = body.to_string();
+            !text.contains("old-master") && !text.contains("old-child")
+        }),
+        "old historical payload must not be parsed as a current request"
+    );
+    assert!(
+        lookups.iter().any(|body| body
+            .to_string()
+            .contains("CPLAssetAndMasterHiddenByAssetDate")),
+        "Hidden scope request"
+    );
+    assert!(
+        lookups
+            .iter()
+            .any(|body| body.to_string().contains("WithoutHiddenOrDeleted")),
+        "unfiled scope request"
+    );
+    let requests = server.received_requests().await.unwrap();
+    let count = |path: &str| {
+        requests
+            .iter()
+            .filter(|request| request.method.as_str() == "GET" && request.url.path() == path)
+            .count()
+    };
+    assert_eq!(count("/hidden-original"), 1);
+    assert_eq!(count("/hidden-edited"), 1);
+    assert_eq!(count("/peer"), 1);
+    server.verify().await;
+    eprintln!(
+        "RELEASED_SHARED_HIDDEN_REACHED protected_rows={} queries={}",
+        protected_snapshot().len(),
+        lookups.len()
+    );
+}
+
+#[tokio::test]
+async fn released_shared_hidden_edited_progress_keeps_old_ambiguity_28() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(true, exercise_released_shared_hidden_history())
+        .await;
+}
