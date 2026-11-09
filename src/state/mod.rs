@@ -20,10 +20,11 @@ pub(crate) use db::{
 pub use db::ImportedRecord;
 pub(crate) use db::{
     AssetVerificationState, CheckpointTransition, DownloadContextStateStore, DownloadedFileRecord,
-    LegacyFileEvidence, OwnedTempFile, PendingPublicationRecord, ReconciliationCatalogPath,
+    LegacyFileEvidence, OwnedTempFile, PendingPublicationRecord, QualificationFailure,
+    QualificationReservation, QualificationReserve, ReconciliationCatalogPath,
     ReconciliationContent, ReconciliationPathKey, ReconciliationReservation,
-    ReconciliationStateStore, RetryErrorRetention, ScopedDbSyncToken, SyncEpochGate,
-    TempFileOwnershipStore,
+    ReconciliationStateStore, RetryErrorRetention, SYNC_EPOCH_KEY, ScopedDbSyncToken,
+    SyncEpochGate, TempFileOwnershipStore,
 };
 pub use db::{
     DownloadStateStore, ImportStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore,

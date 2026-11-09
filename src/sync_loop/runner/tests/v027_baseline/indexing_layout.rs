@@ -307,6 +307,18 @@ async fn run_pending_upgrade_indexing_cycle(
     root: &std::path::Path,
     shared: &crate::auth::SharedSession,
 ) -> crate::sync_cycle::CycleResult {
+    try_run_pending_upgrade_indexing_cycle(db, session, indexing_running, root, shared)
+        .await
+        .unwrap()
+}
+
+async fn try_run_pending_upgrade_indexing_cycle(
+    db: Arc<SqliteStateDb>,
+    session: BaselineSession,
+    indexing_running: bool,
+    root: &std::path::Path,
+    shared: &crate::auth::SharedSession,
+) -> anyhow::Result<crate::sync_cycle::CycleResult> {
     let mut library = PhotoLibrary::new(
         "https://synthetic.example/database/1/photos/production/private".into(),
         Arc::new(std::collections::HashMap::new()),
@@ -351,7 +363,6 @@ async fn run_pending_upgrade_indexing_cycle(
         &CancellationToken::new(),
     )
     .await
-    .unwrap()
 }
 
 fn assert_released_catalog_preserved(
@@ -933,4 +944,309 @@ fn pending_upgrade_tagged_outcome_roundtrips_through_baseline_v2_decoder_and_gat
         assert_eq!(parsed.as_object().unwrap().len(), 3);
         assert_eq!(parsed["prior_next_attempt_at"], json!(prior));
     }
+}
+
+async fn seed_running_pending_upgrade(
+    media_url: &str,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    Arc<Vec<Value>>,
+    crate::auth::session::SharedSession,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    seed_existing_upgrade_db(&db_path);
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata(key,value) VALUES(?1,?2)",
+            rusqlite::params![format!("sync_token:{ZONE}"), OLD_TOKEN],
+        )
+        .unwrap();
+    }
+    let inventory = Arc::new(pair("current", "current.JPG", media_url, 21));
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let session = pending_upgrade_session(0, Arc::clone(&inventory));
+    let running =
+        run_pending_upgrade_indexing_cycle(Arc::clone(&db), session, true, &root, &shared).await;
+    assert_eq!(running.stats.downloaded, 0, "{running:?}");
+    assert!(
+        db.get_metadata(&indexing_reconciliation_key(ZONE))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    drop(db);
+    (dir, root, db_path, inventory, shared)
+}
+
+#[tokio::test]
+async fn pending_upgrade_qualification_write_fault_surfaces_and_keeps_guard() {
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/current"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (_dir, root, db_path, inventory, shared) =
+        seed_running_pending_upgrade(&format!("{}/current", server.uri())).await;
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    {
+        let conn = db
+            .acquire_lock("inject qualification commit fault")
+            .unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER fail_qualification_commit BEFORE UPDATE ON metadata \
+             WHEN NEW.key='{}' AND json_valid(NEW.value) \
+             AND json_extract(NEW.value,'$.last_outcome')='indexing_inventory_qualified' \
+             BEGIN SELECT RAISE(ABORT,'injected qualification commit fault'); END;",
+            crate::state::db::sync_epoch::library_key(ZONE)
+        ))
+        .unwrap();
+    }
+    let running_record = {
+        let conn = db.acquire_lock("read running record").unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    let session = pending_upgrade_session(1, inventory);
+    let counters = session.clone();
+    let failed =
+        run_pending_upgrade_indexing_cycle(Arc::clone(&db), session, false, &root, &shared).await;
+    assert!(counters.inventory_queries.load(Ordering::SeqCst) > 0);
+    assert!(failed.failed_count > 0, "{failed:?}");
+    assert!(failed.stats.state_write_failures > 0, "{failed:?}");
+    assert!(
+        db.get_metadata(&indexing_reconciliation_key(ZONE))
+            .await
+            .unwrap()
+            .is_some(),
+        "failed qualification commit keeps its durable hold"
+    );
+    assert_eq!(
+        db.get_metadata(&indexing_replay_key(ZONE)).await.unwrap(),
+        None
+    );
+    assert_eq!(db.get_metadata(&sync_token_key(ZONE)).await.unwrap(), None);
+    let after = {
+        let conn = db
+            .acquire_lock("read retained qualification guard")
+            .unwrap();
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [crate::state::db::sync_epoch::library_key(ZONE)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (
+            raw,
+            crate::state::db::sync_epoch::read_library(&conn, ZONE)
+                .unwrap()
+                .unwrap(),
+        )
+    };
+    assert!(
+        after.0.contains("qualification_in_progress:v1:"),
+        "write fault must leave the committed reservation guard: {}",
+        after.0
+    );
+    assert_eq!(after.1.state, "pending");
+    assert_eq!(after.1.attempt, running_record.attempt);
+    assert_eq!(after.1.attempts, running_record.attempts);
+    assert!(after.1.binding.is_none());
+}
+
+#[tokio::test]
+async fn pending_upgrade_qualification_not_due_keeps_existing_deadline_and_no_work() {
+    let (_dir, root, db_path, inventory, shared) =
+        seed_running_pending_upgrade("http://synthetic.invalid/current").await;
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let future = chrono::Utc::now().timestamp() + 3_600;
+    {
+        let conn = db
+            .acquire_lock("seed future qualification deadline")
+            .unwrap();
+        conn.execute(
+            "UPDATE metadata SET value=json_set(value,'$.next_attempt_at',?1) WHERE key=?2",
+            rusqlite::params![future, crate::state::db::sync_epoch::library_key(ZONE)],
+        )
+        .unwrap();
+    }
+    let session = pending_upgrade_session(1, inventory);
+    let counters = session.clone();
+    let held =
+        run_pending_upgrade_indexing_cycle(Arc::clone(&db), session, false, &root, &shared).await;
+    assert_eq!(counters.inventory_queries.load(Ordering::SeqCst), 0);
+    assert!(
+        held.holds
+            .iter()
+            .any(|hold| hold.reason == "indexing_qualification_not_due"),
+        "{held:?}"
+    );
+    let record = {
+        let conn = db.acquire_lock("read retained future deadline").unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(record.next_attempt_at, future);
+    assert_eq!(record.state, "pending");
+    assert!(record.binding.is_none());
+    assert!(
+        db.get_metadata(&indexing_reconciliation_key(ZONE))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        db.get_metadata(&indexing_replay_key(ZONE)).await.unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn pending_upgrade_qualification_unknown_namespace_refuses_without_fallback() {
+    let (_dir, root, db_path, inventory, shared) =
+        seed_running_pending_upgrade("http://synthetic.invalid/current").await;
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    {
+        let conn = db
+            .acquire_lock("seed unknown qualification namespace")
+            .unwrap();
+        conn.execute(
+            "UPDATE metadata SET value=json_set(value,'$.last_outcome','qualification_in_progress:v1:{not-json}','$.next_attempt_at',0) WHERE key=?1",
+            [crate::state::db::sync_epoch::library_key(ZONE)],
+        )
+        .unwrap();
+    }
+    let session = pending_upgrade_session(1, inventory);
+    let counters = session.clone();
+    let error =
+        try_run_pending_upgrade_indexing_cycle(Arc::clone(&db), session, false, &root, &shared)
+            .await
+            .expect_err("unknown qualification namespace must refuse the cycle");
+    assert_eq!(counters.inventory_queries.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.boundaries.load(Ordering::SeqCst), 0);
+    assert!(
+        error.to_string().contains("malformed") || error.to_string().contains("refusing"),
+        "{error}"
+    );
+    drop(db);
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let raw: String = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [crate::state::db::sync_epoch::library_key(ZONE)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        raw.contains("qualification_in_progress:v1:{not-json}"),
+        "{raw}"
+    );
+    let replay: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [indexing_replay_key(ZONE)],
+            |row| row.get(0),
+        )
+        .ok();
+    let token: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [sync_token_key(ZONE)],
+            |row| row.get(0),
+        )
+        .ok();
+    assert_eq!(replay, None);
+    assert_eq!(token, None);
+    let hold: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            [indexing_reconciliation_key(ZONE)],
+            |row| row.get(0),
+        )
+        .ok();
+    assert!(hold.is_some());
+}
+
+#[tokio::test]
+async fn pending_upgrade_qualification_failed_transfer_keeps_attempt_and_floor() {
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/broken"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let (_dir, root, db_path, inventory, shared) =
+        seed_running_pending_upgrade(&format!("{}/broken", server.uri())).await;
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let running_record = {
+        let conn = db.acquire_lock("read running record").unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    let session = pending_upgrade_session(1, inventory);
+    let counters = session.clone();
+    let refused =
+        run_pending_upgrade_indexing_cycle(Arc::clone(&db), session, false, &root, &shared).await;
+    assert!(counters.inventory_queries.load(Ordering::SeqCst) > 0);
+    assert!(refused.stats.failed > 0, "{refused:?}");
+    let record = {
+        let conn = db
+            .acquire_lock("read transfer-refused qualification record")
+            .unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(
+        record.last_outcome.as_deref(),
+        Some("qualification_incomplete:v1:failed_transfers"),
+        "a local transfer failure must not become a provider attempt"
+    );
+    assert_eq!(record.attempts, running_record.attempts);
+    assert_eq!(record.attempt, running_record.attempt);
+    assert_eq!(record.state, "pending");
+    assert!(record.binding.is_none());
+    assert_eq!(
+        db.get_metadata(&indexing_replay_key(ZONE)).await.unwrap(),
+        None
+    );
+    assert_eq!(db.get_metadata(&sync_token_key(ZONE)).await.unwrap(), None);
+    assert!(
+        db.get_metadata(&indexing_reconciliation_key(ZONE))
+            .await
+            .unwrap()
+            .is_some()
+    );
 }

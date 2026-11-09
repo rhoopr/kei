@@ -1380,6 +1380,7 @@ pub(crate) async fn run_cycle_with_witness(
                 && !config.runtime.dry_run
                 && !config.runtime.only_print_filenames
                 && !is_retry_failed
+                && !indexing_reconciliation
             {
                 db.defer_sync_epoch(
                     lib_state.zone_name.clone(),
@@ -1402,10 +1403,135 @@ pub(crate) async fn run_cycle_with_witness(
             && !indexing_reconciliation
             && !is_retry_failed
             && download_controls.run_mode.downloads_files();
+        let qualification_candidate = indexing_finished
+            && indexing_reconciliation
+            && !is_retry_failed
+            && !config.runtime.only_print_filenames
+            && download_controls.run_mode.downloads_files()
+            && !lib_state.plan_is_stale;
+        let retained_cursor_at_start = if let Some(db) = state_db {
+            db.get_metadata(&lib_state.sync_token_key).await?
+        } else {
+            None
+        };
+        let mut retained_checkpoint_attempt = 1;
+        let hold_key = retained_checkpoint_hold_key(&lib_state.zone_name);
+        let retained_hold_at_start = if let Some(db) = state_db {
+            db.get_metadata(&hold_key).await?
+        } else {
+            None
+        };
+        let replay_key = indexing_replay_key(&lib_state.zone_name);
+        let replay_at_start = match state_db {
+            Some(db) => db.get_metadata(&replay_key).await?,
+            None => None,
+        };
+        let indexing_replay_pending = replay_at_start.is_some();
+        let materialization_key = indexing_materialization_key(&lib_state.zone_name);
+        let materialization_at_start = match state_db {
+            Some(db) => db.get_metadata(&materialization_key).await?,
+            None => None,
+        };
+        let indexing_materialization_pending = materialization_at_start.is_some();
+        let mut zone_metadata_fence = enum_metadata_at_start.clone();
+        zone_metadata_fence.push((
+            materialization_key.clone(),
+            materialization_at_start.clone(),
+        ));
+        active_cursor_fences.push((
+            materialization_key.clone(),
+            materialization_at_start.clone(),
+        ));
+        zone_metadata_fence.push((indexing_key.clone(), indexing_hold_at_start.clone()));
+        zone_metadata_fence.push((replay_key.clone(), replay_at_start.clone()));
+        active_cursor_fences.push((replay_key.clone(), replay_at_start.clone()));
+        active_cursor_fences.push((indexing_key.clone(), indexing_hold_at_start.clone()));
+        zone_metadata_fence.push((
+            lib_state.sync_token_key.clone(),
+            retained_cursor_at_start.clone(),
+        ));
+        active_cursor_fences.push((
+            lib_state.sync_token_key.clone(),
+            retained_cursor_at_start.clone(),
+        ));
+        zone_metadata_fence.push((hold_key.clone(), retained_hold_at_start.clone()));
+        // Successful zone staging removes its hold before aggregate activation.
+        active_cursor_fences.push((hold_key.clone(), None));
+
         let mut force_epoch_baseline = false;
         let mut promote_only = false;
         let mut epoch_attempt: Option<String> = None;
-        if let Some(db) = state_db
+        let mut qualification_reservation: Option<state::QualificationReservation> = None;
+        if qualification_candidate {
+            let db = state_db
+                .ok_or_else(|| anyhow::anyhow!("Indexing qualification requires durable state"))?;
+            let mut expected_metadata = enum_metadata_at_start.clone();
+            expected_metadata.extend(path_metadata_at_start.iter().cloned());
+            expected_metadata.push((
+                materialization_key.clone(),
+                materialization_at_start.clone(),
+            ));
+            expected_metadata.push((indexing_key.clone(), indexing_hold_at_start.clone()));
+            expected_metadata.push((replay_key.clone(), replay_at_start.clone()));
+            expected_metadata.push((
+                lib_state.sync_token_key.clone(),
+                retained_cursor_at_start.clone(),
+            ));
+            expected_metadata.push((hold_key.clone(), retained_hold_at_start.clone()));
+            expected_metadata.push((
+                state::SYNC_EPOCH_KEY.to_owned(),
+                db.get_metadata(state::SYNC_EPOCH_KEY).await?,
+            ));
+            match db
+                .reserve_indexing_qualification(
+                    lib_state.zone_name.clone(),
+                    indexing_key.clone(),
+                    replay_key.clone(),
+                    expected_metadata,
+                    config.watch.interval,
+                )
+                .await?
+            {
+                state::QualificationReserve::Reserved(reservation) => {
+                    qualification_reservation = Some(*reservation);
+                }
+                state::QualificationReserve::NotDue { .. } => {
+                    record_selected_hold(
+                        &mut library_holds,
+                        &mut cycle_stats,
+                        &lib_state.zone_name,
+                        library_ordinal,
+                        LibraryHoldKind::IndexingReconciliation,
+                        "indexing_qualification_not_due",
+                        "a selected library retains its existing indexing qualification deadline; no baseline attempt or cursor was claimed",
+                        true,
+                    );
+                    db_sync_token_advance_safe = false;
+                    continue;
+                }
+                state::QualificationReserve::NotPending => {
+                    // A validated complete/ready/blocked record keeps its
+                    // ordinary gate path below.
+                }
+                state::QualificationReserve::StaleFence => {
+                    record_selected_hold(
+                        &mut library_holds,
+                        &mut cycle_stats,
+                        &lib_state.zone_name,
+                        library_ordinal,
+                        LibraryHoldKind::IndexingReconciliation,
+                        "indexing_qualification_stale_fence",
+                        "selected library epoch qualification evidence changed; this cycle refuses qualification and ordinary fallback",
+                        true,
+                    );
+                    db_sync_token_advance_safe = false;
+                    continue;
+                }
+            }
+        }
+        let qualification_owned = qualification_reservation.is_some();
+        if qualification_reservation.is_none()
+            && let Some(db) = state_db
             && !config.runtime.dry_run
         {
             let ineligible_without_defer = config.runtime.only_print_filenames || is_retry_failed;
@@ -1414,7 +1540,7 @@ pub(crate) async fn run_cycle_with_witness(
                     .sync_epoch_has_pending(lib_state.zone_name.clone())
                     .await?
                 {
-                    if !ineligible_without_defer {
+                    if !ineligible_without_defer && !indexing_reconciliation {
                         db.defer_sync_epoch(
                             lib_state.zone_name.clone(),
                             config.watch.interval,
@@ -1566,51 +1692,6 @@ pub(crate) async fn run_cycle_with_witness(
                 }
             }
         }
-        let retained_cursor_at_start = if let Some(db) = state_db {
-            db.get_metadata(&lib_state.sync_token_key).await?
-        } else {
-            None
-        };
-        let mut retained_checkpoint_attempt = 1;
-        let hold_key = retained_checkpoint_hold_key(&lib_state.zone_name);
-        let retained_hold_at_start = if let Some(db) = state_db {
-            db.get_metadata(&hold_key).await?
-        } else {
-            None
-        };
-        let replay_key = indexing_replay_key(&lib_state.zone_name);
-        let replay_at_start = match state_db {
-            Some(db) => db.get_metadata(&replay_key).await?,
-            None => None,
-        };
-        let indexing_replay_pending = replay_at_start.is_some();
-        let materialization_key = indexing_materialization_key(&lib_state.zone_name);
-        let materialization_at_start = match state_db {
-            Some(db) => db.get_metadata(&materialization_key).await?,
-            None => None,
-        };
-        let indexing_materialization_pending = materialization_at_start.is_some();
-        let mut zone_metadata_fence = enum_metadata_at_start.clone();
-        zone_metadata_fence.push((
-            materialization_key.clone(),
-            materialization_at_start.clone(),
-        ));
-        active_cursor_fences.push((materialization_key.clone(), materialization_at_start));
-        zone_metadata_fence.push((indexing_key.clone(), indexing_hold_at_start.clone()));
-        zone_metadata_fence.push((replay_key.clone(), replay_at_start.clone()));
-        active_cursor_fences.push((replay_key.clone(), replay_at_start));
-        active_cursor_fences.push((indexing_key.clone(), indexing_hold_at_start.clone()));
-        zone_metadata_fence.push((
-            lib_state.sync_token_key.clone(),
-            retained_cursor_at_start.clone(),
-        ));
-        active_cursor_fences.push((
-            lib_state.sync_token_key.clone(),
-            retained_cursor_at_start.clone(),
-        ));
-        zone_metadata_fence.push((hold_key.clone(), retained_hold_at_start.clone()));
-        // Successful zone staging removes its hold before aggregate activation.
-        active_cursor_fences.push((hold_key.clone(), None));
 
         if !config.runtime.dry_run
             && retained_hold_at_start.as_deref().is_some_and(|encoded| {
@@ -2159,13 +2240,13 @@ pub(crate) async fn run_cycle_with_witness(
                 continue;
             }
         }
-        let mut sync_result = download::download_photos_with_sync(
+        let mut sync_result = Box::pin(download::download_photos_with_sync(
             &download_client,
             &lib_state.plan.passes,
             Arc::clone(&download_config),
             download_controls,
             shutdown_token.clone(),
-        )
+        ))
         .await?;
 
         // Capture only the initial complete selected scope, before a bridge
@@ -2263,13 +2344,13 @@ pub(crate) async fn run_cycle_with_witness(
                             sync_result.checkpoint.observation.clone().map(Box::new);
                         Arc::make_mut(&mut bridge_config).prior_sparse_bridge_proofs =
                             Arc::from(sync_result.checkpoint.sparse_identity_proofs.clone());
-                        let bridge_result = download::download_photos_with_sync(
+                        let bridge_result = Box::pin(download::download_photos_with_sync(
                             &download_client,
                             &lib_state.plan.passes,
                             bridge_config,
                             download_controls,
                             shutdown_token.clone(),
-                        )
+                        ))
                         .await?;
                         observe_sync_component(
                             "delta_bridge",
@@ -2317,13 +2398,13 @@ pub(crate) async fn run_cycle_with_witness(
                                 // instead of immediately enumerating it a third time.
                                 if !bridge_result.full_enumeration_ran {
                                     let previous = sync_result;
-                                    sync_result = download::download_photos_with_sync(
+                                    sync_result = Box::pin(download::download_photos_with_sync(
                                         &download_client,
                                         &lib_state.plan.passes,
                                         Arc::clone(&download_config),
                                         download_controls,
                                         shutdown_token.clone(),
-                                    )
+                                    ))
                                     .await?;
                                     sync_result.outcome = merge_download_outcomes(
                                         &previous.outcome,
@@ -2646,7 +2727,84 @@ pub(crate) async fn run_cycle_with_witness(
 
         if indexing_reconciliation {
             let mut qualified = false;
-            if matches!(
+            if let Some(reservation) = qualification_reservation.take()
+                && let Some(db) = state_db
+            {
+                let auth_or_cancel = matches!(
+                    sync_result.outcome,
+                    download::DownloadOutcome::SessionExpired { .. }
+                ) || sync_result.stats.interrupted
+                    || shutdown_token.is_cancelled();
+                let qualification_reason = if auth_or_cancel {
+                    None
+                } else if lib_state.plan_is_stale {
+                    Some(state::QualificationFailure::StalePlan)
+                } else if !indexing_finished || indexing_hold_required {
+                    Some(state::QualificationFailure::ReadinessRegressed)
+                } else if !sync_result.full_enumeration_ran {
+                    Some(state::QualificationFailure::NotFullEnumeration)
+                } else if sync_result.checkpoint.enumeration_incomplete
+                    || sync_result.checkpoint.enumeration_errors > 0
+                {
+                    Some(state::QualificationFailure::EnumerationIncomplete)
+                } else if sync_result.stats.failed > 0 {
+                    Some(state::QualificationFailure::FailedTransfers)
+                } else if sync_result.stats.exif_failures > 0
+                    || sync_result.stats.metadata_capture_failures > 0
+                {
+                    Some(state::QualificationFailure::MetadataFailures)
+                } else if !library_completed_without_errors
+                    || sync_result.checkpoint.state_write_failures > 0
+                    || !checkpoint_transition_state_safe
+                    || !matches!(
+                        checkpoint_decision,
+                        SourceCheckpointDecision::Advance { .. }
+                    )
+                {
+                    Some(state::QualificationFailure::ProofIncomplete)
+                } else {
+                    None
+                };
+                let finish = if auth_or_cancel {
+                    db.finish_indexing_qualification_auth_or_cancel(
+                        reservation.clone(),
+                        config.watch.interval,
+                    )
+                    .await
+                    .map(|_| ())
+                } else if let Some(reason) = qualification_reason {
+                    db.finish_indexing_qualification_nonqualified(reservation.clone(), reason)
+                        .await
+                        .map(|_| ())
+                } else {
+                    match db.commit_indexing_qualification(reservation.clone()).await {
+                        Ok(()) => {
+                            qualified = true;
+                            Ok(())
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "Failed to commit indexing qualification; retaining the durable reservation guard"
+                            );
+                            Err(error)
+                        }
+                    }
+                };
+                if let Err(error) = finish {
+                    tracing::warn!(
+                        error = %error,
+                        "Indexing qualification finish failed; the committed reservation guard remains"
+                    );
+                    sync_result.checkpoint.state_write_failures = sync_result
+                        .checkpoint
+                        .state_write_failures
+                        .saturating_add(1);
+                    sync_result.stats.state_write_failures =
+                        sync_result.stats.state_write_failures.saturating_add(1);
+                    cycle_failed_count = cycle_failed_count.saturating_add(1);
+                }
+            } else if matches!(
                 checkpoint_decision,
                 SourceCheckpointDecision::Advance { .. }
             ) && !is_retry_failed
@@ -2657,8 +2815,9 @@ pub(crate) async fn run_cycle_with_witness(
                 && library_completed_without_errors
                 && let Some(db) = state_db
             {
-                // Qualify coverage without adopting its cursor. The next
-                // cycle still bridges the retained provider checkpoint.
+                // Existing complete-epoch indexing qualification keeps its
+                // ordinary path. Pending ExistingUpgrade records only use the
+                // reservation owner transaction above.
                 let obligations = vec![(replay_key.clone(), "1".to_owned())];
                 match db
                     .commit_checkpoint_transition(state::CheckpointTransition {
@@ -3047,6 +3206,7 @@ pub(crate) async fn run_cycle_with_witness(
         cycle_stats.accumulate(&sync_result.stats);
 
         if shutdown_token.is_cancelled()
+            && !qualification_owned
             && let Some(db) = state_db
             && !config.runtime.dry_run
         {
@@ -3067,6 +3227,7 @@ pub(crate) async fn run_cycle_with_witness(
                 );
                 if let Some(db) = state_db
                     && !config.runtime.dry_run
+                    && !qualification_owned
                 {
                     db.recover_sync_epoch_attempt(
                         lib_state.zone_name.clone(),
@@ -3079,7 +3240,8 @@ pub(crate) async fn run_cycle_with_witness(
                 break; // Stop iterating libraries -- need re-auth
             }
             download::DownloadOutcome::PartialFailure { failed_count } => {
-                if let Some(db) = state_db
+                if !qualification_owned
+                    && let Some(db) = state_db
                     && !config.runtime.dry_run
                 {
                     if sync_result.stats.state_write_failures > 0 {

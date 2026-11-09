@@ -1012,6 +1012,54 @@ pub trait SyncTokenStore: Send + Sync {
     async fn sync_epoch_id(&self) -> Result<Option<String>, StateError> {
         Ok(None)
     }
+
+    /// Reserve one pending indexing qualification without claiming a baseline
+    /// attempt or cursor. Stores without exact epoch ownership refuse the lane.
+    async fn reserve_indexing_qualification(
+        &self,
+        _library: String,
+        _indexing_key: String,
+        _replay_key: String,
+        _expected_metadata: Vec<(String, Option<String>)>,
+        _watch_interval: Option<u64>,
+    ) -> Result<super::sync_epoch::QualificationReserve, StateError> {
+        Ok(super::sync_epoch::QualificationReserve::StaleFence)
+    }
+
+    /// Finish a qualification successfully through its owning epoch transaction.
+    async fn commit_indexing_qualification(
+        &self,
+        _reservation: super::sync_epoch::QualificationReservation,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "commit_indexing_qualification",
+            detail: "indexing qualification is not implemented by this state store".into(),
+        })
+    }
+
+    async fn finish_indexing_qualification_nonqualified(
+        &self,
+        _reservation: super::sync_epoch::QualificationReservation,
+        _reason: super::sync_epoch::QualificationFailure,
+    ) -> Result<super::sync_epoch::QualificationFinish, StateError> {
+        Ok(super::sync_epoch::QualificationFinish::NotOwner)
+    }
+
+    async fn finish_indexing_qualification_provider_failure(
+        &self,
+        _reservation: super::sync_epoch::QualificationReservation,
+        _watch_interval: Option<u64>,
+    ) -> Result<super::sync_epoch::QualificationFinish, StateError> {
+        Ok(super::sync_epoch::QualificationFinish::NotOwner)
+    }
+
+    async fn finish_indexing_qualification_auth_or_cancel(
+        &self,
+        _reservation: super::sync_epoch::QualificationReservation,
+        _watch_interval: Option<u64>,
+    ) -> Result<super::sync_epoch::QualificationFinish, StateError> {
+        Ok(super::sync_epoch::QualificationFinish::NotOwner)
+    }
 }
 
 /// Album and people membership reads/writes.

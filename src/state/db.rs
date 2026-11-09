@@ -41,7 +41,10 @@ mod reports;
 pub(crate) mod source_revalidation;
 mod sparse_identity;
 pub(crate) mod sync_epoch;
-pub(crate) use sync_epoch::SyncEpochGate;
+pub(crate) use sync_epoch::{
+    QualificationFailure, QualificationReservation, QualificationReserve, SYNC_EPOCH_KEY,
+    SyncEpochGate,
+};
 pub(crate) mod support;
 pub(crate) use metadata_capture_retry::MetadataCaptureRetryGeneration;
 pub(crate) use sparse_identity::{

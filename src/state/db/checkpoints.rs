@@ -563,6 +563,66 @@ impl SyncTokenStore for SqliteStateDb {
     async fn sync_epoch_id(&self) -> Result<Option<String>, StateError> {
         SqliteStateDb::sync_epoch_id(self).await
     }
+
+    async fn reserve_indexing_qualification(
+        &self,
+        library: String,
+        indexing_key: String,
+        replay_key: String,
+        expected_metadata: Vec<(String, Option<String>)>,
+        watch_interval: Option<u64>,
+    ) -> Result<super::sync_epoch::QualificationReserve, StateError> {
+        SqliteStateDb::reserve_indexing_qualification(
+            self,
+            library,
+            indexing_key,
+            replay_key,
+            expected_metadata,
+            watch_interval,
+        )
+        .await
+    }
+
+    async fn commit_indexing_qualification(
+        &self,
+        reservation: super::sync_epoch::QualificationReservation,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::commit_indexing_qualification(self, reservation).await
+    }
+
+    async fn finish_indexing_qualification_nonqualified(
+        &self,
+        reservation: super::sync_epoch::QualificationReservation,
+        reason: super::sync_epoch::QualificationFailure,
+    ) -> Result<super::sync_epoch::QualificationFinish, StateError> {
+        SqliteStateDb::finish_indexing_qualification_nonqualified(self, reservation, reason).await
+    }
+
+    async fn finish_indexing_qualification_provider_failure(
+        &self,
+        reservation: super::sync_epoch::QualificationReservation,
+        watch_interval: Option<u64>,
+    ) -> Result<super::sync_epoch::QualificationFinish, StateError> {
+        SqliteStateDb::finish_indexing_qualification_provider_failure(
+            self,
+            reservation,
+            watch_interval,
+        )
+        .await
+    }
+
+    async fn finish_indexing_qualification_auth_or_cancel(
+        &self,
+        reservation: super::sync_epoch::QualificationReservation,
+        watch_interval: Option<u64>,
+    ) -> Result<super::sync_epoch::QualificationFinish, StateError> {
+        SqliteStateDb::finish_indexing_qualification_auth_or_cancel(
+            self,
+            reservation,
+            watch_interval,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
