@@ -3868,6 +3868,16 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
     .unwrap();
     assert_eq!(released_rows(&db_path, &columns), legacy_rows);
 
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS metadata_audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT, key TEXT, old_value TEXT, new_value TEXT);
+             CREATE TRIGGER IF NOT EXISTS audit_metadata_insert AFTER INSERT ON metadata BEGIN INSERT INTO metadata_audit(op,key,old_value,new_value) VALUES('insert',NEW.key,NULL,NEW.value); END;
+             CREATE TRIGGER IF NOT EXISTS audit_metadata_update AFTER UPDATE ON metadata BEGIN INSERT INTO metadata_audit(op,key,old_value,new_value) VALUES('update',NEW.key,OLD.value,NEW.value); END;
+             CREATE TRIGGER IF NOT EXISTS audit_metadata_delete AFTER DELETE ON metadata BEGIN INSERT INTO metadata_audit(op,key,old_value,new_value) VALUES('delete',OLD.key,OLD.value,NULL); END;",
+        )
+        .unwrap();
+    }
     let protected_snapshot = || {
         rows(
             &db_path,
@@ -4063,6 +4073,12 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
                     for row in rows(&db_path, "SELECT key, value FROM metadata ORDER BY key") {
                         eprintln!("META {row:?}");
                     }
+                    for row in rows(
+                        &db_path,
+                        "SELECT seq,op,key,old_value,new_value FROM metadata_audit ORDER BY seq",
+                    ) {
+                        eprintln!("AUDIT {row:?}");
+                    }
                     eprintln!("CYCLE0 {result:?} EPOCH {epoch:?}");
                     for event in trace.events() {
                         if matches!(event.level, tracing::Level::WARN | tracing::Level::ERROR) {
@@ -4230,7 +4246,7 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
     );
 }
 
-#[ignore = "precise reachability blocker: the per-zone staged reconciliation commit fails with checkpoint planning facts changed before a ready binding or pending token exists; the next gate is the pending baseline floor and must not be forced"]
+#[ignore = "fixture fence mismatch: expected pending_download_config_hash=None but the synthetic source seeded old-pending-download-hash; the production config_hash key was absent so the Ok(None) branch never cleared the orphan pending key. Remove the orphan seed to reach the staged promotion"]
 #[tokio::test]
 async fn released_config_reconciliation_stages_before_atomic_promotion_36() {
     super::PRESERVE_SHARED_CLAIMS
