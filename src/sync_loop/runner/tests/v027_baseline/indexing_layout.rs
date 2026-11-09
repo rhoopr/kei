@@ -2136,3 +2136,85 @@ async fn pending_upgrade_qualification_readiness_regression_retains_guard() {
     );
     assert_eq!(db.get_metadata(&sync_token_key(ZONE)).await.unwrap(), None);
 }
+
+#[tokio::test]
+async fn pending_upgrade_qualification_no_active_passes_keeps_deadline() {
+    let (_dir, root, db_path, _inventory, shared) =
+        seed_running_pending_upgrade("http://synthetic.invalid/current").await;
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let before = {
+        let conn = db
+            .acquire_lock("read pre-no-active qualification record")
+            .unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    let session = pending_upgrade_session(1, Arc::new(Vec::new()));
+    let counters = session.clone();
+    let mut library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(PendingUpgradeIndexingView {
+            session,
+            indexing_running: false,
+        }),
+        Arc::new(zone()),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        baseline_owner(),
+        "com",
+    ));
+    let mut selected =
+        make_run_cycle_library_state_with_passes(ZONE, &sync_token_key(ZONE), Vec::new());
+    selected.library = library;
+    let builder = make_run_cycle_download_config_builder(&root, db.clone());
+    let result = run_cycle(
+        &[&selected],
+        &make_run_cycle_config(),
+        Some(db.as_ref()),
+        false,
+        &builder,
+        download::DownloadControls::download_hidden(),
+        &shared,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(counters.inventory_queries.load(Ordering::SeqCst), 0);
+    assert_eq!(counters.boundaries.load(Ordering::SeqCst), 0);
+    assert_eq!(result.stats.downloaded, 0, "{result:?}");
+    let after = {
+        let conn = db
+            .acquire_lock("read post-no-active qualification record")
+            .unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(after.next_attempt_at, before.next_attempt_at);
+    assert_eq!(after.attempt, before.attempt);
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.state, "pending");
+    assert!(after.binding.is_none());
+    assert!(
+        db.get_metadata(&indexing_reconciliation_key(ZONE))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        db.get_metadata(&indexing_replay_key(ZONE)).await.unwrap(),
+        None
+    );
+    assert_eq!(db.get_metadata(&sync_token_key(ZONE)).await.unwrap(), None);
+}
