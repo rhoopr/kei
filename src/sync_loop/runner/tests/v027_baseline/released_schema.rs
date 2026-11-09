@@ -1942,3 +1942,926 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_populated(
         }
     );
 }
+
+/// Refusal controls built from the same released fixture family.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::sync_loop::runner::tests) enum ReleasedControlCase {
+    /// Equal bytes in a released Primary row do not grant identity over the
+    /// selected Shared child. The Shared child must take a distinct safe copy
+    /// and the rejected no-copy goal is recorded as such.
+    ForeignEqualBytes28,
+    /// A recorded failed old master whose saved exclusive child now maps to a
+    /// different provider master has no original-destination authority. The
+    /// old debt and original path must survive unchanged.
+    ChangedMaster36,
+}
+
+pub(in crate::sync_loop::runner::tests) async fn exercise_released_controls(
+    case: ReleasedControlCase,
+) {
+    let (trace, _trace_guard) = crate::test_helpers::TracingCapture::install();
+    let changed_master = matches!(case, ReleasedControlCase::ChangedMaster36);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = dir.path().join("released.db");
+    let db_path = dir.path().join("state.db");
+
+    let provider_still = MEDIA.to_vec();
+    let checksum = signature(&provider_still);
+    let old_still = root.join("primary-equal.JPG");
+    let old_motion = root.join("primary-equal.MOV");
+    let old_sidecar = root.join("primary-equal.JPG.xmp");
+    let current_still = root.join("shared-only.JPG");
+    let current_motion = root.join("shared-only.MOV");
+
+    {
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        match case {
+            ReleasedControlCase::ForeignEqualBytes28 => {
+                crate::state::schema::migrate_genuine_v28(&conn).unwrap();
+            }
+            ReleasedControlCase::ChangedMaster36 => {
+                crate::state::schema::migrate_genuine_v36(&conn).unwrap();
+            }
+        }
+        if changed_master {
+            std::fs::write(&current_still, &provider_still).unwrap();
+            insert_released_asset(
+                &conn,
+                ZONE,
+                "old-master",
+                "original",
+                "shared-only.JPG",
+                &current_still,
+                &provider_still,
+                &checksum,
+                true,
+            );
+            conn.execute(
+                "INSERT INTO assets(library,id,version_size,checksum,filename,created_at,added_at,size_bytes,media_type,status,last_seen_at,download_attempts,last_error,source) \
+                 VALUES (?1,'old-master','live_original',?2,'shared-only.MOV',1700000000,1700000002,?3,'video','failed',1700000004,2,'previous live companion transfer failed','icloud')",
+                rusqlite::params![ZONE, signature(MOTION), MOTION.len() as i64],
+            )
+            .unwrap();
+            conn.execute_batch(&format!(
+                "INSERT INTO legacy_master_state_owners VALUES ('{ZONE}','old-master','asset-current-master',1700000000);
+                 INSERT INTO asset_master_mappings VALUES ('{ZONE}','asset-current-master','current-master',1700000000);
+                 INSERT INTO asset_metadata_capture_revisions VALUES ('{ZONE}','old-master',1,1700000000);"
+            ))
+            .unwrap();
+        } else {
+            std::fs::write(&old_still, &provider_still).unwrap();
+            std::fs::write(&old_motion, MOTION).unwrap();
+            std::fs::write(&old_sidecar, b"released primary sidecar").unwrap();
+            insert_released_asset(
+                &conn,
+                "PrimarySync",
+                "old-primary-master",
+                "original",
+                "primary-equal.JPG",
+                &old_still,
+                &provider_still,
+                &checksum,
+                true,
+            );
+            insert_released_asset(
+                &conn,
+                "PrimarySync",
+                "old-primary-master",
+                "live_original",
+                "primary-equal.MOV",
+                &old_motion,
+                MOTION,
+                &signature(MOTION),
+                true,
+            );
+            conn.execute_batch(
+                "INSERT INTO asset_master_mappings VALUES ('PrimarySync','old-primary-child','old-primary-master',1700000000);
+                 INSERT INTO asset_metadata_capture_revisions VALUES ('PrimarySync','old-primary-master',1,1700000000);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO metadata VALUES (?1,?2)",
+                rusqlite::params![format!("sync_token:PrimarySync"), OLD_TOKEN],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO metadata VALUES (?1,?2)",
+            rusqlite::params![format!("sync_token:{ZONE}"), OLD_TOKEN],
+        )
+        .unwrap();
+    }
+
+    let columns = released_columns(&source);
+    let legacy_rows = released_rows(&source, &columns);
+    crate::state::db::account::adopt_legacy(
+        &source,
+        &db_path,
+        &baseline_owner(),
+        "baseline@example.invalid",
+        "com",
+    )
+    .await
+    .unwrap();
+    assert_eq!(released_rows(&db_path, &columns), legacy_rows);
+
+    let old_snapshot = || {
+        rows(
+            &db_path,
+            "SELECT * FROM assets WHERE library='PrimarySync' ORDER BY id,version_size",
+        )
+        .into_iter()
+        .chain(rows(
+            &db_path,
+            "SELECT * FROM asset_metadata_paths WHERE library='PrimarySync' ORDER BY id,version_size",
+        ))
+        .collect::<Vec<_>>()
+    };
+    let old_before = old_snapshot();
+    let failed_before = changed_master.then(|| {
+        rows(
+            &db_path,
+            &format!(
+                "SELECT status,local_path,last_error FROM assets WHERE library='{ZONE}' AND id='old-master' AND version_size='live_original'"
+            ),
+        )
+    });
+    let old_still_mtime = changed_master.then(|| {
+        std::fs::metadata(&current_still)
+            .unwrap()
+            .modified()
+            .unwrap()
+    });
+    let foreign_mtime = (!changed_master).then(|| {
+        (
+            std::fs::metadata(&old_still).unwrap().modified().unwrap(),
+            std::fs::metadata(&old_motion).unwrap().modified().unwrap(),
+            std::fs::metadata(&old_sidecar).unwrap().modified().unwrap(),
+        )
+    });
+
+    let server = crate::test_helpers::start_wiremock_or_skip("released control acceptance")
+        .await
+        .expect("acceptance server must bind");
+    let stale_motion = format!("{}/motion-stale", server.uri());
+    let fresh_motion = format!("{}/motion-fresh", server.uri());
+    for (endpoint, bytes, content_type, expected) in [
+        (
+            "/shared-equal",
+            MEDIA,
+            "image/jpeg",
+            usize::from(!changed_master),
+        ),
+        ("/new", MEDIA, "image/jpeg", 1),
+        ("/during", MEDIA, "image/jpeg", 1),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(bytes.to_vec())
+                    .insert_header("content-type", content_type),
+            )
+            .expect(expected as u64)
+            .mount(&server)
+            .await;
+    }
+    if changed_master {
+        Mock::given(method("GET"))
+            .and(path("/motion-stale"))
+            .respond_with(ResponseTemplate::new(410))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/motion-fresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(MOTION)
+                    .insert_header("content-type", "video/quicktime"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let (current_master, current_child, still_url, filename) = if changed_master {
+        (
+            "current-master",
+            "asset-current-master",
+            format!("{}/existing", server.uri()),
+            "shared-only.JPG",
+        )
+    } else {
+        (
+            "shared-master",
+            "asset-shared-master",
+            format!("{}/shared-equal", server.uri()),
+            "shared-equal.JPG",
+        )
+    };
+    let mut existing = pair(current_master, filename, &still_url, 1);
+    existing[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    existing[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(provider_still.len());
+    if changed_master {
+        existing[0]["fields"]["resOriginalVidComplRes"] = json!({"value":{
+            "downloadURL":stale_motion.clone(),
+            "size":MOTION.len(),
+            "fileChecksum":signature(MOTION)}});
+        existing[0]["fields"]["resOriginalVidComplFileType"] =
+            json!({"value":"com.apple.quicktime-movie"});
+    }
+    let mut new_item = pair("new-master", "new.JPG", &format!("{}/new", server.uri()), 2);
+    new_item[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    new_item[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    let mut inventory = existing;
+    inventory.extend(new_item);
+    let mut concurrent = pair(
+        "during-master",
+        "during.JPG",
+        &format!("{}/during", server.uri()),
+        3,
+    );
+    concurrent[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    concurrent[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+
+    let token_key = sync_token_key(ZONE);
+    let app_config = make_populated_app_config();
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let lookups = Arc::new(Mutex::new(Vec::new()));
+    let stale_lookups = Arc::new(AtomicUsize::new(0));
+    for cycle in 0..3 {
+        let db = Arc::new(
+            SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        let inner = BaselineSession {
+            database: "shared",
+            cycle,
+            inventory: Arc::new(inventory.clone()),
+            concurrent: Arc::new(concurrent.clone()),
+            incremental_addition: Arc::new(Vec::new()),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            inventory_queries: Arc::new(AtomicUsize::new(0)),
+            inventory_starts: Arc::new(AtomicUsize::new(0)),
+            boundaries: Arc::new(AtomicUsize::new(0)),
+            changes: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/shared".to_string(),
+            Arc::new(std::collections::HashMap::new()),
+            if changed_master {
+                Box::new(MotionRefreshSession {
+                    inner: inner.clone(),
+                    stale_motion_url: stale_motion.clone(),
+                    fresh_motion_url: fresh_motion.clone(),
+                    cycle,
+                    lookups: Arc::clone(&lookups),
+                    stale_lookups: Arc::clone(&stale_lookups),
+                })
+            } else {
+                Box::new(inner.clone())
+            },
+            Arc::new(zone()),
+            "shared".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+            db.clone(),
+            baseline_owner(),
+            "com",
+        ));
+        let selection = &app_config.filters.selection;
+        let selected_zones = crate::commands::zone_name_set(std::slice::from_ref(&library));
+        let collection_zones = selected_zones.clone();
+        let resolved_scope = crate::commands::pass_scope_for_zone(
+            selection,
+            ZONE,
+            &selected_zones,
+            &collection_zones,
+        );
+        let collection_context =
+            crate::commands::build_collection_context(selection, std::slice::from_ref(&library))
+                .await
+                .unwrap();
+        let plan = crate::commands::resolve_passes_for_scope(
+            &library,
+            selection,
+            resolved_scope,
+            &collection_context,
+            &[],
+        )
+        .await
+        .unwrap();
+        let mut selected = make_run_cycle_library_state_with_passes(ZONE, &token_key, plan.passes);
+        selected.library = library;
+        let base = make_run_cycle_download_config_builder(&root, db.clone());
+        let builder = |mode, exclude, groups, zone| {
+            let mut config = (*base(mode, exclude, groups, zone)).clone();
+            config.folder_structure = "none".into();
+            config.file_match_policy = crate::types::FileMatchPolicy::NameId7;
+            Arc::new(config)
+        };
+        let result = run_cycle(
+            &[&selected],
+            &app_config,
+            Some(db.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        if !changed_master {
+            assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
+            assert!(result.db_sync_token_advance_safe, "cycle {cycle}");
+            assert_eq!(result.stats.downloaded, if cycle == 0 { 3 } else { 0 });
+            assert_eq!(
+                db.get_metadata(&token_key).await.unwrap().as_deref(),
+                Some(format!("v27-after-cycle-{}", cycle + 1).as_str())
+            );
+            // The released Primary bytes stay exactly where they were; the
+            // selected Shared child took its own distinct destination.
+            assert_eq!(std::fs::read(&old_still).unwrap(), provider_still);
+            assert_eq!(std::fs::read(&old_motion).unwrap(), MOTION);
+            assert_eq!(
+                std::fs::read(&old_sidecar).unwrap(),
+                b"released primary sidecar"
+            );
+            let (still_mtime, motion_mtime, sidecar_mtime) = foreign_mtime.unwrap();
+            assert_eq!(
+                std::fs::metadata(&old_still).unwrap().modified().unwrap(),
+                still_mtime
+            );
+            assert_eq!(
+                std::fs::metadata(&old_motion).unwrap().modified().unwrap(),
+                motion_mtime
+            );
+            assert_eq!(
+                std::fs::metadata(&old_sidecar).unwrap().modified().unwrap(),
+                sidecar_mtime
+            );
+            assert_eq!(old_snapshot(), old_before, "released Primary rows changed");
+            let completed = db.get_downloaded_page(0, 100).await.unwrap();
+            let shared = completed
+                .iter()
+                .find(|row| {
+                    row.library.as_ref() == ZONE
+                        && row.id.as_ref() == current_child
+                        && row.version_size.as_str() == "original"
+                })
+                .expect("the selected Shared child must complete");
+            let shared_path = shared.local_path.as_ref().unwrap();
+            assert_ne!(
+                shared_path, &old_still,
+                "equal Primary bytes must not be adopted as the Shared destination"
+            );
+            assert_eq!(std::fs::read(shared_path).unwrap(), provider_still);
+        } else {
+            // No original-destination authority for the changed master.
+            assert!(
+                !current_motion.exists(),
+                "the old companion path must not be published with changed-master authority"
+            );
+            assert_eq!(
+                std::fs::read(&current_still).unwrap(),
+                provider_still,
+                "the released still/path must survive"
+            );
+            assert_eq!(
+                std::fs::metadata(&current_still)
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                old_still_mtime.unwrap()
+            );
+            let retained = rows(
+                &db_path,
+                &format!(
+                    "SELECT status,local_path,last_error FROM assets WHERE library='{ZONE}' AND id='old-master' AND version_size='live_original'"
+                ),
+            );
+            assert_eq!(retained.len(), 1, "the released obligation must survive");
+            assert_ne!(
+                retained[0][0],
+                rusqlite::types::Value::Text("downloaded".into()),
+                "changed-master authority must not falsely complete the old debt"
+            );
+            assert_eq!(
+                retained[0][1],
+                rusqlite::types::Value::Null,
+                "no destination may be attached to changed-master debt"
+            );
+            assert!(
+                matches!(
+                    &retained[0][0],
+                    rusqlite::types::Value::Text(status)
+                        if status == "failed" || status == "pending"
+                ),
+                "old debt stays failed or retryable, never completed: {retained:?}"
+            );
+            let _ = failed_before;
+            assert_eq!(old_snapshot(), old_before);
+            let receipts = rows(
+                &db_path,
+                &format!(
+                    "SELECT native_path FROM download_receipts WHERE library='{ZONE}' ORDER BY id"
+                ),
+            );
+            let old_key =
+                crate::state::db::provider_selection::SelectionPath::from_path(&current_motion)
+                    .key()
+                    .unwrap();
+            assert!(
+                receipts
+                    .iter()
+                    .all(|row| row[0] != rusqlite::types::Value::Text(old_key.clone())),
+                "no receipt may claim the old companion destination"
+            );
+            if result.failed_count != 0 {
+                for event in trace.events() {
+                    if matches!(event.level, tracing::Level::WARN | tracing::Level::ERROR) {
+                        eprintln!("TRACE {:?} {:?}", event.level, event.fields);
+                    }
+                }
+            }
+        }
+    }
+    server.verify().await;
+    eprintln!(
+        "RELEASED_CONTROL_REACHED case={case:?} old_primary_rows={} changed_old_motion_exists={}",
+        old_snapshot().len(),
+        current_motion.exists()
+    );
+}
+
+#[tokio::test]
+async fn released_foreign_equal_bytes_take_a_distinct_shared_copy_28() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(
+            true,
+            exercise_released_controls(ReleasedControlCase::ForeignEqualBytes28),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn released_changed_master_has_no_original_destination_authority_36() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(
+            true,
+            exercise_released_controls(ReleasedControlCase::ChangedMaster36),
+        )
+        .await;
+}
+
+/// Token-agnostic provider for the protected-history fault/reopen family.
+#[derive(Clone)]
+struct ProtectedSession {
+    records: Arc<Vec<serde_json::Value>>,
+    incremental: Arc<Vec<serde_json::Value>>,
+    cycle: usize,
+    inventories: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for ProtectedSession {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        let request: serde_json::Value = serde_json::from_str(&body)?;
+        if url.contains("/zones/list") {
+            return Ok(json!({"zones":[{"zoneID":zone(),
+                "syncToken":"protected-boundary","deleted":false}]}));
+        }
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(json!({"records":[{"recordName":"index",
+                "recordType":"CheckIndexingState",
+                "fields":{"state":{"value":"FINISHED"}}}]}));
+        }
+        if url.contains("/internal/records/query/batch") {
+            return Ok(crate::sync_loop::test_support::album_count_response(
+                self.records.len() as u64 / 2,
+            ));
+        }
+        if url.contains("/records/query?") {
+            self.inventories
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let offset = request["query"]["filterBy"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|filter| filter["fieldName"] == "startRank")
+                .and_then(|filter| filter["fieldValue"]["value"].as_u64())
+                .unwrap_or(0);
+            let records = if offset == 0 {
+                self.records.as_ref().clone()
+            } else {
+                Vec::new()
+            };
+            return Ok(json!({"records":records,"syncToken":"query-not-checkpoint"}));
+        }
+        if url.contains("/records/lookup?") {
+            let requested = request["records"].as_array().cloned().unwrap_or_default();
+            let records: Vec<_> = self
+                .records
+                .iter()
+                .chain(self.incremental.iter())
+                .filter(|record| {
+                    requested
+                        .iter()
+                        .any(|query| query["recordName"] == record["recordName"])
+                })
+                .cloned()
+                .collect();
+            return Ok(json!({"records":records}));
+        }
+        if url.contains("/changes/zone?") {
+            let records = if self.cycle == 1 {
+                self.incremental.as_ref().clone()
+            } else {
+                Vec::new()
+            };
+            return Ok(json!({"zones":[{"zoneID":zone(),
+                "records":records,
+                "syncToken":format!("protected-after-{}", self.cycle),
+                "moreComing":false}]}));
+        }
+        anyhow::bail!("unexpected protected-history endpoint: {url}")
+    }
+
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+/// Protected released history plus an injected checkpoint fault, then real
+/// recovery and two quiet reopens. Same fixture family as the reuse cases.
+pub(in crate::sync_loop::runner::tests) async fn exercise_released_protected_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    let protected_dir = root.join("protected");
+    std::fs::create_dir_all(&protected_dir).unwrap();
+
+    let old_still = protected_dir.join("old.JPG");
+    let old_motion = protected_dir.join("old.MOV");
+    let old_sidecar = protected_dir.join("old.JPG.xmp");
+    let old_bytes = MEDIA.to_vec();
+    std::fs::write(&old_still, &old_bytes).unwrap();
+    std::fs::write(&old_motion, MOTION).unwrap();
+    std::fs::write(&old_sidecar, b"protected released sidecar").unwrap();
+    let old_mtimes = (
+        std::fs::metadata(&old_still).unwrap().modified().unwrap(),
+        std::fs::metadata(&old_motion).unwrap().modified().unwrap(),
+        std::fs::metadata(&old_sidecar).unwrap().modified().unwrap(),
+    );
+
+    let source = dir.path().join("released.db");
+    let db_path = dir.path().join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&source).unwrap();
+        crate::state::schema::migrate_genuine_v28(&conn).unwrap();
+        insert_released_asset(
+            &conn,
+            "PrimarySync",
+            "old-primary-master",
+            "original",
+            "old.JPG",
+            &old_still,
+            &old_bytes,
+            &signature(&old_bytes),
+            true,
+        );
+        insert_released_asset(
+            &conn,
+            "PrimarySync",
+            "old-primary-master",
+            "live_original",
+            "old.MOV",
+            &old_motion,
+            MOTION,
+            &signature(MOTION),
+            true,
+        );
+        let shared_history = root.join("shared-history.JPG");
+        std::fs::write(&shared_history, MEDIA).unwrap();
+        insert_released_asset(
+            &conn,
+            ZONE,
+            "shared-history-master",
+            "original",
+            "shared-history.JPG",
+            &shared_history,
+            MEDIA,
+            &signature(MEDIA),
+            true,
+        );
+        conn.execute_batch(&format!(
+            "INSERT INTO legacy_master_state_owners VALUES ('{ZONE}','shared-history-master','asset-shared-history-master',1700000000);
+             INSERT INTO asset_master_mappings VALUES ('{ZONE}','asset-shared-history-master','shared-history-master',1700000000);
+             INSERT INTO asset_metadata_capture_revisions VALUES ('{ZONE}','shared-history-master',1,1700000000);
+             INSERT INTO asset_master_mappings VALUES ('PrimarySync','old-primary-child','old-primary-master',1700000000);
+             INSERT INTO asset_metadata_capture_revisions VALUES ('PrimarySync','old-primary-master',1,1700000000);
+             INSERT INTO unresolved_sparse_identities(library,source_record_name,original_evidence,observed_evidence,generation,first_seen_at,last_outcome)
+               VALUES('PrimarySync','historical-source','[1,\"historical-child\",\"SharedSync-absent\",\"historical-owner\"]','[1,\"historical-child\",\"SharedSync-absent\",\"historical-owner\"]',7,1000,'[invalid outcome');
+             INSERT INTO metadata VALUES ('unresolved_asset_identity:PrimarySync','opaque original marker');"
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metadata VALUES (?1,?2)",
+            rusqlite::params![format!("sync_token:PrimarySync"), OLD_TOKEN],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO metadata VALUES (?1,?2)",
+            rusqlite::params![format!("sync_token:{ZONE}"), OLD_TOKEN],
+        )
+        .unwrap();
+    }
+    let columns = released_columns(&source);
+    let legacy_rows = released_rows(&source, &columns);
+    crate::state::db::account::adopt_legacy(
+        &source,
+        &db_path,
+        &baseline_owner(),
+        "baseline@example.invalid",
+        "com",
+    )
+    .await
+    .unwrap();
+    assert_eq!(released_rows(&db_path, &columns), legacy_rows);
+
+    let protected_snapshot = || {
+        rows(
+            &db_path,
+            "SELECT * FROM assets WHERE library='PrimarySync' ORDER BY id,version_size",
+        )
+        .into_iter()
+        .chain(rows(
+            &db_path,
+            "SELECT * FROM asset_metadata_paths WHERE library='PrimarySync' ORDER BY id,version_size",
+        ))
+        .chain(rows(
+            &db_path,
+            "SELECT * FROM unresolved_sparse_identities ORDER BY library,source_record_name",
+        ))
+        .chain(rows(
+            &db_path,
+            "SELECT key,value FROM metadata WHERE key LIKE 'unresolved_asset_identity:%' ORDER BY key",
+        ))
+        .collect::<Vec<_>>()
+    };
+    let protected_before = protected_snapshot();
+
+    let server = crate::test_helpers::start_wiremock_or_skip("released protected history")
+        .await
+        .expect("acceptance server must bind");
+    for endpoint in ["/current", "/new", "/later"] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(MEDIA)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let checksum = signature(MEDIA);
+    let mut current = pair(
+        "current-master",
+        "current.JPG",
+        &format!("{}/current", server.uri()),
+        1,
+    );
+    current[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    current[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    let mut new_item = pair("new-master", "new.JPG", &format!("{}/new", server.uri()), 2);
+    new_item[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    new_item[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    let mut history = pair(
+        "shared-history-master",
+        "shared-history.JPG",
+        &format!("{}/shared-history", server.uri()),
+        4,
+    );
+    history[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    history[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    let mut later = pair(
+        "later-master",
+        "later.JPG",
+        &format!("{}/later", server.uri()),
+        5,
+    );
+    later[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum.clone());
+    later[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(MEDIA.len());
+    let mut inventory = history;
+    inventory.extend(current);
+    inventory.extend(new_item);
+
+    let token_key = sync_token_key(ZONE);
+    let app_config = make_populated_app_config();
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let inventories = Arc::new(AtomicUsize::new(0));
+    let incremental = Arc::new(later);
+    for cycle in 0..5 {
+        let inner = Arc::new(
+            SqliteStateDb::open_owned(&db_path, &baseline_owner())
+                .await
+                .unwrap(),
+        );
+        if cycle == 1 {
+            // Fail the incremental checkpoint write once; the durable media
+            // and previous state must survive and the next cycle must recover.
+            let sql = format!(
+                "CREATE TRIGGER fail_checkpoint BEFORE UPDATE ON metadata WHEN NEW.key='{}' BEGIN SELECT RAISE(ABORT,'injected checkpoint failure'); END;",
+                token_key
+            );
+            inner
+                .acquire_lock("install released checkpoint fault")
+                .unwrap()
+                .execute_batch(&sql)
+                .unwrap();
+        }
+        let session = ProtectedSession {
+            records: Arc::new(inventory.clone()),
+            incremental: Arc::clone(&incremental),
+            cycle,
+            inventories: Arc::clone(&inventories),
+        };
+        let mut library = PhotoLibrary::new(
+            "https://synthetic.example/database/1/photos/production/shared".to_string(),
+            Arc::new(std::collections::HashMap::new()),
+            Box::new(session.clone()),
+            Arc::new(zone()),
+            "shared".into(),
+            crate::retry::RetryConfig::default(),
+        )
+        .await
+        .unwrap();
+        library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+            inner.clone(),
+            baseline_owner(),
+            "com",
+        ));
+        let selection = &app_config.filters.selection;
+        let selected_zones = crate::commands::zone_name_set(std::slice::from_ref(&library));
+        let collection_zones = selected_zones.clone();
+        let resolved_scope = crate::commands::pass_scope_for_zone(
+            selection,
+            ZONE,
+            &selected_zones,
+            &collection_zones,
+        );
+        let collection_context =
+            crate::commands::build_collection_context(selection, std::slice::from_ref(&library))
+                .await
+                .unwrap();
+        let plan = crate::commands::resolve_passes_for_scope(
+            &library,
+            selection,
+            resolved_scope,
+            &collection_context,
+            &[],
+        )
+        .await
+        .unwrap();
+        let mut selected = make_run_cycle_library_state_with_passes(ZONE, &token_key, plan.passes);
+        selected.library = library;
+        let base = make_run_cycle_download_config_builder(&root, inner.clone());
+        let builder = |mode, exclude, groups, zone| {
+            let mut config = (*base(mode, exclude, groups, zone)).clone();
+            config.folder_structure = "none".into();
+            config.file_match_policy = crate::types::FileMatchPolicy::NameId7;
+            Arc::new(config)
+        };
+        let result = run_cycle(
+            &[&selected],
+            &app_config,
+            Some(inner.as_ref()),
+            false,
+            &builder,
+            download::DownloadControls::download_hidden(),
+            &shared,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&old_still).unwrap(), old_bytes);
+        assert_eq!(std::fs::read(&old_motion).unwrap(), MOTION);
+        assert_eq!(
+            std::fs::read(&old_sidecar).unwrap(),
+            b"protected released sidecar"
+        );
+        assert_eq!(
+            (
+                std::fs::metadata(&old_still).unwrap().modified().unwrap(),
+                std::fs::metadata(&old_motion).unwrap().modified().unwrap(),
+                std::fs::metadata(&old_sidecar).unwrap().modified().unwrap(),
+            ),
+            old_mtimes,
+            "cycle {cycle}: protected mtimes"
+        );
+        assert_eq!(
+            protected_snapshot(),
+            protected_before,
+            "cycle {cycle}: protected history rows changed"
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(OLD_TOKEN),
+            "cycle {cycle}: unselected released cursor changed"
+        );
+
+        if cycle == 0 {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let epoch = crate::state::db::sync_epoch::read_library(&conn, ZONE)
+                .unwrap()
+                .expect("the first cycle enrolls the populated library");
+            assert_eq!(epoch.reason, "existing_upgrade");
+            assert_eq!(epoch.state, "complete");
+            assert_eq!(result.failed_count, 0, "{result:?}");
+            assert!(result.db_sync_token_advance_safe, "{result:?}");
+            assert_eq!(result.stats.downloaded, 2, "{result:?}");
+            assert_eq!(
+                inner.get_metadata(&token_key).await.unwrap().as_deref(),
+                Some("protected-after-0")
+            );
+        } else if cycle == 1 {
+            assert!(
+                result.failed_count > 0 || result.stats.state_write_failures > 0,
+                "the injected fault must be observable: {result:?}"
+            );
+            assert!(!result.db_sync_token_advance_safe, "{result:?}");
+            assert_eq!(
+                inner.get_metadata(&token_key).await.unwrap().as_deref(),
+                Some("protected-after-0"),
+                "the failed checkpoint must not advance the token"
+            );
+            inner
+                .acquire_lock("remove released checkpoint fault")
+                .unwrap()
+                .execute_batch("DROP TRIGGER IF EXISTS fail_checkpoint")
+                .unwrap();
+        } else if cycle == 2 {
+            assert_eq!(result.failed_count, 0, "recovery must settle: {result:?}");
+            assert!(result.db_sync_token_advance_safe, "{result:?}");
+            assert_eq!(
+                inner.get_metadata(&token_key).await.unwrap().as_deref(),
+                Some("protected-after-2"),
+                "recovery cycle advances the current checkpoint"
+            );
+        } else {
+            assert_eq!(result.failed_count, 0, "cycle {cycle}: {result:?}");
+            assert!(result.db_sync_token_advance_safe, "cycle {cycle}");
+            assert_eq!(result.stats.downloaded, 0, "cycle {cycle}: quiet reopen");
+        }
+    }
+    let requests = server.received_requests().await.unwrap();
+    let count = |path: &str| {
+        requests
+            .iter()
+            .filter(|request| request.method.as_str() == "GET" && request.url.path() == path)
+            .count()
+    };
+    assert_eq!(count("/current"), 1, "the current item transfers once");
+    assert_eq!(count("/new"), 1, "the second current item transfers once");
+    assert_eq!(count("/later"), 1, "the incremental item transfers once");
+    assert_eq!(
+        count("/shared-history"),
+        0,
+        "same-identity Shared history must reuse without a GET"
+    );
+    assert!(inventories.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    server.verify().await;
+    eprintln!(
+        "RELEASED_PROTECTED_REACHED protected_rows={} current_gets={} inventories={}",
+        protected_snapshot().len(),
+        count("/current"),
+        inventories.load(std::sync::atomic::Ordering::SeqCst)
+    );
+}
+
+#[tokio::test]
+async fn released_protected_history_survives_fault_and_quiet_reopens_28() {
+    super::PRESERVE_SHARED_CLAIMS
+        .scope(true, exercise_released_protected_history())
+        .await;
+}
