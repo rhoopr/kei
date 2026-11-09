@@ -3861,9 +3861,57 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
              INSERT INTO metadata VALUES ('enum_config_hash','old-active-enum-hash');
              INSERT INTO metadata VALUES ('pending_enum_config_hash','{current_enum_hash}');
              INSERT INTO metadata VALUES ('config_hash','old-active-path-hash');
-             INSERT INTO metadata VALUES ('sync_token:v27:{ZONE}','old-active-v27-cursor');"
+             INSERT INTO metadata VALUES ('sync_token:{ZONE}','old-active-v27-cursor');"
         ))
         .unwrap();
+        let legacy_key = format!("sync_token:{ZONE}");
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [&legacy_key],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "old-active-v27-cursor",
+            "source carries the actual legacy released cursor"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key LIKE 'sync_token:v27:%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "source has no hand-installed current v27 token"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key='sync_epoch:v1' OR key LIKE 'sync_epoch_library:v1:%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "source has no completed epoch"
+        );
+        let receipts_table: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='download_receipts')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if receipts_table {
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM download_receipts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0,
+                "source has no current receipts"
+            );
+        }
     }
     let columns = released_columns(&source);
     let legacy_rows = released_rows(&source, &columns);
@@ -3921,8 +3969,19 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
         );
         assert_eq!(metadata("pending_download_config_hash"), None);
         assert_eq!(
-            metadata(&format!("sync_token:v27:{ZONE}")).as_deref(),
-            Some("old-active-v27-cursor")
+            metadata(&format!("sync_token:{ZONE}")).as_deref(),
+            Some("old-active-v27-cursor"),
+            "actual legacy released cursor before the cycle"
+        );
+        assert_eq!(
+            metadata(&format!("sync_token:v27:{ZONE}")),
+            None,
+            "no hand-installed current v27 token"
+        );
+        assert_eq!(
+            metadata(&format!("sync_epoch_library:v1:{ZONE}")),
+            None,
+            "no completed epoch before the cycle"
         );
     }
 
@@ -4114,6 +4173,16 @@ pub(in crate::sync_loop::runner::tests) async fn exercise_released_config_reconc
                 .ok();
             assert_eq!(active_hash, "old-active-enum-hash");
             assert_eq!(pending_hash, current_enum_hash);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT value FROM metadata WHERE key=?1",
+                    [format!("sync_token:{ZONE}")],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok(),
+                None,
+                "normal enrollment clears the actual old cursor"
+            );
             assert_eq!(epoch.state, "ready", "valid staged epoch before promotion");
             assert!(epoch.binding.is_some(), "ready binding retained");
             assert_eq!(staged_observation, 1);
