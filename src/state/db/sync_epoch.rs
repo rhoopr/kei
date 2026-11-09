@@ -174,22 +174,10 @@ pub(crate) struct QualificationReservation {
     )]
     pub(crate) prior_record: String,
     pub(crate) reserved_record: String,
-    #[allow(
-        dead_code,
-        reason = "consumed by commit_indexing_qualification once the L1 helper lands"
-    )]
     pub(crate) restored_record: String,
     pub(crate) reserved_outcome: String,
     pub(crate) expected_metadata: Vec<(String, Option<String>)>,
-    #[allow(
-        dead_code,
-        reason = "consumed by commit_indexing_qualification once the L1 helper lands"
-    )]
     pub(crate) indexing_key: String,
-    #[allow(
-        dead_code,
-        reason = "consumed by commit_indexing_qualification once the L1 helper lands"
-    )]
     pub(crate) replay_key: String,
 }
 
@@ -932,6 +920,46 @@ pub(crate) fn reserve_indexing_qualification(
     dead_code,
     reason = "consumed by the L1 shared-seam qualification integration"
 )]
+fn commit_indexing_qualification_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    reservation: &QualificationReservation,
+) -> Result<(), StateError> {
+    validate(tx)?;
+    let Some(actual) = metadata_value(tx, &library_key(&reservation.library))? else {
+        return Err(StateError::SyncEpochMismatch);
+    };
+    if actual != reservation.reserved_record {
+        return Err(StateError::SyncEpochMismatch);
+    }
+    if !fence_matches(tx, &reservation.expected_metadata)? {
+        return Err(StateError::SyncEpochMismatch);
+    }
+    let record = read_library(tx, &reservation.library)?.ok_or(StateError::SyncEpochMismatch)?;
+    if record.epoch != reservation.epoch
+        || record.attempt != reservation.attempt
+        || record.state != "pending"
+        || record.binding.is_some()
+        || record.last_outcome.as_deref() != Some(reservation.reserved_outcome.as_str())
+    {
+        return Err(StateError::SyncEpochMismatch);
+    }
+    let transition = crate::state::CheckpointTransition {
+        expected_metadata: reservation.expected_metadata.clone(),
+        legacy_preservation_proofs: Vec::new(),
+        legacy_config_hash: None,
+        sparse_identity_proofs: Vec::new(),
+        metadata_updates: vec![
+            (reservation.replay_key.clone(), "1".to_owned()),
+            (
+                library_key(&reservation.library),
+                reservation.restored_record.clone(),
+            ),
+        ],
+        metadata_deletes: vec![reservation.indexing_key.clone()],
+    };
+    super::checkpoints::commit_observation_transition_in_tx(tx, transition, None, false)
+}
+
 fn qualification_record_for_finish(
     conn: &Connection,
     reservation: &QualificationReservation,
@@ -1343,6 +1371,23 @@ impl SqliteStateDb {
             )?;
             tx.commit()?;
             Ok(outcome)
+        })
+        .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by the L1 shared-seam qualification integration"
+    )]
+    pub(crate) async fn commit_indexing_qualification(
+        &self,
+        reservation: QualificationReservation,
+    ) -> Result<(), StateError> {
+        self.with_conn_mut("committing indexing qualification", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            commit_indexing_qualification_in_tx(&tx, &reservation)?;
+            tx.commit()?;
+            Ok(())
         })
         .await
     }
@@ -2680,6 +2725,66 @@ mod tests {
             stored_record(&conn),
             Some(reservation.reserved_record),
             "ordinary recovery must not overwrite the qualification guard"
+        );
+    }
+
+    #[test]
+    fn qualification_success_commit_clears_only_own_guard_and_creates_replay() {
+        let mut conn = qualification_db();
+        let fence = qualification_fence(&conn);
+        let reservation = reserved_or_panic(reserve_qualification(&conn, &fence, 10_000));
+        let prior: SyncEpochLibrary = serde_json::from_str(&reservation.prior_record).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        commit_indexing_qualification_in_tx(&tx, &reservation).unwrap();
+        tx.commit().unwrap();
+
+        let after = current_record(&conn);
+        assert_eq!(after.state, "pending");
+        assert!(after.binding.is_none());
+        assert_eq!(after.attempt, prior.attempt);
+        assert_eq!(after.attempts, prior.attempts);
+        assert_eq!(after.next_attempt_at, prior.next_attempt_at);
+        assert_eq!(
+            after.last_outcome.as_deref(),
+            Some(QUALIFICATION_QUALIFIED_OUTCOME)
+        );
+        assert_eq!(metadata_value(&conn, TEST_INDEXING_KEY).unwrap(), None);
+        assert_eq!(
+            metadata_value(&conn, TEST_REPLAY_KEY).unwrap().as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            metadata_value(&conn, TEST_SYNC_TOKEN_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("retained-token"),
+            "qualification must not adopt a cursor"
+        );
+        assert_eq!(validate(&conn).unwrap().epoch, reservation.epoch);
+    }
+
+    #[test]
+    fn qualification_success_commit_refuses_changed_fence() {
+        let mut conn = qualification_db();
+        let fence = qualification_fence(&conn);
+        let reservation = reserved_or_panic(reserve_qualification(&conn, &fence, 10_000));
+        let reserved = stored_record(&conn);
+        conn.execute(
+            "UPDATE metadata SET value='changed' WHERE key=?1",
+            [crate::download::DOWNLOAD_CONFIG_HASH_KEY],
+        )
+        .unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(commit_indexing_qualification_in_tx(&tx, &reservation).is_err());
+        tx.rollback().unwrap();
+        assert_eq!(stored_record(&conn), reserved);
+        assert_eq!(
+            metadata_value(&conn, TEST_INDEXING_KEY).unwrap().as_deref(),
+            Some("1")
         );
     }
 
