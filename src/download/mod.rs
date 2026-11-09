@@ -37,6 +37,11 @@ pub(crate) use orchestration::config::{
 pub(crate) use orchestration::context::{ClaimedLegacyMasterStates, DownloadContext};
 use orchestration::context::{RecordedLocalFile, preload_download_context};
 pub use orchestration::dispatch::download_photos_with_sync;
+#[allow(
+    unused_imports,
+    reason = "L1 shared held-epoch seam calls this exact private re-export"
+)]
+pub(crate) use orchestration::generation::replay_due_admitted_selection;
 pub(crate) use orchestration::generation::{
     has_current_observation, has_due as has_due_selection_work, replay_due_admitted_selection,
 };

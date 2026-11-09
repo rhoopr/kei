@@ -1660,3 +1660,228 @@ async fn retained_root_window_is_unique_and_rotates() {
     assert_eq!(rotated_ids, vec![root1.id.clone(), root3.id.clone()]);
     assert!(!rotated_ids.contains(&root2.id));
 }
+
+#[derive(Clone)]
+struct AuthLookupSession {
+    zone: &'static str,
+    lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::icloud::photos::PhotosSession for AuthLookupSession {
+    async fn post(
+        &self,
+        url: &str,
+        _body: String,
+        _headers: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
+        let request: serde_json::Value = serde_json::from_str(&_body)?;
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            return Ok(
+                json!({"records":[{"recordName":"index-state","recordType":"CheckIndexingState","fields":{"state":{"value":"FINISHED"}}}]}),
+            );
+        }
+        if url.contains("/internal/records/query/batch") {
+            return Ok(json!({"batch":[{"records":[{"fields":{"itemCount":{"value":1}}}]}]}));
+        }
+        if url.contains("/records/lookup?") {
+            self.lookups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(anyhow::Error::new(
+                crate::icloud::photos::session::HttpStatusError {
+                    status: 401,
+                    url: url.into(),
+                    retry_after: None,
+                    body: None,
+                },
+            ));
+        }
+        if url.contains("/zones/list") {
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":self.zone,"ownerRecordName":"_defaultOwner"},"syncToken":"inventory-last-page","deleted":false}]}),
+            );
+        }
+        if url.contains("/records/query?") {
+            return Ok(json!({"records":[],"syncToken":"inventory-last-page","moreComing":false}));
+        }
+        if url.contains("/changes/zone?") {
+            return Ok(
+                json!({"zones":[{"zoneID":{"zoneName":self.zone,"ownerRecordName":"_defaultOwner"},"records":[],"syncToken":"auth-after","moreComing":false}]}),
+            );
+        }
+        anyhow::bail!("unexpected auth lookup endpoint {url}")
+    }
+    fn clone_box(&self) -> Box<dyn crate::icloud::photos::PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn retry_function_preserves_auth_and_cancellation_without_ack_or_backoff() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{
+        MEDIA, ZONE, baseline_owner, make_run_cycle_config, make_run_cycle_download_config_builder,
+        make_shared_session_for_run_cycle, seed_existing_upgrade_db,
+    };
+    use crate::commands::{AlbumPass, PassKind};
+    use crate::download;
+    use crate::icloud::photos::PhotoLibrary;
+    use crate::state::SqliteStateDb;
+    use tokio_util::sync::CancellationToken;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    seed_existing_upgrade_db(&db_path);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let allow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/fail"))
+        .respond_with(GatedBytes {
+            calls: Arc::clone(&calls),
+            allow,
+            bytes: Arc::new(MEDIA.to_vec()),
+        })
+        .mount(&server)
+        .await;
+    let inventory = media_pair(ZONE, "fail", "fail.JPG", &format!("{}/fail", server.uri()));
+    let full_queries = Arc::new(AtomicUsize::new(0));
+    let changes = Arc::new(AtomicUsize::new(0));
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let selected = stock36_library_state(
+        db.clone(),
+        ZONE,
+        inventory,
+        Arc::clone(&full_queries),
+        Arc::clone(&changes),
+    )
+    .await;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let mut config = make_run_cycle_config();
+    config.retry.max_retries = 0;
+    run_stock36_cycle(&db, &[&selected], &root, &shared, &config)
+        .await
+        .expect("failed baseline must create the due admitted decision");
+    db.make_selection_retry_due(baseline_owner(), "asset-fail".to_owned())
+        .await
+        .unwrap();
+
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let session = AuthLookupSession {
+        zone: ZONE,
+        lookups: Arc::clone(&lookups),
+    };
+    let mut library = PhotoLibrary::new(
+        "https://synthetic.example/database/1/photos/production/private".into(),
+        Arc::new(std::collections::HashMap::new()),
+        Box::new(session),
+        Arc::new(json!({"zoneName":ZONE,"ownerRecordName":"_defaultOwner"})),
+        "private".into(),
+        crate::retry::RetryConfig::default(),
+    )
+    .await
+    .unwrap();
+    library.shadow_capture = Some(crate::icloud::photos::inbox::ShadowCapture::new(
+        db.clone(),
+        baseline_owner(),
+        "com",
+    ));
+    let passes = vec![AlbumPass {
+        kind: PassKind::Unfiled,
+        album: library.all(),
+        exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
+    }];
+    let base = make_run_cycle_download_config_builder(&root, db.clone());
+    let owner_config = (*base(
+        download::SyncMode::Full,
+        Arc::new(rustc_hash::FxHashSet::default()),
+        Arc::new(download::AssetGroupings::default()),
+        Arc::from(ZONE),
+    ))
+    .clone();
+    let owner_config = Arc::new(owner_config);
+    let controls = download::DownloadControls::download_hidden();
+    let client = reqwest::Client::new();
+    let snapshot = |db: &SqliteStateDb| -> (String, String, i64, i64, Option<String>) {
+        let conn = db.acquire_lock("snapshot auth retry owner").unwrap();
+        let decision: (String, String, i64, i64) = conn
+            .query_row(
+                "SELECT reason,admission_hash,attempts,next_retry_at FROM provider_active_decisions WHERE child='asset-fail'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let cursor: Option<String> = conn
+            .query_row(
+                "SELECT replay_after FROM provider_active_generations WHERE id=(SELECT generation FROM provider_active_decisions WHERE child='asset-fail')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (decision.0, decision.1, decision.2, decision.3, cursor)
+    };
+    let before = snapshot(db.as_ref());
+    let calls_before = calls.load(Ordering::SeqCst);
+
+    let auth = crate::download::replay_due_admitted_selection(
+        &client,
+        &passes,
+        owner_config.clone(),
+        controls,
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(
+        auth.as_ref()
+            .err()
+            .is_some_and(|error| { crate::icloud::photos::session::is_session_error(error) }),
+        "confirmation auth must surface as the existing session error: {auth:?}"
+    );
+    assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        calls_before,
+        "auth must not GET"
+    );
+    assert_eq!(
+        snapshot(db.as_ref()),
+        before,
+        "auth must not ack or back off"
+    );
+
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let quiet = crate::download::replay_due_admitted_selection(
+        &client,
+        &passes,
+        owner_config,
+        controls,
+        cancelled,
+    )
+    .await
+    .expect("cancellation must not become a provider error");
+    assert!(quiet.is_none());
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        1,
+        "cancellation must not lookup"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        calls_before,
+        "cancellation must not GET"
+    );
+    assert_eq!(
+        snapshot(db.as_ref()),
+        before,
+        "cancellation must not ack or back off"
+    );
+}

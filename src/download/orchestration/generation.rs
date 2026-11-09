@@ -2429,7 +2429,6 @@ enum DueMediaRefusal {
     InvalidRendition,
     MissingRendition,
     ResourceChanged,
-    SessionError,
     ConfirmationRefused,
 }
 
@@ -2445,18 +2444,32 @@ impl DueMediaRefusal {
             Self::InvalidRendition => "invalid_rendition",
             Self::MissingRendition => "missing_rendition",
             Self::ResourceChanged => "resource_changed",
-            Self::SessionError => "session_error",
             Self::ConfirmationRefused => "confirmation_refused",
         }
     }
 }
 
-fn classify_due_media_error(error: &anyhow::Error) -> DueMediaRefusal {
-    if crate::icloud::photos::session::is_session_error(error) {
-        DueMediaRefusal::SessionError
-    } else {
-        DueMediaRefusal::ConfirmationRefused
+enum DueMediaFailure {
+    Refusal(DueMediaRefusal),
+    Session(anyhow::Error),
+    State(anyhow::Error),
+    Interrupted,
+}
+
+fn classify_due_media_error(error: anyhow::Error, cancel: &CancellationToken) -> DueMediaFailure {
+    if cancel.is_cancelled() {
+        return DueMediaFailure::Interrupted;
     }
+    if crate::icloud::photos::session::is_session_error(&error) {
+        return DueMediaFailure::Session(error);
+    }
+    if error
+        .downcast_ref::<crate::state::error::StateError>()
+        .is_some()
+    {
+        return DueMediaFailure::State(error);
+    }
+    DueMediaFailure::Refusal(DueMediaRefusal::ConfirmationRefused)
 }
 
 fn log_due_media_refusal(generation: &str, refusal: DueMediaRefusal) {
@@ -2476,27 +2489,40 @@ async fn due_media_task(
     config: &DownloadConfig,
     zone_name: &str,
     zone: &Value,
-) -> Result<filter::DownloadTask, DueMediaRefusal> {
+    cancel: &CancellationToken,
+) -> Result<filter::DownloadTask, DueMediaFailure> {
+    if cancel.is_cancelled() {
+        return Err(DueMediaFailure::Interrupted);
+    }
     let body = identity
         .confirmation
         .as_deref()
-        .ok_or(DueMediaRefusal::MissingConfirmation)?;
+        .ok_or(DueMediaFailure::Refusal(
+            DueMediaRefusal::MissingConfirmation,
+        ))?;
     let master = identity
         .master
         .as_deref()
-        .ok_or(DueMediaRefusal::MissingMaster)?;
+        .ok_or(DueMediaFailure::Refusal(DueMediaRefusal::MissingMaster))?;
     let stored = current_asset(body, &identity.child, master, zone)
-        .map_err(|_error| DueMediaRefusal::InvalidConfirmation)?;
+        .map_err(|_error| DueMediaFailure::Refusal(DueMediaRefusal::InvalidConfirmation))?;
     let current = album
         .confirm_layout_asset(&identity.child, zone_name)
         .await
-        .map_err(|error| classify_due_media_error(&error))?;
+        .map_err(|error| classify_due_media_error(error, cancel))?;
+    if cancel.is_cancelled() {
+        return Err(DueMediaFailure::Interrupted);
+    }
     if !same_selected_facts(&stored, &current.asset) {
-        return Err(DueMediaRefusal::ProviderFactsChanged);
+        return Err(DueMediaFailure::Refusal(
+            DueMediaRefusal::ProviderFactsChanged,
+        ));
     }
     let pass_config = config.with_pass(pass);
     if filter::is_asset_filtered(&current.asset, &pass_config).is_some() {
-        return Err(DueMediaRefusal::NotCurrentlySelected);
+        return Err(DueMediaFailure::Refusal(
+            DueMediaRefusal::NotCurrentlySelected,
+        ));
     }
     if config
         .selection_context
@@ -2506,14 +2532,16 @@ async fn due_media_task(
         let witness = stored
             .selector_membership()
             .cloned()
-            .ok_or(DueMediaRefusal::MissingSelectorWitness)?;
+            .ok_or(DueMediaFailure::Refusal(
+                DueMediaRefusal::MissingSelectorWitness,
+            ))?;
         album
             .confirm_selector_membership(&witness, &identity.child)
             .await
-            .map_err(|error| classify_due_media_error(&error))?;
+            .map_err(|error| classify_due_media_error(error, cancel))?;
     }
     let version = crate::state::VersionSizeKey::from_str(&destination.version_size)
-        .ok_or(DueMediaRefusal::InvalidRendition)?;
+        .ok_or(DueMediaFailure::Refusal(DueMediaRefusal::InvalidRendition))?;
     let provider_version =
         filter::provider_version_for_selected(&current.asset, &pass_config, version);
     let version_facts = current
@@ -2522,11 +2550,11 @@ async fn due_media_task(
         .iter()
         .find(|(size, _)| crate::state::VersionSizeKey::from(*size) == provider_version)
         .map(|(_, facts)| facts)
-        .ok_or(DueMediaRefusal::MissingRendition)?;
+        .ok_or(DueMediaFailure::Refusal(DueMediaRefusal::MissingRendition))?;
     if version_facts.checksum.as_ref() != destination.checksum
         || version_facts.size != destination.size
     {
-        return Err(DueMediaRefusal::ResourceChanged);
+        return Err(DueMediaFailure::Refusal(DueMediaRefusal::ResourceChanged));
     }
     let metadata = filter::build_selected_payload(&current.asset, &pass_config, version);
     Ok(filter::DownloadTask {
@@ -2596,7 +2624,6 @@ pub(crate) async fn replay_due_admitted_selection(
     let mut combined = SyncStats::default();
     let mut attempted = false;
     let mut failed_count = 0usize;
-    let mut session_expired = false;
     let mut remaining_decisions = MAX_REPLAY_DECISIONS;
     for root in roots {
         if remaining_decisions == 0 {
@@ -2630,9 +2657,16 @@ pub(crate) async fn replay_due_admitted_selection(
             .context("Missing admitted media zone")?
             .to_owned();
         let run = context.replay_run(root.clone(), passes, false, true);
-        let mut last_examined = None;
+        let mut last_ackable = None;
         for identity in window.identities {
-            last_examined = Some((identity.pass_key.clone(), identity.child.clone()));
+            if cancel.is_cancelled() {
+                combined.interrupted = true;
+                return Ok(Some(SyncResult::from_execution(
+                    DownloadOutcome::PartialFailure { failed_count: 0 },
+                    None,
+                    combined,
+                )));
+            }
             let Some(pass) = passes
                 .iter()
                 .find(|pass| pass_key(pass) == identity.pass_key)
@@ -2653,14 +2687,26 @@ pub(crate) async fn replay_due_admitted_selection(
                     &config,
                     &zone_name,
                     &root.spec.zone,
+                    &cancel,
                 )
                 .await
                 {
                     Ok(task) => tasks.push(task),
-                    Err(refusal) => {
+                    Err(DueMediaFailure::Refusal(refusal)) => {
                         refused = true;
+                        last_ackable = Some((identity.pass_key.clone(), identity.child.clone()));
                         log_due_media_refusal(&root.id, refusal);
                         break;
+                    }
+                    Err(DueMediaFailure::Session(error)) => return Err(error),
+                    Err(DueMediaFailure::State(error)) => return Err(error),
+                    Err(DueMediaFailure::Interrupted) => {
+                        combined.interrupted = true;
+                        return Ok(Some(SyncResult::from_execution(
+                            DownloadOutcome::PartialFailure { failed_count: 0 },
+                            None,
+                            combined,
+                        )));
                     }
                 }
             }
@@ -2709,32 +2755,48 @@ pub(crate) async fn replay_due_admitted_selection(
             combined.interrupted |= cancel.is_cancelled();
             failed_count = failed_count.saturating_add(pass_result.failed.len());
             if pass_result.auth_errors > 0 {
-                session_expired = true;
-                break;
+                combined.interrupted = true;
+                return Ok(Some(SyncResult::from_execution(
+                    DownloadOutcome::SessionExpired {
+                        auth_error_count: pass_result.auth_errors,
+                    },
+                    None,
+                    combined,
+                )));
             }
-            if pass_result.state_write_failures == 0 && !cancel.is_cancelled() {
-                let failed_write_keys: rustc_hash::FxHashSet<_> = pass_result
-                    .failed_failure_writes
-                    .iter()
-                    .map(|failure| failure.task_key.clone())
-                    .collect();
-                let failures: Vec<_> = pass_result
-                    .media_failures
-                    .into_iter()
-                    .filter(|failure| {
-                        !failed_write_keys.contains(
-                            &crate::download::orchestration::url_refresh::RetryTaskKey::from(
-                                &failure.task,
-                            ),
-                        )
-                    })
-                    .collect();
-                if !failures.is_empty() {
-                    run.record_media_failure_backoff(&failures).await?;
-                }
+            if pass_result.state_write_failures > 0 {
+                return Err(anyhow::anyhow!("admitted media retry state write failed"));
             }
+            if cancel.is_cancelled() {
+                combined.interrupted = true;
+                return Ok(Some(SyncResult::from_execution(
+                    DownloadOutcome::PartialFailure { failed_count: 0 },
+                    None,
+                    combined,
+                )));
+            }
+            let failed_write_keys: rustc_hash::FxHashSet<_> = pass_result
+                .failed_failure_writes
+                .iter()
+                .map(|failure| failure.task_key.clone())
+                .collect();
+            let failures: Vec<_> = pass_result
+                .media_failures
+                .into_iter()
+                .filter(|failure| {
+                    !failed_write_keys.contains(
+                        &crate::download::orchestration::url_refresh::RetryTaskKey::from(
+                            &failure.task,
+                        ),
+                    )
+                })
+                .collect();
+            if !failures.is_empty() {
+                run.record_media_failure_backoff(&failures).await?;
+            }
+            last_ackable = Some((identity.pass_key.clone(), identity.child.clone()));
         }
-        if let Some(last_examined) = last_examined {
+        if let Some(last_ackable) = last_ackable {
             let acknowledged = context
                 .capture
                 .db
@@ -2742,25 +2804,18 @@ pub(crate) async fn replay_due_admitted_selection(
                     owner.clone(),
                     root.id.clone(),
                     window.cursor,
-                    last_examined,
+                    last_ackable,
                 )
                 .await?;
             if !acknowledged {
                 break;
             }
         }
-        if session_expired || cancel.is_cancelled() {
-            break;
-        }
     }
     if !attempted {
         return Ok(None);
     }
-    let outcome = if session_expired {
-        DownloadOutcome::SessionExpired {
-            auth_error_count: 1,
-        }
-    } else if failed_count > 0 {
+    let outcome = if failed_count > 0 {
         DownloadOutcome::PartialFailure { failed_count }
     } else {
         DownloadOutcome::Success
@@ -4281,7 +4336,10 @@ mod fairness_redaction_tests {
     #[test]
     fn due_media_refusal_classification_drops_provider_identity() {
         let error = anyhow::anyhow!("provider child RAW-PROVIDER-CHILD-SENTINEL failed");
-        let refusal = classify_due_media_error(&error);
+        let failure = classify_due_media_error(error, &CancellationToken::new());
+        let DueMediaFailure::Refusal(refusal) = failure else {
+            panic!("expected a durable refusal");
+        };
         assert_eq!(refusal, DueMediaRefusal::ConfirmationRefused);
         assert!(!refusal.as_str().contains("RAW-PROVIDER-CHILD-SENTINEL"));
     }
