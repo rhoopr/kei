@@ -5415,4 +5415,6 @@ async fn genuine_v36_epoch_failed_transfer_receipt_reopen_and_pending_replay() {
 mod epoch_pending;
 #[path = "v027_baseline/legacy_scale.rs"]
 mod legacy_scale;
+#[path = "v027_baseline/operational_holds.rs"]
+mod operational_holds;
 pub(super) mod released_schema;
