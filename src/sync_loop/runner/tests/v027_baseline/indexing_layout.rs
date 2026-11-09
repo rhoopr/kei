@@ -301,6 +301,36 @@ fn pending_upgrade_session(cycle: usize, inventory: Arc<Vec<Value>>) -> Baseline
     }
 }
 
+#[derive(Clone)]
+struct ReadinessRegressView {
+    session: BaselineSession,
+    probes: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl PhotosSession for ReadinessRegressView {
+    async fn post(
+        &self,
+        url: &str,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Value> {
+        let request: Value = serde_json::from_str(&body)?;
+        if request["query"]["recordType"] == "CheckIndexingState" {
+            let probe = self.probes.fetch_add(1, Ordering::SeqCst);
+            let state = if probe < 2 { "FINISHED" } else { "RUNNING" };
+            return Ok(
+                json!({"records":[{"recordName":"index-state","recordType":"CheckIndexingState",
+                "fields":{"state":{"value":state}}}]}),
+            );
+        }
+        self.session.post(url, body, headers).await
+    }
+    fn clone_box(&self) -> Box<dyn PhotosSession> {
+        Box::new(self.clone())
+    }
+}
+
 fn pending_upgrade_quiet_session() -> ResetCycleSession {
     ResetCycleSession {
         zone: ZONE,
@@ -2028,4 +2058,81 @@ async fn pending_upgrade_qualification_healthy_peer_same_media_both_orders() {
             assert_eq!(std::fs::read(path).unwrap(), MEDIA);
         }
     }
+}
+
+#[tokio::test]
+async fn pending_upgrade_qualification_readiness_regression_retains_guard() {
+    let server = crate::start_wiremock_or_skip!();
+    Mock::given(method("GET"))
+        .and(path("/current"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (_dir, root, db_path, inventory, shared) =
+        seed_running_pending_upgrade(&format!("{}/current", server.uri())).await;
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let before = {
+        let conn = db
+            .acquire_lock("read pre-readiness-regression record")
+            .unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    let session = BaselineSession {
+        database: "private",
+        cycle: 1,
+        inventory,
+        concurrent: Arc::new(Vec::new()),
+        incremental_addition: Arc::new(Vec::new()),
+        requests: Arc::new(Mutex::new(Vec::new())),
+        inventory_queries: Arc::new(AtomicUsize::new(0)),
+        inventory_starts: Arc::new(AtomicUsize::new(0)),
+        boundaries: Arc::new(AtomicUsize::new(0)),
+        changes: Arc::new(AtomicUsize::new(0)),
+    };
+    let view = ReadinessRegressView {
+        session,
+        probes: Arc::new(AtomicUsize::new(0)),
+    };
+    let _ = try_run_pending_upgrade_indexing_cycle_with_session(
+        Arc::clone(&db),
+        Box::new(view),
+        &root,
+        &shared,
+    )
+    .await;
+    let after = {
+        let conn = db
+            .acquire_lock("read post-readiness-regression record")
+            .unwrap();
+        crate::state::db::sync_epoch::read_library(&conn, ZONE)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(after.attempt, before.attempt);
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.state, "pending");
+    assert!(after.binding.is_none());
+    assert_eq!(
+        after.last_outcome.as_deref(),
+        Some("qualification_incomplete:v1:readiness_regressed"),
+        "final RUNNING must nonqualify without consuming an attempt"
+    );
+    assert!(
+        db.get_metadata(&indexing_reconciliation_key(ZONE))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        db.get_metadata(&indexing_replay_key(ZONE)).await.unwrap(),
+        None
+    );
+    assert_eq!(db.get_metadata(&sync_token_key(ZONE)).await.unwrap(), None);
 }
