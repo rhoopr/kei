@@ -1418,10 +1418,12 @@ async fn baseline_contract(
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .unwrap();
-            assert_eq!(
-                retained,
-                (1, 0, String::new(), 0),
-                "failed transfer must retain its admitted destination without a premature confirmation backoff"
+            assert_eq!(retained.0, 1, "failed transfer stays admitted");
+            assert_eq!(retained.1, 0, "failed transfer stays unverified");
+            assert_eq!(retained.2, "download_failed", "truthful media reason");
+            assert!(
+                retained.3 > chrono::Utc::now().timestamp(),
+                "actual transfer failure carries a positive item deadline"
             );
         } else {
             assert!(pending.is_empty());

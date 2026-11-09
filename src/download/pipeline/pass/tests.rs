@@ -35,6 +35,8 @@ fn pass_config_debug_keeps_runtime_handles_out_of_output() {
         rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         bandwidth_limiter: None,
         library: Arc::from("PrimarySync"),
+        selection_run: None,
+        selection_pass: None,
     };
 
     let rendered = format!("{config:?}");
@@ -119,6 +121,8 @@ fn test_run_download_pass_skips_all_tasks_when_cancelled() {
                         rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         bandwidth_limiter: None,
                         library: std::sync::Arc::from("PrimarySync"),
+                        selection_run: None,
+                        selection_pass: None,
                     };
                     let result = run_download_pass(pass_config, tasks).await;
                     assert_eq!(
@@ -187,6 +191,8 @@ fn test_run_download_pass_processes_tasks_when_not_cancelled() {
                         rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                         bandwidth_limiter: None,
                         library: std::sync::Arc::from("PrimarySync"),
+                        selection_run: None,
+                        selection_pass: None,
                     };
                     let result = run_download_pass(pass_config, tasks).await;
                     assert_eq!(result.failed.len(), 1);
@@ -259,6 +265,8 @@ async fn download_pass_invalid_unknown_media_marks_failed_not_downloaded() {
             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             bandwidth_limiter: None,
             library: std::sync::Arc::from("PrimarySync"),
+            selection_run: None,
+            selection_pass: None,
         },
         vec![task],
     )
@@ -377,6 +385,8 @@ async fn download_pass_opens_state_write_circuit_breaker_mid_run() {
             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             bandwidth_limiter: None,
             library: std::sync::Arc::from("PrimarySync"),
+            selection_run: None,
+            selection_pass: None,
         },
         tasks,
     )

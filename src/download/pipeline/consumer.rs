@@ -34,6 +34,8 @@ pub(super) struct StreamConsumerResult {
     pub(super) downloaded: usize,
     pub(super) exif_failures: usize,
     pub(super) failed: Vec<DownloadTask>,
+    pub(super) media_failures: Vec<super::MediaFailureTask>,
+    pub(super) failed_failure_writes: Vec<super::FailedFailureWrite>,
     pub(super) auth_errors: usize,
     pub(super) pending_state_writes: Vec<PendingStateWrite>,
     pub(super) bytes_downloaded_total: u64,
@@ -67,6 +69,8 @@ pub(super) async fn consume_stream_download_tasks(
     let temp_suffix: Arc<str> = Arc::clone(&config.temp_suffix);
     let bandwidth_limiter = config.bandwidth_limiter.clone();
     let rate_limit_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let selection_run = config.selection_run.clone();
+    let selection_pass = config.selection_pass.clone();
     let download_stream = ReceiverStream::new(task_rx)
         .map(|task| {
             let client = download_client.clone();
@@ -75,7 +79,25 @@ pub(super) async fn consume_stream_download_tasks(
             let rate_limit_counter = Arc::clone(&rate_limit_counter);
             let bandwidth_limiter = bandwidth_limiter.clone();
             let shutdown_token = pipeline_shutdown.clone();
+            let selection_run = selection_run.clone();
+            let selection_pass = selection_pass.clone();
             async move {
+                let captured = match (&selection_run, &selection_pass) {
+                    (Some(run), Some(pass_key)) => {
+                        match run.capture_media_failure_identity(&task, pass_key).await {
+                            Ok(captured) => captured,
+                            Err(error) => {
+                                tracing::warn!(target: "kei::download::pipeline",
+                                    asset_id = %task.asset_id,
+                                    error = %error,
+                                    "Could not capture admitted media owner before dispatch"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
                 let result = Box::pin(download_single_task(
                     &client,
                     &task,
@@ -91,7 +113,7 @@ pub(super) async fn consume_stream_download_tasks(
                     },
                 ))
                 .await;
-                (task, result)
+                (task, captured, result)
             }
         })
         .buffer_unordered(concurrency);
@@ -106,6 +128,8 @@ pub(super) async fn consume_stream_download_tasks(
     let mut downloaded = 0usize;
     let mut exif_failures = 0usize;
     let mut failed: Vec<DownloadTask> = Vec::new();
+    let mut media_failures = Vec::new();
+    let mut failed_failure_writes = Vec::new();
     let mut auth_errors = 0usize;
     let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
     let mut bytes_downloaded_total: u64 = 0;
@@ -116,7 +140,7 @@ pub(super) async fn consume_stream_download_tasks(
     let mut recap = crate::download::recap::RunRecap::default();
     let mut drain_logged = false;
     let mut state_write_circuit_error: Option<anyhow::Error> = None;
-    while let Some((task, result)) = download_stream.next().await {
+    while let Some((task, captured, result)) = download_stream.next().await {
         if pipeline_shutdown.is_cancelled() && !drain_logged {
             pb.suspend(|| tracing::info!(target: "kei::download::pipeline", "Shutdown requested, draining in-flight downloads..."));
             drain_logged = true;
@@ -259,15 +283,32 @@ pub(super) async fn consume_stream_download_tasks(
                         });
                     }
                 }
+                let media_cause = super::media_failure_cause(&e);
+                let mut failure_write_succeeded = true;
                 if let Some(db) = &state_db
-                    && let Err(e) =
+                    && let Err(error) =
                         finalize_failed(db.as_ref(), &task.library, &task, &e.to_string()).await
                 {
+                    failure_write_succeeded = false;
+                    failed_failure_writes.push(super::FailedFailureWrite {
+                        task_key: crate::download::orchestration::url_refresh::RetryTaskKey::from(
+                            &task,
+                        ),
+                    });
                     tracing::warn!(target: "kei::download::pipeline",
                         asset_id = %task.asset_id,
-                        error = %e,
+                        error = %error,
                         "Failed to mark failure"
                     );
+                }
+                if let Some(cause) = media_cause
+                    && failure_write_succeeded
+                {
+                    media_failures.push(super::MediaFailureTask {
+                        task: task.clone(),
+                        captured: captured.clone(),
+                        cause,
+                    });
                 }
                 failed.push(task);
             }
@@ -278,6 +319,8 @@ pub(super) async fn consume_stream_download_tasks(
         downloaded,
         exif_failures,
         failed,
+        media_failures,
+        failed_failure_writes,
         auth_errors,
         pending_state_writes,
         bytes_downloaded_total,

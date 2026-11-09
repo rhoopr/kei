@@ -154,7 +154,7 @@ async fn historical_pending(database: &'static str, fail_deferral: bool) {
                     .execute_batch(
                         "CREATE TRIGGER refuse_retained_deferral BEFORE UPDATE OF next_retry_at
                      ON provider_active_decisions
-                     WHEN NEW.reason='current_confirmation_unavailable' BEGIN
+                     WHEN NEW.reason='download_failed' BEGIN
                      SELECT RAISE(ABORT,'synthetic retained retry deferral failure'); END;",
                     )
                     .unwrap();

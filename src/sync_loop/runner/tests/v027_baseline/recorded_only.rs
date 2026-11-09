@@ -803,6 +803,190 @@ async fn stock36_held_identity_baseline_promotes_after_own_fresh_proof() {
     assert_eq!(destination_state(&db, "asset-fail"), (1, 1));
 }
 
+fn captured_from_identity(
+    identity: &crate::state::db::provider_generations::SelectionRetryIdentity,
+) -> crate::state::db::provider_generations::CapturedSelectionRetry {
+    crate::state::db::provider_generations::CapturedSelectionRetry {
+        generation: identity.generation.clone(),
+        specification_hash: identity.specification_hash.clone(),
+        pass_key: identity.pass_key.clone(),
+        child: identity.child.clone(),
+        state_id: identity.state_id.clone(),
+        manifest_hash: identity.manifest_hash.clone(),
+        admission_hash: identity.admission_hash.clone(),
+        destination: identity.destinations[0].clone(),
+    }
+}
+
+#[tokio::test]
+async fn stock36_media_failure_backoff_and_window_fences() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer};
+
+    use super::{
+        MEDIA, ZONE, baseline_owner, make_run_cycle_config, make_shared_session_for_run_cycle,
+        seed_existing_upgrade_db,
+    };
+    use crate::state::SqliteStateDb;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    seed_existing_upgrade_db(&db_path);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let allow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fail"))
+        .respond_with(GatedBytes {
+            calls: Arc::clone(&calls),
+            allow: Arc::clone(&allow),
+            bytes: Arc::new(MEDIA.to_vec()),
+        })
+        .mount(&server)
+        .await;
+    let inventory = media_pair(ZONE, "fail", "fail.JPG", &format!("{}/fail", server.uri()));
+    let full_queries = Arc::new(AtomicUsize::new(0));
+    let changes = Arc::new(AtomicUsize::new(0));
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let selected = stock36_library_state(
+        db.clone(),
+        ZONE,
+        inventory,
+        Arc::clone(&full_queries),
+        Arc::clone(&changes),
+    )
+    .await;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let mut config = make_run_cycle_config();
+    config.retry.max_retries = 0;
+    run_stock36_cycle(&db, &[&selected], &root, &shared, &config)
+        .await
+        .expect("failed-media baseline must return a result");
+
+    let identity = {
+        let conn = db.acquire_lock("read failed media identity").unwrap();
+        let (generation, key): (String, String) = conn
+            .query_row(
+                "SELECT generation,pass_key FROM provider_active_decisions WHERE child='asset-fail'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        (generation, key)
+    };
+    let identity = db
+        .selection_retry_identity(
+            baseline_owner(),
+            identity.0.clone(),
+            identity.1.clone(),
+            "asset-fail".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let captured = captured_from_identity(&identity);
+    assert!(
+        db.defer_selection_media_failure(baseline_owner(), captured.clone())
+            .await
+            .unwrap()
+    );
+    let (reason, attempts, deadline, verified) = decision_state(&db, "asset-fail");
+    assert_eq!(reason, "download_failed");
+    assert_eq!(
+        attempts, 2,
+        "the first cycle and the explicit backoff both charge"
+    );
+    assert!(deadline > chrono::Utc::now().timestamp());
+    assert_eq!(verified, 0);
+    assert!(
+        !db.defer_selection_media_failure(baseline_owner(), captured)
+            .await
+            .unwrap(),
+        "a stale captured identity must not charge another attempt"
+    );
+    assert_eq!(decision_state(&db, "asset-fail").1, 2);
+
+    let window = db
+        .due_admitted_media_window(baseline_owner(), identity.generation.clone(), 10)
+        .await
+        .unwrap();
+    assert!(window.identities.is_empty(), "future item is not due");
+
+    db.make_selection_retry_due(baseline_owner(), "asset-fail".to_owned())
+        .await
+        .unwrap();
+    let window = db
+        .due_admitted_media_window(baseline_owner(), identity.generation.clone(), 10)
+        .await
+        .unwrap();
+    assert_eq!(window.identities.len(), 1);
+    let due = &window.identities[0];
+    assert!(
+        !db.ack_due_admitted_media_window(
+            baseline_owner(),
+            identity.generation.clone(),
+            Some("wrong-cursor".to_owned()),
+            (due.pass_key.clone(), due.child.clone()),
+        )
+        .await
+        .unwrap(),
+        "CAS mismatch must refuse the cursor ack"
+    );
+    assert!(
+        db.ack_due_admitted_media_window(
+            baseline_owner(),
+            identity.generation.clone(),
+            window.cursor.clone(),
+            (due.pass_key.clone(), due.child.clone()),
+        )
+        .await
+        .unwrap()
+    );
+    let cursor: Option<String> = {
+        let conn = db.acquire_lock("read acked cursor").unwrap();
+        conn.query_row(
+            "SELECT replay_after FROM provider_active_generations WHERE id=?1",
+            [&identity.generation],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        cursor,
+        Some(serde_json::to_string(&(due.pass_key.clone(), due.child.clone())).unwrap())
+    );
+
+    db.make_selection_retry_due(baseline_owner(), "asset-fail".to_owned())
+        .await
+        .unwrap();
+    db.acquire_lock("exhaust asset attempts")
+        .unwrap()
+        .execute(
+            "UPDATE assets SET download_attempts=11 WHERE library=?1 AND id='asset-fail'",
+            [ZONE],
+        )
+        .unwrap();
+    let exhausted = db
+        .due_admitted_media_window(baseline_owner(), identity.generation.clone(), 10)
+        .await
+        .unwrap();
+    assert!(
+        exhausted.identities.is_empty(),
+        "asset max attempts must filter before provider work"
+    );
+    assert_eq!(full_queries.load(Ordering::SeqCst), 1);
+    assert!(calls.load(Ordering::SeqCst) > 0);
+}
+
 /// A phase-1 failure that the same-cycle cleanup resolves is not media failure
 /// evidence. It must leave no item retry deadline or confirmation reason.
 #[tokio::test]
@@ -951,7 +1135,7 @@ fn admission_hash_for(
 /// injected row is hash-valid for its exact bytes; the unchanged reader must
 /// refuse it and mutate nothing.
 #[tokio::test]
-async fn unchanged_reader_rejects_injected_download_failed_reason_without_mutation() {
+async fn new_reader_accepts_injected_download_failed_reason_without_mutation() {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
@@ -963,7 +1147,6 @@ async fn unchanged_reader_rejects_injected_download_failed_reason_without_mutati
         seed_existing_upgrade_db,
     };
     use crate::state::SqliteStateDb;
-    use crate::state::error::StateError;
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("photos");
@@ -1134,8 +1317,8 @@ async fn unchanged_reader_rejects_injected_download_failed_reason_without_mutati
         )
         .await;
     assert!(
-        matches!(read, Err(StateError::ProviderSelectionInvalid)),
-        "the unchanged reader must refuse download_failed: {read:?}"
+        matches!(read, Ok(Some(_))),
+        "the new reader must accept download_failed: {read:?}"
     );
     let after_read = {
         let conn = db.acquire_lock("snapshot read-only refusal").unwrap();
@@ -1161,7 +1344,7 @@ async fn unchanged_reader_rejects_injected_download_failed_reason_without_mutati
 /// control makes the injected decision due, runs the ordinary cycle twice with
 /// a reopen between, and proves no retirement, compaction or completion.
 #[tokio::test]
-async fn unchanged_reader_preserves_injected_download_failed_across_replay_and_two_reopens() {
+async fn new_reader_accepts_and_preserves_download_failed_across_replay_and_two_reopens() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1338,25 +1521,23 @@ async fn unchanged_reader_preserves_injected_download_failed_across_replay_and_t
         .await;
         let replay = run_stock36_cycle(&db, &[&selected], &root, &shared, &config).await;
         let generations = generation_count(db.as_ref());
+        let current = snapshot(db.as_ref());
         eprintln!(
-            "L7 old-reader replay reopen={reopen} result={replay:?} calls={} generations={generations} row={:?}",
+            "L7 new-reader replay reopen={reopen} result_ok={} calls={} generations={generations} row={current:?}",
+            replay.is_ok(),
             calls.load(Ordering::SeqCst),
-            snapshot(db.as_ref()),
         );
         assert!(generations >= generations_after_state);
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            calls_before,
-            "the invalid reason must cause no provider GET"
-        );
-        assert_eq!(
-            snapshot(db.as_ref()),
-            injected,
-            "ordinary replay must not retire or complete the injected decision"
+        assert!(
+            calls.load(Ordering::SeqCst) > calls_before,
+            "the accepted due item must be attempted"
         );
         assert!(
-            replay.is_err(),
-            "ordinary replay must refuse the invalid reason instead of silently completing it"
+            replay.is_ok(),
+            "the new reader must consume the reason without a fatal refusal: {replay:?}"
         );
+        assert_eq!(current.2, "download_failed");
+        assert!(current.5.is_none(), "ordinary replay must not compact it");
+        assert_eq!(current.6, 0, "ordinary replay must not complete it");
     }
 }

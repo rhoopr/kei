@@ -1,6 +1,6 @@
 //! Pass finalization, retry cleanup, and sync outcome aggregation.
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,6 +35,11 @@ pub(in crate::download) struct StreamingResult {
     pub(in crate::download) downloaded: usize,
     pub(in crate::download) exif_failures: usize,
     pub(in crate::download) failed: Vec<DownloadTask>,
+    pub(in crate::download) media_failures: Vec<super::MediaFailureTask>,
+    pub(in crate::download) failed_failure_writes: Vec<super::FailedFailureWrite>,
+    pub(in crate::download) selection_run:
+        Option<Arc<crate::download::orchestration::generation::SelectionRun>>,
+    pub(in crate::download) selection_pass: Option<String>,
     pub(in crate::download) auth_errors: usize,
     /// CloudKit session failures require recovery even without failed CDN transfers.
     pub(in crate::download) provider_auth_errors: usize,
@@ -240,6 +245,10 @@ pub(super) async fn finalize_streaming_download(
         downloaded: consumer.downloaded,
         exif_failures: consumer.exif_failures,
         failed: consumer.failed,
+        media_failures: consumer.media_failures,
+        failed_failure_writes: consumer.failed_failure_writes,
+        selection_run: config.selection_run.clone(),
+        selection_pass: config.selection_pass.clone(),
         auth_errors: consumer.auth_errors,
         provider_auth_errors: metrics
             .provider_auth_errors
@@ -359,6 +368,10 @@ pub(in crate::download) async fn build_download_result(
         }),
     );
     let failed_tasks = streaming_result.failed;
+    let phase1_media_failures = streaming_result.media_failures;
+    let phase1_failed_failure_writes = streaming_result.failed_failure_writes;
+    let selection_run = streaming_result.selection_run;
+    let selection_pass = streaming_result.selection_pass;
     let skip_breakdown: crate::download::SkipBreakdown = streaming_result.skip_summary.into();
 
     if auth_errors >= AUTH_ERROR_THRESHOLD || provider_auth_errors > 0 {
@@ -599,7 +612,14 @@ pub(in crate::download) async fn build_download_result(
         rate_limit_counter: Arc::clone(&phase2_rate_counter),
         bandwidth_limiter: config.bandwidth_limiter.clone(),
         library: Arc::clone(&config.library),
+        selection_run: selection_run.clone(),
+        selection_pass: selection_pass.clone(),
     };
+    let phase2_attempted: FxHashSet<_> = retry_plan
+        .tasks
+        .iter()
+        .map(crate::download::RetryTaskKey::from)
+        .collect();
     let mut pass_result = run_download_pass(pass_config, retry_plan.tasks).await;
     pass_result.rate_limit_observations += retry_plan.rate_limit_observations;
 
@@ -660,6 +680,47 @@ pub(in crate::download) async fn build_download_result(
             stats,
             checkpoint,
         ));
+    }
+
+    if auth_errors == 0
+        && phase2_auth_errors == 0
+        && retry_plan.provider_auth_errors == 0
+        && state_write_failures == 0
+        && !checkpoint.interrupted
+        && !shutdown_token.is_cancelled()
+        && let Some(run) = &selection_run
+    {
+        let phase2_media_failures = pass_result.media_failures;
+        let phase2_failed_failure_writes = pass_result.failed_failure_writes;
+        let mut final_media: FxHashMap<_, _> = phase1_media_failures
+            .into_iter()
+            .map(|failure| (crate::download::RetryTaskKey::from(&failure.task), failure))
+            .collect();
+        let phase2_media_keys: FxHashSet<_> = phase2_media_failures
+            .iter()
+            .map(|failure| crate::download::RetryTaskKey::from(&failure.task))
+            .collect();
+        for key in &downloaded_keys {
+            final_media.remove(key);
+        }
+        for key in &phase2_attempted {
+            if !phase2_media_keys.contains(key) && !downloaded_keys.contains(key) {
+                final_media.remove(key);
+            }
+        }
+        for failure in phase2_media_failures {
+            final_media.insert(crate::download::RetryTaskKey::from(&failure.task), failure);
+        }
+        for failure in phase1_failed_failure_writes
+            .into_iter()
+            .chain(phase2_failed_failure_writes)
+        {
+            final_media.remove(&failure.task_key);
+        }
+        if !final_media.is_empty() {
+            run.record_media_failure_backoff(&final_media.into_values().collect::<Vec<_>>())
+                .await?;
+        }
     }
 
     let failed = remaining_failed.len();

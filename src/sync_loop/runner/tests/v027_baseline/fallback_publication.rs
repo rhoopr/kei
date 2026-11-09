@@ -1593,7 +1593,7 @@ async fn issue845_partial_movie_case(repeated_observation: bool) {
         assert_eq!(retry[4], expected_pass);
         assert_eq!(retry[5], "asset-shared");
         assert_eq!(retry[6], "admitted");
-        assert_eq!(retry[7], "current_confirmation_unavailable");
+        assert_eq!(retry[7], "download_failed");
         let expected_attempts = if cycle == 2 { 2 } else { 1 };
         assert_eq!(retry[8], expected_attempts);
         let deadline = retry[9].as_i64().unwrap();
@@ -1626,7 +1626,11 @@ async fn issue845_partial_movie_case(repeated_observation: bool) {
         saved_retry = Some(retry);
         drop(conn);
         let requests = movie_gets.load(Ordering::SeqCst) - before_requests;
-        let expected_requests = if cycle == 1 { 0 } else { 2 };
+        let expected_requests = match cycle {
+            0 => 4,
+            1 => 0,
+            _ => 2,
+        };
         assert_eq!(
             requests, expected_requests,
             "per-cycle 410 requests on cycle {cycle}"

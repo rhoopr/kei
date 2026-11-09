@@ -982,6 +982,16 @@ pub(super) fn merge_streaming_result(combined: &mut StreamingResult, result: Str
     combined.downloaded += result.downloaded;
     combined.exif_failures += result.exif_failures;
     combined.failed.extend(result.failed);
+    combined.media_failures.extend(result.media_failures);
+    combined
+        .failed_failure_writes
+        .extend(result.failed_failure_writes);
+    if combined.selection_run.is_none() {
+        combined.selection_run = result.selection_run;
+    }
+    if combined.selection_pass.is_none() {
+        combined.selection_pass = result.selection_pass;
+    }
     combined.auth_errors += result.auth_errors;
     combined.provider_auth_errors += result.provider_auth_errors;
     combined.state_write_failures += result.state_write_failures;
@@ -1005,6 +1015,16 @@ pub(super) fn merge_token_recovery_result(combined: &mut StreamingResult, result
     combined.downloaded += result.downloaded;
     combined.exif_failures += result.exif_failures;
     combined.failed.extend(result.failed);
+    combined.media_failures.extend(result.media_failures);
+    combined
+        .failed_failure_writes
+        .extend(result.failed_failure_writes);
+    if combined.selection_run.is_none() {
+        combined.selection_run = result.selection_run;
+    }
+    if combined.selection_pass.is_none() {
+        combined.selection_pass = result.selection_pass;
+    }
     combined.auth_errors += result.auth_errors;
     combined.provider_auth_errors += result.provider_auth_errors;
     combined.state_write_failures += result.state_write_failures;

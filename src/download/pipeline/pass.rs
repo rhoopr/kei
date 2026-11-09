@@ -42,6 +42,9 @@ pub(in crate::download) struct PassConfig<'a> {
     /// CloudKit zone name scoping every state-DB key written by this pass.
     /// Sourced from `DownloadConfig::library` at pass dispatch.
     pub(in crate::download) library: Arc<str>,
+    pub(in crate::download) selection_run:
+        Option<Arc<crate::download::orchestration::generation::SelectionRun>>,
+    pub(in crate::download) selection_pass: Option<String>,
 }
 
 impl std::fmt::Debug for PassConfig<'_> {
@@ -67,6 +70,8 @@ pub(in crate::download) struct PassResult {
     pub(in crate::download) downloaded_tasks: Vec<DownloadTask>,
     pub(in crate::download) exif_failures: usize,
     pub(in crate::download) failed: Vec<DownloadTask>,
+    pub(in crate::download) media_failures: Vec<super::MediaFailureTask>,
+    pub(in crate::download) failed_failure_writes: Vec<super::FailedFailureWrite>,
     pub(in crate::download) auth_errors: usize,
     pub(in crate::download) state_write_failures: usize,
     pub(in crate::download) bytes_downloaded: u64,
@@ -113,6 +118,8 @@ pub(in crate::download) async fn run_download_pass(
     let library: Arc<str> = Arc::clone(&config.library);
     let mode = config.reporting.personality_mode;
     let url_obtained_at = &config.url_obtained_at;
+    let selection_run = config.selection_run.clone();
+    let selection_pass = config.selection_pass.clone();
     let planned_tasks = tasks.clone();
 
     let mut download_stream = stream::iter(tasks)
@@ -124,7 +131,25 @@ pub(in crate::download) async fn run_download_pass(
             let rate_limit_counter = Arc::clone(&rate_limit_counter);
             let bandwidth_limiter = bandwidth_limiter.clone();
             let shutdown_token = pass_shutdown.clone();
+            let selection_run = selection_run.clone();
+            let selection_pass = selection_pass.clone();
             async move {
+                let captured = match (&selection_run, &selection_pass) {
+                    (Some(run), Some(pass_key)) => {
+                        match run.capture_media_failure_identity(&task, pass_key).await {
+                            Ok(captured) => captured,
+                            Err(error) => {
+                                tracing::warn!(target: "kei::download::pipeline",
+                                    asset_id = %task.asset_id,
+                                    error = %error,
+                                    "Could not capture admitted media owner before dispatch"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
                 if let Some(obtained_at) =
                     url_obtained_at.get(&crate::download::RetryTaskKey::from(&task))
                 {
@@ -148,12 +173,14 @@ pub(in crate::download) async fn run_download_pass(
                     },
                 ))
                 .await;
-                (task, result)
+                (task, captured, result)
             }
         })
         .buffer_unordered(concurrency);
 
     let mut failed: Vec<DownloadTask> = Vec::new();
+    let mut media_failures = Vec::new();
+    let mut failed_failure_writes = Vec::new();
     let mut downloaded = 0usize;
     let mut downloaded_tasks: Vec<DownloadTask> = Vec::new();
     let mut auth_errors = 0usize;
@@ -177,7 +204,7 @@ pub(in crate::download) async fn run_download_pass(
     // updates fire per-item. Collecting first would freeze the progress bar
     // until the last download finished and defer every mark_downloaded to
     // the end of the pass — defeating the point of parallel cleanup.
-    while let Some((task, result)) = download_stream.next().await {
+    while let Some((task, captured, result)) = download_stream.next().await {
         match &result {
             Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes, retained)) => {
                 downloaded += 1;
@@ -282,17 +309,34 @@ pub(in crate::download) async fn run_download_pass(
                         });
                     }
                 }
+                let media_cause = super::media_failure_cause(e);
+                let mut failure_write_succeeded = true;
                 if let Some(db) = &state_db
-                    && let Err(e) =
+                    && let Err(error) =
                         finalize_failed(db.as_ref(), &task.library, &task, &e.to_string()).await
                 {
                     failure_state_writes += 1;
+                    failure_write_succeeded = false;
+                    failed_failure_writes.push(super::FailedFailureWrite {
+                        task_key: crate::download::orchestration::url_refresh::RetryTaskKey::from(
+                            &task,
+                        ),
+                    });
                     pass_shutdown.cancel();
                     tracing::warn!(target: "kei::download::pipeline",
                         asset_id = %task.asset_id,
-                        error = %e,
+                        error = %error,
                         "Failed to mark failure"
                     );
+                }
+                if let Some(cause) = media_cause
+                    && failure_write_succeeded
+                {
+                    media_failures.push(super::MediaFailureTask {
+                        task: task.clone(),
+                        captured: captured.clone(),
+                        cause,
+                    });
                 }
                 failed.push(task);
             }
@@ -322,6 +366,9 @@ pub(in crate::download) async fn run_download_pass(
             .is_err()
         {
             failure_state_writes += 1;
+            failed_failure_writes.push(super::FailedFailureWrite {
+                task_key: crate::download::orchestration::url_refresh::RetryTaskKey::from(&task),
+            });
         }
         failed.push(task);
     }
@@ -343,6 +390,8 @@ pub(in crate::download) async fn run_download_pass(
         downloaded_tasks,
         exif_failures,
         failed,
+        media_failures,
+        failed_failure_writes,
         auth_errors,
         state_write_failures: state_write_failures + failure_state_writes,
         bytes_downloaded: bytes_downloaded_total,

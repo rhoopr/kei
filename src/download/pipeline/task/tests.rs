@@ -306,6 +306,8 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
             rate_limit_counter: Arc::new(AtomicUsize::new(0)),
             bandwidth_limiter: None,
             library: Arc::from("PrimarySync"),
+            selection_run: None,
+            selection_pass: None,
         },
         vec![winner_task],
     )
@@ -334,6 +336,8 @@ async fn different_byte_destination_race_keeps_loser_failed_without_metadata_wri
             rate_limit_counter: Arc::new(AtomicUsize::new(0)),
             bandwidth_limiter: None,
             library: Arc::from("PrimarySync"),
+            selection_run: None,
+            selection_pass: None,
         },
         vec![loser_task],
     )
@@ -486,6 +490,8 @@ async fn full_expired_url_cleanup_recovers_queued_tasks_but_respects_shutdown() 
                 rate_limit_counter: Arc::new(AtomicUsize::new(0)),
                 bandwidth_limiter: None,
                 library: config.library.clone(),
+                selection_run: None,
+                selection_pass: None,
             },
             fresh,
         )

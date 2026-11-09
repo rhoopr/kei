@@ -35,6 +35,15 @@ use crate::state::db::provider_selection::{
 const MAX_REPLAY_DECISIONS: u32 = 64;
 const DEFERRED_REASON: &str = "selection_generation_deferred";
 
+type CapturedMediaFailureCache = Arc<
+    std::sync::Mutex<
+        rustc_hash::FxHashMap<
+            (String, String, String),
+            Option<Arc<crate::download::pipeline::CapturedMediaFailure>>,
+        >,
+    >,
+>;
+
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static TEST_GENERATION_FORMAT: u8;
@@ -486,6 +495,16 @@ pub(crate) struct SelectionRun {
     fresh_confirmation: bool,
     pub(in crate::download) retained_retry: bool,
     retry_sources: Arc<std::sync::Mutex<SelectionRetrySources>>,
+    captured_media_failures: CapturedMediaFailureCache,
+}
+
+impl std::fmt::Debug for SelectionRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectionRun")
+            .field("generation", &self.root.id)
+            .field("retained_retry", &self.retained_retry)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SelectionContext {
@@ -658,6 +677,9 @@ impl SelectionContext {
             fresh_confirmation: false,
             retained_retry: false,
             retry_sources: Arc::clone(&self.retry_sources),
+            captured_media_failures: Arc::new(std::sync::Mutex::new(
+                rustc_hash::FxHashMap::default(),
+            )),
         }))
     }
 
@@ -681,6 +703,9 @@ impl SelectionContext {
             fresh_confirmation,
             retained_retry,
             retry_sources: Arc::clone(&self.retry_sources),
+            captured_media_failures: Arc::new(std::sync::Mutex::new(
+                rustc_hash::FxHashMap::default(),
+            )),
         })
     }
 }
@@ -826,6 +851,9 @@ impl SelectionRun {
                     fresh_confirmation: true,
                     retained_retry: self.retained_retry,
                     retry_sources: self.retry_sources.clone(),
+                    captured_media_failures: Arc::new(std::sync::Mutex::new(
+                        rustc_hash::FxHashMap::default(),
+                    )),
                 });
                 return Ok((
                     run,
@@ -945,6 +973,9 @@ impl SelectionRun {
             fresh_confirmation: true,
             retained_retry: self.retained_retry,
             retry_sources: self.retry_sources.clone(),
+            captured_media_failures: Arc::new(std::sync::Mutex::new(
+                rustc_hash::FxHashMap::default(),
+            )),
         });
         Ok((
             run,
@@ -1164,6 +1195,139 @@ impl SelectionRun {
             )
             .await?;
         Ok(Some(root))
+    }
+
+    /// Capture the exact admitted owner identity before dispatch. The caller
+    /// carries it with the task so a later failure can compare the same tuple
+    /// inside the backoff transaction instead of rereading after failure.
+    pub(in crate::download) async fn capture_media_failure_identity(
+        &self,
+        task: &filter::DownloadTask,
+        pass_key: &str,
+    ) -> Result<Option<Arc<crate::download::pipeline::CapturedMediaFailure>>> {
+        let run = if self.root.spec.zone.get("zoneName").and_then(Value::as_str)
+            == Some(task.library.as_ref())
+        {
+            self
+        } else {
+            match self.source_runs.get(task.library.as_ref()) {
+                Some(run) => run.as_ref(),
+                None => return Ok(None),
+            }
+        };
+        if !run.albums.contains_key(pass_key) {
+            return Ok(None);
+        }
+        let cache_key = (
+            run.root.id.clone(),
+            pass_key.to_owned(),
+            task.asset_record_name.to_string(),
+        );
+        if let Some(cached) = run
+            .captured_media_failures
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("Media failure identity cache poisoned"))?
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+        let identity = run
+            .capture
+            .db
+            .selection_retry_identity(
+                run.capture.owner.clone(),
+                run.root.id.clone(),
+                pass_key.to_owned(),
+                task.asset_record_name.to_string(),
+            )
+            .await?;
+        let captured = identity.and_then(|identity| {
+            if identity.state_id != task.asset_id.as_ref() {
+                return None;
+            }
+            let destination = identity.destinations.iter().find(|destination| {
+                destination.version_size == task.version_size.as_str()
+                    && destination.path.to_path() == task.download_path
+                    && destination.checksum == task.checksum.as_ref()
+                    && destination.size == task.size
+            })?;
+            Some(Arc::new(crate::download::pipeline::CapturedMediaFailure {
+                task_key: super::url_refresh::RetryTaskKey::from(task),
+                generation: identity.generation,
+                specification_hash: identity.specification_hash,
+                pass_key: identity.pass_key,
+                child: identity.child,
+                state_id: identity.state_id,
+                manifest_hash: identity.manifest_hash,
+                admission_hash: identity.admission_hash,
+                destination: destination.clone(),
+            }))
+        });
+        run.captured_media_failures
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("Media failure identity cache poisoned"))?
+            .insert(cache_key, captured.clone());
+        Ok(captured)
+    }
+
+    /// Record the exact truthful media-failure backoff for captured admitted
+    /// tasks. A stale capture is refused by the state owner and writes nothing.
+    pub(in crate::download) async fn record_media_failure_backoff(
+        &self,
+        failures: &[crate::download::pipeline::MediaFailureTask],
+    ) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for failure in failures {
+            let Some(captured) = &failure.captured else {
+                continue;
+            };
+            if captured.task_key
+                != crate::download::orchestration::url_refresh::RetryTaskKey::from(&failure.task)
+            {
+                continue;
+            }
+            tracing::debug!(
+                target: "kei::download::pipeline",
+                cause = ?failure.cause,
+                generation = %captured.generation,
+                child = %captured.child,
+                "Recording admitted media failure backoff"
+            );
+            if !seen.insert((
+                captured.generation.clone(),
+                captured.pass_key.clone(),
+                captured.child.clone(),
+            )) {
+                continue;
+            }
+            let recorded = self
+                .capture
+                .db
+                .defer_selection_media_failure(
+                    self.capture.owner.clone(),
+                    crate::state::db::provider_generations::CapturedSelectionRetry {
+                        generation: captured.generation.clone(),
+                        specification_hash: captured.specification_hash.clone(),
+                        pass_key: captured.pass_key.clone(),
+                        child: captured.child.clone(),
+                        state_id: captured.state_id.clone(),
+                        manifest_hash: captured.manifest_hash.clone(),
+                        admission_hash: captured.admission_hash.clone(),
+                        destination: captured.destination.clone(),
+                    },
+                )
+                .await?;
+            if !recorded {
+                tracing::debug!(
+                    target: "kei::download::pipeline",
+                    generation = %captured.generation,
+                    child = %captured.child,
+                    "Captured media failure owner is stale; backoff refused"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Capture only failed tasks' original selected provenance. This transient
@@ -2254,6 +2418,298 @@ pub(crate) async fn has_due(
         }
     }
     Ok(Some(false))
+}
+
+async fn due_media_task(
+    identity: &crate::state::db::provider_generations::SelectionRetryIdentity,
+    destination: &SelectionDestination,
+    album: &PhotoAlbum,
+    pass: &AlbumPass,
+    config: &DownloadConfig,
+    zone_name: &str,
+    zone: &Value,
+) -> Result<filter::DownloadTask> {
+    let body = identity
+        .confirmation
+        .as_deref()
+        .context("Due admitted media has no stored confirmation")?;
+    let master = identity
+        .master
+        .as_deref()
+        .context("Due admitted media has no stored master")?;
+    let stored = current_asset(body, &identity.child, master, zone)?;
+    let current = album
+        .confirm_layout_asset(&identity.child, zone_name)
+        .await?;
+    anyhow::ensure!(
+        same_selected_facts(&stored, &current.asset),
+        "Current provider facts differ from the admitted media"
+    );
+    let pass_config = config.with_pass(pass);
+    if filter::is_asset_filtered(&current.asset, &pass_config).is_some() {
+        anyhow::bail!("Admitted media is not currently selected");
+    }
+    if config
+        .selection_context
+        .as_ref()
+        .is_some_and(|context| context.profile.get("selector_binding").is_some())
+    {
+        let witness = stored
+            .selector_membership()
+            .cloned()
+            .context("Missing current selecting relation witness")?;
+        album
+            .confirm_selector_membership(&witness, &identity.child)
+            .await?;
+    }
+    let version = crate::state::VersionSizeKey::from_str(&destination.version_size)
+        .context("Invalid admitted rendition key")?;
+    let provider_version =
+        filter::provider_version_for_selected(&current.asset, &pass_config, version);
+    let version_facts = current
+        .asset
+        .versions()
+        .iter()
+        .find(|(size, _)| crate::state::VersionSizeKey::from(*size) == provider_version)
+        .map(|(_, facts)| facts)
+        .context("Current provider lacks the admitted rendition")?;
+    anyhow::ensure!(
+        version_facts.checksum.as_ref() == destination.checksum
+            && version_facts.size == destination.size,
+        "Current provider resource differs from the admitted destination"
+    );
+    let metadata = filter::build_selected_payload(&current.asset, &pass_config, version);
+    Ok(filter::DownloadTask {
+        require_created_entry: !config.allows_existing_mutation(),
+        url: version_facts.url.clone(),
+        download_path: destination.path.to_path(),
+        replacement_fingerprint: None,
+        publication_binding: None,
+        pending_cross_parent_root: None,
+        superseded_requested_path: None,
+        checksum: version_facts.checksum.clone(),
+        asset_id: Arc::from(identity.state_id.as_str()),
+        asset_record_name: Arc::from(identity.child.as_str()),
+        library: Arc::from(zone_name),
+        metadata,
+        size: version_facts.size,
+        created_local: current.asset.created_local(),
+        version_size: version,
+        media_type: filter::determine_media_type(version, &current.asset),
+    })
+}
+
+/// Replay one bounded admitted-media window while an epoch is independently
+/// held. This never runs inventory, admits new work, drains metadata tails, or
+/// supplies checkpoint/token authority.
+#[allow(
+    dead_code,
+    reason = "called by the L1 shared held-epoch seam, delivered as a separate patch"
+)]
+pub(crate) async fn replay_due_admitted_selection(
+    client: &Client,
+    passes: &[AlbumPass],
+    config: Arc<DownloadConfig>,
+    controls: DownloadControls,
+    cancel: CancellationToken,
+) -> Result<Option<SyncResult>> {
+    if !controls.run_mode.downloads_files() || cancel.is_cancelled() {
+        return Ok(None);
+    }
+    let Some(context) = context(passes, &config, controls).await? else {
+        return Ok(None);
+    };
+    let owner = context.capture.owner.clone();
+    let mut roots = Vec::new();
+    if let Some(root) = context.current().await? {
+        roots.push(root);
+    }
+    let mut exclude = roots
+        .first()
+        .map(|root| root.id.clone())
+        .unwrap_or_default();
+    for _ in 0..8 {
+        let Some(root) = context
+            .capture
+            .db
+            .retained_selection_root(
+                owner.clone(),
+                context.scope.clone(),
+                context.config_hash.clone(),
+                exclude.clone(),
+                (context.format == 2).then(|| context.profile.clone()),
+            )
+            .await?
+        else {
+            break;
+        };
+        exclude = root.id.clone();
+        roots.push(root);
+    }
+
+    let mut combined = SyncStats::default();
+    let mut attempted = false;
+    let mut failed_count = 0usize;
+    let mut session_expired = false;
+    for root in roots {
+        let window = context
+            .capture
+            .db
+            .due_admitted_media_window(owner.clone(), root.id.clone(), config.max_download_attempts)
+            .await?;
+        if window.identities.is_empty() {
+            continue;
+        }
+        let zone_name = root
+            .spec
+            .zone
+            .get("zoneName")
+            .and_then(Value::as_str)
+            .context("Missing admitted media zone")?
+            .to_owned();
+        let run = context.replay_run(root.clone(), passes, false, true);
+        let mut last_examined = None;
+        for identity in window.identities {
+            last_examined = Some((identity.pass_key.clone(), identity.child.clone()));
+            let Some(pass) = passes
+                .iter()
+                .find(|pass| pass_key(pass) == identity.pass_key)
+            else {
+                continue;
+            };
+            let Some(album) = run.albums.get(&identity.pass_key) else {
+                continue;
+            };
+            let mut tasks = Vec::new();
+            let mut refused = false;
+            for destination in &identity.destinations {
+                match due_media_task(
+                    &identity,
+                    destination,
+                    album,
+                    pass,
+                    &config,
+                    &zone_name,
+                    &root.spec.zone,
+                )
+                .await
+                {
+                    Ok(task) => tasks.push(task),
+                    Err(error) => {
+                        refused = true;
+                        tracing::debug!(
+                            target: "kei::download::pipeline",
+                            generation = %root.id,
+                            child = %identity.child,
+                            %error,
+                            "Due admitted media refused by current proof"
+                        );
+                        break;
+                    }
+                }
+            }
+            if refused || tasks.is_empty() {
+                continue;
+            }
+            let pass_config = crate::download::pipeline::PassConfig {
+                prior_auth_errors: 0,
+                url_obtained_at: Default::default(),
+                client,
+                retry_config: &config.retry,
+                metadata: crate::download::metadata_rewrite::MetadataFlags::from(config.as_ref()),
+                mark_capture_repair_after_download: matches!(
+                    config.capture_timestamp_repair,
+                    crate::download::CaptureTimestampRepair::ReplaceWithCaptureLocal
+                ),
+                concurrency: config.concurrent_downloads,
+                reporting: controls.reporting,
+                temp_suffix: Arc::clone(&config.temp_suffix),
+                shutdown_token: cancel.clone(),
+                state_db: config.state_db.clone(),
+                rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                bandwidth_limiter: config.bandwidth_limiter.clone(),
+                library: Arc::from(zone_name.as_str()),
+                selection_run: Some(run.clone()),
+                selection_pass: Some(identity.pass_key.clone()),
+            };
+            let pass_result =
+                crate::download::pipeline::run_download_pass(pass_config, tasks).await;
+            attempted = true;
+            combined.assets_seen = combined.assets_seen.saturating_add(1);
+            combined.downloaded = combined.downloaded.saturating_add(pass_result.downloaded);
+            combined.failed = combined.failed.saturating_add(pass_result.failed.len());
+            combined.exif_failures = combined
+                .exif_failures
+                .saturating_add(pass_result.exif_failures);
+            combined.state_write_failures = combined
+                .state_write_failures
+                .saturating_add(pass_result.state_write_failures);
+            combined.bytes_downloaded = combined
+                .bytes_downloaded
+                .saturating_add(pass_result.bytes_downloaded);
+            combined.disk_bytes_written = combined
+                .disk_bytes_written
+                .saturating_add(pass_result.disk_bytes_written);
+            combined.interrupted |= cancel.is_cancelled();
+            failed_count = failed_count.saturating_add(pass_result.failed.len());
+            if pass_result.auth_errors > 0 {
+                session_expired = true;
+                break;
+            }
+            if pass_result.state_write_failures == 0 && !cancel.is_cancelled() {
+                let failed_write_keys: rustc_hash::FxHashSet<_> = pass_result
+                    .failed_failure_writes
+                    .iter()
+                    .map(|failure| failure.task_key.clone())
+                    .collect();
+                let failures: Vec<_> = pass_result
+                    .media_failures
+                    .into_iter()
+                    .filter(|failure| {
+                        !failed_write_keys.contains(
+                            &crate::download::orchestration::url_refresh::RetryTaskKey::from(
+                                &failure.task,
+                            ),
+                        )
+                    })
+                    .collect();
+                if !failures.is_empty() {
+                    run.record_media_failure_backoff(&failures).await?;
+                }
+            }
+        }
+        if let Some(last_examined) = last_examined {
+            let acknowledged = context
+                .capture
+                .db
+                .ack_due_admitted_media_window(
+                    owner.clone(),
+                    root.id.clone(),
+                    window.cursor,
+                    last_examined,
+                )
+                .await?;
+            if !acknowledged {
+                break;
+            }
+        }
+        if session_expired || cancel.is_cancelled() {
+            break;
+        }
+    }
+    if !attempted {
+        return Ok(None);
+    }
+    let outcome = if session_expired {
+        DownloadOutcome::SessionExpired {
+            auth_error_count: 1,
+        }
+    } else if failed_count > 0 {
+        DownloadOutcome::PartialFailure { failed_count }
+    } else {
+        DownloadOutcome::Success
+    };
+    Ok(Some(SyncResult::from_execution(outcome, None, combined)))
 }
 
 pub(super) async fn inventory(

@@ -127,6 +127,8 @@ async fn persistent_expiry_does_not_starve_delayed_healthy_peer() {
             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             bandwidth_limiter: None,
             library: "PrimarySync".into(),
+            selection_run: None,
+            selection_pass: None,
         },
         tasks,
     )
@@ -511,6 +513,8 @@ async fn cancelled_explicit_dispatch_reports_and_persists_every_unfinished_task(
             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             bandwidth_limiter: None,
             library: "PrimarySync".into(),
+            selection_run: None,
+            selection_pass: None,
         },
         tasks,
     );
@@ -865,6 +869,8 @@ async fn targeted_refresh_preserves_selection_and_no_overwrite_publication() {
                 rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 bandwidth_limiter: None,
                 library: "PrimarySync".into(),
+                selection_run: None,
+                selection_pass: None,
             },
             plan.tasks,
         )
@@ -1096,6 +1102,8 @@ async fn explicit_retry_enforces_cumulative_auth_threshold_and_retains_queued_de
             rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             bandwidth_limiter: None,
             library: "PrimarySync".into(),
+            selection_run: None,
+            selection_pass: None,
         },
         tasks,
     )

@@ -543,6 +543,8 @@ async fn twins_finish_both_passes_with_independent_metadata_and_reopened_state()
                     rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     bandwidth_limiter: None,
                     library: config.library.clone(),
+                    selection_run: None,
+                    selection_pass: None,
                 },
                 tasks.clone(),
             )

@@ -1493,6 +1493,8 @@ pub(super) async fn download_photos_incremental_collecting_inner(
         rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         bandwidth_limiter: config.bandwidth_limiter.clone(),
         library: Arc::clone(&config.library),
+        selection_run: config.selection_run.clone(),
+        selection_pass: config.selection_pass.clone(),
     };
     let mut pass_result = run_download_pass(pass_config, tasks).await;
     pass_result.failed.extend(unrefreshed);
@@ -1540,6 +1542,8 @@ pub(super) async fn download_photos_incremental_collecting_inner(
                 rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 bandwidth_limiter: config.bandwidth_limiter.clone(),
                 library: Arc::clone(&config.library),
+                selection_run: config.selection_run.clone(),
+                selection_pass: config.selection_pass.clone(),
             };
             let retry_result = run_download_pass(retry_pass_config, retry_tasks).await;
             merge_expired_url_retry_result(

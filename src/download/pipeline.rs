@@ -25,6 +25,56 @@ pub(in crate::download) use task::{DownloadSingleContext, download_single_task};
 #[cfg(test)]
 mod test_support;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::download) enum MediaFailureCause {
+    Transfer,
+    ExpiredUrl,
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::download) struct CapturedMediaFailure {
+    pub(in crate::download) task_key: crate::download::orchestration::url_refresh::RetryTaskKey,
+    pub(in crate::download) generation: String,
+    pub(in crate::download) specification_hash: String,
+    pub(in crate::download) pass_key: String,
+    pub(in crate::download) child: String,
+    pub(in crate::download) state_id: String,
+    pub(in crate::download) manifest_hash: String,
+    pub(in crate::download) admission_hash: String,
+    pub(in crate::download) destination: crate::state::db::provider_selection::SelectionDestination,
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::download) struct MediaFailureTask {
+    pub(in crate::download) task: crate::download::filter::DownloadTask,
+    pub(in crate::download) captured: Option<std::sync::Arc<CapturedMediaFailure>>,
+    pub(in crate::download) cause: MediaFailureCause,
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::download) struct FailedFailureWrite {
+    pub(in crate::download) task_key: crate::download::orchestration::url_refresh::RetryTaskKey,
+}
+
+#[must_use]
+pub(in crate::download) fn media_failure_cause(error: &anyhow::Error) -> Option<MediaFailureCause> {
+    use crate::download::error::DownloadError;
+    let download = error.downcast_ref::<DownloadError>()?;
+    match download {
+        DownloadError::HttpStatus {
+            status: 401 | 403, ..
+        } => None,
+        DownloadError::HttpStatus { status: 410, .. } => Some(MediaFailureCause::ExpiredUrl),
+        DownloadError::HttpStatus { .. }
+        | DownloadError::Http { .. }
+        | DownloadError::ContentLengthMismatch { .. }
+        | DownloadError::InvalidContent { .. } => Some(MediaFailureCause::Transfer),
+        DownloadError::Interrupted { .. } | DownloadError::Disk(_) | DownloadError::Other(_) => {
+            None
+        }
+    }
+}
+
 pub(super) use crate::download::metadata_rewrite::MetadataFlags;
 pub(super) use adoption::{
     PendingRetryAdoption, mark_reserved_pending_task, recover_current_pending_publication,

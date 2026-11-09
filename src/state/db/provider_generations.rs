@@ -97,6 +97,38 @@ pub(crate) struct GenerationProjection {
     pub(crate) reason: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SelectionRetryIdentity {
+    pub(crate) generation: String,
+    pub(crate) specification_hash: String,
+    pub(crate) pass_key: String,
+    pub(crate) child: String,
+    pub(crate) state_id: String,
+    pub(crate) manifest_hash: String,
+    pub(crate) admission_hash: String,
+    pub(crate) confirmation: Option<Vec<u8>>,
+    pub(crate) master: Option<String>,
+    pub(crate) destinations: Vec<SelectionDestination>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DueAdmittedMediaWindow {
+    pub(crate) cursor: Option<String>,
+    pub(crate) identities: Vec<SelectionRetryIdentity>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CapturedSelectionRetry {
+    pub(crate) generation: String,
+    pub(crate) specification_hash: String,
+    pub(crate) pass_key: String,
+    pub(crate) child: String,
+    pub(crate) state_id: String,
+    pub(crate) manifest_hash: String,
+    pub(crate) admission_hash: String,
+    pub(crate) destination: SelectionDestination,
+}
+
 fn invalid<T>() -> Result<T, StateError> {
     Err(StateError::ProviderSelectionInvalid)
 }
@@ -1294,12 +1326,22 @@ fn defer_attempt(
     key: &str,
     child: &str,
 ) -> Result<(), StateError> {
+    defer_attempt_with_reason(conn, root, key, child, "current_confirmation_unavailable")
+}
+
+fn defer_attempt_with_reason(
+    conn: &Connection,
+    root: &ActiveGeneration,
+    key: &str,
+    child: &str,
+    admitted_reason: &str,
+) -> Result<(), StateError> {
     let (admission,attempts):(String,u32)=conn.query_row("SELECT admission,attempts FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child],|r|Ok((r.get(0)?,r.get(1)?)))?;
     if admission == "excluded" {
         return invalid();
     }
     let delay = (3600_i64 * (1_i64 << attempts.min(5))).min(86400);
-    conn.execute("UPDATE provider_active_decisions SET attempts=?4,next_retry_at=?5,reason=CASE WHEN admission='admitted' THEN 'current_confirmation_unavailable' ELSE reason END WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child,attempts.saturating_add(1).min(32),Utc::now().timestamp()+delay])?;
+    conn.execute("UPDATE provider_active_decisions SET attempts=?4,next_retry_at=?5,reason=CASE WHEN admission='admitted' THEN ?6 ELSE reason END WHERE generation=?1 AND pass_key=?2 AND child=?3",params![root.id,key,child,attempts.saturating_add(1).min(32),Utc::now().timestamp()+delay,admitted_reason])?;
     refresh_admission_hash(conn, root, key, child)
 }
 
@@ -1333,7 +1375,8 @@ fn validate_decision_rows(
         "admitted" => {
             d.outcome == SelectionOutcome::Selected
                 && ((reason.is_empty() && attempts == 0 && deadline == 0)
-                    || (reason == "current_confirmation_unavailable"
+                    || ((reason == "current_confirmation_unavailable"
+                        || reason == "download_failed")
                         && (1..=32).contains(&attempts)
                         && deadline > 0))
         }
@@ -1872,6 +1915,285 @@ impl SqliteStateDb {
             let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3)",params![generation,key,child],|r|r.get(0))?;
             if exists {Ok(Some(load_decision(conn,&root,&key,&child)?))} else {Ok(None)}
         }).await
+    }
+
+    /// Read the exact admitted owner identity before dispatch. This is not a
+    /// post-failure authority: callers must capture it before the transfer and
+    /// revalidate the same tuple inside the backoff transaction.
+    pub(crate) async fn selection_retry_identity(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        key: String,
+        child: String,
+    ) -> Result<Option<SelectionRetryIdentity>, StateError> {
+        self.with_conn("reading selection retry identity", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let root = load_generation(conn, &generation)?;
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3)",
+                params![generation, key, child],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(None);
+            }
+            let manifest = load_decision(conn, &root, &key, &child)?;
+            let (specification_hash, manifest_hash, admission_hash): (String, String, Option<String>) =
+                conn.query_row(
+                    "SELECT g.specification_hash,d.manifest_hash,d.admission_hash FROM provider_active_decisions d JOIN provider_active_generations g ON g.id=d.generation WHERE d.generation=?1 AND d.pass_key=?2 AND d.child=?3",
+                    params![generation, key, child],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+            let admission_hash = admission_hash.ok_or(StateError::ProviderSelectionInvalid)?;
+            Ok(Some(SelectionRetryIdentity {
+                generation,
+                specification_hash,
+                pass_key: key,
+                child,
+                state_id: manifest.state_id.clone(),
+                manifest_hash,
+                admission_hash,
+                confirmation: manifest.decision.confirmation,
+                master: manifest.decision.master,
+                destinations: manifest.decision.destinations,
+            }))
+        })
+        .await
+    }
+
+    /// Read one bounded due admitted-media window using the existing per-root
+    /// `replay_after` cursor. The cursor is not advanced here.
+    pub(crate) async fn due_admitted_media_window(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        max_asset_attempts: u32,
+    ) -> Result<DueAdmittedMediaWindow, StateError> {
+        self.with_conn("reading due admitted media window", move |conn| {
+            account::validate_authenticated(conn, &owner)?;
+            let root = load_generation(conn, &generation)?;
+            let stored: Option<String> = conn.query_row(
+                "SELECT replay_after FROM provider_active_generations WHERE id=?1",
+                [&generation],
+                |row| row.get(0),
+            )?;
+            let after: Option<(String, String)> = stored
+                .as_deref()
+                .map(|value| {
+                    serde_json::from_str(value)
+                        .map_err(|_invalid| StateError::ProviderSelectionInvalid)
+                })
+                .transpose()?;
+            let query = |after: Option<&(String, String)>| -> Result<Vec<(String, String, i64)>, StateError> {
+                Ok(conn.prepare(
+                    "SELECT d.pass_key,d.child,length(d.manifest) FROM provider_active_decisions d
+                     WHERE d.generation=?1
+                       AND (?2 IS NULL OR (d.pass_key,d.child)>(?2,?3))
+                       AND d.next_retry_at<=?4
+                       AND d.admission='admitted'
+                       AND d.compacted_hash IS NULL
+                       AND EXISTS(SELECT 1 FROM provider_active_destinations w
+                         WHERE w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child
+                           AND w.admitted=1 AND w.verified_media=0
+                           AND w.prepared_hash IS NULL AND w.frozen_metadata IS NULL
+                           AND EXISTS(SELECT 1 FROM assets a
+                             WHERE a.library=w.library AND a.id=w.asset_id AND a.version_size=w.version_size
+                               AND (?5=0 OR a.download_attempts<?5)))
+                     ORDER BY d.pass_key,d.child LIMIT 64",
+                )?
+                .query_map(
+                    params![
+                        generation,
+                        after.map(|value| &value.0),
+                        after.map(|value| &value.1),
+                        Utc::now().timestamp(),
+                        max_asset_attempts
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?
+                .collect::<Result<_, _>>()?)
+            };
+            let mut keys = query(after.as_ref())?;
+            if keys.is_empty() && after.is_some() {
+                keys = query(None)?;
+            }
+            let specification_hash: String = conn.query_row(
+                "SELECT specification_hash FROM provider_active_generations WHERE id=?1",
+                [&generation],
+                |row| row.get(0),
+            )?;
+            let mut bytes = 0_usize;
+            let mut identities = Vec::new();
+            let mut pages = RankProofs::new(conn, &root);
+            for (key, child, length) in keys {
+                let length = usize::try_from(length)
+                    .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+                if length > MAX_CHUNK_BYTES {
+                    return invalid();
+                }
+                if bytes.saturating_add(length) > MAX_CHUNK_BYTES {
+                    break;
+                }
+                let manifest = match load_decision_with_pages(conn, &root, &key, &child, true, &mut pages) {
+                    Ok(manifest) => manifest,
+                    Err(StateError::ProviderSelectionFull) => break,
+                    Err(error) => return Err(error),
+                };
+                let (manifest_hash, admission_hash): (String, Option<String>) = conn.query_row(
+                    "SELECT manifest_hash,admission_hash FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+                    params![generation, key, child],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let Some(admission_hash) = admission_hash else {
+                    continue;
+                };
+                let mut unverified = Vec::new();
+                for destination in manifest.decision.destinations {
+                    let path = destination.path.key()?;
+                    let pending: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=0 AND prepared_hash IS NULL AND frozen_metadata IS NULL)",
+                        params![generation, key, child, destination.version_size, path],
+                        |row| row.get(0),
+                    )?;
+                    if pending {
+                        unverified.push(destination);
+                    }
+                }
+                if unverified.is_empty() {
+                    continue;
+                }
+                bytes += length;
+                identities.push(SelectionRetryIdentity {
+                    generation: generation.clone(),
+                    specification_hash: specification_hash.clone(),
+                    pass_key: key,
+                    child,
+                    state_id: manifest.state_id,
+                    manifest_hash,
+                    admission_hash,
+                    confirmation: manifest.decision.confirmation,
+                    master: manifest.decision.master,
+                    destinations: unverified,
+                });
+            }
+            Ok(DueAdmittedMediaWindow {
+                cursor: stored,
+                identities,
+            })
+        })
+        .await
+    }
+
+    /// CAS the per-root cursor to the last examined existing decision. Only the
+    /// scheduling cursor and last-attempt time change.
+    pub(crate) async fn ack_due_admitted_media_window(
+        &self,
+        owner: account::AccountOwner,
+        generation: String,
+        expected_cursor: Option<String>,
+        last_examined: (String, String),
+    ) -> Result<bool, StateError> {
+        self.with_conn_mut("acknowledging due admitted media window", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            account::validate_authenticated(&tx, &owner)?;
+            load_generation(&tx, &generation)?;
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3)",
+                params![generation, last_examined.0, last_examined.1],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let cursor = serde_json::to_string(&last_examined)
+                .map_err(|_invalid| StateError::ProviderSelectionInvalid)?;
+            let changed = match expected_cursor {
+                Some(expected) => tx.execute(
+                    "UPDATE provider_active_generations SET replay_after=?2,last_replayed_at=?3 WHERE id=?1 AND replay_after=?4",
+                    params![generation, cursor, Utc::now().timestamp_millis(), expected],
+                )?,
+                None => tx.execute(
+                    "UPDATE provider_active_generations SET replay_after=?2,last_replayed_at=?3 WHERE id=?1 AND replay_after IS NULL",
+                    params![generation, cursor, Utc::now().timestamp_millis()],
+                )?,
+            };
+            tx.commit()?;
+            Ok(changed == 1)
+        })
+        .await
+    }
+
+    /// Record one truthful media-failure backoff only when the exact captured
+    /// admitted owner is still current. A stale capture writes nothing.
+    pub(crate) async fn defer_selection_media_failure(
+        &self,
+        owner: account::AccountOwner,
+        captured: CapturedSelectionRetry,
+    ) -> Result<bool, StateError> {
+        self.with_conn_mut("recording admitted media failure", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            account::validate_authenticated(&tx, &owner)?;
+            let root = load_generation(&tx, &captured.generation)?;
+            let stored_specification: String = tx.query_row(
+                "SELECT specification_hash FROM provider_active_generations WHERE id=?1",
+                [&captured.generation],
+                |row| row.get(0),
+            )?;
+            if stored_specification != captured.specification_hash {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let manifest = load_decision(&tx, &root, &captured.pass_key, &captured.child)?;
+            if manifest.state_id != captured.state_id {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let (manifest_hash, admission, admission_hash, compacted): (String, String, Option<String>, bool) =
+                tx.query_row(
+                    "SELECT manifest_hash,admission,admission_hash,compacted_hash IS NOT NULL FROM provider_active_decisions WHERE generation=?1 AND pass_key=?2 AND child=?3",
+                    params![captured.generation, captured.pass_key, captured.child],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+            if manifest_hash != captured.manifest_hash
+                || admission != "admitted"
+                || admission_hash.as_deref() != Some(captured.admission_hash.as_str())
+                || compacted
+            {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let Some(destination) = manifest.decision.destinations.iter().find(|destination| {
+                destination.version_size == captured.destination.version_size
+                    && destination.path == captured.destination.path
+                    && destination.checksum == captured.destination.checksum
+                    && destination.size == captured.destination.size
+            }) else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            let path = destination.path.key()?;
+            let valid: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM provider_active_destinations WHERE generation=?1 AND pass_key=?2 AND child=?3 AND version_size=?4 AND path=?5 AND admitted=1 AND verified_media=0 AND prepared_hash IS NULL AND frozen_metadata IS NULL)",
+                params![captured.generation, captured.pass_key, captured.child, destination.version_size, path],
+                |row| row.get(0),
+            )?;
+            if !valid {
+                tx.commit()?;
+                return Ok(false);
+            }
+            defer_attempt_with_reason(
+                &tx,
+                &root,
+                &captured.pass_key,
+                &captured.child,
+                "download_failed",
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
     }
 
     /// Queue, mapping, grouping, independent debt and consumption commit as one
