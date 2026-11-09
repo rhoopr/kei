@@ -90,9 +90,67 @@ async fn v027_inert_old_catalog_preserves_actual_failed_transfer_quiet_retry() {
         .await;
 }
 
+#[derive(Clone)]
+struct GatedBytes {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    allow: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    bytes: std::sync::Arc<Vec<u8>>,
+}
+
+impl wiremock::Respond for GatedBytes {
+    fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        use std::sync::atomic::Ordering;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.allow.load(Ordering::SeqCst) {
+            wiremock::ResponseTemplate::new(200).set_body_bytes(self.bytes.as_slice())
+        } else {
+            wiremock::ResponseTemplate::new(500)
+        }
+    }
+}
+
+fn media_checksum() -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    base64::engine::general_purpose::STANDARD.encode(Sha256::digest(super::MEDIA))
+}
+
+fn media_pair(zone: &str, id: &str, filename: &str, url: &str) -> Vec<serde_json::Value> {
+    use base64::Engine as _;
+    let checksum = media_checksum();
+    let mut page = super::full_album_page_with_download(
+        zone,
+        id,
+        "inventory-last-page",
+        url,
+        super::MEDIA.len() as u64,
+        &checksum,
+    );
+    page["records"][0]["fields"]["filenameEnc"]["value"] =
+        json!(base64::engine::general_purpose::STANDARD.encode(filename));
+    page["records"][0]["recordChangeTag"] = json!(format!("ct-master-{id}"));
+    page["records"][1]["recordChangeTag"] = json!(format!("ct-asset-{id}"));
+    page["records"].as_array().unwrap().clone()
+}
+
+fn missing_master_asset(zone: &str, id: &str, missing_master: &str) -> serde_json::Value {
+    let mut asset = media_pair(zone, id, "orphan.JPG", "https://invalid.example/orphan")
+        .pop()
+        .unwrap();
+    asset["fields"]["masterRef"]["value"]["recordName"] = json!(missing_master);
+    asset
+}
+
+fn master_record(zone: &str, id: &str, record_name: &str) -> serde_json::Value {
+    let mut master = media_pair(zone, id, "orphan.JPG", "https://invalid.example/orphan").remove(0);
+    master["recordName"] = json!(record_name);
+    master
+}
+
 #[cfg(test)]
 async fn stock36_library_state(
     db: std::sync::Arc<SqliteStateDb>,
+    zone_name: &'static str,
     inventory: Vec<serde_json::Value>,
     full_queries: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     changes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -100,14 +158,13 @@ async fn stock36_library_state(
     use std::sync::Arc;
 
     use super::{
-        ResetCycleSession, ZONE, baseline_owner, make_run_cycle_library_state_with_passes,
-        sync_token_key, zone,
+        ResetCycleSession, baseline_owner, make_run_cycle_library_state_with_passes, sync_token_key,
     };
     use crate::commands::{AlbumPass, PassKind};
     use crate::icloud::photos::PhotoLibrary;
 
     let session = ResetCycleSession {
-        zone: ZONE,
+        zone: zone_name,
         inventory: Arc::new(inventory),
         full_queries,
         changes,
@@ -119,7 +176,7 @@ async fn stock36_library_state(
         "https://synthetic.example/database/1/photos/production/private".into(),
         Arc::new(std::collections::HashMap::new()),
         Box::new(session),
-        Arc::new(zone()),
+        Arc::new(json!({"zoneName":zone_name,"ownerRecordName":"_defaultOwner"})),
         "private".into(),
         crate::retry::RetryConfig::default(),
     )
@@ -136,14 +193,14 @@ async fn stock36_library_state(
         exclude_ids: Arc::new(rustc_hash::FxHashSet::default()),
     }];
     let mut selected =
-        make_run_cycle_library_state_with_passes(ZONE, &sync_token_key(ZONE), passes);
+        make_run_cycle_library_state_with_passes(zone_name, &sync_token_key(zone_name), passes);
     selected.library = library;
     selected
 }
 
 async fn run_stock36_cycle(
     db: &std::sync::Arc<SqliteStateDb>,
-    selected: &crate::sync_cycle::LibraryState,
+    selected: &[&crate::sync_cycle::LibraryState],
     root: &std::path::Path,
     shared: &crate::auth::SharedSession,
     config: &crate::config::Config,
@@ -154,7 +211,7 @@ async fn run_stock36_cycle(
 
     let builder = make_run_cycle_download_config_builder(root, db.clone());
     crate::sync_cycle::run_cycle(
-        &[selected],
+        selected,
         config,
         Some(db.as_ref()),
         false,
@@ -166,25 +223,72 @@ async fn run_stock36_cycle(
     .await
 }
 
-/// A real stock-36 existing upgrade has no current receipt, token, epoch
-/// completion marker or admitted destination. Its ordinary first baseline
-/// admits a destination whose HTTP transfer fails through the same-cycle
-/// cleanup. The affected baseline and token must stay held while the due item
-/// retries at the next configured wake without a new inventory.
+fn epoch_state(db: &SqliteStateDb, zone: &str) -> String {
+    let conn = db.acquire_lock("read epoch state").unwrap();
+    conn.query_row(
+        "SELECT json_extract(value,'$.state') FROM metadata WHERE key=?1",
+        [crate::state::db::sync_epoch::library_key(zone)],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn token(db: &SqliteStateDb, zone: &str) -> Option<String> {
+    let conn = db.acquire_lock("read zone token").unwrap();
+    conn.query_row(
+        "SELECT value FROM metadata WHERE key=?1",
+        [super::sync_token_key(zone)],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+fn destination_state(db: &SqliteStateDb, child: &str) -> (i64, i64) {
+    let conn = db.acquire_lock("read destination state").unwrap();
+    conn.query_row(
+        "SELECT w.admitted,w.verified_media FROM provider_active_destinations w WHERE w.child=?1",
+        [child],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap()
+}
+
+fn decision_state(db: &SqliteStateDb, child: &str) -> (String, i64, i64, i64) {
+    let conn = db.acquire_lock("read decision state").unwrap();
+    conn.query_row(
+        "SELECT d.reason,d.attempts,d.next_retry_at,w.verified_media FROM provider_active_decisions d JOIN provider_active_destinations w ON w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child WHERE d.child=?1",
+        [child],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )
+    .unwrap()
+}
+
+fn downloaded_path(db: &SqliteStateDb, zone: &str, child: &str) -> std::path::PathBuf {
+    let conn = db.acquire_lock("read downloaded path").unwrap();
+    let path: String = conn
+        .query_row(
+            "SELECT local_path FROM asset_metadata_paths WHERE library=?1 AND id=?2 AND version_size='original'",
+            [zone, child],
+            |row| row.get(0),
+        )
+        .unwrap();
+    std::path::PathBuf::from(path)
+}
+
+/// Current-accounting positive control: a validated first baseline may publish
+/// its token while an admitted failed transfer remains durably queued. The
+/// aggregate database checkpoint still stays held by the real failed count.
 #[tokio::test]
-async fn stock36_first_baseline_failed_media_retries_at_next_configured_wake_without_inventory() {
+async fn stock36_only_failed_media_keeps_validated_baseline_token_accounted() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer};
 
     use super::{
-        FlakyBytes, MEDIA, ZONE, baseline_owner, full_album_page_with_download,
-        make_run_cycle_config, make_shared_session_for_run_cycle, seed_existing_upgrade_db,
-        sync_token_key,
+        MEDIA, ZONE, baseline_owner, make_run_cycle_config, make_shared_session_for_run_cycle,
+        seed_existing_upgrade_db,
     };
     use crate::state::SqliteStateDb;
 
@@ -195,33 +299,30 @@ async fn stock36_first_baseline_failed_media_retries_at_next_configured_wake_wit
     seed_existing_upgrade_db(&db_path);
 
     let calls = Arc::new(AtomicUsize::new(0));
+    let allow = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/fail"))
-        .respond_with(FlakyBytes {
+        .respond_with(GatedBytes {
             calls: Arc::clone(&calls),
+            allow: Arc::clone(&allow),
             bytes: Arc::new(MEDIA.to_vec()),
-            // Phase 1 and the same-cycle cleanup pass both fail; the third
-            // request belongs to the next normal wake.
-            fail_first: 2,
         })
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/progress"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .mount(&server)
+        .await;
 
-    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(MEDIA));
-    let mut page = full_album_page_with_download(
+    let mut inventory = media_pair(ZONE, "fail", "fail.JPG", &format!("{}/fail", server.uri()));
+    inventory.extend(media_pair(
         ZONE,
-        "fail",
-        "inventory-last-page",
-        &format!("{}/fail", server.uri()),
-        MEDIA.len() as u64,
-        &checksum,
-    );
-    page["records"][0]["fields"]["filenameEnc"]["value"] =
-        serde_json::json!(base64::engine::general_purpose::STANDARD.encode("fail.JPG"));
-    page["records"][0]["recordChangeTag"] = serde_json::json!("ct-master-fail");
-    page["records"][1]["recordChangeTag"] = serde_json::json!("ct-asset-fail");
-    let inventory = page["records"].as_array().unwrap().clone();
+        "progress",
+        "progress.JPG",
+        &format!("{}/progress", server.uri()),
+    ));
 
     let full_queries = Arc::new(AtomicUsize::new(0));
     let changes = Arc::new(AtomicUsize::new(0));
@@ -232,6 +333,7 @@ async fn stock36_first_baseline_failed_media_retries_at_next_configured_wake_wit
     );
     let selected = stock36_library_state(
         db.clone(),
+        ZONE,
         inventory.clone(),
         Arc::clone(&full_queries),
         Arc::clone(&changes),
@@ -241,44 +343,39 @@ async fn stock36_first_baseline_failed_media_retries_at_next_configured_wake_wit
     let mut config = make_run_cycle_config();
     config.retry.max_retries = 0;
 
-    let first = run_stock36_cycle(&db, &selected, &root, &shared, &config)
+    let first = run_stock36_cycle(&db, &[&selected], &root, &shared, &config)
         .await
-        .expect("first ordinary baseline must return a partial result");
+        .expect("ordinary first baseline must return a result");
 
-    let (first_epoch_state, first_deadline, first_reason, admitted, verified) = {
-        let conn = db.acquire_lock("inspect first baseline failure").unwrap();
-        let state: String = conn
-            .query_row(
-                "SELECT json_extract(value,'$.state') FROM metadata WHERE key=?1",
-                [crate::state::db::sync_epoch::library_key(ZONE)],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let (deadline, reason, admitted, verified): (i64, String, i64, i64) = conn
-            .query_row(
-                "SELECT d.next_retry_at,d.reason,w.admitted,w.verified_media FROM provider_active_decisions d JOIN provider_active_destinations w ON w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child WHERE d.child='asset-fail'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        (state, deadline, reason, admitted, verified)
-    };
-    let first_token = db.get_metadata(&sync_token_key(ZONE)).await.unwrap();
+    let first_state = epoch_state(&db, ZONE);
+    let first_token = token(&db, ZONE);
+    let first_decision = decision_state(&db, "asset-fail");
+    let progress = destination_state(&db, "asset-progress");
     eprintln!(
-        "L7 first cycle: failed={} full_queries={} calls={} epoch_state={first_epoch_state} item_deadline={first_deadline} item_reason={first_reason} admitted={admitted} verified_media={verified} token={first_token:?}",
+        "L7 positive first cycle: failed={} full_queries={} epoch={first_state} token={first_token:?} fail={first_decision:?} progress={progress:?} calls={} db_advance={}",
         first.failed_count,
         full_queries.load(Ordering::SeqCst),
         calls.load(Ordering::SeqCst),
+        first.can_advance_database_checkpoint(),
     );
-    assert!(first.failed_count > 0);
-    assert_eq!(full_queries.load(Ordering::SeqCst), 1);
-    assert_eq!(admitted, 1);
-    assert_eq!(verified, 0);
-    assert!(first_deadline > chrono::Utc::now().timestamp());
 
-    // Reopen, then advance only the exact recorded item deadline through the
-    // existing owner hook. This represents the configured item wait elapsing;
-    // selection, admission, receipts and destinations stay untouched.
+    assert_eq!(first_state, "complete");
+    assert!(first_token.is_some());
+    assert!(first.failed_count > 0);
+    assert!(
+        !first.can_advance_database_checkpoint(),
+        "the aggregate database checkpoint stays held by the real failed count"
+    );
+    assert_eq!(first_decision.3, 0, "failed media stays unverified");
+    assert_eq!(progress, (1, 1), "same-library legitimate media progressed");
+    assert_eq!(
+        std::fs::read(downloaded_path(&db, ZONE, "asset-progress")).unwrap(),
+        MEDIA,
+        "same-library legitimate bytes must be published"
+    );
+    assert_eq!(full_queries.load(Ordering::SeqCst), 1);
+
+    allow.store(true, Ordering::SeqCst);
     drop(selected);
     drop(db);
     let db = Arc::new(
@@ -288,6 +385,7 @@ async fn stock36_first_baseline_failed_media_retries_at_next_configured_wake_wit
     );
     let selected = stock36_library_state(
         db.clone(),
+        ZONE,
         inventory,
         Arc::clone(&full_queries),
         Arc::clone(&changes),
@@ -297,66 +395,386 @@ async fn stock36_first_baseline_failed_media_retries_at_next_configured_wake_wit
         .await
         .unwrap();
 
-    let second = run_stock36_cycle(&db, &selected, &root, &shared, &config)
+    let second = run_stock36_cycle(&db, &[&selected], &root, &shared, &config)
         .await
-        .expect("next configured wake must retry retained media");
+        .expect("deadline-boundary replay must complete");
 
-    let (second_epoch_state, admitted, verified, token) = {
-        let conn = db.acquire_lock("inspect next wake retry").unwrap();
-        let state: String = conn
-            .query_row(
-                "SELECT json_extract(value,'$.state') FROM metadata WHERE key=?1",
-                [crate::state::db::sync_epoch::library_key(ZONE)],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let (admitted, verified): (i64, i64) = conn
-            .query_row(
-                "SELECT w.admitted,w.verified_media FROM provider_active_destinations w WHERE w.child='asset-fail'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        let token: Option<String> = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key=?1",
-                [sync_token_key(ZONE)],
-                |row| row.get(0),
-            )
-            .ok();
-        (state, admitted, verified, token)
-    };
     eprintln!(
-        "L7 next wake: failed={} full_queries={} calls={} epoch_state={second_epoch_state} admitted={admitted} verified_media={verified} token={token:?}",
+        "L7 positive deadline-boundary retry: failed={} full_queries={} epoch={} token={:?} fail={:?} calls={}",
         second.failed_count,
         full_queries.load(Ordering::SeqCst),
+        epoch_state(&db, ZONE),
+        token(&db, ZONE),
+        decision_state(&db, "asset-fail"),
         calls.load(Ordering::SeqCst),
     );
 
-    assert_ne!(
-        first_epoch_state, "complete",
-        "a failed first baseline must stay held after its own incomplete work"
-    );
-    assert!(
-        first_token.is_none(),
-        "a failed first baseline must not publish checkpoint authority"
-    );
     assert_eq!(
         full_queries.load(Ordering::SeqCst),
         1,
-        "retained recorded work must retry without a new inventory"
+        "the deadline-boundary replay must not run a new inventory"
     );
-    assert_eq!(admitted, 1);
-    assert_eq!(verified, 1, "the due admitted item must be retried");
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
-    assert_eq!(
-        token, None,
-        "an independent retry must not grant checkpoint authority"
+    assert_eq!(destination_state(&db, "asset-fail"), (1, 1));
+    assert!(calls.load(Ordering::SeqCst) >= 3);
+    assert_eq!(epoch_state(&db, ZONE), "complete");
+    assert!(token(&db, ZONE).is_some());
+}
+
+/// A missing current master independently holds the first baseline. A due
+/// admitted media item must still retry without a new inventory or any
+/// checkpoint/epoch promotion, while a same-library item and a peer library
+/// make legitimate progress. This is a deadline-boundary control, not a
+/// configured-watch cadence claim.
+#[tokio::test]
+async fn stock36_held_identity_baseline_replays_due_admitted_media_without_inventory_or_promotion()
+{
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer};
+
+    use super::{
+        MEDIA, baseline_owner, make_run_cycle_config, make_shared_session_for_run_cycle,
+        seed_existing_upgrade_db,
+    };
+    use crate::state::SqliteStateDb;
+
+    const SUPPORT: &str = "SharedSync-v027-support";
+    const PEER: &str = "SharedSync-v027-peer";
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    seed_existing_upgrade_db(&db_path);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let allow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fail"))
+        .respond_with(GatedBytes {
+            calls: Arc::clone(&calls),
+            allow: Arc::clone(&allow),
+            bytes: Arc::new(MEDIA.to_vec()),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/progress"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/peer"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .mount(&server)
+        .await;
+
+    let mut inventory = media_pair(
+        SUPPORT,
+        "fail",
+        "fail.JPG",
+        &format!("{}/fail", server.uri()),
     );
+    inventory.extend(media_pair(
+        SUPPORT,
+        "progress",
+        "progress.JPG",
+        &format!("{}/progress", server.uri()),
+    ));
+    inventory.push(missing_master_asset(
+        SUPPORT,
+        "orphan",
+        "currently-absent-master",
+    ));
+    let peer_inventory = media_pair(PEER, "peer", "peer.JPG", &format!("{}/peer", server.uri()));
+
+    let support_full = Arc::new(AtomicUsize::new(0));
+    let support_changes = Arc::new(AtomicUsize::new(0));
+    let peer_full = Arc::new(AtomicUsize::new(0));
+    let peer_changes = Arc::new(AtomicUsize::new(0));
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let support = stock36_library_state(
+        db.clone(),
+        SUPPORT,
+        inventory.clone(),
+        Arc::clone(&support_full),
+        Arc::clone(&support_changes),
+    )
+    .await;
+    let peer = stock36_library_state(
+        db.clone(),
+        PEER,
+        peer_inventory,
+        Arc::clone(&peer_full),
+        Arc::clone(&peer_changes),
+    )
+    .await;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let mut config = make_run_cycle_config();
+    config.retry.max_retries = 0;
+
+    let first = run_stock36_cycle(&db, &[&support, &peer], &root, &shared, &config)
+        .await
+        .expect("held first baseline must return a result");
+
+    let first_support_state = epoch_state(&db, SUPPORT);
+    let first_support_token = token(&db, SUPPORT);
+    let first_fail = decision_state(&db, "asset-fail");
+    let first_progress = destination_state(&db, "asset-progress");
+    let first_peer_state = epoch_state(&db, PEER);
+    let first_peer_token = token(&db, PEER);
+    let first_support_full = support_full.load(Ordering::SeqCst);
+    eprintln!(
+        "L7 held first cycle: failed={} support_epoch={first_support_state} support_token={first_support_token:?} fail={first_fail:?} progress={first_progress:?} support_full={first_support_full} support_blocked={} reason={:?} peer_epoch={first_peer_state} peer_token={first_peer_token:?} peer_full={}",
+        first.failed_count,
+        first.stats.sync_token_blocked,
+        first.stats.sync_token_blocked_reason,
+        peer_full.load(Ordering::SeqCst),
+    );
+
+    assert_eq!(first_support_state, "pending");
+    assert!(
+        first_support_token.is_none(),
+        "the independent current identity hold must not publish a token"
+    );
+    assert!(first.stats.sync_token_blocked);
     assert_ne!(
-        second_epoch_state, "complete",
-        "the affected baseline stays held after an independent retry"
+        first.stats.sync_token_blocked_reason,
+        Some("download_failed"),
+        "the baseline hold is independent of the media failure"
     );
+    assert_eq!(first_fail.3, 0, "failed media stays admitted unverified");
+    assert_eq!(
+        first_progress,
+        (1, 1),
+        "same-library legitimate media progressed"
+    );
+    assert_eq!(first_peer_state, "complete");
+    assert!(
+        first_peer_token.is_some(),
+        "the peer library keeps its own checkpoint progress"
+    );
+
+    allow.store(true, Ordering::SeqCst);
+    drop(support);
+    drop(peer);
+    drop(db);
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let support = stock36_library_state(
+        db.clone(),
+        SUPPORT,
+        inventory,
+        Arc::clone(&support_full),
+        Arc::clone(&support_changes),
+    )
+    .await;
+    let peer = stock36_library_state(
+        db.clone(),
+        PEER,
+        media_pair(PEER, "peer", "peer.JPG", &format!("{}/peer", server.uri())),
+        Arc::clone(&peer_full),
+        Arc::clone(&peer_changes),
+    )
+    .await;
+    db.make_selection_retry_due(baseline_owner(), "asset-fail".to_owned())
+        .await
+        .unwrap();
+
+    let second = run_stock36_cycle(&db, &[&support, &peer], &root, &shared, &config)
+        .await
+        .expect("deadline-boundary retry while held must return a result");
+
+    let second_support_state = epoch_state(&db, SUPPORT);
+    let second_support_token = token(&db, SUPPORT);
+    let second_fail = decision_state(&db, "asset-fail");
+    let second_peer_token = token(&db, PEER);
+    eprintln!(
+        "L7 held deadline-boundary retry: failed={} support_epoch={second_support_state} support_token={second_support_token:?} fail={second_fail:?} support_full={} peer_token={second_peer_token:?} peer_full={} calls={}",
+        second.failed_count,
+        support_full.load(Ordering::SeqCst),
+        peer_full.load(Ordering::SeqCst),
+        calls.load(Ordering::SeqCst),
+    );
+
+    assert_eq!(
+        support_full.load(Ordering::SeqCst),
+        first_support_full,
+        "retrying admitted media must not run a new inventory"
+    );
+    assert_eq!(
+        second_fail.3, 1,
+        "the due admitted media item must retry while the baseline is held"
+    );
+    assert_eq!(
+        second_support_token, None,
+        "the retry must not publish checkpoint authority"
+    );
+    assert_eq!(
+        second_support_state, "pending",
+        "the retry must not promote the independently held epoch"
+    );
+    assert!(
+        second_peer_token.is_some(),
+        "the peer keeps its own checkpoint progress"
+    );
+}
+
+/// A resolved current master gives the affected library its own fresh baseline
+/// proof. Only that ordinary baseline may complete the epoch and publish the
+/// token; the earlier media retry does not.
+#[tokio::test]
+async fn stock36_held_identity_baseline_promotes_after_own_fresh_proof() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer};
+
+    use super::{
+        MEDIA, baseline_owner, make_run_cycle_config, make_shared_session_for_run_cycle,
+        seed_existing_upgrade_db,
+    };
+    use crate::state::SqliteStateDb;
+
+    const ZONE: &str = "SharedSync-v027-fresh-proof";
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    seed_existing_upgrade_db(&db_path);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let allow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fail"))
+        .respond_with(GatedBytes {
+            calls: Arc::clone(&calls),
+            allow: Arc::clone(&allow),
+            bytes: Arc::new(MEDIA.to_vec()),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/progress"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(MEDIA))
+        .mount(&server)
+        .await;
+
+    let mut held_inventory =
+        media_pair(ZONE, "fail", "fail.JPG", &format!("{}/fail", server.uri()));
+    held_inventory.extend(media_pair(
+        ZONE,
+        "progress",
+        "progress.JPG",
+        &format!("{}/progress", server.uri()),
+    ));
+    held_inventory.push(missing_master_asset(
+        ZONE,
+        "orphan",
+        "currently-absent-master",
+    ));
+
+    let full_queries = Arc::new(AtomicUsize::new(0));
+    let changes = Arc::new(AtomicUsize::new(0));
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let held = stock36_library_state(
+        db.clone(),
+        ZONE,
+        held_inventory,
+        Arc::clone(&full_queries),
+        Arc::clone(&changes),
+    )
+    .await;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let mut config = make_run_cycle_config();
+    config.retry.max_retries = 0;
+    run_stock36_cycle(&db, &[&held], &root, &shared, &config)
+        .await
+        .expect("held first baseline must return a result");
+    assert_eq!(epoch_state(&db, ZONE), "pending");
+    assert!(token(&db, ZONE).is_none());
+
+    allow.store(true, Ordering::SeqCst);
+    let mut resolved_inventory =
+        media_pair(ZONE, "fail", "fail.JPG", &format!("{}/fail", server.uri()));
+    resolved_inventory.extend(media_pair(
+        ZONE,
+        "progress",
+        "progress.JPG",
+        &format!("{}/progress", server.uri()),
+    ));
+    resolved_inventory.push(master_record(
+        ZONE,
+        "resolved-master",
+        "currently-absent-master",
+    ));
+    resolved_inventory.push(missing_master_asset(
+        ZONE,
+        "orphan",
+        "currently-absent-master",
+    ));
+
+    drop(held);
+    drop(db);
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let resolved = stock36_library_state(
+        db.clone(),
+        ZONE,
+        resolved_inventory,
+        Arc::clone(&full_queries),
+        Arc::clone(&changes),
+    )
+    .await;
+    // Deadline-boundary control for the epoch hold, separate from cadence.
+    let now = chrono::Utc::now().timestamp();
+    db.acquire_lock("advance held epoch to its deadline")
+        .unwrap()
+        .execute(
+            "UPDATE metadata SET value=json_set(value,'$.next_attempt_at',?1) WHERE key=?2",
+            rusqlite::params![
+                now.saturating_sub(1),
+                crate::state::db::sync_epoch::library_key(ZONE)
+            ],
+        )
+        .unwrap();
+
+    let promoted = run_stock36_cycle(&db, &[&resolved], &root, &shared, &config)
+        .await
+        .expect("resolved own baseline must complete");
+    eprintln!(
+        "L7 held baseline own proof: failed={} epoch={} token={:?} full_queries={} fail={:?} calls={}",
+        promoted.failed_count,
+        epoch_state(&db, ZONE),
+        token(&db, ZONE),
+        full_queries.load(Ordering::SeqCst),
+        decision_state(&db, "asset-fail"),
+        calls.load(Ordering::SeqCst),
+    );
+
+    assert_eq!(epoch_state(&db, ZONE), "complete");
+    assert!(token(&db, ZONE).is_some());
+    assert_eq!(destination_state(&db, "asset-fail"), (1, 1));
 }
 
 /// A phase-1 failure that the same-cycle cleanup resolves is not media failure
@@ -366,14 +784,12 @@ async fn stock36_cleanup_success_leaves_no_item_retry_backoff() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use base64::Engine as _;
-    use sha2::{Digest, Sha256};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer};
 
     use super::{
-        FlakyBytes, MEDIA, ZONE, baseline_owner, full_album_page_with_download,
-        make_run_cycle_config, make_shared_session_for_run_cycle, seed_existing_upgrade_db,
+        FlakyBytes, MEDIA, ZONE, baseline_owner, make_run_cycle_config,
+        make_shared_session_for_run_cycle, seed_existing_upgrade_db,
     };
     use crate::state::SqliteStateDb;
 
@@ -390,27 +806,17 @@ async fn stock36_cleanup_success_leaves_no_item_retry_backoff() {
         .respond_with(FlakyBytes {
             calls: Arc::clone(&calls),
             bytes: Arc::new(MEDIA.to_vec()),
-            // Phase 1 fails; the same-cycle cleanup succeeds.
             fail_first: 1,
         })
         .mount(&server)
         .await;
 
-    let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(MEDIA));
-    let mut page = full_album_page_with_download(
+    let inventory = media_pair(
         ZONE,
         "recovered",
-        "inventory-last-page",
+        "recovered.JPG",
         &format!("{}/recovered", server.uri()),
-        MEDIA.len() as u64,
-        &checksum,
     );
-    page["records"][0]["fields"]["filenameEnc"]["value"] =
-        serde_json::json!(base64::engine::general_purpose::STANDARD.encode("recovered.JPG"));
-    page["records"][0]["recordChangeTag"] = serde_json::json!("ct-master-recovered");
-    page["records"][1]["recordChangeTag"] = serde_json::json!("ct-asset-recovered");
-    let inventory = page["records"].as_array().unwrap().clone();
-
     let full_queries = Arc::new(AtomicUsize::new(0));
     let changes = Arc::new(AtomicUsize::new(0));
     let db = Arc::new(
@@ -420,6 +826,7 @@ async fn stock36_cleanup_success_leaves_no_item_retry_backoff() {
     );
     let selected = stock36_library_state(
         db.clone(),
+        ZONE,
         inventory,
         Arc::clone(&full_queries),
         Arc::clone(&changes),
@@ -429,19 +836,11 @@ async fn stock36_cleanup_success_leaves_no_item_retry_backoff() {
     let mut config = make_run_cycle_config();
     config.retry.max_retries = 0;
 
-    let result = run_stock36_cycle(&db, &selected, &root, &shared, &config)
+    let result = run_stock36_cycle(&db, &[&selected], &root, &shared, &config)
         .await
         .expect("cleaned-up first baseline must complete");
 
-    let (verified, reason, attempts, deadline): (i64, String, i64, i64) = {
-        let conn = db.acquire_lock("inspect cleaned-up baseline item").unwrap();
-        conn.query_row(
-            "SELECT w.verified_media,d.reason,d.attempts,d.next_retry_at FROM provider_active_decisions d JOIN provider_active_destinations w ON w.generation=d.generation AND w.pass_key=d.pass_key AND w.child=d.child WHERE d.child='asset-recovered'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap()
-    };
+    let (reason, attempts, deadline, verified) = decision_state(&db, "asset-recovered");
     eprintln!(
         "L7 cleanup success: failed={} full_queries={} calls={} verified_media={verified} reason={reason} attempts={attempts} deadline={deadline}",
         result.failed_count,
@@ -457,4 +856,205 @@ async fn stock36_cleanup_success_leaves_no_item_retry_backoff() {
         ("", 0, 0),
         "a resolved cleanup failure must not leave item retry evidence"
     );
+}
+
+fn admission_hash_for(
+    generation: &str,
+    key: &str,
+    child: &str,
+    manifest_hash: &str,
+    admission: &str,
+    reason: &str,
+    attempts: i64,
+    deadline: i64,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(&(
+        generation,
+        key,
+        child,
+        manifest_hash,
+        admission,
+        reason,
+        attempts,
+        deadline,
+    ))
+    .unwrap();
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Compiled unchanged-reader control for the proposed durable reason. The
+/// injected row is hash-valid for its exact bytes; the unchanged reader must
+/// refuse it and mutate nothing.
+#[tokio::test]
+async fn unchanged_reader_rejects_injected_download_failed_reason_without_mutation() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer};
+
+    use super::{
+        MEDIA, ZONE, baseline_owner, make_run_cycle_config, make_shared_session_for_run_cycle,
+        seed_existing_upgrade_db,
+    };
+    use crate::state::SqliteStateDb;
+    use crate::state::error::StateError;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db_path = dir.path().join("state.db");
+    seed_existing_upgrade_db(&db_path);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let allow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fail"))
+        .respond_with(GatedBytes {
+            calls: Arc::clone(&calls),
+            allow: Arc::clone(&allow),
+            bytes: Arc::new(MEDIA.to_vec()),
+        })
+        .mount(&server)
+        .await;
+
+    let inventory = media_pair(ZONE, "fail", "fail.JPG", &format!("{}/fail", server.uri()));
+    let full_queries = Arc::new(AtomicUsize::new(0));
+    let changes = Arc::new(AtomicUsize::new(0));
+    let db = Arc::new(
+        SqliteStateDb::open_owned(&db_path, &baseline_owner())
+            .await
+            .unwrap(),
+    );
+    let selected = stock36_library_state(
+        db.clone(),
+        ZONE,
+        inventory,
+        Arc::clone(&full_queries),
+        Arc::clone(&changes),
+    )
+    .await;
+    let (_session_dir, shared) = make_shared_session_for_run_cycle().await;
+    let mut config = make_run_cycle_config();
+    config.retry.max_retries = 0;
+    run_stock36_cycle(&db, &[&selected], &root, &shared, &config)
+        .await
+        .expect("failed-media baseline must return a result");
+
+    let (
+        generation,
+        key,
+        child,
+        manifest_hash,
+        admission,
+        old_reason,
+        attempts,
+        deadline,
+        stored_hash,
+    ) = {
+        let conn = db.acquire_lock("read injected decision").unwrap();
+        conn.query_row(
+            "SELECT generation,pass_key,child,manifest_hash,admission,reason,attempts,next_retry_at,admission_hash FROM provider_active_decisions WHERE child='asset-fail'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        admission_hash_for(
+            &generation,
+            &key,
+            &child,
+            &manifest_hash,
+            &admission,
+            &old_reason,
+            attempts,
+            deadline
+        ),
+        stored_hash,
+        "the fixture must begin with a hash-valid recorded decision"
+    );
+
+    let before = {
+        let conn = db.acquire_lock("snapshot injected rows").unwrap();
+        conn.query_row(
+            "SELECT json_array(hex(manifest),manifest_hash,outcome,admission,reason,attempts,next_retry_at,admission_hash) FROM provider_active_decisions WHERE child='asset-fail'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    let injected_hash = admission_hash_for(
+        &generation,
+        &key,
+        &child,
+        &manifest_hash,
+        &admission,
+        "download_failed",
+        attempts,
+        deadline,
+    );
+    {
+        let conn = db.acquire_lock("inject download_failed").unwrap();
+        conn.execute(
+            "UPDATE provider_active_decisions SET reason='download_failed',admission_hash=?1 WHERE generation=?2 AND pass_key=?3 AND child=?4",
+            rusqlite::params![injected_hash, generation, key, child],
+        )
+        .unwrap();
+    }
+    let after_injection = {
+        let conn = db.acquire_lock("snapshot injected reason").unwrap();
+        conn.query_row(
+            "SELECT json_array(hex(manifest),manifest_hash,outcome,admission,reason,attempts,next_retry_at,admission_hash) FROM provider_active_decisions WHERE child='asset-fail'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    assert_ne!(before, after_injection);
+
+    let read = db
+        .selection_decision(
+            baseline_owner(),
+            generation.clone(),
+            key.clone(),
+            child.clone(),
+        )
+        .await;
+    assert!(
+        matches!(read, Err(StateError::ProviderSelectionInvalid)),
+        "the unchanged reader must refuse download_failed: {read:?}"
+    );
+    let after_read = {
+        let conn = db.acquire_lock("snapshot read-only refusal").unwrap();
+        conn.query_row(
+            "SELECT json_array(hex(manifest),manifest_hash,outcome,admission,reason,attempts,next_retry_at,admission_hash) FROM provider_active_decisions WHERE child='asset-fail'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    eprintln!(
+        "L7 old-reader control: injected_reason=download_failed hash_valid=true read={read:?} unchanged={} attempts={attempts} deadline={deadline}",
+        after_injection == after_read
+    );
+    assert_eq!(
+        after_injection, after_read,
+        "the unchanged reader must not mutate the injected row"
+    );
+    assert!(attempts > 0 && deadline > 0);
 }
